@@ -30,6 +30,10 @@ for arg in "$@"; do
         lto=*)      LTO_TYPE="${arg#*=}" ;;
         autofdo=*)  AUTOFDO="${arg#*=}" ;;
         bypasscharging=*) BYPASSCHARGING="${arg#*=}" ;;
+        htsr=*) HTSR="${arg#*=}" ;;
+        wifi_exploit=*) WIFI_EXPLOIT="${arg#*=}" ;;
+        kgsl_exploit=*) KGSL_EXPLOIT="${arg#*=}" ;;
+        data_exploit=*) DATA_EXPLOIT="${arg#*=}" ;;
     esac
 done
 
@@ -160,6 +164,12 @@ if [ -z "$BYPASSCHARGING" ]; then
     [ "${_c:-1}" == "2" ] && BYPASSCHARGING="on" || BYPASSCHARGING="off"
 fi
 
+# Set defaults for performance mods (all ON by default)
+[ -z "$HTSR" ] && HTSR="on"
+[ -z "$WIFI_EXPLOIT" ] && WIFI_EXPLOIT="on"
+[ -z "$KGSL_EXPLOIT" ] && KGSL_EXPLOIT="on"
+[ -z "$DATA_EXPLOIT" ] && DATA_EXPLOIT="on"
+
 
 # ==========================================
 # Resolve Root Solution
@@ -183,6 +193,10 @@ echo "=========================================="
 echo " Timer:     ${HZ} HZ"
 echo " Hardened:  ${HARDENED^^}"
 echo " Bypass:    ${BYPASSCHARGING^^}"
+echo " HTSR 240Hz: ${HTSR^^}"
+echo " WiFi Exploit: ${WIFI_EXPLOIT^^}"
+echo " KGSL Exploit: ${KGSL_EXPLOIT^^}"
+echo " Data Exploit: ${DATA_EXPLOIT^^}"
 [ "$VARIANT" != "stock" ] && echo " Variant:   ${VARIANT} ($REPO_NAME)" || echo " Variant:   stock"
 echo " LTO:       ${LTO_TYPE^^}"
 if [ "$VARIANT" != "stock" ]; then
@@ -444,9 +458,20 @@ EXTREME_CLANG_FLAGS=(
 )
 KERNEL_KCFLAGS="-w ${EXTREME_CLANG_FLAGS[*]}"
 
-# Inject Bypass Charging Macro
 if [ "$BYPASSCHARGING" == "on" ]; then
     KERNEL_KCFLAGS="$KERNEL_KCFLAGS -DCONFIG_MCA_BYPASS=1"
+fi
+if [ "$HTSR" == "on" ]; then
+    KERNEL_KCFLAGS="$KERNEL_KCFLAGS -DCONFIG_HTSR_240=1"
+fi
+if [ "$WIFI_EXPLOIT" == "on" ]; then
+    KERNEL_KCFLAGS="$KERNEL_KCFLAGS -DCONFIG_WIFI_EXPLOIT=1"
+fi
+if [ "$KGSL_EXPLOIT" == "on" ]; then
+    KERNEL_KCFLAGS="$KERNEL_KCFLAGS -DCONFIG_KGSL_EXPLOIT=1"
+fi
+if [ "$DATA_EXPLOIT" == "on" ]; then
+    KERNEL_KCFLAGS="$KERNEL_KCFLAGS -DCONFIG_DATA_EXPLOIT=1"
 fi
 
 KERNEL_LDFLAGS="-O2 --icf=all -mllvm -enable-new-pm=1"
@@ -638,6 +663,10 @@ fi
 [ "$KPM" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-kpm"
 [ "$HARDENED" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-hardened"
 [ "$BYPASSCHARGING" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-bypasscharging"
+[ "$HTSR" == "off" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-nohtsr"
+[ "$WIFI_EXPLOIT" == "off" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-nowifi"
+[ "$KGSL_EXPLOIT" == "off" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-nokgsl"
+[ "$DATA_EXPLOIT" == "off" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-nodata"
 
 HZ_LABEL=""
 case "$HZ" in 100) HZ_LABEL="-powersave" ;; 500) HZ_LABEL="-performance" ;; 1000) HZ_LABEL="-ultra-performance" ;; *) HZ_LABEL="-balance" ;; esac

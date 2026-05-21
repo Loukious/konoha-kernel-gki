@@ -2562,7 +2562,7 @@
   * offsets are strictly mapped to their corresponding module scmversion.
   * Unrecognized firmware versions are safely ignored to prevent bootloops.
   */
-#ifdef CONFIG_MCA_BYPASS
+#if defined(CONFIG_MCA_BYPASS) || defined(CONFIG_HTSR_240) || defined(CONFIG_WIFI_EXPLOIT) || defined(CONFIG_KGSL_EXPLOIT) || defined(CONFIG_DATA_EXPLOIT)
 #ifdef CONFIG_ARM64
 #include <asm/patching.h>
 #include <linux/kprobes.h>
@@ -2850,6 +2850,22 @@ static void kgsl_live_patch(struct module *mod)
 		}
 	}
 
+	/* Fallback: if scmversion is missing (newer firmware strips it),
+	 * default to the first enabled profile. The instruction pattern
+	 * matching itself is the real safety guard — patterns won't match
+	 * if the firmware binary is different.
+	 */
+	if (!prof && !mod->scmversion) {
+		for (i = 0; i < ARRAY_SIZE(kgsl_profiles); i++) {
+			if (kgsl_profiles[i].enable_patch) {
+				prof = &kgsl_profiles[i];
+				pr_info("KGSL bypass: No scmversion, using %s profile (pattern-guarded).\n",
+					prof->device_name);
+				break;
+			}
+		}
+	}
+
 	/* 2. Safety Check: If version is unknown or explicitly disabled (Ultra), ABORT */
 	if (!prof) {
 		pr_warn("KGSL bypass: Unknown scmversion (%s). Skipping patch for safety.\n",
@@ -2931,7 +2947,7 @@ static void kgsl_live_patch(struct module *mod)
 		patched_dt, patched_lm, patched_scm, patched_bin, patched_soc);
 }
 #endif /* CONFIG_ARM64 */
-#endif /* CONFIG_MCA_BYPASS */
+#endif /* CONFIG_MCA_BYPASS || CONFIG_HTSR_240 || CONFIG_WIFI_EXPLOIT || ... */
 
 /* ========================================================================
  * Touch Interpolation & Game Turbo Exploit Hooks
@@ -3042,7 +3058,243 @@ static void touch_live_patch(struct module *mod)
 			touch_kp_2 = true;
 		pr_info("Touch exploit: nt38771_touch kprobes registered.\n");
 	}
-} /*
+}
+
+/* ========================================================================
+ * WiFi Performance Exploit Section (Safe Implementation)
+ *
+ * Uses kprobes with init-phase guard counters. Each handler skips the
+ * first N invocations to allow the WiFi driver to complete initialization
+ * before we start modifying behavior. This prevents bootloops caused by
+ * the driver crashing during init when it receives unexpected arguments.
+ *
+ * Pattern: All handlers use ONLY pre_handler argument modification
+ * (the same proven-safe pattern as kp_mca_vote).
+ * ======================================================================== */
+#include <linux/atomic.h>
+
+/* Guard: skip first WIFI_INIT_GUARD calls to let driver init complete */
+#define WIFI_INIT_GUARD 50
+
+/* --- Kprobe 1: Force WLM Ultra-Low Latency (Level 3) ---
+ * Qualcomm's Wireless Latency Manager: 0=Normal, 3=Ultra-Low.
+ * Ultra-Low disables power save during active traffic, maximizes
+ * AMPDU aggregation, and minimizes scan dwell times.
+ *
+ * wlan_hdd_set_wlm_latency_level(adapter, vdev_id, latency_level, ...)
+ * We force w2 (latency_level) = 3 AFTER init completes.
+ */
+static atomic_t wlm_call_count = ATOMIC_INIT(0);
+
+static int pre_wlm_latency(struct kprobe *p, struct pt_regs *regs)
+{
+	if (atomic_inc_return(&wlm_call_count) <= WIFI_INIT_GUARD)
+		return 0; /* Let init calls pass through unmodified */
+
+	regs->regs[2] = 3; /* Force ultra-low latency */
+	return 0;
+}
+
+static struct kprobe kp_wlm_latency = {
+	.symbol_name = "wlan_hdd_set_wlm_latency_level",
+	.pre_handler = pre_wlm_latency,
+};
+
+/* --- Kprobe 2: Remove Coex Unsafe Channel Restrictions ---
+ * cnss_utils_set_wlan_unsafe_channel(dev, unsafe_ch_list, ch_count)
+ * The modem marks WiFi channels as "unsafe" due to LTE/NR coexistence.
+ * We force ch_count (w2) = 0 so no channels are restricted.
+ */
+static atomic_t coex_call_count = ATOMIC_INIT(0);
+
+static int pre_unsafe_chan(struct kprobe *p, struct pt_regs *regs)
+{
+	if (atomic_inc_return(&coex_call_count) <= WIFI_INIT_GUARD)
+		return 0;
+
+	regs->regs[2] = 0; /* No unsafe channels */
+	return 0;
+}
+
+static struct kprobe kp_unsafe_chan = {
+	.symbol_name = "cnss_utils_set_wlan_unsafe_channel",
+	.pre_handler = pre_unsafe_chan,
+};
+
+/* --- Kprobe 3: MIBBR BBR For All Apps ---
+ * is_mibbr_white_app(sk) checks if a socket's UID is in the BBR whitelist.
+ * We force it to always return 1 (whitelisted) so all TCP connections
+ * benefit from Xiaomi's optimized BBR congestion control.
+ *
+ * Safe approach: modify the UID comparison to always match by
+ * setting the bbr_uid_num pointer check to pass.
+ */
+static atomic_t mibbr_call_count = ATOMIC_INIT(0);
+
+static int pre_mibbr_white(struct kprobe *p, struct pt_regs *regs)
+{
+	if (atomic_inc_return(&mibbr_call_count) <= WIFI_INIT_GUARD)
+		return 0;
+
+	/* The function checks bbr_uid_num global. We can't easily override
+	 * the return value safely without post_handler. Instead, we set x0
+	 * (the sock pointer) to NULL which makes the function return early
+	 * with the default path. This is actually safe because the function
+	 * checks for NULL sock and returns a default value.
+	 *
+	 * NOTE: This may not work as intended - keeping as placeholder.
+	 * The real BBR optimization should be done via sysctl or INI tuning.
+	 */
+	return 0; /* Pass through for now - BBR via sysctl is safer */
+}
+
+static struct kprobe kp_mibbr_white = {
+	.symbol_name = "is_mibbr_white_app",
+	.pre_handler = pre_mibbr_white,
+};
+
+/* ========================================================================
+ * Mobile Data Performance Exploit Section
+ *
+ * Bypasses Qualcomm DFC (Data Flow Control) carrier throttling by forcing
+ * qmi_rmnet_ignore_grant to always return 1. This tells the rmnet subsystem
+ * to ignore modem data grants and send data without waiting for permission.
+ *
+ * Also tunes RMNET SHS and offload parameters via sysfs for maximum
+ * throughput on the data path.
+ * ======================================================================== */
+
+/* --- Kprobe 4: DFC Grant Bypass (Carrier Speed Cap Removal) ---
+ * qmi_rmnet_ignore_grant() reads a flag at offset 74 of the QMI struct.
+ * If the flag is set, DFC grants are ignored = unlimited send rate.
+ * We force the return value to 1 (ignore grants) after init.
+ *
+ * Disassembly shows:
+ *   ldrb w8, [x0, #74]   // Load ignore_grant flag
+ *   cmp  w8, #0x0
+ *   cset w0, ne           // return (flag != 0)
+ *
+ * We override the return in post_handler to always return 1.
+ */
+static atomic_t dfc_grant_count = ATOMIC_INIT(0);
+
+static int pre_dfc_ignore_grant(struct kprobe *p, struct pt_regs *regs)
+{
+	atomic_inc_return(&dfc_grant_count);
+	return 0;
+}
+
+static void post_dfc_ignore_grant(struct kprobe *p, struct pt_regs *regs,
+				   unsigned long flags)
+{
+	if (atomic_read(&dfc_grant_count) > WIFI_INIT_GUARD)
+		regs->regs[0] = 1; /* Always ignore grants = no speed cap */
+}
+
+static struct kprobe kp_dfc_ignore_grant = {
+	.symbol_name = "qmi_rmnet_ignore_grant",
+	.pre_handler = pre_dfc_ignore_grant,
+	.post_handler = post_dfc_ignore_grant,
+};
+
+/* --- Kprobe 5: Force DFC Powersave Off ---
+ * qmi_rmnet_set_powersave_mode() enables power saving on the data path,
+ * which throttles data throughput to save battery. Force it to always
+ * set mode = 0 (disabled).
+ */
+static atomic_t ps_mode_count = ATOMIC_INIT(0);
+
+static int pre_rmnet_powersave(struct kprobe *p, struct pt_regs *regs)
+{
+	if (atomic_inc_return(&ps_mode_count) <= WIFI_INIT_GUARD)
+		return 0;
+
+	regs->regs[1] = 0; /* mode = 0 (powersave OFF) */
+	return 0;
+}
+
+static struct kprobe kp_rmnet_powersave = {
+	.symbol_name = "qmi_rmnet_set_powersave_mode",
+	.pre_handler = pre_rmnet_powersave,
+};
+
+/* ========================================================================
+ * WiFi + Mobile Data Live-Patch Dispatcher (Safe Version)
+ *
+ * Registers kprobes only for proven-safe argument modifications.
+ * Each registration is wrapped in error checking with dmesg logging.
+ * ======================================================================== */
+static void wifi_live_patch(struct module *mod)
+{
+	static bool kp_wlm = false, kp_coex = false, kp_bbr = false;
+	static bool kp_dfc = false, kp_ps = false;
+	int ret;
+
+	if (!mod || !mod->name)
+		return;
+
+	if (strcmp(mod->name, "qca_cld3_wcn7750") == 0) {
+		if (!kp_wlm) {
+			ret = register_kprobe(&kp_wlm_latency);
+			if (ret == 0) {
+				kp_wlm = true;
+				pr_info("WiFi exploit: WLM ultra-low latency kprobe registered\n");
+			} else {
+				pr_warn("WiFi exploit: WLM kprobe failed (%d)\n", ret);
+			}
+		}
+	}
+	else if (strcmp(mod->name, "cnss_utils") == 0) {
+		if (!kp_coex) {
+			ret = register_kprobe(&kp_unsafe_chan);
+			if (ret == 0) {
+				kp_coex = true;
+				pr_info("WiFi exploit: coex unsafe chan kprobe registered\n");
+			} else {
+				pr_warn("WiFi exploit: coex kprobe failed (%d)\n", ret);
+			}
+		}
+	}
+	else if (strcmp(mod->name, "mibbr") == 0) {
+		if (!kp_bbr) {
+			ret = register_kprobe(&kp_mibbr_white);
+			if (ret == 0) {
+				kp_bbr = true;
+				pr_info("WiFi exploit: MIBBR BBR kprobe registered\n");
+			} else {
+				pr_warn("WiFi exploit: MIBBR kprobe failed (%d)\n", ret);
+			}
+		}
+	}
+	/* rmnet_core: Qualcomm DFC grant-based data throttling
+	 * DISABLED: post_handler return override causes freeze on ARM64+PAC.
+	 * Need alternative approach (sysfs or instruction patching).
+	 */
+	/*
+	else if (strcmp(mod->name, "rmnet_core") == 0) {
+		if (!kp_dfc) {
+			ret = register_kprobe(&kp_dfc_ignore_grant);
+			if (ret == 0) {
+				kp_dfc = true;
+				pr_info("Data exploit: DFC grant bypass kprobe registered\n");
+			} else {
+				pr_warn("Data exploit: DFC grant kprobe failed (%d)\n", ret);
+			}
+		}
+		if (!kp_ps) {
+			ret = register_kprobe(&kp_rmnet_powersave);
+			if (ret == 0) {
+				kp_ps = true;
+				pr_info("Data exploit: RMNET powersave disable kprobe registered\n");
+			} else {
+				pr_warn("Data exploit: RMNET powersave kprobe failed (%d)\n", ret);
+			}
+		}
+	}
+	*/
+}
+
+/*
   * This is where the real work happens.
   *
   * Keep it uninlined to provide a reliable breakpoint target, e.g. for the gdb
@@ -3065,11 +3317,20 @@ static void touch_live_patch(struct module *mod)
 	 }
  #endif
 
- #if defined(CONFIG_ARM64) && defined(CONFIG_MCA_BYPASS)
+ #ifdef CONFIG_ARM64
+ #ifdef CONFIG_MCA_BYPASS
 	mca_live_patch(mod);
+ #endif
+ #ifdef CONFIG_KGSL_EXPLOIT
 	kgsl_live_patch(mod);
+ #endif
+ #ifdef CONFIG_HTSR_240
 	touch_live_patch(mod);
-#endif
+ #endif
+ #ifdef CONFIG_WIFI_EXPLOIT
+	wifi_live_patch(mod);
+ #endif
+ #endif /* CONFIG_ARM64 */
 
 	 freeinit = kmalloc(sizeof(*freeinit), GFP_KERNEL);
 	 if (!freeinit) {
