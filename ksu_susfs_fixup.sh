@@ -510,38 +510,6 @@ fix_execveat_handlers() {
     if ! grep -q "ksu_handle_execveat_sucompat" "$SUCOMPAT_C" 2>/dev/null; then
         cat >> "$SUCOMPAT_C" << 'EXECVEAT_SUCOMPAT_EOF'
 
-
-    # Inject ksu_handle_stat_user for kernel 6.1+ if missing (required by tracepoint hook)
-    if ! grep -q "ksu_handle_stat_user" "$SUCOMPAT_C" 2>/dev/null; then
-        cat >> "$SUCOMPAT_C" << 'STAT_USER_EOF'
-
-int ksu_handle_stat_user(int *dfd, const char __user **filename_user, int *flags)
-{
-    if (unlikely(!filename_user))
-        return 0;
-    char path[sizeof(su_path) + 1] = {0};
-    strncpy_from_user(path, *filename_user, sizeof(path));
-    if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
-        pr_info("ksu_handle_stat_user: su->sh!\n");
-        *filename_user = sh_user_path();
-    }
-    return 0;
-}
-STAT_USER_EOF
-        echo "[SUSFS-Fixup] sucompat.c: Injected ksu_handle_stat_user"
-    if ! grep -q "long ksu_handle_execve_sucompat" "$SUCOMPAT_C" 2>/dev/null; then
-        cat >> "$SUCOMPAT_C" << 'SUCOMPAT_EOF'
-
-long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, const struct pt_regs *regs)
-{
-    long (*sys_func)(const struct pt_regs *) = ksu_syscall_table[orig_nr];
-    return sys_func(regs);
-}
-SUCOMPAT_EOF
-        echo "[SUSFS-Fixup] sucompat.c: Injected ksu_handle_execve_sucompat stub"
-    fi
-    }
-
 #ifdef CONFIG_KSU_SUSFS
 static const char _su_path[] = "/system/bin/su";
 static const char _sh_path[] = "/system/bin/sh";
@@ -612,6 +580,9 @@ int ksu_handle_stat_user(int *dfd, const char __user **filename_user, int *flags
 }
 STAT_USER_EOF
         echo "[SUSFS-Fixup] sucompat.c: Injected ksu_handle_stat_user"
+    fi
+
+    # Inject ksu_handle_execve_sucompat stub
     if ! grep -q "long ksu_handle_execve_sucompat" "$SUCOMPAT_C" 2>/dev/null; then
         cat >> "$SUCOMPAT_C" << 'SUCOMPAT_EOF'
 
@@ -622,7 +593,6 @@ long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, 
 }
 SUCOMPAT_EOF
         echo "[SUSFS-Fixup] sucompat.c: Injected ksu_handle_execve_sucompat stub"
-    fi
     fi
 }
 # --------------------------------------------------------------------------
@@ -703,11 +673,13 @@ fix_ksu_next_bridge() {
         fi
     fi
 
-    # Fix ksu_su_compat_enabled static key usage
-    if grep -q "if (!ksu_su_compat_enabled)" "$BRIDGE_C" 2>/dev/null; then
-        sed -i 's/if (!ksu_su_compat_enabled)/if (!static_branch_likely(\&ksu_su_compat_enabled))/g' "$BRIDGE_C"
-        sed -i 's/else if (ksu_su_compat_enabled)/else if (static_branch_likely(\&ksu_su_compat_enabled))/g' "$BRIDGE_C"
-        echo "[SUSFS-Fixup] syscall_event_bridge.c: Fixed ksu_su_compat_enabled static key access"
+    # Fix ksu_su_compat_enabled static key usage (only if it is actually a static key)
+    if grep -q 'DEFINE_STATIC_KEY_TRUE(ksu_su_compat_enabled)' "$SUCOMPAT_C" 2>/dev/null; then
+        if grep -q "if (!ksu_su_compat_enabled)" "$BRIDGE_C" 2>/dev/null; then
+            sed -i 's/if (!ksu_su_compat_enabled)/if (!static_branch_likely(\&ksu_su_compat_enabled))/g' "$BRIDGE_C"
+            sed -i 's/else if (ksu_su_compat_enabled)/else if (static_branch_likely(\&ksu_su_compat_enabled))/g' "$BRIDGE_C"
+            echo "[SUSFS-Fixup] syscall_event_bridge.c: Fixed ksu_su_compat_enabled static key access"
+        fi
     fi
 }
 
