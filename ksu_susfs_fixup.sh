@@ -936,9 +936,188 @@ if [ -f "$SELINUX_HIDE_C" ] && grep -q "context_struct_compute_av_fn\|security_d
     echo "[SUSFS-Fixup] selinux_hide.c: Removed undefined context_struct_compute_av_fn and security_dump_masked_av_fn"
 fi
 
+# --------------------------------------------------------------------------
+# fix_dirty_sepolicy — restore full selinux_hide hooks (DirtySepolicy counter)
+# The SUSFS patch strips ALL THREE selinux_hide hooks from selinux_hide.c:
+#   1. my_write_context  — intercepts /sys/fs/selinux/context (check_context)
+#   2. my_write_access   — intercepts /sys/fs/selinux/access (compute_av)
+#   3. my_setprocattr    — intercepts /proc/self/attr/current (setcurrent)
+#
+# Duck Detector / DirtySepolicy uses all three vectors to detect root.
+# This function restores the upstream selinux_hide.c and applies only
+# the minimal SUSFS compatibility changes needed.
+# --------------------------------------------------------------------------
+fix_dirty_sepolicy() {
+    if [ ! -f "$SELINUX_HIDE_C" ]; then return; fi
+
+    # Skip if all three hooks are already present
+    if grep -q "my_write_context" "$SELINUX_HIDE_C" 2>/dev/null && \
+       grep -q "my_write_access" "$SELINUX_HIDE_C" 2>/dev/null && \
+       grep -q "my_setprocattr" "$SELINUX_HIDE_C" 2>/dev/null; then
+        echo "[SUSFS-Fixup] selinux_hide.c: All DirtySepolicy hooks already present"
+        return
+    fi
+
+    # Determine the KSU-Next source git repo
+    KSU_GIT_DIR=""
+    for candidate in \
+        "$(dirname "$0")/.root_modules/KernelSU-Next" \
+        "$(dirname "$0")/.root_modules/sukisu-ultra" \
+        "$(dirname "$0")/.root_modules/ReSukiSU"; do
+        if [ -d "$candidate/.git" ] && [ -f "$candidate/kernel/feature/selinux_hide.c" ]; then
+            KSU_GIT_DIR="$candidate"
+            break
+        fi
+    done
+    if [ -z "$KSU_GIT_DIR" ]; then
+        echo "[SUSFS-Fixup] selinux_hide.c: Cannot find KSU git repo, skipping DirtySepolicy fix"
+        return
+    fi
+
+    # Step 1: Restore upstream selinux_hide.c from git HEAD
+    echo "[SUSFS-Fixup] selinux_hide.c: Restoring upstream file from $(basename "$KSU_GIT_DIR")"
+    (cd "$KSU_GIT_DIR" && git show HEAD:kernel/feature/selinux_hide.c) > "$SELINUX_HIDE_C"
+
+    # Step 2: Make ksu_selinux_hide_running non-static (SUSFS needs it exported)
+    sed -i 's/^static bool ksu_selinux_hide_running/bool ksu_selinux_hide_running/' "$SELINUX_HIDE_C"
+
+    # Step 3: Remove undefined context_struct_compute_av_fn extern (it's static in kernel)
+    # The upstream file uses it conditionally; replace with direct call
+    if grep -q "context_struct_compute_av_fn" "$SELINUX_HIDE_C" 2>/dev/null; then
+        sed -i '/^static void (\*context_struct_compute_av_fn)/,+2d' "$SELINUX_HIDE_C"
+        sed -i '/if (context_struct_compute_av_fn)/,+4{
+            /if (context_struct_compute_av_fn)/c\    context_struct_compute_av(policydb, scontext, tcontext, tclass, avd, NULL);
+            /context_struct_compute_av_fn(policydb/d
+            /} else {/d
+            /context_struct_compute_av(policydb/d
+            /^[[:space:]]*}$/d
+        }' "$SELINUX_HIDE_C"
+    fi
+
+    # Step 4: Remove undefined security_dump_masked_av_fn extern (debug-only, safe to drop)
+    if grep -q "security_dump_masked_av_fn" "$SELINUX_HIDE_C" 2>/dev/null; then
+        sed -i '/^static void (\*security_dump_masked_av_fn)/,+1d' "$SELINUX_HIDE_C"
+        sed -i '/if (security_dump_masked_av_fn)/,+1d' "$SELINUX_HIDE_C"
+        # Remove the find_kernel_symbol_exact line for security_dump_masked_av
+        sed -i '/security_dump_masked_av_fn = find_kernel_symbol_exact/,+3d' "$SELINUX_HIDE_C"
+    fi
+
+    # Step 5: Remove find_kernel_symbol_exact for context_struct_compute_av since we removed the fn ptr
+    if grep -q "context_struct_compute_av_fn = find_kernel_symbol_exact" "$SELINUX_HIDE_C" 2>/dev/null; then
+        sed -i '/context_struct_compute_av_fn = find_kernel_symbol_exact/,+3d' "$SELINUX_HIDE_C"
+    fi
+
+    echo "[SUSFS-Fixup] selinux_hide.c: Restored ALL DirtySepolicy hooks (write_context + write_access + setprocattr)"
+}
+
 # ==========================================================================
 # Dispatch per manager
 # ==========================================================================
+# --------------------------------------------------------------------------
+# fix_backup_sepolicy_leak — prevent backup_sepolicy from being overwritten
+# --------------------------------------------------------------------------
+fix_backup_sepolicy_leak() {
+    local RULES_C="$KSU_DIR/selinux/rules.c"
+    [ ! -f "$RULES_C" ] && RULES_C=".root_modules/KernelSU-Next/kernel/selinux/rules.c"
+    if [ ! -f "$RULES_C" ]; then return; fi
+
+    if grep -q "if (!backup_sepolicy) {" "$RULES_C" 2>/dev/null; then
+        echo "[SUSFS-Fixup] rules.c: backup_sepolicy already guarded"
+        return
+    fi
+
+    echo "[SUSFS-Fixup] rules.c: Guarding backup_sepolicy against dirty overwrites"
+
+    python3 -c "
+import sys
+import re
+
+with open('$RULES_C', 'r') as f:
+    content = f.read()
+
+pattern = r'(backup_sepolicy =\s+ksu_dup_sepolicy\(rcu_dereference_protected\(old_pol, lockdep_is_held\(&selinux_state\.policy_mutex\)\)\);.*?pr_info\(\"backup sepolicy success!\\\\n\"\);.*?\}\s*\n\s*\})'
+
+def repl(m):
+    block = m.group(1)
+    indented = '\n'.join('    ' + line if line.strip() else line for line in block.split('\n'))
+    return 'if (!backup_sepolicy) {\n' + indented + '\n    }'
+
+new_content = re.sub(pattern, repl, content, flags=re.DOTALL)
+with open('$RULES_C', 'w') as f:
+    f.write(new_content)
+"
+}
+
+# --------------------------------------------------------------------------
+# fix_dirty_sepolicy_seqno — fix Seqno split in DirtySepolicy (Duck Detector)
+# --------------------------------------------------------------------------
+fix_dirty_sepolicy_seqno() {
+    local RULES_C="$KSU_DIR/selinux/rules.c"
+    local HIDE_C="$KSU_DIR/feature/selinux_hide.c"
+
+    [ ! -f "$RULES_C" ] && RULES_C=".root_modules/KernelSU-Next/kernel/selinux/rules.c"
+    [ ! -f "$HIDE_C" ] && HIDE_C=".root_modules/KernelSU-Next/kernel/feature/selinux_hide.c"
+
+    if [ ! -f "$RULES_C" ] || [ ! -f "$HIDE_C" ]; then return; fi
+
+    if grep -q "status->policyload" "$HIDE_C" 2>/dev/null; then
+        echo "[SUSFS-Fixup] selinux_hide.c: seqno split already fixed"
+        return
+    fi
+
+    echo "[SUSFS-Fixup] Guarding against DirtySepolicy Seqno Split (Duck Detector)"
+
+    python3 -c "
+import sys
+import re
+
+def fix_rules_c(filepath):
+    with open(filepath, 'r') as f:
+        content = f.read()
+
+    pattern = r'(static void reset_avc_cache\(\)\s*\{)(.*?)(#if \(LINUX_VERSION_CODE)'
+    def repl(m):
+        return m.group(1) + \"\n    u32 seqno = 1;\n    struct page *spage = selinux_kernel_status_page();\n    if (spage) {\n        struct selinux_kernel_status *status = page_address(spage);\n        seqno = status->policyload;\n    }\n    if (seqno == 0) seqno = 1;\n\" + m.group(3)
+
+    content = re.sub(pattern, repl, content, flags=re.DOTALL)
+    content = re.sub(r'(avc_ss_reset\([^)]*?)0(\))', r'\g<1>seqno\g<2>', content)
+    content = re.sub(r'(selnl_notify_policyload\([^)]*?)0(\))', r'\g<1>seqno\g<2>', content)
+    content = re.sub(r'(selinux_status_update_policyload\([^)]*?)0(\))', r'\g<1>seqno\g<2>', content)
+
+    with open(filepath, 'w') as f:
+        f.write(content)
+
+def fix_hide_c(filepath):
+    with open(filepath, 'r') as f:
+        content = f.read()
+    
+    if 'status->policyload' in content:
+        return
+
+    pattern = r'(length = scnprintf\(buf, SIMPLE_TRANSACTION_LIMIT, \"%x %x %x %x %u %x\", avd\.allowed, 0xffffffff, avd\.auditallow,\s*avd\.auditdeny, avd\.seqno, avd\.flags\);)'
+
+    def repl(m):
+        return \"\"\"
+    {
+        struct page *spage = selinux_kernel_status_page();
+        if (spage) {
+            struct selinux_kernel_status *status = page_address(spage);
+            if (status->policyload > 0) {
+                avd.seqno = status->policyload;
+            }
+        }
+    }
+    \"\"\" + m.group(1)
+
+    content = re.sub(pattern, repl, content)
+    with open(filepath, 'w') as f:
+        f.write(content)
+
+fix_rules_c('$RULES_C')
+fix_hide_c('$HIDE_C')
+"
+}
+
 case "$MANAGER" in
     sukisu|mambosu)
         fix_sulog_type_mismatch
@@ -976,6 +1155,9 @@ SULOG_EXECVE_EOF
         fi
         
         fix_ksu_late_loaded
+        fix_dirty_sepolicy
+        fix_dirty_sepolicy_seqno
+        fix_backup_sepolicy_leak
         ;;
     ksu-next)
         fix_ksu_next_kbuild
@@ -984,6 +1166,9 @@ SULOG_EXECVE_EOF
         fix_ksu_next_ksud
         fix_execveat_handlers
         fix_ksu_next_susfs_umount
+        fix_dirty_sepolicy
+        fix_dirty_sepolicy_seqno
+        fix_backup_sepolicy_leak
         # Fix adb_root call signature mismatch in syscall_event_bridge.c
         if [ -f "$BRIDGE_C" ] && grep -q 'ksu_adb_root_handle_execve((struct pt_regs \*)regs)' "$BRIDGE_C" 2>/dev/null; then
             sed -i 's|ksu_adb_root_handle_execve((struct pt_regs \*)regs)|ksu_adb_root_handle_execve((const char *)PT_REGS_PARM1(regs), (void __user ***)\&PT_REGS_PARM3(regs))|' "$BRIDGE_C"
@@ -1044,3 +1229,7 @@ SULOG_EXECVE_EOF
 esac
 
 echo "[SUSFS-Fixup] All compatibility fixups applied for $MANAGER!"
+
+# --------------------------------------------------------------------------
+# fix_backup_sepolicy_leak — prevent backup_sepolicy from being overwritten
+# --------------------------------------------------------------------------

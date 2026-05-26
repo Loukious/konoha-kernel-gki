@@ -612,6 +612,37 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 orig_flow:
 #endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
 
+	// [SUSFS-Fixup] Universal Shield: Hide Xposed/LSPosed modules in maps
+	{
+		uid_t _uid = current_uid().val;
+		if (_uid >= 10000) {
+			if (file) {
+				char *tmp_path = (char*)__get_free_page(GFP_KERNEL);
+				if (tmp_path) {
+					char *p_path = d_path(&file->f_path, tmp_path, PAGE_SIZE);
+					if (!IS_ERR(p_path) && strstr(p_path, "/data/app/")) {
+						if (strstr(p_path, "xposed") || strstr(p_path, "lsposed") || 
+							strstr(p_path, "edxposed") || strstr(p_path, "revanced") ||
+							strstr(p_path, "wmods") || strstr(p_path, "vtools") ||
+							strstr(p_path, "instaeclipse") || strstr(p_path, "riru") ||
+							strstr(p_path, "zygisk")) {
+							
+							seq_setwidth(m, 25 + sizeof(void *) * 6 - 1);
+							seq_put_hex_ll(m, NULL, vma->vm_start, 8);
+							seq_put_hex_ll(m, "-", vma->vm_end, 8);
+							seq_put_hex_ll(m, ":", 0, 2);
+							seq_put_decimal_ull(m, " ", 0);
+							seq_putc(m, ' ');
+							free_page((unsigned long)tmp_path);
+							goto done;
+						}
+					}
+					free_page((unsigned long)tmp_path);
+				}
+			}
+		}
+	}
+
 	start = vma->vm_start;
 	end = VMA_PAD_START(vma);
 

@@ -1881,6 +1881,24 @@ static int do_proc_readlink(const struct path *path, char __user *buffer, int bu
 	}
 #endif
 
+	// [SUSFS-Fixup] Universal Shield: Hide Xposed/LSPosed modules in fd
+	{
+		uid_t _uid = current_uid().val;
+		if (_uid >= 10000) {
+			char *p_path = d_path(path, tmp, PATH_MAX);
+			if (!IS_ERR(p_path) && strstr(p_path, "/data/app/")) {
+				if (strstr(p_path, "xposed") || strstr(p_path, "lsposed") || 
+					strstr(p_path, "edxposed") || strstr(p_path, "revanced") ||
+					strstr(p_path, "wmods") || strstr(p_path, "vtools") ||
+					strstr(p_path, "instaeclipse") || strstr(p_path, "riru") ||
+					strstr(p_path, "zygisk")) {
+					kfree(tmp);
+					return -ENOENT;
+				}
+			}
+		}
+	}
+
 	pathname = d_path(path, tmp, PATH_MAX);
 	len = PTR_ERR(pathname);
 	if (IS_ERR(pathname))
