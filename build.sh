@@ -466,8 +466,7 @@ EXTREME_CLANG_FLAGS=(
     -fslp-vectorize
     # -fdata-sections // error is being placed in '.init.bss.cmdline.o' section, which is not supported by the current linker script
     -fmerge-all-constants
-    # Disabled because it breaks vendor drivers (e.g., dwc3/DRM) and causes hang/panic on TWRP reboot
-    # -fdelete-null-pointer-checks
+    -fdelete-null-pointer-checks
     -moutline 
     # No safeties (Raw Performance)
     -mharden-sls=none
@@ -516,9 +515,7 @@ if [ "$DATA_EXPLOIT" == "on" ]; then
     KERNEL_KCFLAGS="$KERNEL_KCFLAGS -DCONFIG_DATA_EXPLOIT=1"
 fi
 
-# Disabled --icf=all because it dangerously merges identical functions into .init.text
-# causing Instruction Abort (FSC=0x05) on reboot (e.g., arch_local_irq_enable)
-# KERNEL_LDFLAGS="-O2 --icf=all -mllvm -enable-new-pm=1"
+KERNEL_LDFLAGS="-O2 --icf=all -mllvm -enable-new-pm=1"
 
 if ! check_clang; then
     echo "[-] No Clang toolchain found!"
@@ -614,9 +611,7 @@ scripts/config --file "$OUT_DIR/.config" "${DEBUG_REDUCTION_ARGS[@]}"
 CURRENT_CMDLINE=$(grep '^CONFIG_CMDLINE=' "$OUT_DIR/.config" | sed 's/^CONFIG_CMDLINE="//' | sed 's/"$//')
 CMDLINE_APPEND=""
 echo "$CURRENT_CMDLINE" | grep -q "kasan=off" || CMDLINE_APPEND="$CMDLINE_APPEND kasan=off"
-# Force auto-reboot upon driver hangs to prevent permanent black screens in TWRP
-echo "$CURRENT_CMDLINE" | grep -q "panic=" || CMDLINE_APPEND="$CMDLINE_APPEND panic=1"
-echo "$CURRENT_CMDLINE" | grep -q "panic_on_rcu_stall" || CMDLINE_APPEND="$CMDLINE_APPEND kernel.panic_on_rcu_stall=1"
+echo "$CURRENT_CMDLINE" | grep -q "panic_on_rcu_stall" || CMDLINE_APPEND="$CMDLINE_APPEND kernel.panic_on_rcu_stall=0"
 [ -n "$CMDLINE_APPEND" ] && \
     scripts/config --file "$OUT_DIR/.config" --set-str CONFIG_CMDLINE "$CURRENT_CMDLINE$CMDLINE_APPEND"
 
