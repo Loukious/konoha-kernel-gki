@@ -122,6 +122,22 @@ on:
           - "off"
           - "on"
         default: "off"
+      nethunter:
+        description: "Kali NetHunter label / packet injection build"
+        required: true
+        type: choice
+        options:
+          - "off"
+          - "on"
+        default: "off"
+      nethunter_extra:
+        description: "Extra NetHunter kernel configs (experimental)"
+        required: true
+        type: choice
+        options:
+          - "off"
+          - "on"
+        default: "off"
 
 
 env:
@@ -148,6 +164,8 @@ jobs:
           INPUT_KGSL: ${{ inputs.kgsl_exploit }}
           INPUT_DATA: ${{ inputs.data_exploit }}
           INPUT_DEBUG: ${{ inputs.debug }}
+          INPUT_NETHUNTER: ${{ inputs.nethunter }}
+          INPUT_NETHUNTER_EXTRA: ${{ inputs.nethunter_extra }}
           INPUT_KERNEL_NAME: ${{ inputs.kernel_name }}
           INPUT_SPOOF_UNAME: ${{ inputs.spoof_uname }}
         run: |
@@ -181,6 +199,8 @@ jobs:
           if [ "$INPUT_KGSL" == "off" ]; then BUILD_NAME="${BUILD_NAME}-nokgsl"; fi
           if [ "$INPUT_DATA" == "off" ]; then BUILD_NAME="${BUILD_NAME}-nodata"; fi
           if [ "$INPUT_DEBUG" == "on" ]; then BUILD_NAME="${BUILD_NAME}-debug"; fi
+          if [ "$INPUT_NETHUNTER" == "on" ]; then BUILD_NAME="${BUILD_NAME}-nethunter"; fi
+          if [ "$INPUT_NETHUNTER_EXTRA" == "on" ]; then BUILD_NAME="${BUILD_NAME}-nhextra"; fi
           
           echo "BUILD_NAME=$BUILD_NAME" >> $GITHUB_ENV
           
@@ -231,6 +251,8 @@ jobs:
           INPUT_BYPASS: ${{ inputs.bypasscharging }}
           INPUT_DROIDSPACES: ${{ inputs.droidspaces }}
           INPUT_DEBUG: ${{ inputs.debug }}
+          INPUT_NETHUNTER: ${{ inputs.nethunter }}
+          INPUT_NETHUNTER_EXTRA: ${{ inputs.nethunter_extra }}
           INPUT_KERNEL_NAME: ${{ inputs.kernel_name }}
           INPUT_SPOOF_UNAME: ${{ inputs.spoof_uname }}
         run: |
@@ -267,6 +289,8 @@ jobs:
             kgsl_exploit="$INPUT_KGSL" \
             data_exploit="$INPUT_DATA" \
             debug="$INPUT_DEBUG" \
+            nethunter="$INPUT_NETHUNTER" \
+            nethunter_extra="$INPUT_NETHUNTER_EXTRA" \
             kernel_name="$INPUT_KERNEL_NAME" \
             spoof_uname="$INPUT_SPOOF_UNAME" \
             lto="$LTO_VAL"
@@ -319,6 +343,8 @@ jobs:
             | KGSL GPU Bypass | **${{ inputs.kgsl_exploit }}** |
             | Data Exploits | **${{ inputs.data_exploit }}** |
             | Debug Mode | **${{ inputs.debug }}** |
+            | NetHunter | **${{ inputs.nethunter }}** |
+            | NetHunter Extra Configs | **${{ inputs.nethunter_extra }}** |
             
             Commit: ${{ github.sha }}
             Ref: ${{ github.ref }}

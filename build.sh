@@ -24,6 +24,8 @@ trap cleanup EXIT
 #   lto=thin|full|none    LTO type (default: thin)
 #   autofdo=on|off        AutoFDO (default: on)
 #   droidspaces=on|off    Droidspaces support (default: off)
+#   nethunter=on|off      Add NetHunter label / optional configs (default: off)
+#   nethunter_extra=on|off Enable extra NetHunter kernel configs (default: off)
 # ==========================================
 
 VERSION="1.1"
@@ -47,6 +49,8 @@ for arg in "$@"; do
         data_exploit=*) DATA_EXPLOIT="${arg#*=}" ;;
         droidspaces=*) DROIDSPACES="${arg#*=}" ;;
         debug=*) DEBUG_MODE="${arg#*=}" ;;
+        nethunter=*) NETHUNTER="${arg#*=}" ;;
+        nethunter_extra=*) NETHUNTER_EXTRA="${arg#*=}" ;;
         kernel_name=*) KERNEL_NAME="${arg#*=}" ;;
         spoof_uname=*) SPOOF_UNAME="${arg#*=}" ;;
 
@@ -78,6 +82,8 @@ if [ "$#" -gt 0 ]; then
     [ -z "$BYPASSCHARGING" ] && BYPASSCHARGING="off"
     [ -z "$DROIDSPACES" ] && DROIDSPACES="off"
     [ -z "$DEBUG_MODE" ] && DEBUG_MODE="off"
+    [ -z "$NETHUNTER" ] && NETHUNTER="off"
+    [ -z "$NETHUNTER_EXTRA" ] && NETHUNTER_EXTRA="off"
 else
     NON_INTERACTIVE=0
 fi
@@ -232,12 +238,33 @@ if [ -z "$DEBUG_MODE" ]; then
     [ "${_c:-1}" == "2" ] && DEBUG_MODE="on" || DEBUG_MODE="off"
 fi
 
+# 10. NetHunter
+if [ -z "$NETHUNTER" ]; then
+    echo "=========================================="
+    echo "            Kali NetHunter                "
+    echo "=========================================="
+    echo " 1) OFF (default)"
+    echo " 2) ON  (Label/package NetHunter build)"
+    read -p "Enter choice [1-2] (default 1): " _c
+    [ "${_c:-1}" == "2" ] && NETHUNTER="on" || NETHUNTER="off"
+fi
+if [ "$NETHUNTER" == "on" ] && [ -z "$NETHUNTER_EXTRA" ]; then
+    echo "=========================================="
+    echo "      NetHunter Extra Kernel Configs      "
+    echo "=========================================="
+    echo " 1) OFF (default - boot parity)"
+    echo " 2) ON  (experimental; can break boot)"
+    read -p "Enter choice [1-2] (default 1): " _c
+    [ "${_c:-1}" == "2" ] && NETHUNTER_EXTRA="on" || NETHUNTER_EXTRA="off"
+fi
+
 # Set defaults for performance mods (all ON by default)
 [ -z "$HTSR" ] && HTSR="on"
 [ -z "$WIFI_EXPLOIT" ] && WIFI_EXPLOIT="on"
 [ -z "$KGSL_EXPLOIT" ] && KGSL_EXPLOIT="on"
 [ -z "$DATA_EXPLOIT" ] && DATA_EXPLOIT="on"
 [ -z "$AUTOFDO" ] && AUTOFDO="on"
+[ -z "$NETHUNTER_EXTRA" ] && NETHUNTER_EXTRA="off"
 
 
 # ==========================================
@@ -384,6 +411,8 @@ echo " WiFi Exploit: ${WIFI_EXPLOIT^^}"
 echo " KGSL Exploit: ${KGSL_EXPLOIT^^}"
 echo " Data Exploit: ${DATA_EXPLOIT^^}"
 echo " Debug Mode:   ${DEBUG_MODE^^}"
+echo " NetHunter:    ${NETHUNTER^^}"
+[ "$NETHUNTER" == "on" ] && echo " NH Extra Cfg: ${NETHUNTER_EXTRA^^}"
 [ "$VARIANT" != "stock" ] && echo " Variant:   ${VARIANT} ($REPO_NAME)" || echo " Variant:   stock"
 echo " LTO:       ${LTO_TYPE^^}"
 if [ "$VARIANT" != "stock" ]; then
@@ -670,6 +699,30 @@ if [ "$DROIDSPACES" == "on" ]; then
     ./setup_droidspaces.sh "$OUT_DIR"
 fi
 
+# Kali NetHunter Support
+if [ "$NETHUNTER" == "on" ]; then
+    echo "=========================================="
+    echo "[+] Kali NetHunter mode enabled..."
+    echo "=========================================="
+    if [ "$NETHUNTER_EXTRA" == "on" ]; then
+        echo "[+] Applying extra NetHunter kernel configs..."
+        # Keep this boot-image safe: the AnyKernel package currently ships only
+        # Image.gz, so do not turn built-in Android networking pieces into
+        # modules unless a matching dlkm image/package is also produced.
+        NETHUNTER_ARGS=(
+            -e CONFIG_SYSVIPC
+            -e CONFIG_TUN -e CONFIG_VETH
+            -e CONFIG_MACVLAN -e CONFIG_MACVTAP
+            -e CONFIG_HIDRAW -e CONFIG_UHID
+            -e CONFIG_CFG80211_WEXT
+            -e CONFIG_MAC80211_INJECT_EXT
+        )
+        scripts/config --file "$OUT_DIR/.config" "${NETHUNTER_ARGS[@]}"
+    else
+        echo "[+] Extra NetHunter kernel configs disabled for boot parity."
+    fi
+fi
+
 # Single olddefconfig to finalize all changes
 make O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 olddefconfig || exit 1
 
@@ -777,6 +830,8 @@ fi
 [ "$WIFI_EXPLOIT" == "off" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-nowifi"
 [ "$KGSL_EXPLOIT" == "off" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-nokgsl"
 [ "$DATA_EXPLOIT" == "off" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-nodata"
+[ "$NETHUNTER" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-nethunter"
+[ "$NETHUNTER_EXTRA" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-nhextra"
 
 HZ_LABEL=""
 case "$HZ" in 100) HZ_LABEL="-powersave" ;; 500) HZ_LABEL="-performance" ;; 1000) HZ_LABEL="-ultra-performance" ;; *) HZ_LABEL="-balance" ;; esac
