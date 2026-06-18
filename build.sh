@@ -47,6 +47,7 @@ for arg in "$@"; do
         data_exploit=*) DATA_EXPLOIT="${arg#*=}" ;;
         droidspaces=*) DROIDSPACES="${arg#*=}" ;;
         debug=*) DEBUG_MODE="${arg#*=}" ;;
+        nethunter=*) NETHUNTER="${arg#*=}" ;;
         kernel_name=*) KERNEL_NAME="${arg#*=}" ;;
         spoof_uname=*) SPOOF_UNAME="${arg#*=}" ;;
 
@@ -78,6 +79,7 @@ if [ "$#" -gt 0 ]; then
     [ -z "$BYPASSCHARGING" ] && BYPASSCHARGING="off"
     [ -z "$DROIDSPACES" ] && DROIDSPACES="off"
     [ -z "$DEBUG_MODE" ] && DEBUG_MODE="off"
+    [ -z "$NETHUNTER" ] && NETHUNTER="off"
 else
     NON_INTERACTIVE=0
 fi
@@ -232,6 +234,17 @@ if [ -z "$DEBUG_MODE" ]; then
     [ "${_c:-1}" == "2" ] && DEBUG_MODE="on" || DEBUG_MODE="off"
 fi
 
+# 10. NetHunter
+if [ -z "$NETHUNTER" ]; then
+    echo "=========================================="
+    echo "            Kali NetHunter                "
+    echo "=========================================="
+    echo " 1) OFF (default)"
+    echo " 2) ON  (Add Kali NetHunter configs)"
+    read -p "Enter choice [1-2] (default 1): " _c
+    [ "${_c:-1}" == "2" ] && NETHUNTER="on" || NETHUNTER="off"
+fi
+
 # Set defaults for performance mods (all ON by default)
 [ -z "$HTSR" ] && HTSR="on"
 [ -z "$WIFI_EXPLOIT" ] && WIFI_EXPLOIT="on"
@@ -384,6 +397,7 @@ echo " WiFi Exploit: ${WIFI_EXPLOIT^^}"
 echo " KGSL Exploit: ${KGSL_EXPLOIT^^}"
 echo " Data Exploit: ${DATA_EXPLOIT^^}"
 echo " Debug Mode:   ${DEBUG_MODE^^}"
+echo " NetHunter:    ${NETHUNTER^^}"
 [ "$VARIANT" != "stock" ] && echo " Variant:   ${VARIANT} ($REPO_NAME)" || echo " Variant:   stock"
 echo " LTO:       ${LTO_TYPE^^}"
 if [ "$VARIANT" != "stock" ]; then
@@ -670,6 +684,25 @@ if [ "$DROIDSPACES" == "on" ]; then
     ./setup_droidspaces.sh "$OUT_DIR"
 fi
 
+# Kali NetHunter Support
+if [ "$NETHUNTER" == "on" ]; then
+    echo "=========================================="
+    echo "[+] Applying Kali NetHunter configs..."
+    echo "=========================================="
+    # Keep this boot-image safe: the AnyKernel package currently ships only
+    # Image.gz, so do not turn built-in Android networking pieces into modules
+    # unless a matching dlkm image/package is also produced.
+    NETHUNTER_ARGS=(
+        -e CONFIG_SYSVIPC
+        -e CONFIG_TUN -e CONFIG_VETH
+        -e CONFIG_MACVLAN -e CONFIG_MACVTAP
+        -e CONFIG_HIDRAW -e CONFIG_UHID
+        -e CONFIG_CFG80211_WEXT
+        -e CONFIG_MAC80211_INJECT_EXT
+    )
+    scripts/config --file "$OUT_DIR/.config" "${NETHUNTER_ARGS[@]}"
+fi
+
 # Single olddefconfig to finalize all changes
 make O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 olddefconfig || exit 1
 
@@ -777,6 +810,7 @@ fi
 [ "$WIFI_EXPLOIT" == "off" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-nowifi"
 [ "$KGSL_EXPLOIT" == "off" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-nokgsl"
 [ "$DATA_EXPLOIT" == "off" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-nodata"
+[ "$NETHUNTER" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-nethunter"
 
 HZ_LABEL=""
 case "$HZ" in 100) HZ_LABEL="-powersave" ;; 500) HZ_LABEL="-performance" ;; 1000) HZ_LABEL="-ultra-performance" ;; *) HZ_LABEL="-balance" ;; esac
