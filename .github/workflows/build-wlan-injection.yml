@@ -18,6 +18,11 @@ on:
         required: true
         type: boolean
         default: true
+      kernel_headers_ref:
+        description: Optional kernel git ref used only for module headers (for example the 6.6.57 commit)
+        required: false
+        type: string
+        default: ''
       kernel_symvers_url:
         description: Module.symvers from the installed kernel base
         required: true
@@ -154,13 +159,43 @@ jobs:
 
           test -s out/Module.symvers
           test -s out/include/generated/autoconf.h
+          echo "WLAN_KERNEL_SRC=$GITHUB_WORKSPACE/gki-clo" >> "$GITHUB_ENV"
+          echo "WLAN_KERNEL_OUT=$GITHUB_WORKSPACE/gki-clo/out" >> "$GITHUB_ENV"
+
+      - name: Prepare alternate kernel ABI headers
+        if: ${{ inputs.kernel_headers_ref != '' }}
+        working-directory: gki-clo
+        env:
+          KERNEL_HEADERS_REF: ${{ inputs.kernel_headers_ref }}
+        run: |
+          abi_src="$RUNNER_TEMP/wlan-kernel-abi-src"
+          abi_out="$RUNNER_TEMP/wlan-kernel-abi-out"
+          saved_symvers="$RUNNER_TEMP/wlan-Module.symvers"
+
+          cp out/Module.symvers "$saved_symvers"
+          git fetch --depth=1 origin "$KERNEL_HEADERS_REF"
+          git worktree add --detach "$abi_src" FETCH_HEAD
+          mkdir -p "$abi_out"
+          cp out/.config "$abi_out/.config"
+          "$abi_src/scripts/config" --file "$abi_out/.config" \
+            --set-str LOCALVERSION "-android15-8-4k"
+          make -j"$(nproc)" -C "$abi_src" O="$abi_out" \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            olddefconfig prepare modules_prepare
+          cp "$saved_symvers" "$abi_out/Module.symvers"
+
+          echo "WLAN_KERNEL_SRC=$abi_src" >> "$GITHUB_ENV"
+          echo "WLAN_KERNEL_OUT=$abi_out" >> "$GITHUB_ENV"
+          echo "alternate kernel release: $(cat "$abi_out/include/config/kernel.release")"
 
       - name: Build PixelOS WLAN module
         working-directory: gki-clo
         env:
           CC: clang
-          KERNEL_OUT: ${{ github.workspace }}/gki-clo/out
+          KERNEL_SRC: ${{ env.WLAN_KERNEL_SRC }}
+          KERNEL_OUT: ${{ env.WLAN_KERNEL_OUT }}
           ENABLE_INJECTION: ${{ inputs.enable_injection }}
+          KERNEL_HEADERS_REF: ${{ inputs.kernel_headers_ref }}
         run: |
           chmod +x tools/*.sh
           tools/make_pixelos_wlan_symvers.sh
@@ -170,13 +205,17 @@ jobs:
           else
             mode=control
           fi
+          if [[ -n "$KERNEL_HEADERS_REF" ]]; then
+            abi_version="$(cut -d- -f1 "$KERNEL_OUT/include/config/kernel.release")"
+            mode="${mode}-abi${abi_version}"
+          fi
           module="artifacts/wlan/qca_cld3_wcn7750-konoha-${mode}.ko"
           REQUIRE_INJECTION="$ENABLE_INJECTION" \
             tools/build_wlan_injection_module.sh "$module"
 
           echo "WLAN_MODE=$mode" >> "$GITHUB_ENV"
           echo "WLAN_MODULE=$module" >> "$GITHUB_ENV"
-          kernel_release="$(cat out/include/config/kernel.release)"
+          kernel_release="$(cat "$KERNEL_OUT/include/config/kernel.release")"
           module_vermagic="$(modinfo -F vermagic "$module")"
 
           case "$module_vermagic" in

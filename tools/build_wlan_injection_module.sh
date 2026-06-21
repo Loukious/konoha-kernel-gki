@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+KERNEL_SRC="${KERNEL_SRC:-$ROOT_DIR}"
 KERNEL_OUT="${KERNEL_OUT:-$ROOT_DIR/out}"
 WLAN_TREE="${WLAN_TREE:-$ROOT_DIR/vendor/qcom/opensource/wlan}"
 OUT_KO="${1:-$ROOT_DIR/artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko}"
@@ -69,13 +70,13 @@ if [[ -f "$VENDOR_SYMVERS" ]]; then
 	EXTRA_SYMVERS="$VENDOR_SYMVERS"
 else
 	echo "[+] Building Qualcomm WLAN platform dependencies"
-	make -j"$JOBS" -C "$ROOT_DIR" O="$KERNEL_OUT" M="$PLATFORM_DIR" modules \
+	make -j"$JOBS" -C "$KERNEL_SRC" O="$KERNEL_OUT" M="$PLATFORM_DIR" modules \
 		"${COMMON_ARGS[@]}" "${PLATFORM_ARGS[@]}"
 	EXTRA_SYMVERS="$PLATFORM_DIR/Module.symvers"
 fi
 
 echo "[+] Building WCN7750 driver"
-make -j"$JOBS" -C "$ROOT_DIR" O="$KERNEL_OUT" M="$QCACLD_DIR" modules \
+make -j"$JOBS" -C "$KERNEL_SRC" O="$KERNEL_OUT" M="$QCACLD_DIR" modules \
 	"${COMMON_ARGS[@]}" \
 	WLAN_ROOT="$QCACLD_DIR" \
 	WLAN_PROFILE=sun_gki_wcn7750 \
