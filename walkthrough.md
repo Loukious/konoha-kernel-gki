@@ -50,10 +50,10 @@ on, and NetHunter extra configs off was confirmed to boot. The equivalent local
 WSL output was not boot-equivalent, so device-test artifacts should come from
 GitHub Actions.
 
-`.github/workflows/build-wlan-injection.yml` reproduces that configuration and
-uses Antman tag `10032024` (Neutron clang 19). Its test builds use no LTO for
-the shortest turnaround. It builds the matching kernel, patched WLAN module,
-and PixelOS `vendor_dlkm` images in one run.
+`.github/workflows/build-wlan-injection.yml` reproduces the proven
+`build-custom` environment with Ubuntu clang 18 and full LTO. It builds the
+matching kernel, patched WLAN module, and PixelOS `vendor_dlkm` images in one
+run.
 
 ## WLAN Driver Port
 

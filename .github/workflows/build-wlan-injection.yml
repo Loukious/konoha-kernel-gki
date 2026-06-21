@@ -11,7 +11,6 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  NEUTRON_TAG: "10032024"
 
 concurrency:
   group: wlan-injection-${{ github.ref }}
@@ -33,10 +32,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             android-sdk-libsparse-utils bc bison build-essential ccache curl \
-            e2fsprogs fakeroot flex g++-multilib gcc-multilib git kmod \
-            lib32ncurses-dev lib32readline-dev lib32z1-dev libncurses-dev \
-            libssl-dev libxml2 libxml2-utils lzop rsync schedtool \
-            squashfs-tools wget zip zlib1g-dev zstd
+            clang e2fsprogs fakeroot flex g++-multilib gcc-multilib git gnupg \
+            gperf imagemagick jq kmod lib32ncurses-dev lib32readline-dev \
+            lib32z1-dev libncurses-dev libsdl1.2-dev libssl-dev libxml2 \
+            libxml2-utils lld llvm lzop pngcrush python3 rsync schedtool \
+            squashfs-tools wget xsltproc zip zlib1g-dev zstd
 
       - name: Create build swap
         run: |
@@ -44,16 +44,6 @@ jobs:
           sudo chmod 600 /mnt/build_swapfile
           sudo mkswap /mnt/build_swapfile
           sudo swapon /mnt/build_swapfile
-
-      - name: Install pinned Neutron clang with Antman
-        run: |
-          mkdir -p toolchains/clang
-          cd toolchains/clang
-          bash <(curl -fsSL https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman) \
-            -S="$NEUTRON_TAG" --noconfirm --noprogress --noaxel
-          bash <(curl -fsSL https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman) \
-            --patch=glibc --noconfirm --noprogress --noaxel
-          bin/clang --version
 
       - name: Clone build inputs
         env:
@@ -96,7 +86,7 @@ jobs:
             nethunter_extra=off \
             kernel_name=-Kono-Ha-Kernel \
             spoof_uname=on \
-            lto=none
+            lto=full
 
       - name: Build patched PixelOS WLAN module
         working-directory: gki-clo
@@ -104,7 +94,6 @@ jobs:
           CC: clang
           KERNEL_OUT: ${{ github.workspace }}/gki-clo/out
         run: |
-          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH"
           chmod +x tools/*.sh
           tools/make_pixelos_wlan_symvers.sh
           tools/build_wlan_injection_module.sh
