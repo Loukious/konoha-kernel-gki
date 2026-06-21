@@ -2,11 +2,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULE_DIR="$ROOT_DIR/sources/pixelos/android_device_xiaomi_onyx-kernel/modules/vendor_dlkm"
-OUT_IMG="$ROOT_DIR/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx.img"
+STOCK_IMAGE=""
 WIFI_KO=""
-PADDING_MIB=8
+OUT_IMG="$ROOT_DIR/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img"
 SPARSE_OUT=""
+AVBTOOL="${AVBTOOL:-avbtool}"
+CLUSTER_SIZE=16384
 ALLOW_VERMAGIC_MISMATCH=0
 ALLOW_MODULE_NAME_MISMATCH=0
 KEEP_STAGE=0
@@ -15,29 +16,29 @@ usage() {
 	cat <<'EOF'
 Usage: tools/make_pixelos_vendor_dlkm_img.sh [options]
 
-Build a PixelOS onyx vendor_dlkm.img from the extracted PixelOS module set.
+Replace the WCN7750 module in a matching PixelOS onyx vendor_dlkm image.
 
 Options:
-  --module-dir DIR                 Source directory with PixelOS vendor_dlkm .ko files.
-  --wifi-ko FILE                   Replace qca_cld3_wcn7750.ko with this module.
-  --out FILE                       Output image path.
-  --padding-mib N                  Free space to add to the ext4 image (default: 8).
-  --sparse-out FILE                Also write an Android sparse image for fastboot.
+  --stock-image FILE               Matching stock PixelOS vendor_dlkm image.
+  --wifi-ko FILE                   Replacement qca_cld3_wcn7750.ko module.
+  --out FILE                       Output raw EROFS image.
+  --sparse-out FILE                Also write an Android sparse image.
+  --avbtool FILE                   avbtool executable/script (default: avbtool).
+  --cluster-size BYTES             EROFS compressed cluster size (default: 16384).
   --allow-vermagic-mismatch        Permit replacement Wi-Fi module vermagic mismatch.
   --allow-module-name-mismatch     Permit replacement Wi-Fi module name mismatch.
   --keep-stage                     Keep the temporary staging directory.
   -h, --help                       Show this help.
 
-Notes:
-  The image is ext4 because the local workspace has mke2fs but not mkfs.erofs.
-  PixelOS onyx fstab has both ext4 and erofs vendor_dlkm entries.
+The output keeps the stock partition size, filesystem contents, ownership, modes,
+and SELinux labels. A fresh AVB hashtree/footer is generated without FEC.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-		--module-dir)
-			MODULE_DIR="$2"
+		--stock-image)
+			STOCK_IMAGE="$2"
 			shift 2
 			;;
 		--wifi-ko)
@@ -48,12 +49,16 @@ while [[ $# -gt 0 ]]; do
 			OUT_IMG="$2"
 			shift 2
 			;;
-		--padding-mib)
-			PADDING_MIB="$2"
-			shift 2
-			;;
 		--sparse-out)
 			SPARSE_OUT="$2"
+			shift 2
+			;;
+		--avbtool)
+			AVBTOOL="$2"
+			shift 2
+			;;
+		--cluster-size)
+			CLUSTER_SIZE="$2"
 			shift 2
 			;;
 		--allow-vermagic-mismatch)
@@ -87,60 +92,66 @@ need() {
 	fi
 }
 
-need mke2fs
-need tune2fs
+run_avbtool() {
+	if [[ "$AVBTOOL" == */* ]]; then
+		if [[ -x "$AVBTOOL" ]]; then
+			"$AVBTOOL" "$@"
+		else
+			python3 "$AVBTOOL" "$@"
+		fi
+	else
+		"$AVBTOOL" "$@"
+	fi
+}
+
+need dump.erofs
+need fsck.erofs
+need mkfs.erofs
 need modinfo
-need fakeroot
+need python3
 if [[ -n "$SPARSE_OUT" ]]; then
 	need img2simg
 fi
 
-if ! [[ "$PADDING_MIB" =~ ^[0-9]+$ ]]; then
-	echo "--padding-mib must be a non-negative integer: $PADDING_MIB" >&2
+if [[ -z "$STOCK_IMAGE" || ! -f "$STOCK_IMAGE" ]]; then
+	echo "A matching --stock-image is required: $STOCK_IMAGE" >&2
+	exit 1
+fi
+if [[ -z "$WIFI_KO" || ! -f "$WIFI_KO" ]]; then
+	echo "A replacement --wifi-ko is required: $WIFI_KO" >&2
+	exit 1
+fi
+if [[ "$AVBTOOL" == */* && ! -f "$AVBTOOL" ]]; then
+	echo "avbtool not found: $AVBTOOL" >&2
+	exit 1
+fi
+if ! [[ "$CLUSTER_SIZE" =~ ^[0-9]+$ ]] || \
+	((CLUSTER_SIZE < 4096 || (CLUSTER_SIZE & (CLUSTER_SIZE - 1)) != 0)); then
+	echo "--cluster-size must be a power of two of at least 4096 bytes." >&2
 	exit 2
 fi
 
-if [[ ! -d "$MODULE_DIR" ]]; then
-	echo "Module directory not found: $MODULE_DIR" >&2
+partition_size="$(stat -c %s "$STOCK_IMAGE")"
+if ((partition_size % 4096 != 0)); then
+	echo "Stock image size is not block-aligned: $partition_size" >&2
+	exit 1
+fi
+if ! run_avbtool info_image --image "$STOCK_IMAGE" | grep -q 'Partition Name:[[:space:]]*vendor_dlkm'; then
+	echo "Stock image does not contain a vendor_dlkm AVB descriptor." >&2
 	exit 1
 fi
 
-STOCK_WIFI="$MODULE_DIR/qca_cld3_wcn7750.ko"
-if [[ ! -f "$STOCK_WIFI" ]]; then
-	echo "Stock PixelOS Wi-Fi module not found: $STOCK_WIFI" >&2
+replacement_name="$(modinfo -F name "$WIFI_KO")"
+if [[ "$replacement_name" != "qca_cld3_wcn7750" && "$ALLOW_MODULE_NAME_MISMATCH" -ne 1 ]]; then
+	echo "Replacement module name is '$replacement_name', expected 'qca_cld3_wcn7750'." >&2
 	exit 1
-fi
-
-if [[ ! -f "$MODULE_DIR/modules.load" ]]; then
-	echo "modules.load not found in $MODULE_DIR" >&2
-	exit 1
-fi
-
-if [[ -n "$WIFI_KO" ]]; then
-	if [[ ! -f "$WIFI_KO" ]]; then
-		echo "Replacement Wi-Fi module not found: $WIFI_KO" >&2
-		exit 1
-	fi
-
-	replacement_name="$(modinfo -F name "$WIFI_KO")"
-	if [[ "$replacement_name" != "qca_cld3_wcn7750" && "$ALLOW_MODULE_NAME_MISMATCH" -ne 1 ]]; then
-		echo "Replacement module name is '$replacement_name', expected 'qca_cld3_wcn7750'." >&2
-		echo "Use --allow-module-name-mismatch only for throwaway testing." >&2
-		exit 1
-	fi
-
-	stock_vermagic="$(modinfo -F vermagic "$STOCK_WIFI")"
-	replacement_vermagic="$(modinfo -F vermagic "$WIFI_KO")"
-	if [[ "$stock_vermagic" != "$replacement_vermagic" && "$ALLOW_VERMAGIC_MISMATCH" -ne 1 ]]; then
-		echo "Replacement vermagic mismatch:" >&2
-		echo "  stock:       $stock_vermagic" >&2
-		echo "  replacement: $replacement_vermagic" >&2
-		echo "Use --allow-vermagic-mismatch only if the target kernel/module loader is known to accept it." >&2
-		exit 1
-	fi
 fi
 
 mkdir -p "$(dirname "$OUT_IMG")"
+if [[ -n "$SPARSE_OUT" ]]; then
+	mkdir -p "$(dirname "$SPARSE_OUT")"
+fi
+
 STAGE="$(mktemp -d)"
 cleanup() {
 	if [[ "$KEEP_STAGE" -eq 1 ]]; then
@@ -152,50 +163,73 @@ cleanup() {
 trap cleanup EXIT
 
 ROOT="$STAGE/vendor_dlkm"
-MOD_DST="$ROOT/lib/modules"
-mkdir -p "$MOD_DST"
+CONTEXTS="$STAGE/file_contexts"
+FS_IMAGE="$STAGE/vendor_dlkm.erofs"
+mkdir -p "$ROOT"
 
-find "$MODULE_DIR" -maxdepth 1 -type f \( -name '*.ko' -o -name 'modules.load*' -o -name 'modules.blocklist' \) \
-	-exec cp -a {} "$MOD_DST/" \;
+echo "Extracting stock EROFS image"
+fsck.erofs --extract="$ROOT" --no-preserve "$STOCK_IMAGE" >/dev/null
 
-if [[ -n "$WIFI_KO" ]]; then
-	cp -a "$WIFI_KO" "$MOD_DST/qca_cld3_wcn7750.ko"
-fi
-
-find "$ROOT" -type d -exec chmod 0755 {} +
-find "$ROOT" -type f -exec chmod 0644 {} +
-
-module_count="$(find "$MOD_DST" -maxdepth 1 -type f -name '*.ko' | wc -l)"
-if [[ "$module_count" -lt 300 ]]; then
-	echo "Refusing to build: only $module_count modules staged; expected the full PixelOS vendor_dlkm set." >&2
+STOCK_WIFI="$ROOT/lib/modules/qca_cld3_wcn7750.ko"
+if [[ ! -f "$STOCK_WIFI" ]]; then
+	echo "Stock Wi-Fi module not found in image: $STOCK_WIFI" >&2
 	exit 1
 fi
 
-used_bytes="$(du -sb "$ROOT" | awk '{print $1}')"
-image_bytes=$((used_bytes + PADDING_MIB * 1024 * 1024))
-block_size=4096
-blocks=$(((image_bytes + block_size - 1) / block_size))
-
-rm -f "$OUT_IMG"
-if [[ -n "$SPARSE_OUT" ]]; then
-	mkdir -p "$(dirname "$SPARSE_OUT")"
-	rm -f "$SPARSE_OUT"
+stock_vermagic="$(modinfo -F vermagic "$STOCK_WIFI")"
+replacement_vermagic="$(modinfo -F vermagic "$WIFI_KO")"
+if [[ "$stock_vermagic" != "$replacement_vermagic" && "$ALLOW_VERMAGIC_MISMATCH" -ne 1 ]]; then
+	echo "Replacement vermagic mismatch:" >&2
+	echo "  stock:       $stock_vermagic" >&2
+	echo "  replacement: $replacement_vermagic" >&2
+	echo "Use --allow-vermagic-mismatch only with its matching custom kernel." >&2
+	exit 1
 fi
-echo "Building $OUT_IMG"
-echo "  source modules: $MODULE_DIR"
-echo "  staged modules: $module_count"
-if [[ -n "$WIFI_KO" ]]; then
-	echo "  replacement Wi-Fi: $WIFI_KO"
-fi
-echo "  padding MiB: $PADDING_MIB"
-echo "  ext4 blocks: $blocks"
 
-fakeroot -- bash -c "
-	set -e
-	chown -R 0:0 '$ROOT'
-	mke2fs -q -t ext4 -b $block_size -L vendor_dlkm -d '$ROOT' '$OUT_IMG' $blocks
-"
-tune2fs -c 0 -i 0 "$OUT_IMG" >/dev/null
+install -m 0644 "$WIFI_KO" "$STOCK_WIFI"
+module_count="$(find "$ROOT/lib/modules" -maxdepth 1 -type f -name '*.ko' | wc -l)"
+if [[ "$module_count" -lt 300 ]]; then
+	echo "Refusing to build: only $module_count modules were extracted." >&2
+	exit 1
+fi
+
+filesystem_uuid="$(dump.erofs -s "$STOCK_IMAGE" | awk -F': *' '/Filesystem UUID:/ {print $2; exit}')"
+if [[ -z "$filesystem_uuid" ]]; then
+	echo "Could not read the stock EROFS UUID." >&2
+	exit 1
+fi
+
+# PixelOS labels vendor_dlkm contents as vendor_file. Extraction as an ordinary
+# CI user cannot restore security.selinux xattrs, so mkfs applies them directly.
+printf '%s\n' '/vendor_dlkm(/.*)? u:object_r:vendor_file:s0' >"$CONTEXTS"
+
+echo "Building replacement EROFS image"
+echo "  stock image:       $STOCK_IMAGE"
+echo "  partition bytes:   $partition_size"
+echo "  replacement Wi-Fi: $WIFI_KO"
+echo "  replacement magic: $replacement_vermagic"
+echo "  EROFS cluster:     $CLUSTER_SIZE"
+
+mkfs.erofs --quiet \
+	-zlz4hc,level=12 -C"$CLUSTER_SIZE" \
+	-T1230768000 --all-time --all-root \
+	--mount-point=/vendor_dlkm --file-contexts="$CONTEXTS" \
+	-U"$filesystem_uuid" \
+	"$FS_IMAGE" "$ROOT"
+
+rm -f "$OUT_IMG" "$SPARSE_OUT"
+cp "$FS_IMAGE" "$OUT_IMG"
+run_avbtool add_hashtree_footer \
+	--image "$OUT_IMG" \
+	--partition_name vendor_dlkm \
+	--partition_size "$partition_size" \
+	--hash_algorithm sha256 \
+	--do_not_generate_fec
+
+if [[ "$(stat -c %s "$OUT_IMG")" -ne "$partition_size" ]]; then
+	echo "Output size does not match the stock partition image." >&2
+	exit 1
+fi
 
 echo "Created: $OUT_IMG"
 ls -lh "$OUT_IMG"

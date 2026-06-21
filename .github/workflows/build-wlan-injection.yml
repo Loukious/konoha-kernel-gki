@@ -8,6 +8,16 @@ on:
         required: true
         type: string
         default: sixteen-qpr2
+      stock_vendor_dlkm_url:
+        description: Matching PixelOS onyx stock vendor_dlkm template
+        required: true
+        type: string
+        default: https://github.com/Loukious/konoha-kernel-gki/releases/download/vendor-dlkm-template-20260613/vendor_dlkm-stock.img
+      stock_vendor_dlkm_sha256:
+        description: SHA-256 of the stock vendor_dlkm template
+        required: true
+        type: string
+        default: 7ab9cbc6ecd05e6321daf25706a0fdcdd6b625e39aeab0ecfa1a71cbf3757c2e
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -32,7 +42,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             android-sdk-libsparse-utils bc bison build-essential ccache curl \
-            clang e2fsprogs fakeroot flex g++-multilib gcc-multilib git gnupg \
+            clang erofs-utils fakeroot flex g++-multilib gcc-multilib git gnupg \
             gperf imagemagick jq kmod lib32ncurses-dev lib32readline-dev \
             lib32z1-dev libncurses-dev libsdl1.2-dev libssl-dev libxml2 \
             libxml2-utils lld llvm lzop pngcrush python3 rsync schedtool \
@@ -56,7 +66,17 @@ jobs:
           git clone --depth=1 --branch "$PIXELOS_BRANCH" \
             https://github.com/PixelOS-Devices/android_device_xiaomi_onyx-kernel.git \
             gki-clo/sources/pixelos/android_device_xiaomi_onyx-kernel
+          git clone --depth=1 https://android.googlesource.com/platform/external/avb \
+            gki-clo/sources/avb
           test -f gki-clo/anykernel/anykernel.sh
+
+      - name: Download matching PixelOS vendor_dlkm template
+        env:
+          STOCK_URL: ${{ inputs.stock_vendor_dlkm_url }}
+          STOCK_SHA256: ${{ inputs.stock_vendor_dlkm_sha256 }}
+        run: |
+          curl -fL --retry 3 "$STOCK_URL" -o gki-clo/sources/pixelos/vendor_dlkm-stock.img
+          echo "$STOCK_SHA256  gki-clo/sources/pixelos/vendor_dlkm-stock.img" | sha256sum -c -
 
       - name: Apply WCN7750 packet-injection port
         working-directory: gki-clo/vendor/qcom/opensource/wlan
@@ -111,28 +131,35 @@ jobs:
         working-directory: gki-clo
         run: |
           tools/make_pixelos_vendor_dlkm_img.sh \
+            --stock-image sources/pixelos/vendor_dlkm-stock.img \
             --wifi-ko artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko \
-            --padding-mib 16 \
             --allow-vermagic-mismatch \
-            --out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4.img \
-            --sparse-out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4-sparse.img
+            --avbtool sources/avb/avbtool.py \
+            --out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img \
+            --sparse-out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs-sparse.img
 
       - name: Verify artifacts
         working-directory: gki-clo
         run: |
           module=artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
-          raw=artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4.img
-          sparse=artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4-sparse.img
+          stock=sources/pixelos/vendor_dlkm-stock.img
+          raw=artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img
+          sparse=artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs-sparse.img
           roundtrip="$RUNNER_TEMP/vendor_dlkm-roundtrip.img"
-          extracted="$RUNNER_TEMP/qca_cld3_wcn7750.ko"
+          extracted_root="$RUNNER_TEMP/vendor_dlkm-extracted"
+          verify_dir="$RUNNER_TEMP/avb-verify"
 
           test "$(modinfo -F name "$module")" = qca_cld3_wcn7750
           grep -a -q hdd_monitor_mode_tx_inject "$module"
-          e2fsck -fn "$raw"
-          debugfs -R "dump /lib/modules/qca_cld3_wcn7750.ko $extracted" "$raw"
-          cmp "$module" "$extracted"
+          test "$(stat -c %s "$raw")" = "$(stat -c %s "$stock")"
+          mkdir -p "$extracted_root" "$verify_dir"
+          fsck.erofs --extract="$extracted_root" --no-preserve "$raw"
+          cmp "$module" "$extracted_root/lib/modules/qca_cld3_wcn7750.ko"
           simg2img "$sparse" "$roundtrip"
           cmp "$raw" "$roundtrip"
+          ln -s "$PWD/$raw" "$verify_dir/vendor_dlkm.img"
+          (cd "$verify_dir" && python3 "$GITHUB_WORKSPACE/gki-clo/sources/avb/avbtool.py" \
+            verify_image --image vendor_dlkm.img)
           sha256sum "$module" "$raw" "$sparse" | tee artifacts/SHA256SUMS
 
       - name: Upload matching kernel
@@ -150,7 +177,7 @@ jobs:
           path: |
             gki-clo/artifacts/SHA256SUMS
             gki-clo/artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
-            gki-clo/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4.img
-            gki-clo/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4-sparse.img
+            gki-clo/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img
+            gki-clo/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs-sparse.img
           retention-days: 7
           if-no-files-found: error

@@ -35,8 +35,10 @@ The useful module source for packaging is
 It contains the prebuilt PixelOS vendor modules and `qca_cld3_wcn7750.ko`.
 
 The PixelOS device tree declares `vendor_dlkm` as an A/B OTA partition and
-allows both ext4 and erofs fstab entries. The local image builder uses ext4
-because this workspace has `mke2fs`/`fakeroot` but not `mkfs.erofs`.
+builds it as EROFS. The earlier generic ext4 image was much larger than stock
+and did not boot. The current builder starts from the matching stock image,
+preserves its full contents, and rebuilds EROFS after replacing only the Wi-Fi
+module.
 
 The PixelOS sm8635 modules source tree did not match the actual Wi-Fi module
 closely enough: the prebuilt module references WCN7750 paths, while that source
@@ -136,56 +138,48 @@ The image builder is:
 tools/make_pixelos_vendor_dlkm_img.sh
 ```
 
-Stock PixelOS baseline image:
+Required matching PixelOS template:
 
 ```text
-artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-stock-ext4.img
-```
-
-Patched image with only `qca_cld3_wcn7750.ko` replaced:
-
-```text
-artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4.img
+vendor_dlkm-stock.img
 ```
 
 Workflow images for fastbootd testing:
 
 ```text
-artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4.img
-artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4-sparse.img
+artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img
+artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs-sparse.img
 ```
 
-The patched image was built with:
+Build it with:
 
 ```sh
 tools/make_pixelos_vendor_dlkm_img.sh \
+  --stock-image vendor_dlkm-stock.img \
   --wifi-ko artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko \
   --allow-vermagic-mismatch \
-  --out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4.img
-```
-
-The smaller image was built with:
-
-```sh
-tools/make_pixelos_vendor_dlkm_img.sh \
-  --wifi-ko artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko \
-  --allow-vermagic-mismatch \
-  --padding-mib 16 \
-  --out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4.img \
-  --sparse-out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4-sparse.img
+  --avbtool sources/avb/avbtool.py \
+  --out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img \
+  --sparse-out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs-sparse.img
 ```
 
 The mismatch allowance is only against PixelOS stock module metadata. It is
-expected here because the replacement module is built for Kono-Ha
-`6.6.142-Kono-Ha-Kernel`, while PixelOS stock `qca_cld3_wcn7750.ko` reports
+expected because the replacement module is built together with the custom
+kernel, while PixelOS stock `qca_cld3_wcn7750.ko` reports
 `6.6.57-android15-8-4k`.
+
+The patched module is larger than stock. A stock-style 4 KiB EROFS compression
+cluster misses the partition limit, so the builder uses a 16 KiB compressed
+cluster. Linux 6.6 supports this EROFS `big_pcluster` feature. The resulting raw
+image is exactly 47,210,496 bytes, the same as the stock image, and receives a
+fresh SHA-256 AVB hashtree/footer.
 
 Verification performed:
 
-- `e2fsck -fn` completed cleanly on the patched image.
-- `debugfs` extracted `/lib/modules/qca_cld3_wcn7750.ko` from the image.
-- `modinfo` on the extracted module still reports `name: qca_cld3_wcn7750`.
-- `strings` on the extracted module still shows the monitor injection path.
+- `fsck.erofs` extracted the complete rebuilt filesystem.
+- The embedded `qca_cld3_wcn7750.ko` is byte-identical to the workflow module.
+- Converting the sparse artifact back to raw is byte-identical to the raw image.
+- `avbtool verify_image` validates the new footer and complete hashtree.
 
 ## Flashing Notes
 
@@ -214,12 +208,19 @@ fastboot reboot fastboot
 Then flash using the matching slot suffix:
 
 ```sh
-fastboot flash vendor_dlkm_a artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4-sparse.img
+fastboot flash vendor_dlkm_a artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img
 ```
 
 Use `vendor_dlkm_b` instead if the target boot slot is `b`. If fastboot prints
 `partition size: 0`, it is still not in fastbootd or the bootloader cannot see
 the logical partition.
+
+To recover from a failed test, return to fastbootd and restore the matching
+stock image to that same slot:
+
+```sh
+fastboot flash vendor_dlkm_a vendor_dlkm-stock.img
+```
 
 ## Current Boot Debug Note
 
@@ -246,9 +247,8 @@ recovery on this device uses the same `boot_a`/`boot_b` kernel. Flashing
 
 ## Next Steps
 
-1. Commit and push the workflow, tools, and maintained 6.6 port patch.
-2. Run `Build NetHunter WLAN Injection` from GitHub Actions.
-3. Flash the kernel artifact and confirm normal boot before replacing
+1. Run `Build NetHunter WLAN Injection` from GitHub Actions.
+2. Flash the kernel artifact and confirm normal boot before replacing
    `vendor_dlkm`.
-4. Enter userspace fastbootd, flash the sparse `vendor_dlkm` image to the same
+3. Enter userspace fastbootd, flash the EROFS `vendor_dlkm` image to the same
    A/B slot, then test monitor mode and management-frame injection.
