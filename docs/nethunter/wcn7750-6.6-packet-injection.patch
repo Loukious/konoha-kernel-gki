@@ -123,7 +123,7 @@ index 4e357920..3a02d033 100644
  		goto fail0;
  	}
  
-+	pdev->is_mgmt_over_wmi_enabled = 0;
++	/* Preserve management TX mode advertised by firmware services. */
 +
  	/* init LL/HL cfg here */
  	pdev->cfg.is_high_latency = ol_cfg_is_high_latency(cfg_pdev);
@@ -170,7 +170,7 @@ index 3a5d965b..3ff7ca15 100644
 +static bool ol_tx_needs_global_mgmt_pool(void)
 +{
 +#ifdef FEATURE_FRAME_INJECTION_SUPPORT
-+	return true;
++	return !ol_tx_get_is_mgmt_over_wmi_enabled();
 +#else
 +	return !ol_tx_get_is_mgmt_over_wmi_enabled();
 +#endif

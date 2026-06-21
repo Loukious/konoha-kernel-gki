@@ -91,22 +91,8 @@ chmod 700 "$LOG_ROOT" "$RUN_DIR" 2>/dev/null
   fi
 
   dmesg >"$RUN_DIR/dmesg-start.txt" 2>&1
-  (
-    dmesg -w >"$RUN_DIR/dmesg-live.txt" 2>&1
-  ) &
-  DMESG_PID=$!
-
-  (
-    i=0
-    while [ "$i" -lt 180 ]; do
-      setprop persist.sys.usb.config mtp,adb 2>/dev/null
-      setprop sys.usb.config mtp,adb 2>/dev/null
-      settings put global adb_enabled 1 2>/dev/null
-      svc usb setFunctions mtp,adb 2>/dev/null
-      i=$((i + 1))
-      sleep 1
-    done
-  ) >"$RUN_DIR/adb-enable.log" 2>&1 &
+  echo "ADB/USB forcing disabled; logger only records state." \
+    >"$RUN_DIR/adb-enable.log"
 
   (
     i=0
@@ -138,7 +124,6 @@ chmod 700 "$LOG_ROOT" "$RUN_DIR" 2>/dev/null
     sleep 1
   done
 
-  kill "$DMESG_PID" 2>/dev/null
   dmesg >"$RUN_DIR/dmesg-final.txt" 2>&1
   getprop >"$RUN_DIR/getprop-final.txt" 2>/dev/null
   sync
