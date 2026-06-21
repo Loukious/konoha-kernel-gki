@@ -1,13 +1,23 @@
-name: Build NetHunter WLAN Injection
+name: Package WLAN Injection vendor_dlkm
 
 on:
   workflow_dispatch:
     inputs:
-      pixelos_branch:
-        description: PixelOS onyx kernel-module branch
+      wlan_module_url:
+        description: Prebuilt WLAN injection module URL
         required: true
         type: string
-        default: sixteen-qpr2
+        default: https://github.com/Loukious/konoha-kernel-gki/releases/download/wlan-injection-base/qca_cld3_wcn7750-konoha-injection.ko
+      wlan_module_sha256_url:
+        description: SHA-256 file for the prebuilt WLAN module
+        required: true
+        type: string
+        default: https://github.com/Loukious/konoha-kernel-gki/releases/download/wlan-injection-base/qca_cld3_wcn7750-konoha-injection.ko.sha256
+      expected_kernel_release:
+        description: Required WLAN module vermagic prefix
+        required: true
+        type: string
+        default: 6.6.142
       stock_vendor_dlkm_url:
         description: Matching PixelOS onyx stock vendor_dlkm template
         required: true
@@ -23,113 +33,71 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 concurrency:
-  group: wlan-injection-${{ github.ref }}
-  cancel-in-progress: false
+  group: wlan-image-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    name: Kernel, WLAN module, and vendor_dlkm
+  package:
+    name: Package and verify vendor_dlkm
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
         with:
           path: gki-clo
 
-      - name: Install build dependencies
+      - name: Install image tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            android-sdk-libsparse-utils bc bison build-essential ccache curl \
-            clang erofs-utils fakeroot flex g++-multilib gcc-multilib git gnupg \
-            gperf imagemagick jq kmod lib32ncurses-dev lib32readline-dev \
-            lib32z1-dev libncurses-dev libsdl1.2-dev libssl-dev libxml2 \
-            libxml2-utils lld llvm lzop pngcrush python3 rsync schedtool \
-            squashfs-tools wget xsltproc zip zlib1g-dev zstd
+            android-sdk-libsparse-utils curl erofs-utils git kmod python3
 
-      - name: Create build swap
-        run: |
-          sudo fallocate -l 10G /mnt/build_swapfile
-          sudo chmod 600 /mnt/build_swapfile
-          sudo mkswap /mnt/build_swapfile
-          sudo swapon /mnt/build_swapfile
-
-      - name: Clone build inputs
+      - name: Download image inputs
         env:
-          PIXELOS_BRANCH: ${{ inputs.pixelos_branch }}
-        run: |
-          mkdir -p gki-clo/vendor/qcom/opensource gki-clo/sources/pixelos
-          git clone --depth=1 --branch onyx-v-oss \
-            https://github.com/MiCode/vendor_qcom_opensource_wlan.git \
-            gki-clo/vendor/qcom/opensource/wlan
-          git clone --depth=1 --branch "$PIXELOS_BRANCH" \
-            https://github.com/PixelOS-Devices/android_device_xiaomi_onyx-kernel.git \
-            gki-clo/sources/pixelos/android_device_xiaomi_onyx-kernel
-          git clone --depth=1 https://android.googlesource.com/platform/external/avb \
-            gki-clo/sources/avb
-          test -f gki-clo/anykernel/anykernel.sh
-
-      - name: Download matching PixelOS vendor_dlkm template
-        env:
+          MODULE_URL: ${{ inputs.wlan_module_url }}
+          MODULE_SHA256_URL: ${{ inputs.wlan_module_sha256_url }}
           STOCK_URL: ${{ inputs.stock_vendor_dlkm_url }}
           STOCK_SHA256: ${{ inputs.stock_vendor_dlkm_sha256 }}
         run: |
-          curl -fL --retry 3 "$STOCK_URL" -o gki-clo/sources/pixelos/vendor_dlkm-stock.img
+          mkdir -p gki-clo/artifacts/wlan gki-clo/sources/pixelos
+          git clone --depth=1 https://android.googlesource.com/platform/external/avb \
+            gki-clo/sources/avb
+
+          curl -fL --retry 3 "$MODULE_URL" \
+            -o gki-clo/artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
+          curl -fL --retry 3 "$MODULE_SHA256_URL" \
+            -o gki-clo/artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko.sha256
+          (
+            cd gki-clo/artifacts/wlan
+            sha256sum -c qca_cld3_wcn7750-konoha-injection.ko.sha256
+          )
+
+          curl -fL --retry 3 "$STOCK_URL" \
+            -o gki-clo/sources/pixelos/vendor_dlkm-stock.img
           echo "$STOCK_SHA256  gki-clo/sources/pixelos/vendor_dlkm-stock.img" | sha256sum -c -
 
-      - name: Apply WCN7750 packet-injection port
-        working-directory: gki-clo/vendor/qcom/opensource/wlan
-        run: |
-          git apply --check "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-packet-injection.patch"
-          git apply "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-packet-injection.patch"
-          git diff --check
-
-      - name: Build matching KSU-Next kernel
-        working-directory: gki-clo
-        run: |
-          chmod +x build.sh
-          ./build.sh \
-            hz=250 \
-            variant=root \
-            root=ksu-next \
-            kpm=off \
-            hardened=off \
-            bypasscharging=on \
-            droidspaces=off \
-            htsr=on \
-            wifi_exploit=on \
-            kgsl_exploit=on \
-            data_exploit=on \
-            debug=on \
-            nethunter=on \
-            nethunter_extra=off \
-            kernel_name=-Kono-Ha-Kernel \
-            spoof_uname=on \
-            lto=full
-
-      - name: Build patched PixelOS WLAN module
+      - name: Validate WLAN module
         working-directory: gki-clo
         env:
-          CC: clang
-          KERNEL_OUT: ${{ github.workspace }}/gki-clo/out
+          EXPECTED_RELEASE: ${{ inputs.expected_kernel_release }}
         run: |
-          chmod +x tools/*.sh
-          tools/make_pixelos_wlan_symvers.sh
-          tools/build_wlan_injection_module.sh
+          module=artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
+          module_vermagic="$(modinfo -F vermagic "$module")"
 
-          kernel_release="$(make -s O=out ARCH=arm64 CC=clang LLVM=1 kernelrelease)"
-          module_vermagic="$(modinfo -F vermagic artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko)"
-          echo "kernel release:  $kernel_release"
-          echo "module vermagic: $module_vermagic"
+          test "$(modinfo -F name "$module")" = qca_cld3_wcn7750
           case "$module_vermagic" in
-            "$kernel_release"*) ;;
-            *) echo "WLAN module vermagic does not match the built kernel" >&2; exit 1 ;;
+            "$EXPECTED_RELEASE"*) ;;
+            *) echo "Unexpected WLAN module vermagic: $module_vermagic" >&2; exit 1 ;;
           esac
+          grep -a -q hdd_monitor_mode_tx_inject "$module"
+          grep -a -q qcwlanstate "$module"
+          echo "module vermagic: $module_vermagic"
 
       - name: Build PixelOS vendor_dlkm images
         working-directory: gki-clo
         run: |
+          chmod +x tools/make_pixelos_vendor_dlkm_img.sh
           tools/make_pixelos_vendor_dlkm_img.sh \
             --stock-image sources/pixelos/vendor_dlkm-stock.img \
             --wifi-ko artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko \
@@ -138,7 +106,7 @@ jobs:
             --out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img \
             --sparse-out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs-sparse.img
 
-      - name: Verify artifacts
+      - name: Verify images
         working-directory: gki-clo
         run: |
           module=artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
@@ -149,9 +117,6 @@ jobs:
           extracted_root="$RUNNER_TEMP/vendor_dlkm-extracted"
           verify_dir="$RUNNER_TEMP/avb-verify"
 
-          test "$(modinfo -F name "$module")" = qca_cld3_wcn7750
-          grep -a -q hdd_monitor_mode_tx_inject "$module"
-          grep -a -q qcwlanstate "$module"
           test "$(stat -c %s "$raw")" = "$(stat -c %s "$stock")"
           mkdir -p "$extracted_root" "$verify_dir"
           fsck.erofs --extract="$extracted_root" --no-preserve "$raw"
@@ -163,21 +128,12 @@ jobs:
             verify_image --image vendor_dlkm.img)
           sha256sum "$module" "$raw" "$sparse" | tee artifacts/SHA256SUMS
 
-      - name: Upload matching kernel
+      - name: Upload WLAN injection image
         uses: actions/upload-artifact@v4
         with:
-          name: Kono-Ha-KSU-Next-NetHunter-matching-kernel
-          path: gki-clo/Kono-Ha-Release/
-          retention-days: 7
-          if-no-files-found: error
-
-      - name: Upload WLAN injection artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: PixelOS-onyx-WCN7750-injection
+          name: PixelOS-onyx-WCN7750-injection-image
           path: |
             gki-clo/artifacts/SHA256SUMS
-            gki-clo/artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
             gki-clo/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img
             gki-clo/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs-sparse.img
           retention-days: 7

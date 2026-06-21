@@ -52,10 +52,18 @@ on, and NetHunter extra configs off was confirmed to boot. The equivalent local
 WSL output was not boot-equivalent, so device-test artifacts should come from
 GitHub Actions.
 
-`.github/workflows/build-wlan-injection.yml` reproduces the proven
-`build-custom` environment with Ubuntu clang 18 and full LTO. It builds the
-matching kernel, patched WLAN module, and PixelOS `vendor_dlkm` images in one
-run.
+The WLAN pipeline is split into two workflows:
+
+- `.github/workflows/build-wlan-kernel-module.yml` is the slow path. It
+  reproduces the proven kernel environment, builds the matching kernel and
+  patched WLAN module, then publishes the checksummed module to the stable
+  `wlan-injection-base` release.
+- `.github/workflows/build-wlan-injection.yml` is the fast path. It downloads
+  that prebuilt module and the pinned stock PixelOS image, then only packages
+  and verifies `vendor_dlkm`.
+
+Run the slow workflow only after kernel configuration, ABI, toolchain, or WLAN
+driver source changes. Packaging and EROFS/AVB changes use the fast workflow.
 
 ## WLAN Driver Port
 
@@ -250,8 +258,8 @@ recovery on this device uses the same `boot_a`/`boot_b` kernel. Flashing
 
 ## Next Steps
 
-1. Run `Build NetHunter WLAN Injection` from GitHub Actions.
-2. Flash the kernel artifact and confirm normal boot before replacing
-   `vendor_dlkm`.
+1. Run `Build WLAN Kernel and Module Base` only when the kernel or driver
+   changes.
+2. Run `Package WLAN Injection vendor_dlkm` for image-only iterations.
 3. Enter userspace fastbootd, flash the EROFS `vendor_dlkm` image to the same
    A/B slot, then test monitor mode and management-frame injection.

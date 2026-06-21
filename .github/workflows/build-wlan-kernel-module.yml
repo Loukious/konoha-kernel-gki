@@ -1,0 +1,160 @@
+name: Build WLAN Kernel and Module Base
+
+on:
+  workflow_dispatch:
+    inputs:
+      pixelos_branch:
+        description: PixelOS onyx kernel-module branch
+        required: true
+        type: string
+        default: sixteen-qpr2
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: wlan-kernel-module-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build matching kernel and WLAN module
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: gki-clo
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache clang curl fakeroot flex \
+            g++-multilib gcc-multilib git gnupg gperf imagemagick jq kmod \
+            lib32ncurses-dev lib32readline-dev lib32z1-dev libncurses-dev \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils lld llvm lzop \
+            pngcrush python3 rsync schedtool squashfs-tools wget xsltproc \
+            zip zlib1g-dev zstd
+
+      - name: Create build swap
+        run: |
+          sudo fallocate -l 10G /mnt/build_swapfile
+          sudo chmod 600 /mnt/build_swapfile
+          sudo mkswap /mnt/build_swapfile
+          sudo swapon /mnt/build_swapfile
+
+      - name: Clone build inputs
+        env:
+          PIXELOS_BRANCH: ${{ inputs.pixelos_branch }}
+        run: |
+          mkdir -p gki-clo/vendor/qcom/opensource gki-clo/sources/pixelos
+          git clone --depth=1 --branch onyx-v-oss \
+            https://github.com/MiCode/vendor_qcom_opensource_wlan.git \
+            gki-clo/vendor/qcom/opensource/wlan
+          git clone --depth=1 --branch "$PIXELOS_BRANCH" \
+            https://github.com/PixelOS-Devices/android_device_xiaomi_onyx-kernel.git \
+            gki-clo/sources/pixelos/android_device_xiaomi_onyx-kernel
+          test -f gki-clo/anykernel/anykernel.sh
+
+      - name: Apply WCN7750 packet-injection port
+        working-directory: gki-clo/vendor/qcom/opensource/wlan
+        run: |
+          git apply --check "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-packet-injection.patch"
+          git apply "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-packet-injection.patch"
+          git diff --check
+
+      - name: Build matching KSU-Next kernel
+        working-directory: gki-clo
+        run: |
+          chmod +x build.sh
+          ./build.sh \
+            hz=250 \
+            variant=root \
+            root=ksu-next \
+            kpm=off \
+            hardened=off \
+            bypasscharging=on \
+            droidspaces=off \
+            htsr=on \
+            wifi_exploit=on \
+            kgsl_exploit=on \
+            data_exploit=on \
+            debug=on \
+            nethunter=on \
+            nethunter_extra=off \
+            kernel_name=-Kono-Ha-Kernel \
+            spoof_uname=on \
+            lto=full
+
+      - name: Build patched PixelOS WLAN module
+        working-directory: gki-clo
+        env:
+          CC: clang
+          KERNEL_OUT: ${{ github.workspace }}/gki-clo/out
+        run: |
+          chmod +x tools/*.sh
+          tools/make_pixelos_wlan_symvers.sh
+          tools/build_wlan_injection_module.sh
+
+          module=artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
+          kernel_release="$(make -s O=out ARCH=arm64 CC=clang LLVM=1 kernelrelease)"
+          module_vermagic="$(modinfo -F vermagic "$module")"
+
+          case "$module_vermagic" in
+            "$kernel_release"*) ;;
+            *) echo "WLAN module vermagic does not match the built kernel" >&2; exit 1 ;;
+          esac
+          grep -a -q hdd_monitor_mode_tx_inject "$module"
+          grep -a -q qcwlanstate "$module"
+
+          module_name="$(basename "$module")"
+          (cd artifacts/wlan && sha256sum "$module_name" >"$module_name.sha256")
+          {
+            echo "kernel_release=$kernel_release"
+            echo "module_vermagic=$module_vermagic"
+            echo "source_sha=$GITHUB_SHA"
+          } >artifacts/wlan/WLAN_BUILD_INFO.txt
+
+      - name: Upload matching kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kono-Ha-KSU-Next-NetHunter-matching-kernel
+          path: gki-clo/Kono-Ha-Release/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload WLAN module base
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kono-Ha-WCN7750-injection-module-base
+          path: |
+            gki-clo/artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
+            gki-clo/artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko.sha256
+            gki-clo/artifacts/wlan/WLAN_BUILD_INFO.txt
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish stable WLAN module base
+        working-directory: gki-clo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=wlan-injection-base
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "WCN7750 injection module base" \
+              --notes "Stable module input for the fast vendor_dlkm packaging workflow."
+          fi
+          gh release upload "$tag" \
+            artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko \
+            artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko.sha256 \
+            artifacts/wlan/WLAN_BUILD_INFO.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
