@@ -149,8 +149,16 @@ jobs:
           esac
           grep -a -q hdd_monitor_mode_tx_inject "$module"
           grep -a -q qcwlanstate "$module"
+
+          stock_module=sources/pixelos/android_device_xiaomi_onyx-kernel/modules/vendor_dlkm/qca_cld3_wcn7750.ko
+          stock_ops_size="$(readelf -sW "$stock_module" | awk '$8 == "wlan_hdd_cfg80211_ops" { print $3; exit }')"
+          module_ops_size="$(readelf -sW "$module" | awk '$8 == "wlan_hdd_cfg80211_ops" { print $3; exit }')"
+          test -n "$stock_ops_size"
+          test "$module_ops_size" = "$stock_ops_size"
+
           echo "kernel release:  $kernel_release"
           echo "module vermagic: $module_vermagic"
+          echo "cfg80211_ops:    $module_ops_size bytes (PixelOS stock: $stock_ops_size)"
 
       - name: Build PixelOS vendor_dlkm images
         working-directory: gki-clo

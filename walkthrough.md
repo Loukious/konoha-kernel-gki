@@ -88,8 +88,11 @@ diff. The current 6.6 WCN7750 port does this:
   frees them without entering the normal management descriptor pool callbacks.
 - Adds defensive checks around monitor vdev and management descriptor pool use.
 - Bounds an unrelated MLO partner-array walk that clang 18/19 fortify rejects.
-- Makes cfg80211 testmode hooks compile only when the driver profile and the
-  kernel headers both support NL80211 testmode.
+- Keeps cfg80211 testmode enabled in the driver profile and forces its layout
+  macro while compiling the external module. PixelOS stock `cfg80211.ko` uses
+  that layout; disabling it removes two callbacks from `struct cfg80211_ops`
+  and makes the rebuilt driver ABI-unsafe. The boot kernel config stays
+  unchanged because this GKI supplies cfg80211 through PixelOS vendor modules.
 
 ## WLAN Build Verification
 
@@ -140,6 +143,24 @@ copy was created at:
 ```text
 artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
 ```
+
+## Device Log Diagnosis (2026-06-21 15:50)
+
+The logs in `artifacts/device-logs/20260621-155004` show that the earlier
+`/dev/wlan` problem was fixed: the driver loaded, created major 462, firmware
+reported ready, and the device MAC was received. Probe then failed in
+`wiphy_new_nm()` at the paired P2P callback check in `net/wireless/core.c:463`.
+
+The failing rebuilt module had a 1,016-byte `wlan_hdd_cfg80211_ops`, while the
+working PixelOS module has a 1,032-byte object. PixelOS enables
+`CONFIG_NL80211_TESTMODE`, which inserts two callbacks before the later ops.
+The stock cfg80211 module therefore read every subsequent rebuilt callback at
+the wrong offset and rejected probe before `wlan0` could be created.
+
+The corrected local module has the same 1,032-byte object as stock. Verified
+post-testmode callback offsets also match: `dump_survey` at `0x1d8`, scheduled
+scan at `0x250`, and TDLS management at `0x268`. The workflow now compares the
+stock and rebuilt object sizes and fails before packaging if they differ.
 
 ## Vendor DLKM Images
 
