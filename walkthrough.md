@@ -162,6 +162,14 @@ post-testmode callback offsets also match: `dump_survey` at `0x1d8`, scheduled
 scan at `0x250`, and TDLS management at `0x268`. The workflow now compares the
 stock and rebuilt object sizes and fails before packaging if they differ.
 
+The next device trace showed `cfg_parse(WLAN_INI_FILE)` returning status `0x10`
+and `hdd_context_create()` returning `-1`. The direct build had derived
+`MULTI_IF_NAME` from the module name and looked for the nonexistent path
+`wlan/qca_cld/qca_cld3_wcn7750/WCNSS_qcom_cfg.ini`. PixelOS stock uses
+`wlan/qca_cld/wcn7750/WCNSS_qcom_cfg.ini`. The module build now passes
+`CHIP_NAME=wcn7750` independently of `MODNAME=qca_cld3_wcn7750` and verifies
+that the correct resource path is embedded before packaging.
+
 ## Vendor DLKM Images
 
 The image builder is:

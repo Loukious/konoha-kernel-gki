@@ -79,6 +79,7 @@ make -j"$JOBS" -C "$ROOT_DIR" O="$KERNEL_OUT" M="$QCACLD_DIR" modules \
 	WLAN_ROOT="$QCACLD_DIR" \
 	WLAN_PROFILE=sun_gki_wcn7750 \
 	MODNAME=qca_cld3_wcn7750 \
+	CHIP_NAME=wcn7750 \
 	DEVNAME=wcn7750 \
 	WLAN_CTRL_NAME="$WLAN_CTRL_NAME" \
 	QCA_WIFI_FTM_NL80211=y \
@@ -109,6 +110,11 @@ fi
 
 if ! grep -a -q 'qcwlanstate' "$OUT_KO"; then
 	echo "Android /dev/$WLAN_CTRL_NAME state control is missing from $OUT_KO" >&2
+	exit 1
+fi
+
+if ! grep -a -q 'wlan/qca_cld/wcn7750/WCNSS_qcom_cfg.ini' "$OUT_KO"; then
+	echo "PixelOS WCN7750 INI resource prefix is missing from $OUT_KO" >&2
 	exit 1
 fi
 
