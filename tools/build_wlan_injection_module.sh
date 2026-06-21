@@ -9,6 +9,7 @@ PLATFORM_DIR="$WLAN_TREE/platform"
 QCACLD_DIR="$WLAN_TREE/qcacld-3.0"
 VENDOR_SYMVERS="${VENDOR_SYMVERS:-$ROOT_DIR/artifacts/wlan/vendor-abi/pixelos-qca-extra.symvers}"
 JOBS="${JOBS:-$(nproc)}"
+WLAN_CTRL_NAME="${WLAN_CTRL_NAME:-wlan}"
 
 if [[ ! -f "$KERNEL_OUT/.config" || ! -f "$KERNEL_OUT/Module.symvers" ]]; then
 	echo "Kernel output is incomplete: $KERNEL_OUT" >&2
@@ -73,6 +74,7 @@ make -j"$JOBS" -C "$ROOT_DIR" O="$KERNEL_OUT" M="$QCACLD_DIR" modules \
 	WLAN_PROFILE=sun_gki_wcn7750 \
 	MODNAME=qca_cld3_wcn7750 \
 	DEVNAME=wcn7750 \
+	WLAN_CTRL_NAME="$WLAN_CTRL_NAME" \
 	CONFIG_QCA_WIFI_ISOC=0 \
 	CONFIG_QCA_WIFI_2_0=1 \
 	CONFIG_QCA_CLD_WLAN=m \
@@ -95,6 +97,11 @@ fi
 
 if ! grep -a -q 'hdd_monitor_mode_tx_inject' "$OUT_KO"; then
 	echo "Injection entry point is missing from $OUT_KO" >&2
+	exit 1
+fi
+
+if ! grep -a -q 'qcwlanstate' "$OUT_KO"; then
+	echo "Android /dev/$WLAN_CTRL_NAME state control is missing from $OUT_KO" >&2
 	exit 1
 fi
 
