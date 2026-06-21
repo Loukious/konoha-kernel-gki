@@ -54,16 +54,16 @@ GitHub Actions.
 
 The WLAN pipeline is split into two workflows:
 
-- `.github/workflows/build-wlan-kernel-module.yml` is the slow path. It
-  reproduces the proven kernel environment, builds the matching kernel and
-  patched WLAN module, then publishes the checksummed module to the stable
-  `wlan-injection-base` release.
-- `.github/workflows/build-wlan-injection.yml` is the fast path. It downloads
-  that prebuilt module and the pinned stock PixelOS image, then only packages
-  and verifies `vendor_dlkm`.
+- `.github/workflows/build-wlan-kernel-module.yml` is the slow, infrequent
+  path. It builds the kernel and publishes its `Module.symvers` to the stable
+  `wlan-kernel-symbols` release.
+- `.github/workflows/build-wlan-injection.yml` is the normal fast path. It runs
+  `modules_prepare` without linking the kernel, compiles the current patched
+  WLAN source into a new `.ko`, then packages and verifies `vendor_dlkm`.
 
-Run the slow workflow only after kernel configuration, ABI, toolchain, or WLAN
-driver source changes. Packaging and EROFS/AVB changes use the fast workflow.
+Run the slow workflow only after kernel configuration, ABI, or toolchain
+changes. WLAN driver changes and EROFS/AVB packaging changes use the fast
+workflow, which always emits both the `.ko` and image.
 
 ## WLAN Driver Port
 
@@ -258,8 +258,8 @@ recovery on this device uses the same `boot_a`/`boot_b` kernel. Flashing
 
 ## Next Steps
 
-1. Run `Build WLAN Kernel and Module Base` only when the kernel or driver
-   changes.
-2. Run `Package WLAN Injection vendor_dlkm` for image-only iterations.
+1. Run `Build WLAN Kernel Base` only when the kernel configuration, ABI, or
+   toolchain changes.
+2. Run `Build WLAN Module and vendor_dlkm` for WLAN driver or image changes.
 3. Enter userspace fastbootd, flash the EROFS `vendor_dlkm` image to the same
    A/B slot, then test monitor mode and management-frame injection.

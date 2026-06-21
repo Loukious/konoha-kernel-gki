@@ -23,6 +23,7 @@ trap cleanup EXIT
 #   kpm_patch=on|off      Inject kpimg with kptools (default: on; resukisu defaults off)
 #   lto=thin|full|none    LTO type (default: thin)
 #   autofdo=on|off        AutoFDO (default: on)
+#   prepare_only=on|off   Prepare external modules without building the kernel
 #   droidspaces=on|off    Droidspaces support (default: off)
 #   nethunter=on|off      Add NetHunter label / optional configs (default: off)
 #   nethunter_extra=on|off Enable extra NetHunter kernel configs (default: off)
@@ -42,6 +43,7 @@ for arg in "$@"; do
         kpm_patch=*) KPM_PATCH="${arg#*=}" ;;
         lto=*)      LTO_TYPE="${arg#*=}" ;;
         autofdo=*)  AUTOFDO="${arg#*=}" ;;
+        prepare_only=*) PREPARE_ONLY="${arg#*=}" ;;
         bypasscharging=*) BYPASSCHARGING="${arg#*=}" ;;
         htsr=*) HTSR="${arg#*=}" ;;
         wifi_exploit=*) WIFI_EXPLOIT="${arg#*=}" ;;
@@ -56,6 +58,8 @@ for arg in "$@"; do
 
     esac
 done
+
+[ -z "$PREPARE_ONLY" ] && PREPARE_ONLY="off"
 
 
 echo "Applying Custom Kernel Name and Spoof Uname..."
@@ -725,6 +729,13 @@ fi
 
 # Single olddefconfig to finalize all changes
 make O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 olddefconfig || exit 1
+
+if [ "$PREPARE_ONLY" == "on" ]; then
+    echo "[+] Preparing kernel headers for external WLAN modules..."
+    make -j"$(nproc --all)" O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 modules_prepare || exit 1
+    echo "[+] Kernel module preparation complete: $(cat "$OUT_DIR/include/config/kernel.release")"
+    exit 0
+fi
 
 # ==========================================
 # Build
