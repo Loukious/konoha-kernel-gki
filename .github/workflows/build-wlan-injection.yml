@@ -8,6 +8,11 @@ on:
         required: true
         type: string
         default: sixteen-qpr2
+      wlan_branch:
+        description: MiCode WLAN branch matching the installed vendor driver
+        required: true
+        type: string
+        default: piano-w-oss
       kernel_symvers_url:
         description: Module.symvers from the installed kernel base
         required: true
@@ -68,9 +73,10 @@ jobs:
       - name: Clone WLAN and PixelOS inputs
         env:
           PIXELOS_BRANCH: ${{ inputs.pixelos_branch }}
+          WLAN_BRANCH: ${{ inputs.wlan_branch }}
         run: |
           mkdir -p gki-clo/vendor/qcom/opensource gki-clo/sources/pixelos
-          git clone --depth=1 --branch onyx-v-oss \
+          git clone --depth=1 --branch "$WLAN_BRANCH" \
             https://github.com/MiCode/vendor_qcom_opensource_wlan.git \
             gki-clo/vendor/qcom/opensource/wlan
           git clone --depth=1 --branch "$PIXELOS_BRANCH" \
@@ -78,6 +84,12 @@ jobs:
             gki-clo/sources/pixelos/android_device_xiaomi_onyx-kernel
           git clone --depth=1 https://android.googlesource.com/platform/external/avb \
             gki-clo/sources/avb
+
+          wlan_version="$(sed -n 's/.*QWLAN_VERSIONSTR[[:space:]]*"\([^"]*\)".*/\1/p' \
+            gki-clo/vendor/qcom/opensource/wlan/qcacld-3.0/core/mac/inc/qwlan_version.h)"
+          echo "WLAN source branch: $WLAN_BRANCH"
+          echo "WLAN source version: $wlan_version"
+          test "$wlan_version" = "5.2.1.119O"
 
       - name: Download kernel symbols and stock image
         env:
@@ -123,7 +135,7 @@ jobs:
             nethunter_extra=off \
             kernel_name=-Kono-Ha-Kernel \
             spoof_uname=on \
-            lto=full \
+            lto=none \
             prepare_only=on
 
           test -s out/Module.symvers
