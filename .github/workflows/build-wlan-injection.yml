@@ -13,6 +13,11 @@ on:
         required: true
         type: string
         default: https://github.com/Loukious/konoha-kernel-gki/releases/download/wlan-injection-base/qca_cld3_wcn7750-konoha-injection.ko.sha256
+      bootstrap_module_run_id:
+        description: Combined-build run used only until the stable module release exists
+        required: true
+        type: string
+        default: "27904909516"
       expected_kernel_release:
         description: Required WLAN module vermagic prefix
         required: true
@@ -31,6 +36,10 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  actions: read
+  contents: read
 
 concurrency:
   group: wlan-image-${{ github.ref }}
@@ -57,17 +66,35 @@ jobs:
         env:
           MODULE_URL: ${{ inputs.wlan_module_url }}
           MODULE_SHA256_URL: ${{ inputs.wlan_module_sha256_url }}
+          BOOTSTRAP_RUN_ID: ${{ inputs.bootstrap_module_run_id }}
           STOCK_URL: ${{ inputs.stock_vendor_dlkm_url }}
           STOCK_SHA256: ${{ inputs.stock_vendor_dlkm_sha256 }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p gki-clo/artifacts/wlan gki-clo/sources/pixelos
           git clone --depth=1 https://android.googlesource.com/platform/external/avb \
             gki-clo/sources/avb
 
-          curl -fL --retry 3 "$MODULE_URL" \
-            -o gki-clo/artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
-          curl -fL --retry 3 "$MODULE_SHA256_URL" \
-            -o gki-clo/artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko.sha256
+          module=gki-clo/artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
+          checksum="$module.sha256"
+          if curl -fL --retry 3 "$MODULE_URL" -o "$module"; then
+            curl -fL --retry 3 "$MODULE_SHA256_URL" -o "$checksum"
+          else
+            echo "Stable module is unavailable; using bootstrap run $BOOTSTRAP_RUN_ID"
+            rm -f "$module"
+            mkdir -p "$RUNNER_TEMP/wlan-base"
+            gh run download "$BOOTSTRAP_RUN_ID" \
+              --repo "$GITHUB_REPOSITORY" \
+              --name PixelOS-onyx-WCN7750-injection \
+              --dir "$RUNNER_TEMP/wlan-base"
+            found_module="$(find "$RUNNER_TEMP/wlan-base" -type f \
+              -name qca_cld3_wcn7750-konoha-injection.ko -print -quit)"
+            test -n "$found_module"
+            cp "$found_module" "$module"
+            (cd gki-clo/artifacts/wlan && \
+              sha256sum qca_cld3_wcn7750-konoha-injection.ko \
+                >qca_cld3_wcn7750-konoha-injection.ko.sha256)
+          fi
           (
             cd gki-clo/artifacts/wlan
             sha256sum -c qca_cld3_wcn7750-konoha-injection.ko.sha256
