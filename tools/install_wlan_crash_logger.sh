@@ -12,6 +12,7 @@ fi
 
 SCRIPT_NAME="wlan-crashlog.sh"
 REMOTE_SCRIPT="/data/adb/post-fs-data.d/${SCRIPT_NAME}"
+REMOTE_MODULE="/data/adb/modules/wlan_crash_logger"
 REMOTE_LOG_ROOT="/data/adb/wlan-crashlogs"
 
 usage() {
@@ -20,7 +21,7 @@ Usage: $0 install|remove|pull [output-dir]
 
 Commands:
   install      Install the KernelSU early-boot Wi-Fi crash logger.
-  remove       Remove the logger from /data/adb/post-fs-data.d.
+  remove       Remove the logger hooks.
   pull [dir]   Pull saved logs from ${REMOTE_LOG_ROOT}.
 
 Set ADB=/path/to/adb if auto-detection is wrong.
@@ -42,15 +43,24 @@ require_root_adb() {
 install_logger() {
   require_root_adb
 
-  local tmp_payload
+  local tmp_payload tmp_module_prop tmp_wrapper
   tmp_payload="$(mktemp)"
-  trap 'rm -f "${tmp_payload}"' RETURN
+  tmp_module_prop="$(mktemp)"
+  tmp_wrapper="$(mktemp)"
+  trap 'rm -f "${tmp_payload}" "${tmp_module_prop}" "${tmp_wrapper}"' RETURN
 
   cat > "${tmp_payload}" <<'PAYLOAD'
 #!/system/bin/sh
 
 LOG_ROOT=/data/adb/wlan-crashlogs
 BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+mkdir -p "$LOG_ROOT"
+
+RUN_MARK="${LOG_ROOT}/.capture-${BOOT_ID:-unknown-boot}"
+if ! mkdir "$RUN_MARK" 2>/dev/null; then
+  exit 0
+fi
+
 STAMP="$(date +%Y%m%d-%H%M%S 2>/dev/null)"
 [ -n "$STAMP" ] || STAMP=unknown-time
 RUN_DIR="${LOG_ROOT}/${STAMP}-${BOOT_ID:-no-bootid}"
@@ -132,16 +142,34 @@ chmod 700 "$LOG_ROOT" "$RUN_DIR" 2>/dev/null
 exit 0
 PAYLOAD
 
+  cat > "${tmp_module_prop}" <<PROP
+id=wlan_crash_logger
+name=WLAN Crash Logger
+version=1.1
+versionCode=2
+author=Kono-Ha debug
+description=Captures early Wi-Fi boot logs to ${REMOTE_LOG_ROOT}; does not change USB or ADB state.
+PROP
+
+  cat > "${tmp_wrapper}" <<WRAPPER
+#!/system/bin/sh
+${REMOTE_SCRIPT}
+WRAPPER
+
   "${ADB_BIN}" push "${tmp_payload}" /data/local/tmp/"${SCRIPT_NAME}" >/dev/null
-  adb_shell_root "mkdir -p /data/adb/post-fs-data.d ${REMOTE_LOG_ROOT}; cp /data/local/tmp/${SCRIPT_NAME} ${REMOTE_SCRIPT}; chmod 0755 ${REMOTE_SCRIPT}; rm -f /data/local/tmp/${SCRIPT_NAME}; ls -l ${REMOTE_SCRIPT}"
+  "${ADB_BIN}" push "${tmp_module_prop}" /data/local/tmp/wlan_crash_logger.module.prop >/dev/null
+  "${ADB_BIN}" push "${tmp_wrapper}" /data/local/tmp/wlan_crash_logger.post-fs-data.sh >/dev/null
+  "${ADB_BIN}" push "${tmp_wrapper}" /data/local/tmp/wlan_crash_logger.service.sh >/dev/null
+  adb_shell_root "mkdir -p /data/adb/post-fs-data.d ${REMOTE_LOG_ROOT} ${REMOTE_MODULE}; cp /data/local/tmp/${SCRIPT_NAME} ${REMOTE_SCRIPT}; cp /data/local/tmp/wlan_crash_logger.module.prop ${REMOTE_MODULE}/module.prop; cp /data/local/tmp/wlan_crash_logger.post-fs-data.sh ${REMOTE_MODULE}/post-fs-data.sh; cp /data/local/tmp/wlan_crash_logger.service.sh ${REMOTE_MODULE}/service.sh; chmod 0755 ${REMOTE_SCRIPT} ${REMOTE_MODULE}/post-fs-data.sh ${REMOTE_MODULE}/service.sh; chmod 0644 ${REMOTE_MODULE}/module.prop; rm -f /data/local/tmp/${SCRIPT_NAME} /data/local/tmp/wlan_crash_logger.module.prop /data/local/tmp/wlan_crash_logger.post-fs-data.sh /data/local/tmp/wlan_crash_logger.service.sh; ls -l ${REMOTE_SCRIPT} ${REMOTE_MODULE}/post-fs-data.sh ${REMOTE_MODULE}/service.sh ${REMOTE_MODULE}/module.prop"
   echo "Installed ${REMOTE_SCRIPT}"
+  echo "Installed ${REMOTE_MODULE}"
   echo "Logs will be saved under ${REMOTE_LOG_ROOT} on each boot."
 }
 
 remove_logger() {
   require_root_adb
-  adb_shell_root "rm -f ${REMOTE_SCRIPT}; ls -l ${REMOTE_SCRIPT} 2>/dev/null || true"
-  echo "Removed ${REMOTE_SCRIPT}"
+  adb_shell_root "rm -f ${REMOTE_SCRIPT}; rm -rf ${REMOTE_MODULE}; ls -l ${REMOTE_SCRIPT} ${REMOTE_MODULE} 2>/dev/null || true"
+  echo "Removed ${REMOTE_SCRIPT} and ${REMOTE_MODULE}"
 }
 
 pull_logs() {
