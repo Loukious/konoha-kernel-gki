@@ -212,7 +212,7 @@ echo "  EROFS cluster:     $CLUSTER_SIZE"
 
 mkfs.erofs --quiet \
 	-zlz4hc,level=12 -C"$CLUSTER_SIZE" \
-	-T1230768000 --all-time --all-root \
+	-T1230768000 --all-root \
 	--mount-point=/vendor_dlkm --file-contexts="$CONTEXTS" \
 	-U"$filesystem_uuid" \
 	"$FS_IMAGE" "$ROOT"
