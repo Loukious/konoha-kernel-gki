@@ -120,6 +120,14 @@ jobs:
           git apply "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-packet-injection.patch"
           git diff --check
 
+      - name: Apply WCN7750 6.6 build compatibility
+        if: ${{ inputs.enable_injection == false }}
+        working-directory: gki-clo/vendor/qcom/opensource/wlan
+        run: |
+          git apply --check "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-build-compat.patch"
+          git apply "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-build-compat.patch"
+          git diff --check
+
       - name: Prepare kernel headers without building kernel
         working-directory: gki-clo
         run: |

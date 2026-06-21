@@ -1,0 +1,14 @@
+diff --git a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c b/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
+index cb044784..145b6f4b 100644
+--- a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
++++ b/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
+@@ -4114,7 +4114,8 @@ lim_match_link_info(uint8_t req_link_id,
+ {
+ 	uint8_t i;
+ 
+-	for (i = 0; i < partner_info->num_partner_links; i++) {
++	for (i = 0; i < QDF_MIN(partner_info->num_partner_links,
++			       QDF_ARRAY_SIZE(partner_info->partner_link_info)); i++) {
+ 		if (partner_info->partner_link_info[i].link_id == req_link_id &&
+ 		    (qdf_is_macaddr_equal(link_addr,
+ 					  &partner_info->partner_link_info[i].link_addr)))
