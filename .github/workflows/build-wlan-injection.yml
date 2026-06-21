@@ -13,6 +13,11 @@ on:
         required: true
         type: string
         default: piano-w-oss
+      enable_injection:
+        description: Apply the injection port (disable for a source/ABI control build)
+        required: true
+        type: boolean
+        default: true
       kernel_symvers_url:
         description: Module.symvers from the installed kernel base
         required: true
@@ -108,6 +113,7 @@ jobs:
           echo "$STOCK_SHA256  gki-clo/sources/pixelos/vendor_dlkm-stock.img" | sha256sum -c -
 
       - name: Apply WCN7750 packet-injection port
+        if: ${{ inputs.enable_injection }}
         working-directory: gki-clo/vendor/qcom/opensource/wlan
         run: |
           git apply --check "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-packet-injection.patch"
@@ -141,17 +147,27 @@ jobs:
           test -s out/Module.symvers
           test -s out/include/generated/autoconf.h
 
-      - name: Build patched PixelOS WLAN module
+      - name: Build PixelOS WLAN module
         working-directory: gki-clo
         env:
           CC: clang
           KERNEL_OUT: ${{ github.workspace }}/gki-clo/out
+          ENABLE_INJECTION: ${{ inputs.enable_injection }}
         run: |
           chmod +x tools/*.sh
           tools/make_pixelos_wlan_symvers.sh
-          tools/build_wlan_injection_module.sh
 
-          module=artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
+          if [[ "$ENABLE_INJECTION" == "true" ]]; then
+            mode=injection
+          else
+            mode=control
+          fi
+          module="artifacts/wlan/qca_cld3_wcn7750-konoha-${mode}.ko"
+          REQUIRE_INJECTION="$ENABLE_INJECTION" \
+            tools/build_wlan_injection_module.sh "$module"
+
+          echo "WLAN_MODE=$mode" >> "$GITHUB_ENV"
+          echo "WLAN_MODULE=$module" >> "$GITHUB_ENV"
           kernel_release="$(cat out/include/config/kernel.release)"
           module_vermagic="$(modinfo -F vermagic "$module")"
 
@@ -159,7 +175,12 @@ jobs:
             "$kernel_release"*) ;;
             *) echo "WLAN module vermagic does not match the prepared kernel" >&2; exit 1 ;;
           esac
-          grep -a -q hdd_monitor_mode_tx_inject "$module"
+          if [[ "$ENABLE_INJECTION" == "true" ]]; then
+            grep -a -q hdd_monitor_mode_tx_inject "$module"
+          elif grep -a -q hdd_monitor_mode_tx_inject "$module"; then
+            echo "Control module unexpectedly contains injection code" >&2
+            exit 1
+          fi
           grep -a -q qcwlanstate "$module"
 
           stock_module=sources/pixelos/android_device_xiaomi_onyx-kernel/modules/vendor_dlkm/qca_cld3_wcn7750.ko
@@ -177,19 +198,19 @@ jobs:
         run: |
           tools/make_pixelos_vendor_dlkm_img.sh \
             --stock-image sources/pixelos/vendor_dlkm-stock.img \
-            --wifi-ko artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko \
+            --wifi-ko "$WLAN_MODULE" \
             --allow-vermagic-mismatch \
             --avbtool sources/avb/avbtool.py \
-            --out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img \
-            --sparse-out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs-sparse.img
+            --out "artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-${WLAN_MODE}-erofs.img" \
+            --sparse-out "artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-${WLAN_MODE}-erofs-sparse.img"
 
       - name: Verify artifacts
         working-directory: gki-clo
         run: |
-          module=artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
+          module="$WLAN_MODULE"
           stock=sources/pixelos/vendor_dlkm-stock.img
-          raw=artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img
-          sparse=artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs-sparse.img
+          raw="artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-${WLAN_MODE}-erofs.img"
+          sparse="artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-${WLAN_MODE}-erofs-sparse.img"
           roundtrip="$RUNNER_TEMP/vendor_dlkm-roundtrip.img"
           extracted_root="$RUNNER_TEMP/vendor_dlkm-extracted"
           verify_dir="$RUNNER_TEMP/avb-verify"
@@ -208,11 +229,10 @@ jobs:
       - name: Upload WLAN module and image
         uses: actions/upload-artifact@v4
         with:
-          name: PixelOS-onyx-WCN7750-injection
+          name: PixelOS-onyx-WCN7750-${{ env.WLAN_MODE }}
           path: |
             gki-clo/artifacts/SHA256SUMS
-            gki-clo/artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
-            gki-clo/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img
-            gki-clo/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs-sparse.img
+            gki-clo/artifacts/wlan/*.ko
+            gki-clo/artifacts/vendor_dlkm/*.img
           retention-days: 7
           if-no-files-found: error

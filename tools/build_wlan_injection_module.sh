@@ -10,6 +10,7 @@ QCACLD_DIR="$WLAN_TREE/qcacld-3.0"
 VENDOR_SYMVERS="${VENDOR_SYMVERS:-$ROOT_DIR/artifacts/wlan/vendor-abi/pixelos-qca-extra.symvers}"
 JOBS="${JOBS:-$(nproc)}"
 WLAN_CTRL_NAME="${WLAN_CTRL_NAME:-wlan}"
+REQUIRE_INJECTION="${REQUIRE_INJECTION:-true}"
 
 if [[ ! -f "$KERNEL_OUT/.config" || ! -f "$KERNEL_OUT/Module.symvers" ]]; then
 	echo "Kernel output is incomplete: $KERNEL_OUT" >&2
@@ -73,7 +74,7 @@ else
 	EXTRA_SYMVERS="$PLATFORM_DIR/Module.symvers"
 fi
 
-echo "[+] Building patched WCN7750 driver"
+echo "[+] Building WCN7750 driver"
 make -j"$JOBS" -C "$ROOT_DIR" O="$KERNEL_OUT" M="$QCACLD_DIR" modules \
 	"${COMMON_ARGS[@]}" \
 	WLAN_ROOT="$QCACLD_DIR" \
@@ -103,10 +104,20 @@ if [[ "$(modinfo -F name "$OUT_KO")" != "qca_cld3_wcn7750" ]]; then
 	exit 1
 fi
 
-if ! grep -a -q 'hdd_monitor_mode_tx_inject' "$OUT_KO"; then
-	echo "Injection entry point is missing from $OUT_KO" >&2
-	exit 1
-fi
+case "$REQUIRE_INJECTION" in
+	true|1|yes)
+		if ! grep -a -q 'hdd_monitor_mode_tx_inject' "$OUT_KO"; then
+			echo "Injection entry point is missing from $OUT_KO" >&2
+			exit 1
+		fi
+		;;
+	false|0|no)
+		;;
+	*)
+		echo "Invalid REQUIRE_INJECTION value: $REQUIRE_INJECTION" >&2
+		exit 2
+		;;
+esac
 
 if ! grep -a -q 'qcwlanstate' "$OUT_KO"; then
 	echo "Android /dev/$WLAN_CTRL_NAME state control is missing from $OUT_KO" >&2

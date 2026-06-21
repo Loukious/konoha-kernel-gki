@@ -175,9 +175,17 @@ remove_logger() {
 pull_logs() {
   require_root_adb
   local out_dir="${1:-artifacts/wlan-crashlogs}"
+  local remote_tar="/data/local/tmp/wlan-crashlogs-pull.tar"
+  local local_tar
+
+  local_tar="$(mktemp)"
+  trap 'rm -f "${local_tar}"' RETURN
   mkdir -p "${out_dir}"
   adb_shell_root "ls -la ${REMOTE_LOG_ROOT} 2>/dev/null || true"
-  "${ADB_BIN}" pull "${REMOTE_LOG_ROOT}" "${out_dir}/" >/dev/null
+  adb_shell_root "cd /data/adb && tar -cf ${remote_tar} wlan-crashlogs && chmod 0644 ${remote_tar}"
+  "${ADB_BIN}" pull "${remote_tar}" "${local_tar}" >/dev/null
+  adb_shell_root "rm -f ${remote_tar}"
+  tar -xf "${local_tar}" -C "${out_dir}"
   echo "Pulled logs to ${out_dir}/wlan-crashlogs"
 }
 
