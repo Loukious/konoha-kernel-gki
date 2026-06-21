@@ -45,14 +45,15 @@ therefore the better source for the patched Wi-Fi module.
 
 ## Kernel Build
 
-The GitHub Actions KSU-Next build with 250 Hz, full LTO, debug mode, NetHunter
+The GitHub Actions KSU-Next build with 250 Hz, debug mode, NetHunter
 on, and NetHunter extra configs off was confirmed to boot. The equivalent local
 WSL output was not boot-equivalent, so device-test artifacts should come from
 GitHub Actions.
 
 `.github/workflows/build-wlan-injection.yml` reproduces that configuration and
-uses Antman tag `10032024` (Neutron clang 19). It builds the matching kernel,
-patched WLAN module, and PixelOS `vendor_dlkm` images in one run.
+uses Antman tag `10032024` (Neutron clang 19). Its test builds use no LTO for
+the shortest turnaround. It builds the matching kernel, patched WLAN module,
+and PixelOS `vendor_dlkm` images in one run.
 
 ## WLAN Driver Port
 
