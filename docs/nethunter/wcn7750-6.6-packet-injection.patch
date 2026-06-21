@@ -1,0 +1,569 @@
+diff --git a/qcacld-3.0/Kbuild b/qcacld-3.0/Kbuild
+index db72b3f7..9b1c0fd1 100644
+--- a/qcacld-3.0/Kbuild
++++ b/qcacld-3.0/Kbuild
+@@ -257,6 +257,10 @@ ifeq ($(CONFIG_WLAN_FEATURE_TWT), y)
+ HDD_OBJS += $(HDD_SRC_DIR)/wlan_hdd_twt.o
+ endif
+ 
++ifeq ($(CONFIG_FEATURE_FRAME_INJECTION_SUPPORT), y)
++CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y
++endif
++
+ ifeq ($(CONFIG_FEATURE_MONITOR_MODE_SUPPORT), y)
+ HDD_OBJS += $(HDD_SRC_DIR)/wlan_hdd_rx_monitor.o
+ endif
+@@ -3696,6 +3700,11 @@ ccflags-$(CONFIG_FEATURE_WLAN_TIME_SYNC_FTM) += -DFEATURE_WLAN_TIME_SYNC_FTM
+ ccflags-$(CONFIG_WLAN_FEATURE_LRO_CTX_IN_CB) += -DWLAN_FEATURE_LRO_CTX_IN_CB
+ 
+ #For both legacy and lithium chip's monitor mode config
++ifeq ($(CONFIG_FEATURE_FRAME_INJECTION_SUPPORT), y)
++ccflags-y += -DFEATURE_FRAME_INJECTION_SUPPORT
++CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y
++endif
++
+ ifeq ($(CONFIG_FEATURE_MONITOR_MODE_SUPPORT), y)
+ ccflags-y += -DFEATURE_MONITOR_MODE_SUPPORT
+ ccflags-$(CONFIG_DP_CON_MON_MSI_ENABLED) += -DDP_CON_MON_MSI_ENABLED
+diff --git a/qcacld-3.0/configs/default_defconfig b/qcacld-3.0/configs/default_defconfig
+index 9dadd748..21d915ab 100644
+--- a/qcacld-3.0/configs/default_defconfig
++++ b/qcacld-3.0/configs/default_defconfig
+@@ -1297,6 +1297,7 @@ CONFIG_WLAN_SPECTRAL_ENABLE := y
+ CONFIG_WMI_CMD_STRINGS := y
+ 
+ CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y
++CONFIG_FEATURE_FRAME_INJECTION_SUPPORT := y
+ 
+ CONFIG_WLAN_ALLOCATE_GLOBAL_BUFFERS_DYNAMICALLY := n
+ CONFIG_WLAN_FEATURE_TWT := y
+diff --git a/qcacld-3.0/configs/pineapple_consolidate_wcn7750_defconfig b/qcacld-3.0/configs/pineapple_consolidate_wcn7750_defconfig
+index 1cb9fe0f..6896dc6c 100644
+--- a/qcacld-3.0/configs/pineapple_consolidate_wcn7750_defconfig
++++ b/qcacld-3.0/configs/pineapple_consolidate_wcn7750_defconfig
+@@ -31,3 +31,4 @@ CONFIG_WLAN_FEATURE_DP_CFG_EVENT_HISTORY=y
+ CONFIG_WLAN_FEATURE_DP_MON_STATUS_RING_HISTORY=y
+ CONFIG_ENABLE_SCHED_HISTORY_SIZE=y
+ CONFIG_WLAN_TRACE_HIDE_MAC_ADDRESS_DISABLE=y
++CONFIG_FEATURE_FRAME_INJECTION_SUPPORT=y
+diff --git a/qcacld-3.0/configs/pineapple_gki_wcn7750_defconfig b/qcacld-3.0/configs/pineapple_gki_wcn7750_defconfig
+index 4db66663..548cd61c 100644
+--- a/qcacld-3.0/configs/pineapple_gki_wcn7750_defconfig
++++ b/qcacld-3.0/configs/pineapple_gki_wcn7750_defconfig
+@@ -64,6 +64,7 @@ CONFIG_FEATURE_HTC_CREDIT_HISTORY=y
+ CONFIG_FEATURE_INTEROP_ISSUES_AP=y
+ CONFIG_FEATURE_MEMDUMP_ENABLE=y
+ CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y
++CONFIG_FEATURE_FRAME_INJECTION_SUPPORT=y
+ CONFIG_FEATURE_MSCS=y
+ CONFIG_FEATURE_NO_DBS_INTRABAND_MCC_SUPPORT=y
+ CONFIG_FEATURE_OEM_DATA=y
+diff --git a/qcacld-3.0/configs/sun_consolidate_wcn7750_defconfig b/qcacld-3.0/configs/sun_consolidate_wcn7750_defconfig
+index 14ced54e..383b3374 100644
+--- a/qcacld-3.0/configs/sun_consolidate_wcn7750_defconfig
++++ b/qcacld-3.0/configs/sun_consolidate_wcn7750_defconfig
+@@ -35,3 +35,4 @@ CONFIG_WLAN_OBJMGR_DEBUG=y
+ CONFIG_WLAN_OBJMGR_REF_ID_TRACE=y
+ CONFIG_WLAN_WARN_ON_ASSERT=y
+ CONFIG_PANIC_ON_BUG=y
++CONFIG_FEATURE_FRAME_INJECTION_SUPPORT=y
+diff --git a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig b/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
+index 06134a51..5caf3ee0 100644
+--- a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
++++ b/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
+@@ -64,6 +64,7 @@ CONFIG_FEATURE_HTC_CREDIT_HISTORY=y
+ CONFIG_FEATURE_INTEROP_ISSUES_AP=y
+ CONFIG_FEATURE_MEMDUMP_ENABLE=y
+ CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y
++CONFIG_FEATURE_FRAME_INJECTION_SUPPORT=y
+ CONFIG_FEATURE_MSCS=y
+ CONFIG_FEATURE_NO_DBS_INTRABAND_MCC_SUPPORT=y
+ CONFIG_FEATURE_OEM_DATA=y
+@@ -128,7 +129,7 @@ CONFIG_QCA_MONITOR_PKT_SUPPORT=y
+ CONFIG_QCA_SUPPORT_TX_THROTTLE=y
+ CONFIG_QCA_TARGET_IF_MLME=y
+ CONFIG_QCA_WIFI_FTM=y
+-CONFIG_QCA_WIFI_FTM_NL80211=y
++CONFIG_QCA_WIFI_FTM_NL80211=n
+ CONFIG_QCA_WIFI_QCA8074=y
+ CONFIG_QCA_WIFI_QCA8074_VP=y
+ CONFIG_QCOM_ESE=y
+@@ -361,7 +362,7 @@ CONFIG_WLAN_TWT_SAP_PDEV_COUNT=y
+ CONFIG_WLAN_TWT_SAP_STA_COUNT=y
+ CONFIG_CFG80211_EXTERNAL_AUTH_MLO_SUPPORT=y
+ CONFIG_CFG80211_EXT_FEATURE_SECURE_NAN=y
+-CONFIG_NL80211_TESTMODE=y
++CONFIG_NL80211_TESTMODE=n
+ CONFIG_FEATURE_WLAN_CH_AVOID_EXT=y
+ CONFIG_WLAN_AUX_SUPPORT=y
+ CONFIG_CFG_BMISS_OFFLOAD_MAX_VDEV=4
+diff --git a/qcacld-3.0/configs/wcn7750_defconfig b/qcacld-3.0/configs/wcn7750_defconfig
+index 6b950e7d..8fc8835b 100644
+--- a/qcacld-3.0/configs/wcn7750_defconfig
++++ b/qcacld-3.0/configs/wcn7750_defconfig
+@@ -673,6 +673,7 @@ CONFIG_WLAN_SPECTRAL_ENABLE := y
+ CONFIG_WMI_CMD_STRINGS := y
+ 
+ CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y
++CONFIG_FEATURE_FRAME_INJECTION_SUPPORT := y
+ CONFIG_WLAN_ALLOCATE_GLOBAL_BUFFERS_DYNAMICALLY := n
+ CONFIG_WLAN_FEATURE_TWT := y
+ CONFIG_FW_THERMAL_THROTTLE := y
+diff --git a/qcacld-3.0/core/dp/txrx/ol_tx_desc.c b/qcacld-3.0/core/dp/txrx/ol_tx_desc.c
+index 475d7099..4b5344fa 100644
+--- a/qcacld-3.0/core/dp/txrx/ol_tx_desc.c
++++ b/qcacld-3.0/core/dp/txrx/ol_tx_desc.c
+@@ -345,10 +345,16 @@ ol_tx_desc_alloc_wrapper(struct ol_txrx_pdev_t *pdev,
+ 			 struct ol_txrx_vdev_t *vdev,
+ 			 struct ol_txrx_msdu_info_t *msdu_info)
+ {
+-	if (qdf_unlikely(msdu_info->htt.info.frame_type == htt_pkt_type_mgmt))
++	if (qdf_unlikely(msdu_info->htt.info.frame_type == htt_pkt_type_mgmt)) {
++		if (!pdev->mgmt_pool) {
++			ol_txrx_err("management tx pool unavailable");
++			return NULL;
++		}
++
+ 		return ol_tx_desc_alloc(pdev, vdev, pdev->mgmt_pool);
+-	else
+-		return ol_tx_desc_alloc(pdev, vdev, vdev->pool);
++	}
++
++	return ol_tx_desc_alloc(pdev, vdev, vdev->pool);
+ }
+ #else
+ struct ol_tx_desc_t *
+diff --git a/qcacld-3.0/core/dp/txrx/ol_txrx.c b/qcacld-3.0/core/dp/txrx/ol_txrx.c
+index 4e357920..3a02d033 100644
+--- a/qcacld-3.0/core/dp/txrx/ol_txrx.c
++++ b/qcacld-3.0/core/dp/txrx/ol_txrx.c
+@@ -878,6 +878,8 @@ ol_txrx_pdev_attach(ol_txrx_soc_handle soc,
+ 		goto fail0;
+ 	}
+ 
++	pdev->is_mgmt_over_wmi_enabled = 0;
++
+ 	/* init LL/HL cfg here */
+ 	pdev->cfg.is_high_latency = ol_cfg_is_high_latency(cfg_pdev);
+ 	/*
+@@ -5745,7 +5747,7 @@ uint8_t ol_txrx_get_mon_vdev_from_pdev(struct cdp_soc_t *soc_hdl,
+ 	struct ol_txrx_soc_t *soc = (struct ol_txrx_soc_t *)soc_hdl;
+ 	ol_txrx_pdev_handle pdev = ol_txrx_get_pdev_from_pdev_id(soc, pdev_id);
+ 
+-	if (qdf_unlikely(!pdev))
++	if (qdf_unlikely(!pdev || !pdev->monitor_vdev))
+ 		return -EINVAL;
+ 
+ 	return pdev->monitor_vdev->vdev_id;
+diff --git a/qcacld-3.0/core/dp/txrx/ol_txrx_flow_control.c b/qcacld-3.0/core/dp/txrx/ol_txrx_flow_control.c
+index 3a5d965b..3ff7ca15 100644
+--- a/qcacld-3.0/core/dp/txrx/ol_txrx_flow_control.c
++++ b/qcacld-3.0/core/dp/txrx/ol_txrx_flow_control.c
+@@ -56,6 +56,9 @@
+ static void
+ ol_tx_register_global_mgmt_pool(struct ol_txrx_pdev_t *pdev)
+ {
++	if (pdev->mgmt_pool)
++		return;
++
+ 	pdev->mgmt_pool = ol_tx_create_flow_pool(TX_FLOW_MGMT_POOL_ID,
+ 						 TX_FLOW_MGMT_POOL_SIZE);
+ 	if (!pdev->mgmt_pool)
+@@ -71,7 +74,11 @@ ol_tx_register_global_mgmt_pool(struct ol_txrx_pdev_t *pdev)
+ static void
+ ol_tx_deregister_global_mgmt_pool(struct ol_txrx_pdev_t *pdev)
+ {
++	if (!pdev->mgmt_pool)
++		return;
++
+ 	ol_tx_dec_pool_ref(pdev->mgmt_pool, false);
++	pdev->mgmt_pool = NULL;
+ }
+ #else
+ static inline void
+@@ -105,6 +112,15 @@ bool ol_txrx_fwd_desc_thresh_check(struct ol_txrx_vdev_t *txrx_vdev)
+ 	return enough_desc_flag;
+ }
+ 
++static bool ol_tx_needs_global_mgmt_pool(void)
++{
++#ifdef FEATURE_FRAME_INJECTION_SUPPORT
++	return true;
++#else
++	return !ol_tx_get_is_mgmt_over_wmi_enabled();
++#endif
++}
++
+ /**
+  * ol_tx_set_desc_global_pool_size() - set global pool size
+  * @num_msdu_desc: total number of descriptors
+@@ -125,7 +141,7 @@ void ol_tx_set_desc_global_pool_size(uint32_t num_msdu_desc)
+ 		return;
+ 	}
+ 	pdev->num_msdu_desc = num_msdu_desc;
+-	if (!ol_tx_get_is_mgmt_over_wmi_enabled())
++	if (ol_tx_needs_global_mgmt_pool())
+ 		pdev->num_msdu_desc += TX_FLOW_MGMT_POOL_SIZE;
+ 	ol_txrx_info_high("Global pool size: %d", pdev->num_msdu_desc);
+ }
+@@ -165,7 +181,7 @@ void ol_tx_register_flow_control(struct ol_txrx_pdev_t *pdev)
+ 	qdf_spinlock_create(&pdev->tx_desc.flow_pool_list_lock);
+ 	TAILQ_INIT(&pdev->tx_desc.flow_pool_list);
+ 
+-	if (!ol_tx_get_is_mgmt_over_wmi_enabled())
++	if (ol_tx_needs_global_mgmt_pool())
+ 		ol_tx_register_global_mgmt_pool(pdev);
+ }
+ 
+@@ -181,7 +197,7 @@ void ol_tx_deregister_flow_control(struct ol_txrx_pdev_t *pdev)
+ 	struct ol_tx_flow_pool_t *pool = NULL;
+ 	struct cdp_soc_t *soc;
+ 
+-	if (!ol_tx_get_is_mgmt_over_wmi_enabled())
++	if (ol_tx_needs_global_mgmt_pool())
+ 		ol_tx_deregister_global_mgmt_pool(pdev);
+ 
+ 	soc = cds_get_context(QDF_MODULE_ID_SOC);
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c b/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+index 63617ac0..3de02804 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+@@ -76,6 +76,10 @@
+ #include <wlan_cfg80211_scan.h>
+ #include <wlan_cfg80211_ftm.h>
+ 
++#if defined(WLAN_NL80211_TESTMODE) && defined(CONFIG_NL80211_TESTMODE)
++#define HDD_CFG80211_TESTMODE_SUPPORTED
++#endif
++
+ #include "wlan_hdd_ext_scan.h"
+ 
+ #include "wlan_hdd_stats.h"
+@@ -1057,7 +1061,7 @@ static struct ieee80211_iface_combination
+ 
+ static struct cfg80211_ops wlan_hdd_cfg80211_ops;
+ 
+-#ifdef WLAN_NL80211_TESTMODE
++#ifdef HDD_CFG80211_TESTMODE_SUPPORTED
+ enum wlan_hdd_tm_attr {
+ 	WLAN_HDD_TM_ATTR_INVALID = 0,
+ 	WLAN_HDD_TM_ATTR_CMD = 1,
+@@ -1081,7 +1085,7 @@ static const struct nla_policy wlan_hdd_tm_policy[WLAN_HDD_TM_ATTR_MAX + 1] = {
+ 	[WLAN_HDD_TM_ATTR_DATA] = {.type = NLA_BINARY,
+ 				   .len = WLAN_HDD_TM_DATA_MAX_LEN},
+ };
+-#endif /* WLAN_NL80211_TESTMODE */
++#endif /* HDD_CFG80211_TESTMODE_SUPPORTED */
+ 
+ enum wlan_hdd_vendor_ie_access_policy {
+ 	WLAN_HDD_VENDOR_IE_ACCESS_NONE = 0,
+@@ -30242,7 +30246,7 @@ wlan_hdd_cfg80211_set_mac_acl(struct wiphy *wiphy,
+ 	return errno;
+ }
+ 
+-#ifdef WLAN_NL80211_TESTMODE
++#ifdef HDD_CFG80211_TESTMODE_SUPPORTED
+ #ifdef FEATURE_WLAN_LPHB
+ /**
+  * wlan_hdd_cfg80211_lphb_ind_handler() - handle low power heart beat indication
+@@ -30444,7 +30448,7 @@ static int wlan_hdd_cfg80211_testmode(struct wiphy *wiphy,
+ 	return errno;
+ }
+ 
+-#endif /* CONFIG_NL80211_TESTMODE */
++#endif /* HDD_CFG80211_TESTMODE_SUPPORTED */
+ 
+ #ifdef QCA_HT_2040_COEX
+ /**
+@@ -33784,7 +33788,7 @@ static struct cfg80211_ops wlan_hdd_cfg80211_ops = {
+ 	.resume = wlan_hdd_cfg80211_resume_wlan,
+ 	.suspend = wlan_hdd_cfg80211_suspend_wlan,
+ 	.set_mac_acl = wlan_hdd_cfg80211_set_mac_acl,
+-#ifdef WLAN_NL80211_TESTMODE
++#ifdef HDD_CFG80211_TESTMODE_SUPPORTED
+ 	.testmode_cmd = wlan_hdd_cfg80211_testmode,
+ #endif
+ #ifdef QCA_HT_2040_COEX
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+index 6130d22c..0b1812d9 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -7240,6 +7240,7 @@ static const struct net_device_ops wlan_drv_ops = {
+ static const struct net_device_ops wlan_mon_drv_ops = {
+ 	.ndo_open = hdd_mon_open,
+ 	.ndo_stop = hdd_stop,
++	.ndo_start_xmit = hdd_hard_start_xmit,
+ 	.ndo_get_stats = hdd_get_stats,
+ };
+ 
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_rx_monitor.c b/qcacld-3.0/core/hdd/src/wlan_hdd_rx_monitor.c
+index 58ef1333..056d09f6 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_rx_monitor.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_rx_monitor.c
+@@ -36,7 +36,7 @@ int hdd_enable_monitor_mode(struct net_device *dev)
+ 	hdd_enter_dev(dev);
+ 
+ 	vdev_id = cdp_get_mon_vdev_from_pdev(soc, OL_TXRX_PDEV_ID);
+-	if (vdev_id < 0)
++	if (vdev_id == (uint8_t)-EINVAL)
+ 		return -EINVAL;
+ 
+ 	return cdp_set_monitor_mode(soc, vdev_id, false);
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c b/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+index f80c14ed..56781463 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+@@ -33,12 +33,14 @@
+ #include <linux/skbuff.h>
+ #include <linux/etherdevice.h>
+ #include <linux/if_ether.h>
++#include <asm/unaligned.h>
+ #include <linux/inetdevice.h>
+ #include <cds_sched.h>
+ #include <cds_utils.h>
+ 
+ #include <linux/wireless.h>
+ #include <net/cfg80211.h>
++#include <net/ieee80211_radiotap.h>
+ #include "sap_api.h"
+ #include "wlan_hdd_wmm.h"
+ #include <cdp_txrx_cmn.h>
+@@ -49,6 +51,7 @@
+ #include "wlan_hdd_cfg80211.h"
+ #include <wlan_hdd_tsf.h>
+ #include <net/tcp.h>
++#include "wma_api.h"
+ 
+ #include <ol_defines.h>
+ #include "cfg_ucfg_api.h"
+@@ -60,6 +63,7 @@
+ #include "os_if_dp.h"
+ #include "wlan_ipa_ucfg_api.h"
+ #include "wlan_hdd_stats.h"
++#include "wlan_hdd_main.h"
+ 
+ #ifdef TX_MULTIQ_PER_AC
+ #if defined(QCA_LL_TX_FLOW_CONTROL_V2) || defined(QCA_LL_PDEV_TX_FLOW_CONTROL)
+@@ -489,6 +493,151 @@ hdd_drop_tx_packet_on_ftm(struct sk_buff *skb)
+ }
+ #endif
+ 
++#ifdef FEATURE_FRAME_INJECTION_SUPPORT
++#define HDD_IEEE80211_FCS_LEN 4
++
++static bool hdd_monitor_tx_dev(struct hdd_adapter *adapter,
++			       struct net_device *dev)
++{
++	if (!adapter || !dev)
++		return false;
++
++	return wlan_hdd_is_session_type_monitor(adapter->device_mode) ||
++	       dev->type == ARPHRD_IEEE80211_RADIOTAP;
++}
++
++static bool hdd_radiotap_flags(const struct sk_buff *skb, uint16_t rtap_len,
++			       uint8_t *flags)
++{
++	const struct ieee80211_radiotap_header *rtap;
++	uint32_t present;
++	uint32_t first_present;
++	unsigned int offset;
++
++	*flags = 0;
++
++	if (rtap_len < sizeof(*rtap) || rtap_len > skb->len)
++		return false;
++
++	rtap = (const struct ieee80211_radiotap_header *)skb->data;
++	first_present = le32_to_cpu(rtap->it_present);
++	present = first_present;
++	offset = sizeof(*rtap);
++
++	while (present & BIT(IEEE80211_RADIOTAP_EXT)) {
++		if (offset + sizeof(uint32_t) > rtap_len)
++			return false;
++
++		present = get_unaligned_le32(skb->data + offset);
++		offset += sizeof(uint32_t);
++	}
++
++	if (!(first_present & BIT(IEEE80211_RADIOTAP_FLAGS)))
++		return true;
++
++	if (first_present & BIT(IEEE80211_RADIOTAP_TSFT)) {
++		offset = ALIGN(offset, 8);
++		if (offset + sizeof(uint64_t) > rtap_len)
++			return false;
++		offset += sizeof(uint64_t);
++	}
++
++	if (offset + sizeof(uint8_t) > rtap_len)
++		return false;
++
++	*flags = skb->data[offset];
++	return true;
++}
++
++static bool hdd_strip_radiotap(struct sk_buff *skb)
++{
++	const struct ieee80211_radiotap_header *rtap;
++	uint16_t rtap_len;
++	uint8_t rtap_flags;
++
++	if (skb->len < sizeof(*rtap))
++		return true;
++
++	rtap = (const struct ieee80211_radiotap_header *)skb->data;
++	if (rtap->it_version != PKTHDR_RADIOTAP_VERSION)
++		return true;
++
++	rtap_len = le16_to_cpu(rtap->it_len);
++	if (rtap_len < sizeof(*rtap) || rtap_len >= skb->len) {
++		hdd_dp_warn_rl("monitor tx: invalid radiotap len %u skb len %u",
++			       rtap_len, skb->len);
++		return false;
++	}
++
++	if (!hdd_radiotap_flags(skb, rtap_len, &rtap_flags)) {
++		hdd_dp_warn_rl("monitor tx: failed to parse radiotap header");
++		return false;
++	}
++
++	skb_pull(skb, rtap_len);
++
++	if (rtap_flags & IEEE80211_RADIOTAP_F_FCS) {
++		if (skb->len <= HDD_IEEE80211_FCS_LEN)
++			return false;
++
++		skb_trim(skb, skb->len - HDD_IEEE80211_FCS_LEN);
++	}
++
++	return true;
++}
++
++static bool hdd_injection_frame_is_valid(const struct sk_buff *skb)
++{
++	const struct ieee80211_hdr *hdr;
++	unsigned int hdr_len;
++
++	if (skb->len < sizeof(struct ieee80211_hdr))
++		return false;
++
++	hdr = (const struct ieee80211_hdr *)skb->data;
++	hdr_len = ieee80211_hdrlen(hdr->frame_control);
++
++	if (hdr_len < sizeof(struct ieee80211_hdr) || skb->len < hdr_len)
++		return false;
++
++	return ieee80211_is_mgmt(hdr->frame_control);
++}
++
++static void hdd_monitor_mode_tx_inject(struct hdd_adapter *adapter,
++				       struct net_device *dev,
++				       struct sk_buff *skb)
++{
++	void *soc = cds_get_context(QDF_MODULE_ID_SOC);
++	int ret;
++
++	if (!soc || !adapter || !adapter->deflink) {
++		kfree_skb(skb);
++		return;
++	}
++
++	if (!hdd_strip_radiotap(skb) ||
++	    !hdd_injection_frame_is_valid(skb)) {
++		hdd_dp_warn_rl("monitor tx: dropping invalid injection frame len %u",
++			       skb->len);
++		kfree_skb(skb);
++		return;
++	}
++
++	skb->next = NULL;
++	QDF_NBUF_CB_MGMT_TXRX_DESC_ID(skb) = WMA_MGMT_TX_INJECTION_DESC_ID;
++	ret = cdp_mgmt_send_ext(soc, adapter->deflink->vdev_id,
++				(qdf_nbuf_t)skb, 0, 0, 0);
++	if (ret) {
++		hdd_dp_warn_rl("monitor tx: injection failed vdev %u status %d",
++			       adapter->deflink->vdev_id, ret);
++		kfree_skb(skb);
++		return;
++	}
++
++	netif_trans_update(dev);
++}
++#endif /* FEATURE_FRAME_INJECTION_SUPPORT */
++
+ /**
+  * __hdd_hard_start_xmit() - Transmit a frame
+  * @skb: pointer to OS packet (sk_buff)
+@@ -515,6 +664,13 @@ static void __hdd_hard_start_xmit(struct sk_buff *skb,
+ 	enum sme_qos_wmmuptype up;
+ 	QDF_STATUS status;
+ 
++#ifdef FEATURE_FRAME_INJECTION_SUPPORT
++	if (hdd_monitor_tx_dev(adapter, dev)) {
++		hdd_monitor_mode_tx_inject(adapter, dev, skb);
++		return;
++	}
++#endif
++
+ 	if (hdd_drop_tx_packet_on_ftm(skb))
+ 		return;
+ 
+diff --git a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c b/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
+index cb044784..145b6f4b 100644
+--- a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
++++ b/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
+@@ -4114,7 +4114,8 @@ lim_match_link_info(uint8_t req_link_id,
+ {
+ 	uint8_t i;
+ 
+-	for (i = 0; i < partner_info->num_partner_links; i++) {
++	for (i = 0; i < QDF_MIN(partner_info->num_partner_links,
++			       QDF_ARRAY_SIZE(partner_info->partner_link_info)); i++) {
+ 		if (partner_info->partner_link_info[i].link_id == req_link_id &&
+ 		    (qdf_is_macaddr_equal(link_addr,
+ 					  &partner_info->partner_link_info[i].link_addr)))
+diff --git a/qcacld-3.0/core/wma/inc/wma_api.h b/qcacld-3.0/core/wma/inc/wma_api.h
+index 26dd8f88..a92b87e9 100644
+--- a/qcacld-3.0/core/wma/inc/wma_api.h
++++ b/qcacld-3.0/core/wma/inc/wma_api.h
+@@ -39,6 +39,8 @@
+ 
+ typedef void *WMA_HANDLE;
+ 
++#define WMA_MGMT_TX_INJECTION_DESC_ID 0xffff
++
+ /**
+  * enum GEN_PARAM - general parameters
+  * @GEN_VDEV_PARAM_AMPDU: Set ampdu size
+diff --git a/qcacld-3.0/core/wma/src/wma_data.c b/qcacld-3.0/core/wma/src/wma_data.c
+index a6ea07c4..151ccf07 100644
+--- a/qcacld-3.0/core/wma/src/wma_data.c
++++ b/qcacld-3.0/core/wma/src/wma_data.c
+@@ -1366,6 +1366,12 @@ wma_mgmt_tx_ack_comp_hdlr(void *wma_context, qdf_nbuf_t netbuf, int32_t status)
+ 	uint8_t vdev_id;
+ 
+ 	desc_id = QDF_NBUF_CB_MGMT_TXRX_DESC_ID(netbuf);
++#ifdef FEATURE_FRAME_INJECTION_SUPPORT
++	if (desc_id == WMA_MGMT_TX_INJECTION_DESC_ID) {
++		qdf_nbuf_free(netbuf);
++		return;
++	}
++#endif
+ 	vdev_id = mgmt_txrx_get_vdev_id(pdev, desc_id);
+ 
+ 	mgmt_params.vdev_id = vdev_id;
+@@ -1391,6 +1397,12 @@ wma_mgmt_tx_dload_comp_hldr(void *wma_context, qdf_nbuf_t netbuf,
+ 	tp_wma_handle wma_handle = (tp_wma_handle) wma_context;
+ 	void *mac_context = wma_handle->mac_context;
+ 
++#ifdef FEATURE_FRAME_INJECTION_SUPPORT
++	if (QDF_NBUF_CB_MGMT_TXRX_DESC_ID(netbuf) ==
++	    WMA_MGMT_TX_INJECTION_DESC_ID)
++		return;
++#endif
++
+ 	wma_debug("Tx Complete Status %d", status);
+ 
+ 	if (!wma_handle->tx_frm_download_comp_cb) {

@@ -1,0 +1,168 @@
+name: Build NetHunter WLAN Injection
+
+on:
+  workflow_dispatch:
+    inputs:
+      pixelos_branch:
+        description: PixelOS onyx kernel-module branch
+        required: true
+        type: string
+        default: sixteen-qpr2
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NEUTRON_TAG: "10032024"
+
+concurrency:
+  group: wlan-injection-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Kernel, WLAN module, and vendor_dlkm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: gki-clo
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            android-sdk-libsparse-utils bc bison build-essential ccache curl \
+            e2fsprogs fakeroot flex g++-multilib gcc-multilib git kmod \
+            lib32ncurses-dev lib32readline-dev lib32z1-dev libncurses-dev \
+            libssl-dev libxml2 libxml2-utils lzop rsync schedtool \
+            squashfs-tools wget zip zlib1g-dev zstd
+
+      - name: Create build swap
+        run: |
+          sudo fallocate -l 10G /mnt/build_swapfile
+          sudo chmod 600 /mnt/build_swapfile
+          sudo mkswap /mnt/build_swapfile
+          sudo swapon /mnt/build_swapfile
+
+      - name: Install pinned Neutron clang with Antman
+        run: |
+          mkdir -p toolchains/clang
+          cd toolchains/clang
+          bash <(curl -fsSL https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman) \
+            -S="$NEUTRON_TAG" --noconfirm --noprogress --noaxel
+          bash <(curl -fsSL https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman) \
+            --patch=glibc --noconfirm --noprogress --noaxel
+          bin/clang --version
+
+      - name: Clone build inputs
+        env:
+          PIXELOS_BRANCH: ${{ inputs.pixelos_branch }}
+        run: |
+          mkdir -p gki-clo/vendor/qcom/opensource gki-clo/sources/pixelos
+          git clone --depth=1 --branch onyx-v-oss \
+            https://github.com/MiCode/vendor_qcom_opensource_wlan.git \
+            gki-clo/vendor/qcom/opensource/wlan
+          git clone --depth=1 --branch "$PIXELOS_BRANCH" \
+            https://github.com/PixelOS-Devices/android_device_xiaomi_onyx-kernel.git \
+            gki-clo/sources/pixelos/android_device_xiaomi_onyx-kernel
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git \
+            gki-clo/anykernel
+
+      - name: Apply WCN7750 packet-injection port
+        working-directory: gki-clo/vendor/qcom/opensource/wlan
+        run: |
+          git apply --check "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-packet-injection.patch"
+          git apply "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-packet-injection.patch"
+          git diff --check
+
+      - name: Build matching KSU-Next kernel
+        working-directory: gki-clo
+        run: |
+          chmod +x build.sh
+          ./build.sh \
+            hz=250 \
+            variant=root \
+            root=ksu-next \
+            kpm=off \
+            hardened=off \
+            bypasscharging=on \
+            droidspaces=off \
+            htsr=on \
+            wifi_exploit=on \
+            kgsl_exploit=on \
+            data_exploit=on \
+            debug=on \
+            nethunter=on \
+            nethunter_extra=off \
+            kernel_name=-Kono-Ha-Kernel \
+            spoof_uname=on \
+            lto=full
+
+      - name: Build patched PixelOS WLAN module
+        working-directory: gki-clo
+        env:
+          CC: clang
+          KERNEL_OUT: ${{ github.workspace }}/gki-clo/out
+        run: |
+          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH"
+          chmod +x tools/*.sh
+          tools/make_pixelos_wlan_symvers.sh
+          tools/build_wlan_injection_module.sh
+
+          kernel_release="$(make -s O=out ARCH=arm64 CC=clang LLVM=1 kernelrelease)"
+          module_vermagic="$(modinfo -F vermagic artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko)"
+          echo "kernel release:  $kernel_release"
+          echo "module vermagic: $module_vermagic"
+          case "$module_vermagic" in
+            "$kernel_release"*) ;;
+            *) echo "WLAN module vermagic does not match the built kernel" >&2; exit 1 ;;
+          esac
+
+      - name: Build PixelOS vendor_dlkm images
+        working-directory: gki-clo
+        run: |
+          tools/make_pixelos_vendor_dlkm_img.sh \
+            --wifi-ko artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko \
+            --padding-mib 16 \
+            --allow-vermagic-mismatch \
+            --out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4.img \
+            --sparse-out artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4-sparse.img
+
+      - name: Verify artifacts
+        working-directory: gki-clo
+        run: |
+          module=artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
+          raw=artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4.img
+          sparse=artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4-sparse.img
+          roundtrip="$RUNNER_TEMP/vendor_dlkm-roundtrip.img"
+          extracted="$RUNNER_TEMP/qca_cld3_wcn7750.ko"
+
+          test "$(modinfo -F name "$module")" = qca_cld3_wcn7750
+          grep -a -q hdd_monitor_mode_tx_inject "$module"
+          e2fsck -fn "$raw"
+          debugfs -R "dump /lib/modules/qca_cld3_wcn7750.ko $extracted" "$raw"
+          cmp "$module" "$extracted"
+          simg2img "$sparse" "$roundtrip"
+          cmp "$raw" "$roundtrip"
+          sha256sum "$module" "$raw" "$sparse" | tee artifacts/SHA256SUMS
+
+      - name: Upload matching kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kono-Ha-KSU-Next-NetHunter-matching-kernel
+          path: gki-clo/Kono-Ha-Release/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload WLAN injection artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PixelOS-onyx-WCN7750-injection
+          path: |
+            gki-clo/artifacts/SHA256SUMS
+            gki-clo/artifacts/wlan/qca_cld3_wcn7750-konoha-injection.ko
+            gki-clo/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4.img
+            gki-clo/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-ext4-sparse.img
+          retention-days: 7
+          if-no-files-found: error
