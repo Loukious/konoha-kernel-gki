@@ -171,12 +171,14 @@ jobs:
             "$abi_src/arch/arm64/configs/vendor/onyx_perf.config"
           "$abi_src/scripts/config" --file "$abi_out/.config" \
             --set-str LOCALVERSION "-android15-8-4k" \
-            --disable LOCALVERSION_AUTO
+            --disable LOCALVERSION_AUTO \
+            --disable KUNIT
           make -j"$(nproc)" -C "$abi_src" O="$abi_out" \
             ARCH=arm64 LLVM=1 LLVM_IAS=1 LOCALVERSION= \
             olddefconfig prepare modules_prepare
           cp "$saved_symvers" "$abi_out/Module.symvers"
 
+          grep -qx '# CONFIG_KUNIT is not set' "$abi_out/.config"
           kernel_release="$(cat "$abi_out/include/config/kernel.release")"
           case "$kernel_release" in
             6.6.*-android15-8-4k) ;;
