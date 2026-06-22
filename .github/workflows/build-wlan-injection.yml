@@ -18,11 +18,16 @@ on:
         required: true
         type: boolean
         default: true
-      kernel_headers_ref:
-        description: Optional kernel git ref used only for module headers (for example the 6.6.57 commit)
-        required: false
+      kernel_source_repo:
+        description: Device kernel source used for WLAN ABI headers
+        required: true
         type: string
-        default: ''
+        default: https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git
+      kernel_source_branch:
+        description: Xiaomi kernel source branch for Poco F7 (onyx)
+        required: true
+        type: string
+        default: onyx-v-oss
       kernel_symvers_url:
         description: Module.symvers from the installed kernel base
         required: true
@@ -82,10 +87,15 @@ jobs:
 
       - name: Clone WLAN and PixelOS inputs
         env:
+          KERNEL_SOURCE_BRANCH: ${{ inputs.kernel_source_branch }}
+          KERNEL_SOURCE_REPO: ${{ inputs.kernel_source_repo }}
           PIXELOS_BRANCH: ${{ inputs.pixelos_branch }}
           WLAN_BRANCH: ${{ inputs.wlan_branch }}
         run: |
           mkdir -p gki-clo/vendor/qcom/opensource gki-clo/sources/pixelos
+          git clone --depth=1 --filter=blob:none --single-branch \
+            --branch "$KERNEL_SOURCE_BRANCH" "$KERNEL_SOURCE_REPO" \
+            gki-clo/sources/xiaomi-kernel
           git clone --depth=1 --branch "$WLAN_BRANCH" \
             https://github.com/MiCode/vendor_qcom_opensource_wlan.git \
             gki-clo/vendor/qcom/opensource/wlan
@@ -100,6 +110,9 @@ jobs:
           echo "WLAN source branch: $WLAN_BRANCH"
           echo "WLAN source version: $wlan_version"
           test "$wlan_version" = "5.2.1.119O"
+          test -f gki-clo/sources/xiaomi-kernel/build.config.msm.onyx
+          test -f gki-clo/sources/xiaomi-kernel/include/linux/qcom-iommu-util.h
+          test -f gki-clo/sources/xiaomi-kernel/kernel/sched/walt/walt.c
 
       - name: Download kernel symbols and stock image
         env:
@@ -133,60 +146,47 @@ jobs:
           git apply "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-build-compat.patch"
           git diff --check
 
-      - name: Prepare kernel headers without building kernel
-        working-directory: gki-clo
-        run: |
-          chmod +x build.sh
-          ./build.sh \
-            hz=250 \
-            variant=root \
-            root=ksu-next \
-            kpm=off \
-            hardened=off \
-            bypasscharging=on \
-            droidspaces=off \
-            htsr=on \
-            wifi_exploit=on \
-            kgsl_exploit=on \
-            data_exploit=on \
-            debug=on \
-            nethunter=on \
-            nethunter_extra=off \
-            kernel_name=-Kono-Ha-Kernel \
-            spoof_uname=on \
-            lto=none \
-            prepare_only=on
-
-          test -s out/Module.symvers
-          test -s out/include/generated/autoconf.h
-          echo "WLAN_KERNEL_SRC=$GITHUB_WORKSPACE/gki-clo" >> "$GITHUB_ENV"
-          echo "WLAN_KERNEL_OUT=$GITHUB_WORKSPACE/gki-clo/out" >> "$GITHUB_ENV"
-
-      - name: Prepare alternate kernel ABI headers
-        if: ${{ inputs.kernel_headers_ref != '' }}
+      - name: Prepare Xiaomi Onyx kernel ABI headers
         working-directory: gki-clo
         env:
-          KERNEL_HEADERS_REF: ${{ inputs.kernel_headers_ref }}
+          KERNEL_SOURCE_BRANCH: ${{ inputs.kernel_source_branch }}
         run: |
-          abi_src="$RUNNER_TEMP/wlan-kernel-abi-src"
-          abi_out="$RUNNER_TEMP/wlan-kernel-abi-out"
+          abi_src="$GITHUB_WORKSPACE/gki-clo/sources/xiaomi-kernel"
+          abi_out="$GITHUB_WORKSPACE/gki-clo/out"
           saved_symvers="$RUNNER_TEMP/wlan-Module.symvers"
 
-          cp out/Module.symvers "$saved_symvers"
-          git fetch --depth=1 origin "$KERNEL_HEADERS_REF"
-          git worktree add --detach "$abi_src" FETCH_HEAD
+          cp "$abi_out/Module.symvers" "$saved_symvers"
           mkdir -p "$abi_out"
-          cp out/.config "$abi_out/.config"
+          install -D -m 0644 \
+            tools/xiaomi-source-stubs/drivers/misc/hwid/Kconfig \
+            "$abi_src/drivers/misc/hwid/Kconfig"
+          rm "$abi_src/drivers/power/supply/mca"
+          install -D -m 0644 \
+            tools/xiaomi-source-stubs/drivers/power/supply/mca/Kconfig \
+            "$abi_src/drivers/power/supply/mca/Kconfig"
+          KCONFIG_CONFIG="$abi_out/.config" \
+            "$abi_src/scripts/kconfig/merge_config.sh" -m -r -y \
+            "$abi_src/arch/arm64/configs/gki_defconfig" \
+            "$abi_src/arch/arm64/configs/vendor/sun_perf.config" \
+            "$abi_src/arch/arm64/configs/vendor/onyx_perf.config"
           "$abi_src/scripts/config" --file "$abi_out/.config" \
-            --set-str LOCALVERSION "-android15-8-4k"
+            --set-str LOCALVERSION "-android15-8-4k" \
+            --disable LOCALVERSION_AUTO
           make -j"$(nproc)" -C "$abi_src" O="$abi_out" \
-            ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 LOCALVERSION= \
             olddefconfig prepare modules_prepare
           cp "$saved_symvers" "$abi_out/Module.symvers"
 
+          kernel_release="$(cat "$abi_out/include/config/kernel.release")"
+          case "$kernel_release" in
+            6.6.*-android15-8-4k) ;;
+            *) echo "Unexpected Onyx kernel release: $kernel_release" >&2; exit 1 ;;
+          esac
           echo "WLAN_KERNEL_SRC=$abi_src" >> "$GITHUB_ENV"
           echo "WLAN_KERNEL_OUT=$abi_out" >> "$GITHUB_ENV"
-          echo "alternate kernel release: $(cat "$abi_out/include/config/kernel.release")"
+          echo "Xiaomi source branch: $KERNEL_SOURCE_BRANCH"
+          echo "Xiaomi source commit: $(git -C "$abi_src" rev-parse HEAD)"
+          echo "Onyx kernel release: $kernel_release"
 
       - name: Build PixelOS WLAN module
         working-directory: gki-clo
@@ -195,7 +195,7 @@ jobs:
           KERNEL_SRC: ${{ env.WLAN_KERNEL_SRC }}
           KERNEL_OUT: ${{ env.WLAN_KERNEL_OUT }}
           ENABLE_INJECTION: ${{ inputs.enable_injection }}
-          KERNEL_HEADERS_REF: ${{ inputs.kernel_headers_ref }}
+          KERNEL_SOURCE_BRANCH: ${{ inputs.kernel_source_branch }}
         run: |
           chmod +x tools/*.sh
           tools/make_pixelos_wlan_symvers.sh
@@ -205,10 +205,7 @@ jobs:
           else
             mode=control
           fi
-          if [[ -n "$KERNEL_HEADERS_REF" ]]; then
-            abi_version="$(cut -d- -f1 "$KERNEL_OUT/include/config/kernel.release")"
-            mode="${mode}-abi${abi_version}"
-          fi
+          mode="${mode}-${KERNEL_SOURCE_BRANCH}"
           module="artifacts/wlan/qca_cld3_wcn7750-konoha-${mode}.ko"
           REQUIRE_INJECTION="$ENABLE_INJECTION" \
             tools/build_wlan_injection_module.sh "$module"
