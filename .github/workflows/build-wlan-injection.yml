@@ -18,6 +18,11 @@ on:
         required: true
         type: boolean
         default: true
+      apply_compat_patch:
+        description: Apply the neutral 6.6 compatibility patch to a control build
+        required: true
+        type: boolean
+        default: false
       kernel_source_repo:
         description: Device kernel source used for WLAN ABI headers
         required: true
@@ -109,7 +114,7 @@ jobs:
             gki-clo/vendor/qcom/opensource/wlan/qcacld-3.0/core/mac/inc/qwlan_version.h)"
           echo "WLAN source branch: $WLAN_BRANCH"
           echo "WLAN source version: $wlan_version"
-          test "$wlan_version" = "5.2.1.119O"
+          test -n "$wlan_version"
           test -f gki-clo/sources/xiaomi-kernel/build.config.msm.onyx
           test -f gki-clo/sources/xiaomi-kernel/include/linux/qcom-iommu-util.h
           test -f gki-clo/sources/xiaomi-kernel/kernel/sched/walt/walt.c
@@ -139,7 +144,7 @@ jobs:
           git diff --check
 
       - name: Apply WCN7750 6.6 build compatibility
-        if: ${{ inputs.enable_injection == false }}
+        if: ${{ inputs.enable_injection == false && inputs.apply_compat_patch }}
         working-directory: gki-clo/vendor/qcom/opensource/wlan
         run: |
           git apply --check "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-build-compat.patch"
@@ -197,17 +202,21 @@ jobs:
           KERNEL_SRC: ${{ env.WLAN_KERNEL_SRC }}
           KERNEL_OUT: ${{ env.WLAN_KERNEL_OUT }}
           ENABLE_INJECTION: ${{ inputs.enable_injection }}
+          APPLY_COMPAT_PATCH: ${{ inputs.apply_compat_patch }}
           KERNEL_SOURCE_BRANCH: ${{ inputs.kernel_source_branch }}
+          WLAN_BRANCH: ${{ inputs.wlan_branch }}
         run: |
           chmod +x tools/*.sh
           tools/make_pixelos_wlan_symvers.sh
 
           if [[ "$ENABLE_INJECTION" == "true" ]]; then
             mode=injection
+          elif [[ "$APPLY_COMPAT_PATCH" == "true" ]]; then
+            mode=control-compat
           else
-            mode=control
+            mode=control-clean
           fi
-          mode="${mode}-${KERNEL_SOURCE_BRANCH}"
+          mode="${mode}-${WLAN_BRANCH}-${KERNEL_SOURCE_BRANCH}"
           module="artifacts/wlan/qca_cld3_wcn7750-konoha-${mode}.ko"
           REQUIRE_INJECTION="$ENABLE_INJECTION" \
             tools/build_wlan_injection_module.sh "$module"
