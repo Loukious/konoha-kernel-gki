@@ -90,12 +90,15 @@ jobs:
           sudo mkswap /mnt/wlan_swapfile
           sudo swapon /mnt/wlan_swapfile
 
-      - name: Download Clang Toolchain
+      - name: Download Neutron Clang Toolchain
         run: |
-          mkdir -p toolchains
-          git clone --depth=1 https://github.com/ZyCromerZ/Clang.git \
-            -b main toolchains/clang
-          toolchains/clang/bin/clang --version
+          mkdir -p toolchains/neutron-clang
+          cd toolchains/neutron-clang
+          bash <(curl -fsSL "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman") \
+            -S=10032024 --noconfirm --noprogress --noaxel
+          bash <(curl -fsSL "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman") \
+            --patch=glibc --noconfirm --noprogress --noaxel
+          bin/clang --version
 
       - name: Clone WLAN and PixelOS inputs
         env:
@@ -163,7 +166,7 @@ jobs:
         env:
           KERNEL_SOURCE_BRANCH: ${{ inputs.kernel_source_branch }}
         run: |
-          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH"
+          export PATH="$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
           clang --version
 
           abi_src="$GITHUB_WORKSPACE/gki-clo/sources/xiaomi-kernel"
@@ -217,7 +220,7 @@ jobs:
           WLAN_BRANCH: ${{ inputs.wlan_branch }}
           WLAN_EXTRA_KCFLAGS: -Oz
         run: |
-          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH"
+          export PATH="$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
           clang --version
 
           chmod +x tools/*.sh
