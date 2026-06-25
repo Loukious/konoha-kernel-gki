@@ -190,13 +190,18 @@ if [[ -n "$STOCK_ROOT" ]]; then
 		exit 1
 	fi
 else
-	if ! fsck.erofs --help 2>&1 | grep -q -- '--no-preserve'; then
+	fsck_help="$(fsck.erofs --help 2>&1 || true)"
+	if ! grep -Eq -- '--extract(\[|=)' <<<"$fsck_help"; then
 		echo "This fsck.erofs cannot extract to a directory." >&2
 		echo "Use --stock-root with PixelOS modules/vendor_dlkm, or install newer erofs-utils." >&2
 		exit 1
 	fi
+	FSCK_EXTRACT_ARGS=(--extract="$ROOT")
+	if grep -Fq -- '--[no-]preserve' <<<"$fsck_help"; then
+		FSCK_EXTRACT_ARGS+=(--no-preserve)
+	fi
 	echo "Extracting stock EROFS image"
-	fsck.erofs --extract="$ROOT" --no-preserve "$STOCK_IMAGE" >/dev/null
+	fsck.erofs "${FSCK_EXTRACT_ARGS[@]}" "$STOCK_IMAGE" >/dev/null
 fi
 
 STOCK_WIFI="$ROOT/lib/modules/qca_cld3_wcn7750.ko"
