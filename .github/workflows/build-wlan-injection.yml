@@ -205,6 +205,7 @@ jobs:
           APPLY_COMPAT_PATCH: ${{ inputs.apply_compat_patch }}
           KERNEL_SOURCE_BRANCH: ${{ inputs.kernel_source_branch }}
           WLAN_BRANCH: ${{ inputs.wlan_branch }}
+          WLAN_EXTRA_KCFLAGS: -Oz
         run: |
           chmod +x tools/*.sh
           tools/make_pixelos_wlan_symvers.sh
@@ -255,6 +256,7 @@ jobs:
             --stock-image sources/pixelos/vendor_dlkm-stock.img \
             --stock-root sources/pixelos/android_device_xiaomi_onyx-kernel/modules/vendor_dlkm \
             --wifi-ko "$WLAN_MODULE" \
+            --cluster-size 4096 \
             --allow-vermagic-mismatch \
             --avbtool sources/avb/avbtool.py \
             --out "artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-${WLAN_MODE}-erofs.img" \
