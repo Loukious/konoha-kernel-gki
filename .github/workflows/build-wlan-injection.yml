@@ -90,6 +90,13 @@ jobs:
           sudo mkswap /mnt/wlan_swapfile
           sudo swapon /mnt/wlan_swapfile
 
+      - name: Download Clang Toolchain
+        run: |
+          mkdir -p toolchains
+          git clone --depth=1 https://github.com/ZyCromerZ/Clang.git \
+            -b main toolchains/clang
+          toolchains/clang/bin/clang --version
+
       - name: Clone WLAN and PixelOS inputs
         env:
           KERNEL_SOURCE_BRANCH: ${{ inputs.kernel_source_branch }}
@@ -156,6 +163,9 @@ jobs:
         env:
           KERNEL_SOURCE_BRANCH: ${{ inputs.kernel_source_branch }}
         run: |
+          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH"
+          clang --version
+
           abi_src="$GITHUB_WORKSPACE/gki-clo/sources/xiaomi-kernel"
           abi_out="$GITHUB_WORKSPACE/gki-clo/out"
           saved_symvers="$RUNNER_TEMP/wlan-Module.symvers"
@@ -207,6 +217,9 @@ jobs:
           WLAN_BRANCH: ${{ inputs.wlan_branch }}
           WLAN_EXTRA_KCFLAGS: -Oz
         run: |
+          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH"
+          clang --version
+
           chmod +x tools/*.sh
           tools/make_pixelos_wlan_symvers.sh
 
