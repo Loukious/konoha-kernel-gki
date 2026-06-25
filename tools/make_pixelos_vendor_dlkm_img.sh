@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STOCK_IMAGE=""
+STOCK_ROOT=""
 WIFI_KO=""
 OUT_IMG="$ROOT_DIR/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img"
 SPARSE_OUT=""
@@ -20,6 +21,7 @@ Replace the WCN7750 module in a matching PixelOS onyx vendor_dlkm image.
 
 Options:
   --stock-image FILE               Matching stock PixelOS vendor_dlkm image.
+  --stock-root DIR                 Optional extracted vendor_dlkm module tree.
   --wifi-ko FILE                   Replacement qca_cld3_wcn7750.ko module.
   --out FILE                       Output raw EROFS image.
   --sparse-out FILE                Also write an Android sparse image.
@@ -39,6 +41,10 @@ while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--stock-image)
 			STOCK_IMAGE="$2"
+			shift 2
+			;;
+		--stock-root)
+			STOCK_ROOT="$2"
 			shift 2
 			;;
 		--wifi-ko)
@@ -117,6 +123,10 @@ if [[ -z "$STOCK_IMAGE" || ! -f "$STOCK_IMAGE" ]]; then
 	echo "A matching --stock-image is required: $STOCK_IMAGE" >&2
 	exit 1
 fi
+if [[ -n "$STOCK_ROOT" && ! -d "$STOCK_ROOT" ]]; then
+	echo "The --stock-root directory does not exist: $STOCK_ROOT" >&2
+	exit 1
+fi
 if [[ -z "$WIFI_KO" || ! -f "$WIFI_KO" ]]; then
 	echo "A replacement --wifi-ko is required: $WIFI_KO" >&2
 	exit 1
@@ -167,8 +177,26 @@ CONTEXTS="$STAGE/file_contexts"
 FS_IMAGE="$STAGE/vendor_dlkm.erofs"
 mkdir -p "$ROOT"
 
-echo "Extracting stock EROFS image"
-fsck.erofs --extract="$ROOT" --no-preserve "$STOCK_IMAGE" >/dev/null
+if [[ -n "$STOCK_ROOT" ]]; then
+	echo "Staging extracted stock vendor_dlkm modules"
+	if [[ -f "$STOCK_ROOT/lib/modules/qca_cld3_wcn7750.ko" ]]; then
+		cp -a "$STOCK_ROOT/." "$ROOT/"
+	elif [[ -f "$STOCK_ROOT/qca_cld3_wcn7750.ko" ]]; then
+		mkdir -p "$ROOT/lib/modules"
+		cp -a "$STOCK_ROOT/." "$ROOT/lib/modules/"
+	else
+		echo "Stock Wi-Fi module not found in --stock-root: $STOCK_ROOT" >&2
+		exit 1
+	fi
+else
+	if ! fsck.erofs --help 2>&1 | grep -q -- '--no-preserve'; then
+		echo "This fsck.erofs cannot extract to a directory." >&2
+		echo "Use --stock-root with PixelOS modules/vendor_dlkm, or install newer erofs-utils." >&2
+		exit 1
+	fi
+	echo "Extracting stock EROFS image"
+	fsck.erofs --extract="$ROOT" --no-preserve "$STOCK_IMAGE" >/dev/null
+fi
 
 STOCK_WIFI="$ROOT/lib/modules/qca_cld3_wcn7750.ko"
 if [[ ! -f "$STOCK_WIFI" ]]; then
@@ -201,21 +229,34 @@ fi
 
 # PixelOS labels vendor_dlkm contents as vendor_file. Extraction as an ordinary
 # CI user cannot restore security.selinux xattrs, so mkfs applies them directly.
-printf '%s\n' '/vendor_dlkm(/.*)? u:object_r:vendor_file:s0' >"$CONTEXTS"
+{
+	printf '%s\n' '/(/.*)? u:object_r:vendor_file:s0'
+	printf '%s\n' '/vendor_dlkm(/.*)? u:object_r:vendor_file:s0'
+} >"$CONTEXTS"
 
 echo "Building replacement EROFS image"
 echo "  stock image:       $STOCK_IMAGE"
+if [[ -n "$STOCK_ROOT" ]]; then
+	echo "  stock root:        $STOCK_ROOT"
+fi
 echo "  partition bytes:   $partition_size"
 echo "  replacement Wi-Fi: $WIFI_KO"
 echo "  replacement magic: $replacement_vermagic"
 echo "  EROFS cluster:     $CLUSTER_SIZE"
 
-mkfs.erofs --quiet \
-	-zlz4hc,level=12 -C"$CLUSTER_SIZE" \
-	-T1230768000 --all-root \
-	--mount-point=/vendor_dlkm --file-contexts="$CONTEXTS" \
-	-U"$filesystem_uuid" \
-	"$FS_IMAGE" "$ROOT"
+MKFS_ARGS=(
+	--quiet
+	-zlz4hc,level=12
+	-C"$CLUSTER_SIZE"
+	-T1230768000
+	--all-root
+	--file-contexts="$CONTEXTS"
+	-U"$filesystem_uuid"
+)
+if mkfs.erofs --help 2>&1 | grep -q -- '--mount-point'; then
+	MKFS_ARGS+=(--mount-point=/vendor_dlkm)
+fi
+mkfs.erofs "${MKFS_ARGS[@]}" "$FS_IMAGE" "$ROOT"
 
 rm -f "$OUT_IMG" "$SPARSE_OUT"
 cp "$FS_IMAGE" "$OUT_IMG"
