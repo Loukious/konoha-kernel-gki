@@ -150,6 +150,7 @@ if ! run_avbtool info_image --image "$STOCK_IMAGE" | grep -q 'Partition Name:[[:
 	echo "Stock image does not contain a vendor_dlkm AVB descriptor." >&2
 	exit 1
 fi
+stock_avb_info="$(run_avbtool info_image --image "$STOCK_IMAGE")"
 
 replacement_name="$(modinfo -F name "$WIFI_KO")"
 if [[ "$replacement_name" != "qca_cld3_wcn7750" && "$ALLOW_MODULE_NAME_MISMATCH" -ne 1 ]]; then
@@ -226,6 +227,21 @@ if [[ -z "$filesystem_uuid" ]]; then
 	echo "Could not read the stock EROFS UUID." >&2
 	exit 1
 fi
+fec_num_roots="$(awk -F': *' '/FEC num roots:/ {print $2; exit}' <<<"$stock_avb_info")"
+AVB_FEC_ARGS=()
+if [[ "$fec_num_roots" =~ ^[0-9]+$ ]] && ((fec_num_roots > 0)) && \
+	command -v fec >/dev/null 2>&1; then
+	AVB_FEC_ARGS=(--fec_num_roots "$fec_num_roots")
+else
+	AVB_FEC_ARGS=(--do_not_generate_fec)
+fi
+AVB_PROP_ARGS=()
+while IFS= read -r line; do
+	prop="$(sed -n "s/^[[:space:]]*Prop: \\(.*\\) -> '\\(.*\\)'$/\\1:\\2/p" <<<"$line")"
+	if [[ -n "$prop" ]]; then
+		AVB_PROP_ARGS+=(--prop "$prop")
+	fi
+done <<<"$stock_avb_info"
 
 # PixelOS labels vendor_dlkm contents as vendor_file. Extraction as an ordinary
 # CI user cannot restore security.selinux xattrs, so mkfs applies them directly.
@@ -243,6 +259,11 @@ echo "  partition bytes:   $partition_size"
 echo "  replacement Wi-Fi: $WIFI_KO"
 echo "  replacement magic: $replacement_vermagic"
 echo "  EROFS cluster:     $CLUSTER_SIZE"
+if [[ "${AVB_FEC_ARGS[*]}" == *--do_not_generate_fec* ]]; then
+	echo "  AVB FEC roots:     0"
+else
+	echo "  AVB FEC roots:     ${fec_num_roots:-0}"
+fi
 
 MKFS_ARGS=(
 	--quiet
@@ -265,7 +286,8 @@ run_avbtool add_hashtree_footer \
 	--partition_name vendor_dlkm \
 	--partition_size "$partition_size" \
 	--hash_algorithm sha256 \
-	--do_not_generate_fec
+	"${AVB_FEC_ARGS[@]}" \
+	"${AVB_PROP_ARGS[@]}"
 
 if [[ "$(stat -c %s "$OUT_IMG")" -ne "$partition_size" ]]; then
 	echo "Output size does not match the stock partition image." >&2
