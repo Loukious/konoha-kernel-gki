@@ -1,3 +1,20 @@
+diff --git a/qcacld-3.0/Kbuild b/qcacld-3.0/Kbuild
+index db72b3f7..132a548b 100644
+--- a/qcacld-3.0/Kbuild
++++ b/qcacld-3.0/Kbuild
+@@ -1740,2 +1740,12 @@
+ MGMT_RX_SRNG_DIR := components/mgmt_rx_srng
++ifeq ($(CONFIG_FEATURE_MGMT_RX_OVER_SRNG), y)
++MGMT_RX_SRNG_OBJS := $(MGMT_RX_SRNG_DIR)/core/src/wlan_mgmt_rx_srng.o \
++		    $(MGMT_RX_SRNG_DIR)/dispatcher/src/wlan_mgmt_rx_srng_ucfg_api.o \
++		    components/target_if/mgmt_rx_srng/src/target_if_mgmt_rx_srng.o \
++		    $(MGMT_RX_SRNG_DIR)/dispatcher/src/wlan_mgmt_rx_srng_tgt_api.o
++ccflags-y += -DFEATURE_MGMT_RX_OVER_SRNG
++endif
++
++$(call add-wlan-objs,mgmt_rx_srng,$(MGMT_RX_SRNG_OBJS))
++
+ MGMT_RX_SRNG_INC := -I$(WLAN_ROOT)/$(MGMT_RX_SRNG_DIR)/core/inc \
 diff --git a/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c b/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c
 index 24a536c8..012b4f43 100644
 --- a/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c
@@ -65,10 +82,11 @@ diff --git a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig b/qcacld-3.0/configs/s
 index 06134a51..619a1b4d 100644
 --- a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
 +++ b/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
-@@ -64,6 +64,7 @@ CONFIG_FEATURE_HTC_CREDIT_HISTORY=y
+@@ -64,6 +64,8 @@ CONFIG_FEATURE_HTC_CREDIT_HISTORY=y
  CONFIG_FEATURE_INTEROP_ISSUES_AP=y
  CONFIG_FEATURE_MEMDUMP_ENABLE=y
  CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y
++CONFIG_FEATURE_MGMT_RX_OVER_SRNG=y
 +CONFIG_FEATURE_SMEM_MAILBOX=y
  CONFIG_FEATURE_MSCS=y
  CONFIG_FEATURE_NO_DBS_INTRABAND_MCC_SUPPORT=y
