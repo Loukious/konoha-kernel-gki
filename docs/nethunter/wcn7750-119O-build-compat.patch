@@ -1,0 +1,89 @@
+diff --git a/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c b/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c
+index 24a536c8..012b4f43 100644
+--- a/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c
++++ b/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c
+@@ -48,6 +48,22 @@
+ #define MLME_GET_CHAN_STATS_PASSIVE_SCAN_TIME 40
+ #define MLME_GET_CHAN_STATS_WIDE_BAND_PASSIVE_SCAN_TIME 110
+ 
++#define XIAOMI_HW_PLATFORM_2G_5G_ONLY 3
++#define XIAOMI_HW_COUNTRY_CN 0
++
++extern int get_hw_version_platform(void);
++extern int get_hw_country_version(void);
++
++static inline bool mlme_xiaomi_hw_is_2g_5g_only(void)
++{
++	return get_hw_version_platform() == XIAOMI_HW_PLATFORM_2G_5G_ONLY;
++}
++
++static inline bool mlme_xiaomi_hw_is_cn_build(void)
++{
++	return get_hw_country_version() == XIAOMI_HW_COUNTRY_CN;
++}
++
+ struct wlan_mlme_rx_ops *
+ mlme_get_rx_ops(struct wlan_objmgr_psoc *psoc)
+ {
+@@ -1366,8 +1382,12 @@ static void mlme_init_generic_cfg(struct wlan_objmgr_psoc *psoc,
+ 		cfg_get(psoc, CFG_ENABLE_RTT_MAC_RANDOMIZATION);
+ 	gen->band_capability =
+ 		cfg_get(psoc, CFG_BAND_CAPABILITY);
+-	if (!gen->band_capability)
++	if (mlme_xiaomi_hw_is_2g_5g_only()) {
++		mlme_debug("replace ini BandCapability=3, support both 2.4G and 5G");
++		gen->band_capability = BIT(REG_BAND_2G) | BIT(REG_BAND_5G);
++	} else if (!gen->band_capability) {
+ 		gen->band_capability = REG_BAND_MASK_ALL;
++	}
+ 	gen->band = gen->band_capability;
+ 	gen->select_5ghz_margin =
+ 		cfg_get(psoc, CFG_SELECT_5GHZ_MARGIN);
+@@ -1607,6 +1627,10 @@ mlme_init_qos_edca_params(struct wlan_objmgr_psoc *psoc,
+ {
+ 	edca_params->enable_edca_params =
+ 			cfg_get(psoc, CFG_EDCA_ENABLE_PARAM);
++	if (!mlme_xiaomi_hw_is_cn_build()) {
++		mlme_debug("set enable_edca_params 0 due to not CN build");
++		edca_params->enable_edca_params = false;
++	}
+ 
+ 	edca_params->enable_wmm_txop =
+ 			cfg_get(psoc, CFG_ENABLE_WMM_TXOP);
+@@ -3543,6 +3567,10 @@ static void mlme_init_wifi_pos_cfg(struct wlan_objmgr_psoc *psoc,
+ 		cfg_get(psoc, CFG_FINE_TIME_MEAS_CAPABILITY);
+ 	wifi_pos_cfg->oem_6g_support_disable =
+ 		cfg_get(psoc, CFG_OEM_SIXG_SUPPORT_DISABLE);
++	if (mlme_xiaomi_hw_is_2g_5g_only()) {
++		mlme_debug("replace ini oem_6g_support_disable=1");
++		wifi_pos_cfg->oem_6g_support_disable = true;
++	}
+ 	mlme_init_wifi_pos_11az_config(psoc, wifi_pos_cfg);
+ }
+ 
+diff --git a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig b/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
+index 06134a51..619a1b4d 100644
+--- a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
++++ b/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
+@@ -64,6 +64,7 @@ CONFIG_FEATURE_HTC_CREDIT_HISTORY=y
+ CONFIG_FEATURE_INTEROP_ISSUES_AP=y
+ CONFIG_FEATURE_MEMDUMP_ENABLE=y
+ CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y
++CONFIG_FEATURE_SMEM_MAILBOX=y
+ CONFIG_FEATURE_MSCS=y
+ CONFIG_FEATURE_NO_DBS_INTRABAND_MCC_SUPPORT=y
+ CONFIG_FEATURE_OEM_DATA=y
+diff --git a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c b/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
+index cb044784..145b6f4b 100644
+--- a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
++++ b/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
+@@ -4114,7 +4114,8 @@ lim_match_link_info(uint8_t req_link_id,
+ {
+ 	uint8_t i;
+ 
+-	for (i = 0; i < partner_info->num_partner_links; i++) {
++	for (i = 0; i < QDF_MIN(partner_info->num_partner_links,
++			       QDF_ARRAY_SIZE(partner_info->partner_link_info)); i++) {
+ 		if (partner_info->partner_link_info[i].link_id == req_link_id &&
+ 		    (qdf_is_macaddr_equal(link_addr,
+ 					  &partner_info->partner_link_info[i].link_addr)))

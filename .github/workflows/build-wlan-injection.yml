@@ -157,8 +157,15 @@ jobs:
         if: ${{ inputs.enable_injection == false && inputs.apply_compat_patch }}
         working-directory: gki-clo/vendor/qcom/opensource/wlan
         run: |
-          git apply --check "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-build-compat.patch"
-          git apply "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-build-compat.patch"
+          primary="$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-build-compat.patch"
+          fallback="$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-119O-build-compat.patch"
+          patch="$primary"
+          if ! git apply --check "$patch" 2>/tmp/wcn7750-compat.err; then
+            patch="$fallback"
+            git apply --check "$patch"
+          fi
+          echo "Applying compatibility patch: $(basename "$patch")"
+          git apply "$patch"
           git diff --check
 
       - name: Prepare Xiaomi Onyx kernel ABI headers
