@@ -1,0 +1,2282 @@
+diff --git a/qcacld-3.0/Kbuild b/qcacld-3.0/Kbuild
+index 95d0578..855098b 100644
+--- a/qcacld-3.0/Kbuild
++++ b/qcacld-3.0/Kbuild
+@@ -116,6 +116,7 @@ HDD_SRC_DIR :=	$(HDD_DIR)/src
+ 
+ HDD_INC := 	-I$(WLAN_ROOT)/$(HDD_INC_DIR) \
+ 		-I$(WLAN_ROOT)/$(HDD_SRC_DIR) \
++		-I$(WLAN_ROOT)/$(HDD_SRC_DIR)/p2phc
+ 
+ HDD_OBJS := 	$(HDD_SRC_DIR)/wlan_hdd_assoc.o \
+ 		$(HDD_SRC_DIR)/wlan_hdd_cfg.o \
+@@ -139,7 +140,10 @@ HDD_OBJS := 	$(HDD_SRC_DIR)/wlan_hdd_assoc.o \
+ 		$(HDD_SRC_DIR)/wlan_hdd_tx_rx.o \
+ 		$(HDD_SRC_DIR)/wlan_hdd_wmm.o \
+ 		$(HDD_SRC_DIR)/wlan_hdd_wowl.o\
+-		$(HDD_SRC_DIR)/wlan_hdd_ll_lt_sap.o
++		$(HDD_SRC_DIR)/wlan_hdd_ll_lt_sap.o\
++		$(HDD_SRC_DIR)/p2phc/p2phc.o \
++		$(HDD_SRC_DIR)/p2phc/dlhc.o \
++		$(HDD_SRC_DIR)/p2phc/p2phc_switch.o
+ 
+ ifeq ($(CONFIG_UNIT_TEST), y)
+ HDD_OBJS += $(HDD_SRC_DIR)/wlan_hdd_unit_test.o
+diff --git a/qcacld-3.0/core/hdd/src/p2phc/dlhc.c b/qcacld-3.0/core/hdd/src/p2phc/dlhc.c
+new file mode 100644
+index 0000000..12dbd89
+--- /dev/null
++++ b/qcacld-3.0/core/hdd/src/p2phc/dlhc.c
+@@ -0,0 +1,945 @@
++// MIUI ADD: WIFI_P2PHC
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/types.h>
++#include <linux/string.h>
++#include <linux/errno.h>
++#include <linux/kernel.h>
++#include "dlhc.h"
++
++#ifdef CONFIG_INET
++/* Entire module is for IP only */
++#include <linux/mm.h>
++#include <linux/socket.h>
++#include <linux/sockios.h>
++#include <linux/termios.h>
++#include <linux/in.h>
++#include <linux/fcntl.h>
++#include <linux/inet.h>
++#include <linux/netdevice.h>
++#include <net/ip.h>
++#include <net/protocol.h>
++#include <net/icmp.h>
++#include <net/tcp.h>
++#include <linux/skbuff.h>
++#include <net/sock.h>
++#include <linux/timer.h>
++#include <linux/uaccess.h>
++#include <net/checksum.h>
++#include <asm/unaligned.h>
++
++static unsigned char * put16(unsigned char *cp, unsigned short x);
++static unsigned char * put32(unsigned char *cp, unsigned int x);
++static unsigned short pull16(unsigned char **cpp);
++static unsigned int pull32(unsigned char **cpp);
++
++/* Allocate compression data structure
++ *	slots must be in range 0 to 255 (zero meaning no compression)
++ * Returns pointer to structure or ERR_PTR() on error.
++ */
++static struct dlhc *__dlhc_init(struct dlhc *comp, int rslots, int tslots, unsigned char flags)
++{
++	short i;
++	struct cstate *ts;
++
++	if (! comp)
++		goto out_fail;
++
++	if (rslots > 0) {
++		size_t rsize = rslots * sizeof(struct cstate);
++		comp->rstate = kzalloc(rsize, GFP_KERNEL);
++		if (! comp->rstate)
++			goto out_fail;
++		comp->rslot_limit = rslots - 1;
++	}
++
++	if (tslots > 0) {
++		size_t tsize = tslots * sizeof(struct cstate);
++		comp->tstate = kzalloc(tsize, GFP_KERNEL);
++		if (! comp->tstate)
++			goto out_free;
++		comp->tslot_limit = tslots - 1;
++	}
++
++	comp->xmit_oldest = 0;
++	comp->xmit_current = 255;
++	comp->recv_current = 255;
++	/*
++	 * don't accept any packets with implicit index until we get
++	 * one with an explicit index.  Otherwise the uncompress code
++	 * will try to use connection 255, which is almost certainly
++	 * out of range
++	 */
++	comp->flags |= DLHC_F_TOSS;
++	comp->flags |= flags;
++
++	if ( tslots > 0 ) {
++		ts = comp->tstate;
++		for(i = comp->tslot_limit; i > 0; --i){
++			ts[i].cs_this = i;
++			ts[i].next = &(ts[i - 1]);
++		}
++		ts[0].next = &(ts[comp->tslot_limit]);
++		ts[0].cs_this = 0;
++	}
++	return comp;
++
++out_free:
++	kfree(comp->rstate);
++out_fail:
++	return ERR_PTR(-ENOMEM);
++}
++
++struct dlhc *dlhc_init(int rslots, int tslots)
++{
++	struct dlhc *comp, *comp_tcp, *comp_udp;
++
++	if (rslots < 0 || rslots > 255 || tslots < 0 || tslots > 255)
++		return ERR_PTR(-EINVAL);
++
++	comp = kzalloc(sizeof(struct dlhc) * 2, GFP_KERNEL);
++	if (! comp)
++		goto out_fail;
++
++	/* tcp */
++	comp_tcp = comp;
++	comp_tcp = __dlhc_init(comp_tcp, rslots, tslots, DLHC_F_TCP);
++	if (IS_ERR(comp_tcp)) {
++		kfree(comp);
++		goto out_fail;
++	}
++	/* udp */
++	comp_udp = comp + 1;
++	comp_udp = __dlhc_init(comp_udp, rslots, tslots, DLHC_F_UDP);
++	if (IS_ERR(comp_udp)) {
++		dlhc_free(comp);
++		goto out_fail;
++	}
++	return comp;
++
++out_fail:
++	return ERR_PTR(-ENOMEM);
++}
++
++void dlhc_free(struct dlhc *comp)
++{
++	struct dlhc *comp2;
++
++	if ( IS_ERR_OR_NULL(comp) )
++		return;
++
++	if ( comp->tstate != NULLSLSTATE )
++		kfree( comp->tstate );
++
++	if ( comp->rstate != NULLSLSTATE )
++		kfree( comp->rstate );
++
++	comp2 = comp + 1;
++	if ( comp2->tstate != NULLSLSTATE )
++		kfree( comp2->tstate );
++
++	if ( comp2->rstate != NULLSLSTATE )
++		kfree( comp2->rstate );
++
++	kfree( comp );
++}
++
++int dlhc_reset(struct dlhc *comp)
++{
++	int i;
++	struct cstate *ts;
++	struct cstate *rs;
++	struct dlhc *comp2;
++
++	if ( IS_ERR_OR_NULL(comp) )
++		return -1;
++
++	/* tcp tx */
++	comp->xmit_current = 255;
++	comp->xmit_oldest = 0;
++	ts = comp->tstate;
++	memset(ts, 0, (comp->tslot_limit + 1) * sizeof(struct cstate));
++	for (i = comp->tslot_limit; i > 0; --i) {
++			ts[i].cs_this = i;
++			ts[i].next = &(ts[i - 1]);
++	}
++	ts[0].next = &(ts[comp->tslot_limit]);
++
++	/* tcp rx */
++	comp->recv_current = 255;
++	comp->flags |= DLHC_F_TOSS;
++	rs = comp->rstate;
++	for (i = comp->rslot_limit; i > 0; --i) {
++		rs[i].initialized = false;
++	}
++
++	comp2 = comp + 1;
++	/* udp tx */
++	comp2->xmit_current = 255;
++	comp2->xmit_oldest = 0;
++	ts = comp2->tstate;
++	memset(ts, 0, (comp2->tslot_limit + 1) * sizeof(struct cstate));
++	for (i = comp2->tslot_limit; i > 0; --i) {
++			ts[i].cs_this = i;
++			ts[i].next = &(ts[i - 1]);
++	}
++	ts[0].next = &(ts[comp2->tslot_limit]);
++
++	/* udp rx */
++	comp2->recv_current = 255;
++	comp2->flags |= DLHC_F_TOSS;
++	rs = comp2->rstate;
++	for (i = comp2->rslot_limit; i > 0; --i) {
++		rs[i].initialized = false;
++	}
++
++	return 0;
++}
++
++/* Put a short in host order into a char array in network order */
++static inline unsigned char *put16(unsigned char *cp, unsigned short x)
++{
++	*cp++ = x >> 8;
++	*cp++ = x;
++
++	return cp;
++}
++
++static inline unsigned char *put32(unsigned char *cp, unsigned int x)
++{
++	*cp++ = x >> 24;
++	*cp++ = x >> 16;
++	*cp++ = x >> 8;
++	*cp++ = x;
++
++	return cp;
++}
++
++/* Pull a 16-bit integer in host order from buffer in network byte order */
++static unsigned short pull16(unsigned char **cpp)
++{
++	short rval;
++
++	rval = *(*cpp)++;
++	rval <<= 8;
++	rval |= *(*cpp)++;
++	return rval;
++}
++
++static unsigned int pull32(unsigned char **cpp)
++{
++	unsigned int rval;
++
++	rval = *(*cpp)++;
++	rval <<= 8;
++	rval |= *(*cpp)++;
++	rval <<= 8;
++	rval |= *(*cpp)++;
++	rval <<= 8;
++	rval |= *(*cpp)++;
++	return rval;
++}
++
++/*
++ * icp and isize are the original packet.
++ * ocp is a place to put a copy if necessary.
++ * cpp is initially a pointer to icp.  If the copy is used,
++ *    change it to ocp.
++ */
++static int __dlhc_compress_tcp(struct dlhc *comp, unsigned char *icp, int isize,
++	unsigned char *ocp, unsigned char **cpp, int compress_cid)
++{
++	struct cstate *ocs = &(comp->tstate[comp->xmit_oldest]);
++	struct cstate *lcs = ocs;
++	struct cstate *cs = lcs->next;
++	int nlen, hlen;
++	unsigned char *cp;
++	struct iphdr *ip;
++	struct tcphdr *th;
++
++	ip = (struct iphdr *) icp;
++	nlen = ip->ihl * 4;
++	if (isize < nlen + sizeof(struct tcphdr))
++		return isize;
++
++	th = (struct tcphdr *)(icp + nlen);
++	if (th->doff < sizeof(struct tcphdr) / 4)
++		return isize;
++	hlen = nlen + th->doff * 4;
++
++	/*  Bail if the TCP packet isn't `compressible' (i.e., ACK isn't set or
++	 *  some other control bit is set). Also uncompressible if
++	 *  it's a runt.
++	 */
++	if(hlen > isize || th->syn || th->fin || th->rst || th->urg ||
++	    ! (th->ack)){
++		/* TCP connection stuff; send as regular IP */
++		comp->stat_o_tcp++;
++		return isize;
++	}
++	/*
++	 * Packet is compressible -- we're going to send either a
++	 * COMPRESSED_TCP or UNCOMPRESSED_TCP packet.  Either way,
++	 * we need to locate (or create) the connection state.
++	 *
++	 * States are kept in a circularly linked list with
++	 * xmit_oldest pointing to the end of the list.  The
++	 * list is kept in lru order by moving a state to the
++	 * head of the list whenever it is referenced.  Since
++	 * the list is short and, empirically, the connection
++	 * we want is almost always near the front, we locate
++	 * states via linear search.  If we don't find a state
++	 * for the datagram, the oldest state is (re-)used.
++	 */
++	for ( ; ; ) {
++		if( ip->saddr == cs->cs_ip.saddr
++		 && ip->daddr == cs->cs_ip.daddr
++		 && th->source == cs->cs_tcp.source
++		 && th->dest == cs->cs_tcp.dest)
++			goto found;
++
++		/* if current equal oldest, at end of list */
++		if ( cs == ocs )
++			break;
++		lcs = cs;
++		cs = cs->next;
++		comp->stat_o_searches++;
++	}
++	/*
++	 * Didn't find it -- re-use oldest cstate.  Send an
++	 * uncompressed packet that tells the other side what
++	 * connection number we're using for this conversation.
++	 *
++	 * Note that since the state list is circular, the oldest
++	 * state points to the newest and we only need to set
++	 * xmit_oldest to update the lru linkage.
++	 */
++	comp->stat_o_misses++;
++	comp->xmit_oldest = lcs->cs_this;
++	goto uncompressed;
++
++found:
++	/*
++	 * Found it -- move to the front on the connection list.
++	 */
++	if(lcs == ocs) {
++		/* found at most recently used */
++	} else if (cs == ocs) {
++		/* found at least recently used */
++		comp->xmit_oldest = lcs->cs_this;
++	} else {
++		/* more than 2 elements */
++		lcs->next = cs->next;
++		cs->next = ocs->next;
++		ocs->next = cs;
++	}
++
++	/*
++	 * Make sure that only what we expect to change changed.
++	 * Check the following:
++	 * IP protocol version, header length & type of service.
++	 * The "Don't fragment" bit.
++	 * The time-to-live field.
++	 * The TCP header length.
++	 * IP options, if any.
++	 * TCP options, if any.
++	 * If any of these things are different between the previous &
++	 * current datagram, we send the current datagram `uncompressed'.
++	 */
++	if(ip->version != cs->cs_ip.version || ip->ihl != cs->cs_ip.ihl
++	 || ip->tos != cs->cs_ip.tos
++	 || (ip->frag_off & htons(0x4000)) != (cs->cs_ip.frag_off & htons(0x4000))
++	 || ip->ttl != cs->cs_ip.ttl
++	 || th->doff != cs->cs_tcp.doff
++	 || (ip->ihl > 5 && memcmp(ip+1,cs->cs_ipopt,((ip->ihl)-5)*4) != 0)
++	 || (th->doff > 5 && memcmp(th+1,cs->cs_tcpopt,((th->doff)-5)*4) != 0)){
++		goto uncompressed;
++	}
++
++	if (!(th->urg) && (th->urg_ptr != cs->cs_tcp.urg_ptr)) {
++		/* argh! URG not set but urp changed -- a sensible
++		 * implementation should never do this but RFC793
++		 * doesn't prohibit the change so we have to deal
++		 * with it. */
++		goto uncompressed;
++	}
++
++	//memcpy(&cs->cs_ip, ip, 20);
++	//memcpy(&cs->cs_tcp, th, 20);
++
++	if(compress_cid == 0 || comp->xmit_current != cs->cs_this){
++		cp = ocp;
++		*cpp = ocp;
++		*cp++ = NEW_C;
++		*cp++ = cs->cs_this;
++		comp->xmit_current = cs->cs_this;
++	} else {
++		cp = ocp;
++		*cpp = ocp;
++		*cp++ = 0;
++	}
++
++	cp = put16(cp, ntohs(ip->id));
++	cp = put32(cp, ntohl(th->seq));
++	cp = put32(cp, ntohl(th->ack_seq));
++	cp = put16(cp, ntohs(th->window));
++	cp = put16(cp, ntohs(th->check));
++	if(th->psh)
++		ocp[0] |= TCP_PUSH_BIT;
++
++	memcpy(cp, icp + hlen, isize - hlen);
++	ocp[0] &= ~DL_TYPE_MASK;
++	ocp[0] |= DL_TYPE_COMPRESSED_TCP;
++
++	comp->stat_o_compressed++;
++	return isize - hlen + (cp - ocp);
++
++	/* Update connection state cs & send uncompressed packet (i.e.,
++	 * a regular ip/tcp packet but with the 'conversation id' we hope
++	 * to use on future compressed packets in the protocol field).
++	 */
++uncompressed:
++	memcpy(&cs->cs_ip,ip,20);
++	memcpy(&cs->cs_tcp,th,20);
++	if (ip->ihl > 5)
++	  memcpy(cs->cs_ipopt, ip+1, ((ip->ihl) - 5) * 4);
++	if (th->doff > 5)
++	  memcpy(cs->cs_tcpopt, th+1, ((th->doff) - 5) * 4);
++	comp->xmit_current = cs->cs_this;
++	comp->stat_o_uncompressed++;
++	memcpy(ocp, icp, isize);
++	*cpp = ocp;
++	ocp[9] = cs->cs_this;
++	ocp[0] &= ~DL_TYPE_MASK;
++	ocp[0] |= DL_TYPE_UNCOMPRESSED_TCP;
++	return isize;
++}
++
++static int __dlhc_compress_udp(struct dlhc *comp, unsigned char *icp, int isize,
++	unsigned char *ocp, unsigned char **cpp, int compress_cid)
++{
++	struct cstate *ocs = &(comp->tstate[comp->xmit_oldest]);
++	struct cstate *lcs = ocs;
++	struct cstate *cs = lcs->next;
++	int nlen, hlen;
++	unsigned char *cp;
++	struct iphdr *ip;
++	struct udphdr *uh;
++
++	ip = (struct iphdr *) icp;
++	nlen = ip->ihl * 4;
++	hlen = nlen + sizeof(struct udphdr);
++	if (isize < hlen)
++		return isize;
++
++	uh = (struct udphdr *)(icp + nlen);
++
++	/*
++	 * Packet is compressible -- we're going to send either a
++	 * COMPRESSED_TCP or UNCOMPRESSED_TCP packet.  Either way,
++	 * we need to locate (or create) the connection state.
++	 *
++	 * States are kept in a circularly linked list with
++	 * xmit_oldest pointing to the end of the list.  The
++	 * list is kept in lru order by moving a state to the
++	 * head of the list whenever it is referenced.  Since
++	 * the list is short and, empirically, the connection
++	 * we want is almost always near the front, we locate
++	 * states via linear search.  If we don't find a state
++	 * for the datagram, the oldest state is (re-)used.
++	 */
++	for ( ; ; ) {
++		if( ip->saddr == cs->cs_ip.saddr
++		 && ip->daddr == cs->cs_ip.daddr
++		 && uh->source == cs->cs_udp.source
++		 && uh->dest == cs->cs_udp.dest)
++			goto found;
++
++		/* if current equal oldest, at end of list */
++		if ( cs == ocs )
++			break;
++		lcs = cs;
++		cs = cs->next;
++		comp->stat_o_searches++;
++	}
++	/*
++	 * Didn't find it -- re-use oldest cstate.  Send an
++	 * uncompressed packet that tells the other side what
++	 * connection number we're using for this conversation.
++	 *
++	 * Note that since the state list is circular, the oldest
++	 * state points to the newest and we only need to set
++	 * xmit_oldest to update the lru linkage.
++	 */
++	comp->stat_o_misses++;
++	comp->xmit_oldest = lcs->cs_this;
++	goto uncompressed;
++
++found:
++	/*
++	 * Found it -- move to the front on the connection list.
++	 */
++	if(lcs == ocs) {
++		/* found at most recently used */
++	} else if (cs == ocs) {
++		/* found at least recently used */
++		comp->xmit_oldest = lcs->cs_this;
++	} else {
++		/* more than 2 elements */
++		lcs->next = cs->next;
++		cs->next = ocs->next;
++		ocs->next = cs;
++	}
++
++	/*
++	 * Make sure that only what we expect to change changed.
++	 * Check the following:
++	 * IP protocol version, header length & type of service.
++	 * The "Don't fragment" bit.
++	 * The time-to-live field.
++	 * IP options, if any.
++	 * If any of these things are different between the previous &
++	 * current datagram, we send the current datagram `uncompressed'.
++	 */
++	if(ip->version != cs->cs_ip.version || ip->ihl != cs->cs_ip.ihl
++	 || ip->tos != cs->cs_ip.tos
++	 || (ip->frag_off & htons(0x4000)) != (cs->cs_ip.frag_off & htons(0x4000))
++	 || ip->ttl != cs->cs_ip.ttl
++	 || (ip->ihl > 5 && memcmp(ip+1,cs->cs_ipopt,((ip->ihl)-5)*4) != 0)) {
++		goto uncompressed;
++	}
++
++	//memcpy(&cs->cs_ip, ip, 20);
++	//memcpy(&cs->cs_udp, uh, 8);
++
++	if(compress_cid == 0 || comp->xmit_current != cs->cs_this){
++		cp = ocp;
++		*cpp = ocp;
++		*cp++ = NEW_C;
++		*cp++ = cs->cs_this;
++		comp->xmit_current = cs->cs_this;
++	} else {
++		cp = ocp;
++		*cpp = ocp;
++		*cp++ = 0;
++	}
++
++	cp = put16(cp, ntohs(ip->id));
++	cp = put16(cp, ntohs(uh->len));
++	cp = put16(cp, ntohs(uh->check));
++
++	memcpy(cp, icp + hlen, isize - hlen);
++	ocp[0] &= ~DL_TYPE_MASK;
++	ocp[0] |= DL_TYPE_COMPRESSED_UDP;
++
++	comp->stat_o_compressed++;
++	return isize - hlen + (cp - ocp);
++
++	/* Update connection state cs & send uncompressed packet (i.e.,
++	 * a regular ip/tcp packet but with the 'conversation id' we hope
++	 * to use on future compressed packets in the protocol field).
++	 */
++uncompressed:
++	memcpy(&cs->cs_ip,ip,20);
++	memcpy(&cs->cs_udp,uh,8);
++	if (ip->ihl > 5)
++	  memcpy(cs->cs_ipopt, ip+1, ((ip->ihl) - 5) * 4);
++	comp->xmit_current = cs->cs_this;
++	comp->stat_o_uncompressed++;
++	memcpy(ocp, icp, isize);
++	*cpp = ocp;
++	ocp[9] = cs->cs_this;
++	ocp[0] &= ~DL_TYPE_MASK;
++	ocp[0] |= DL_TYPE_UNCOMPRESSED_UDP;
++	return isize;
++}
++
++int dlhc_compress(struct dlhc *comp, unsigned char *icp, int isize,
++	unsigned char *ocp, unsigned char **cpp, int compress_cid)
++{
++	struct iphdr *ip;
++
++	/*
++	 *	Don't play with runt packets.
++	 */
++	if(isize < sizeof(struct iphdr))
++		return isize;
++
++	ip = (struct iphdr *) icp;
++	if (ip->version != 4 || ip->ihl < 5)
++		return isize;
++
++	/* Bail if this packet is an IP fragment */
++	if (ntohs(ip->frag_off) & 0x3fff) {
++		return isize;
++	}
++
++	if (ip->protocol == IPPROTO_TCP) {
++		return __dlhc_compress_tcp(comp, icp, isize, ocp, cpp, compress_cid);
++	} else if (ip->protocol == IPPROTO_UDP) {
++		return __dlhc_compress_udp(comp + 1, icp, isize, ocp, cpp, compress_cid);
++	}
++
++	return isize;
++}
++
++static int __dlhc_uncompress_tcp(struct dlhc *comp, unsigned char *icp, int isize)
++{
++	unsigned char changes;
++	long x;
++	struct tcphdr *thp;
++	struct iphdr *ip;
++	struct cstate *cs;
++	int len, hdrlen;
++	unsigned char *cp = icp;
++
++	comp->stat_i_compressed++;
++	if(isize < 15){
++		comp->stat_i_error++;
++		return 0;
++	}
++	changes = *cp++;
++	if(changes & NEW_C){
++		/* Make sure the state index is in range, then grab the state.
++		 * If we have a good state index, clear the 'discard' flag.
++		 */
++		x = *cp++;	/* Read conn index */
++		if(x < 0 || x > comp->rslot_limit)
++			goto bad;
++
++		/* Check if the cstate is initialized */
++		if (!comp->rstate[x].initialized)
++			goto bad;
++
++		comp->flags &=~ DLHC_F_TOSS;
++		comp->recv_current = x;
++	} else {
++		/* this packet has an implicit state index.  If we've
++		 * had a line error since the last time we got an
++		 * explicit state index, we have to toss the packet. */
++		if(comp->flags & DLHC_F_TOSS){
++			comp->stat_i_tossed++;
++			return 0;
++		}
++	}
++	cs = &comp->rstate[comp->recv_current];
++	thp = &cs->cs_tcp;
++	ip = &cs->cs_ip;
++
++	ip->id = htons(pull16(&cp));
++	thp->seq = htonl(pull32(&cp));
++	thp->ack_seq = htonl(pull32(&cp));
++	thp->window = htons(pull16(&cp));
++	thp->check = htons(pull16(&cp));
++	thp->psh = (changes & TCP_PUSH_BIT) ? 1 : 0;
++
++	hdrlen = ip->ihl * 4 + thp->doff * 4;
++
++	/*
++	 * At this point, cp points to the first byte of data in the
++	 * packet.  Put the reconstructed TCP and IP headers back on the
++	 * packet.  Recalculate IP checksum (but not TCP checksum).
++	 */
++	len = isize - (cp - icp);
++	if (len < 0)
++		goto bad;
++	len += hdrlen;
++	ip->tot_len = htons(len);
++	ip->check = 0;
++
++	memmove(icp + hdrlen, cp, len - hdrlen);
++
++	cp = icp;
++	memcpy(cp, ip, 20);
++	cp += 20;
++
++	if (ip->ihl > 5) {
++	  memcpy(cp, cs->cs_ipopt, (ip->ihl - 5) * 4);
++	  cp += (ip->ihl - 5) * 4;
++	}
++
++	put_unaligned(ip_fast_csum(icp, ip->ihl),
++		      &((struct iphdr *)icp)->check);
++
++	memcpy(cp, thp, 20);
++	cp += 20;
++
++	if (thp->doff > 5) {
++	  memcpy(cp, cs->cs_tcpopt, ((thp->doff) - 5) * 4);
++	  cp += ((thp->doff) - 5) * 4;
++	}
++
++	return len;
++bad:
++	comp->stat_i_error++;
++	return dlhc_toss( comp );
++}
++
++static int __dlhc_uncompress_udp(struct dlhc *comp, unsigned char *icp, int isize)
++{
++	unsigned char changes;
++	long x;
++	struct udphdr *uhp;
++	struct iphdr *ip;
++	struct cstate *cs;
++	int len, hdrlen;
++	unsigned char *cp = icp;
++
++	comp->stat_i_compressed++;
++	if(isize < 7){
++		comp->stat_i_error++;
++		return 0;
++	}
++	changes = *cp++;
++	if(changes & NEW_C){
++		/* Make sure the state index is in range, then grab the state.
++		 * If we have a good state index, clear the 'discard' flag.
++		 */
++		x = *cp++;	/* Read conn index */
++		if(x < 0 || x > comp->rslot_limit)
++			goto bad;
++
++		/* Check if the cstate is initialized */
++		if (!comp->rstate[x].initialized)
++			goto bad;
++
++		comp->flags &=~ DLHC_F_TOSS;
++		comp->recv_current = x;
++	} else {
++		/* this packet has an implicit state index.  If we've
++		 * had a line error since the last time we got an
++		 * explicit state index, we have to toss the packet. */
++		if(comp->flags & DLHC_F_TOSS){
++			comp->stat_i_tossed++;
++			return 0;
++		}
++	}
++	cs = &comp->rstate[comp->recv_current];
++	uhp = &cs->cs_udp;
++	ip = &cs->cs_ip;
++
++	ip->id = htons(pull16(&cp));
++	uhp->len = htons(pull16(&cp));
++	uhp->check = htons(pull16(&cp));
++
++	hdrlen = (ip->ihl * 4) + 8;
++
++	/*
++	 * At this point, cp points to the first byte of data in the
++	 * packet.  Put the reconstructed UDP and IP headers back on the
++	 * packet.  Recalculate IP checksum (but not UDP checksum).
++	 */
++	len = isize - (cp - icp);
++	if (len < 0)
++		goto bad;
++	len += hdrlen;
++	ip->tot_len = htons(len);
++	ip->check = 0;
++
++	memmove(icp + hdrlen, cp, len - hdrlen);
++
++	cp = icp;
++	memcpy(cp, ip, 20);
++	cp += 20;
++
++	if (ip->ihl > 5) {
++	  memcpy(cp, cs->cs_ipopt, (ip->ihl - 5) * 4);
++	  cp += (ip->ihl - 5) * 4;
++	}
++
++	put_unaligned(ip_fast_csum(icp, ip->ihl),
++		      &((struct iphdr *)icp)->check);
++
++	memcpy(cp, uhp, 8);
++	cp += 8;
++
++	return len;
++bad:
++	comp->stat_i_error++;
++	return dlhc_toss( comp );
++}
++
++int dlhc_uncompress(struct dlhc *comp, unsigned char *icp, int isize)
++{
++	unsigned char dl_type = icp[0] & DL_TYPE_MASK;
++
++	if (dl_type == DL_TYPE_COMPRESSED_TCP) {
++		return __dlhc_uncompress_tcp(comp, icp, isize);
++	} else if (dl_type == DL_TYPE_COMPRESSED_UDP) {
++		return __dlhc_uncompress_udp(comp + 1, icp, isize);
++	}
++	return 0;
++}
++
++static int __dlhc_remember_tcp(struct dlhc *comp, unsigned char *icp, int isize)
++{
++	struct cstate *cs;
++	unsigned ihl;
++	unsigned char index;
++
++	if(isize < 20) {
++		/* The packet is shorter than a legal IP header */
++		comp->stat_i_runt++;
++		return dlhc_toss( comp );
++	}
++	/* Peek at the IP header's IHL field to find its length */
++	ihl = icp[0] & 0xf;
++	if(ihl < 20 / 4){
++		/* The IP header length field is too small */
++		comp->stat_i_runt++;
++		return dlhc_toss( comp );
++	}
++
++	if (ip_fast_csum(icp, ihl)) {
++		/* Bad IP header checksum; discard */
++		comp->stat_i_badcheck++;
++		return dlhc_toss( comp );
++	}
++
++	index = icp[9];
++	if(index > comp->rslot_limit) {
++		comp->stat_i_error++;
++		return dlhc_toss(comp);
++	}
++
++	icp[0] &= ~DL_TYPE_MASK;
++	icp[0] |= DL_TYPE_IP;
++	icp[9] = IPPROTO_TCP;
++	ip_send_check((struct iphdr *)icp);
++
++	/* Update local state */
++	cs = &comp->rstate[comp->recv_current = index];
++	comp->flags &=~ DLHC_F_TOSS;
++	memcpy(&cs->cs_ip,icp,20);
++	memcpy(&cs->cs_tcp,icp + ihl*4,20);
++	if (ihl > 5)
++	  memcpy(cs->cs_ipopt, icp + sizeof(struct iphdr), (ihl - 5) * 4);
++	if (cs->cs_tcp.doff > 5)
++	  memcpy(cs->cs_tcpopt, icp + ihl*4 + sizeof(struct tcphdr), (cs->cs_tcp.doff - 5) * 4);
++	cs->initialized = true;
++	/* Put headers back on packet
++	 * Neither header checksum is recalculated
++	 */
++	comp->stat_i_uncompressed++;
++	return isize;
++}
++
++static int __dlhc_remember_udp(struct dlhc *comp, unsigned char *icp, int isize)
++{
++	struct cstate *cs;
++	unsigned ihl;
++	unsigned char index;
++
++	if(isize < 20) {
++		/* The packet is shorter than a legal IP header */
++		comp->stat_i_runt++;
++		return dlhc_toss( comp );
++	}
++	/* Peek at the IP header's IHL field to find its length */
++	ihl = icp[0] & 0xf;
++	if(ihl < 20 / 4){
++		/* The IP header length field is too small */
++		comp->stat_i_runt++;
++		return dlhc_toss( comp );
++	}
++
++	if (ip_fast_csum(icp, ihl)) {
++		/* Bad IP header checksum; discard */
++		comp->stat_i_badcheck++;
++		return dlhc_toss( comp );
++	}
++
++	index = icp[9];
++	if(index > comp->rslot_limit) {
++		comp->stat_i_error++;
++		return dlhc_toss(comp);
++	}
++
++	icp[0] &= ~DL_TYPE_MASK;
++	icp[0] |= DL_TYPE_IP;
++	icp[9] = IPPROTO_UDP;
++	ip_send_check((struct iphdr *)icp);
++
++	/* Update local state */
++	cs = &comp->rstate[comp->recv_current = index];
++	comp->flags &=~ DLHC_F_TOSS;
++	memcpy(&cs->cs_ip, icp, 20);
++	memcpy(&cs->cs_udp, icp + ihl*4, 8);
++	if (ihl > 5)
++	  memcpy(cs->cs_ipopt, icp + sizeof(struct iphdr), (ihl - 5) * 4);
++	cs->initialized = true;
++
++	comp->stat_i_uncompressed++;
++	return isize;
++}
++
++int dlhc_remember(struct dlhc *comp, unsigned char *icp, int isize)
++{
++	unsigned char dl_type = icp[0] & DL_TYPE_MASK;
++
++	if (dl_type == DL_TYPE_UNCOMPRESSED_TCP) {
++		return __dlhc_remember_tcp(comp, icp, isize);
++	} else if (dl_type == DL_TYPE_UNCOMPRESSED_UDP) {
++		return __dlhc_remember_udp(comp + 1, icp, isize);
++	}
++	return 0;
++}
++
++int dlhc_toss(struct dlhc *comp)
++{
++	if ( comp == NULL )
++		return 0;
++
++	comp->flags |= DLHC_F_TOSS;
++	return 0;
++}
++
++#else /* CONFIG_INET */
++
++int
++dlhc_toss(struct dlhc *comp)
++{
++  printk(KERN_DEBUG "Called IP function on non IP-system: dlhc_toss");
++  return -EINVAL;
++}
++int
++dlhc_uncompress(struct dlhc *comp, unsigned char *icp, int isize)
++{
++  printk(KERN_DEBUG "Called IP function on non IP-system: dlhc_uncompress");
++  return -EINVAL;
++}
++int
++dlhc_compress(struct dlhc *comp, unsigned char *icp, int isize,
++	unsigned char *ocp, unsigned char **cpp, int compress_cid)
++{
++  printk(KERN_DEBUG "Called IP function on non IP-system: dlhc_compress");
++  return -EINVAL;
++}
++
++int
++dlhc_remember(struct dlhc *comp, unsigned char *icp, int isize)
++{
++  printk(KERN_DEBUG "Called IP function on non IP-system: dlhc_remember");
++  return -EINVAL;
++}
++
++int dlhc_reset(struct dlhc *comp)
++{
++	printk(KERN_DEBUG "Called IP function on non IP-system: dlhc_reset");
++}
++
++void
++dlhc_free(struct dlhc *comp)
++{
++  printk(KERN_DEBUG "Called IP function on non IP-system: dlhc_free");
++}
++
++struct dlhc *
++dlhc_init(int rslots, int tslots)
++{
++  printk(KERN_DEBUG "Called IP function on non IP-system: dlhc_init");
++  return NULL;
++}
++
++#endif /* CONFIG_INET */
++// END WIFI_P2PHC
+diff --git a/qcacld-3.0/core/hdd/src/p2phc/dlhc.h b/qcacld-3.0/core/hdd/src/p2phc/dlhc.h
+new file mode 100644
+index 0000000..c045866
+--- /dev/null
++++ b/qcacld-3.0/core/hdd/src/p2phc/dlhc.h
+@@ -0,0 +1,104 @@
++// MIUI ADD: WIFI_P2PHC
++#ifndef _DLHC_H_
++#define _DLHC_H_
++/*
++ * Packet types (must not conflict with IP protocol version)
++ *
++ * The top nibble of the first octet is the packet type.  There are
++ * three possible types: IP (not proto TCP or tcp with one of the
++ * control flags set); uncompressed TCP (a normal IP/TCP packet but
++ * with the 8-bit protocol field replaced by an 8-bit connection id --
++ * this type of packet syncs the sender & receiver); and compressed
++ * TCP (described above).
++ *
++ * LSB of 4-bit field is TCP "PUSH" bit (a worthless anachronism) and
++ * is logically part of the 4-bit "changes" field that follows.  Top
++ * three bits are actual packet type.  For backward compatibility
++ * and in the interest of conserving bits, numbers are chosen so the
++ * IP protocol version number (4) which normally appears in this nibble
++ * means "IP packet".
++ */
++
++#include <linux/ip.h>
++#include <linux/tcp.h>
++#include <linux/udp.h>
++
++/* SLIP compression masks for len/vers byte */
++#define DL_TYPE_IP	 				0x40
++#define DL_TYPE_UNCOMPRESSED_TCP 	0x70
++#define DL_TYPE_COMPRESSED_TCP 		0x80
++#define DL_TYPE_UNCOMPRESSED_UDP 	0x90
++#define DL_TYPE_COMPRESSED_UDP 		0xA0
++#define DL_TYPE_ERROR 				0x00
++#define DL_TYPE_MASK 				0xF0
++
++/* Bits in first octet of compressed packet */
++#define NEW_C			0x08
++#define TCP_PUSH_BIT 	0x04
++
++typedef __u8 byte_t;
++
++/*
++ * "state" data for each active tcp conversation on the wire.  This is
++ * basically a copy of the entire IP/TCP header from the last packet
++ * we saw from the conversation together with a small identifier
++ * the transmit & receive ends of the line use to locate saved header.
++ */
++struct cstate {
++	byte_t	cs_this;	/* connection id number (xmit) */
++	bool	initialized;	/* true if initialized */
++	struct cstate *next;	/* next in ring (xmit) */
++	struct iphdr cs_ip;	/* ip/tcp hdr from most recent packet */
++	struct tcphdr cs_tcp;
++	struct udphdr cs_udp;
++	unsigned char cs_ipopt[64];
++	unsigned char cs_tcpopt[64];
++};
++#define NULLSLSTATE	(struct cstate *)0
++
++/*
++ * all the state data for one serial line (we need one of these per line).
++ */
++struct dlhc {
++	struct cstate *tstate;	/* transmit connection states (array)*/
++	struct cstate *rstate;	/* receive connection states (array)*/
++
++	byte_t tslot_limit;	/* highest transmit slot id (0-l)*/
++	byte_t rslot_limit;	/* highest receive slot id (0-l)*/
++
++	byte_t xmit_oldest;	/* oldest xmit in ring */
++	byte_t xmit_current;	/* most recent xmit id */
++	byte_t recv_current;	/* most recent rcvd id */
++
++	byte_t flags;
++#define DLHC_F_TCP	0x80
++#define DLHC_F_UDP	0x40
++#define DLHC_F_TOSS	0x01	/* tossing rcvd frames until id received */
++
++	unsigned int stat_o_nontcp;	/* outbound non-TCP packets */
++	unsigned int stat_o_tcp;	/* outbound TCP packets */
++	unsigned int stat_o_uncompressed;	/* outbound uncompressed packets */
++	unsigned int stat_o_compressed;	/* outbound compressed packets */
++	unsigned int stat_o_searches;	/* searches for connection state */
++	unsigned int stat_o_misses;	/* times couldn't find conn. state */
++
++	unsigned int stat_i_uncompressed;	/* inbound uncompressed packets */
++	unsigned int stat_i_compressed;	/* inbound compressed packets */
++	unsigned int stat_i_error;	/* inbound error packets */
++	unsigned int stat_i_tossed;	/* inbound packets tossed because of error */
++	unsigned int stat_i_runt;
++	unsigned int stat_i_badcheck;
++};
++
++struct dlhc *dlhc_init(int rslots, int tslots);
++void dlhc_free(struct dlhc *comp);
++int dlhc_reset(struct dlhc *comp);
++int dlhc_compress(struct dlhc *comp, unsigned char *icp, int isize,
++		  unsigned char *ocp, unsigned char **cpp, int compress_cid);
++int dlhc_uncompress(struct dlhc *comp, unsigned char *icp, int isize);
++int dlhc_remember(struct dlhc *comp, unsigned char *icp, int isize);
++int dlhc_toss(struct dlhc *comp);
++
++#endif	/* _DLHC_H_ */
++
++// END WIFI_P2PHC
+diff --git a/qcacld-3.0/core/hdd/src/p2phc/p2phc.c b/qcacld-3.0/core/hdd/src/p2phc/p2phc.c
+new file mode 100644
+index 0000000..902c305
+--- /dev/null
++++ b/qcacld-3.0/core/hdd/src/p2phc/p2phc.c
+@@ -0,0 +1,580 @@
++// MIUI ADD: WIFI_P2PHC
++
++#include "p2phc.h"
++
++p2phc_t g_p2phc = {.hooks_is_reg = false};
++
++#define ETH_HLEN	14		/* Total octets in header.	 */
++
++#define IP_HDR_LEN_MAX (60)
++#define TCP_HDR_LEN_MAX (60)
++#define HDR_LEN_MAX (IP_HDR_LEN_MAX + TCP_HDR_LEN_MAX)
++
++#define P2PHC_MAX_PACKET_SIZE (1200)
++
++static inline int p2phc_enable(const struct net *net)
++{
++	return sysctl_p2phc_enable;
++}
++
++/*
++* netfilter hooks handler
++*/
++static inline int __disable_tcp_timestamps(struct sk_buff *skb)
++{
++	struct sock *sk;
++	struct tcp_sock *tp;
++
++	sk = skb_to_full_sk(skb);
++	if (sk == NULL)
++		return -1;
++
++	if (sk->sk_state == TCP_ESTABLISHED) {
++		tp = tcp_sk(sk);
++		if (unlikely(tp->rx_opt.tstamp_ok)) {
++			tp->rx_opt.tstamp_ok = 0;
++			p2phc_dbg("%s", __func__);
++		}
++	}
++
++	return 0;
++}
++
++#ifdef TX_HOOK_NETDEV
++static inline unsigned int __p2phc_tx_netdev_hook(struct sk_buff *skb,
++	struct net_device *dev)
++{
++	p2phc_t *p2phc = &g_p2phc;
++	spinlock_t *plock = NULL;
++	struct dlhc *dlc = NULL;
++	struct iphdr *iph = NULL;
++	struct tcphdr *tcph = NULL;
++	unsigned char hc[HDR_LEN_MAX] = {0,}, dl_type;
++	unsigned char *phc = hc, *h;
++	int hlen, hclen, clen;
++	unsigned int verdict = NF_ACCEPT;
++	static atomic_t pkg_cmp = {0}, pkg_mark = {0};
++	(void)pkg_cmp;
++	(void)pkg_mark;
++
++	if (strncmp(skb->dev->name, "p2p", 3))
++		return NF_ACCEPT;
++
++	//p2phc_dbg("%s dev:%s", __func__, skb->dev->name);
++
++	if (skb->len > P2PHC_MAX_PACKET_SIZE)
++		return NF_ACCEPT;
++
++	iph = ip_hdr(skb);
++	if (iph == NULL)
++		return NF_ACCEPT;
++
++	if (iph->version != 4 || ipv4_is_multicast(iph->daddr))
++		return NF_ACCEPT;
++
++	if (iph->protocol == IPPROTO_TCP) {
++		__disable_tcp_timestamps(skb);
++		tcph = tcp_hdr(skb);
++		if (tcph == NULL)
++			return NF_ACCEPT;
++		hlen = (iph->ihl * 4) + (tcph->doff * 4);
++		plock = &p2phc->tcp_tx_lock;
++	} else if (iph->protocol == IPPROTO_UDP) {
++		hlen = (iph->ihl * 4) + 8;
++		plock = &p2phc->udp_tx_lock;
++	} else {
++		return NF_ACCEPT;
++	}
++
++#ifdef SKB_DUMP
++	p2phc_info("%s before hc", __func__);
++	skb_dump(KERN_INFO, skb, true);
++#endif
++
++#ifdef PER_CPU
++	unsigned int cpu;
++	/* get per-CPU data */
++	cpu = get_cpu();
++	if (cpu < 0 || cpu >= CONFIG_NR_CPUS)
++		goto err;
++	dlc = p2phc->dlc[cpu];
++#else
++	dlc = p2phc->dlc;
++#endif
++
++	/* tx handler */
++	h = (unsigned char *)iph;
++	spin_lock(plock);
++	hclen = dlhc_compress(dlc, h, hlen, hc, &phc, 0);
++	spin_unlock(plock);
++	clen = hlen - hclen;
++	dl_type = hc[0] & DL_TYPE_MASK;
++
++	if (clen) {
++		p2phc_dbg("%s hc compress clen:%d cnt:%d", __func__, clen, atomic_inc_return(&pkg_cmp));
++		/*p2phc_dbg("%s ack:%u win:%hu", __func__,
++			ntohl(tcph->ack_seq), ntohs(tcph->window));*/
++		/* mac header */
++		memmove(skb->data + clen, skb->data, ETH_HLEN);
++		skb_pull(skb, clen);
++		skb_reset_mac_header(skb);
++		/* ip header */
++		memcpy(h + clen, hc, hclen);
++		skb->network_header += clen;
++		skb->ip_summed = CHECKSUM_NONE;
++	} else if (dl_type == DL_TYPE_UNCOMPRESSED_TCP || dl_type == DL_TYPE_UNCOMPRESSED_UDP) {
++		p2phc_dbg("%s hc mark cid:%d cnt:%d", __func__, hc[9], atomic_inc_return(&pkg_mark));
++		h[0] &= ~DL_TYPE_MASK;
++		h[0] |= dl_type;
++		h[9] = hc[9];
++		ip_send_check(iph);
++	} else {
++		goto err;
++	}
++
++err:
++#ifdef PER_CPU
++	put_cpu();
++#endif
++
++#ifdef SKB_DUMP
++	p2phc_info("%s after hc", __func__);
++	skb_dump(KERN_INFO, skb, true);
++#endif
++	return verdict;
++}
++
++unsigned int p2phc_tx_netdev_hook(struct sk_buff *skb,
++	struct net_device *dev)
++{
++	unsigned int ret = -1;
++#ifdef TIME_DUMP
++	ktime_t start, diff;
++	start = ktime_get();
++#endif
++	if (p2phc_enable(&init_net)) {
++		ret = __p2phc_tx_netdev_hook(skb, dev);
++	}
++#ifdef TIME_DUMP
++	diff = ktime_sub(ktime_get(), start);
++	p2phc_info("%s used %lld ns", __func__, ktime_to_ns(diff));
++#endif
++	return ret;
++}
++
++
++#elif defined(TX_HOOK_IPV4)
++
++static unsigned int tx_ipv4_hook(void *priv, struct sk_buff *skb,
++	const struct nf_hook_state *state)
++{
++	p2phc_t *p2phc = (p2phc_t *)priv;
++	struct dlhc *dlc = NULL;
++	struct iphdr *iph = NULL;
++	struct tcphdr *tcph = NULL;
++	unsigned char hc[HDR_LEN_MAX] = {0,};
++	unsigned char *phc = hc, *h;
++	int hlen, hclen, clen;
++	unsigned int verdict = NF_ACCEPT;
++
++	if (strncmp(skb->dev->name, "p2p", 3))
++		return NF_ACCEPT;
++
++	//p2phc_dbg("%s dev:%s", __func__, skb->dev->name);
++
++	iph = ip_hdr(skb);
++	if (iph == NULL)
++		return NF_ACCEPT;
++
++	if (iph->protocol != IPPROTO_TCP)
++		return NF_ACCEPT;
++
++	tcph = tcp_hdr(skb);
++	if (tcph == NULL)
++		return NF_ACCEPT;
++
++#ifdef SKB_DUMP
++	p2phc_info("%s before hc", __func__);
++	skb_dump(KERN_INFO, skb, true);
++#endif
++
++#ifdef PER_CPU
++	unsigned int cpu;
++	/* get per-CPU data */
++	cpu = get_cpu();
++	if (cpu < 0 || cpu >= CONFIG_NR_CPUS)
++		goto err;
++	dlc = p2phc->dlc[cpu];
++#else
++	dlc = p2phc->dlc;
++#endif
++
++	/* tx handler */
++	h = (unsigned char *)iph;
++	hlen = (iph->ihl * 4) + (tcph->doff * 4);
++	spin_lock_bh(&p2phc->tcp_tx_lock);
++	hclen = dlhc_compress(dlc, h, hlen, hc, &phc, 0);
++	spin_unlock_bh(&p2phc->tcp_tx_lock);
++	clen = hlen - hclen;
++
++	if (clen) {
++		//p2phc_dbg("%s hc compress clen:%d", __func__, clen);
++		memcpy(h + clen, hc, hclen);
++		skb_pull(skb, clen);
++		skb_reset_mac_header(skb);
++		skb->network_header += clen;
++	} else if (hc[0] & DL_TYPE_UNCOMPRESSED_TCP) {
++		//p2phc_dbg("%s hc mark cid:%d", __func__, hc[9]);
++		h[0] |= DL_TYPE_UNCOMPRESSED_TCP;
++		h[9] = hc[9];
++		//ip_send_check(iph);
++	} else {
++		goto err;
++	}
++
++err:
++#ifdef PER_CPU
++	put_cpu();
++#endif
++
++#ifdef SKB_DUMP
++	p2phc_info("%s after hc", __func__);
++	skb_dump(KERN_INFO, skb, true);
++#endif
++	return verdict;
++}
++#else
++#error "tx hook not set"
++#endif
++
++static inline unsigned int __rx_inet_hook(void *priv, struct sk_buff *skb,
++	const struct nf_hook_state *state)
++{
++	p2phc_t *p2phc = (p2phc_t *)priv;
++	spinlock_t *plock = NULL;
++	struct dlhc *dlc = NULL;
++	struct iphdr *iph = NULL;
++	unsigned char *h, dl_type;
++	int len, hclen;
++	unsigned int verdict = NF_ACCEPT;
++	static atomic_t pkg_cmp = {0}, pkg_mark = {0};
++	(void)pkg_cmp;
++	(void)pkg_mark;
++
++	if (strncmp(skb->dev->name, "p2p", 3))
++		return NF_ACCEPT;
++
++	//p2phc_dbg("%s dev:%s", __func__, skb->dev->name);
++
++	iph = ip_hdr(skb);
++	if (iph == NULL)
++		return NF_ACCEPT;
++	h = (unsigned char *)iph;
++
++	dl_type = h[0] & DL_TYPE_MASK;
++	if (dl_type == DL_TYPE_UNCOMPRESSED_TCP || dl_type == DL_TYPE_COMPRESSED_TCP) {
++		plock = &p2phc->tcp_rx_lock;
++	} else if (dl_type == DL_TYPE_UNCOMPRESSED_UDP || dl_type == DL_TYPE_COMPRESSED_UDP) {
++		plock = &p2phc->udp_rx_lock;
++	} else {
++		return NF_ACCEPT;
++	}
++
++#ifdef SKB_DUMP
++	p2phc_info("%s before hc", __func__);
++	skb_dump(KERN_INFO, skb, true);
++#endif
++
++#ifdef PER_CPU
++	unsigned int cpu;
++	/* get per-CPU data */
++	cpu = get_cpu();
++	if (cpu < 0 || cpu >= CONFIG_NR_CPUS)
++		goto err;
++	dlc = p2phc->dlc[cpu];
++#else
++	dlc = p2phc->dlc;
++#endif
++
++	if (dlc == NULL) {
++		p2phc_err("%s hc rx err, type:%02x", __func__, dl_type);
++		return NF_DROP;
++	}
++
++	/* rx handler */
++	len = skb->len;
++	if (dl_type == DL_TYPE_COMPRESSED_TCP || dl_type == DL_TYPE_COMPRESSED_UDP) {
++		p2phc_dbg("%s hc uncompress cnt:%d", __func__, atomic_inc_return(&pkg_cmp));
++		if (skb_tailroom(skb) < HDR_LEN_MAX) {
++			p2phc_err("%s hc uncompress err tailroom", __func__);
++			verdict = NF_DROP;
++			goto err;
++		}
++		skb_put(skb, HDR_LEN_MAX);
++		spin_lock(plock);
++		hclen = dlhc_uncompress(dlc, h, len);
++		spin_unlock(plock);
++		if (hclen <= 0) {
++			p2phc_err("%s hc uncompress err [%02x %02x]", __func__, h[0], h[1]);
++			verdict = NF_DROP;
++			goto err;
++		}
++		skb->transport_header = skb->network_header + (iph->ihl * 4);
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
++		/*p2phc_dbg("%s ack:%u win:%hu", __func__,
++			ntohl(tcp_hdr(skb)->ack_seq), ntohs(tcp_hdr(skb)->window));*/
++		// TODO revert skb_put length:(HDR_LEN_MAX - (hclen - len))
++	} else if (dl_type == DL_TYPE_UNCOMPRESSED_TCP || dl_type == DL_TYPE_UNCOMPRESSED_UDP) {
++		p2phc_dbg("%s hc remember, cid:%d cnt:%d", __func__, h[9], atomic_inc_return(&pkg_mark));
++		spin_lock(plock);
++		hclen = dlhc_remember(dlc, h, len);
++		spin_unlock(plock);
++		if (hclen <= 0) {
++			p2phc_err("%s hc remember err", __func__);
++			verdict = NF_DROP;
++			goto err;
++		}
++	}
++
++err:
++#ifdef PER_CPU
++	put_cpu();
++#endif
++
++#ifdef SKB_DUMP
++	p2phc_info("%s after hc", __func__);
++	skb_dump(KERN_INFO, skb, true);
++#endif
++	return verdict;
++}
++
++static unsigned int rx_inet_hook(void *priv, struct sk_buff *skb,
++	const struct nf_hook_state *state)
++{
++	unsigned int ret;
++#ifdef TIME_DUMP
++	ktime_t start, diff;
++	start = ktime_get();
++#endif
++	ret = __rx_inet_hook(priv, skb, state);
++#ifdef TIME_DUMP
++	diff = ktime_sub(ktime_get(), start);
++	p2phc_info("%s used %lld ns", __func__, ktime_to_ns(diff));
++#endif
++	return ret;
++}
++
++static struct nf_hook_ops p2phc_hooks[] = {
++	{
++		.hook = rx_inet_hook,
++		.priv = &g_p2phc,
++		.pf = NFPROTO_INET,
++		.hooknum = NF_INET_INGRESS,
++		.priority = NF_IP_PRI_FIRST,
++	},
++#ifdef TX_HOOK_IPV4
++	{
++		.hook = tx_ipv4_hook,
++		.priv = &g_p2phc,
++		.pf = NFPROTO_IPV4,
++		.hooknum = NF_INET_POST_ROUTING,
++		.priority = NF_IP_PRI_LAST,
++	},
++#endif
++};
++
++/**
++ * device notifier event handler
++ */
++#if 1
++static inline int p2phc_p2px_event(struct net_device *dev, enum netdev_cmd cmd)
++{
++	int ret = 0;
++	if (cmd == NETDEV_REGISTER && !g_p2phc.hooks_is_reg) {
++		p2phc_hooks[0].dev = dev;
++		ret = nf_register_net_hooks(&init_net, p2phc_hooks,
++						ARRAY_SIZE(p2phc_hooks));
++		if (ret) {
++			p2phc_err("%s nf_register_net_hooks err:%d", __func__, ret);
++			return 0;
++		}
++		g_p2phc.hooks_is_reg = true;
++		p2phc_info("%s nf_register_net_hooks", __func__);
++	} else if (cmd == NETDEV_UNREGISTER && g_p2phc.hooks_is_reg) {
++		nf_unregister_net_hooks(&init_net, p2phc_hooks,
++				    ARRAY_SIZE(p2phc_hooks));
++		g_p2phc.hooks_is_reg = false;
++		p2phc_info("%s nf_unregister_net_hooks", __func__);
++	}
++
++	return 0;
++}
++
++/*
++static const char *__netdev_cmd_to_name(enum netdev_cmd cmd)
++{
++#define N(val) 						\
++	case NETDEV_##val:				\
++		return "NETDEV_" __stringify(val);
++	switch (cmd) {
++	N(UP) N(DOWN) N(REBOOT) N(CHANGE) N(REGISTER) N(UNREGISTER)
++	N(CHANGEMTU) N(CHANGEADDR) N(GOING_DOWN) N(CHANGENAME) N(FEAT_CHANGE)
++	N(BONDING_FAILOVER) N(PRE_UP) N(PRE_TYPE_CHANGE) N(POST_TYPE_CHANGE)
++	N(POST_INIT) N(RELEASE) N(NOTIFY_PEERS) N(JOIN) N(CHANGEUPPER)
++	N(RESEND_IGMP) N(PRECHANGEMTU) N(CHANGEINFODATA) N(BONDING_INFO)
++	N(PRECHANGEUPPER) N(CHANGELOWERSTATE) N(UDP_TUNNEL_PUSH_INFO)
++	N(UDP_TUNNEL_DROP_INFO) N(CHANGE_TX_QUEUE_LEN)
++	N(CVLAN_FILTER_PUSH_INFO) N(CVLAN_FILTER_DROP_INFO)
++	N(SVLAN_FILTER_PUSH_INFO) N(SVLAN_FILTER_DROP_INFO)
++	N(PRE_CHANGEADDR)
++	}
++#undef N
++	return "UNKNOWN_NETDEV_EVENT";
++}
++*/
++
++static int p2phc_device_event(struct notifier_block *nb,
++			       unsigned long event, void *data)
++{
++	struct net_device *dev = netdev_notifier_info_to_dev(data);
++	p2phc_t *p2phc = &g_p2phc;
++	struct dlhc *dlc = NULL;
++
++	if(strncmp(dev->name, "p2p", 3)) {
++		return NOTIFY_DONE;
++	}
++
++#ifdef PER_CPU
++	unsigned int cpu;
++	/* get per-CPU data */
++	cpu = get_cpu();
++	if (cpu < 0 || cpu >= CONFIG_NR_CPUS)
++		return NOTIFY_DONE;
++	dlc = p2phc->dlc[cpu];
++#else
++	dlc = p2phc->dlc;
++#endif
++
++	/*
++	p2phc_dbg("%s %s %s", __func__, dev->name, __netdev_cmd_to_name(event));
++	p2phc_dbg("%s dev->operstate:%d", __func__, dev->operstate);
++	*/
++
++	switch (event) {
++	case NETDEV_REGISTER:
++	case NETDEV_UNREGISTER:
++		p2phc_p2px_event(dev, event);
++		break;
++	case NETDEV_UP:
++	case NETDEV_CHANGE:
++		if (netif_oper_up(dev)){
++			p2phc_dbg("%s dlhc_reset", __func__);
++			dlhc_reset(dlc);
++		}
++		break;
++	default :
++		break;
++	}
++
++	return NOTIFY_DONE;
++}
++
++struct notifier_block p2phc_nb __read_mostly = {
++	.notifier_call = p2phc_device_event,
++};
++#endif
++
++/**
++ * init & cleanup
++ */
++int p2phc_init(void)
++{
++	int ret = -1;
++
++#ifdef PER_CPU
++	int cpu;
++	for (cpu = 0; cpu < CONFIG_NR_CPUS; cpu ++) {
++		g_p2phc.dlc[cpu] = dlhc_init(16, 16);
++		if (IS_ERR(g_p2phc.dlc[cpu]))
++			goto err_init;
++		p2phc_info("%s dlhc_init cpu:%d, dlc:%p", __func__, cpu, g_p2phc.dlc[cpu]);
++	}
++#else
++	g_p2phc.dlc = dlhc_init(16, 16);
++	if (IS_ERR(g_p2phc.dlc)) {
++		p2phc_err("%s dlhc_init err", __func__);
++		goto err_init;
++	}
++#endif
++	spin_lock_init(&g_p2phc.tcp_rx_lock);
++	spin_lock_init(&g_p2phc.tcp_tx_lock);
++	spin_lock_init(&g_p2phc.udp_rx_lock);
++	spin_lock_init(&g_p2phc.udp_tx_lock);
++
++	ret = register_netdevice_notifier(&p2phc_nb);
++	if (ret) {
++		p2phc_err("%s register_netdevice_notifier err:%d", __func__, ret);
++		goto err_reg_notifier;
++	}
++
++	p2phc_info("%s ok", __func__);
++	return 0;
++
++err_reg_notifier:
++	unregister_netdevice_notifier(&p2phc_nb);
++err_init:
++#ifdef PER_CPU
++	for (cpu = 0; cpu < CONFIG_NR_CPUS; cpu ++) {
++		if (g_p2phc.dlc[cpu]) {
++			dlhc_free(g_p2phc.dlc[cpu]);
++			g_p2phc.dlc[cpu] = NULL;
++		}
++		p2phc_info("%s dlhc_free cpu:%d, dlc:%p", __func__, cpu, g_p2phc.dlc[cpu]);
++	}
++#else
++	if (g_p2phc.dlc) {
++		dlhc_free(g_p2phc.dlc);
++		g_p2phc.dlc = NULL;
++	}
++#endif
++	return ret;
++}
++
++int p2phc_cleanup(void)
++{
++#ifdef STAT_DUMP
++	if (g_p2phc.task) {
++		kthread_stop(g_p2phc.task);
++		sysctl_p2phc_debug = 0;
++		g_p2phc.task = NULL;
++	}
++#endif
++
++#ifdef PER_CPU
++	int cpu;
++	for (cpu = 0; cpu < CONFIG_NR_CPUS; cpu ++) {
++		if (g_p2phc.dlc[cpu]) {
++			dlhc_free(g_p2phc.dlc[cpu]);
++			g_p2phc.dlc[cpu] = NULL;
++		}
++		p2phc_dbg("%s dlhc_free cpu:%d, dlc:%p", __func__, cpu, g_p2phc.dlc[cpu]);
++	}
++#else
++	if (g_p2phc.dlc) {
++		dlhc_free(g_p2phc.dlc);
++		g_p2phc.dlc = NULL;
++	}
++#endif
++	unregister_netdevice_notifier(&p2phc_nb);
++
++	if (g_p2phc.hooks_is_reg) {
++		nf_unregister_net_hooks(&init_net, p2phc_hooks,
++				    ARRAY_SIZE(p2phc_hooks));
++		g_p2phc.hooks_is_reg = false;
++		p2phc_info("%s nf_unregister_net_hooks", __func__);
++	}
++
++	p2phc_info("%s ok", __func__);
++	return 0;
++}
++// END WIFI_P2PHC
+diff --git a/qcacld-3.0/core/hdd/src/p2phc/p2phc.h b/qcacld-3.0/core/hdd/src/p2phc/p2phc.h
+new file mode 100644
+index 0000000..a00c664
+--- /dev/null
++++ b/qcacld-3.0/core/hdd/src/p2phc/p2phc.h
+@@ -0,0 +1,55 @@
++// MIUI ADD: WIFI_P2PHC
++#ifndef _P2PHC_H_
++#define _P2PHC_H_
++
++#include <net/ip.h>
++#include <linux/ip.h>
++#include <linux/tcp.h>
++#include <uapi/linux/netfilter_ipv4.h>
++#include <linux/netfilter.h>
++
++#include "dlhc.h"
++#include "p2phc_debug.h"
++#include "p2phc_switch.h"
++
++//#define PER_CPU
++#define TX_HOOK_NETDEV
++//#define TX_HOOK_IPV4
++
++int p2phc_init(void);
++int p2phc_cleanup(void);
++
++typedef struct _p2phc {
++	spinlock_t tcp_rx_lock;
++	spinlock_t tcp_tx_lock;
++	spinlock_t udp_rx_lock;
++	spinlock_t udp_tx_lock;
++#ifdef PER_CPU
++	struct dlhc *dlc[CONFIG_NR_CPUS];
++#else
++	struct dlhc *dlc;
++#endif
++	bool hooks_is_reg;
++#ifdef STAT_DUMP
++	struct task_struct *task;
++#endif
++	struct ctl_table_header *ctl;
++} p2phc_t;
++
++extern p2phc_t g_p2phc;
++extern struct notifier_block p2phc_nb __read_mostly;
++
++#ifdef TX_HOOK_NETDEV
++extern unsigned int p2phc_tx_netdev_hook(struct sk_buff *skb,
++	struct net_device *dev);
++#else
++static inline unsigned int p2phc_tx_netdev_hook(struct sk_buff *skb,
++	struct net_device *dev)
++{
++	return 0;
++}
++#endif
++
++#endif	/* _MINET_P2PHC_H_ */
++
++// END WIFI_P2PHC
+diff --git a/qcacld-3.0/core/hdd/src/p2phc/p2phc_debug.h b/qcacld-3.0/core/hdd/src/p2phc/p2phc_debug.h
+new file mode 100644
+index 0000000..7043c59
+--- /dev/null
++++ b/qcacld-3.0/core/hdd/src/p2phc/p2phc_debug.h
+@@ -0,0 +1,35 @@
++// MIUI ADD: WIFI_P2PHC
++#ifndef __P2PHC_DEBUG_H_
++#define __P2PHC_DEBUG_H_
++
++//#define SKB_DUMP
++#define STAT_DUMP
++//#define TIME_DUMP
++//#define DEBUG_LOG
++
++#ifdef DEBUG_LOG
++#define p2phc_dbg(fmt, ...)                                              	\
++	printk(KERN_DEBUG "p2phc-d: " fmt, ##__VA_ARGS__)
++#else
++#define p2phc_dbg(fmt, ...)
++#endif
++
++#define p2phc_info(fmt, ...)                                              	\
++	printk(KERN_INFO "p2phc-i: " fmt, ##__VA_ARGS__)
++
++#define p2phc_err(fmt, ...)                                               	\
++	printk(KERN_ERR "p2phc-e: " fmt, ##__VA_ARGS__)
++
++#define IPv4_FMT "%d.%d.%d.%d"
++#define IPv4_ARG(x)                                                       	\
++	((u8 *)(x))[0], ((u8 *)(x))[1], ((u8 *)(x))[2], ((u8 *)(x))[3]
++
++#define IPv6_FMT "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x"
++#define IPv6_ARG(x)                                                        	\
++	ntohs((x.s6_addr16)[0]), ntohs((x.s6_addr16)[1]), 						\
++	ntohs((x.s6_addr16)[2]), ntohs((x.s6_addr16)[3]),						\
++	ntohs((x.s6_addr16)[4]), ntohs((x.s6_addr16)[5]), 						\
++	ntohs((x.s6_addr16)[6]), ntohs((x.s6_addr16)[7])
++
++#endif /* __P2PHC_DEBUG_H_*/
++// END WIFI_P2PHC
+diff --git a/qcacld-3.0/core/hdd/src/p2phc/p2phc_switch.c b/qcacld-3.0/core/hdd/src/p2phc/p2phc_switch.c
+new file mode 100644
+index 0000000..ffefc02
+--- /dev/null
++++ b/qcacld-3.0/core/hdd/src/p2phc/p2phc_switch.c
+@@ -0,0 +1,400 @@
++// MIUI ADD: WIFI_P2PHC
++#include <wlan_hdd_includes.h>
++#include "osif_psoc_sync.h"
++#include <wlan_hdd_sysfs.h>
++#include <linux/sched/signal.h>
++#include <linux/signal.h>
++#include <linux/module.h>
++#include <linux/kthread.h>
++#include <linux/delay.h>
++#include "qdf_trace.h"
++
++#include "p2phc.h"
++
++volatile int sysctl_p2phc_enable = 0;
++int sysctl_p2phc_debug = 0;
++int sysctl_p2phc_interval = 10;
++
++#ifdef STAT_DUMP
++static int p2phc_thread(void *data)
++{
++	p2phc_t *p2phc = (p2phc_t *)data;
++	struct dlhc *dlc;
++	p2phc_info("%s", __func__);
++	while (!kthread_should_stop()) {
++		schedule_timeout_interruptible(HZ * sysctl_p2phc_interval);
++
++		p2phc_info("###### TCP stat ######");
++		dlc = p2phc->dlc;
++		spin_lock(&p2phc->tcp_rx_lock);
++		p2phc_info("i_uncompressed: %d", dlc->stat_i_uncompressed);
++		p2phc_info("i_compressed:   %d", dlc->stat_i_compressed);
++		p2phc_info("i_error:        %d", dlc->stat_i_error);
++		p2phc_info("i_tossed:       %d", dlc->stat_i_tossed);
++		p2phc_info("i_runt:         %d", dlc->stat_i_runt);
++		p2phc_info("i_badcheck:     %d", dlc->stat_i_badcheck);
++		spin_unlock(&p2phc->tcp_rx_lock);
++
++		spin_lock(&p2phc->tcp_tx_lock);
++		p2phc_info("o_uncompressed: %d", dlc->stat_o_uncompressed);
++		p2phc_info("o_compressed:   %d", dlc->stat_o_compressed);
++		p2phc_info("o_tcp:          %d", dlc->stat_o_tcp);
++		p2phc_info("o_searches:     %d", dlc->stat_o_searches);
++		p2phc_info("o_misses:       %d", dlc->stat_o_misses);
++		spin_unlock(&p2phc->tcp_tx_lock);
++
++		p2phc_info("###### UDP stat ######");
++		dlc = dlc + 1;
++		spin_lock(&p2phc->udp_rx_lock);
++		p2phc_info("i_uncompressed: %d", dlc->stat_i_uncompressed);
++		p2phc_info("i_compressed:   %d", dlc->stat_i_compressed);
++		p2phc_info("i_error:        %d", dlc->stat_i_error);
++		p2phc_info("i_tossed:       %d", dlc->stat_i_tossed);
++		p2phc_info("i_runt:         %d", dlc->stat_i_runt);
++		p2phc_info("i_badcheck:     %d", dlc->stat_i_badcheck);
++		spin_unlock(&p2phc->udp_rx_lock);
++
++		spin_lock(&p2phc->udp_tx_lock);
++		p2phc_info("o_uncompressed: %d", dlc->stat_o_uncompressed);
++		p2phc_info("o_compressed:   %d", dlc->stat_o_compressed);
++		p2phc_info("o_searches:     %d", dlc->stat_o_searches);
++		p2phc_info("o_misses:       %d", dlc->stat_o_misses);
++		spin_unlock(&p2phc->udp_tx_lock);
++
++		p2phc_info("###### stat end ######");
++	}
++	return 0;
++}
++#endif
++
++static ssize_t __hdd_sysfs_p2phc_debug_store(struct hdd_context *hdd_ctx,
++				struct kobj_attribute *attr,
++				char const *buf, size_t count)
++{
++#ifdef STAT_DUMP
++	char buf_local[MAX_SYSFS_USER_COMMAND_SIZE_LENGTH + 1];
++	char *sptr, *token;
++	int value, ret;
++	if (!wlan_hdd_validate_modules_state(hdd_ctx))
++		return -EINVAL;
++
++	ret = hdd_sysfs_validate_and_copy_buf(buf_local, sizeof(buf_local),
++					      buf, count);
++	if (ret) {
++		hdd_err_rl("invalid input");
++		return ret;
++	}
++
++	sptr = buf_local;
++	token = strsep(&sptr, " ");
++	if (!token)
++		return -EINVAL;
++	if (kstrtou32(token, 0, &value))
++		return -EINVAL;
++	if (sysctl_p2phc_enable !=0) {
++		sysctl_p2phc_debug = value;
++        }
++
++	switch (sysctl_p2phc_debug) {
++	case 0:
++		if (g_p2phc.task) {
++			kthread_stop(g_p2phc.task);
++			g_p2phc.task = NULL;
++		}
++		break;
++	case 1:
++		if (g_p2phc.task != NULL) {
++			break;
++		}
++		g_p2phc.task = kthread_run(p2phc_thread, (void *)&g_p2phc, "p2phc_thread");
++		if (IS_ERR_OR_NULL(g_p2phc.task)) {
++				p2phc_err("%s kthread_run err", __func__);
++				unregister_netdevice_notifier(&p2phc_nb);
++		}
++		break;
++	default:
++		hdd_err_rl("invalid input");
++		break;
++	}
++#endif
++	return count;
++}
++
++static ssize_t hdd_sysfs_p2phc_debug_store(struct kobject *kobj,
++					     struct kobj_attribute *attr,
++					     char const *buf, size_t count)
++{
++	struct osif_psoc_sync *psoc_sync;
++	struct hdd_context *hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
++	ssize_t errno_size;
++	int ret;
++
++	ret = wlan_hdd_validate_context(hdd_ctx);
++	if (ret != 0)
++		return ret;
++
++	errno_size = osif_psoc_sync_op_start(wiphy_dev(hdd_ctx->wiphy),
++					     &psoc_sync);
++	if (errno_size)
++		return errno_size;
++
++	errno_size = __hdd_sysfs_p2phc_debug_store(hdd_ctx, attr,
++						     buf, count);
++
++	osif_psoc_sync_op_stop(psoc_sync);
++
++	return errno_size;
++}
++
++static ssize_t __hdd_sysfs_p2phc_debug_show(struct hdd_context *hdd_ctx,
++			       struct kobj_attribute *attr, char *buf)
++{
++	if (!wlan_hdd_validate_modules_state(hdd_ctx))
++		return -EINVAL;
++
++	return scnprintf(buf, sizeof(buf), "%d\n", sysctl_p2phc_debug);
++}
++
++static ssize_t hdd_sysfs_p2phc_debug_show(struct kobject *kobj,
++					    struct kobj_attribute *attr,
++					    char *buf)
++{
++	struct osif_psoc_sync *psoc_sync;
++	struct hdd_context *hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
++	ssize_t errno_size;
++	int ret;
++
++	ret = wlan_hdd_validate_context(hdd_ctx);
++	if (ret != 0)
++		return ret;
++
++	errno_size = osif_psoc_sync_op_start(wiphy_dev(hdd_ctx->wiphy),
++					     &psoc_sync);
++	if (errno_size)
++		return errno_size;
++
++	errno_size = __hdd_sysfs_p2phc_debug_show(hdd_ctx, attr, buf);
++
++	osif_psoc_sync_op_stop(psoc_sync);
++
++	return errno_size;
++}
++
++static ssize_t __hdd_sysfs_p2phc_interval_store(struct hdd_context *hdd_ctx,
++				struct kobj_attribute *attr,
++				char const *buf, size_t count)
++{
++#ifdef STAT_DUMP
++	char buf_local[MAX_SYSFS_USER_COMMAND_SIZE_LENGTH + 1];
++	char *sptr, *token;
++	int value, ret;
++	if (!wlan_hdd_validate_modules_state(hdd_ctx))
++		return -EINVAL;
++	ret = hdd_sysfs_validate_and_copy_buf(buf_local, sizeof(buf_local),
++					      buf, count);
++	if (ret) {
++		hdd_err_rl("invalid input");
++		return ret;
++	}
++	sptr = buf_local;
++	token = strsep(&sptr, " ");
++	if (!token)
++		return -EINVAL;
++	if (kstrtou32(token, 0, &value))
++		return -EINVAL;
++	if (value >= 1 && value <= 20) {
++		sysctl_p2phc_interval = value;
++	} else {
++		p2phc_info("Time interval does not meet the range");
++	}
++#endif
++	return count;
++}
++static ssize_t hdd_sysfs_p2phc_interval_store(struct kobject *kobj,
++					     struct kobj_attribute *attr,
++					     char const *buf, size_t count)
++{
++	struct osif_psoc_sync *psoc_sync;
++	struct hdd_context *hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
++	ssize_t errno_size;
++	int ret;
++
++	ret = wlan_hdd_validate_context(hdd_ctx);
++	if (ret != 0)
++		return ret;
++	errno_size = osif_psoc_sync_op_start(wiphy_dev(hdd_ctx->wiphy),
++					     &psoc_sync);
++	if (errno_size)
++		return errno_size;
++	errno_size = __hdd_sysfs_p2phc_interval_store(hdd_ctx, attr,
++						     buf, count);
++	osif_psoc_sync_op_stop(psoc_sync);
++	return errno_size;
++}
++static ssize_t __hdd_sysfs_p2phc_interval_show(struct hdd_context *hdd_ctx,
++			       struct kobj_attribute *attr, char *buf)
++{
++	if (!wlan_hdd_validate_modules_state(hdd_ctx))
++		return -EINVAL;
++	return scnprintf(buf, sizeof(buf), "%d\n", sysctl_p2phc_interval);
++}
++static ssize_t hdd_sysfs_p2phc_interval_show(struct kobject *kobj,
++					    struct kobj_attribute *attr,
++					    char *buf)
++{
++	struct osif_psoc_sync *psoc_sync;
++	struct hdd_context *hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
++	ssize_t errno_size;
++	int ret;
++
++	ret = wlan_hdd_validate_context(hdd_ctx);
++	if (ret != 0)
++		return ret;
++	errno_size = osif_psoc_sync_op_start(wiphy_dev(hdd_ctx->wiphy),
++					     &psoc_sync);
++	if (errno_size)
++		return errno_size;
++	errno_size = __hdd_sysfs_p2phc_interval_show(hdd_ctx, attr, buf);
++	osif_psoc_sync_op_stop(psoc_sync);
++	return errno_size;
++}
++
++static ssize_t __hdd_sysfs_p2phc_enable_store(struct hdd_context *hdd_ctx,
++				struct kobj_attribute *attr,
++				char const *buf, size_t count)
++{
++#ifdef STAT_DUMP
++	char buf_local[MAX_SYSFS_USER_COMMAND_SIZE_LENGTH + 1];
++	char *sptr, *token;
++	int value, ret;
++	if (!wlan_hdd_validate_modules_state(hdd_ctx))
++		return -EINVAL;
++	ret = hdd_sysfs_validate_and_copy_buf(buf_local, sizeof(buf_local),
++					      buf, count);
++	if (ret) {
++		hdd_err_rl("invalid input");
++		return ret;
++	}
++	sptr = buf_local;
++	token = strsep(&sptr, " ");
++	if (!token)
++		return -EINVAL;
++	if (kstrtou32(token, 0, &value))
++		return -EINVAL;
++	if (sysctl_p2phc_enable != value) {
++		if (value) {
++			if(0 == p2phc_init()) {
++				sysctl_p2phc_enable = value;
++			}
++		} else {
++			sysctl_p2phc_enable = value;
++			p2phc_cleanup();
++		}
++	}
++#endif
++	return count;
++}
++static ssize_t hdd_sysfs_p2phc_enable_store(struct kobject *kobj,
++					     struct kobj_attribute *attr,
++					     char const *buf, size_t count)
++{
++	struct osif_psoc_sync *psoc_sync;
++	struct hdd_context *hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
++	ssize_t errno_size;
++	int ret;
++
++	ret = wlan_hdd_validate_context(hdd_ctx);
++	if (ret != 0)
++		return ret;
++	errno_size = osif_psoc_sync_op_start(wiphy_dev(hdd_ctx->wiphy),
++					     &psoc_sync);
++	if (errno_size)
++		return errno_size;
++	errno_size = __hdd_sysfs_p2phc_enable_store(hdd_ctx, attr,
++						     buf, count);
++	osif_psoc_sync_op_stop(psoc_sync);
++	return errno_size;
++}
++static ssize_t __hdd_sysfs_p2phc_enable_show(struct hdd_context *hdd_ctx,
++			       struct kobj_attribute *attr, char *buf)
++{
++	if (!wlan_hdd_validate_modules_state(hdd_ctx))
++		return -EINVAL;
++	return scnprintf(buf, sizeof(buf), "%d\n", sysctl_p2phc_enable);
++}
++static ssize_t hdd_sysfs_p2phc_enable_show(struct kobject *kobj,
++					    struct kobj_attribute *attr,
++					    char *buf)
++{
++	struct osif_psoc_sync *psoc_sync;
++	struct hdd_context *hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
++	ssize_t errno_size;
++	int ret;
++
++	ret = wlan_hdd_validate_context(hdd_ctx);
++	if (ret != 0)
++		return ret;
++	errno_size = osif_psoc_sync_op_start(wiphy_dev(hdd_ctx->wiphy),
++					     &psoc_sync);
++	if (errno_size)
++		return errno_size;
++	errno_size = __hdd_sysfs_p2phc_enable_show(hdd_ctx, attr, buf);
++	osif_psoc_sync_op_stop(psoc_sync);
++	return errno_size;
++}
++
++/* warning! need write-all permission so overriding check */
++#undef VERIFY_OCTAL_PERMISSIONS
++#define VERIFY_OCTAL_PERMISSIONS(perms) (perms)
++
++static struct kobj_attribute sysfs_sysctl_p2phc_debug =
++	__ATTR(p2phc_debug, 0660, hdd_sysfs_p2phc_debug_show,
++	       hdd_sysfs_p2phc_debug_store);
++static struct kobj_attribute sysfs_sysctl_p2phc_interval =
++	__ATTR(p2phc_interval, 0660, hdd_sysfs_p2phc_interval_show,
++	       hdd_sysfs_p2phc_interval_store);
++static struct kobj_attribute sysfs_sysctl_p2phc_enable =
++	__ATTR(p2phc_enable, 0666, hdd_sysfs_p2phc_enable_show,
++	       hdd_sysfs_p2phc_enable_store);
++
++int hdd_sysfs_p2phc_switch_create(struct kobject *p2phc_kobject)
++{
++	int error;
++	if (!p2phc_kobject) {
++		hdd_err("could not get driver kobject!");
++		return -EINVAL;
++	}
++	error = sysfs_create_file(p2phc_kobject,
++				  &sysfs_sysctl_p2phc_debug.attr);
++	if (error) {
++		hdd_err("Failed to create sysfs file p2phc_debug");
++		return -EINVAL;
++	}
++	error = sysfs_create_file(p2phc_kobject,
++				  &sysfs_sysctl_p2phc_interval.attr);
++	if (error) {
++		hdd_err("Failed to create sysfs file p2phc_interval");
++		sysfs_remove_file(p2phc_kobject, &sysfs_sysctl_p2phc_debug.attr);
++		return -EINVAL;
++        }
++	error = sysfs_create_file(p2phc_kobject,
++				  &sysfs_sysctl_p2phc_enable.attr);
++	if (error) {
++		hdd_err("Failed to create sysfs file p2phc_enable");
++		sysfs_remove_file(p2phc_kobject, &sysfs_sysctl_p2phc_debug.attr);
++		sysfs_remove_file(p2phc_kobject, &sysfs_sysctl_p2phc_interval.attr);
++		return -EINVAL;
++        }
++	return error;
++}
++void hdd_sysfs_p2phc_switch_destroy(struct kobject *p2phc_kobject)
++{
++	if (!p2phc_kobject) {
++		hdd_err("could not get p2phc kobject!");
++		return;
++	}
++	sysfs_remove_file(p2phc_kobject, &sysfs_sysctl_p2phc_enable.attr);
++	sysfs_remove_file(p2phc_kobject, &sysfs_sysctl_p2phc_interval.attr);
++	sysfs_remove_file(p2phc_kobject, &sysfs_sysctl_p2phc_debug.attr);
++}
++// END WIFI_P2PHC
+diff --git a/qcacld-3.0/core/hdd/src/p2phc/p2phc_switch.h b/qcacld-3.0/core/hdd/src/p2phc/p2phc_switch.h
+new file mode 100644
+index 0000000..da0e0b0
+--- /dev/null
++++ b/qcacld-3.0/core/hdd/src/p2phc/p2phc_switch.h
+@@ -0,0 +1,15 @@
++// MIUI ADD: WIFI_P2PHC
++#ifndef _P2PHC_SWITCH_H_
++#define _P2PHC_SWITCH_H_
++
++int hdd_sysfs_p2phc_switch_create(struct kobject *p2phc_kobject);
++void hdd_sysfs_p2phc_switch_destroy(struct kobject *p2phc_kobject);
++
++extern volatile int sysctl_p2phc_enable;
++
++extern int sysctl_p2phc_debug;
++
++extern int sysctl_p2phc_interval;
++
++#endif
++// END WIFI_P2PHC
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+index 990e80c..a071a2a 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -245,6 +245,7 @@
+ #include "wlan_psoc_mlme_ucfg_api.h"
+ #include "wlan_ll_sap_ucfg_api.h"
+ #include "wlan_hdd_tx_rx.h"
++#include "p2phc.h"
+ 
+ #include "os_if_dp_local_pkt_capture.h"
+ #include <wlan_mlo_mgr_link_switch.h>
+@@ -22118,6 +22119,7 @@ static void __exit hdd_module_exit(void)
+ static void __exit hdd_module_exit(void)
+ {
+ 	hdd_driver_unload();
++	p2phc_cleanup();
+ }
+ #endif
+ #else
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_sysfs.c b/qcacld-3.0/core/hdd/src/wlan_hdd_sysfs.c
+index 4afc0bd..30159b9 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_sysfs.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_sysfs.c
+@@ -99,6 +99,7 @@
+ #include <wlan_hdd_sysfs_rf_test_mode.h>
+ #include "wlan_module_ids.h"
+ #include <wlan_coex_ucfg_api.h>
++#include "p2phc.h"
+ 
+ #define MAX_PSOC_ID_SIZE 10
+ 
+@@ -114,6 +115,7 @@
+ #endif
+ 
+ static struct kobject *wlan_kobject;
++static struct kobject *p2phc_kobject;
+ static struct kobject *driver_kobject;
+ static struct kobject *fw_kobject;
+ static struct kobject *psoc_kobject;
+@@ -873,6 +875,13 @@ static void hdd_sysfs_create_driver_root_obj(void)
+ 		return;
+ 	}
+ 
++	p2phc_kobject = kobject_create_and_add("p2phc", driver_kobject);
++	if (!p2phc_kobject) {
++		hdd_err("could not allocate p2phc kobject");
++		kobject_put(driver_kobject);
++		driver_kobject = NULL;
++	}
++
+ 	wlan_kobject = kobject_create_and_add("wlan", driver_kobject);
+ 	if (!wlan_kobject) {
+ 		hdd_err("could not allocate wlan kobject");
+@@ -888,6 +897,11 @@ static void hdd_sysfs_destroy_driver_root_obj(void)
+ 		wlan_kobject = NULL;
+ 	}
+ 
++	if (p2phc_kobject) {
++		kobject_put(p2phc_kobject);
++		p2phc_kobject = NULL;
++	}
++
+ 	if (driver_kobject) {
+ 		kobject_put(driver_kobject);
+ 		driver_kobject = NULL;
+@@ -1326,6 +1340,7 @@ void hdd_create_sysfs_files(struct hdd_context *hdd_ctx)
+ {
+ 	hdd_sysfs_create_driver_root_obj();
+ 	hdd_sysfs_create_version_interface(hdd_ctx->psoc);
++	hdd_sysfs_p2phc_switch_create(p2phc_kobject);
+ 	hdd_sysfs_mem_stats_create(wlan_kobject);
+ 	if  (QDF_GLOBAL_MISSION_MODE == hdd_get_conparam()) {
+ 		hdd_sysfs_create_powerstats_interface();
+@@ -1393,6 +1408,7 @@ void hdd_destroy_sysfs_files(void)
+ 		hdd_sysfs_destroy_powerstats_interface();
+ 	}
+ 	hdd_sysfs_mem_stats_destroy(wlan_kobject);
++	hdd_sysfs_p2phc_switch_destroy(p2phc_kobject);
+ 	hdd_sysfs_destroy_version_interface();
+ 	hdd_sysfs_destroy_driver_root_obj();
+ }

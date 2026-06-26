@@ -23,6 +23,11 @@ on:
         required: true
         type: boolean
         default: false
+      apply_p2phc_patch:
+        description: Add Xiaomi p2phc stock-driver hooks to a control build
+        required: true
+        type: boolean
+        default: true
       kernel_source_repo:
         description: Device kernel source used for WLAN ABI headers
         required: true
@@ -170,6 +175,14 @@ jobs:
           git apply "$patch"
           git diff --check
 
+      - name: Apply WCN7750 p2phc stock-driver hooks
+        if: ${{ inputs.enable_injection == false && inputs.apply_compat_patch && inputs.apply_p2phc_patch }}
+        working-directory: gki-clo/vendor/qcom/opensource/wlan
+        run: |
+          git apply --check "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-119O-p2phc.patch"
+          git apply "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-119O-p2phc.patch"
+          git diff --check
+
       - name: Prepare Xiaomi Onyx kernel ABI headers
         working-directory: gki-clo
         env:
@@ -233,6 +246,7 @@ jobs:
           KERNEL_OUT: ${{ env.WLAN_KERNEL_OUT }}
           ENABLE_INJECTION: ${{ inputs.enable_injection }}
           APPLY_COMPAT_PATCH: ${{ inputs.apply_compat_patch }}
+          APPLY_P2PHC_PATCH: ${{ inputs.apply_p2phc_patch }}
           KERNEL_SOURCE_BRANCH: ${{ inputs.kernel_source_branch }}
           WLAN_BRANCH: ${{ inputs.wlan_branch }}
           WLAN_EXTRA_KCFLAGS: ""
@@ -249,6 +263,9 @@ jobs:
             mode=control-compat
           else
             mode=control-clean
+          fi
+          if [[ "$ENABLE_INJECTION" == "false" && "$APPLY_COMPAT_PATCH" == "true" && "$APPLY_P2PHC_PATCH" == "true" ]]; then
+            mode="${mode}-p2phc"
           fi
           mode="${mode}-${WLAN_BRANCH}-${KERNEL_SOURCE_BRANCH}"
           module="artifacts/wlan/qca_cld3_wcn7750-konoha-${mode}.ko"
