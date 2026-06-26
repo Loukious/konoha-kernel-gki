@@ -101,6 +101,17 @@ chmod 700 "$LOG_ROOT" "$RUN_DIR" 2>/dev/null
   fi
 
   dmesg >"$RUN_DIR/dmesg-start.txt" 2>&1
+  (
+    dmesg -w >"$RUN_DIR/dmesg-live.txt" 2>&1 || {
+      while :; do
+        echo "=== dmesg fallback $(date 2>/dev/null) uptime $(cat /proc/uptime 2>/dev/null) ==="
+        dmesg 2>/dev/null | tail -800
+        sleep 1
+      done
+    }
+  ) &
+  DMESG_PID=$!
+
   echo "ADB/USB forcing disabled; logger only records state." \
     >"$RUN_DIR/adb-enable.log"
 
@@ -119,21 +130,34 @@ chmod 700 "$LOG_ROOT" "$RUN_DIR" 2>/dev/null
   ) &
 
   i=0
-  while [ "$i" -lt 240 ]; do
+  while [ "$i" -lt 480 ]; do
     {
       echo "=== sample $i $(date 2>/dev/null) ==="
+      echo "uptime=$(cat /proc/uptime 2>/dev/null)"
       getprop sys.boot_completed init.svc.vendor.wifi_hal init.svc.wpa_supplicant \
-        init.svc.wificond init.svc.netd sys.usb.config sys.usb.state 2>/dev/null
+        init.svc.wificond init.svc.netd init.svc.surfaceflinger init.svc.bootanim \
+        init.svc.zygote init.svc.system_server sys.usb.config sys.usb.state 2>/dev/null
       cat /proc/modules 2>/dev/null | grep -E 'qca|wlan|cfg80211|cnss|icnss' || true
       ip link show 2>/dev/null || true
+      ps -A -T 2>/dev/null | grep -E 'system_server|surfaceflinger|wpa|wifi|wlan|vendor|ksu|init' || true
+      cat /proc/interrupts 2>/dev/null | grep -Ei 'wlan|qca|icnss|cnss|ipa|glink|smp2p|qrtr' || true
     } >>"$RUN_DIR/samples.txt" 2>&1
 
-    dmesg 2>/dev/null | tail -400 >"$RUN_DIR/dmesg-tail-latest.txt"
+    if [ "$i" = 6 ] || [ "$i" = 12 ]; then
+      echo w >/proc/sysrq-trigger 2>/dev/null || true
+    fi
+
+    {
+      echo "=== dmesg tail sample $i $(date 2>/dev/null) uptime $(cat /proc/uptime 2>/dev/null) ==="
+      dmesg 2>/dev/null | tail -240
+    } >>"$RUN_DIR/dmesg-tail-ring.txt" 2>&1
+    dmesg 2>/dev/null | tail -800 >"$RUN_DIR/dmesg-tail-latest.txt"
     sync
     i=$((i + 1))
-    sleep 1
+    sleep 0.5 2>/dev/null || sleep 1
   done
 
+  kill "$DMESG_PID" 2>/dev/null || true
   dmesg >"$RUN_DIR/dmesg-final.txt" 2>&1
   getprop >"$RUN_DIR/getprop-final.txt" 2>/dev/null
   sync
