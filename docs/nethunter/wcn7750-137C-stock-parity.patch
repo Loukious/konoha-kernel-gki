@@ -1,3 +1,38 @@
+diff --git a/qca-wifi-host-cmn/dp/wifi3.0/dp_peer.h b/qca-wifi-host-cmn/dp/wifi3.0/dp_peer.h
+index 2a36c5e..ebc7c1c 100644
+--- a/qca-wifi-host-cmn/dp/wifi3.0/dp_peer.h
++++ b/qca-wifi-host-cmn/dp/wifi3.0/dp_peer.h
+@@ -2020,7 +2020,7 @@ uint16_t dp_get_link_peer_id_by_lmac_id(struct dp_soc *soc, uint16_t peer_id,
+  * Return: peer in success
+  *         NULL in failure
+  */
+-static inline
++static noinline
+ struct dp_peer *dp_peer_get_tgt_peer_hash_find(struct dp_soc *soc,
+ 					       uint8_t *peer_mac,
+ 					       int mac_addr_is_aligned,
+@@ -2406,7 +2406,7 @@ struct dp_peer *dp_peer_hash_find_wrapper(struct dp_soc *soc,
+ 				      mod_id);
+ }
+ 
+-static inline
++static noinline
+ struct dp_peer *dp_peer_get_tgt_peer_hash_find(struct dp_soc *soc,
+ 					       uint8_t *peer_mac,
+ 					       int mac_addr_is_aligned,
+diff --git a/qca-wifi-host-cmn/hif/src/ce/ce_service_srng.c b/qca-wifi-host-cmn/hif/src/ce/ce_service_srng.c
+index 42ce1e1..8137935 100644
+--- a/qca-wifi-host-cmn/hif/src/ce/ce_service_srng.c
++++ b/qca-wifi-host-cmn/hif/src/ce/ce_service_srng.c
+@@ -1219,7 +1219,7 @@ uint16_t ce_get_direct_link_dest_srng_buffers(struct hif_softc *scn,
+  *
+  * Return: QDF status
+  */
+-static void
++static noinline void
+ ce_save_srng_info(struct hif_softc *hif_ctx, struct hif_ce_ring_info *srng_info,
+ 		  void *srng_ctx)
+ {
 diff --git a/qca-wifi-host-cmn/os_if/linux/qca_vendor.h b/qca-wifi-host-cmn/os_if/linux/qca_vendor.h
 index 82a1eaa..8bc435e 100644
 --- a/qca-wifi-host-cmn/os_if/linux/qca_vendor.h
@@ -15,8 +50,48 @@ index 82a1eaa..8bc435e 100644
  	/* keep last */
  	QCA_WLAN_VENDOR_ATTR_CONFIG_AFTER_LAST,
  	QCA_WLAN_VENDOR_ATTR_CONFIG_MAX =
+diff --git a/qca-wifi-host-cmn/target_if/spectral/target_if_spectral.c b/qca-wifi-host-cmn/target_if/spectral/target_if_spectral.c
+index dc61126..2ff6750 100644
+--- a/qca-wifi-host-cmn/target_if/spectral/target_if_spectral.c
++++ b/qca-wifi-host-cmn/target_if/spectral/target_if_spectral.c
+@@ -1081,7 +1081,7 @@ target_if_log_read_spectral_enabled(
+  *
+  * Return: none
+  */
+-static void
++static noinline void
+ target_if_log_read_spectral_params(
+ 	const char *function_name,
+ 	struct spectral_config *pparam)
+diff --git a/qca-wifi-host-cmn/umac/cmn_services/crypto/src/wlan_crypto_obj_mgr.c b/qca-wifi-host-cmn/umac/cmn_services/crypto/src/wlan_crypto_obj_mgr.c
+index 6981b12..f97abfe 100644
+--- a/qca-wifi-host-cmn/umac/cmn_services/crypto/src/wlan_crypto_obj_mgr.c
++++ b/qca-wifi-host-cmn/umac/cmn_services/crypto/src/wlan_crypto_obj_mgr.c
+@@ -404,7 +404,8 @@ static void crypto_remove_entry(struct crypto_psoc_priv_obj *psoc,
+ 	TAILQ_INSERT_TAIL(free_list, crypto_entry, hash_list_elem);
+ }
+ 
+-static void crypto_free_list(struct crypto_psoc_priv_obj *psoc, void *ptr)
++static noinline void crypto_free_list(struct crypto_psoc_priv_obj *psoc,
++				      void *ptr)
+ {
+ 	struct wlan_crypto_key_entry *crypto_entry, *hash_entry_next;
+ 
+diff --git a/qca-wifi-host-cmn/umac/mlme/connection_mgr/core/src/wlan_cm_bss_scoring.c b/qca-wifi-host-cmn/umac/mlme/connection_mgr/core/src/wlan_cm_bss_scoring.c
+index e0b8449..d99d745 100644
+--- a/qca-wifi-host-cmn/umac/mlme/connection_mgr/core/src/wlan_cm_bss_scoring.c
++++ b/qca-wifi-host-cmn/umac/mlme/connection_mgr/core/src/wlan_cm_bss_scoring.c
+@@ -2463,7 +2463,7 @@ cm_validate_t2lm_scan_entry(struct scan_cache_entry *entry)
+ }
+ #endif
+ 
+-static bool
++static noinline bool
+ cm_check_and_update_bssid_hint_entry_bss_score(struct scan_cache_entry *entry,
+ 					       struct scoring_cfg *score_config,
+ 					       struct qdf_mac_addr *bssid_hint,
 diff --git a/qcacld-3.0/Kbuild b/qcacld-3.0/Kbuild
-index f0c315a..8ea5319 100644
+index f0c315a..fd78d8a 100644
 --- a/qcacld-3.0/Kbuild
 +++ b/qcacld-3.0/Kbuild
 @@ -1753,6 +1753,16 @@ $(call add-wlan-objs,pkt_capture,$(PKT_CAPTURE_OBJS))
@@ -36,6 +111,16 @@ index f0c315a..8ea5319 100644
  MGMT_RX_SRNG_INC := -I$(WLAN_ROOT)/$(MGMT_RX_SRNG_DIR)/core/inc \
  		    -I$(WLAN_ROOT)/$(MGMT_RX_SRNG_DIR)/dispatcher/inc \
  		    -I$(WLAN_ROOT)/components/target_if/mgmt_rx_srng/inc
+@@ -4019,7 +4029,9 @@ ccflags-$(CONFIG_WLAN_LOG_INFO) += -DWLAN_LOG_INFO
+ ccflags-$(CONFIG_WLAN_LOG_DEBUG) += -DWLAN_LOG_DEBUG
+ ccflags-$(CONFIG_WLAN_LOG_ENTER) += -DWLAN_LOG_ENTER
+ ccflags-$(CONFIG_WLAN_LOG_EXIT) += -DWLAN_LOG_EXIT
++ccflags-$(CONFIG_WLAN_OPEN_SOURCE) += -DWLAN_OPEN_SOURCE
+ ccflags-$(WLAN_OPEN_SOURCE) += -DWLAN_OPEN_SOURCE
++ccflags-$(CONFIG_WLAN_FEATURE_FAST_SAP_ACS) += -DWLAN_FEATURE_FAST_SAP_ACS
+ ccflags-$(CONFIG_FEATURE_STATS_EXT) += -DWLAN_FEATURE_STATS_EXT
+ ccflags-$(CONFIG_QCACLD_FEATURE_NAN) += -DWLAN_FEATURE_NAN
+ ccflags-$(CONFIG_QCACLD_FEATURE_SON) += -DWLAN_FEATURE_SON
 diff --git a/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c b/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c
 index b0a4f61..a4bd705 100644
 --- a/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c
@@ -250,7 +335,7 @@ index e6019d5..175ec7f 100644
  #define WCN7750_HEADERS_DEF (1)
  #endif
 diff --git a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig b/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
-index b9f1eca..4a56466 100644
+index b9f1eca..edf5fc7 100644
 --- a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
 +++ b/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
 @@ -64,6 +64,9 @@ CONFIG_FEATURE_HTC_CREDIT_HISTORY=y
@@ -263,13 +348,21 @@ index b9f1eca..4a56466 100644
  CONFIG_FEATURE_MSCS=y
  CONFIG_FEATURE_NO_DBS_INTRABAND_MCC_SUPPORT=y
  CONFIG_FEATURE_OEM_DATA=y
-@@ -402,3 +405,4 @@ CONFIG_FEATURE_MGMT_RX_OVER_SRNG=y
+@@ -249,6 +252,7 @@ CONFIG_WLAN_NUD_TRACKING=y
+ CONFIG_WLAN_OFFLOAD_PACKETS=y
+ CONFIG_WLAN_OPEN_P2P_INTERFACE=y
+ CONFIG_WLAN_OPEN_SOURCE=y
++WLAN_OPEN_SOURCE := y
+ CONFIG_WLAN_PDEV_VDEV_SEND_MULTI_PARAM=y
+ CONFIG_WLAN_PMO_ENABLE=y
+ CONFIG_WLAN_POLICY_MGR_ENABLE=y
+@@ -402,3 +406,4 @@ CONFIG_FEATURE_MGMT_RX_OVER_SRNG=y
  CONFIG_WLAN_CHIPSET_STATS=y
  CONFIG_WLAN_CHIPSET_LOG_MAX_SIZE=y
  CONFIG_CONFIG_WLAN_DUMP_IN_PROGRESS=y
 +CONFIG_WLAN_DYNAMIC_ARP_NS_OFFLOAD=y
 diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c b/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
-index 1826ae0..ee2bc83 100644
+index 1826ae0..8fcb991 100644
 --- a/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
 +++ b/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
 @@ -258,6 +258,12 @@
@@ -595,13 +688,14 @@ index 1826ae0..ee2bc83 100644
  };
  
  
-@@ -13170,6 +13465,16 @@ static int hdd_set_dbam_config(struct wlan_hdd_link_info *link_info,
+@@ -13170,6 +13465,17 @@ static int hdd_set_dbam_config(struct wlan_hdd_link_info *link_info,
  }
  #endif
  
 +#ifdef WLAN_FEATURE_FAST_SAP_ACS
-+static int wlan_hdd_cfg80211_set_fast_acs(struct wlan_hdd_link_info *link_info,
-+					  const struct nlattr *attr)
++static noinline int
++wlan_hdd_cfg80211_set_fast_acs(struct wlan_hdd_link_info *link_info,
++			       const struct nlattr *attr)
 +{
 +	is_sap_fast_acs = nla_get_u8(attr);
 +	hdd_debug("fast enabled %d", is_sap_fast_acs);
@@ -612,7 +706,7 @@ index 1826ae0..ee2bc83 100644
  /**
   * hdd_set_beamformer_periodic_sounding() - enable/disable Tx Beamforming
   * @link_info: Link info pointer in HDD adapter
-@@ -14895,6 +15200,10 @@ static const struct independent_setters independent_setters[] = {
+@@ -14895,6 +15201,10 @@ static const struct independent_setters independent_setters[] = {
  	{QCA_WLAN_VENDOR_ATTR_CONFIG_SET_NSS_ANT,
  	 hdd_config_set_nss_and_antenna_mode},
  	// END WIFI_PowerSave
@@ -623,6 +717,19 @@ index 1826ae0..ee2bc83 100644
  };
  
  #ifdef WLAN_FEATURE_ELNA
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+index 8dccb0e..cd556d0 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -18725,7 +18725,7 @@ destroy_sync:
+  *
+  * Return: QDF_STATUS
+  */
+-static QDF_STATUS hdd_open_p2p_interface(struct hdd_context *hdd_ctx)
++static noinline QDF_STATUS hdd_open_p2p_interface(struct hdd_context *hdd_ctx)
+ {
+ 	QDF_STATUS status;
+ 	bool p2p_dev_addr_admin;
 diff --git a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c b/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
 index 8a3dbda..4038687 100644
 --- a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
@@ -637,3 +744,46 @@ index 8a3dbda..4038687 100644
  		if (partner_info->partner_link_info[i].link_id == req_link_id &&
  		    (qdf_is_macaddr_equal(link_addr,
  					  &partner_info->partner_link_info[i].link_addr)))
+diff --git a/qcacld-3.0/core/mac/src/pe/lim/lim_process_assoc_rsp_frame.c b/qcacld-3.0/core/mac/src/pe/lim/lim_process_assoc_rsp_frame.c
+index eb85e10..08cbcf7 100644
+--- a/qcacld-3.0/core/mac/src/pe/lim/lim_process_assoc_rsp_frame.c
++++ b/qcacld-3.0/core/mac/src/pe/lim/lim_process_assoc_rsp_frame.c
+@@ -647,7 +647,7 @@ static inline void lim_process_eht_info(tpSirProbeRespBeacon beacon,
+ #endif
+ 
+ #define MAX_RETRY_TIMER 1500
+-static QDF_STATUS
++static noinline QDF_STATUS
+ lim_handle_pmfcomeback_timer(struct pe_session *session_entry,
+ 			     tpSirAssocRsp assoc_rsp)
+ {
+diff --git a/qcacld-3.0/core/sap/src/sap_fsm.c b/qcacld-3.0/core/sap/src/sap_fsm.c
+index a61fe22..348dc3c 100644
+--- a/qcacld-3.0/core/sap/src/sap_fsm.c
++++ b/qcacld-3.0/core/sap/src/sap_fsm.c
+@@ -2715,7 +2715,7 @@ QDF_STATUS sap_populate_peer_assoc_info(struct mac_context *mac_ctx,
+ }
+ 
+ #ifdef WLAN_FEATURE_11BE_MLO
+-static void
++static noinline void
+ sap_reassoc_mld_copy(struct csr_roam_info *csr_roaminfo,
+ 		     tSap_StationAssocReassocCompleteEvent *reassoc_complete)
+ {
+diff --git a/qcacld-3.0/core/sme/src/csr/csr_api_roam.c b/qcacld-3.0/core/sme/src/csr/csr_api_roam.c
+index f2a1f4e..720cdf5 100644
+--- a/qcacld-3.0/core/sme/src/csr/csr_api_roam.c
++++ b/qcacld-3.0/core/sme/src/csr/csr_api_roam.c
+@@ -4154,9 +4154,9 @@ csr_roam_chk_lnk_assoc_ind(struct mac_context *mac_ctx, tSirSmeRsp *msg_ptr)
+  *
+  * Return: True if peer is present otherwise return false
+  */
+-static bool csr_if_peer_present(struct mac_context *mac_ctx,
+-				uint8_t *bssid,
+-				uint8_t *peer_macaddr)
++static noinline bool csr_if_peer_present(struct mac_context *mac_ctx,
++					 uint8_t *bssid,
++					 uint8_t *peer_macaddr)
+ {
+ 	struct wlan_objmgr_peer *peer;
+ 	uint8_t pdev_id;
