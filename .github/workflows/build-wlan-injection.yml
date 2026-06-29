@@ -329,27 +329,57 @@ jobs:
           echo "WLAN_MODULE=$module" >> "$GITHUB_ENV"
           kernel_release="$(cat "$KERNEL_OUT/include/config/kernel.release")"
           module_vermagic="$(modinfo -F vermagic "$module")"
+          mkdir -p artifacts/wlan
+          nm -S --defined-only "$module" 2>/dev/null | tee artifacts/wlan/qca_cld3_wcn7750.defined-symbols.txt >/dev/null
+          readelf -sW "$module" > artifacts/wlan/qca_cld3_wcn7750.readelf-symbols.txt
 
           case "$module_vermagic" in
             "$kernel_release"*) ;;
-            *) echo "WLAN module vermagic does not match the prepared kernel" >&2; exit 1 ;;
+            *)
+              echo "WLAN module vermagic does not match the prepared kernel" >&2
+              echo "  kernel release:  $kernel_release" >&2
+              echo "  module vermagic: $module_vermagic" >&2
+              exit 1
+              ;;
           esac
           if [[ "$ENABLE_INJECTION" == "true" ]]; then
-            grep -a -q hdd_monitor_mode_tx_inject "$module"
+            if ! grep -a -q hdd_monitor_mode_tx_inject "$module"; then
+              echo "Injection module is missing hdd_monitor_mode_tx_inject" >&2
+              exit 1
+            fi
           elif grep -a -q hdd_monitor_mode_tx_inject "$module"; then
             echo "Control module unexpectedly contains injection code" >&2
             exit 1
           fi
-          grep -a -q qcwlanstate "$module"
+          if ! grep -a -q qcwlanstate "$module"; then
+            echo "WLAN module is missing qcwlanstate" >&2
+            exit 1
+          fi
 
           stock_module=sources/pixelos/android_device_xiaomi_onyx-kernel/modules/vendor_dlkm/qca_cld3_wcn7750.ko
           stock_ops_size="$(readelf -sW "$stock_module" | awk '$8 == "wlan_hdd_cfg80211_ops" { print $3; exit }')"
           module_ops_size="$(readelf -sW "$module" | awk '$8 == "wlan_hdd_cfg80211_ops" { print $3; exit }')"
-          test -n "$stock_ops_size"
-          test "$module_ops_size" = "$stock_ops_size"
+          if [[ -z "$stock_ops_size" ]]; then
+            echo "Could not read wlan_hdd_cfg80211_ops size from PixelOS stock module" >&2
+            exit 1
+          fi
+          if [[ -z "$module_ops_size" ]]; then
+            echo "Could not read wlan_hdd_cfg80211_ops size from rebuilt module" >&2
+            exit 1
+          fi
+          if [[ "$module_ops_size" != "$stock_ops_size" ]]; then
+            echo "wlan_hdd_cfg80211_ops size mismatch" >&2
+            echo "  rebuilt: $module_ops_size bytes" >&2
+            echo "  stock:   $stock_ops_size bytes" >&2
+            exit 1
+          fi
+          awk '{ print $NF }' artifacts/wlan/qca_cld3_wcn7750.defined-symbols.txt | sort -u > artifacts/wlan/qca_cld3_wcn7750.defined-symbol-names.txt
+          missing_symbols=0
           require_symbol() {
-            nm -S --defined-only "$module" 2>/dev/null |
-              awk '{ print $NF }' | grep -qx "$1"
+            if ! grep -qx "$1" artifacts/wlan/qca_cld3_wcn7750.defined-symbol-names.txt; then
+              echo "Required WLAN symbol missing: $1" >&2
+              missing_symbols=$((missing_symbols + 1))
+            fi
           }
           if [[ "$ENABLE_INJECTION" == "false" && "$APPLY_COMPAT_PATCH" == "true" ]]; then
             require_symbol wlan_mgmt_rx_srng_cfg_enable
@@ -365,6 +395,10 @@ jobs:
               [[ -z "$symbol" ]] && continue
               require_symbol "$symbol"
             done < docs/nethunter/wcn7750-stock-parity-symbols.txt
+          fi
+          if (( missing_symbols > 0 )); then
+            echo "$missing_symbols required WLAN symbol(s) were missing" >&2
+            exit 1
           fi
 
           echo "kernel release:  $kernel_release"
@@ -404,6 +438,18 @@ jobs:
           (cd "$verify_dir" && python3 "$GITHUB_WORKSPACE/gki-clo/sources/avb/avbtool.py" \
             verify_image --image vendor_dlkm.img)
           sha256sum "$module" "$raw" "$sparse" | tee artifacts/SHA256SUMS
+
+      - name: Upload failed WLAN debug files
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-wlan-debug-${{ github.run_id }}
+          path: |
+            gki-clo/artifacts/wlan/*
+            gki-clo/vendor/qcom/opensource/wlan/qcacld-3.0/Module.symvers
+            gki-clo/vendor/qcom/opensource/wlan/qcacld-3.0/qca_cld3_wcn7750.ko
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Upload WLAN module and image
         uses: actions/upload-artifact@v4
