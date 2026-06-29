@@ -9,10 +9,10 @@ on:
         type: string
         default: sixteen-qpr2
       wlan_branch:
-        description: MiCode WLAN branch matching the installed vendor driver
+        description: MiCode WLAN branch used for the replacement vendor driver
         required: true
         type: string
-        default: onyx-v-oss
+        default: popsicle-w-oss
       enable_injection:
         description: Apply the injection port (disable for a source/ABI control build)
         required: true
@@ -169,12 +169,22 @@ jobs:
         if: ${{ inputs.enable_injection == false && inputs.apply_compat_patch }}
         working-directory: gki-clo/vendor/qcom/opensource/wlan
         run: |
-          primary="$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-build-compat.patch"
-          fallback="$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-119O-build-compat.patch"
-          patch="$primary"
-          if ! git apply --check "$patch" 2>/tmp/wcn7750-compat.err; then
-            patch="$fallback"
-            git apply --check "$patch"
+          patches=(
+            "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-build-compat.patch"
+            "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-137C-stock-parity.patch"
+            "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-119O-build-compat.patch"
+          )
+          patch=""
+          for candidate in "${patches[@]}"; do
+            if git apply --check "$candidate" 2>/tmp/wcn7750-compat.err; then
+              patch="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$patch" ]]; then
+            echo "No WCN7750 compatibility patch applies to this WLAN branch." >&2
+            cat /tmp/wcn7750-compat.err >&2
+            exit 1
           fi
           echo "Applying compatibility patch: $(basename "$patch")"
           git apply "$patch"
@@ -184,8 +194,16 @@ jobs:
         if: ${{ inputs.enable_injection == false && inputs.apply_compat_patch && inputs.apply_p2phc_patch }}
         working-directory: gki-clo/vendor/qcom/opensource/wlan
         run: |
-          git apply --check "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-119O-p2phc.patch"
-          git apply "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-119O-p2phc.patch"
+          patch="$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-119O-p2phc.patch"
+          if git apply --check "$patch" 2>/tmp/wcn7750-p2phc.err; then
+            git apply "$patch"
+          elif grep -R -q 'p2phc_init' qcacld-3.0/core/hdd/src/p2phc 2>/dev/null &&
+               grep -R -q 'dlhc_compress' qcacld-3.0/core/hdd/src/p2phc 2>/dev/null; then
+            echo "WCN7750 p2phc hooks already exist in this WLAN branch."
+          else
+            cat /tmp/wcn7750-p2phc.err >&2
+            exit 1
+          fi
           git diff --check
 
       - name: Prepare Xiaomi Onyx kernel ABI headers
@@ -338,6 +356,12 @@ jobs:
           if [[ "$ENABLE_INJECTION" == "false" && "$APPLY_P2PHC_PATCH" == "true" ]]; then
             require_symbol p2phc_init
             require_symbol dlhc_compress
+          fi
+          if [[ "$ENABLE_INJECTION" == "false" && "$APPLY_COMPAT_PATCH" == "true" ]]; then
+            while IFS= read -r symbol; do
+              [[ -z "$symbol" ]] && continue
+              require_symbol "$symbol"
+            done < docs/nethunter/wcn7750-stock-parity-symbols.txt
           fi
 
           echo "kernel release:  $kernel_release"

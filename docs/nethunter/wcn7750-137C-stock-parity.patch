@@ -1,0 +1,639 @@
+diff --git a/qca-wifi-host-cmn/os_if/linux/qca_vendor.h b/qca-wifi-host-cmn/os_if/linux/qca_vendor.h
+index 82a1eaa..8bc435e 100644
+--- a/qca-wifi-host-cmn/os_if/linux/qca_vendor.h
++++ b/qca-wifi-host-cmn/os_if/linux/qca_vendor.h
+@@ -6677,6 +6677,12 @@ enum qca_wlan_vendor_attr_config {
+ 	 */
+ 	QCA_WLAN_VENDOR_ATTR_CONFIG_SET_NSS_ANT = 200,
+ 	// END WIFI_PowerSave
++
++#ifdef WLAN_FEATURE_FAST_SAP_ACS
++	/* 8-bit unsigned value to enable fast SAP ACS. */
++	QCA_WLAN_VENDOR_ATTR_CONFIG_SET_FAST_ACS = 201,
++#endif
++
+ 	/* keep last */
+ 	QCA_WLAN_VENDOR_ATTR_CONFIG_AFTER_LAST,
+ 	QCA_WLAN_VENDOR_ATTR_CONFIG_MAX =
+diff --git a/qcacld-3.0/Kbuild b/qcacld-3.0/Kbuild
+index f0c315a..8ea5319 100644
+--- a/qcacld-3.0/Kbuild
++++ b/qcacld-3.0/Kbuild
+@@ -1753,6 +1753,16 @@ $(call add-wlan-objs,pkt_capture,$(PKT_CAPTURE_OBJS))
+ ########## MGMT RX SRNG ##########
+ 
+ MGMT_RX_SRNG_DIR := components/mgmt_rx_srng
++ifeq ($(CONFIG_FEATURE_MGMT_RX_OVER_SRNG), y)
++MGMT_RX_SRNG_OBJS := $(MGMT_RX_SRNG_DIR)/core/src/wlan_mgmt_rx_srng.o \
++		    $(MGMT_RX_SRNG_DIR)/dispatcher/src/wlan_mgmt_rx_srng_ucfg_api.o \
++		    components/target_if/mgmt_rx_srng/src/target_if_mgmt_rx_srng.o \
++		    $(MGMT_RX_SRNG_DIR)/dispatcher/src/wlan_mgmt_rx_srng_tgt_api.o
++ccflags-y += -DFEATURE_MGMT_RX_OVER_SRNG
++endif
++
++$(call add-wlan-objs,mgmt_rx_srng,$(MGMT_RX_SRNG_OBJS))
++
+ MGMT_RX_SRNG_INC := -I$(WLAN_ROOT)/$(MGMT_RX_SRNG_DIR)/core/inc \
+ 		    -I$(WLAN_ROOT)/$(MGMT_RX_SRNG_DIR)/dispatcher/inc \
+ 		    -I$(WLAN_ROOT)/components/target_if/mgmt_rx_srng/inc
+diff --git a/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c b/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c
+index b0a4f61..a4bd705 100644
+--- a/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c
++++ b/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c
+@@ -48,6 +48,22 @@
+ #define MLME_GET_CHAN_STATS_PASSIVE_SCAN_TIME 40
+ #define MLME_GET_CHAN_STATS_WIDE_BAND_PASSIVE_SCAN_TIME 110
+ 
++#define XIAOMI_HW_PLATFORM_2G_5G_ONLY 3
++#define XIAOMI_HW_COUNTRY_CN 0
++
++extern int get_hw_version_platform(void);
++extern int get_hw_country_version(void);
++
++static inline bool mlme_xiaomi_hw_is_2g_5g_only(void)
++{
++	return get_hw_version_platform() == XIAOMI_HW_PLATFORM_2G_5G_ONLY;
++}
++
++static inline bool mlme_xiaomi_hw_is_cn_build(void)
++{
++	return get_hw_country_version() == XIAOMI_HW_COUNTRY_CN;
++}
++
+ struct wlan_mlme_rx_ops *
+ mlme_get_rx_ops(struct wlan_objmgr_psoc *psoc)
+ {
+@@ -1391,8 +1407,12 @@ static void mlme_init_generic_cfg(struct wlan_objmgr_psoc *psoc,
+ 		cfg_get(psoc, CFG_ENABLE_RTT_MAC_RANDOMIZATION);
+ 	gen->band_capability =
+ 		cfg_get(psoc, CFG_BAND_CAPABILITY);
+-	if (!gen->band_capability)
++	if (mlme_xiaomi_hw_is_2g_5g_only()) {
++		mlme_debug("replace ini BandCapability=3, support both 2.4G and 5G");
++		gen->band_capability = BIT(REG_BAND_2G) | BIT(REG_BAND_5G);
++	} else if (!gen->band_capability) {
+ 		gen->band_capability = REG_BAND_MASK_ALL;
++	}
+ 	gen->band = gen->band_capability;
+ 	gen->select_5ghz_margin =
+ 		cfg_get(psoc, CFG_SELECT_5GHZ_MARGIN);
+@@ -1635,6 +1655,10 @@ mlme_init_qos_edca_params(struct wlan_objmgr_psoc *psoc,
+ 
+ 	edca_params->enable_edca_params =
+ 			cfg_get(psoc, CFG_EDCA_ENABLE_PARAM);
++	if (!mlme_xiaomi_hw_is_cn_build()) {
++		mlme_debug("set enable_edca_params 0 due to not CN build");
++		edca_params->enable_edca_params = false;
++	}
+ 
+ 	edca_params->enable_wmm_txop =
+ 			cfg_get(psoc, CFG_ENABLE_WMM_TXOP);
+@@ -3632,6 +3656,10 @@ static void mlme_init_wifi_pos_cfg(struct wlan_objmgr_psoc *psoc,
+ 		cfg_get(psoc, CFG_FINE_TIME_MEAS_CAPABILITY);
+ 	wifi_pos_cfg->oem_6g_support_disable =
+ 		cfg_get(psoc, CFG_OEM_SIXG_SUPPORT_DISABLE);
++	if (mlme_xiaomi_hw_is_2g_5g_only()) {
++		mlme_debug("replace ini oem_6g_support_disable=1");
++		wifi_pos_cfg->oem_6g_support_disable = true;
++	}
+ 	wifi_pos_cfg->is_rtt_bw_downgrade_enabled =
+ 		cfg_get(psoc, CFG_ENABLE_RTT_BW_DOWNGRADE);
+ 
+diff --git a/qcacld-3.0/components/pmo/core/inc/wlan_pmo_suspend_resume.h b/qcacld-3.0/components/pmo/core/inc/wlan_pmo_suspend_resume.h
+index 455344a..1022e0a 100644
+--- a/qcacld-3.0/components/pmo/core/inc/wlan_pmo_suspend_resume.h
++++ b/qcacld-3.0/components/pmo/core/inc/wlan_pmo_suspend_resume.h
+@@ -181,6 +181,14 @@ bool pmo_core_vdev_get_restore_dtim(struct wlan_objmgr_vdev *vdev)
+ }
+ 
+ #ifdef FEATURE_WLAN_DYNAMIC_ARP_NS_OFFLOAD
++bool
++pmo_core_get_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev);
++
++void
++pmo_core_set_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev,
++				       enum pmo_offload_trigger trigger,
++				       bool enable);
++
+ /**
+  * pmo_core_dynamic_arp_ns_offload_enable() - Enable vdev arp/ns offload
+  * @vdev: objmgr vdev handle
+diff --git a/qcacld-3.0/components/pmo/core/src/wlan_pmo_ns.c b/qcacld-3.0/components/pmo/core/src/wlan_pmo_ns.c
+index b743640..cb5be4d 100644
+--- a/qcacld-3.0/components/pmo/core/src/wlan_pmo_ns.c
++++ b/qcacld-3.0/components/pmo/core/src/wlan_pmo_ns.c
+@@ -254,6 +254,67 @@ static QDF_STATUS pmo_core_ns_offload_sanity(struct wlan_objmgr_vdev *vdev)
+ 	return QDF_STATUS_SUCCESS;
+ }
+ 
++#ifdef FEATURE_WLAN_DYNAMIC_ARP_NS_OFFLOAD
++bool pmo_core_get_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev)
++{
++	QDF_STATUS status;
++	bool enabled = false;
++	struct pmo_vdev_priv_obj *vdev_ctx;
++	struct pmo_psoc_priv_obj *pmo_psoc_ctx;
++
++	if (!vdev) {
++		pmo_err("vdev is NULL");
++		return false;
++	}
++
++	status = pmo_vdev_get_ref(vdev);
++	if (status != QDF_STATUS_SUCCESS)
++		return false;
++
++	vdev_ctx = pmo_vdev_get_priv(vdev);
++	if (!vdev_ctx)
++		goto put_ref;
++
++	pmo_psoc_ctx = vdev_ctx->pmo_psoc_ctx;
++	if (!pmo_psoc_ctx)
++		goto put_ref;
++
++	if (pmo_core_ns_offload_sanity(vdev) == QDF_STATUS_SUCCESS)
++		enabled = pmo_psoc_ctx->psoc_cfg.ns_offload_enable_dynamic;
++
++put_ref:
++	wlan_objmgr_vdev_release_ref(vdev, WLAN_PMO_ID);
++	return enabled;
++}
++
++void pmo_core_set_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev,
++					    enum pmo_offload_trigger trigger,
++					    bool enable)
++{
++	QDF_STATUS status;
++	struct pmo_vdev_priv_obj *vdev_ctx;
++	struct pmo_psoc_priv_obj *pmo_psoc_ctx;
++
++	if (!vdev) {
++		pmo_err("vdev is NULL");
++		return;
++	}
++
++	status = pmo_vdev_get_ref(vdev);
++	if (status != QDF_STATUS_SUCCESS)
++		return;
++
++	vdev_ctx = pmo_vdev_get_priv(vdev);
++	pmo_psoc_ctx = vdev_ctx ? vdev_ctx->pmo_psoc_ctx : NULL;
++	if (pmo_psoc_ctx &&
++	    trigger == pmo_ns_offload_dynamic_update &&
++	    pmo_core_ns_offload_sanity(vdev) == QDF_STATUS_SUCCESS)
++		pmo_psoc_ctx->psoc_cfg.ns_offload_enable_dynamic = enable;
++
++	wlan_objmgr_vdev_release_ref(vdev, WLAN_PMO_ID);
++}
++#endif
++
+ QDF_STATUS pmo_core_ns_check_offload(struct wlan_objmgr_psoc *psoc,
+ 				     enum pmo_offload_trigger trigger,
+ 				     uint8_t vdev_id)
+diff --git a/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_ucfg_api.h b/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_ucfg_api.h
+index 0151434..28edef6 100644
+--- a/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_ucfg_api.h
++++ b/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_ucfg_api.h
+@@ -648,6 +648,14 @@ ucfg_pmo_dynamic_arp_ns_offload_runtime_prevent(struct wlan_objmgr_vdev *vdev);
+  */
+ void
+ ucfg_pmo_dynamic_arp_ns_offload_runtime_allow(struct wlan_objmgr_vdev *vdev);
++
++bool
++ucfg_pmo_get_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev);
++
++void
++ucfg_pmo_set_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev,
++				       enum pmo_offload_trigger trigger,
++				       bool enable);
+ #else
+ static inline QDF_STATUS
+ ucfg_pmo_dynamic_arp_ns_offload_enable(struct wlan_objmgr_vdev *vdev)
+diff --git a/qcacld-3.0/components/pmo/dispatcher/src/wlan_pmo_ucfg_api.c b/qcacld-3.0/components/pmo/dispatcher/src/wlan_pmo_ucfg_api.c
+index 654af2f..809b62d 100644
+--- a/qcacld-3.0/components/pmo/dispatcher/src/wlan_pmo_ucfg_api.c
++++ b/qcacld-3.0/components/pmo/dispatcher/src/wlan_pmo_ucfg_api.c
+@@ -250,6 +250,20 @@ ucfg_pmo_dynamic_arp_ns_offload_runtime_allow(struct wlan_objmgr_vdev *vdev)
+ {
+ 	return pmo_core_dynamic_arp_ns_offload_runtime_allow(vdev);
+ }
++
++bool
++ucfg_pmo_get_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev)
++{
++	return pmo_core_get_ns_offload_enable_dynamic(vdev);
++}
++
++void
++ucfg_pmo_set_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev,
++				       enum pmo_offload_trigger trigger,
++				       bool enable)
++{
++	return pmo_core_set_ns_offload_enable_dynamic(vdev, trigger, enable);
++}
+ #endif
+ 
+ QDF_STATUS
+diff --git a/qcacld-3.0/configs/config_to_feature.h b/qcacld-3.0/configs/config_to_feature.h
+index e6019d5..175ec7f 100644
+--- a/qcacld-3.0/configs/config_to_feature.h
++++ b/qcacld-3.0/configs/config_to_feature.h
+@@ -3155,6 +3155,10 @@ defined(CONFIG_WLAN_TX_FLOW_CONTROL_V2)
+ #define FEATURE_ML_MONITOR_MODE_SUPPORT (1)
+ #endif
+ 
++#ifdef CONFIG_WLAN_FEATURE_FAST_SAP_ACS
++#define WLAN_FEATURE_FAST_SAP_ACS (1)
++#endif
++
+ #ifdef CONFIG_WCN7750_HEADERS_DEF
+ #define WCN7750_HEADERS_DEF (1)
+ #endif
+diff --git a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig b/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
+index b9f1eca..4a56466 100644
+--- a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
++++ b/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
+@@ -64,6 +64,9 @@ CONFIG_FEATURE_HTC_CREDIT_HISTORY=y
+ CONFIG_FEATURE_INTEROP_ISSUES_AP=y
+ CONFIG_FEATURE_MEMDUMP_ENABLE=y
+ CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y
++CONFIG_CNSS2_SSR_DRIVER_DUMP=y
++CONFIG_FEATURE_SMEM_MAILBOX=y
++CONFIG_WLAN_FEATURE_FAST_SAP_ACS=y
+ CONFIG_FEATURE_MSCS=y
+ CONFIG_FEATURE_NO_DBS_INTRABAND_MCC_SUPPORT=y
+ CONFIG_FEATURE_OEM_DATA=y
+@@ -402,3 +405,4 @@ CONFIG_FEATURE_MGMT_RX_OVER_SRNG=y
+ CONFIG_WLAN_CHIPSET_STATS=y
+ CONFIG_WLAN_CHIPSET_LOG_MAX_SIZE=y
+ CONFIG_CONFIG_WLAN_DUMP_IN_PROGRESS=y
++CONFIG_WLAN_DYNAMIC_ARP_NS_OFFLOAD=y
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c b/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+index 1826ae0..ee2bc83 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+@@ -258,6 +258,12 @@
+ #define AP_PROFILE_XR_ENABLE 0x1
+ #define AP_PROFILE_XPAN_ENABLE 0x2
+ 
++#ifdef WLAN_FEATURE_FAST_SAP_ACS
++static bool is_sap_fast_acs;
++static const struct nla_policy
++get_usable_channel_policy[QCA_WLAN_VENDOR_ATTR_USABLE_CHANNELS_MAX + 1];
++#endif
++
+ /**
+  * rtt_is_enabled - Macro to check if the bitmap has any RTT roles set
+  * @bitmap: The bitmap to be checked
+@@ -4134,6 +4140,285 @@ static void hdd_remove_6ghz_freq_from_acs_list(uint32_t *org_freq_list,
+ 	*org_ch_list_count = ch_list_count;
+ }
+ 
++#ifdef WLAN_FEATURE_FAST_SAP_ACS
++static int separate_24g_5g_freq(uint32_t *raw_data, uint32_t raw_data_len,
++				uint32_t *freq_list_24g,
++				uint32_t *freq_list_24g_len,
++				uint32_t *freq_list_5g,
++				uint32_t *freq_list_5g_len)
++{
++	uint32_t ch_index;
++
++	for (ch_index = 0; ch_index < raw_data_len; ch_index++) {
++		if (WLAN_REG_IS_24GHZ_CH_FREQ(raw_data[ch_index])) {
++			freq_list_24g[*freq_list_24g_len] = raw_data[ch_index];
++			(*freq_list_24g_len)++;
++		} else if (WLAN_REG_IS_5GHZ_CH_FREQ(raw_data[ch_index])) {
++			freq_list_5g[*freq_list_5g_len] = raw_data[ch_index];
++			(*freq_list_5g_len)++;
++		}
++	}
++
++	return 0;
++}
++
++static int hdd_get_usable_channel(struct hdd_context *hdd_ctx,
++				  const void *data, uint32_t data_len,
++				  int ch_width, uint32_t *list_usable_2g,
++				  uint32_t *list_usable_2g_count,
++				  uint32_t *list_usable_5g,
++				  uint32_t *list_usable_5g_count)
++{
++	struct get_usable_chan_req_params req_msg = {0};
++	struct get_usable_chan_res_params *res_msg;
++	struct nlattr *tb[QCA_WLAN_VENDOR_ATTR_USABLE_CHANNELS_MAX + 1];
++	int ret;
++	uint32_t count = 0, i;
++	QDF_STATUS status;
++	uint32_t sap_cfg_tmp[NUM_CHANNELS];
++	uint32_t sap_cfg_tmp_count = 0;
++
++	if (QDF_GLOBAL_FTM_MODE == hdd_get_conparam())
++		return -EPERM;
++
++	ret = wlan_hdd_validate_context(hdd_ctx);
++	if (ret)
++		return ret;
++
++	ret = wlan_cfg80211_nla_parse(tb,
++				      QCA_WLAN_VENDOR_ATTR_USABLE_CHANNELS_MAX,
++				      data, data_len,
++				      get_usable_channel_policy);
++	if (ret) {
++		hdd_err("Invalid usable channel attrs");
++		return ret;
++	}
++
++	res_msg = qdf_mem_malloc(NUM_CHANNELS * sizeof(*res_msg));
++	if (!res_msg) {
++		hdd_err("res_msg invalid");
++		return -EINVAL;
++	}
++
++	if (!tb[QCA_WLAN_VENDOR_ATTR_USABLE_CHANNELS_BAND_MASK]) {
++		req_msg.band_mask = BIT(REG_BAND_2G) | BIT(REG_BAND_5G) |
++				    BIT(REG_BAND_6G);
++	} else {
++		req_msg.band_mask =
++			nla_get_u32(tb[QCA_WLAN_VENDOR_ATTR_USABLE_CHANNELS_BAND_MASK]);
++		if (!req_msg.band_mask) {
++			req_msg.band_mask = BIT(REG_BAND_2G) | BIT(REG_BAND_5G) |
++					    BIT(REG_BAND_6G);
++		} else {
++			if (req_msg.band_mask & BIT(NL80211_BAND_2GHZ))
++				req_msg.band_mask |= BIT(REG_BAND_2G);
++			if (req_msg.band_mask & BIT(NL80211_BAND_5GHZ))
++				req_msg.band_mask |= BIT(REG_BAND_5G);
++			if (req_msg.band_mask & BIT(NL80211_BAND_6GHZ))
++				req_msg.band_mask |= BIT(REG_BAND_6G);
++			if (req_msg.band_mask & BIT(NL80211_BAND_60GHZ))
++				hdd_err("band: %d not supported",
++					NL80211_BAND_60GHZ);
++		}
++	}
++
++	if (!tb[QCA_WLAN_VENDOR_ATTR_USABLE_CHANNELS_IFACE_MODE_MASK]) {
++		req_msg.iface_mode_mask = BIT(NL80211_IFTYPE_STATION) |
++					  BIT(NL80211_IFTYPE_AP) |
++					  BIT(NL80211_IFTYPE_P2P_GO) |
++					  BIT(NL80211_IFTYPE_P2P_CLIENT) |
++					  BIT(NL80211_IFTYPE_P2P_DEVICE) |
++					  BIT(NL80211_IFTYPE_NAN);
++	} else {
++		req_msg.iface_mode_mask =
++			nla_get_u32(tb[QCA_WLAN_VENDOR_ATTR_USABLE_CHANNELS_IFACE_MODE_MASK]);
++		if (!req_msg.iface_mode_mask)
++			req_msg.iface_mode_mask =
++				BIT(NL80211_IFTYPE_STATION) |
++				BIT(NL80211_IFTYPE_AP) |
++				BIT(NL80211_IFTYPE_P2P_GO) |
++				BIT(NL80211_IFTYPE_P2P_CLIENT) |
++				BIT(NL80211_IFTYPE_P2P_DEVICE) |
++				BIT(NL80211_IFTYPE_NAN);
++	}
++
++	if (tb[QCA_WLAN_VENDOR_ATTR_USABLE_CHANNELS_FILTER_MASK])
++		req_msg.filter_mask =
++			nla_get_u32(tb[QCA_WLAN_VENDOR_ATTR_USABLE_CHANNELS_FILTER_MASK]);
++
++	status = wlan_reg_get_usable_channel(hdd_ctx->pdev, req_msg, res_msg,
++					     &count, REG_CURRENT_PWR_MODE);
++	if (status != QDF_STATUS_SUCCESS) {
++		hdd_err("get usable channel failed %d", status);
++		ret = -EINVAL;
++		goto free_res;
++	}
++
++	for (i = 0; i < count; i++) {
++		if (!res_msg[i].freq)
++			continue;
++		if (ch_width <= res_msg[i].bw)
++			sap_cfg_tmp[sap_cfg_tmp_count++] = res_msg[i].freq;
++	}
++
++	separate_24g_5g_freq(sap_cfg_tmp, sap_cfg_tmp_count, list_usable_2g,
++			     list_usable_2g_count, list_usable_5g,
++			     list_usable_5g_count);
++
++free_res:
++	qdf_mem_free(res_msg);
++	return ret ? ret : sap_cfg_tmp_count;
++}
++
++static int hdd_set_acs_freq_same_as_wifi(struct hdd_context *hdd_ctx)
++{
++	struct hdd_adapter *adapter, *next_adapter = NULL;
++	struct hdd_station_ctx *sta_ctx;
++	wlan_net_dev_ref_dbgid dbgid = NET_DEV_HOLD_GET_SAP_OPERATING_BAND;
++	struct wlan_hdd_link_info *link_info;
++	uint32_t freq_sta_connected = 0;
++
++	hdd_for_each_adapter_dev_held_safe(hdd_ctx, adapter, next_adapter, dbgid) {
++		hdd_adapter_for_each_active_link_info(adapter, link_info) {
++			if (adapter && adapter->device_mode == QDF_STA_MODE) {
++				sta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(link_info);
++				if (sta_ctx && hdd_is_vdev_in_conn_state(link_info))
++					freq_sta_connected = sta_ctx->conn_info.chan_freq;
++			}
++		}
++		hdd_adapter_dev_put_debug(adapter, dbgid);
++	}
++
++	if ((policy_mgr_is_hw_dbs_capable(hdd_ctx->psoc) &&
++	     WLAN_REG_IS_5GHZ_CH_FREQ(freq_sta_connected)) ||
++	    (!policy_mgr_is_hw_dbs_capable(hdd_ctx->psoc) &&
++	     !policy_mgr_is_hw_sbs_capable(hdd_ctx->psoc)))
++		return freq_sta_connected;
++
++	return 0;
++}
++
++static bool hdd_is_acs_channel_safe_channel(struct hdd_context *hdd_ctx,
++					    int channel_count,
++					    uint32_t *freq_list)
++{
++	uint8_t ch_index;
++
++	for (ch_index = 0; ch_index < channel_count; ch_index++) {
++		if (!policy_mgr_is_safe_channel(hdd_ctx->psoc, freq_list[ch_index]))
++			return false;
++	}
++
++	return true;
++}
++
++static int hdd_update_acs_info(struct hdd_context *hdd_ctx,
++			       struct sap_config *sap_cfg, const void *data,
++			       uint32_t data_len)
++{
++	uint32_t list_sap_cfg_2g_count = 0;
++	uint32_t list_sap_cfg_2g[MAX_CHANNEL] = {0};
++	uint32_t list_sap_cfg_5g_count = 0;
++	uint32_t list_sap_cfg_5g[MAX_CHANNEL] = {0};
++	uint32_t freq_list_usable_2g_count = 0;
++	uint32_t freq_list_usable_2g[NUM_CHANNELS] = {0};
++	uint32_t freq_list_usable_5g_count = 0;
++	uint32_t freq_list_usable_5g[NUM_CHANNELS] = {0};
++	uint32_t i, j;
++	uint32_t freq_list_tmp_count = 0;
++	uint32_t freq_list_tmp[NUM_CHANNELS] = {0};
++	uint32_t freq_tmp_index;
++	uint32_t freq_same_as_wifi;
++	uint32_t pcl_index, ori_freq_index;
++	bool freq_in_pcl = false;
++
++	if (!hdd_ctx) {
++		hdd_err("hdd_ctx is NULL");
++		return -EINVAL;
++	}
++
++	hdd_debug("do fast sap ACS start");
++	freq_same_as_wifi = hdd_set_acs_freq_same_as_wifi(hdd_ctx);
++	if (freq_same_as_wifi) {
++		freq_list_tmp[0] = freq_same_as_wifi;
++		freq_list_tmp_count = 1;
++		goto out;
++	}
++
++	hdd_get_usable_channel(hdd_ctx, data, data_len, sap_cfg->acs_cfg.ch_width,
++			       freq_list_usable_2g,
++			       &freq_list_usable_2g_count,
++			       freq_list_usable_5g,
++			       &freq_list_usable_5g_count);
++
++	separate_24g_5g_freq(sap_cfg->acs_cfg.freq_list,
++			     sap_cfg->acs_cfg.ch_list_count,
++			     list_sap_cfg_2g, &list_sap_cfg_2g_count,
++			     list_sap_cfg_5g, &list_sap_cfg_5g_count);
++
++	for (i = 0; i < freq_list_usable_2g_count; i++) {
++		if (list_sap_cfg_2g_count &&
++		    freq_list_usable_2g[i] > list_sap_cfg_2g[0] &&
++		    freq_list_usable_2g[i] < list_sap_cfg_2g[list_sap_cfg_2g_count - 1])
++			freq_list_tmp[freq_list_tmp_count++] = freq_list_usable_2g[i];
++	}
++
++	for (j = 0; j < freq_list_usable_5g_count; j++) {
++		if (list_sap_cfg_5g_count &&
++		    freq_list_usable_5g[j] >= list_sap_cfg_5g[0] &&
++		    freq_list_usable_5g[j] <= list_sap_cfg_5g[list_sap_cfg_5g_count - 1])
++			freq_list_tmp[freq_list_tmp_count++] = freq_list_usable_5g[j];
++	}
++
++	if (!freq_list_tmp_count) {
++		hdd_debug("fast SAP ACS get null suitable channel");
++		return -EINVAL;
++	}
++
++out:
++	if (!hdd_is_acs_channel_safe_channel(hdd_ctx, freq_list_tmp_count,
++					     freq_list_tmp)) {
++		hdd_debug("No safe channel, do nothing");
++		return -EINVAL;
++	}
++
++	for (ori_freq_index = 0; ori_freq_index < freq_list_tmp_count;
++	     ori_freq_index++) {
++		for (pcl_index = 0; pcl_index < sap_cfg->acs_cfg.pcl_ch_count;
++		     pcl_index++) {
++			if (sap_cfg->acs_cfg.pcl_chan_freq[pcl_index] ==
++			    freq_list_tmp[ori_freq_index]) {
++				freq_in_pcl = true;
++				break;
++			}
++		}
++	}
++
++	if (!freq_in_pcl) {
++		hdd_debug("No suitable channel in PCL, do nothing");
++		return -EINVAL;
++	}
++
++	sap_cfg->acs_cfg.start_ch_freq = freq_list_tmp[0];
++	sap_cfg->acs_cfg.end_ch_freq = freq_list_tmp[freq_list_tmp_count - 1];
++
++	for (freq_tmp_index = 0; freq_tmp_index < sap_cfg->acs_cfg.ch_list_count;
++	     freq_tmp_index++) {
++		if (freq_tmp_index < freq_list_tmp_count)
++			sap_cfg->acs_cfg.freq_list[freq_tmp_index] =
++				freq_list_tmp[freq_tmp_index];
++		else
++			sap_cfg->acs_cfg.freq_list[freq_tmp_index] = 0;
++	}
++
++	sap_cfg->acs_cfg.ch_list_count = freq_list_tmp_count;
++	hdd_nofl_debug("Dump raw FAST ACS chanlist - ");
++	sap_dump_acs_channel(&sap_cfg->acs_cfg);
++
++	return 0;
++}
++#endif
++
+ static uint32_t hdd_convert_freq_to_band_bitmap(qdf_freq_t freq)
+ {
+ 	if (WLAN_REG_IS_24GHZ_CH_FREQ((freq)))
+@@ -4477,6 +4762,13 @@ static int __wlan_hdd_cfg80211_do_acs(struct wiphy *wiphy,
+ 
+ 	sap_config->acs_cfg.acs_mode = true;
+ 
++#ifdef WLAN_FEATURE_FAST_SAP_ACS
++	if (is_sap_fast_acs && hw_mode > QCA_ACS_MODE_IEEE80211G &&
++	    sizeof(hdd_ctx->reg.alpha2) >= (REG_ALPHA2_LEN + 1) &&
++	    hdd_ctx->reg.alpha2[0] == 'C' && hdd_ctx->reg.alpha2[1] == 'N')
++		hdd_update_acs_info(hdd_ctx, sap_config, data, data_len);
++#endif
++
+ 	if (wlan_reg_get_keep_6ghz_sta_cli_connection(hdd_ctx->pdev))
+ 		hdd_remove_6ghz_freq_from_acs_list(
+ 					sap_config->acs_cfg.freq_list,
+@@ -9553,6 +9845,9 @@ const struct nla_policy wlan_hdd_wifi_config_policy[
+ 	// MIUI ADD: WIFI_PowerSave
+ 	[QCA_WLAN_VENDOR_ATTR_CONFIG_SET_NSS_ANT] = {.type = NLA_U8},
+ 	// END WIFI_PowerSave
++#ifdef WLAN_FEATURE_FAST_SAP_ACS
++	[QCA_WLAN_VENDOR_ATTR_CONFIG_SET_FAST_ACS] = {.type = NLA_U8},
++#endif
+ };
+ 
+ 
+@@ -13170,6 +13465,16 @@ static int hdd_set_dbam_config(struct wlan_hdd_link_info *link_info,
+ }
+ #endif
+ 
++#ifdef WLAN_FEATURE_FAST_SAP_ACS
++static int wlan_hdd_cfg80211_set_fast_acs(struct wlan_hdd_link_info *link_info,
++					  const struct nlattr *attr)
++{
++	is_sap_fast_acs = nla_get_u8(attr);
++	hdd_debug("fast enabled %d", is_sap_fast_acs);
++	return 0;
++}
++#endif
++
+ /**
+  * hdd_set_beamformer_periodic_sounding() - enable/disable Tx Beamforming
+  * @link_info: Link info pointer in HDD adapter
+@@ -14895,6 +15200,10 @@ static const struct independent_setters independent_setters[] = {
+ 	{QCA_WLAN_VENDOR_ATTR_CONFIG_SET_NSS_ANT,
+ 	 hdd_config_set_nss_and_antenna_mode},
+ 	// END WIFI_PowerSave
++#ifdef WLAN_FEATURE_FAST_SAP_ACS
++	{QCA_WLAN_VENDOR_ATTR_CONFIG_SET_FAST_ACS,
++	 wlan_hdd_cfg80211_set_fast_acs},
++#endif
+ };
+ 
+ #ifdef WLAN_FEATURE_ELNA
+diff --git a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c b/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
+index 8a3dbda..4038687 100644
+--- a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
++++ b/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
+@@ -4141,7 +4141,8 @@ lim_match_link_info(uint8_t req_link_id,
+ {
+ 	uint8_t i;
+ 
+-	for (i = 0; i < partner_info->num_partner_links; i++) {
++	for (i = 0; i < QDF_MIN(partner_info->num_partner_links,
++			       QDF_ARRAY_SIZE(partner_info->partner_link_info)); i++) {
+ 		if (partner_info->partner_link_info[i].link_id == req_link_id &&
+ 		    (qdf_is_macaddr_equal(link_addr,
+ 					  &partner_info->partner_link_info[i].link_addr)))
