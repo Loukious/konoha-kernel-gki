@@ -17,17 +17,17 @@ on:
         description: Apply the injection port (disable for a source/ABI control build)
         required: true
         type: boolean
-        default: true
+        default: false
       apply_compat_patch:
         description: Apply the neutral 6.6 compatibility patch to a control build
         required: true
         type: boolean
-        default: false
+        default: true
       apply_p2phc_patch:
         description: Add Xiaomi p2phc stock-driver hooks to a control build
         required: true
         type: boolean
-        default: false
+        default: true
       kernel_source_repo:
         description: Device kernel source used for WLAN ABI headers
         required: true
@@ -38,6 +38,11 @@ on:
         required: true
         type: string
         default: onyx-v-oss
+      kernel_release_override:
+        description: Kernel release string to stamp into the external module
+        required: true
+        type: string
+        default: 6.6.57-android15-8-4k
       kernel_symvers_url:
         description: Module.symvers from the installed kernel base
         required: true
@@ -187,6 +192,7 @@ jobs:
         working-directory: gki-clo
         env:
           KERNEL_SOURCE_BRANCH: ${{ inputs.kernel_source_branch }}
+          KERNEL_RELEASE_OVERRIDE: ${{ inputs.kernel_release_override }}
         run: |
           export PATH="$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
           clang --version
@@ -196,9 +202,31 @@ jobs:
           saved_symvers="$RUNNER_TEMP/wlan-Module.symvers"
           kernel_device="${KERNEL_SOURCE_BRANCH%%-*}"
           vendor_perf_config="$abi_src/arch/arm64/configs/vendor/${kernel_device}_perf.config"
+          kernel_localversion="-android15-8-4k"
 
           cp "$abi_out/Module.symvers" "$saved_symvers"
           mkdir -p "$abi_out"
+          if [[ -n "$KERNEL_RELEASE_OVERRIDE" ]]; then
+            base_version="${KERNEL_RELEASE_OVERRIDE%%-*}"
+            if [[ "$KERNEL_RELEASE_OVERRIDE" == *-* ]]; then
+              kernel_localversion="-${KERNEL_RELEASE_OVERRIDE#*-}"
+            else
+              kernel_localversion=""
+            fi
+            IFS=. read -r kernel_version kernel_patchlevel kernel_sublevel <<< "$base_version"
+            if [[ -z "${kernel_version:-}" || -z "${kernel_patchlevel:-}" || -z "${kernel_sublevel:-}" ]]; then
+              echo "Invalid kernel_release_override: $KERNEL_RELEASE_OVERRIDE" >&2
+              exit 1
+            fi
+            KERNEL_VERSION="$kernel_version" \
+              KERNEL_PATCHLEVEL="$kernel_patchlevel" \
+              KERNEL_SUBLEVEL="$kernel_sublevel" \
+              perl -0pi -e '
+                s/^VERSION = .*/VERSION = $ENV{KERNEL_VERSION}/m;
+                s/^PATCHLEVEL = .*/PATCHLEVEL = $ENV{KERNEL_PATCHLEVEL}/m;
+                s/^SUBLEVEL = .*/SUBLEVEL = $ENV{KERNEL_SUBLEVEL}/m;
+              ' "$abi_src/Makefile"
+          fi
           install -D -m 0644 \
             tools/xiaomi-source-stubs/drivers/misc/hwid/Kconfig \
             "$abi_src/drivers/misc/hwid/Kconfig"
@@ -217,7 +245,7 @@ jobs:
             "$abi_src/arch/arm64/configs/vendor/sun_perf.config" \
             "$vendor_perf_config"
           "$abi_src/scripts/config" --file "$abi_out/.config" \
-            --set-str LOCALVERSION "-android15-8-4k" \
+            --set-str LOCALVERSION "$kernel_localversion" \
             --disable LOCALVERSION_AUTO \
             --disable KUNIT
           make -j"$(nproc)" -C "$abi_src" O="$abi_out" \
@@ -227,10 +255,14 @@ jobs:
 
           grep -qx '# CONFIG_KUNIT is not set' "$abi_out/.config"
           kernel_release="$(cat "$abi_out/include/config/kernel.release")"
-          case "$kernel_release" in
-            6.6.*-android15-8-4k) ;;
-            *) echo "Unexpected Onyx kernel release: $kernel_release" >&2; exit 1 ;;
-          esac
+          if [[ -n "$KERNEL_RELEASE_OVERRIDE" ]]; then
+            test "$kernel_release" = "$KERNEL_RELEASE_OVERRIDE"
+          else
+            case "$kernel_release" in
+              6.6.*-android15-8-4k) ;;
+              *) echo "Unexpected Onyx kernel release: $kernel_release" >&2; exit 1 ;;
+            esac
+          fi
           echo "WLAN_KERNEL_SRC=$abi_src" >> "$GITHUB_ENV"
           echo "WLAN_KERNEL_OUT=$abi_out" >> "$GITHUB_ENV"
           echo "Xiaomi source branch: $KERNEL_SOURCE_BRANCH"
@@ -294,6 +326,19 @@ jobs:
           module_ops_size="$(readelf -sW "$module" | awk '$8 == "wlan_hdd_cfg80211_ops" { print $3; exit }')"
           test -n "$stock_ops_size"
           test "$module_ops_size" = "$stock_ops_size"
+          require_symbol() {
+            nm -S --defined-only "$module" 2>/dev/null |
+              awk '{ print $NF }' | grep -qx "$1"
+          }
+          if [[ "$ENABLE_INJECTION" == "false" && "$APPLY_COMPAT_PATCH" == "true" ]]; then
+            require_symbol wlan_mgmt_rx_srng_cfg_enable
+            require_symbol qdf_ssr_driver_dump_init
+            require_symbol ucfg_pmo_get_ns_offload_enable_dynamic
+          fi
+          if [[ "$ENABLE_INJECTION" == "false" && "$APPLY_P2PHC_PATCH" == "true" ]]; then
+            require_symbol p2phc_init
+            require_symbol dlhc_compress
+          fi
 
           echo "kernel release:  $kernel_release"
           echo "module vermagic: $module_vermagic"
