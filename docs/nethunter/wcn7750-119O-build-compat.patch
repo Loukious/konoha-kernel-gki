@@ -82,15 +82,30 @@ diff --git a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig b/qcacld-3.0/configs/s
 index 06134a51..619a1b4d 100644
 --- a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
 +++ b/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
-@@ -64,6 +64,8 @@ CONFIG_FEATURE_HTC_CREDIT_HISTORY=y
+@@ -64,6 +64,10 @@ CONFIG_FEATURE_HTC_CREDIT_HISTORY=y
  CONFIG_FEATURE_INTEROP_ISSUES_AP=y
  CONFIG_FEATURE_MEMDUMP_ENABLE=y
  CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y
++CONFIG_CNSS2_SSR_DRIVER_DUMP=y
 +CONFIG_FEATURE_MGMT_RX_OVER_SRNG=y
 +CONFIG_FEATURE_SMEM_MAILBOX=y
++CONFIG_WLAN_FEATURE_FAST_SAP_ACS=y
  CONFIG_FEATURE_MSCS=y
  CONFIG_FEATURE_NO_DBS_INTRABAND_MCC_SUPPORT=y
  CONFIG_FEATURE_OEM_DATA=y
+@@ -249,6 +253,7 @@ CONFIG_WLAN_NUD_TRACKING=y
+ CONFIG_WLAN_OFFLOAD_PACKETS=y
+ CONFIG_WLAN_OPEN_P2P_INTERFACE=y
+ CONFIG_WLAN_OPEN_SOURCE=y
++WLAN_OPEN_SOURCE := y
+ CONFIG_WLAN_PDEV_VDEV_SEND_MULTI_PARAM=y
+ CONFIG_WLAN_PMO_ENABLE=y
+ CONFIG_WLAN_POLICY_MGR_ENABLE=y
+@@ -402,3 +407,4 @@ CONFIG_FEATURE_MGMT_RX_OVER_SRNG=y
+ CONFIG_FEATURE_MGMT_RX_OVER_SRNG=y
+ CONFIG_WLAN_CHIPSET_STATS=y
+ CONFIG_WLAN_CHIPSET_LOG_MAX_SIZE=y
++CONFIG_WLAN_DYNAMIC_ARP_NS_OFFLOAD=y
 diff --git a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c b/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
 index cb044784..145b6f4b 100644
 --- a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
@@ -105,3 +120,320 @@ index cb044784..145b6f4b 100644
  		if (partner_info->partner_link_info[i].link_id == req_link_id &&
  		    (qdf_is_macaddr_equal(link_addr,
  					  &partner_info->partner_link_info[i].link_addr)))
+diff --git a/qcacld-3.0/Kbuild b/qcacld-3.0/Kbuild
+--- a/qcacld-3.0/Kbuild
++++ b/qcacld-3.0/Kbuild
+@@ -118,6 +118,7 @@ HDD_OBJS := 	$(HDD_SRC_DIR)/wlan_hdd_hostapd.o \
+ 		$(HDD_SRC_DIR)/wlan_hdd_hostapd.o \
+ 		$(HDD_SRC_DIR)/wlan_hdd_ioctl.o \
+ 		$(HDD_SRC_DIR)/wlan_hdd_main.o \
++		$(HDD_SRC_DIR)/wlan_hdd_nss_mode_switch.o \
+ 		$(HDD_SRC_DIR)/wlan_hdd_object_manager.o \
+ 		$(HDD_SRC_DIR)/wlan_hdd_oemdata.o \
+ 		$(HDD_SRC_DIR)/wlan_hdd_p2p.o \
+@@ -3958,7 +3959,9 @@ ccflags-$(CONFIG_WLAN_LOG_INFO) += -DWLAN_LOG_INFO
+ ccflags-$(CONFIG_WLAN_LOG_INFO) += -DWLAN_LOG_INFO
+ ccflags-$(CONFIG_WLAN_LOG_DEBUG) += -DWLAN_LOG_DEBUG
+ ccflags-$(CONFIG_WLAN_LOG_ENTER) += -DWLAN_LOG_ENTER
+ ccflags-$(CONFIG_WLAN_LOG_EXIT) += -DWLAN_LOG_EXIT
++ccflags-$(CONFIG_WLAN_OPEN_SOURCE) += -DWLAN_OPEN_SOURCE
+ ccflags-$(WLAN_OPEN_SOURCE) += -DWLAN_OPEN_SOURCE
++ccflags-$(CONFIG_WLAN_FEATURE_FAST_SAP_ACS) += -DWLAN_FEATURE_FAST_SAP_ACS
+ ccflags-$(CONFIG_FEATURE_STATS_EXT) += -DWLAN_FEATURE_STATS_EXT
+ ccflags-$(CONFIG_QCACLD_FEATURE_NAN) += -DWLAN_FEATURE_NAN
+ ccflags-$(CONFIG_QCACLD_FEATURE_SON) += -DWLAN_FEATURE_SON
+diff --git a/qcacld-3.0/components/pmo/core/inc/wlan_pmo_ns.h b/qcacld-3.0/components/pmo/core/inc/wlan_pmo_ns.h
+--- a/qcacld-3.0/components/pmo/core/inc/wlan_pmo_ns.h
++++ b/qcacld-3.0/components/pmo/core/inc/wlan_pmo_ns.h
+@@ -93,6 +93,15 @@ QDF_STATUS
+ pmo_core_get_ns_offload_params(struct wlan_objmgr_vdev *vdev,
+ 			       struct pmo_ns_offload_params *params);
+ 
++#ifdef FEATURE_WLAN_DYNAMIC_ARP_NS_OFFLOAD
++bool pmo_core_get_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev);
++
++void
++pmo_core_set_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev,
++				       enum pmo_offload_trigger trigger,
++				       bool enable);
++#endif
++
+ #endif /* WLAN_POWER_MANAGEMENT_OFFLOAD */
+ 
+ #endif /* end  of _WLAN_PMO_NS_H_ */
+diff --git a/qcacld-3.0/components/pmo/core/src/wlan_pmo_ns.c b/qcacld-3.0/components/pmo/core/src/wlan_pmo_ns.c
+--- a/qcacld-3.0/components/pmo/core/src/wlan_pmo_ns.c
++++ b/qcacld-3.0/components/pmo/core/src/wlan_pmo_ns.c
+@@ -254,6 +254,67 @@ static QDF_STATUS pmo_core_ns_offload_sanity(struct wlan_objmgr_vdev *vdev)
+ 	return QDF_STATUS_SUCCESS;
+ }
+ 
++#ifdef FEATURE_WLAN_DYNAMIC_ARP_NS_OFFLOAD
++bool pmo_core_get_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev)
++{
++	QDF_STATUS status;
++	bool enabled = false;
++	struct pmo_vdev_priv_obj *vdev_ctx;
++	struct pmo_psoc_priv_obj *pmo_psoc_ctx;
++
++	if (!vdev) {
++		pmo_err("vdev is NULL");
++		return false;
++	}
++
++	status = pmo_vdev_get_ref(vdev);
++	if (status != QDF_STATUS_SUCCESS)
++		return false;
++
++	vdev_ctx = pmo_vdev_get_priv(vdev);
++	if (!vdev_ctx)
++		goto put_ref;
++
++	pmo_psoc_ctx = vdev_ctx->pmo_psoc_ctx;
++	if (!pmo_psoc_ctx)
++		goto put_ref;
++
++	if (pmo_core_ns_offload_sanity(vdev) == QDF_STATUS_SUCCESS)
++		enabled = pmo_psoc_ctx->psoc_cfg.ns_offload_enable_dynamic;
++
++put_ref:
++	wlan_objmgr_vdev_release_ref(vdev, WLAN_PMO_ID);
++	return enabled;
++}
++
++void pmo_core_set_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev,
++					    enum pmo_offload_trigger trigger,
++					    bool enable)
++{
++	QDF_STATUS status;
++	struct pmo_vdev_priv_obj *vdev_ctx;
++	struct pmo_psoc_priv_obj *pmo_psoc_ctx;
++
++	if (!vdev) {
++		pmo_err("vdev is NULL");
++		return;
++	}
++
++	status = pmo_vdev_get_ref(vdev);
++	if (status != QDF_STATUS_SUCCESS)
++		return;
++
++	vdev_ctx = pmo_vdev_get_priv(vdev);
++	pmo_psoc_ctx = vdev_ctx ? vdev_ctx->pmo_psoc_ctx : NULL;
++	if (pmo_psoc_ctx &&
++	    trigger == pmo_ns_offload_dynamic_update &&
++	    pmo_core_ns_offload_sanity(vdev) == QDF_STATUS_SUCCESS)
++		pmo_psoc_ctx->psoc_cfg.ns_offload_enable_dynamic = enable;
++
++	wlan_objmgr_vdev_release_ref(vdev, WLAN_PMO_ID);
++}
++#endif
++
+ QDF_STATUS pmo_core_ns_check_offload(struct wlan_objmgr_psoc *psoc,
+ 				     enum pmo_offload_trigger trigger,
+ 				     uint8_t vdev_id)
+diff --git a/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_ucfg_api.h b/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_ucfg_api.h
+--- a/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_ucfg_api.h
++++ b/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_ucfg_api.h
+@@ -627,6 +627,14 @@ ucfg_pmo_dynamic_arp_ns_offload_runtime_prevent(struct wlan_objmgr_vdev *vdev);
+  */
+ void
+ ucfg_pmo_dynamic_arp_ns_offload_runtime_allow(struct wlan_objmgr_vdev *vdev);
++
++bool
++ucfg_pmo_get_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev);
++
++void
++ucfg_pmo_set_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev,
++				       enum pmo_offload_trigger trigger,
++				       bool enable);
+ #else
+ static inline QDF_STATUS
+ ucfg_pmo_dynamic_arp_ns_offload_enable(struct wlan_objmgr_vdev *vdev)
+diff --git a/qcacld-3.0/components/pmo/dispatcher/src/wlan_pmo_ucfg_api.c b/qcacld-3.0/components/pmo/dispatcher/src/wlan_pmo_ucfg_api.c
+--- a/qcacld-3.0/components/pmo/dispatcher/src/wlan_pmo_ucfg_api.c
++++ b/qcacld-3.0/components/pmo/dispatcher/src/wlan_pmo_ucfg_api.c
+@@ -226,6 +226,20 @@ ucfg_pmo_dynamic_arp_ns_offload_runtime_allow(struct wlan_objmgr_vdev *vdev)
+ {
+ 	return pmo_core_dynamic_arp_ns_offload_runtime_allow(vdev);
+ }
++
++bool
++ucfg_pmo_get_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev)
++{
++	return pmo_core_get_ns_offload_enable_dynamic(vdev);
++}
++
++void
++ucfg_pmo_set_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev,
++				       enum pmo_offload_trigger trigger,
++				       bool enable)
++{
++	pmo_core_set_ns_offload_enable_dynamic(vdev, trigger, enable);
++}
+ #endif
+ 
+ QDF_STATUS
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_cm_api.h b/qcacld-3.0/core/hdd/src/wlan_hdd_cm_api.h
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_cm_api.h
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_cm_api.h
+@@ -379,6 +379,14 @@ hdd_cm_is_connecting(struct wlan_hdd_link_info *link_info);
+  */
+ bool hdd_cm_is_disconnected(struct wlan_hdd_link_info *link_info);
+ 
++/**
++ * hdd_cm_is_connected() - Function to check if vdev is connected or not
++ * @link_info: pointer to the link info structure
++ *
++ * Return: true if connected, false otherwise
++ */
++bool hdd_cm_is_connected(struct wlan_hdd_link_info *link_info);
++
+ /**
+  * hdd_cm_is_vdev_roaming() - Function to check roaming in progress
+  * @link_info: pointer to the link_info structure
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_cm_connect.c b/qcacld-3.0/core/hdd/src/wlan_hdd_cm_connect.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_cm_connect.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_cm_connect.c
+@@ -160,6 +160,27 @@ bool hdd_cm_is_disconnected(struct wlan_hdd_link_info *link_info)
+ 	return is_vdev_disconnected;
+ }
+ 
++bool hdd_cm_is_connected(struct wlan_hdd_link_info *link_info)
++{
++	struct wlan_objmgr_vdev *vdev;
++	bool is_vdev_connected;
++	enum QDF_OPMODE opmode;
++
++	vdev = hdd_objmgr_get_vdev_by_user(link_info, WLAN_OSIF_CM_ID);
++	if (!vdev)
++		return false;
++
++	opmode = wlan_vdev_mlme_get_opmode(vdev);
++	if (opmode != QDF_STA_MODE && opmode != QDF_P2P_CLIENT_MODE) {
++		hdd_objmgr_put_vdev_by_user(vdev, WLAN_OSIF_CM_ID);
++		return false;
++	}
++	is_vdev_connected = ucfg_cm_is_vdev_connected(vdev);
++
++	hdd_objmgr_put_vdev_by_user(vdev, WLAN_OSIF_CM_ID);
++	return is_vdev_connected;
++}
++
+ bool hdd_cm_is_vdev_roaming(struct wlan_hdd_link_info *link_info)
+ {
+ 	struct wlan_objmgr_vdev *vdev;
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_nss_mode_switch.c b/qcacld-3.0/core/hdd/src/wlan_hdd_nss_mode_switch.c
+new file mode 100644
+--- /dev/null
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_nss_mode_switch.c
+@@ -0,0 +1,81 @@
++#include <linux/string.h>
++#include "wlan_hdd_ioctl.h"
++#include "wlan_hdd_cm_api.h"
++#include "wlan_hdd_nss_mode_switch.h"
++
++enum {
++	NSS_MODE_DEFAULT,
++	NSS_MODE_1x1,
++	NSS_MODE_2x2
++} nss_mode_type;
++
++static int g_nss_mode_type = NSS_MODE_DEFAULT;
++
++int wlan_hdd_set_nss_and_antenna_mode(struct wlan_hdd_link_info *link_info,
++				      int nss, int mode)
++{
++	QDF_STATUS status;
++
++	hdd_debug("NSS = %d, antenna mode = %d", nss, mode);
++
++	if (nss > 2 || nss <= 0) {
++		hdd_err("Invalid NSS: %d", nss);
++		return -EINVAL;
++	}
++
++	if (mode > HDD_ANTENNA_MODE_2X2 || mode < HDD_ANTENNA_MODE_1X1) {
++		hdd_err("Invalid antenna mode: %d", mode);
++		return -EINVAL;
++	}
++
++	if ((nss == NSS_1x1_MODE && mode == HDD_ANTENNA_MODE_2X2) ||
++	    (nss == NSS_2x2_MODE && mode == HDD_ANTENNA_MODE_1X1)) {
++		hdd_err("nss and antenna mode mismatch: nss=%d mode=%d",
++			nss, mode);
++		return -EINVAL;
++	}
++
++	status = hdd_update_nss(link_info, nss, nss);
++	if (QDF_IS_STATUS_ERROR(status)) {
++		hdd_err("cfg set nss failed, value %d status %d", nss, status);
++		return qdf_status_to_os_return(status);
++	}
++
++	status = hdd_set_antenna_mode(link_info, mode);
++	if (QDF_IS_STATUS_ERROR(status)) {
++		hdd_err("cfg set antenna mode failed, value %d status %d",
++			mode, status);
++		return qdf_status_to_os_return(status);
++	}
++
++	if (nss == NSS_1x1_MODE) {
++		g_nss_mode_type = NSS_MODE_1x1;
++		hdd_err("change NSS mode to 1x1 successfully");
++	}
++
++	if (nss == NSS_2x2_MODE) {
++		g_nss_mode_type = NSS_MODE_2x2;
++		hdd_err("change NSS mode to 2x2 successfully");
++	}
++
++	hdd_exit();
++	return 0;
++}
++
++void wlan_hdd_stop_nss_mode_switch(struct hdd_adapter *adapter)
++{
++	if (!adapter || hdd_validate_adapter(adapter)) {
++		hdd_debug("wlan_hdd_stop_nss_mode_switch: adapter is not valid, return.");
++		return;
++	}
++
++	hdd_enter_dev(adapter->dev);
++
++	if (adapter->device_mode == QDF_STA_MODE) {
++		if (g_nss_mode_type == NSS_MODE_2x2 ||
++		    g_nss_mode_type == NSS_MODE_DEFAULT) {
++			g_nss_mode_type = NSS_MODE_DEFAULT;
++			goto exit;
++		}
++
++		wlan_hdd_set_nss_and_antenna_mode(adapter->deflink,
++						  NSS_2x2_MODE,
++						  HDD_ANTENNA_MODE_2X2);
++		g_nss_mode_type = NSS_MODE_DEFAULT;
++	}
++exit:
++	hdd_exit();
++}
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_nss_mode_switch.h b/qcacld-3.0/core/hdd/src/wlan_hdd_nss_mode_switch.h
+new file mode 100644
+--- /dev/null
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_nss_mode_switch.h
+@@ -0,0 +1,16 @@
++#ifndef _WLAN_HDD_NSS_MODE_SWITCH_H
++#define _WLAN_HDD_NSS_MODE_SWITCH_H
++
++#include "wlan_hdd_main.h"
++
++struct nss_mode_context {
++	char intf_name[IFNAMSIZ];
++	struct nss_mode_context *next;
++	bool is_nss_2x2;
++};
++
++int wlan_hdd_set_nss_and_antenna_mode(struct wlan_hdd_link_info *link_info,
++				      int nss, int mode);
++void wlan_hdd_stop_nss_mode_switch(struct hdd_adapter *adapter);
++
++#endif /* _WLAN_HDD_NSS_MODE_SWITCH_H */
