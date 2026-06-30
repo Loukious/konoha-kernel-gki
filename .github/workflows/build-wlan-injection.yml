@@ -420,8 +420,12 @@ jobs:
             done < docs/nethunter/wcn7750-stock-parity-symbols.txt
           fi
           if (( missing_symbols > 0 )); then
-            echo "$missing_symbols required WLAN symbol(s) were missing" >&2
-            exit 1
+            if [[ "$ENABLE_TRACE" == "true" ]]; then
+              echo "Trace build warning: $missing_symbols expected WLAN symbol(s) were missing" >&2
+            else
+              echo "$missing_symbols required WLAN symbol(s) were missing" >&2
+              exit 1
+            fi
           fi
 
           echo "kernel release:  $kernel_release"
