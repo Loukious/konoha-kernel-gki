@@ -396,6 +396,18 @@ jobs:
             echo "  stock:   $stock_ops_size bytes" >&2
             exit 1
           fi
+          stock_drv_ops_size="$(readelf -sW "$stock_module" | awk '$5 == "GLOBAL" && $8 == "wlan_drv_ops" { print $3; exit }')"
+          module_drv_ops_size="$(readelf -sW "$module" | awk '$5 == "GLOBAL" && $8 == "wlan_drv_ops" { print $3; exit }')"
+          if [[ -z "$stock_drv_ops_size" || -z "$module_drv_ops_size" ]]; then
+            echo "Could not read wlan_drv_ops size for stock or rebuilt module" >&2
+            exit 1
+          fi
+          if [[ "$module_drv_ops_size" != "$stock_drv_ops_size" ]]; then
+            echo "wlan_drv_ops size mismatch" >&2
+            echo "  rebuilt: $module_drv_ops_size bytes" >&2
+            echo "  stock:   $stock_drv_ops_size bytes" >&2
+            exit 1
+          fi
           awk '{ print $NF }' artifacts/wlan/qca_cld3_wcn7750.defined-symbols.txt | sort -u > artifacts/wlan/qca_cld3_wcn7750.defined-symbol-names.txt
           missing_symbols=0
           require_symbol() {
@@ -420,12 +432,8 @@ jobs:
             done < docs/nethunter/wcn7750-stock-parity-symbols.txt
           fi
           if (( missing_symbols > 0 )); then
-            if [[ "$ENABLE_TRACE" == "true" ]]; then
-              echo "Trace build warning: $missing_symbols expected WLAN symbol(s) were missing" >&2
-            else
-              echo "$missing_symbols required WLAN symbol(s) were missing" >&2
-              exit 1
-            fi
+            echo "$missing_symbols required WLAN symbol(s) were missing" >&2
+            exit 1
           fi
 
           echo "kernel release:  $kernel_release"
