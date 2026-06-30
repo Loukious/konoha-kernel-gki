@@ -1,8 +1,50 @@
 diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
-index 7743d83..4fbd790 100644
+index 55cff226..72e71a5b 100644
 --- a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
 +++ b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
-@@ -787,40 +787,58 @@ static int __hdd_soc_probe(struct device *dev,
+@@ -548,24 +548,40 @@ int hdd_hif_open(struct device *dev, void *bdev, const struct hif_bus_id *bid,
+ 	uint32_t mode = cds_get_conparam();
+ 	struct hdd_context *hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
+ 
+-	if (!hdd_ctx)
++	pr_info("konoha_wlan_trace: hdd_hif_open enter dev=%p bdev=%p bid=%p bus=%d reinit=%d mode=%u qdf_ctx=%p hdd_ctx=%p\n",
++		dev, bdev, bid, bus_type, reinit, mode, qdf_ctx, hdd_ctx);
++	if (!hdd_ctx) {
++		pr_info("konoha_wlan_trace: hdd_hif_open no_hdd_ctx ret=%d\n",
++			-EFAULT);
+ 		return -EFAULT;
++	}
+ 
+ 	hdd_hif_init_driver_state_callbacks(dev, &cbk);
+ 
++	pr_info("konoha_wlan_trace: hdd_hif_open hif_open begin psoc=%p\n",
++		hdd_ctx->psoc);
+ 	hif_ctx = hif_open(qdf_ctx, mode, bus_type, &cbk, hdd_ctx->psoc);
+ 	if (!hif_ctx) {
+ 		hdd_err("hif_open error");
++		pr_info("konoha_wlan_trace: hdd_hif_open hif_open ret=%d\n",
++			-ENOMEM);
+ 		return -ENOMEM;
+ 	}
++	pr_info("konoha_wlan_trace: hdd_hif_open hif_open hif_ctx=%p\n",
++		hif_ctx);
+ 
+ 	ret = hdd_init_cds_hif_context(hif_ctx);
++	pr_info("konoha_wlan_trace: hdd_hif_open init_cds_hif_context ret=%d\n",
++		ret);
+ 	if (ret) {
+ 		hdd_err("Failed to set global HIF CDS Context err: %d", ret);
+ 		goto err_hif_close;
+ 	}
+ 
++	pr_info("konoha_wlan_trace: hdd_hif_open register_shutdown_notifier begin\n");
+ 	status = hdd_hif_register_shutdown_notifier(hif_ctx);
++	pr_info("konoha_wlan_trace: hdd_hif_open register_shutdown_notifier status=%d\n",
++		status);
+ 	if (status != QDF_STATUS_SUCCESS) {
+ 		hdd_err("Shutdown notifier register failed: %d", status);
+ 		goto err_deinit_hif_context;
+@@ -780,40 +796,58 @@ static int __hdd_soc_probe(struct device *dev,
  	QDF_STATUS status;
  	int errno;
  
@@ -61,7 +103,7 @@ index 7743d83..4fbd790 100644
  	if (QDF_IS_STATUS_ERROR(status)) {
  		errno = qdf_status_to_os_return(status);
  		goto wlan_exit;
-@@ -834,26 +852,39 @@ static int __hdd_soc_probe(struct device *dev,
+@@ -826,26 +860,39 @@ static int __hdd_soc_probe(struct device *dev,
  
  	hdd_set_sar_init_index(hdd_ctx);
  	hdd_soc_load_unlock(dev);
@@ -101,7 +143,7 @@ index 7743d83..4fbd790 100644
  
  	return check_for_probe_defer(errno);
  }
-@@ -878,24 +909,34 @@ static int hdd_soc_probe(struct device *dev,
+@@ -870,24 +917,34 @@ static int hdd_soc_probe(struct device *dev,
  	struct osif_psoc_sync *psoc_sync;
  	int errno;
  
@@ -136,7 +178,7 @@ index 7743d83..4fbd790 100644
  	hdd_start_complete(errno);
  	osif_psoc_sync_unregister(dev);
  	osif_psoc_sync_wait_for_ops(psoc_sync);
-@@ -903,6 +944,7 @@ destroy_sync:
+@@ -895,6 +952,7 @@ destroy_sync:
  	osif_psoc_sync_trans_stop(psoc_sync);
  	osif_psoc_sync_destroy(psoc_sync);
  
@@ -144,7 +186,7 @@ index 7743d83..4fbd790 100644
  	return errno;
  }
  
-@@ -1895,16 +1937,24 @@ static int wlan_hdd_pld_probe(struct device *dev,
+@@ -1886,16 +1944,24 @@ static int wlan_hdd_pld_probe(struct device *dev,
  			      void *id)
  {
  	enum qdf_bus_type bus_type = to_bus_type(pld_bus_type);
@@ -170,7 +212,7 @@ index 7743d83..4fbd790 100644
  }
  
  /**
-@@ -1916,12 +1966,15 @@ static int wlan_hdd_pld_probe(struct device *dev,
+@@ -1907,12 +1973,15 @@ static int wlan_hdd_pld_probe(struct device *dev,
   */
  static void wlan_hdd_pld_remove(struct device *dev, enum pld_bus_type bus_type)
  {
@@ -186,7 +228,7 @@ index 7743d83..4fbd790 100644
  }
  
  static void hdd_soc_idle_shutdown_lock(struct device *dev)
-@@ -1949,12 +2002,16 @@ static int wlan_hdd_pld_idle_shutdown(struct device *dev,
+@@ -1940,12 +2009,16 @@ static int wlan_hdd_pld_idle_shutdown(struct device *dev,
  {
  	int ret;
  
@@ -203,7 +245,7 @@ index 7743d83..4fbd790 100644
  	return ret;
  }
  
-@@ -1968,7 +2025,14 @@ static int wlan_hdd_pld_idle_shutdown(struct device *dev,
+@@ -1959,7 +2032,14 @@ static int wlan_hdd_pld_idle_shutdown(struct device *dev,
  static int wlan_hdd_pld_idle_restart(struct device *dev,
  				      enum pld_bus_type bus_type)
  {
@@ -219,7 +261,7 @@ index 7743d83..4fbd790 100644
  }
  
  /**
-@@ -1981,11 +2045,14 @@ static int wlan_hdd_pld_idle_restart(struct device *dev,
+@@ -1972,11 +2052,14 @@ static int wlan_hdd_pld_idle_restart(struct device *dev,
  static void wlan_hdd_pld_shutdown(struct device *dev,
  				  enum pld_bus_type bus_type)
  {
@@ -234,7 +276,7 @@ index 7743d83..4fbd790 100644
  }
  
  /**
-@@ -2003,13 +2070,19 @@ static int wlan_hdd_pld_reinit(struct device *dev,
+@@ -1994,13 +2077,19 @@ static int wlan_hdd_pld_reinit(struct device *dev,
  			       void *id)
  {
  	enum qdf_bus_type bus_type = to_bus_type(pld_bus_type);
@@ -255,7 +297,7 @@ index 7743d83..4fbd790 100644
  }
  
  /**
-@@ -2389,10 +2462,18 @@ struct pld_driver_ops wlan_drv_ops = {
+@@ -2381,10 +2470,18 @@ struct pld_driver_ops wlan_drv_ops = {
  
  int wlan_hdd_register_driver(void)
  {
@@ -276,10 +318,10 @@ index 7743d83..4fbd790 100644
 +	pr_info("konoha_wlan_trace: wlan_hdd_unregister_driver exit\n");
  }
 diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
-index 1a9e5f1..8033fa2 100644
+index 6130d22c..b47badab 100644
 --- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
 +++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
-@@ -633,6 +633,8 @@ QDF_STATUS hdd_common_roam_callback(struct wlan_objmgr_psoc *psoc,
+@@ -632,6 +632,8 @@ QDF_STATUS hdd_common_roam_callback(struct wlan_objmgr_psoc *psoc,
  
  void hdd_start_complete(int ret)
  {
@@ -288,7 +330,7 @@ index 1a9e5f1..8033fa2 100644
  	wlan_start_ret_val = ret;
  	complete_all(&wlan_start_comp);
  }
-@@ -5201,16 +5203,26 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5210,16 +5212,26 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  	struct dev_set_param setparam[MAX_PDEV_PRE_ENABLE_PARAMS] = {};
  
  	hdd_enter();
@@ -315,7 +357,7 @@ index 1a9e5f1..8033fa2 100644
  		hdd_exit();
  		return 0;
  	}
-@@ -5225,9 +5237,15 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5234,9 +5246,15 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  	case DRIVER_MODULES_CLOSED:
  		hdd_nofl_debug("Wlan transitioning (CLOSED -> ENABLED)");
  		hdd_debug_domain_set(QDF_DEBUG_DOMAIN_ACTIVE);
@@ -331,7 +373,7 @@ index 1a9e5f1..8033fa2 100644
  			if (ret) {
  				hdd_err("Failed to power up device; errno:%d",
  					ret);
-@@ -5238,10 +5256,15 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5247,10 +5265,15 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  		hdd_init_adapter_ops_wq(hdd_ctx);
  		pld_set_fw_log_mode(hdd_ctx->parent_dev,
  				    hdd_ctx->config->enable_fw_log);
@@ -347,7 +389,7 @@ index 1a9e5f1..8033fa2 100644
  		if (ret) {
  			hdd_err("Failed to open hif; errno: %d", ret);
  			goto power_down;
-@@ -5250,10 +5273,17 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5259,10 +5282,17 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  		hif_ctx = cds_get_context(QDF_MODULE_ID_HIF);
  		if (!hif_ctx) {
  			ret = -EINVAL;
@@ -365,7 +407,7 @@ index 1a9e5f1..8033fa2 100644
  		if (status != QDF_STATUS_SUCCESS) {
  			hdd_err("No Memory to Create BMI Context; status: %d",
  				status);
-@@ -5292,11 +5322,16 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5301,11 +5331,16 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  
  		hdd_update_cds_ac_specs_params(hdd_ctx);
  
@@ -382,7 +424,7 @@ index 1a9e5f1..8033fa2 100644
  		if (QDF_IS_STATUS_ERROR(status)) {
  			hdd_err("Failed to Open legacy components; status: %d",
  				status);
-@@ -5304,7 +5339,10 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5313,7 +5348,10 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  			goto ipa_component_free;
  		}
  
@@ -393,7 +435,7 @@ index 1a9e5f1..8033fa2 100644
  		if (ret) {
  			hdd_err("Failed to update configuration; errno: %d",
  				ret);
-@@ -5312,10 +5350,15 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5321,10 +5359,15 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  		}
  
  		status = wbuff_module_init();
@@ -409,7 +451,7 @@ index 1a9e5f1..8033fa2 100644
  		if (QDF_IS_STATUS_ERROR(status)) {
  			hdd_err("Failed to Open CDS; status: %d", status);
  			ret = qdf_status_to_os_return(status);
-@@ -5331,7 +5374,10 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5340,7 +5383,10 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  		ucfg_dp_set_rx_thread_affinity(hdd_ctx->psoc);
  
  		/* initialize components configurations after psoc open */
@@ -420,7 +462,7 @@ index 1a9e5f1..8033fa2 100644
  		if (ret) {
  			hdd_err("Failed to update component configs; errno: %d",
  				ret);
-@@ -5342,7 +5388,10 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5351,7 +5397,10 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  		if (hdd_get_conparam() == QDF_GLOBAL_MONITOR_MODE)
  			hdd_override_all_ps(hdd_ctx);
  
@@ -431,7 +473,7 @@ index 1a9e5f1..8033fa2 100644
  		if (!QDF_IS_STATUS_SUCCESS(status)) {
  			hdd_err("Failed to Open cds post open; status: %d",
  				status);
-@@ -5352,13 +5401,19 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5361,13 +5410,19 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  		/* Set IRQ affinity for WLAN DP and CE IRQS */
  		hif_config_irq_set_perf_affinity_hint(hif_ctx);
  
@@ -451,7 +493,7 @@ index 1a9e5f1..8033fa2 100644
  		if (ret)
  			goto deregister_cb;
  
-@@ -5377,7 +5432,10 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5386,7 +5441,10 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  
  		wlan_hdd_register_afc_pld_cb(hdd_ctx->psoc);
  
@@ -462,7 +504,7 @@ index 1a9e5f1..8033fa2 100644
  		if (!QDF_IS_STATUS_SUCCESS(status)) {
  			hdd_err("Failed to pre-enable CDS; status: %d", status);
  			ret = qdf_status_to_os_return(status);
-@@ -5423,14 +5481,20 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5432,14 +5490,20 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  			break;
  		}
  
@@ -483,7 +525,34 @@ index 1a9e5f1..8033fa2 100644
  			if (QDF_IS_STATUS_ERROR(status)) {
  				cds_err("Failed to initialize Direct Link datapath");
  				ret = -EINVAL;
-@@ -5459,6 +5523,8 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5447,15 +5511,26 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 			}
+ 		}
+ 
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules enable_power_management begin\n");
+ 		hdd_enable_power_management(hdd_ctx);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules enable_power_management done\n");
+ 
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules skip_acs_timer_init begin\n");
+ 		hdd_skip_acs_scan_timer_init(hdd_ctx);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules skip_acs_timer_init done\n");
+ 
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hif flags begin hif_ctx=%p\n",
++			hif_ctx);
+ 		hdd_set_hif_init_phase(hif_ctx, false);
+ 		hdd_hif_set_enable_detection(hif_ctx, true);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hif flags done\n");
+ 
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules connectivity_logging begin\n");
+ 		wlan_hdd_start_connectivity_logging(hdd_ctx);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules connectivity_logging done\n");
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules son_status_up begin\n");
+ 		hdd_son_send_module_status_event(HDD_WLAN_STATUS_EVT_UP);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules son_status_up done\n");
+ 
+ 		break;
+ 
+@@ -5468,6 +5543,8 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  
  	hdd_ctx->driver_status = DRIVER_MODULES_ENABLED;
  	hdd_nofl_debug("Wlan transitioned (now ENABLED)");
@@ -492,7 +561,7 @@ index 1a9e5f1..8033fa2 100644
  
  	ucfg_ipa_reg_is_driver_unloading_cb(hdd_ctx->pdev,
  					    cds_is_driver_unloading);
-@@ -5494,11 +5560,16 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5495,11 +5572,16 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  
  	hdd_exit();
  
@@ -509,7 +578,7 @@ index 1a9e5f1..8033fa2 100644
  	/*
  	 * Disable scheduler 1st so that scheduler thread doesn't send messages
  	 * to fw in parallel to the cleanup
-@@ -5507,14 +5578,19 @@ sched_disable:
+@@ -5508,14 +5590,19 @@ sched_disable:
  	hdd_destroy_sysfs_files();
  	cds_post_disable();
  unregister_notifiers:
@@ -530,7 +599,7 @@ index 1a9e5f1..8033fa2 100644
  
  	if (tgt_hdl && target_psoc_get_wmi_ready(tgt_hdl))
  		hdd_runtime_suspend_context_deinit(hdd_ctx);
-@@ -5527,6 +5603,8 @@ cds_txrx_free:
+@@ -5528,6 +5615,8 @@ cds_txrx_free:
  	cds_dp_close(hdd_ctx->psoc);
  
  close:
@@ -539,7 +608,7 @@ index 1a9e5f1..8033fa2 100644
  	dispatcher_disable();
  	hdd_ctx->driver_status = DRIVER_MODULES_CLOSED;
  	hdd_info("Wlan transition aborted (now CLOSED)");
-@@ -5534,24 +5612,36 @@ close:
+@@ -5535,24 +5624,36 @@ close:
  	cds_close(hdd_ctx->psoc);
  
  psoc_close:
@@ -576,7 +645,7 @@ index 1a9e5f1..8033fa2 100644
  	cds_shutdown_notifier_purge();
  	hdd_check_for_leaks(hdd_ctx, reinit);
  	hdd_debug_domain_set(QDF_DEBUG_DOMAIN_INIT);
-@@ -18897,10 +18987,16 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
+@@ -18894,10 +18995,16 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
  	bool is_imps_enabled;
  
  	hdd_enter();
@@ -593,7 +662,7 @@ index 1a9e5f1..8033fa2 100644
  	if (QDF_IS_STATUS_ERROR(status))
  		return qdf_status_to_os_return(status);
  
-@@ -18912,19 +19008,26 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
+@@ -18909,19 +19016,26 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
  	hdd_driver_memdump_init();
  
  	errno = wlan_hdd_alloc_iface_combination_mem(hdd_ctx);
@@ -620,7 +689,7 @@ index 1a9e5f1..8033fa2 100644
  	if (errno) {
  		hdd_err("Failed to start modules; errno:%d", errno);
  		goto free_iface_comb;
-@@ -18938,22 +19041,30 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
+@@ -18935,22 +19049,30 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
  	wlan_hdd_update_wiphy(hdd_ctx);
  
  	hdd_ctx->mac_handle = cds_get_context(QDF_MODULE_ID_SME);
@@ -651,7 +720,7 @@ index 1a9e5f1..8033fa2 100644
  	if (errno) {
  		hdd_err("register_netdevice_notifier failed; errno:%d", errno);
  		goto unregister_wiphy;
-@@ -18964,6 +19075,8 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
+@@ -18961,6 +19083,8 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
  	hdd_lpass_notify_wlan_version(hdd_ctx);
  
  	status = wlansap_global_init();
@@ -660,7 +729,7 @@ index 1a9e5f1..8033fa2 100644
  	if (QDF_IS_STATUS_ERROR(status))
  		goto unregister_notifiers;
  
-@@ -18977,22 +19090,33 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
+@@ -18974,22 +19098,33 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
  
  	hdd_exit();
  
@@ -694,7 +763,7 @@ index 1a9e5f1..8033fa2 100644
  	hdd_driver_memdump_deinit();
  	osif_request_manager_deinit();
  	qdf_nbuf_deinit_replenish_timer();
-@@ -19004,6 +19128,7 @@ memdump_deinit:
+@@ -19001,6 +19136,7 @@ memdump_deinit:
  
  	hdd_exit();
  
@@ -702,7 +771,7 @@ index 1a9e5f1..8033fa2 100644
  	return errno;
  }
  
-@@ -20440,10 +20565,13 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
+@@ -20437,10 +20573,13 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
  	hdd_enter();
  
  	id = hdd_validate_wlan_string(user_buf);
@@ -716,7 +785,7 @@ index 1a9e5f1..8033fa2 100644
  		hdd_inform_wifi_off();
  		goto exit;
  	case WLAN_ON_STR:
-@@ -20452,65 +20580,98 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
+@@ -20449,65 +20588,98 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
  	case WLAN_WAIT_FOR_READY_STR:
  		is_wait_for_ready = true;
  		hdd_info("Wifi wait for ready from UI\n");
@@ -819,7 +888,7 @@ index 1a9e5f1..8033fa2 100644
  		if (ret)
  			return ret;
  	}
-@@ -20518,20 +20679,28 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
+@@ -20515,20 +20687,28 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
  	if (id == WLAN_ENABLE_STR) {
  		if (!hdd_ctx) {
  			hdd_err_rl("hdd_ctx is Null");
@@ -849,7 +918,7 @@ index 1a9e5f1..8033fa2 100644
  	return count;
  }
  
-@@ -21652,14 +21821,21 @@ static int hdd_register_driver_retry(void)
+@@ -21649,14 +21829,21 @@ static int hdd_register_driver_retry(void)
  	int count = 0;
  	int errno;
  
@@ -872,7 +941,7 @@ index 1a9e5f1..8033fa2 100644
  		msleep(HDD_PLD_REGISTER_FAIL_SLEEP_DURATION);
  		continue;
  	}
-@@ -21689,9 +21865,14 @@ int hdd_driver_load(void)
+@@ -21686,9 +21873,14 @@ int hdd_driver_load(void)
  
  	pr_info("%s: Loading driver v%s\n", WLAN_MODULE_NAME,
  		g_wlan_driver_version);
@@ -887,7 +956,7 @@ index 1a9e5f1..8033fa2 100644
  	if (QDF_IS_STATUS_ERROR(status)) {
  		errno = qdf_status_to_os_return(status);
  		goto exit;
-@@ -21700,6 +21881,8 @@ int hdd_driver_load(void)
+@@ -21697,6 +21889,8 @@ int hdd_driver_load(void)
  	osif_sync_init();
  
  	status = osif_driver_sync_create_and_trans(&driver_sync);
@@ -896,7 +965,7 @@ index 1a9e5f1..8033fa2 100644
  	if (QDF_IS_STATUS_ERROR(status)) {
  		hdd_err("Failed to init driver sync; status:%u", status);
  		errno = qdf_status_to_os_return(status);
-@@ -21707,12 +21890,16 @@ int hdd_driver_load(void)
+@@ -21704,12 +21898,16 @@ int hdd_driver_load(void)
  	}
  
  	errno = hdd_init();
@@ -913,7 +982,7 @@ index 1a9e5f1..8033fa2 100644
  	if (QDF_IS_STATUS_ERROR(status)) {
  		hdd_err("Failed to init component cb; status:%u", status);
  		errno = qdf_status_to_os_return(status);
-@@ -21720,6 +21907,8 @@ int hdd_driver_load(void)
+@@ -21717,6 +21915,8 @@ int hdd_driver_load(void)
  	}
  
  	status = hdd_component_init();
@@ -922,7 +991,7 @@ index 1a9e5f1..8033fa2 100644
  	if (QDF_IS_STATUS_ERROR(status)) {
  		hdd_err("Failed to init components; status:%u", status);
  		errno = qdf_status_to_os_return(status);
-@@ -21727,6 +21916,8 @@ int hdd_driver_load(void)
+@@ -21724,6 +21924,8 @@ int hdd_driver_load(void)
  	}
  
  	status = qdf_wake_lock_create(&wlan_wake_lock, "wlan");
@@ -931,7 +1000,7 @@ index 1a9e5f1..8033fa2 100644
  	if (QDF_IS_STATUS_ERROR(status)) {
  		hdd_err("Failed to create wake lock; status:%u", status);
  		errno = qdf_status_to_os_return(status);
-@@ -21736,6 +21927,8 @@ int hdd_driver_load(void)
+@@ -21733,6 +21935,8 @@ int hdd_driver_load(void)
  	hdd_set_conparam(con_mode);
  
  	errno = pld_init();
@@ -940,7 +1009,7 @@ index 1a9e5f1..8033fa2 100644
  	if (errno) {
  		hdd_err("Failed to init PLD; errno:%d", errno);
  		goto wakelock_destroy;
-@@ -21743,6 +21936,8 @@ int hdd_driver_load(void)
+@@ -21740,6 +21944,8 @@ int hdd_driver_load(void)
  
  	/* driver mode pass to cnss2 platform driver*/
  	errno = pld_set_mode(con_mode);
@@ -949,7 +1018,7 @@ index 1a9e5f1..8033fa2 100644
  	if (errno)
  		hdd_err("Failed to set mode in PLD; errno:%d", errno);
  
-@@ -21753,6 +21948,8 @@ int hdd_driver_load(void)
+@@ -21750,6 +21956,8 @@ int hdd_driver_load(void)
  
  	/* psoc probe can happen in registration; do after 'load' transition */
  	errno = hdd_register_driver_retry();
@@ -958,7 +1027,7 @@ index 1a9e5f1..8033fa2 100644
  	if (errno) {
  		hdd_err("Failed to register driver; errno:%d", errno);
  		goto pld_deinit;
-@@ -21764,10 +21961,14 @@ int hdd_driver_load(void)
+@@ -21761,10 +21969,14 @@ int hdd_driver_load(void)
  	 * calling wlan_hdd_state_ctrl_param_create().
  	 */
  	soft_load = hdd_get_wlan_driver_status();
@@ -973,7 +1042,7 @@ index 1a9e5f1..8033fa2 100644
  	if (errno) {
  		hdd_err("Failed to create ctrl param; errno:%d", errno);
  		goto unregister_driver;
-@@ -21776,12 +21977,18 @@ int hdd_driver_load(void)
+@@ -21773,12 +21985,18 @@ int hdd_driver_load(void)
  out:
  	hdd_debug("%s: driver loaded", WLAN_MODULE_NAME);
  	hdd_place_marker(NULL, "DRIVER LOADED", NULL);
@@ -992,7 +1061,7 @@ index 1a9e5f1..8033fa2 100644
  	status = osif_driver_sync_trans_start(&driver_sync);
  	QDF_BUG(QDF_IS_STATUS_SUCCESS(status));
  
-@@ -21797,23 +22004,37 @@ pld_deinit:
+@@ -21794,23 +22012,37 @@ pld_deinit:
  	while (qdf_atomic_read(&wlan_hdd_state_fops_ref))
  		;
  wakelock_destroy:
@@ -1030,7 +1099,7 @@ index 1a9e5f1..8033fa2 100644
  	return errno;
  }
  
-@@ -22080,12 +22301,19 @@ static int wlan_deinit_sysfs(void)
+@@ -22077,12 +22309,19 @@ static int wlan_deinit_sysfs(void)
  #ifdef FEATURE_WLAN_RESIDENT_DRIVER
  static int hdd_module_init(void)
  {
@@ -1051,7 +1120,7 @@ index 1a9e5f1..8033fa2 100644
  		return -EINVAL;
  
  	return 0;
-@@ -22096,7 +22324,10 @@ static int __init hdd_module_init(void)
+@@ -22093,7 +22332,10 @@ static int __init hdd_module_init(void)
  {
  	int ret = -EINVAL;
  
@@ -1063,7 +1132,7 @@ index 1a9e5f1..8033fa2 100644
  		hdd_err("Failed to create sysfs entry");
  
 diff --git a/qcacld-3.0/core/pld/src/pld_common.c b/qcacld-3.0/core/pld/src/pld_common.c
-index 7d48693..c3a984d 100644
+index 7d486930..c3a984d7 100644
 --- a/qcacld-3.0/core/pld/src/pld_common.c
 +++ b/qcacld-3.0/core/pld/src/pld_common.c
 @@ -242,17 +242,26 @@ int pld_register_driver(struct pld_driver_ops *ops)
@@ -1235,7 +1304,7 @@ index 7d48693..c3a984d 100644
  
  	if (!pld_context) {
 diff --git a/qcacld-3.0/core/pld/src/pld_ipci.c b/qcacld-3.0/core/pld/src/pld_ipci.c
-index c0dd805..d5edccd 100644
+index c0dd805e..d5edccdf 100644
 --- a/qcacld-3.0/core/pld/src/pld_ipci.c
 +++ b/qcacld-3.0/core/pld/src/pld_ipci.c
 @@ -53,20 +53,30 @@ static int pld_ipci_probe(struct device *dev)
@@ -1420,7 +1489,7 @@ index c0dd805..d5edccd 100644
  
  #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0))
 diff --git a/qcacld-3.0/core/pld/src/pld_snoc.c b/qcacld-3.0/core/pld/src/pld_snoc.c
-index a2f4ea3..40742bf 100644
+index a2f4ea3f..40742bf4 100644
 --- a/qcacld-3.0/core/pld/src/pld_snoc.c
 +++ b/qcacld-3.0/core/pld/src/pld_snoc.c
 @@ -100,20 +100,29 @@ static int pld_snoc_probe(struct device *dev)
