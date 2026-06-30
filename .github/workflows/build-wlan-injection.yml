@@ -12,7 +12,7 @@ on:
         description: MiCode WLAN branch used for the replacement vendor driver
         required: true
         type: string
-        default: popsicle-w-oss
+        default: annibale-w-oss
       enable_injection:
         description: Apply the injection port (disable for a source/ABI control build)
         required: true
@@ -28,6 +28,11 @@ on:
         required: true
         type: boolean
         default: true
+      enable_trace:
+        description: Add printk breadcrumbs around WLAN enable/startup paths
+        required: true
+        type: boolean
+        default: false
       kernel_source_repo:
         description: Device kernel source used for WLAN ABI headers
         required: true
@@ -206,6 +211,15 @@ jobs:
           fi
           git diff --check
 
+      - name: Apply WCN7750 enable trace markers
+        if: ${{ inputs.enable_trace }}
+        working-directory: gki-clo/vendor/qcom/opensource/wlan
+        run: |
+          patch="$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-enable-trace.patch"
+          git apply --check "$patch"
+          git apply "$patch"
+          git diff --check
+
       - name: Prepare Xiaomi Onyx kernel ABI headers
         working-directory: gki-clo
         env:
@@ -300,6 +314,7 @@ jobs:
           ENABLE_INJECTION: ${{ inputs.enable_injection }}
           APPLY_COMPAT_PATCH: ${{ inputs.apply_compat_patch }}
           APPLY_P2PHC_PATCH: ${{ inputs.apply_p2phc_patch }}
+          ENABLE_TRACE: ${{ inputs.enable_trace }}
           KERNEL_SOURCE_BRANCH: ${{ inputs.kernel_source_branch }}
           WLAN_BRANCH: ${{ inputs.wlan_branch }}
           WLAN_EXTRA_KCFLAGS: ""
@@ -319,6 +334,9 @@ jobs:
           fi
           if [[ "$ENABLE_INJECTION" == "false" && "$APPLY_COMPAT_PATCH" == "true" && "$APPLY_P2PHC_PATCH" == "true" ]]; then
             mode="${mode}-p2phc"
+          fi
+          if [[ "$ENABLE_TRACE" == "true" ]]; then
+            mode="${mode}-trace"
           fi
           mode="${mode}-${WLAN_BRANCH}-${KERNEL_SOURCE_BRANCH}"
           module="artifacts/wlan/qca_cld3_wcn7750-konoha-${mode}.ko"
@@ -353,6 +371,11 @@ jobs:
           fi
           if ! grep -a -q qcwlanstate "$module"; then
             echo "WLAN module is missing qcwlanstate" >&2
+            exit 1
+          fi
+          if [[ "$ENABLE_TRACE" == "true" ]] &&
+             ! grep -a -q konoha_wlan_trace "$module"; then
+            echo "Trace module is missing konoha_wlan_trace markers" >&2
             exit 1
           fi
 

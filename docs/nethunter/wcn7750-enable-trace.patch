@@ -1,0 +1,154 @@
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
+index 7743d83..90a3f60 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
+@@ -787,6 +787,9 @@ static int __hdd_soc_probe(struct device *dev,
+ 	QDF_STATUS status;
+ 	int errno;
+ 
++	pr_info("konoha_wlan_trace: __hdd_soc_probe enter bus_type=%d\n",
++		bus_type);
++
+ 	hdd_info("probing driver");
+ 
+ 	hdd_soc_load_lock(dev);
+@@ -816,7 +819,10 @@ static int __hdd_soc_probe(struct device *dev,
+ 		goto dp_prealloc_fail;
+ 	}
+ 
++	pr_info("konoha_wlan_trace: __hdd_soc_probe hdd_wlan_startup begin\n");
+ 	errno = hdd_wlan_startup(hdd_ctx);
++	pr_info("konoha_wlan_trace: __hdd_soc_probe hdd_wlan_startup ret=%d\n",
++		errno);
+ 	if (errno)
+ 		goto hdd_context_destroy;
+ 
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+index e3316af..9636191 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -632,6 +632,8 @@ QDF_STATUS hdd_common_roam_callback(struct wlan_objmgr_psoc *psoc,
+ 
+ void hdd_start_complete(int ret)
+ {
++	pr_info("konoha_wlan_trace: hdd_start_complete ret=%d\n", ret);
++
+ 	wlan_start_ret_val = ret;
+ 	complete_all(&wlan_start_comp);
+ }
+@@ -5200,6 +5202,9 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 	struct dev_set_param setparam[MAX_PDEV_PRE_ENABLE_PARAMS] = {};
+ 
+ 	hdd_enter();
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules enter reinit=%d status=%d\n",
++		reinit, hdd_ctx ? hdd_ctx->driver_status : -1);
++
+ 	qdf_dev = cds_get_context(QDF_MODULE_ID_QDF_DEVICE);
+ 	if (!qdf_dev) {
+ 		hdd_exit();
+@@ -5226,7 +5231,10 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 		hdd_debug_domain_set(QDF_DEBUG_DOMAIN_ACTIVE);
+ 
+ 		if (!reinit && !unint) {
++			pr_info("konoha_wlan_trace: hdd_wlan_start_modules pld_power_on begin\n");
+ 			ret = pld_power_on(qdf_dev->dev);
++			pr_info("konoha_wlan_trace: hdd_wlan_start_modules pld_power_on ret=%d\n",
++				ret);
+ 			if (ret) {
+ 				hdd_err("Failed to power up device; errno:%d",
+ 					ret);
+@@ -5237,10 +5245,14 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 		hdd_init_adapter_ops_wq(hdd_ctx);
+ 		pld_set_fw_log_mode(hdd_ctx->parent_dev,
+ 				    hdd_ctx->config->enable_fw_log);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_hif_open begin bus=%d\n",
++			qdf_dev->bus_type);
+ 		ret = hdd_hif_open(qdf_dev->dev, qdf_dev->drv_hdl, qdf_dev->bid,
+ 				   qdf_dev->bus_type,
+ 				   (reinit == true) ?  HIF_ENABLE_TYPE_REINIT :
+ 				   HIF_ENABLE_TYPE_PROBE);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_hif_open ret=%d\n",
++			ret);
+ 		if (ret) {
+ 			hdd_err("Failed to open hif; errno: %d", ret);
+ 			goto power_down;
+@@ -18923,7 +18935,10 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
+ 		goto free_iface_comb;
+ 	}
+ 
++	pr_info("konoha_wlan_trace: hdd_wlan_startup start_modules begin\n");
+ 	errno = hdd_wlan_start_modules(hdd_ctx, false);
++	pr_info("konoha_wlan_trace: hdd_wlan_startup start_modules ret=%d\n",
++		errno);
+ 	if (errno) {
+ 		hdd_err("Failed to start modules; errno:%d", errno);
+ 		goto free_iface_comb;
+@@ -20439,6 +20454,8 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
+ 	hdd_enter();
+ 
+ 	id = hdd_validate_wlan_string(user_buf);
++	pr_info("konoha_wlan_trace: state_write id=%d count=%zu\n",
++		id, count);
+ 
+ 	switch (id) {
+ 	case WLAN_OFF_STR:
+@@ -20457,6 +20474,7 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
+ 		if (!hdd_wlan_soft_driver_load())
+ 			goto exit;
+ 		pr_info("Enabling WiFi\n");
++		pr_info("konoha_wlan_trace: state_write enable after_soft_driver_load\n");
+ 		break;
+ 	case WLAN_DISABLE_STR:
+ 		hdd_nofl_debug("Received WiFi disable from framework\n");
+@@ -20482,10 +20500,18 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
+ 
+ 	hdd_info("is_driver_loaded %d is_driver_recovering %d",
+ 		 cds_is_driver_loaded(), cds_is_driver_recovering());
++	pr_info("konoha_wlan_trace: state_write after_switch id=%d loaded=%d recovering=%d wait_ready=%d\n",
++		id, cds_is_driver_loaded(), cds_is_driver_recovering(),
++		is_wait_for_ready);
+ 
+ 	if (!cds_is_driver_loaded() || cds_is_driver_recovering()) {
++		pr_info("konoha_wlan_trace: state_write wait_start timeout_ms=%d\n",
++			HDD_WLAN_START_WAIT_TIME);
+ 		rc = wait_for_completion_timeout(&wlan_start_comp,
+ 				msecs_to_jiffies(HDD_WLAN_START_WAIT_TIME));
++		pr_info("konoha_wlan_trace: state_write wait_done rc=%lu start_ret=%d loaded=%d recovering=%d\n",
++			rc, wlan_start_ret_val, cds_is_driver_loaded(),
++			cds_is_driver_recovering());
+ 		if (!rc) {
+ 			hdd_err("Driver Loading Timed-out!!");
+ 			ret = -EINVAL;
+@@ -20500,6 +20526,8 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
+ 	 * during the idle shutdown.
+ 	 */
+ 	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
++	pr_info("konoha_wlan_trace: state_write hdd_ctx_present=%d\n",
++		!!hdd_ctx);
+ 	if (hdd_ctx)
+ 		hdd_psoc_idle_timer_stop(hdd_ctx);
+ 
+@@ -20520,16 +20548,22 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
+ 			goto exit;
+ 		}
+ 
++		pr_info("konoha_wlan_trace: state_write enable ctx_is_disabled=%d\n",
++			hdd_ctx->is_wlan_disabled);
+ 		if (!hdd_ctx->is_wlan_disabled) {
+ 			hdd_err_rl("WiFi is already enabled");
+ 			goto exit;
+ 		}
+ 		hdd_ctx->is_wlan_disabled = false;
++		pr_info("konoha_wlan_trace: state_write enable marked_enabled\n");
+ 	}
+ 
+-	if (id == WLAN_ON_STR)
++	if (id == WLAN_ON_STR) {
++		pr_info("konoha_wlan_trace: state_write inform_wifi_on\n");
+ 		hdd_inform_wifi_on();
++	}
+ exit:
++	pr_info("konoha_wlan_trace: state_write exit id=%d\n", id);
+ 	hdd_exit();
+ 	return count;
+ }
