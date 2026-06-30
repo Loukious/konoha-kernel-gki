@@ -1,18 +1,50 @@
 diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
-index 7743d83..90a3f60 100644
+index 7743d83..4fbd790 100644
 --- a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
 +++ b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
-@@ -787,6 +787,9 @@ static int __hdd_soc_probe(struct device *dev,
+@@ -787,40 +787,58 @@ static int __hdd_soc_probe(struct device *dev,
  	QDF_STATUS status;
  	int errno;
  
-+	pr_info("konoha_wlan_trace: __hdd_soc_probe enter bus_type=%d\n",
-+		bus_type);
-+
++	pr_info("konoha_wlan_trace: __hdd_soc_probe enter dev=%p bdev=%p bid=%p bus=%d\n",
++		dev, bdev, bid, bus_type);
  	hdd_info("probing driver");
  
  	hdd_soc_load_lock(dev);
-@@ -816,7 +819,10 @@ static int __hdd_soc_probe(struct device *dev,
+ 	cds_set_load_in_progress(true);
+ 	cds_set_driver_in_bad_state(false);
+ 	cds_set_recovery_in_progress(false);
++	pr_info("konoha_wlan_trace: __hdd_soc_probe flags set load_in_progress=1\n");
+ 
+ 	errno = hdd_init_qdf_ctx(dev, bdev, bus_type, bid);
++	pr_info("konoha_wlan_trace: __hdd_soc_probe hdd_init_qdf_ctx ret=%d\n",
++		errno);
+ 	if (errno)
+ 		goto unlock;
+ 
+ 	errno = hdd_init_dma_mask(dev, bus_type);
++	pr_info("konoha_wlan_trace: __hdd_soc_probe hdd_init_dma_mask ret=%d\n",
++		errno);
+ 	if (errno)
+ 		goto unlock;
+ 
+ 	hdd_ctx = hdd_context_create(dev);
+ 	if (IS_ERR(hdd_ctx)) {
+ 		errno = PTR_ERR(hdd_ctx);
++		pr_info("konoha_wlan_trace: __hdd_soc_probe hdd_context_create err=%d\n",
++			errno);
+ 		goto assert_fail_count;
+ 	}
++	pr_info("konoha_wlan_trace: __hdd_soc_probe hdd_context_create ctx=%p psoc=%p\n",
++		hdd_ctx, hdd_ctx->psoc);
+ 
+ 	status = ucfg_dp_prealloc_init((struct cdp_ctrl_objmgr_psoc *)
+ 					hdd_ctx->psoc);
++	pr_info("konoha_wlan_trace: __hdd_soc_probe ucfg_dp_prealloc_init status=%d\n",
++		status);
+ 
+ 	if (status != QDF_STATUS_SUCCESS) {
+ 		errno = qdf_status_to_os_return(status);
  		goto dp_prealloc_fail;
  	}
  
@@ -23,46 +55,289 @@ index 7743d83..90a3f60 100644
  	if (errno)
  		goto hdd_context_destroy;
  
+ 	status = hdd_psoc_create_vdevs(hdd_ctx);
++	pr_info("konoha_wlan_trace: __hdd_soc_probe hdd_psoc_create_vdevs status=%d\n",
++		status);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		errno = qdf_status_to_os_return(status);
+ 		goto wlan_exit;
+@@ -834,26 +852,39 @@ static int __hdd_soc_probe(struct device *dev,
+ 
+ 	hdd_set_sar_init_index(hdd_ctx);
+ 	hdd_soc_load_unlock(dev);
++	pr_info("konoha_wlan_trace: __hdd_soc_probe success loaded=%d recovering=%d\n",
++		cds_is_driver_loaded(), cds_is_driver_recovering());
+ 
+ 	return 0;
+ 
+ wlan_exit:
++	pr_info("konoha_wlan_trace: __hdd_soc_probe fail wlan_exit errno=%d\n",
++		errno);
+ 	hdd_wlan_exit(hdd_ctx);
+ 
+ hdd_context_destroy:
++	pr_info("konoha_wlan_trace: __hdd_soc_probe fail hdd_context_destroy errno=%d\n",
++		errno);
+ 	ucfg_dp_prealloc_deinit();
+ 
+ dp_prealloc_fail:
++	pr_info("konoha_wlan_trace: __hdd_soc_probe fail dp_prealloc_fail errno=%d\n",
++		errno);
+ 	hdd_context_destroy(hdd_ctx);
+ 
+ assert_fail_count:
+ 	probe_fail_cnt++;
++	pr_info("konoha_wlan_trace: __hdd_soc_probe fail assert_fail_count errno=%d failures=%u\n",
++		errno, probe_fail_cnt);
+ 	hdd_err("consecutive probe failures:%u", probe_fail_cnt);
+ 	QDF_BUG(probe_fail_cnt < SSR_MAX_FAIL_CNT);
+ 
+ unlock:
+ 	cds_set_load_in_progress(false);
+ 	hdd_soc_load_unlock(dev);
++	pr_info("konoha_wlan_trace: __hdd_soc_probe exit errno=%d probe_defer_ret=%d loaded=%d recovering=%d\n",
++		errno, check_for_probe_defer(errno), cds_is_driver_loaded(),
++		cds_is_driver_recovering());
+ 
+ 	return check_for_probe_defer(errno);
+ }
+@@ -878,24 +909,34 @@ static int hdd_soc_probe(struct device *dev,
+ 	struct osif_psoc_sync *psoc_sync;
+ 	int errno;
+ 
++	pr_info("konoha_wlan_trace: hdd_soc_probe enter dev=%p bdev=%p bid=%p bus=%d\n",
++		dev, bdev, bid, bus_type);
+ 	hdd_info("probing driver");
+ 
+ 	errno = osif_psoc_sync_create_and_trans(&psoc_sync);
++	pr_info("konoha_wlan_trace: hdd_soc_probe sync_create ret=%d sync=%p\n",
++		errno, errno ? NULL : psoc_sync);
+ 	if (errno)
+ 		return errno;
+ 
+ 	osif_psoc_sync_register(dev, psoc_sync);
++	pr_info("konoha_wlan_trace: hdd_soc_probe sync_registered\n");
+ 	errno = __hdd_soc_probe(dev, bdev, bid, bus_type);
++	pr_info("konoha_wlan_trace: hdd_soc_probe __hdd_soc_probe ret=%d\n",
++		errno);
+ 	if (errno)
+ 		goto destroy_sync;
+ 
+ 	osif_psoc_sync_trans_stop(psoc_sync);
+ 
++	pr_info("konoha_wlan_trace: hdd_soc_probe start_complete success\n");
+ 	hdd_start_complete(0);
+ 
+ 	return 0;
+ 
+ destroy_sync:
++	pr_info("konoha_wlan_trace: hdd_soc_probe destroy_sync errno=%d\n",
++		errno);
+ 	hdd_start_complete(errno);
+ 	osif_psoc_sync_unregister(dev);
+ 	osif_psoc_sync_wait_for_ops(psoc_sync);
+@@ -903,6 +944,7 @@ destroy_sync:
+ 	osif_psoc_sync_trans_stop(psoc_sync);
+ 	osif_psoc_sync_destroy(psoc_sync);
+ 
++	pr_info("konoha_wlan_trace: hdd_soc_probe exit errno=%d\n", errno);
+ 	return errno;
+ }
+ 
+@@ -1895,16 +1937,24 @@ static int wlan_hdd_pld_probe(struct device *dev,
+ 			      void *id)
+ {
+ 	enum qdf_bus_type bus_type = to_bus_type(pld_bus_type);
++	int ret;
+ 
++	pr_info("konoha_wlan_trace: wlan_hdd_pld_probe enter dev=%p pld_bus=%d bdev=%p id=%p qdf_bus=%d\n",
++		dev, pld_bus_type, bdev, id, bus_type);
+ 	if (bus_type == QDF_BUS_TYPE_NONE) {
+ 		hdd_err("Invalid bus type %d->%d", pld_bus_type, bus_type);
++		pr_info("konoha_wlan_trace: wlan_hdd_pld_probe invalid_bus\n");
+ 		return -EINVAL;
+ 	}
+ 	qdf_ssr_driver_dump_register_region("hang_event_data",
+ 					    g_fw_host_hang_event,
+ 					    sizeof(g_fw_host_hang_event));
+ 
+-	return hdd_soc_probe(dev, bdev, id, bus_type);
++	pr_info("konoha_wlan_trace: wlan_hdd_pld_probe calling hdd_soc_probe\n");
++	ret = hdd_soc_probe(dev, bdev, id, bus_type);
++	pr_info("konoha_wlan_trace: wlan_hdd_pld_probe hdd_soc_probe ret=%d\n",
++		ret);
++	return ret;
+ }
+ 
+ /**
+@@ -1916,12 +1966,15 @@ static int wlan_hdd_pld_probe(struct device *dev,
+  */
+ static void wlan_hdd_pld_remove(struct device *dev, enum pld_bus_type bus_type)
+ {
++	pr_info("konoha_wlan_trace: wlan_hdd_pld_remove enter dev=%p pld_bus=%d\n",
++		dev, bus_type);
+ 	hdd_enter();
+ 
+ 	hdd_soc_remove(dev);
+ 	qdf_ssr_driver_dump_unregister_region("hang_event_data");
+ 
+ 	hdd_exit();
++	pr_info("konoha_wlan_trace: wlan_hdd_pld_remove exit\n");
+ }
+ 
+ static void hdd_soc_idle_shutdown_lock(struct device *dev)
+@@ -1949,12 +2002,16 @@ static int wlan_hdd_pld_idle_shutdown(struct device *dev,
+ {
+ 	int ret;
+ 
++	pr_info("konoha_wlan_trace: wlan_hdd_pld_idle_shutdown enter dev=%p pld_bus=%d\n",
++		dev, bus_type);
+ 	hdd_soc_idle_shutdown_lock(dev);
+ 
+ 	ret = hdd_psoc_idle_shutdown(dev);
+ 
+ 	hdd_soc_idle_shutdown_unlock();
+ 
++	pr_info("konoha_wlan_trace: wlan_hdd_pld_idle_shutdown ret=%d\n",
++		ret);
+ 	return ret;
+ }
+ 
+@@ -1968,7 +2025,14 @@ static int wlan_hdd_pld_idle_shutdown(struct device *dev,
+ static int wlan_hdd_pld_idle_restart(struct device *dev,
+ 				      enum pld_bus_type bus_type)
+ {
+-	return hdd_psoc_idle_restart(dev);
++	int ret;
++
++	pr_info("konoha_wlan_trace: wlan_hdd_pld_idle_restart enter dev=%p pld_bus=%d\n",
++		dev, bus_type);
++	ret = hdd_psoc_idle_restart(dev);
++	pr_info("konoha_wlan_trace: wlan_hdd_pld_idle_restart ret=%d\n",
++		ret);
++	return ret;
+ }
+ 
+ /**
+@@ -1981,11 +2045,14 @@ static int wlan_hdd_pld_idle_restart(struct device *dev,
+ static void wlan_hdd_pld_shutdown(struct device *dev,
+ 				  enum pld_bus_type bus_type)
+ {
++	pr_info("konoha_wlan_trace: wlan_hdd_pld_shutdown enter dev=%p pld_bus=%d\n",
++		dev, bus_type);
+ 	hdd_enter();
+ 
+ 	hdd_soc_recovery_shutdown(dev);
+ 
+ 	hdd_exit();
++	pr_info("konoha_wlan_trace: wlan_hdd_pld_shutdown exit\n");
+ }
+ 
+ /**
+@@ -2003,13 +2070,19 @@ static int wlan_hdd_pld_reinit(struct device *dev,
+ 			       void *id)
+ {
+ 	enum qdf_bus_type bus_type = to_bus_type(pld_bus_type);
++	int ret;
+ 
++	pr_info("konoha_wlan_trace: wlan_hdd_pld_reinit enter dev=%p pld_bus=%d bdev=%p id=%p qdf_bus=%d\n",
++		dev, pld_bus_type, bdev, id, bus_type);
+ 	if (bus_type == QDF_BUS_TYPE_NONE) {
+ 		hdd_err("Invalid bus type %d->%d", pld_bus_type, bus_type);
++		pr_info("konoha_wlan_trace: wlan_hdd_pld_reinit invalid_bus\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	return hdd_soc_recovery_reinit(dev, bdev, id, bus_type);
++	ret = hdd_soc_recovery_reinit(dev, bdev, id, bus_type);
++	pr_info("konoha_wlan_trace: wlan_hdd_pld_reinit ret=%d\n", ret);
++	return ret;
+ }
+ 
+ /**
+@@ -2389,10 +2462,18 @@ struct pld_driver_ops wlan_drv_ops = {
+ 
+ int wlan_hdd_register_driver(void)
+ {
+-	return pld_register_driver(&wlan_drv_ops);
++	int ret;
++
++	pr_info("konoha_wlan_trace: wlan_hdd_register_driver enter ops=%p probe=%p remove=%p\n",
++		&wlan_drv_ops, wlan_drv_ops.probe, wlan_drv_ops.remove);
++	ret = pld_register_driver(&wlan_drv_ops);
++	pr_info("konoha_wlan_trace: wlan_hdd_register_driver ret=%d\n", ret);
++	return ret;
+ }
+ 
+ void wlan_hdd_unregister_driver(void)
+ {
++	pr_info("konoha_wlan_trace: wlan_hdd_unregister_driver enter\n");
+ 	pld_unregister_driver();
++	pr_info("konoha_wlan_trace: wlan_hdd_unregister_driver exit\n");
+ }
 diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
-index e3316af..9636191 100644
+index 1a9e5f1..8033fa2 100644
 --- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
 +++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
-@@ -632,6 +632,8 @@ QDF_STATUS hdd_common_roam_callback(struct wlan_objmgr_psoc *psoc,
+@@ -633,6 +633,8 @@ QDF_STATUS hdd_common_roam_callback(struct wlan_objmgr_psoc *psoc,
  
  void hdd_start_complete(int ret)
  {
-+	pr_info("konoha_wlan_trace: hdd_start_complete ret=%d\n", ret);
-+
++	pr_info("konoha_wlan_trace: hdd_start_complete ret=%d loaded=%d recovering=%d\n",
++		ret, cds_is_driver_loaded(), cds_is_driver_recovering());
  	wlan_start_ret_val = ret;
  	complete_all(&wlan_start_comp);
  }
-@@ -5200,6 +5202,9 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5201,16 +5203,26 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  	struct dev_set_param setparam[MAX_PDEV_PRE_ENABLE_PARAMS] = {};
  
  	hdd_enter();
-+	pr_info("konoha_wlan_trace: hdd_wlan_start_modules enter reinit=%d status=%d\n",
-+		reinit, hdd_ctx ? hdd_ctx->driver_status : -1);
-+
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules enter ctx=%p reinit=%d status=%d parent=%p psoc=%p\n",
++		hdd_ctx, reinit, hdd_ctx ? hdd_ctx->driver_status : -1,
++		hdd_ctx ? hdd_ctx->parent_dev : NULL,
++		hdd_ctx ? hdd_ctx->psoc : NULL);
  	qdf_dev = cds_get_context(QDF_MODULE_ID_QDF_DEVICE);
  	if (!qdf_dev) {
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules no_qdf_dev ret=%d\n",
++			-EINVAL);
  		hdd_exit();
-@@ -5226,7 +5231,10 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 		return -EINVAL;
+ 	}
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules qdf_dev=%p dev=%p drv_hdl=%p bid=%p bus=%d\n",
++		qdf_dev, qdf_dev->dev, qdf_dev->drv_hdl, qdf_dev->bid,
++		qdf_dev->bus_type);
+ 
+ 	hdd_psoc_idle_timer_stop(hdd_ctx);
+ 
+ 	if (hdd_ctx->driver_status == DRIVER_MODULES_ENABLED) {
+ 		hdd_debug("Driver modules already Enabled");
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules already_enabled\n");
+ 		hdd_exit();
+ 		return 0;
+ 	}
+@@ -5225,9 +5237,15 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 	case DRIVER_MODULES_CLOSED:
+ 		hdd_nofl_debug("Wlan transitioning (CLOSED -> ENABLED)");
  		hdd_debug_domain_set(QDF_DEBUG_DOMAIN_ACTIVE);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules transition unint=%d reinit=%d status=%d\n",
++			unint, reinit, hdd_ctx->driver_status);
  
  		if (!reinit && !unint) {
-+			pr_info("konoha_wlan_trace: hdd_wlan_start_modules pld_power_on begin\n");
++			pr_info("konoha_wlan_trace: hdd_wlan_start_modules pld_power_on begin dev=%p\n",
++				qdf_dev->dev);
  			ret = pld_power_on(qdf_dev->dev);
 +			pr_info("konoha_wlan_trace: hdd_wlan_start_modules pld_power_on ret=%d\n",
 +				ret);
  			if (ret) {
  				hdd_err("Failed to power up device; errno:%d",
  					ret);
-@@ -5237,10 +5245,14 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5238,10 +5256,15 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  		hdd_init_adapter_ops_wq(hdd_ctx);
  		pld_set_fw_log_mode(hdd_ctx->parent_dev,
  				    hdd_ctx->config->enable_fw_log);
-+		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_hif_open begin bus=%d\n",
-+			qdf_dev->bus_type);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_hif_open begin enable_type=%d\n",
++			(reinit == true) ? HIF_ENABLE_TYPE_REINIT :
++					   HIF_ENABLE_TYPE_PROBE);
  		ret = hdd_hif_open(qdf_dev->dev, qdf_dev->drv_hdl, qdf_dev->bid,
  				   qdf_dev->bus_type,
  				   (reinit == true) ?  HIF_ENABLE_TYPE_REINIT :
@@ -72,35 +347,425 @@ index e3316af..9636191 100644
  		if (ret) {
  			hdd_err("Failed to open hif; errno: %d", ret);
  			goto power_down;
-@@ -18923,7 +18935,10 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
+@@ -5250,10 +5273,17 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 		hif_ctx = cds_get_context(QDF_MODULE_ID_HIF);
+ 		if (!hif_ctx) {
+ 			ret = -EINVAL;
++			pr_info("konoha_wlan_trace: hdd_wlan_start_modules no_hif_ctx ret=%d\n",
++				ret);
+ 			goto power_down;
+ 		}
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hif_ctx=%p\n",
++			hif_ctx);
+ 
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules ol_cds_init begin\n");
+ 		status = ol_cds_init(qdf_dev, hif_ctx);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules ol_cds_init status=%d\n",
++			status);
+ 		if (status != QDF_STATUS_SUCCESS) {
+ 			hdd_err("No Memory to Create BMI Context; status: %d",
+ 				status);
+@@ -5292,11 +5322,16 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 
+ 		hdd_update_cds_ac_specs_params(hdd_ctx);
+ 
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules registering dp/qmi callbacks\n");
+ 		hdd_dp_register_callbacks(hdd_ctx);
+ 
+ 		hdd_qmi_register_callbacks(hdd_ctx);
+ 
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_component_psoc_open begin psoc=%p\n",
++			hdd_ctx->psoc);
+ 		status = hdd_component_psoc_open(hdd_ctx->psoc);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_component_psoc_open status=%d\n",
++			status);
+ 		if (QDF_IS_STATUS_ERROR(status)) {
+ 			hdd_err("Failed to Open legacy components; status: %d",
+ 				status);
+@@ -5304,7 +5339,10 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 			goto ipa_component_free;
+ 		}
+ 
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_update_config begin\n");
+ 		ret = hdd_update_config(hdd_ctx);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_update_config ret=%d\n",
++			ret);
+ 		if (ret) {
+ 			hdd_err("Failed to update configuration; errno: %d",
+ 				ret);
+@@ -5312,10 +5350,15 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 		}
+ 
+ 		status = wbuff_module_init();
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules wbuff_module_init status=%d\n",
++			status);
+ 		if (QDF_IS_STATUS_ERROR(status))
+ 			hdd_err("WBUFF init unsuccessful; status: %d", status);
+ 
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules cds_open begin\n");
+ 		status = cds_open(hdd_ctx->psoc);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules cds_open status=%d\n",
++			status);
+ 		if (QDF_IS_STATUS_ERROR(status)) {
+ 			hdd_err("Failed to Open CDS; status: %d", status);
+ 			ret = qdf_status_to_os_return(status);
+@@ -5331,7 +5374,10 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 		ucfg_dp_set_rx_thread_affinity(hdd_ctx->psoc);
+ 
+ 		/* initialize components configurations after psoc open */
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_update_components_config begin\n");
+ 		ret = hdd_update_components_config(hdd_ctx);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_update_components_config ret=%d\n",
++			ret);
+ 		if (ret) {
+ 			hdd_err("Failed to update component configs; errno: %d",
+ 				ret);
+@@ -5342,7 +5388,10 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 		if (hdd_get_conparam() == QDF_GLOBAL_MONITOR_MODE)
+ 			hdd_override_all_ps(hdd_ctx);
+ 
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules cds_dp_open begin\n");
+ 		status = cds_dp_open(hdd_ctx->psoc);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules cds_dp_open status=%d\n",
++			status);
+ 		if (!QDF_IS_STATUS_SUCCESS(status)) {
+ 			hdd_err("Failed to Open cds post open; status: %d",
+ 				status);
+@@ -5352,13 +5401,19 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 		/* Set IRQ affinity for WLAN DP and CE IRQS */
+ 		hif_config_irq_set_perf_affinity_hint(hif_ctx);
+ 
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_register_cb begin\n");
+ 		ret = hdd_register_cb(hdd_ctx);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_register_cb ret=%d\n",
++			ret);
+ 		if (ret) {
+ 			hdd_err("Failed to register HDD callbacks!");
+ 			goto cds_txrx_free;
+ 		}
+ 
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_register_notifiers begin\n");
+ 		ret = hdd_register_notifiers(hdd_ctx);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_register_notifiers ret=%d\n",
++			ret);
+ 		if (ret)
+ 			goto deregister_cb;
+ 
+@@ -5377,7 +5432,10 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 
+ 		wlan_hdd_register_afc_pld_cb(hdd_ctx->psoc);
+ 
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules cds_pre_enable begin\n");
+ 		status = cds_pre_enable();
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules cds_pre_enable status=%d\n",
++			status);
+ 		if (!QDF_IS_STATUS_SUCCESS(status)) {
+ 			hdd_err("Failed to pre-enable CDS; status: %d", status);
+ 			ret = qdf_status_to_os_return(status);
+@@ -5423,14 +5481,20 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 			break;
+ 		}
+ 
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_configure_cds begin\n");
+ 		ret = hdd_configure_cds(hdd_ctx);
++		pr_info("konoha_wlan_trace: hdd_wlan_start_modules hdd_configure_cds ret=%d\n",
++			ret);
+ 		if (ret) {
+ 			hdd_err("Failed to Enable cds modules; errno: %d", ret);
+ 			goto sched_disable;
+ 		}
+ 
+ 		if (hdd_get_conparam() == QDF_GLOBAL_MISSION_MODE) {
++			pr_info("konoha_wlan_trace: hdd_wlan_start_modules direct_link_init begin\n");
+ 			status = ucfg_dp_direct_link_init(hdd_ctx->psoc);
++			pr_info("konoha_wlan_trace: hdd_wlan_start_modules direct_link_init status=%d\n",
++				status);
+ 			if (QDF_IS_STATUS_ERROR(status)) {
+ 				cds_err("Failed to initialize Direct Link datapath");
+ 				ret = -EINVAL;
+@@ -5459,6 +5523,8 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 
+ 	hdd_ctx->driver_status = DRIVER_MODULES_ENABLED;
+ 	hdd_nofl_debug("Wlan transitioned (now ENABLED)");
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules enabled ctx=%p pdev=%p mac=%p\n",
++		hdd_ctx, hdd_ctx->pdev, hdd_ctx->mac_handle);
+ 
+ 	ucfg_ipa_reg_is_driver_unloading_cb(hdd_ctx->pdev,
+ 					    cds_is_driver_unloading);
+@@ -5494,11 +5560,16 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 
+ 	hdd_exit();
+ 
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules success\n");
+ 	return 0;
+ 
+ deconfigure_cds:
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules cleanup deconfigure_cds ret=%d\n",
++		ret);
+ 	hdd_deconfigure_cds(hdd_ctx);
+ sched_disable:
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules cleanup sched_disable ret=%d\n",
++		ret);
+ 	/*
+ 	 * Disable scheduler 1st so that scheduler thread doesn't send messages
+ 	 * to fw in parallel to the cleanup
+@@ -5507,14 +5578,19 @@ sched_disable:
+ 	hdd_destroy_sysfs_files();
+ 	cds_post_disable();
+ unregister_notifiers:
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules cleanup unregister_notifiers ret=%d\n",
++		ret);
+ 	hdd_unregister_notifiers(hdd_ctx);
+ 
+ deregister_cb:
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules cleanup deregister_cb ret=%d\n",
++		ret);
+ 	hdd_deregister_cb(hdd_ctx);
+ 
+ cds_txrx_free:
+-
+ 	tgt_hdl = wlan_psoc_get_tgt_if_handle(hdd_ctx->psoc);
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules cleanup cds_txrx_free ret=%d tgt_hdl=%p\n",
++		ret, tgt_hdl);
+ 
+ 	if (tgt_hdl && target_psoc_get_wmi_ready(tgt_hdl))
+ 		hdd_runtime_suspend_context_deinit(hdd_ctx);
+@@ -5527,6 +5603,8 @@ cds_txrx_free:
+ 	cds_dp_close(hdd_ctx->psoc);
+ 
+ close:
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules cleanup close ret=%d\n",
++		ret);
+ 	dispatcher_disable();
+ 	hdd_ctx->driver_status = DRIVER_MODULES_CLOSED;
+ 	hdd_info("Wlan transition aborted (now CLOSED)");
+@@ -5534,24 +5612,36 @@ close:
+ 	cds_close(hdd_ctx->psoc);
+ 
+ psoc_close:
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules cleanup psoc_close ret=%d\n",
++		ret);
+ 	hdd_component_psoc_close(hdd_ctx->psoc, cds_is_driver_recovering());
+ 	wlan_global_lmac_if_close(hdd_ctx->psoc);
+ 	cds_deinit_ini_config();
+ 
+ ipa_component_free:
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules cleanup ipa_component_free ret=%d\n",
++		ret);
+ 	ucfg_ipa_component_config_free();
+ 
+ cds_free:
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules cleanup cds_free ret=%d\n",
++		ret);
+ 	ol_cds_free();
+ 
+ hif_close:
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules cleanup hif_close ret=%d\n",
++		ret);
+ 	hif_ctx = cds_get_context(QDF_MODULE_ID_HIF);
+ 	hdd_hif_close(hdd_ctx, hif_ctx);
+ power_down:
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules cleanup power_down ret=%d\n",
++		ret);
+ 	hdd_deinit_adapter_ops_wq(hdd_ctx);
+ 	if (!reinit && !unint)
+ 		pld_power_off(qdf_dev->dev);
+ release_lock:
++	pr_info("konoha_wlan_trace: hdd_wlan_start_modules exit ret=%d status=%d\n",
++		ret, hdd_ctx->driver_status);
+ 	cds_shutdown_notifier_purge();
+ 	hdd_check_for_leaks(hdd_ctx, reinit);
+ 	hdd_debug_domain_set(QDF_DEBUG_DOMAIN_INIT);
+@@ -18897,10 +18987,16 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
+ 	bool is_imps_enabled;
+ 
+ 	hdd_enter();
++	pr_info("konoha_wlan_trace: hdd_wlan_startup enter ctx=%p psoc=%p parent=%p status=%d\n",
++		hdd_ctx, hdd_ctx ? hdd_ctx->psoc : NULL,
++		hdd_ctx ? hdd_ctx->parent_dev : NULL,
++		hdd_ctx ? hdd_ctx->driver_status : -1);
+ 
+ 	qdf_nbuf_init_replenish_timer();
+ 
+ 	status = wlan_hdd_cache_chann_mutex_create(hdd_ctx);
++	pr_info("konoha_wlan_trace: hdd_wlan_startup cache_mutex status=%d\n",
++		status);
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		return qdf_status_to_os_return(status);
+ 
+@@ -18912,19 +19008,26 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
+ 	hdd_driver_memdump_init();
+ 
+ 	errno = wlan_hdd_alloc_iface_combination_mem(hdd_ctx);
++	pr_info("konoha_wlan_trace: hdd_wlan_startup alloc_iface ret=%d\n",
++		errno);
+ 	if (errno) {
+ 		hdd_err("failed to alloc iface combination mem");
+ 		goto memdump_deinit;
+ 	}
+ 
+ 	errno = hdd_init_regulatory_update_event(hdd_ctx);
++	pr_info("konoha_wlan_trace: hdd_wlan_startup regulatory_event ret=%d\n",
++		errno);
+ 	if (errno) {
+ 		hdd_err("Failed to initialize regulatory update event; errno:%d",
+ 			errno);
  		goto free_iface_comb;
  	}
  
-+	pr_info("konoha_wlan_trace: hdd_wlan_startup start_modules begin\n");
++	pr_info("konoha_wlan_trace: hdd_wlan_startup hdd_wlan_start_modules begin\n");
  	errno = hdd_wlan_start_modules(hdd_ctx, false);
-+	pr_info("konoha_wlan_trace: hdd_wlan_startup start_modules ret=%d\n",
-+		errno);
++	pr_info("konoha_wlan_trace: hdd_wlan_startup hdd_wlan_start_modules ret=%d status=%d\n",
++		errno, hdd_ctx->driver_status);
  	if (errno) {
  		hdd_err("Failed to start modules; errno:%d", errno);
  		goto free_iface_comb;
-@@ -20439,6 +20454,8 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
+@@ -18938,22 +19041,30 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
+ 	wlan_hdd_update_wiphy(hdd_ctx);
+ 
+ 	hdd_ctx->mac_handle = cds_get_context(QDF_MODULE_ID_SME);
++	pr_info("konoha_wlan_trace: hdd_wlan_startup mac_handle=%p\n",
++		hdd_ctx->mac_handle);
+ 	if (!hdd_ctx->mac_handle)
+ 		goto stop_modules;
+ 
+ 	errno = hdd_wiphy_init(hdd_ctx);
++	pr_info("konoha_wlan_trace: hdd_wlan_startup hdd_wiphy_init ret=%d wiphy=%p\n",
++		errno, hdd_ctx->wiphy);
+ 	if (errno) {
+ 		hdd_err("Failed to initialize wiphy; errno:%d", errno);
+ 		goto stop_modules;
+ 	}
+ 
+ 	errno = hdd_initialize_mac_address(hdd_ctx);
++	pr_info("konoha_wlan_trace: hdd_wlan_startup initialize_mac ret=%d\n",
++		errno);
+ 	if (errno) {
+ 		hdd_err("MAC initializtion failed: %d", errno);
+ 		goto unregister_wiphy;
+ 	}
+ 
+ 	errno = register_netdevice_notifier(&hdd_netdev_notifier);
++	pr_info("konoha_wlan_trace: hdd_wlan_startup register_netdevice_notifier ret=%d\n",
++		errno);
+ 	if (errno) {
+ 		hdd_err("register_netdevice_notifier failed; errno:%d", errno);
+ 		goto unregister_wiphy;
+@@ -18964,6 +19075,8 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
+ 	hdd_lpass_notify_wlan_version(hdd_ctx);
+ 
+ 	status = wlansap_global_init();
++	pr_info("konoha_wlan_trace: hdd_wlan_startup wlansap_global_init status=%d\n",
++		status);
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		goto unregister_notifiers;
+ 
+@@ -18977,22 +19090,33 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
+ 
+ 	hdd_exit();
+ 
++	pr_info("konoha_wlan_trace: hdd_wlan_startup success\n");
+ 	return 0;
+ 
+ unregister_notifiers:
++	pr_info("konoha_wlan_trace: hdd_wlan_startup cleanup unregister_notifiers errno=%d status=%d\n",
++		errno, status);
+ 	unregister_netdevice_notifier(&hdd_netdev_notifier);
+ 
+ unregister_wiphy:
++	pr_info("konoha_wlan_trace: hdd_wlan_startup cleanup unregister_wiphy errno=%d\n",
++		errno);
+ 	qdf_dp_trace_deinit();
+ 	wiphy_unregister(hdd_ctx->wiphy);
+ 
+ stop_modules:
++	pr_info("konoha_wlan_trace: hdd_wlan_startup cleanup stop_modules errno=%d\n",
++		errno);
+ 	hdd_wlan_stop_modules(hdd_ctx, false);
+ 
+ free_iface_comb:
++	pr_info("konoha_wlan_trace: hdd_wlan_startup cleanup free_iface_comb errno=%d\n",
++		errno);
+ 	wlan_hdd_free_iface_combination_mem(hdd_ctx);
+ 
+ memdump_deinit:
++	pr_info("konoha_wlan_trace: hdd_wlan_startup cleanup memdump_deinit errno=%d fw_down=%d\n",
++		errno, cds_is_fw_down());
+ 	hdd_driver_memdump_deinit();
+ 	osif_request_manager_deinit();
+ 	qdf_nbuf_deinit_replenish_timer();
+@@ -19004,6 +19128,7 @@ memdump_deinit:
+ 
+ 	hdd_exit();
+ 
++	pr_info("konoha_wlan_trace: hdd_wlan_startup exit errno=%d\n", errno);
+ 	return errno;
+ }
+ 
+@@ -20440,10 +20565,13 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
  	hdd_enter();
  
  	id = hdd_validate_wlan_string(user_buf);
-+	pr_info("konoha_wlan_trace: state_write id=%d count=%zu\n",
-+		id, count);
++	pr_info("konoha_wlan_trace: state_write id=%d count=%zu loaded=%d recovering=%d\n",
++		id, count, cds_is_driver_loaded(), cds_is_driver_recovering());
  
  	switch (id) {
  	case WLAN_OFF_STR:
-@@ -20457,6 +20474,7 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
- 		if (!hdd_wlan_soft_driver_load())
+ 		hdd_info("Wifi turning off from UI\n");
++		pr_info("konoha_wlan_trace: state_write off inform_wifi_off\n");
+ 		hdd_inform_wifi_off();
+ 		goto exit;
+ 	case WLAN_ON_STR:
+@@ -20452,65 +20580,98 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
+ 	case WLAN_WAIT_FOR_READY_STR:
+ 		is_wait_for_ready = true;
+ 		hdd_info("Wifi wait for ready from UI\n");
++		pr_info("konoha_wlan_trace: state_write wait_for_ready requested\n");
+ 		break;
+ 	case WLAN_ENABLE_STR:
+ 		hdd_nofl_debug("Received WiFi enable from framework\n");
+-		if (!hdd_wlan_soft_driver_load())
++		ret = hdd_wlan_soft_driver_load();
++		pr_info("konoha_wlan_trace: state_write soft_driver_load ret=%d\n",
++			ret);
++		if (!ret)
  			goto exit;
  		pr_info("Enabling WiFi\n");
 +		pr_info("konoha_wlan_trace: state_write enable after_soft_driver_load\n");
  		break;
  	case WLAN_DISABLE_STR:
  		hdd_nofl_debug("Received WiFi disable from framework\n");
-@@ -20482,10 +20500,18 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
+-		if (!cds_is_driver_loaded())
++		if (!cds_is_driver_loaded()) {
++			pr_info("konoha_wlan_trace: state_write disable ignored_not_loaded\n");
+ 			goto exit;
++		}
+ 
+ 		is_wlan_force_disabled = hdd_get_wlan_driver_status();
++		pr_info("konoha_wlan_trace: state_write disable force_disabled=%d\n",
++			is_wlan_force_disabled);
+ 		if (is_wlan_force_disabled)
+ 			goto exit;
+ 		pr_info("Disabling WiFi\n");
+ 		break;
+ 	case WLAN_FORCE_DISABLE_STR:
+ 		hdd_nofl_debug("Received Force WiFi disable from framework\n");
+-		if (!cds_is_driver_loaded())
++		if (!cds_is_driver_loaded()) {
++			pr_info("konoha_wlan_trace: state_write force_disable ignored_not_loaded\n");
+ 			goto exit;
++		}
+ 
++		pr_info("konoha_wlan_trace: state_write force_disable soft_unload begin\n");
+ 		hdd_wlan_soft_driver_unload();
++		pr_info("konoha_wlan_trace: state_write force_disable soft_unload done\n");
+ 		goto exit;
+ 	default:
+ 		hdd_err_rl("Invalid value received from framework");
++		pr_info("konoha_wlan_trace: state_write invalid ret=%d\n",
++			-EINVAL);
+ 		return -EINVAL;
+ 	}
  
  	hdd_info("is_driver_loaded %d is_driver_recovering %d",
  		 cds_is_driver_loaded(), cds_is_driver_recovering());
@@ -119,23 +784,53 @@ index e3316af..9636191 100644
  		if (!rc) {
  			hdd_err("Driver Loading Timed-out!!");
  			ret = -EINVAL;
-@@ -20500,6 +20526,8 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
++			pr_info("konoha_wlan_trace: state_write wait_timeout ret=%d\n",
++				ret);
+ 			return ret;
+ 		}
+ 	}
+ 
+-	if (is_wait_for_ready)
++	if (is_wait_for_ready) {
++		pr_info("konoha_wlan_trace: state_write wait_ready_done count=%zu\n",
++			count);
+ 		return count;
++	}
+ 	/*
+ 	 * Flush idle shutdown work for cases to synchronize the wifi on
  	 * during the idle shutdown.
  	 */
  	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
-+	pr_info("konoha_wlan_trace: state_write hdd_ctx_present=%d\n",
-+		!!hdd_ctx);
++	pr_info("konoha_wlan_trace: state_write hdd_ctx=%p id=%d\n",
++		hdd_ctx, id);
  	if (hdd_ctx)
  		hdd_psoc_idle_timer_stop(hdd_ctx);
  
-@@ -20520,16 +20548,22 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
+ 	if (id == WLAN_DISABLE_STR) {
+ 		if (!hdd_ctx) {
+ 			hdd_err_rl("hdd_ctx is Null");
++			pr_info("konoha_wlan_trace: state_write disable no_hdd_ctx\n");
  			goto exit;
  		}
  
-+		pr_info("konoha_wlan_trace: state_write enable ctx_is_disabled=%d\n",
-+			hdd_ctx->is_wlan_disabled);
+ 		ret = hdd_disable_wifi(hdd_ctx);
++		pr_info("konoha_wlan_trace: state_write disable ret=%d disabled=%d\n",
++			ret, hdd_ctx->is_wlan_disabled);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -20518,20 +20679,28 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
+ 	if (id == WLAN_ENABLE_STR) {
+ 		if (!hdd_ctx) {
+ 			hdd_err_rl("hdd_ctx is Null");
++			pr_info("konoha_wlan_trace: state_write enable no_hdd_ctx\n");
+ 			goto exit;
+ 		}
+ 
  		if (!hdd_ctx->is_wlan_disabled) {
  			hdd_err_rl("WiFi is already enabled");
++			pr_info("konoha_wlan_trace: state_write enable already_enabled flag=%d\n",
++				hdd_ctx->is_wlan_disabled);
  			goto exit;
  		}
  		hdd_ctx->is_wlan_disabled = false;
@@ -148,7 +843,770 @@ index e3316af..9636191 100644
  		hdd_inform_wifi_on();
 +	}
  exit:
-+	pr_info("konoha_wlan_trace: state_write exit id=%d\n", id);
  	hdd_exit();
++	pr_info("konoha_wlan_trace: state_write exit id=%d count=%zu\n",
++		id, count);
  	return count;
  }
+ 
+@@ -21652,14 +21821,21 @@ static int hdd_register_driver_retry(void)
+ 	int count = 0;
+ 	int errno;
+ 
++	pr_info("konoha_wlan_trace: hdd_register_driver_retry enter max=%d sleep_ms=%d\n",
++		HDD_MAX_PLD_REGISTER_RETRY, HDD_PLD_REGISTER_FAIL_SLEEP_DURATION);
+ 	while (true) {
+ 		errno = wlan_hdd_register_driver();
++		pr_info("konoha_wlan_trace: hdd_register_driver_retry attempt=%d ret=%d\n",
++			count, errno);
+ 		if (errno != -EAGAIN)
+ 			return errno;
+ 		hdd_nofl_info("Retry Platform Driver Registration; errno:%d count:%d",
+ 			      errno, count);
+-		if (++count == HDD_MAX_PLD_REGISTER_RETRY)
++		if (++count == HDD_MAX_PLD_REGISTER_RETRY) {
++			pr_info("konoha_wlan_trace: hdd_register_driver_retry max_retry ret=%d\n",
++				errno);
+ 			return errno;
++		}
+ 		msleep(HDD_PLD_REGISTER_FAIL_SLEEP_DURATION);
+ 		continue;
+ 	}
+@@ -21689,9 +21865,14 @@ int hdd_driver_load(void)
+ 
+ 	pr_info("%s: Loading driver v%s\n", WLAN_MODULE_NAME,
+ 		g_wlan_driver_version);
++	pr_info("konoha_wlan_trace: hdd_driver_load enter module=%s version=%s con_mode=%d loaded=%d recovering=%d\n",
++		WLAN_MODULE_NAME, g_wlan_driver_version, con_mode,
++		cds_is_driver_loaded(), cds_is_driver_recovering());
+ 	hdd_place_marker(NULL, "START LOADING", NULL);
+ 
+ 	status = hdd_qdf_init();
++	pr_info("konoha_wlan_trace: hdd_driver_load hdd_qdf_init status=%d\n",
++		status);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		errno = qdf_status_to_os_return(status);
+ 		goto exit;
+@@ -21700,6 +21881,8 @@ int hdd_driver_load(void)
+ 	osif_sync_init();
+ 
+ 	status = osif_driver_sync_create_and_trans(&driver_sync);
++	pr_info("konoha_wlan_trace: hdd_driver_load sync_create status=%d sync=%p\n",
++		status, QDF_IS_STATUS_SUCCESS(status) ? driver_sync : NULL);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		hdd_err("Failed to init driver sync; status:%u", status);
+ 		errno = qdf_status_to_os_return(status);
+@@ -21707,12 +21890,16 @@ int hdd_driver_load(void)
+ 	}
+ 
+ 	errno = hdd_init();
++	pr_info("konoha_wlan_trace: hdd_driver_load hdd_init ret=%d\n",
++		errno);
+ 	if (errno) {
+ 		hdd_err("Failed to init HDD; errno:%d", errno);
+ 		goto trans_stop;
+ 	}
+ 
+ 	status = hdd_component_cb_init();
++	pr_info("konoha_wlan_trace: hdd_driver_load component_cb_init status=%d\n",
++		status);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		hdd_err("Failed to init component cb; status:%u", status);
+ 		errno = qdf_status_to_os_return(status);
+@@ -21720,6 +21907,8 @@ int hdd_driver_load(void)
+ 	}
+ 
+ 	status = hdd_component_init();
++	pr_info("konoha_wlan_trace: hdd_driver_load component_init status=%d\n",
++		status);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		hdd_err("Failed to init components; status:%u", status);
+ 		errno = qdf_status_to_os_return(status);
+@@ -21727,6 +21916,8 @@ int hdd_driver_load(void)
+ 	}
+ 
+ 	status = qdf_wake_lock_create(&wlan_wake_lock, "wlan");
++	pr_info("konoha_wlan_trace: hdd_driver_load wake_lock_create status=%d\n",
++		status);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		hdd_err("Failed to create wake lock; status:%u", status);
+ 		errno = qdf_status_to_os_return(status);
+@@ -21736,6 +21927,8 @@ int hdd_driver_load(void)
+ 	hdd_set_conparam(con_mode);
+ 
+ 	errno = pld_init();
++	pr_info("konoha_wlan_trace: hdd_driver_load pld_init ret=%d\n",
++		errno);
+ 	if (errno) {
+ 		hdd_err("Failed to init PLD; errno:%d", errno);
+ 		goto wakelock_destroy;
+@@ -21743,6 +21936,8 @@ int hdd_driver_load(void)
+ 
+ 	/* driver mode pass to cnss2 platform driver*/
+ 	errno = pld_set_mode(con_mode);
++	pr_info("konoha_wlan_trace: hdd_driver_load pld_set_mode ret=%d mode=%d\n",
++		errno, con_mode);
+ 	if (errno)
+ 		hdd_err("Failed to set mode in PLD; errno:%d", errno);
+ 
+@@ -21753,6 +21948,8 @@ int hdd_driver_load(void)
+ 
+ 	/* psoc probe can happen in registration; do after 'load' transition */
+ 	errno = hdd_register_driver_retry();
++	pr_info("konoha_wlan_trace: hdd_driver_load register_driver_retry ret=%d\n",
++		errno);
+ 	if (errno) {
+ 		hdd_err("Failed to register driver; errno:%d", errno);
+ 		goto pld_deinit;
+@@ -21764,10 +21961,14 @@ int hdd_driver_load(void)
+ 	 * calling wlan_hdd_state_ctrl_param_create().
+ 	 */
+ 	soft_load = hdd_get_wlan_driver_status();
++	pr_info("konoha_wlan_trace: hdd_driver_load soft_load=%d\n",
++		soft_load);
+ 	if (soft_load)
+ 		goto out;
+ 
+ 	errno = wlan_hdd_state_ctrl_param_create();
++	pr_info("konoha_wlan_trace: hdd_driver_load state_ctrl_create ret=%d\n",
++		errno);
+ 	if (errno) {
+ 		hdd_err("Failed to create ctrl param; errno:%d", errno);
+ 		goto unregister_driver;
+@@ -21776,12 +21977,18 @@ int hdd_driver_load(void)
+ out:
+ 	hdd_debug("%s: driver loaded", WLAN_MODULE_NAME);
+ 	hdd_place_marker(NULL, "DRIVER LOADED", NULL);
++	pr_info("konoha_wlan_trace: hdd_driver_load success loaded=%d recovering=%d\n",
++		cds_is_driver_loaded(), cds_is_driver_recovering());
+ 
+ 	return 0;
+ 
+ unregister_driver:
++	pr_info("konoha_wlan_trace: hdd_driver_load cleanup unregister_driver errno=%d\n",
++		errno);
+ 	wlan_hdd_unregister_driver();
+ pld_deinit:
++	pr_info("konoha_wlan_trace: hdd_driver_load cleanup pld_deinit errno=%d\n",
++		errno);
+ 	status = osif_driver_sync_trans_start(&driver_sync);
+ 	QDF_BUG(QDF_IS_STATUS_SUCCESS(status));
+ 
+@@ -21797,23 +22004,37 @@ pld_deinit:
+ 	while (qdf_atomic_read(&wlan_hdd_state_fops_ref))
+ 		;
+ wakelock_destroy:
++	pr_info("konoha_wlan_trace: hdd_driver_load cleanup wakelock_destroy errno=%d\n",
++		errno);
+ 	qdf_wake_lock_destroy(&wlan_wake_lock);
+ comp_deinit:
++	pr_info("konoha_wlan_trace: hdd_driver_load cleanup comp_deinit errno=%d\n",
++		errno);
+ 	hdd_component_deinit();
+ comp_cb_deinit:
++	pr_info("konoha_wlan_trace: hdd_driver_load cleanup comp_cb_deinit errno=%d\n",
++		errno);
+ 	hdd_component_cb_deinit();
+ hdd_deinit:
++	pr_info("konoha_wlan_trace: hdd_driver_load cleanup hdd_deinit errno=%d\n",
++		errno);
+ 	hdd_deinit();
+ trans_stop:
++	pr_info("konoha_wlan_trace: hdd_driver_load cleanup trans_stop errno=%d sync=%p\n",
++		errno, driver_sync);
+ 	if (driver_sync) {
+ 		osif_driver_sync_trans_stop(driver_sync);
+ 		osif_driver_sync_destroy(driver_sync);
+ 	}
+ sync_deinit:
++	pr_info("konoha_wlan_trace: hdd_driver_load cleanup sync_deinit errno=%d\n",
++		errno);
+ 	osif_sync_deinit();
+ 	hdd_qdf_deinit();
+ 
+ exit:
++	pr_info("konoha_wlan_trace: hdd_driver_load exit errno=%d loaded=%d recovering=%d\n",
++		errno, cds_is_driver_loaded(), cds_is_driver_recovering());
+ 	return errno;
+ }
+ 
+@@ -22080,12 +22301,19 @@ static int wlan_deinit_sysfs(void)
+ #ifdef FEATURE_WLAN_RESIDENT_DRIVER
+ static int hdd_module_init(void)
+ {
++	pr_info("konoha_wlan_trace: hdd_module_init resident_driver noop\n");
+ 	return 0;
+ }
+ #else
+ static int hdd_module_init(void)
+ {
+-	if (hdd_driver_load())
++	int ret;
++
++	pr_info("konoha_wlan_trace: hdd_module_init module enter\n");
++	ret = hdd_driver_load();
++	pr_info("konoha_wlan_trace: hdd_module_init hdd_driver_load ret=%d\n",
++		ret);
++	if (ret)
+ 		return -EINVAL;
+ 
+ 	return 0;
+@@ -22096,7 +22324,10 @@ static int __init hdd_module_init(void)
+ {
+ 	int ret = -EINVAL;
+ 
++	pr_info("konoha_wlan_trace: hdd_module_init builtin enter\n");
+ 	ret = wlan_init_sysfs();
++	pr_info("konoha_wlan_trace: hdd_module_init builtin wlan_init_sysfs ret=%d\n",
++		ret);
+ 	if (ret)
+ 		hdd_err("Failed to create sysfs entry");
+ 
+diff --git a/qcacld-3.0/core/pld/src/pld_common.c b/qcacld-3.0/core/pld/src/pld_common.c
+index 7d48693..c3a984d 100644
+--- a/qcacld-3.0/core/pld/src/pld_common.c
++++ b/qcacld-3.0/core/pld/src/pld_common.c
+@@ -242,17 +242,26 @@ int pld_register_driver(struct pld_driver_ops *ops)
+ 	int ret = 0;
+ 	struct pld_context *pld_context;
+ 
++	pr_info("konoha_wlan_trace: pld_register_driver enter ops=%p probe=%p remove=%p suspend=%p resume=%p\n",
++		ops, ops ? ops->probe : NULL, ops ? ops->remove : NULL,
++		ops ? ops->suspend : NULL, ops ? ops->resume : NULL);
+ 	pld_context = pld_get_global_context();
++	pr_info("konoha_wlan_trace: pld_register_driver global_context=%p\n",
++		pld_context);
+ 
+ 	if (!pld_context) {
+ 		pr_err("global context is NULL\n");
+ 		ret = -ENODEV;
++		pr_info("konoha_wlan_trace: pld_register_driver no_context ret=%d\n",
++			ret);
+ 		goto out;
+ 	}
+ 
+ 	if (pld_context->ops) {
+ 		pr_err("driver already registered\n");
+ 		ret = -EEXIST;
++		pr_info("konoha_wlan_trace: pld_register_driver already_registered old_ops=%p ret=%d\n",
++			pld_context->ops, ret);
+ 		goto out;
+ 	}
+ 
+@@ -260,79 +269,132 @@ int pld_register_driver(struct pld_driver_ops *ops)
+ 	    !ops->suspend || !ops->resume) {
+ 		pr_err("Required callback functions are missing\n");
+ 		ret = -EINVAL;
++		pr_info("konoha_wlan_trace: pld_register_driver missing_callbacks ret=%d\n",
++			ret);
+ 		goto out;
+ 	}
+ 
+ 	pld_context->ops = ops;
+ 	pld_context->pld_driver_state = 0;
++	pr_info("konoha_wlan_trace: pld_register_driver context_ops_set state=0\n");
+ 
++	pr_info("konoha_wlan_trace: pld_register_driver pcie_register begin\n");
+ 	ret = pld_pcie_register_driver();
++	pr_info("konoha_wlan_trace: pld_register_driver pcie_register ret=%d\n",
++		ret);
+ 	if (ret) {
+ 		pld_err_rl("Fail to register pcie driver\n");
+ 		goto fail_pcie;
+ 	}
+ 	pld_context->pld_driver_state |= PLD_PCIE_REGISTERED;
++	pr_info("konoha_wlan_trace: pld_register_driver state_after_pcie=0x%x\n",
++		pld_context->pld_driver_state);
+ 
++	pr_info("konoha_wlan_trace: pld_register_driver snoc_register begin\n");
+ 	ret = pld_snoc_register_driver();
++	pr_info("konoha_wlan_trace: pld_register_driver snoc_register ret=%d\n",
++		ret);
+ 	if (ret) {
+ 		pld_err_rl("Fail to register snoc driver\n");
+ 		goto fail_snoc;
+ 	}
+ 	pld_context->pld_driver_state |= PLD_SNOC_REGISTERED;
++	pr_info("konoha_wlan_trace: pld_register_driver state_after_snoc=0x%x\n",
++		pld_context->pld_driver_state);
+ 
++	pr_info("konoha_wlan_trace: pld_register_driver sdio_register begin\n");
+ 	ret = pld_sdio_register_driver();
++	pr_info("konoha_wlan_trace: pld_register_driver sdio_register ret=%d\n",
++		ret);
+ 	if (ret) {
+ 		pr_err("Fail to register sdio driver\n");
+ 		goto fail_sdio;
+ 	}
+ 	pld_context->pld_driver_state |= PLD_SDIO_REGISTERED;
++	pr_info("konoha_wlan_trace: pld_register_driver state_after_sdio=0x%x\n",
++		pld_context->pld_driver_state);
+ 
++	pr_info("konoha_wlan_trace: pld_register_driver snoc_fw_sim_register begin\n");
+ 	ret = pld_snoc_fw_sim_register_driver();
++	pr_info("konoha_wlan_trace: pld_register_driver snoc_fw_sim_register ret=%d\n",
++		ret);
+ 	if (ret) {
+ 		pr_err("Fail to register snoc fw sim driver\n");
+ 		goto fail_snoc_fw_sim;
+ 	}
+ 	pld_context->pld_driver_state |= PLD_SNOC_FW_SIM_REGISTERED;
++	pr_info("konoha_wlan_trace: pld_register_driver state_after_snoc_fw_sim=0x%x\n",
++		pld_context->pld_driver_state);
+ 
++	pr_info("konoha_wlan_trace: pld_register_driver pcie_fw_sim_register begin\n");
+ 	ret = pld_pcie_fw_sim_register_driver();
++	pr_info("konoha_wlan_trace: pld_register_driver pcie_fw_sim_register ret=%d\n",
++		ret);
+ 	if (ret) {
+ 		pr_err("Fail to register pcie fw sim driver\n");
+ 		goto fail_pcie_fw_sim;
+ 	}
+ 	pld_context->pld_driver_state |= PLD_PCIE_FW_SIM_REGISTERED;
++	pr_info("konoha_wlan_trace: pld_register_driver state_after_pcie_fw_sim=0x%x\n",
++		pld_context->pld_driver_state);
+ 
++	pr_info("konoha_wlan_trace: pld_register_driver usb_register begin\n");
+ 	ret = pld_usb_register_driver();
++	pr_info("konoha_wlan_trace: pld_register_driver usb_register ret=%d\n",
++		ret);
+ 	if (ret) {
+ 		pr_err("Fail to register usb driver\n");
+ 		goto fail_usb;
+ 	}
+ 	pld_context->pld_driver_state |= PLD_USB_REGISTERED;
++	pr_info("konoha_wlan_trace: pld_register_driver state_after_usb=0x%x\n",
++		pld_context->pld_driver_state);
+ 
++	pr_info("konoha_wlan_trace: pld_register_driver ipci_register begin\n");
+ 	ret = pld_ipci_register_driver();
++	pr_info("konoha_wlan_trace: pld_register_driver ipci_register ret=%d\n",
++		ret);
+ 	if (ret) {
+ 		pld_err_rl("Fail to register ipci driver\n");
+ 		goto fail_ipci;
+ 	}
+ 	pld_context->pld_driver_state |= PLD_IPCI_REGISTERED;
++	pr_info("konoha_wlan_trace: pld_register_driver success state=0x%x ret=%d\n",
++		pld_context->pld_driver_state, ret);
+ 
+ 	return ret;
+ 
+ fail_ipci:
++	pr_info("konoha_wlan_trace: pld_register_driver fail_ipci ret=%d state=0x%x\n",
++		ret, pld_context->pld_driver_state);
+ 	pld_usb_unregister_driver();
+ fail_usb:
++	pr_info("konoha_wlan_trace: pld_register_driver fail_usb ret=%d state=0x%x\n",
++		ret, pld_context->pld_driver_state);
+ 	pld_pcie_fw_sim_unregister_driver();
+ fail_pcie_fw_sim:
++	pr_info("konoha_wlan_trace: pld_register_driver fail_pcie_fw_sim ret=%d state=0x%x\n",
++		ret, pld_context->pld_driver_state);
+ 	pld_snoc_fw_sim_unregister_driver();
+ fail_snoc_fw_sim:
++	pr_info("konoha_wlan_trace: pld_register_driver fail_snoc_fw_sim ret=%d state=0x%x\n",
++		ret, pld_context->pld_driver_state);
+ 	pld_sdio_unregister_driver();
+ fail_sdio:
++	pr_info("konoha_wlan_trace: pld_register_driver fail_sdio ret=%d state=0x%x\n",
++		ret, pld_context->pld_driver_state);
+ 	pld_snoc_unregister_driver();
+ fail_snoc:
++	pr_info("konoha_wlan_trace: pld_register_driver fail_snoc ret=%d state=0x%x\n",
++		ret, pld_context->pld_driver_state);
+ 	pld_pcie_unregister_driver();
+ fail_pcie:
++	pr_info("konoha_wlan_trace: pld_register_driver fail_pcie ret=%d state=0x%x\n",
++		ret, pld_context ? pld_context->pld_driver_state : 0U);
+ 	pld_context->pld_driver_state = 0;
+ 	pld_context->ops = NULL;
+ out:
++	pr_info("konoha_wlan_trace: pld_register_driver exit ret=%d\n", ret);
+ 	return ret;
+ }
+ 
+@@ -340,6 +402,7 @@ void pld_unregister_driver(void)
+ {
+ 	struct pld_context *pld_context;
+ 
++	pr_info("konoha_wlan_trace: pld_unregister_driver enter\n");
+ 	pld_context = pld_get_global_context();
+ 
+ 	if (!pld_context) {
+diff --git a/qcacld-3.0/core/pld/src/pld_ipci.c b/qcacld-3.0/core/pld/src/pld_ipci.c
+index c0dd805..d5edccd 100644
+--- a/qcacld-3.0/core/pld/src/pld_ipci.c
++++ b/qcacld-3.0/core/pld/src/pld_ipci.c
+@@ -53,20 +53,30 @@ static int pld_ipci_probe(struct device *dev)
+ 	struct pld_context *pld_context;
+ 	int ret = 0;
+ 
++	pr_info("konoha_wlan_trace: pld_ipci_probe enter dev=%p\n", dev);
+ 	pld_context = pld_get_global_context();
++	pr_info("konoha_wlan_trace: pld_ipci_probe global_context=%p ops=%p\n",
++		pld_context, pld_context ? pld_context->ops : NULL);
+ 	if (!pld_context) {
+ 		ret = -ENODEV;
+ 		goto out;
+ 	}
+ 
+ 	ret = pld_add_dev(pld_context, dev, NULL, PLD_BUS_TYPE_IPCI);
++	pr_info("konoha_wlan_trace: pld_ipci_probe pld_add_dev ret=%d\n",
++		ret);
+ 	if (ret)
+ 		goto out;
+ 
+-	return pld_context->ops->probe(dev, PLD_BUS_TYPE_IPCI,
+-				       NULL, NULL);
++	pr_info("konoha_wlan_trace: pld_ipci_probe calling ops->probe=%p\n",
++		pld_context->ops->probe);
++	ret = pld_context->ops->probe(dev, PLD_BUS_TYPE_IPCI, NULL, NULL);
++	pr_info("konoha_wlan_trace: pld_ipci_probe ops_probe ret=%d\n",
++		ret);
++	return ret;
+ 
+ out:
++	pr_info("konoha_wlan_trace: pld_ipci_probe exit ret=%d\n", ret);
+ 	return ret;
+ }
+ 
+@@ -85,7 +95,10 @@ static void pld_ipci_remove(struct device *dev)
+ 	int errno;
+ 	struct osif_psoc_sync *psoc_sync;
+ 
++	pr_info("konoha_wlan_trace: pld_ipci_remove enter dev=%p\n", dev);
+ 	errno = osif_psoc_sync_trans_start_wait(dev, &psoc_sync);
++	pr_info("konoha_wlan_trace: pld_ipci_remove sync_start ret=%d sync=%p\n",
++		errno, errno ? NULL : psoc_sync);
+ 	if (errno)
+ 		return;
+ 
+@@ -93,6 +106,8 @@ static void pld_ipci_remove(struct device *dev)
+ 	osif_psoc_sync_wait_for_ops(psoc_sync);
+ 
+ 	pld_context = pld_get_global_context();
++	pr_info("konoha_wlan_trace: pld_ipci_remove global_context=%p ops=%p\n",
++		pld_context, pld_context ? pld_context->ops : NULL);
+ 
+ 	if (!pld_context)
+ 		goto out;
+@@ -104,6 +119,7 @@ static void pld_ipci_remove(struct device *dev)
+ out:
+ 	osif_psoc_sync_trans_stop(psoc_sync);
+ 	osif_psoc_sync_destroy(psoc_sync);
++	pr_info("konoha_wlan_trace: pld_ipci_remove exit\n");
+ }
+ 
+ /**
+@@ -118,12 +134,22 @@ out:
+ static int pld_ipci_reinit(struct device *dev)
+ {
+ 	struct pld_context *pld_context;
++	int ret;
+ 
++	pr_info("konoha_wlan_trace: pld_ipci_reinit enter dev=%p\n", dev);
+ 	pld_context = pld_get_global_context();
+-	if (pld_context->ops->reinit)
+-		return pld_context->ops->reinit(dev, PLD_BUS_TYPE_IPCI,
+-						NULL, NULL);
++	pr_info("konoha_wlan_trace: pld_ipci_reinit global_context=%p ops=%p\n",
++		pld_context, pld_context ? pld_context->ops : NULL);
++	if (pld_context && pld_context->ops->reinit) {
++		ret = pld_context->ops->reinit(dev, PLD_BUS_TYPE_IPCI,
++					       NULL, NULL);
++		pr_info("konoha_wlan_trace: pld_ipci_reinit ops_ret=%d\n",
++			ret);
++		return ret;
++	}
+ 
++	pr_info("konoha_wlan_trace: pld_ipci_reinit no_reinit ret=%d\n",
++		-ENODEV);
+ 	return -ENODEV;
+ }
+ 
+@@ -139,9 +165,12 @@ static void pld_ipci_shutdown(struct device *dev)
+ {
+ 	struct pld_context *pld_context;
+ 
++	pr_info("konoha_wlan_trace: pld_ipci_shutdown enter dev=%p\n", dev);
+ 	pld_context = pld_get_global_context();
+-	if (pld_context->ops->shutdown)
++	if (pld_context && pld_context->ops->shutdown)
+ 		pld_context->ops->shutdown(dev, PLD_BUS_TYPE_IPCI);
++	pr_info("konoha_wlan_trace: pld_ipci_shutdown exit context=%p\n",
++		pld_context);
+ }
+ 
+ /**
+@@ -547,12 +576,28 @@ struct icnss_driver_ops pld_ipci_ops = {
+ 
+ int pld_ipci_register_driver(void)
+ {
+-	return icnss_register_driver(&pld_ipci_ops);
++	int ret;
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0))
++	void *trace_dev_info = pld_ipci_ops.dev_info;
++#else
++	void *trace_dev_info = NULL;
++#endif
++
++	pr_info("konoha_wlan_trace: pld_ipci_register_driver enter ops=%p name=%s probe=%p dev_info=%p\n",
++		&pld_ipci_ops, pld_ipci_ops.name, pld_ipci_ops.probe,
++		trace_dev_info);
++	ret = icnss_register_driver(&pld_ipci_ops);
++	pr_info("konoha_wlan_trace: pld_ipci_register_driver icnss_register ret=%d\n",
++		ret);
++	return ret;
+ }
+ 
+ void pld_ipci_unregister_driver(void)
+ {
++	pr_info("konoha_wlan_trace: pld_ipci_unregister_driver enter ops=%p\n",
++		&pld_ipci_ops);
+ 	icnss_unregister_driver(&pld_ipci_ops);
++	pr_info("konoha_wlan_trace: pld_ipci_unregister_driver exit\n");
+ }
+ 
+ #ifdef CONFIG_SHADOW_V3
+@@ -577,9 +622,14 @@ int pld_ipci_wlan_enable(struct device *dev, struct pld_wlan_enable_cfg *config,
+ {
+ 	struct icnss_wlan_enable_cfg cfg;
+ 	enum icnss_driver_mode icnss_mode;
++	int ret;
+ 
+-	if (!dev)
++	pr_info("konoha_wlan_trace: pld_ipci_wlan_enable enter dev=%p mode=%d host_version=%s cfg=%p\n",
++		dev, mode, host_version ? host_version : "(null)", config);
++	if (!dev) {
++		pr_info("konoha_wlan_trace: pld_ipci_wlan_enable no_dev\n");
+ 		return -ENODEV;
++	}
+ 
+ 	cfg.num_ce_tgt_cfg = config->num_ce_tgt_cfg;
+ 	cfg.ce_tgt_cfg = (struct ce_tgt_pipe_cfg *)
+@@ -615,15 +665,30 @@ int pld_ipci_wlan_enable(struct device *dev, struct pld_wlan_enable_cfg *config,
+ 		break;
+ 	}
+ 
+-	return icnss_wlan_enable(dev, &cfg, icnss_mode, host_version);
++	pr_info("konoha_wlan_trace: pld_ipci_wlan_enable icnss_wlan_enable begin icnss_mode=%d ce=%u svc=%u shadow=%u shadow_v2=%u rri_valid=%u\n",
++		icnss_mode, cfg.num_ce_tgt_cfg, cfg.num_ce_svc_pipe_cfg,
++		cfg.num_shadow_reg_cfg, cfg.num_shadow_reg_v2_cfg,
++		cfg.rri_over_ddr_cfg_valid);
++	ret = icnss_wlan_enable(dev, &cfg, icnss_mode, host_version);
++	pr_info("konoha_wlan_trace: pld_ipci_wlan_enable icnss_wlan_enable ret=%d\n",
++		ret);
++	return ret;
+ }
+ 
+ int pld_ipci_wlan_disable(struct device *dev, enum pld_driver_mode mode)
+ {
+-	if (!dev)
++	int ret;
++
++	pr_info("konoha_wlan_trace: pld_ipci_wlan_disable enter dev=%p mode=%d\n",
++		dev, mode);
++	if (!dev) {
++		pr_info("konoha_wlan_trace: pld_ipci_wlan_disable no_dev\n");
+ 		return -ENODEV;
++	}
+ 
+-	return icnss_wlan_disable(dev, ICNSS_OFF);
++	ret = icnss_wlan_disable(dev, ICNSS_OFF);
++	pr_info("konoha_wlan_trace: pld_ipci_wlan_disable ret=%d\n", ret);
++	return ret;
+ }
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0))
+diff --git a/qcacld-3.0/core/pld/src/pld_snoc.c b/qcacld-3.0/core/pld/src/pld_snoc.c
+index a2f4ea3..40742bf 100644
+--- a/qcacld-3.0/core/pld/src/pld_snoc.c
++++ b/qcacld-3.0/core/pld/src/pld_snoc.c
+@@ -100,20 +100,29 @@ static int pld_snoc_probe(struct device *dev)
+ 	struct pld_context *pld_context;
+ 	int ret = 0;
+ 
++	pr_info("konoha_wlan_trace: pld_snoc_probe enter dev=%p\n", dev);
+ 	pld_context = pld_get_global_context();
++	pr_info("konoha_wlan_trace: pld_snoc_probe global_context=%p ops=%p\n",
++		pld_context, pld_context ? pld_context->ops : NULL);
+ 	if (!pld_context) {
+ 		ret = -ENODEV;
+ 		goto out;
+ 	}
+ 
+ 	ret = pld_add_dev(pld_context, dev, NULL, PLD_BUS_TYPE_SNOC);
++	pr_info("konoha_wlan_trace: pld_snoc_probe pld_add_dev ret=%d\n",
++		ret);
+ 	if (ret)
+ 		goto out;
+ 
+-	return pld_context->ops->probe(dev, PLD_BUS_TYPE_SNOC,
+-				       NULL, NULL);
++	pr_info("konoha_wlan_trace: pld_snoc_probe calling ops->probe=%p\n",
++		pld_context->ops->probe);
++	ret = pld_context->ops->probe(dev, PLD_BUS_TYPE_SNOC, NULL, NULL);
++	pr_info("konoha_wlan_trace: pld_snoc_probe ops_probe ret=%d\n", ret);
++	return ret;
+ 
+ out:
++	pr_info("konoha_wlan_trace: pld_snoc_probe exit ret=%d\n", ret);
+ 	return ret;
+ }
+ 
+@@ -132,7 +141,10 @@ static void pld_snoc_remove(struct device *dev)
+ 	int errno;
+ 	struct osif_psoc_sync *psoc_sync;
+ 
++	pr_info("konoha_wlan_trace: pld_snoc_remove enter dev=%p\n", dev);
+ 	errno = osif_psoc_sync_trans_start_wait(dev, &psoc_sync);
++	pr_info("konoha_wlan_trace: pld_snoc_remove sync_start ret=%d sync=%p\n",
++		errno, errno ? NULL : psoc_sync);
+ 	if (errno)
+ 		return;
+ 
+@@ -140,6 +152,8 @@ static void pld_snoc_remove(struct device *dev)
+ 	osif_psoc_sync_wait_for_ops(psoc_sync);
+ 
+ 	pld_context = pld_get_global_context();
++	pr_info("konoha_wlan_trace: pld_snoc_remove global_context=%p ops=%p\n",
++		pld_context, pld_context ? pld_context->ops : NULL);
+ 
+ 	if (!pld_context)
+ 		goto out;
+@@ -151,6 +165,7 @@ static void pld_snoc_remove(struct device *dev)
+ out:
+ 	osif_psoc_sync_trans_stop(psoc_sync);
+ 	osif_psoc_sync_destroy(psoc_sync);
++	pr_info("konoha_wlan_trace: pld_snoc_remove exit\n");
+ }
+ 
+ /**
+@@ -165,12 +180,22 @@ out:
+ static int pld_snoc_reinit(struct device *dev)
+ {
+ 	struct pld_context *pld_context;
++	int ret;
+ 
++	pr_info("konoha_wlan_trace: pld_snoc_reinit enter dev=%p\n", dev);
+ 	pld_context = pld_get_global_context();
+-	if (pld_context->ops->reinit)
+-		return pld_context->ops->reinit(dev, PLD_BUS_TYPE_SNOC,
+-						NULL, NULL);
++	pr_info("konoha_wlan_trace: pld_snoc_reinit global_context=%p ops=%p\n",
++		pld_context, pld_context ? pld_context->ops : NULL);
++	if (pld_context && pld_context->ops->reinit) {
++		ret = pld_context->ops->reinit(dev, PLD_BUS_TYPE_SNOC,
++					       NULL, NULL);
++		pr_info("konoha_wlan_trace: pld_snoc_reinit ops_ret=%d\n",
++			ret);
++		return ret;
++	}
+ 
++	pr_info("konoha_wlan_trace: pld_snoc_reinit no_reinit ret=%d\n",
++		-ENODEV);
+ 	return -ENODEV;
+ }
+ 
+@@ -186,9 +211,12 @@ static void pld_snoc_shutdown(struct device *dev)
+ {
+ 	struct pld_context *pld_context;
+ 
++	pr_info("konoha_wlan_trace: pld_snoc_shutdown enter dev=%p\n", dev);
+ 	pld_context = pld_get_global_context();
+-	if (pld_context->ops->shutdown)
++	if (pld_context && pld_context->ops->shutdown)
+ 		pld_context->ops->shutdown(dev, PLD_BUS_TYPE_SNOC);
++	pr_info("konoha_wlan_trace: pld_snoc_shutdown exit context=%p\n",
++		pld_context);
+ }
+ 
+ /**
+@@ -425,12 +453,28 @@ struct icnss_driver_ops pld_snoc_ops = {
+ 
+ int pld_snoc_register_driver(void)
+ {
+-	return icnss_register_driver(&pld_snoc_ops);
++	int ret;
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0))
++	void *trace_dev_info = pld_snoc_ops.dev_info;
++#else
++	void *trace_dev_info = NULL;
++#endif
++
++	pr_info("konoha_wlan_trace: pld_snoc_register_driver enter ops=%p name=%s probe=%p dev_info=%p\n",
++		&pld_snoc_ops, pld_snoc_ops.name, pld_snoc_ops.probe,
++		trace_dev_info);
++	ret = icnss_register_driver(&pld_snoc_ops);
++	pr_info("konoha_wlan_trace: pld_snoc_register_driver icnss_register ret=%d\n",
++		ret);
++	return ret;
+ }
+ 
+ void pld_snoc_unregister_driver(void)
+ {
++	pr_info("konoha_wlan_trace: pld_snoc_unregister_driver enter ops=%p\n",
++		&pld_snoc_ops);
+ 	icnss_unregister_driver(&pld_snoc_ops);
++	pr_info("konoha_wlan_trace: pld_snoc_unregister_driver exit\n");
+ }
+ 
+ int pld_snoc_wlan_enable(struct device *dev, struct pld_wlan_enable_cfg *config,
+@@ -438,9 +482,14 @@ int pld_snoc_wlan_enable(struct device *dev, struct pld_wlan_enable_cfg *config,
+ {
+ 	struct icnss_wlan_enable_cfg cfg;
+ 	enum icnss_driver_mode icnss_mode;
++	int ret;
+ 
+-	if (!dev)
++	pr_info("konoha_wlan_trace: pld_snoc_wlan_enable enter dev=%p mode=%d host_version=%s cfg=%p\n",
++		dev, mode, host_version ? host_version : "(null)", config);
++	if (!dev) {
++		pr_info("konoha_wlan_trace: pld_snoc_wlan_enable no_dev\n");
+ 		return -ENODEV;
++	}
+ 
+ 	cfg.num_ce_tgt_cfg = config->num_ce_tgt_cfg;
+ 	cfg.ce_tgt_cfg = (struct ce_tgt_pipe_cfg *)
+@@ -451,6 +500,9 @@ int pld_snoc_wlan_enable(struct device *dev, struct pld_wlan_enable_cfg *config,
+ 	cfg.num_shadow_reg_cfg = config->num_shadow_reg_cfg;
+ 	cfg.shadow_reg_cfg = (struct icnss_shadow_reg_cfg *)
+ 		config->shadow_reg_cfg;
++	pr_info("konoha_wlan_trace: pld_snoc_wlan_enable cfg ce_tgt=%u ce_svc=%u shadow=%u\n",
++		cfg.num_ce_tgt_cfg, cfg.num_ce_svc_pipe_cfg,
++		cfg.num_shadow_reg_cfg);
+ 
+ 	switch (mode) {
+ 	case PLD_FTM:
+@@ -464,15 +516,27 @@ int pld_snoc_wlan_enable(struct device *dev, struct pld_wlan_enable_cfg *config,
+ 		break;
+ 	}
+ 
+-	return icnss_wlan_enable(dev, &cfg, icnss_mode, host_version);
++	pr_info("konoha_wlan_trace: pld_snoc_wlan_enable icnss_mode=%d begin\n",
++		icnss_mode);
++	ret = icnss_wlan_enable(dev, &cfg, icnss_mode, host_version);
++	pr_info("konoha_wlan_trace: pld_snoc_wlan_enable ret=%d\n", ret);
++	return ret;
+ }
+ 
+ int pld_snoc_wlan_disable(struct device *dev, enum pld_driver_mode mode)
+ {
+-	if (!dev)
++	int ret;
++
++	pr_info("konoha_wlan_trace: pld_snoc_wlan_disable enter dev=%p mode=%d\n",
++		dev, mode);
++	if (!dev) {
++		pr_info("konoha_wlan_trace: pld_snoc_wlan_disable no_dev\n");
+ 		return -ENODEV;
++	}
+ 
+-	return icnss_wlan_disable(dev, ICNSS_OFF);
++	ret = icnss_wlan_disable(dev, ICNSS_OFF);
++	pr_info("konoha_wlan_trace: pld_snoc_wlan_disable ret=%d\n", ret);
++	return ret;
+ }
+ 
+ int pld_snoc_get_soc_info(struct device *dev, struct pld_soc_info *info)
