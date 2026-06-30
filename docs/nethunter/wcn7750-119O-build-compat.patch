@@ -101,11 +101,6 @@ index 06134a51..619a1b4d 100644
  CONFIG_WLAN_PDEV_VDEV_SEND_MULTI_PARAM=y
  CONFIG_WLAN_PMO_ENABLE=y
  CONFIG_WLAN_POLICY_MGR_ENABLE=y
-@@ -402,3 +407,4 @@ CONFIG_FEATURE_MGMT_RX_OVER_SRNG=y
- CONFIG_FEATURE_MGMT_RX_OVER_SRNG=y
- CONFIG_WLAN_CHIPSET_STATS=y
- CONFIG_WLAN_CHIPSET_LOG_MAX_SIZE=y
-+CONFIG_WLAN_DYNAMIC_ARP_NS_OFFLOAD=y
 diff --git a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c b/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
 index cb044784..145b6f4b 100644
 --- a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
@@ -145,18 +140,16 @@ diff --git a/qcacld-3.0/Kbuild b/qcacld-3.0/Kbuild
 diff --git a/qcacld-3.0/components/pmo/core/inc/wlan_pmo_ns.h b/qcacld-3.0/components/pmo/core/inc/wlan_pmo_ns.h
 --- a/qcacld-3.0/components/pmo/core/inc/wlan_pmo_ns.h
 +++ b/qcacld-3.0/components/pmo/core/inc/wlan_pmo_ns.h
-@@ -93,6 +93,15 @@ QDF_STATUS
+@@ -93,6 +93,13 @@ QDF_STATUS
  pmo_core_get_ns_offload_params(struct wlan_objmgr_vdev *vdev,
  			       struct pmo_ns_offload_params *params);
  
-+#ifdef FEATURE_WLAN_DYNAMIC_ARP_NS_OFFLOAD
 +bool pmo_core_get_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev);
 +
 +void
 +pmo_core_set_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev,
 +				       enum pmo_offload_trigger trigger,
 +				       bool enable);
-+#endif
 +
  #endif /* WLAN_POWER_MANAGEMENT_OFFLOAD */
  
@@ -164,11 +157,10 @@ diff --git a/qcacld-3.0/components/pmo/core/inc/wlan_pmo_ns.h b/qcacld-3.0/compo
 diff --git a/qcacld-3.0/components/pmo/core/src/wlan_pmo_ns.c b/qcacld-3.0/components/pmo/core/src/wlan_pmo_ns.c
 --- a/qcacld-3.0/components/pmo/core/src/wlan_pmo_ns.c
 +++ b/qcacld-3.0/components/pmo/core/src/wlan_pmo_ns.c
-@@ -254,6 +254,67 @@ static QDF_STATUS pmo_core_ns_offload_sanity(struct wlan_objmgr_vdev *vdev)
+@@ -254,6 +254,65 @@ static QDF_STATUS pmo_core_ns_offload_sanity(struct wlan_objmgr_vdev *vdev)
  	return QDF_STATUS_SUCCESS;
  }
  
-+#ifdef FEATURE_WLAN_DYNAMIC_ARP_NS_OFFLOAD
 +bool pmo_core_get_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev)
 +{
 +	QDF_STATUS status;
@@ -227,7 +219,6 @@ diff --git a/qcacld-3.0/components/pmo/core/src/wlan_pmo_ns.c b/qcacld-3.0/compo
 +
 +	wlan_objmgr_vdev_release_ref(vdev, WLAN_PMO_ID);
 +}
-+#endif
 +
  QDF_STATUS pmo_core_ns_check_offload(struct wlan_objmgr_psoc *psoc,
  				     enum pmo_offload_trigger trigger,
@@ -235,11 +226,10 @@ diff --git a/qcacld-3.0/components/pmo/core/src/wlan_pmo_ns.c b/qcacld-3.0/compo
 diff --git a/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_ucfg_api.h b/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_ucfg_api.h
 --- a/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_ucfg_api.h
 +++ b/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_ucfg_api.h
-@@ -627,6 +627,14 @@ ucfg_pmo_dynamic_arp_ns_offload_runtime_prevent(struct wlan_objmgr_vdev *vdev);
-  */
- void
- ucfg_pmo_dynamic_arp_ns_offload_runtime_allow(struct wlan_objmgr_vdev *vdev);
-+
+@@ -656,6 +656,14 @@ static inline void
+ ucfg_pmo_dynamic_arp_ns_offload_runtime_allow(struct wlan_objmgr_vdev *vdev) {}
+ #endif
+ 
 +bool
 +ucfg_pmo_get_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev);
 +
@@ -247,9 +237,10 @@ diff --git a/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_ucfg_api.h b/qcac
 +ucfg_pmo_set_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev,
 +				       enum pmo_offload_trigger trigger,
 +				       bool enable);
- #else
- static inline QDF_STATUS
- ucfg_pmo_dynamic_arp_ns_offload_enable(struct wlan_objmgr_vdev *vdev)
++
+ /**
+  * ucfg_pmo_enable_mc_addr_filtering_in_fwr(): Enable cached mc add list in fwr
+  * @psoc: objmgr psoc handle
 diff --git a/qcacld-3.0/components/pmo/dispatcher/src/wlan_pmo_ucfg_api.c b/qcacld-3.0/components/pmo/dispatcher/src/wlan_pmo_ucfg_api.c
 --- a/qcacld-3.0/components/pmo/dispatcher/src/wlan_pmo_ucfg_api.c
 +++ b/qcacld-3.0/components/pmo/dispatcher/src/wlan_pmo_ucfg_api.c
@@ -257,6 +248,7 @@ diff --git a/qcacld-3.0/components/pmo/dispatcher/src/wlan_pmo_ucfg_api.c b/qcac
  {
  	return pmo_core_dynamic_arp_ns_offload_runtime_allow(vdev);
  }
+ #endif
 +
 +bool
 +ucfg_pmo_get_ns_offload_enable_dynamic(struct wlan_objmgr_vdev *vdev)
@@ -271,7 +263,6 @@ diff --git a/qcacld-3.0/components/pmo/dispatcher/src/wlan_pmo_ucfg_api.c b/qcac
 +{
 +	pmo_core_set_ns_offload_enable_dynamic(vdev, trigger, enable);
 +}
- #endif
  
  QDF_STATUS
 diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_cm_api.h b/qcacld-3.0/core/hdd/src/wlan_hdd_cm_api.h
