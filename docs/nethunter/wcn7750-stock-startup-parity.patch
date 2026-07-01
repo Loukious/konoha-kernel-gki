@@ -1,0 +1,119 @@
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -5252,31 +5252,21 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 			goto power_down;
+ 		}
+ 
+-		status = ol_cds_init(qdf_dev, hif_ctx);
+-		if (status != QDF_STATUS_SUCCESS) {
+-			hdd_err("No Memory to Create BMI Context; status: %d",
+-				status);
+-			ret = qdf_status_to_os_return(status);
+-			goto hif_close;
+-		}
+-
+ 		if (hdd_get_conparam() == QDF_GLOBAL_EPPING_MODE) {
+ 			status = epping_open();
+ 			if (status) {
+ 				hdd_err("Failed to open in epping mode: %d",
+ 					status);
+ 				ret = -EINVAL;
+-				goto cds_free;
++				goto hif_close;
+ 			}
+ 
+ 			status = epping_enable(qdf_dev->dev, false);
+ 			if (status) {
+ 				hdd_err("Failed to enable in epping mode : %d",
+ 					status);
+ 				epping_close();
+-				goto cds_free;
++				goto hif_close;
+ 			}
+ 
+ 			hdd_info("epping mode enabled");
+@@ -5286,14 +5276,8 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 		}
+ 
+-		if (pld_is_ipa_offload_disabled(qdf_dev->dev))
+-			ucfg_ipa_set_pld_enable(false);
+-
+-		if (pld_is_ipa_shared_smmu_enable(qdf_dev->dev))
+-			ucfg_ipa_set_shared_smmu_enable(true);
+-
+-		ucfg_ipa_component_config_update(hdd_ctx->psoc);
++		pld_is_ipa_offload_disabled(qdf_dev->dev);
++		pld_is_ipa_shared_smmu_enable(qdf_dev->dev);
+ 
+ 		hdd_update_cds_ac_specs_params(hdd_ctx);
+ 
+@@ -5308,14 +5292,14 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 			hdd_err("Failed to Open legacy components; status: %d",
+ 				status);
+ 			ret = qdf_status_to_os_return(status);
+-			goto ipa_component_free;
++			goto hif_close;
+ 		}
+ 
+ 		ret = hdd_update_config(hdd_ctx);
+ 		if (ret) {
+ 			hdd_err("Failed to update configuration; errno: %d",
+ 				ret);
+-			goto ipa_component_free;
++			goto hif_close;
+ 		}
+ 
+ 		status = wbuff_module_init();
+@@ -5537,12 +5521,6 @@ psoc_close:
+ 	wlan_global_lmac_if_close(hdd_ctx->psoc);
+ 	cds_deinit_ini_config();
+ 
+-ipa_component_free:
+-	ucfg_ipa_component_config_free();
+-
+-cds_free:
+-	ol_cds_free();
+-
+ hif_close:
+ 	hif_ctx = cds_get_context(QDF_MODULE_ID_HIF);
+ 	hdd_hif_close(hdd_ctx, hif_ctx);
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
+@@ -44,6 +44,7 @@
+ #include "wlan_ipa_ucfg_api.h"
+ #include "wlan_hdd_debugfs.h"
+ #include "cfg_ucfg_api.h"
++#include "wlan_dp_prealloc.h"
+ #include <linux/suspend.h>
+ #include <qdf_notifier.h>
+ #include <qdf_hang_event_notifier.h>
+@@ -801,8 +802,7 @@ static int __hdd_soc_probe(struct device *dev,
+ 		goto assert_fail_count;
+ 	}
+ 
+-	status = ucfg_dp_prealloc_init((struct cdp_ctrl_objmgr_psoc *)
+-					hdd_ctx->psoc);
++	status = dp_prealloc_init((struct cdp_ctrl_objmgr_psoc *)hdd_ctx->psoc);
+ 
+ 	if (status != QDF_STATUS_SUCCESS) {
+ 		errno = qdf_status_to_os_return(status);
+@@ -833,7 +833,7 @@ wlan_exit:
+ 	hdd_wlan_exit(hdd_ctx);
+ 
+ hdd_context_destroy:
+-	ucfg_dp_prealloc_deinit();
++	dp_prealloc_deinit();
+ 
+ dp_prealloc_fail:
+ 	hdd_context_destroy(hdd_ctx);
+@@ -1039,7 +1039,7 @@ static void __hdd_soc_remove(struct device *dev)
+ 	cds_set_driver_in_bad_state(false);
+ 	cds_set_unload_in_progress(false);
+ 
+-	ucfg_dp_prealloc_deinit();
++	dp_prealloc_deinit();
+ 
+ 	pr_info("%s: Driver De-initialized\n", WLAN_MODULE_NAME);
+ }

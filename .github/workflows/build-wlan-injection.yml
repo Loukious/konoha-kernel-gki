@@ -216,6 +216,15 @@ jobs:
           fi
           git diff --check
 
+      - name: Apply WCN7750 stock startup parity
+        if: ${{ inputs.enable_injection == false && inputs.apply_compat_patch }}
+        working-directory: gki-clo/vendor/qcom/opensource/wlan
+        run: |
+          patch="$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-stock-startup-parity.patch"
+          git apply --recount --check "$patch"
+          git apply --recount "$patch"
+          git diff --check
+
       - name: Apply WCN7750 enable trace markers
         if: ${{ inputs.enable_trace }}
         working-directory: gki-clo/vendor/qcom/opensource/wlan
