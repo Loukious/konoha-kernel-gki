@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STOCK_IMAGE=""
 STOCK_ROOT=""
 WIFI_KO=""
+MODULE_KOS=()
 OUT_IMG="$ROOT_DIR/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img"
 SPARSE_OUT=""
 AVBTOOL="${AVBTOOL:-avbtool}"
@@ -23,6 +24,7 @@ Options:
   --stock-image FILE               Matching stock PixelOS vendor_dlkm image.
   --stock-root DIR                 Optional extracted vendor_dlkm module tree.
   --wifi-ko FILE                   Replacement qca_cld3_wcn7750.ko module.
+  --module-ko FILE                 Replacement module named by modinfo, may repeat.
   --out FILE                       Output raw EROFS image.
   --sparse-out FILE                Also write an Android sparse image.
   --avbtool FILE                   avbtool executable/script (default: avbtool).
@@ -49,6 +51,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--wifi-ko)
 			WIFI_KO="$2"
+			shift 2
+			;;
+		--module-ko)
+			MODULE_KOS+=("$2")
 			shift 2
 			;;
 		--out)
@@ -221,6 +227,30 @@ if [[ "$stock_vermagic" != "$replacement_vermagic" && "$ALLOW_VERMAGIC_MISMATCH"
 fi
 
 install -m 0644 "$WIFI_KO" "$STOCK_WIFI"
+for module_ko in "${MODULE_KOS[@]}"; do
+	if [[ ! -f "$module_ko" ]]; then
+		echo "Replacement module not found: $module_ko" >&2
+		exit 1
+	fi
+	module_name="$(modinfo -F name "$module_ko")"
+	if [[ -z "$module_name" ]]; then
+		echo "Could not read module name from: $module_ko" >&2
+		exit 1
+	fi
+	stock_module="$ROOT/lib/modules/$module_name.ko"
+	if [[ ! -f "$stock_module" ]]; then
+		echo "Stock module not found in image: $stock_module" >&2
+		exit 1
+	fi
+	module_vermagic="$(modinfo -F vermagic "$module_ko")"
+	if [[ "$stock_vermagic" != "$module_vermagic" && "$ALLOW_VERMAGIC_MISMATCH" -ne 1 ]]; then
+		echo "Replacement vermagic mismatch for $module_name:" >&2
+		echo "  stock Wi-Fi:  $stock_vermagic" >&2
+		echo "  replacement: $module_vermagic" >&2
+		exit 1
+	fi
+	install -m 0644 "$module_ko" "$stock_module"
+done
 module_count="$(find "$ROOT/lib/modules" -maxdepth 1 -type f -name '*.ko' | wc -l)"
 if [[ "$module_count" -lt 300 ]]; then
 	echo "Refusing to build: only $module_count modules were extracted." >&2
@@ -262,6 +292,9 @@ if [[ -n "$STOCK_ROOT" ]]; then
 fi
 echo "  partition bytes:   $partition_size"
 echo "  replacement Wi-Fi: $WIFI_KO"
+for module_ko in "${MODULE_KOS[@]}"; do
+	echo "  replacement mod:  $module_ko"
+done
 echo "  replacement magic: $replacement_vermagic"
 echo "  EROFS cluster:     $CLUSTER_SIZE"
 if [[ "${AVB_FEC_ARGS[*]}" == *--do_not_generate_fec* ]]; then

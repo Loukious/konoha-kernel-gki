@@ -33,6 +33,11 @@ on:
         required: true
         type: boolean
         default: false
+      trace_icnss:
+        description: Also build and package a traced icnss2.ko for WPSS bring-up debugging
+        required: true
+        type: boolean
+        default: false
       kernel_source_repo:
         description: Device kernel source used for WLAN ABI headers
         required: true
@@ -218,6 +223,15 @@ jobs:
           patch="$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-enable-trace.patch"
           git apply --check "$patch"
           git apply "$patch"
+          git diff --check
+
+      - name: Apply ICNSS2 WPSS trace markers
+        if: ${{ inputs.trace_icnss }}
+        working-directory: gki-clo/vendor/qcom/opensource/wlan
+        run: |
+          patch="$GITHUB_WORKSPACE/gki-clo/docs/nethunter/icnss2-wpss-trace.patch"
+          git apply --recount --check "$patch"
+          git apply --recount "$patch"
           git diff --check
 
       - name: Prepare Xiaomi Onyx kernel ABI headers
@@ -440,12 +454,36 @@ jobs:
           echo "module vermagic: $module_vermagic"
           echo "cfg80211_ops:    $module_ops_size bytes (PixelOS stock: $stock_ops_size)"
 
+      - name: Build traced ICNSS2 module
+        if: ${{ inputs.trace_icnss }}
+        working-directory: gki-clo
+        env:
+          CC: clang
+          KERNEL_SRC: ${{ env.WLAN_KERNEL_SRC }}
+          KERNEL_OUT: ${{ env.WLAN_KERNEL_OUT }}
+          WLAN_EXTRA_KCFLAGS: ""
+        run: |
+          export PATH="$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
+          icnss_module="artifacts/wlan/icnss2-konoha-${WLAN_MODE}.ko"
+          tools/build_wlan_platform_module.sh "$icnss_module"
+          if ! grep -a -q konoha_icnss_trace "$icnss_module"; then
+            echo "ICNSS2 trace module is missing konoha_icnss_trace markers" >&2
+            exit 1
+          fi
+          echo "ICNSS2_MODULE=$icnss_module" >> "$GITHUB_ENV"
+          echo "WLAN_MODE=${WLAN_MODE}-icnss-trace" >> "$GITHUB_ENV"
+
       - name: Build PixelOS vendor_dlkm images
         working-directory: gki-clo
         run: |
+          extra_modules=()
+          if [[ -n "${ICNSS2_MODULE:-}" ]]; then
+            extra_modules+=(--module-ko "$ICNSS2_MODULE")
+          fi
           tools/make_pixelos_vendor_dlkm_img.sh \
             --stock-image sources/pixelos/vendor_dlkm-stock.img \
             --wifi-ko "$WLAN_MODULE" \
+            "${extra_modules[@]}" \
             --cluster-size 4096 \
             --allow-vermagic-mismatch \
             --avbtool sources/avb/avbtool.py \
@@ -467,12 +505,19 @@ jobs:
           mkdir -p "$extracted_root" "$verify_dir"
           fsck.erofs --extract="$extracted_root" --no-preserve "$raw"
           cmp "$module" "$extracted_root/lib/modules/qca_cld3_wcn7750.ko"
+          if [[ -n "${ICNSS2_MODULE:-}" ]]; then
+            cmp "$ICNSS2_MODULE" "$extracted_root/lib/modules/icnss2.ko"
+          fi
           simg2img "$sparse" "$roundtrip"
           cmp "$raw" "$roundtrip"
           ln -s "$PWD/$raw" "$verify_dir/vendor_dlkm.img"
           (cd "$verify_dir" && python3 "$GITHUB_WORKSPACE/gki-clo/sources/avb/avbtool.py" \
             verify_image --image vendor_dlkm.img)
-          sha256sum "$module" "$raw" "$sparse" | tee artifacts/SHA256SUMS
+          sha_inputs=("$module" "$raw" "$sparse")
+          if [[ -n "${ICNSS2_MODULE:-}" ]]; then
+            sha_inputs+=("$ICNSS2_MODULE")
+          fi
+          sha256sum "${sha_inputs[@]}" | tee artifacts/SHA256SUMS
 
       - name: Upload failed WLAN debug files
         if: failure()
