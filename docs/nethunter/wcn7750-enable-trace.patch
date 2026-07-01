@@ -44,7 +44,7 @@ index 55cff226..72e71a5b 100644
  	if (status != QDF_STATUS_SUCCESS) {
  		hdd_err("Shutdown notifier register failed: %d", status);
  		goto err_deinit_hif_context;
-@@ -780,40 +796,58 @@ static int __hdd_soc_probe(struct device *dev,
+@@ -780,40 +796,59 @@ static int __hdd_soc_probe(struct device *dev,
  	QDF_STATUS status;
  	int errno;
  
@@ -90,9 +90,10 @@ index 55cff226..72e71a5b 100644
  		goto dp_prealloc_fail;
  	}
  
-+	pr_info("konoha_wlan_trace: __hdd_soc_probe hdd_wlan_startup begin\n");
++	pr_err("konoha_wlan_trace: __hdd_soc_probe hdd_wlan_startup begin ctx=%p psoc=%p\n",
++	       hdd_ctx, hdd_ctx->psoc);
  	errno = hdd_wlan_startup(hdd_ctx);
-+	pr_info("konoha_wlan_trace: __hdd_soc_probe hdd_wlan_startup ret=%d\n",
++	pr_err("konoha_wlan_trace: __hdd_soc_probe hdd_wlan_startup ret=%d\n",
 +		errno);
  	if (errno)
  		goto hdd_context_destroy;
@@ -645,36 +646,45 @@ index 6130d22c..b47badab 100644
  	cds_shutdown_notifier_purge();
  	hdd_check_for_leaks(hdd_ctx, reinit);
  	hdd_debug_domain_set(QDF_DEBUG_DOMAIN_INIT);
-@@ -18894,10 +18995,16 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
+@@ -18894,10 +18995,21 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
  	bool is_imps_enabled;
  
++	pr_err("konoha_wlan_trace: hdd_wlan_startup function_entry raw_ctx=%p\n",
++	       hdd_ctx);
  	hdd_enter();
-+	pr_info("konoha_wlan_trace: hdd_wlan_startup enter ctx=%p psoc=%p parent=%p status=%d\n",
++	pr_err("konoha_wlan_trace: hdd_wlan_startup enter ctx=%p psoc=%p parent=%p status=%d\n",
 +		hdd_ctx, hdd_ctx ? hdd_ctx->psoc : NULL,
 +		hdd_ctx ? hdd_ctx->parent_dev : NULL,
 +		hdd_ctx ? hdd_ctx->driver_status : -1);
  
++	pr_err("konoha_wlan_trace: hdd_wlan_startup qdf_nbuf_init_replenish_timer begin\n");
  	qdf_nbuf_init_replenish_timer();
++	pr_err("konoha_wlan_trace: hdd_wlan_startup qdf_nbuf_init_replenish_timer done\n");
  
++	pr_err("konoha_wlan_trace: hdd_wlan_startup cache_mutex begin\n");
  	status = wlan_hdd_cache_chann_mutex_create(hdd_ctx);
-+	pr_info("konoha_wlan_trace: hdd_wlan_startup cache_mutex status=%d\n",
++	pr_err("konoha_wlan_trace: hdd_wlan_startup cache_mutex status=%d\n",
 +		status);
  	if (QDF_IS_STATUS_ERROR(status))
  		return qdf_status_to_os_return(status);
  
-@@ -18909,19 +19016,26 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
+@@ -18909,19 +19021,30 @@ int hdd_wlan_startup(struct hdd_context *hdd_ctx)
++	pr_err("konoha_wlan_trace: hdd_wlan_startup hdd_driver_memdump_init begin\n");
  	hdd_driver_memdump_init();
++	pr_err("konoha_wlan_trace: hdd_wlan_startup hdd_driver_memdump_init done\n");
  
++	pr_err("konoha_wlan_trace: hdd_wlan_startup alloc_iface begin\n");
  	errno = wlan_hdd_alloc_iface_combination_mem(hdd_ctx);
-+	pr_info("konoha_wlan_trace: hdd_wlan_startup alloc_iface ret=%d\n",
++	pr_err("konoha_wlan_trace: hdd_wlan_startup alloc_iface ret=%d\n",
 +		errno);
  	if (errno) {
  		hdd_err("failed to alloc iface combination mem");
  		goto memdump_deinit;
  	}
  
++	pr_err("konoha_wlan_trace: hdd_wlan_startup regulatory_event begin\n");
  	errno = hdd_init_regulatory_update_event(hdd_ctx);
-+	pr_info("konoha_wlan_trace: hdd_wlan_startup regulatory_event ret=%d\n",
++	pr_err("konoha_wlan_trace: hdd_wlan_startup regulatory_event ret=%d\n",
 +		errno);
  	if (errno) {
  		hdd_err("Failed to initialize regulatory update event; errno:%d",
@@ -682,9 +692,9 @@ index 6130d22c..b47badab 100644
  		goto free_iface_comb;
  	}
  
-+	pr_info("konoha_wlan_trace: hdd_wlan_startup hdd_wlan_start_modules begin\n");
++	pr_err("konoha_wlan_trace: hdd_wlan_startup hdd_wlan_start_modules begin\n");
  	errno = hdd_wlan_start_modules(hdd_ctx, false);
-+	pr_info("konoha_wlan_trace: hdd_wlan_startup hdd_wlan_start_modules ret=%d status=%d\n",
++	pr_err("konoha_wlan_trace: hdd_wlan_startup hdd_wlan_start_modules ret=%d status=%d\n",
 +		errno, hdd_ctx->driver_status);
  	if (errno) {
  		hdd_err("Failed to start modules; errno:%d", errno);
