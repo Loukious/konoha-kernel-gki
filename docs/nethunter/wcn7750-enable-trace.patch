@@ -1418,7 +1418,7 @@ index c0dd805e..d5edccdf 100644
  }
  
  /**
-@@ -547,12 +576,28 @@ struct icnss_driver_ops pld_ipci_ops = {
+@@ -547,12 +576,35 @@ struct icnss_driver_ops pld_ipci_ops = {
  
  int pld_ipci_register_driver(void)
  {
@@ -1430,9 +1430,16 @@ index c0dd805e..d5edccdf 100644
 +	void *trace_dev_info = NULL;
 +#endif
 +
-+	pr_info("konoha_wlan_trace: pld_ipci_register_driver enter ops=%p name=%s probe=%p dev_info=%p\n",
++	pr_info("konoha_wlan_trace: pld_ipci_register_driver enter ops=%p name=%s probe=%p remove=%p dev_info=%p drv_state=0x%lx\n",
 +		&pld_ipci_ops, pld_ipci_ops.name, pld_ipci_ops.probe,
-+		trace_dev_info);
++		pld_ipci_ops.remove, trace_dev_info, pld_ipci_ops.drv_state);
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0))
++	if (pld_ipci_ops.dev_info)
++		pr_info("konoha_wlan_trace: pld_ipci_register_driver dev_info0 name=%s id=0x%x dev_info1_name0=0x%x\n",
++			pld_ipci_ops.dev_info[0].name,
++			pld_ipci_ops.dev_info[0].device_id,
++			pld_ipci_ops.dev_info[1].name[0]);
++#endif
 +	ret = icnss_register_driver(&pld_ipci_ops);
 +	pr_info("konoha_wlan_trace: pld_ipci_register_driver icnss_register ret=%d\n",
 +		ret);
