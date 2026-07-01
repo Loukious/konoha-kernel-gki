@@ -78,6 +78,15 @@ diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/w
  hif_close:
  	hif_ctx = cds_get_context(QDF_MODULE_ID_HIF);
  	hdd_hif_close(hdd_ctx, hif_ctx);
+@@ -15225,7 +15203,7 @@ void hdd_psoc_idle_timer_stop(struct hdd_context *hdd_ctx)
+ 
+ void hdd_psoc_idle_timer_stop(struct hdd_context *hdd_ctx)
+ {
+-	qdf_delayed_work_stop_sync(&hdd_ctx->psoc_idle_timeout_work);
++	cancel_delayed_work_sync(&hdd_ctx->psoc_idle_timeout_work.dwork);
+ 	hdd_allow_suspend(WIFI_POWER_EVENT_WAKELOCK_IFACE_CHANGE_TIMER);
+ 	hdd_debug("Stopped psoc idle timer");
+ }
 diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
 --- a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
 +++ b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
