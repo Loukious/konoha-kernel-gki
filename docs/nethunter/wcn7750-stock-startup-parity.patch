@@ -1,6 +1,34 @@
 diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
 --- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
 +++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -130,6 +130,8 @@
+ #include <cdp_txrx_handle.h>
+ #include <qca_vendor.h>
+ #include "wlan_pmo_ucfg_api.h"
++#include "wlan_pmo_priv.h"
++#include "wlan_pmo_objmgr.h"
+ #include "sir_api.h"
+ #include "os_if_wifi_pos.h"
+ #include "wifi_pos_api.h"
+@@ -255,6 +257,8 @@
+ #include "wlan_p2p_ucfg_api.h"
+ #include "wifi_pos_api.h"
+ #include "wlan_mgmt_rx_srng_ucfg_api.h"
+ 
++void dp_try_set_rps_cpu_mask(struct wlan_objmgr_psoc *psoc);
++
+ #ifdef MULTI_CLIENT_LL_SUPPORT
+ #define WLAM_WLM_HOST_DRIVER_PORT_ID 0xFFFFFF
+ #endif
+@@ -4069,7 +4073,7 @@ void hdd_update_hw_sw_info(struct hdd_context *hdd_ctx)
+  *
+  * Return: none
+  */
+-static void
++static __always_inline void
+ hdd_update_cds_ac_specs_params(struct hdd_context *hdd_ctx)
+ {
+ 	uint8_t tx_sched_wrr_param[TX_SCHED_WRR_PARAMS_NUM] = {0};
 @@ -5252,31 +5252,21 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  			goto power_down;
  		}
@@ -87,6 +115,28 @@ diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/w
  	hdd_allow_suspend(WIFI_POWER_EVENT_WAKELOCK_IFACE_CHANGE_TIMER);
  	hdd_debug("Stopped psoc idle timer");
  }
+@@ -19017,7 +18995,7 @@ QDF_STATUS hdd_psoc_create_vdevs(struct hdd_context *hdd_ctx)
+ 		return status;
+ 	}
+ 
+-	ucfg_dp_try_set_rps_cpu_mask(hdd_ctx->psoc);
++	dp_try_set_rps_cpu_mask(hdd_ctx->psoc);
+ 
+ 	if (driver_mode != QDF_GLOBAL_FTM_MODE &&
+ 	    driver_mode != QDF_GLOBAL_EPPING_MODE)
+@@ -22357,9 +22335,11 @@ static int hdd_update_dp_config(struct hdd_context *hdd_ctx)
+  */
+ int hdd_update_config(struct hdd_context *hdd_ctx)
+ {
++	struct pmo_psoc_priv_obj *pmo_psoc_ctx;
+ 	int ret;
+ 
+-	if (ucfg_pmo_is_ns_offloaded(hdd_ctx->psoc))
++	pmo_psoc_ctx = pmo_psoc_get_priv(hdd_ctx->psoc);
++	if (pmo_psoc_ctx && pmo_psoc_ctx->psoc_cfg.ns_offload_enable_static)
+ 		hdd_ctx->ns_offload_enable = true;
+ 
+ 	hdd_update_ol_config(hdd_ctx);
 diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
 --- a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
 +++ b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
@@ -95,9 +145,29 @@ diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c b/qcacld-3.0/core/hdd
  #include "wlan_hdd_debugfs.h"
  #include "cfg_ucfg_api.h"
 +#include "wlan_dp_prealloc.h"
++#include "wlan_pmo_main.h"
  #include <linux/suspend.h>
  #include <qdf_notifier.h>
  #include <qdf_hang_event_notifier.h>
+@@ -610,7 +612,7 @@ int hdd_hif_open(struct device *dev, void *bdev, const struct hif_bus_id *bid,
+ 	hdd_hif_set_ce_max_yield_time(
+ 				hif_ctx, bus_type,
+ 				cfg_get(hdd_ctx->psoc,
+ 					CFG_DP_CE_SERVICE_MAX_YIELD_TIME));
+-	ucfg_pmo_psoc_set_hif_handle(hdd_ctx->psoc, hif_ctx);
++	pmo_core_psoc_set_hif_handle(hdd_ctx->psoc, hif_ctx);
+ 	ucfg_dp_set_hif_handle(hdd_ctx->psoc, hif_ctx);
+ 	hif_set_ce_service_max_rx_ind_flush(hif_ctx,
+ 				cfg_get(hdd_ctx->psoc,
+@@ -646,7 +648,7 @@ void hdd_hif_close(struct hdd_context *hdd_ctx, void *hif_ctx)
+ 	hdd_deinit_cds_hif_context();
+ 	hif_close(hif_ctx);
+ 
+-	ucfg_pmo_psoc_set_hif_handle(hdd_ctx->psoc, NULL);
++	pmo_core_psoc_set_hif_handle(hdd_ctx->psoc, NULL);
+ }
+ 
+ /**
 @@ -801,8 +802,7 @@ static int __hdd_soc_probe(struct device *dev,
  		goto assert_fail_count;
  	}
