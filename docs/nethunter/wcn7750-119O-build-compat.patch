@@ -101,6 +101,27 @@ index 06134a51..619a1b4d 100644
  CONFIG_WLAN_PDEV_VDEV_SEND_MULTI_PARAM=y
  CONFIG_WLAN_PMO_ENABLE=y
  CONFIG_WLAN_POLICY_MGR_ENABLE=y
+diff --git a/platform/inc/icnss2.h b/platform/inc/icnss2.h
+--- a/platform/inc/icnss2.h
++++ b/platform/inc/icnss2.h
+@@ -8,7 +8,6 @@
+ 
+ #include <linux/interrupt.h>
+ #include <linux/device.h>
+-#include "cnss_utils.h"
+ 
+ #define ICNSS_MAX_IRQ_REGISTRATIONS    12
+ #define IWCN_MAX_IRQ_REGISTRATIONS    32
+@@ -73,9 +72,6 @@ struct icnss_driver_ops {
+ 	int (*uevent)(struct device *dev, struct icnss_uevent_data *uevent);
+ 	int (*idle_shutdown)(struct device *dev);
+ 	int (*idle_restart)(struct device *dev);
+-	int (*collect_driver_dump)(struct device *dev,
+-				   struct cnss_ssr_driver_dump_entry *input_array,
+-				   size_t *num_entries_loaded);
+ 	int (*set_therm_cdev_state)(struct device *dev,
+ 				    unsigned long thermal_state,
+ 				    int tcdev_id);
 diff --git a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c b/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
 index cb044784..145b6f4b 100644
 --- a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
@@ -137,6 +158,51 @@ diff --git a/qcacld-3.0/Kbuild b/qcacld-3.0/Kbuild
  ccflags-$(CONFIG_FEATURE_STATS_EXT) += -DWLAN_FEATURE_STATS_EXT
  ccflags-$(CONFIG_QCACLD_FEATURE_NAN) += -DWLAN_FEATURE_NAN
  ccflags-$(CONFIG_QCACLD_FEATURE_SON) += -DWLAN_FEATURE_SON
+diff --git a/qcacld-3.0/core/pld/src/pld_ipci.c b/qcacld-3.0/core/pld/src/pld_ipci.c
+--- a/qcacld-3.0/core/pld/src/pld_ipci.c
++++ b/qcacld-3.0/core/pld/src/pld_ipci.c
+@@ -398,31 +398,6 @@ static int pld_ipci_uevent(struct device *dev, struct icnss_uevent_data *uevent)
+ }
+ #endif
+ 
+-#ifdef WLAN_FEATURE_SSR_DRIVER_DUMP
+-static int
+-pld_ipci_collect_driver_dump(struct device *dev,
+-			     struct cnss_ssr_driver_dump_entry *input_array,
+-			     size_t *num_entries)
+-{
+-	struct pld_context *pld_context;
+-	struct pld_driver_ops *ops;
+-	int ret = -EINVAL;
+-
+-	pld_context = pld_get_global_context();
+-
+-	if (!pld_context)
+-		return ret;
+-
+-	ops = pld_context->ops;
+-	if (ops->collect_driver_dump)
+-		ret =  ops->collect_driver_dump(dev,
+-						PLD_BUS_TYPE_IPCI,
+-						input_array,
+-						num_entries);
+-	return ret;
+-}
+-#endif
+-
+ /**
+  * pld_ipci_idle_restart_cb() - Perform idle restart
+  * @dev: platform device
+@@ -539,9 +514,6 @@ struct icnss_driver_ops pld_ipci_ops = {
+ 	.uevent = pld_ipci_uevent,
+ 	.idle_restart = pld_ipci_idle_restart_cb,
+ 	.idle_shutdown = pld_ipci_idle_shutdown_cb,
+-#ifdef WLAN_FEATURE_SSR_DRIVER_DUMP
+-	.collect_driver_dump = pld_ipci_collect_driver_dump,
+-#endif
+ 	.set_therm_cdev_state = pld_ipci_set_thermal_state,
+ };
+ 
 diff --git a/qcacld-3.0/components/pmo/core/inc/wlan_pmo_ns.h b/qcacld-3.0/components/pmo/core/inc/wlan_pmo_ns.h
 --- a/qcacld-3.0/components/pmo/core/inc/wlan_pmo_ns.h
 +++ b/qcacld-3.0/components/pmo/core/inc/wlan_pmo_ns.h
