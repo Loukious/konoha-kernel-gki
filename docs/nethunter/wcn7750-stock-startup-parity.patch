@@ -1461,3 +1461,55 @@ index 01f64ce4..438591d9 100644
  #ifdef FEATURE_WPSS_THERMAL_MITIGATION
  /**
   * hdd_thermal_fill_clientid_priority() - fill the client id/priority
+
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_power.c b/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
+@@ -2226,5 +2226,6 @@ QDF_STATUS hdd_wlan_re_init(struct hdd_context *hdd_ctx)
+ 
+ 	hdd_restore_thermal_mitigation_config(hdd_ctx);
++	hdd_restore_ddr_bw_mitigation_config(hdd_ctx);
+ 	hdd_restore_sar_config(hdd_ctx);
+ 
+ 	hdd_send_default_scan_ies(hdd_ctx);
+
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_power.c b/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
+@@ -1874,7 +1875,6 @@
+ 	struct hdd_adapter *adapter, *next_adapter = NULL;
+ 	struct wlan_hdd_link_info *link_info;
+ 	bool ignore_cac_updated = false;
+-	bool restart_due_to_cac_pending = false;
+ 
+ 	hdd_enter();
+ 
+@@ -1882,8 +1882,6 @@
+ 					   NET_DEV_HOLD_SSR_RESTART_SAP) {
+ 		if (adapter->device_mode != QDF_SAP_MODE)
+ 			goto next_adapter;
+-restart_post_cac_links:
+-		restart_due_to_cac_pending = false;
+ 		hdd_adapter_for_each_active_link_info(adapter, link_info) {
+ 			if (!test_bit(SOFTAP_INIT_DONE, &link_info->link_flags))
+ 				continue;
+@@ -1895,10 +1893,6 @@
+ 			if (!ignore_cac_updated) {
+ 				hdd_restore_ignore_cac(hdd_ctx);
+ 				ignore_cac_updated = true;
+-			}
+-			if (hdd_ssr_restart_sap_cac_link(adapter, link_info)) {
+-				restart_due_to_cac_pending = true;
+-				continue;
+ 			}
+ 			hdd_debug("Restart prev SAP session(vdev %d), event_flags 0x%lx, link_flags 0x%lx(%s)",
+ 				  link_info->vdev_id,
+@@ -1909,8 +1903,6 @@
+ 			wlan_hdd_start_sap(link_info, true);
+ 			hdd_apctx_set_ap_suspend(hdd_ctx, link_info);
+ 		}
+-		if (restart_due_to_cac_pending)
+-			goto restart_post_cac_links;
+ next_adapter:
+ 		hdd_adapter_dev_put_debug(adapter,
+ 					  NET_DEV_HOLD_SSR_RESTART_SAP);
