@@ -1,26 +1,776 @@
+diff --git a/qca-wifi-host-cmn/cfg/inc/i_cfg.h b/qca-wifi-host-cmn/cfg/inc/i_cfg.h
+index 986ba246..9648ee31 100644
+--- a/qca-wifi-host-cmn/cfg/inc/i_cfg.h
++++ b/qca-wifi-host-cmn/cfg/inc/i_cfg.h
+@@ -24,6 +24,9 @@
+ #define __I_CFG_H
+ 
+ #include "cfg_define.h"
++#include "i_cfg_objmgr.h"
++#include "qdf_atomic.h"
++#include "qdf_list.h"
+ #include "qdf_trace.h"
+ #include "qdf_types.h"
+ #include "wlan_objmgr_psoc_obj.h"
+@@ -63,6 +66,17 @@ struct cfg_values {
+ 	CFG_ALL
+ };
+ 
++struct cfg_value_store {
++	char *path;
++	qdf_list_node_t node;
++	qdf_atomic_t users;
++	struct cfg_values values;
++};
++
++struct cfg_psoc_ctx {
++	struct cfg_value_store *store;
++};
++
+ #undef __CFG_INI_STRING
+ #define __CFG_INI_STRING(args...) __CFG_INI(args)
+ #undef __CFG_INI
+@@ -70,8 +84,7 @@ struct cfg_values {
+ 
+ struct cfg_values *cfg_psoc_get_values(struct wlan_objmgr_psoc *psoc);
+ 
+-#define __cfg_get(psoc, id) (cfg_psoc_get_values( \
+-			(struct wlan_objmgr_psoc *)psoc)->id##_internal)
++#define __cfg_get(psoc, id) (((struct cfg_psoc_ctx *)cfg_psoc_get_priv( \
++			(struct wlan_objmgr_psoc *)psoc))->store->values.id##_internal)
+ 
+ #endif /* __I_CFG_H */
+-
+diff --git a/qca-wifi-host-cmn/cfg/src/cfg.c b/qca-wifi-host-cmn/cfg/src/cfg.c
+index 0d94587d..a894b224 100644
+--- a/qca-wifi-host-cmn/cfg/src/cfg.c
++++ b/qca-wifi-host-cmn/cfg/src/cfg.c
+@@ -41,13 +41,6 @@
+  * @users: number of references on the store
+  * @values: a values struct containing the parsed values from the ini file
+  */
+-struct cfg_value_store {
+-	char *path;
+-	qdf_list_node_t node;
+-	qdf_atomic_t users;
+-	struct cfg_values values;
+-};
+-
+ /**
+  * enum cfg_type - Enum for CFG/INI types
+  * @CFG_INT_ITEM: Integer CFG/INI
+@@ -433,10 +426,6 @@ static struct cfg_value_store *__cfg_global_store;
+ static qdf_list_t __cfg_stores_list;
+ static qdf_spinlock_t __cfg_stores_lock;
+ 
+-struct cfg_psoc_ctx {
+-	struct cfg_value_store *store;
+-};
+-
+ static QDF_STATUS
+ cfg_store_alloc(const char *path, struct cfg_value_store **out_store)
+ {
+diff --git a/qca-wifi-host-cmn/os_if/linux/wlan_osif_request_manager.c b/qca-wifi-host-cmn/os_if/linux/wlan_osif_request_manager.c
+index 52cb1a54..30522691 100644
+--- a/qca-wifi-host-cmn/os_if/linux/wlan_osif_request_manager.c
++++ b/qca-wifi-host-cmn/os_if/linux/wlan_osif_request_manager.c
+@@ -26,7 +26,7 @@
+ /* arbitrary value */
+ #define MAX_NUM_REQUESTS 20
+ 
+-static bool is_initialized;
++bool osif_request_manager_is_initialized;
+ static qdf_list_t requests;
+ static qdf_spinlock_t spinlock;
+ static void *cookie;
+@@ -82,7 +82,7 @@ struct osif_request *osif_request_alloc(const struct osif_request_params *params
+ 	size_t length;
+ 	struct osif_request *request;
+ 
+-	if (!is_initialized) {
++	if (!osif_request_manager_is_initialized) {
+ 		osif_err("invoked when not initialized");
+ 		return NULL;
+ 	}
+@@ -118,7 +118,7 @@ struct osif_request *osif_request_get(void *cookie)
+ {
+ 	struct osif_request *request;
+ 
+-	if (!is_initialized) {
++	if (!osif_request_manager_is_initialized) {
+ 		osif_err("invoked when not initialized");
+ 		return NULL;
+ 	}
+@@ -163,12 +163,12 @@ void osif_request_complete(struct osif_request *request)
+ 
+ void osif_request_manager_init(void)
+ {
+-	if (is_initialized)
++	if (osif_request_manager_is_initialized)
+ 		return;
+ 
+ 	qdf_list_create(&requests, MAX_NUM_REQUESTS);
+ 	qdf_spinlock_create(&spinlock);
+-	is_initialized = true;
++	osif_request_manager_is_initialized = true;
+ }
+ 
+ /*
+@@ -180,5 +180,5 @@ void osif_request_manager_init(void)
+  */
+ void osif_request_manager_deinit(void)
+ {
+-	is_initialized = false;
++	osif_request_manager_is_initialized = false;
+ }
+diff --git a/qcacld-3.0/Kbuild b/qcacld-3.0/Kbuild
+index 6c4ffb05..ecc12277 100644
+--- a/qcacld-3.0/Kbuild
++++ b/qcacld-3.0/Kbuild
+@@ -3829,6 +3829,7 @@ ccflags-$(CONFIG_WLAN_DL_MODES) += -DCONFIG_WLAN_DL_MODES
+ ccflags-$(CONFIG_WLAN_THERMAL_MULTI_CLIENT_SUPPORT) += -DFEATURE_WPSS_THERMAL_MITIGATION
+ ccflags-$(CONFIG_WLAN_DUMP_IN_PROGRESS) += -DCONFIG_WLAN_DUMP_IN_PROGRESS
+ ccflags-$(CONFIG_WLAN_CHIPSET_LOG_MAX_SIZE) += -DWLAN_CHIPSET_LOG_MAX_SIZE=50
++ccflags-$(CONFIG_WLAN_DDR_BW_MITIGATION) += -DWLAN_DDR_BW_MITIGATION
+ ccflags-$(CONFIG_WLAN_BMISS) += -DCONFIG_WLAN_BMISS
+ ccflags-$(CONFIG_WLAN_SYSFS_DP_STATS) += -DWLAN_SYSFS_DP_STATS
+ ccflags-$(CONFIG_WLAN_FREQ_LIST) += -DCONFIG_WLAN_FREQ_LIST
+diff --git a/qcacld-3.0/Kconfig b/qcacld-3.0/Kconfig
+index 271ad6c0..6dc94000 100644
+--- a/qcacld-3.0/Kconfig
++++ b/qcacld-3.0/Kconfig
+@@ -570,6 +570,10 @@ config FW_THERMAL_THROTTLE
+ 	bool "Enable FW_THERMAL_THROTTLE"
+ 	default n
+ 
++config WLAN_DDR_BW_MITIGATION
++	bool "enable WLAN_DDR_BW_MITIGATION"
++	default n
++
+ config GET_DRIVER_MODE
+ 	bool "Enable GET_DRIVER_MODE"
+ 	default n
+diff --git a/qcacld-3.0/components/denylist_mgr/dispatcher/inc/wlan_dlm_ucfg_api.h b/qcacld-3.0/components/denylist_mgr/dispatcher/inc/wlan_dlm_ucfg_api.h
+index b16eda53..840cb7dd 100644
+--- a/qcacld-3.0/components/denylist_mgr/dispatcher/inc/wlan_dlm_ucfg_api.h
++++ b/qcacld-3.0/components/denylist_mgr/dispatcher/inc/wlan_dlm_ucfg_api.h
+@@ -59,6 +59,9 @@ QDF_STATUS ucfg_dlm_deinit(void);
+ QDF_STATUS ucfg_dlm_psoc_set_suspended(struct wlan_objmgr_psoc *psoc,
+ 				       bool state);
+ 
++QDF_STATUS ucfg_dlm_suspend_handler(struct wlan_objmgr_psoc *psoc, void *arg);
++QDF_STATUS ucfg_dlm_resume_handler(struct wlan_objmgr_psoc *psoc, void *arg);
++
+ /**
+  * ucfg_dlm_psoc_get_suspended() - API to get denylist mgr state suspended
+  * @psoc: pointer to psoc object
+diff --git a/qcacld-3.0/components/denylist_mgr/dispatcher/src/wlan_dlm_ucfg_api.c b/qcacld-3.0/components/denylist_mgr/dispatcher/src/wlan_dlm_ucfg_api.c
+index 41648a7f..8c2e1d1b 100644
+--- a/qcacld-3.0/components/denylist_mgr/dispatcher/src/wlan_dlm_ucfg_api.c
++++ b/qcacld-3.0/components/denylist_mgr/dispatcher/src/wlan_dlm_ucfg_api.c
+@@ -143,14 +143,14 @@ QDF_STATUS ucfg_dlm_psoc_get_suspended(struct wlan_objmgr_psoc *psoc,
+ 	return QDF_STATUS_SUCCESS;
+ }
+ 
+-static QDF_STATUS
++QDF_STATUS
+ ucfg_dlm_suspend_handler(struct wlan_objmgr_psoc *psoc, void *arg)
+ {
+ 	ucfg_dlm_psoc_set_suspended(psoc, true);
+ 	return QDF_STATUS_SUCCESS;
+ }
+ 
+-static QDF_STATUS
++QDF_STATUS
+ ucfg_dlm_resume_handler(struct wlan_objmgr_psoc *psoc, void *arg)
+ {
+ 	ucfg_dlm_psoc_set_suspended(psoc, false);
+diff --git a/qcacld-3.0/components/dp/core/src/wlan_dp_main.c b/qcacld-3.0/components/dp/core/src/wlan_dp_main.c
+index 4dbd0e15..086e1480 100644
+--- a/qcacld-3.0/components/dp/core/src/wlan_dp_main.c
++++ b/qcacld-3.0/components/dp/core/src/wlan_dp_main.c
+@@ -70,7 +70,7 @@ static struct wlan_dp_memory_profile_info g_dp_profile_info;
+ #include <wlan_dp_fisa_rx.h>
+ 
+ /* Global DP context */
+-static struct wlan_dp_psoc_context *gp_dp_ctx;
++struct wlan_dp_psoc_context *gp_dp_ctx;
+ 
+ QDF_STATUS dp_allocate_ctx(void)
+ {
+diff --git a/qcacld-3.0/components/fw_offload/core/inc/wlan_fw_offload_main.h b/qcacld-3.0/components/fw_offload/core/inc/wlan_fw_offload_main.h
+index 281448e4..2b944767 100644
+--- a/qcacld-3.0/components/fw_offload/core/inc/wlan_fw_offload_main.h
++++ b/qcacld-3.0/components/fw_offload/core/inc/wlan_fw_offload_main.h
+@@ -145,6 +145,22 @@ struct wlan_fwol_thermal_temp {
+ #endif
+ };
+ 
++#ifdef WLAN_DDR_BW_MITIGATION
++/**
++ * struct wlan_fwol_bwm_params - BW mitigation related config items
++ * @bw_mitigation_enable: To control bw mitigation feature
++ * @throttle_dutycycle_level: Array of throttle duty cycle levels
++ * @bw_sampling_time: sampling time for bw mitigation in ms
++ * @priority_bwm: priority of the bw mitigation to consider by fw
++ */
++struct wlan_fwol_bwm_params {
++	bool bw_mitigation_enable;
++	uint32_t throttle_dutycycle_level[FWOL_THERMAL_THROTTLE_LEVEL_MAX];
++	uint16_t bw_sampling_time;
++	uint8_t priority_bwm;
++};
++#endif
++
+ /**
+  * struct wlan_fwol_ie_allowlist - Probe request IE allowlist config items
+  * @ie_allowlist: IE allowlist flag
+@@ -263,6 +279,9 @@ struct wlan_fwol_cfg {
+ 	/* Add CFG and INI items here */
+ 	struct wlan_fwol_coex_config coex_config;
+ 	struct wlan_fwol_thermal_temp thermal_temp_cfg;
++#ifdef WLAN_DDR_BW_MITIGATION
++	struct wlan_fwol_bwm_params bwm_params_cfg;
++#endif
+ 	struct wlan_fwol_ie_allowlist ie_allowlist_cfg;
+ 	struct wlan_fwol_neighbor_report_cfg neighbor_report_cfg;
+ 	bool ani_enabled;
+diff --git a/qcacld-3.0/components/fw_offload/core/src/wlan_fw_offload_main.c b/qcacld-3.0/components/fw_offload/core/src/wlan_fw_offload_main.c
+index d121b087..f4aa478f 100644
+--- a/qcacld-3.0/components/fw_offload/core/src/wlan_fw_offload_main.c
++++ b/qcacld-3.0/components/fw_offload/core/src/wlan_fw_offload_main.c
+@@ -633,6 +633,39 @@ static inline void fwol_ofdm_scrambler_init(struct wlan_fwol_cfg *fwol_cfg,
+ }
+ #endif
+ 
++#ifdef WLAN_DDR_BW_MITIGATION
++static void
++fwol_init_bw_mitigation_param_in_cfg(struct wlan_objmgr_psoc *psoc,
++				     struct wlan_fwol_cfg *fwol_cfg)
++{
++	struct wlan_fwol_bwm_params *bwm_param = &fwol_cfg->bwm_params_cfg;
++
++	bwm_param->bw_mitigation_enable =
++				cfg_get(psoc, CFG_DDR_BW_MITIGATION_ENABLE);
++	bwm_param->bw_sampling_time =
++				cfg_get(psoc, CFG_DDR_BWM_SAMPLING_TIME);
++	bwm_param->throttle_dutycycle_level[0] =
++			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL0);
++	bwm_param->throttle_dutycycle_level[1] =
++			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL1);
++	bwm_param->throttle_dutycycle_level[2] =
++			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL2);
++	bwm_param->throttle_dutycycle_level[3] =
++			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL3);
++	bwm_param->throttle_dutycycle_level[4] =
++			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL4);
++	bwm_param->throttle_dutycycle_level[5] =
++			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL5);
++	bwm_param->priority_bwm = cfg_get(psoc, CFG_DDR_BWM_PRIORITY);
++}
++#else
++static inline void
++fwol_init_bw_mitigation_param_in_cfg(struct wlan_objmgr_psoc *psoc,
++				     struct wlan_fwol_cfg *fwol_cfg)
++{
++}
++#endif
++
+ QDF_STATUS fwol_cfg_on_psoc_enable(struct wlan_objmgr_psoc *psoc)
+ {
+ 	QDF_STATUS status = QDF_STATUS_SUCCESS;
+@@ -651,6 +684,7 @@ QDF_STATUS fwol_cfg_on_psoc_enable(struct wlan_objmgr_psoc *psoc)
+ 
+ 	fwol_init_coex_config_in_cfg(psoc, &fwol_cfg->coex_config);
+ 	fwol_init_thermal_temp_in_cfg(psoc, &fwol_cfg->thermal_temp_cfg);
++	fwol_init_bw_mitigation_param_in_cfg(psoc, fwol_cfg);
+ 	fwol_init_ie_whiltelist_in_cfg(psoc, &fwol_cfg->ie_allowlist_cfg);
+ 	fwol_init_neighbor_report_cfg(psoc, &fwol_cfg->neighbor_report_cfg);
+ 	fwol_cfg->ani_enabled = cfg_get(psoc, CFG_ENABLE_ANI);
+diff --git a/qcacld-3.0/components/fw_offload/dispatcher/inc/cfg_thermal_temp.h b/qcacld-3.0/components/fw_offload/dispatcher/inc/cfg_thermal_temp.h
+index 2e223c6c..8d369440 100644
+--- a/qcacld-3.0/components/fw_offload/dispatcher/inc/cfg_thermal_temp.h
++++ b/qcacld-3.0/components/fw_offload/dispatcher/inc/cfg_thermal_temp.h
+@@ -536,6 +536,75 @@
+ 					CFG_VALUE_OR_DEFAULT, \
+ 					"Thermal Stats Temperature Offset")
+ 
++#define CFG_DDR_BWM_SAMPLING_TIME CFG_INI_UINT( \
++				"ddr_bwm_sampling_time", \
++				10, \
++				100, \
++				100, \
++				CFG_VALUE_OR_DEFAULT, \
++				"ddr bw mitigation sampling time")
++
++#define CFG_DDR_BW_MITIGATION_ENABLE CFG_INI_BOOL( \
++			"ddr_bw_mitigation_enable", \
++			0, \
++			"DDR BW mitigation feature control")
++
++#define CFG_DDR_BWM_PRIORITY CFG_INI_UINT( \
++				"ddr_bwm_priority", \
++				1, \
++				10, \
++				1, \
++				CFG_VALUE_OR_DEFAULT, \
++				"ddr bw mitigation priority")
++
++#define CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL0 CFG_INI_UINT( \
++			"bwm_throttle_duty_cycle_level_0", \
++			0, \
++			0, \
++			0, \
++			CFG_VALUE_OR_DEFAULT, \
++			"BW mitigation throttle duty cycle level0")
++
++#define CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL1 CFG_INI_UINT( \
++			"bwm_throttle_duty_cycle_level_1", \
++			0, \
++			100, \
++			10, \
++			CFG_VALUE_OR_DEFAULT, \
++			"BW mitigation throttle duty cycle level1")
++
++#define CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL2 CFG_INI_UINT( \
++			"bwm_throttle_duty_cycle_level_2", \
++			0, \
++			100, \
++			30, \
++			CFG_VALUE_OR_DEFAULT, \
++			"BW mitigation throttle duty cycle level2")
++
++#define CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL3 CFG_INI_UINT( \
++			"bwm_throttle_duty_cycle_level_3", \
++			0, \
++			100, \
++			50, \
++			CFG_VALUE_OR_DEFAULT, \
++			"BW mitigation throttle duty cycle level3")
++
++#define CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL4 CFG_INI_UINT( \
++			"bwm_throttle_duty_cycle_level_4", \
++			0, \
++			100, \
++			70, \
++			CFG_VALUE_OR_DEFAULT, \
++			"BW mitigation throttle duty cycle level4")
++
++#define CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL5 CFG_INI_UINT( \
++			"bwm_throttle_duty_cycle_level_5", \
++			0, \
++			100, \
++			90, \
++			CFG_VALUE_OR_DEFAULT, \
++			"BW mitigation throttle duty cycle level5")
++
+ #define CFG_THERMAL_TEMP_ALL \
+ 	CFG(CFG_THERMAL_TEMP_MIN_LEVEL0) \
+ 	CFG(CFG_THERMAL_TEMP_MAX_LEVEL0) \
+@@ -561,6 +630,15 @@
+ 	CFG(CFG_THERMAL_APPS_PRIORITY) \
+ 	CFG(CFG_THERMAL_WPPS_PRIOITY) \
+ 	CFG(CFG_THERMAL_MGMT_ACTION) \
+-	CFG(CFG_THERMAL_STATS_TEMP_OFFSET)\
++	CFG(CFG_THERMAL_STATS_TEMP_OFFSET) \
++	CFG(CFG_DDR_BWM_SAMPLING_TIME) \
++	CFG(CFG_DDR_BW_MITIGATION_ENABLE) \
++	CFG(CFG_DDR_BWM_PRIORITY) \
++	CFG(CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL0) \
++	CFG(CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL1) \
++	CFG(CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL2) \
++	CFG(CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL3) \
++	CFG(CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL4) \
++	CFG(CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL5)
+ 
+ #endif
+diff --git a/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c b/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c
+index 012b4f43..9382239b 100644
+--- a/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c
++++ b/qcacld-3.0/components/mlme/core/src/wlan_mlme_main.c
+@@ -1381,12 +1381,14 @@ static void mlme_init_sr_ini_cfg(struct wlan_objmgr_psoc *psoc,
+ static void mlme_init_generic_cfg(struct wlan_objmgr_psoc *psoc,
+ 				  struct wlan_mlme_generic *gen)
+ {
++	int hw_platform = get_hw_version_platform();
++
+ 	gen->rtt3_enabled = cfg_default(CFG_RTT3_ENABLE);
+ 	gen->rtt_mac_randomization =
+ 		cfg_get(psoc, CFG_ENABLE_RTT_MAC_RANDOMIZATION);
+ 	gen->band_capability =
+ 		cfg_get(psoc, CFG_BAND_CAPABILITY);
+-	if (mlme_xiaomi_hw_is_2g_5g_only()) {
++	if (hw_platform == XIAOMI_HW_PLATFORM_2G_5G_ONLY) {
+ 		mlme_debug("replace ini BandCapability=3, support both 2.4G and 5G");
+ 		gen->band_capability = BIT(REG_BAND_2G) | BIT(REG_BAND_5G);
+ 	} else if (!gen->band_capability) {
+@@ -1630,12 +1632,10 @@ static void
+ mlme_init_qos_edca_params(struct wlan_objmgr_psoc *psoc,
+ 			  struct wlan_mlme_edca_params *edca_params)
+ {
++	bool is_cn_build = mlme_xiaomi_hw_is_cn_build();
++
+ 	edca_params->enable_edca_params =
+ 			cfg_get(psoc, CFG_EDCA_ENABLE_PARAM);
+-	if (!mlme_xiaomi_hw_is_cn_build()) {
+-		mlme_debug("set enable_edca_params 0 due to not CN build");
+-		edca_params->enable_edca_params = false;
+-	}
+ 
+ 	edca_params->enable_wmm_txop =
+ 			cfg_get(psoc, CFG_ENABLE_WMM_TXOP);
+@@ -1669,6 +1669,11 @@ mlme_init_qos_edca_params(struct wlan_objmgr_psoc *psoc,
+ 
+ 	edca_params->edca_param_type =
+ 			cfg_get(psoc, CFG_EDCA_PIFS_PARAM_TYPE);
++
++	if (!is_cn_build) {
++		mlme_debug("set enable_edca_params 0 due to not CN build");
++		edca_params->enable_edca_params = false;
++	}
+ }
+ 
+ static void mlme_init_edca_params(struct wlan_objmgr_psoc *psoc,
+@@ -3568,11 +3573,13 @@ mlme_init_wifi_pos_11az_config(struct wlan_objmgr_psoc *psoc,
+ static void mlme_init_wifi_pos_cfg(struct wlan_objmgr_psoc *psoc,
+ 				   struct wlan_mlme_wifi_pos_cfg *wifi_pos_cfg)
+ {
++	bool is_2g_5g_only = mlme_xiaomi_hw_is_2g_5g_only();
++
+ 	wifi_pos_cfg->fine_time_meas_cap =
+ 		cfg_get(psoc, CFG_FINE_TIME_MEAS_CAPABILITY);
+ 	wifi_pos_cfg->oem_6g_support_disable =
+ 		cfg_get(psoc, CFG_OEM_SIXG_SUPPORT_DISABLE);
+-	if (mlme_xiaomi_hw_is_2g_5g_only()) {
++	if (is_2g_5g_only) {
+ 		mlme_debug("replace ini oem_6g_support_disable=1");
+ 		wifi_pos_cfg->oem_6g_support_disable = true;
+ 	}
+diff --git a/qcacld-3.0/components/pmo/core/src/wlan_pmo_main.c b/qcacld-3.0/components/pmo/core/src/wlan_pmo_main.c
+index 6aa5334d..bc5785a2 100644
+--- a/qcacld-3.0/components/pmo/core/src/wlan_pmo_main.c
++++ b/qcacld-3.0/components/pmo/core/src/wlan_pmo_main.c
+@@ -291,6 +291,8 @@ static void wlan_pmo_init_cfg(struct wlan_objmgr_psoc *psoc,
+ 			cfg_get(psoc, CFG_ACTIVE_UC_APF_MODE);
+ 	psoc_cfg->active_mc_bc_apf_mode =
+ 			cfg_get(psoc, CFG_ACTIVE_MC_BC_APF_MODE);
++	psoc_cfg->is_apf_configure_per_screen_state =
++			cfg_get(psoc, CFG_CONFIGURE_APF_PER_SCREEN_STATE);
+ 	psoc_cfg->ito_repeat_count = cfg_get(psoc, CFG_ITO_REPEAT_COUNT);
+ 	wlan_pmo_ra_filtering_init_cfg(psoc, psoc_cfg);
+ 	wlan_pmo_gpio_wakeup_init_cfg(psoc, psoc_cfg);
+diff --git a/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_apf_cfg.h b/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_apf_cfg.h
+index 8612b727..9cab5a30 100644
+--- a/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_apf_cfg.h
++++ b/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_apf_cfg.h
+@@ -92,9 +92,15 @@
+ 	CFG_VALUE_OR_DEFAULT, \
+ 	"Control MC/BC active APF mode")
+ 
++#define CFG_CONFIGURE_APF_PER_SCREEN_STATE CFG_INI_BOOL( \
++		"gConfigureAPFperScreenState", \
++		1, \
++		"Enable APF Support")
++
+ #define CFG_PMO_APF_ALL \
+ 	CFG(CFG_PMO_APF_ENABLE) \
+ 	CFG(CFG_ACTIVE_UC_APF_MODE) \
+-	CFG(CFG_ACTIVE_MC_BC_APF_MODE)
++	CFG(CFG_ACTIVE_MC_BC_APF_MODE) \
++	CFG(CFG_CONFIGURE_APF_PER_SCREEN_STATE)
+ 
+ #endif /* WLAN_PMO_APF_CFG_H__ */
+diff --git a/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_common_public_struct.h b/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_common_public_struct.h
+index 3a097c8d..fe6d7fe3 100644
+--- a/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_common_public_struct.h
++++ b/qcacld-3.0/components/pmo/dispatcher/inc/wlan_pmo_common_public_struct.h
+@@ -433,6 +433,8 @@ enum pmo_page_fault_action {
+  * wakeups needs to be monitored.
+  * @ssr_frequency_on_pagefault: Time in ms in which SSR needs to be triggered
+  * on max pagefault
++ * @is_apf_configure_per_screen_state: Configure APF mode enable/disable
++ * per screen off/on state
+  */
+ struct pmo_psoc_cfg {
+ 	bool ptrn_match_enable_all_vdev;
+@@ -523,6 +525,7 @@ struct pmo_psoc_cfg {
+ 	uint8_t min_pagefault_wakeups_for_action;
+ 	uint32_t interval_for_pagefault_wakeup_counts;
+ 	uint32_t ssr_frequency_on_pagefault;
++	bool is_apf_configure_per_screen_state;
+ };
+ 
+ /**
+diff --git a/qcacld-3.0/configs/config_to_feature.h b/qcacld-3.0/configs/config_to_feature.h
+index 3c9baad6..95fd04a1 100644
+--- a/qcacld-3.0/configs/config_to_feature.h
++++ b/qcacld-3.0/configs/config_to_feature.h
+@@ -661,6 +661,9 @@
+ #ifdef CONFIG_WLAN_THERMAL_MULTI_CLIENT_SUPPORT
+ #define FEATURE_WPSS_THERMAL_MITIGATION (1)
+ #endif
++#ifdef CONFIG_WLAN_DDR_BW_MITIGATION
++#define WLAN_DDR_BW_MITIGATION (1)
++#endif
+ #ifdef CONFIG_WLAN_SYSFS_DP_STATS
+ #define WLAN_SYSFS_DP_STATS (1)
+ #endif
+diff --git a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig b/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
+index 37ef0eba..88a8d1b8 100644
+--- a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
++++ b/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
+@@ -94,6 +94,7 @@ CONFIG_FEATURE_WLAN_WAPI=y
+ CONFIG_FIX_TXDMA_LIMITATION=y
+ CONFIG_FOURTH_CONNECTION=y
+ CONFIG_FW_THERMAL_THROTTLE=y
++CONFIG_WLAN_DDR_BW_MITIGATION=y
+ CONFIG_GTK_OFFLOAD=y
+ CONFIG_HAL_DISABLE_NON_BA_2K_JUMP_ERROR=y
+ CONFIG_HANDLE_BC_EAP_TX_FRM=y
+@@ -405,3 +406,4 @@ CONFIG_WLAN_SUPPORT_LAPB=y
+ CONFIG_WLAN_FEATURE_UL_JITTER=y
+ CONFIG_WLAN_SYNC_TSF_PLUS=y
+ CONFIG_WLAN_SYNC_TSF_TIMER=y
++CONFIG_WLAN_CHIPSET_LOG_MAX_SIZE=y
+diff --git a/qcacld-3.0/configs/wcn7750_defconfig b/qcacld-3.0/configs/wcn7750_defconfig
+index 6b950e7d..7c1c96bf 100644
+--- a/qcacld-3.0/configs/wcn7750_defconfig
++++ b/qcacld-3.0/configs/wcn7750_defconfig
+@@ -676,6 +676,7 @@ CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y
+ CONFIG_WLAN_ALLOCATE_GLOBAL_BUFFERS_DYNAMICALLY := n
+ CONFIG_WLAN_FEATURE_TWT := y
+ CONFIG_FW_THERMAL_THROTTLE := y
++CONFIG_WLAN_DDR_BW_MITIGATION := y
+ CONFIG_WLAN_FEATURE_BIG_DATA_STATS := y
+ CONFIG_WLAN_FEATURE_IGMP_OFFLOAD := y
+ CONFIG_WLAN_FEATURE_GET_USABLE_CHAN_LIST := y
+@@ -915,3 +916,4 @@ CONFIG_WLAN_SUPPORT_LAPB := y
+ CONFIG_WLAN_FEATURE_UL_JITTER := y
+ CONFIG_WLAN_SYNC_TSF_PLUS := y
+ CONFIG_WLAN_SYNC_TSF_TIMER := y
++CONFIG_WLAN_CHIPSET_LOG_MAX_SIZE := y
+diff --git a/qcacld-3.0/core/hdd/inc/wlan_hdd_he.h b/qcacld-3.0/core/hdd/inc/wlan_hdd_he.h
+index d2774fd0..326c6110 100644
+--- a/qcacld-3.0/core/hdd/inc/wlan_hdd_he.h
++++ b/qcacld-3.0/core/hdd/inc/wlan_hdd_he.h
+@@ -31,6 +31,7 @@ struct hdd_context;
+ struct wma_tgt_cfg;
+ struct hdd_beacon_data;
+ struct sap_config;
++#include "spatial_reuse_api.h"
+ 
+ #ifdef WLAN_FEATURE_11AX
+ /**
+@@ -142,6 +143,10 @@ int wlan_hdd_cfg80211_sr_operations(struct wiphy *wiphy,
+  */
+ void hdd_sr_register_callbacks(struct hdd_context *hdd_ctx);
+ 
++void hdd_sr_osif_events(struct wlan_objmgr_vdev *vdev,
++			enum sr_osif_operation sr_osif_oper,
++			enum sr_osif_reason_code sr_osif_rc);
++
+ #else
+ static inline
+ int wlan_hdd_cfg80211_sr_operations(struct wiphy *wiphy,
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_debugfs.c b/qcacld-3.0/core/hdd/src/wlan_hdd_debugfs.c
+index 5e5a2fb5..0c6740a0 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_debugfs.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_debugfs.c
+@@ -46,7 +46,7 @@
+ 
+ static bool hdd_periodic_pattern_map[MAXNUM_PERIODIC_TX_PTRNS];
+ 
+-static qdf_atomic_t debugfs_thread_count;
++qdf_atomic_t debugfs_thread_count;
+ 
+ void hdd_debugfs_thread_increment(void)
+ {
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
+index 55cff226..93f430e3 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
+@@ -44,6 +44,8 @@
+ #include "wlan_ipa_ucfg_api.h"
+ #include "wlan_hdd_debugfs.h"
+ #include "cfg_ucfg_api.h"
++#include "wlan_dp_prealloc.h"
++#include "wlan_pmo_main.h"
+ #include <linux/suspend.h>
+ #include <qdf_notifier.h>
+ #include <qdf_hang_event_notifier.h>
+@@ -603,7 +605,7 @@ int hdd_hif_open(struct device *dev, void *bdev, const struct hif_bus_id *bid,
+ 				hif_ctx, bus_type,
+ 				cfg_get(hdd_ctx->psoc,
+ 					CFG_DP_CE_SERVICE_MAX_YIELD_TIME));
+-	ucfg_pmo_psoc_set_hif_handle(hdd_ctx->psoc, hif_ctx);
++	pmo_core_psoc_set_hif_handle(hdd_ctx->psoc, hif_ctx);
+ 	ucfg_dp_set_hif_handle(hdd_ctx->psoc, hif_ctx);
+ 	hif_set_ce_service_max_rx_ind_flush(hif_ctx,
+ 				cfg_get(hdd_ctx->psoc,
+@@ -639,7 +641,7 @@ void hdd_hif_close(struct hdd_context *hdd_ctx, void *hif_ctx)
+ 	hdd_deinit_cds_hif_context();
+ 	hif_close(hif_ctx);
+ 
+-	ucfg_pmo_psoc_set_hif_handle(hdd_ctx->psoc, NULL);
++	pmo_core_psoc_set_hif_handle(hdd_ctx->psoc, NULL);
+ }
+ 
+ /**
+@@ -801,8 +803,7 @@ static int __hdd_soc_probe(struct device *dev,
+ 		goto assert_fail_count;
+ 	}
+ 
+-	status = ucfg_dp_prealloc_init((struct cdp_ctrl_objmgr_psoc *)
+-					hdd_ctx->psoc);
++	status = dp_prealloc_init((struct cdp_ctrl_objmgr_psoc *)hdd_ctx->psoc);
+ 
+ 	if (status != QDF_STATUS_SUCCESS) {
+ 		errno = qdf_status_to_os_return(status);
+@@ -833,7 +834,7 @@ wlan_exit:
+ 	hdd_wlan_exit(hdd_ctx);
+ 
+ hdd_context_destroy:
+-	ucfg_dp_prealloc_deinit();
++	dp_prealloc_deinit();
+ 
+ dp_prealloc_fail:
+ 	hdd_context_destroy(hdd_ctx);
+@@ -1039,7 +1040,7 @@ static void __hdd_soc_remove(struct device *dev)
+ 	cds_set_driver_in_bad_state(false);
+ 	cds_set_unload_in_progress(false);
+ 
+-	ucfg_dp_prealloc_deinit();
++	dp_prealloc_deinit();
+ 
+ 	pr_info("%s: Driver De-initialized\n", WLAN_MODULE_NAME);
+ }
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_he.c b/qcacld-3.0/core/hdd/src/wlan_hdd_he.c
+index 3fe9ece4..183a3ee9 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_he.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_he.c
+@@ -359,7 +359,7 @@ sr_events_end:
+ 	return status;
+ }
+ 
+-static void hdd_sr_osif_events(struct wlan_objmgr_vdev *vdev,
++void hdd_sr_osif_events(struct wlan_objmgr_vdev *vdev,
+ 			       enum sr_osif_operation sr_osif_oper,
+ 			       enum sr_osif_reason_code sr_osif_rc)
+ {
 diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+index 10541eca..5d10735e 100644
 --- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
 +++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
-@@ -130,6 +130,8 @@
+@@ -130,6 +130,12 @@
  #include <cdp_txrx_handle.h>
  #include <qca_vendor.h>
  #include "wlan_pmo_ucfg_api.h"
++#include "wlan_pmo_obj_mgmt_api.h"
++#include "wlan_pmo_main.h"
 +#include "wlan_pmo_priv.h"
 +#include "wlan_pmo_objmgr.h"
++#include "i_cfg.h"
++#include "i_cfg_objmgr.h"
  #include "sir_api.h"
  #include "os_if_wifi_pos.h"
  #include "wifi_pos_api.h"
-@@ -255,6 +257,8 @@
- #include "wlan_p2p_ucfg_api.h"
+@@ -139,6 +145,7 @@
+ #include "nan_public_structs.h"
+ #include "nan_ucfg_api.h"
+ #include "wlan_reg_ucfg_api.h"
++#include "reg_services_common.h"
+ #include "wlan_hdd_afc.h"
+ #include "wlan_dfs_ucfg_api.h"
+ #include "wlan_hdd_rx_monitor.h"
+@@ -181,6 +188,8 @@
+ #include "wlan_reg_ucfg_api.h"
+ #include "wlan_ocb_ucfg_api.h"
+ #include <wlan_hdd_spectralscan.h>
++#include "wlan_spectral_utils_api.h"
++#include "wma_api.h"
+ #include "wlan_green_ap_ucfg_api.h"
+ #include <wlan_p2p_ucfg_api.h>
+ #include <wlan_interop_issues_ap_ucfg_api.h>
+@@ -188,6 +197,7 @@
+ #include <wlan_hdd_debugfs_coex.h>
+ #include <wlan_hdd_debugfs_config.h>
+ #include "wlan_dlm_ucfg_api.h"
++#include "wlan_dlm_main.h"
+ #include "ftm_time_sync_ucfg_api.h"
+ #include "wlan_pre_cac_ucfg_api.h"
+ #include "ol_txrx.h"
+@@ -212,6 +222,17 @@
+ #include "wlan_hdd_gpio_wakeup.h"
+ #include "wlan_hdd_bootup_marker.h"
+ #include "wlan_dp_ucfg_api.h"
++
++void dp_bus_bw_compute_timer_stop(struct wlan_objmgr_psoc *psoc);
++extern qdf_atomic_t debugfs_thread_count;
++extern qdf_mutex_t mibstats_lock;
++struct wlan_dp_psoc_context;
++extern struct wlan_dp_psoc_context *gp_dp_ctx;
++void dp_wait_complete_tasks(struct wlan_dp_psoc_context *dp_ctx);
++extern bool osif_request_manager_is_initialized;
++QDF_STATUS wlan_mgmt_txrx_pdev_close(struct wlan_objmgr_pdev *pdev);
++QDF_STATUS wlan_cfr_pdev_close(struct wlan_objmgr_pdev *pdev);
++QDF_STATUS regulatory_pdev_close(struct wlan_objmgr_pdev *pdev);
+ #include "wlan_hdd_medium_assess.h"
+ #include "wlan_hdd_eht.h"
+ #include <linux/bitfield.h>
+@@ -229,6 +250,7 @@
+ #include <son_ucfg_api.h>
+ #include "osif_twt_util.h"
+ #include "wlan_twt_ucfg_ext_api.h"
++#include "twt/core/src/wlan_twt_cfg.h"
+ #include "wlan_hdd_mcc_quota.h"
+ #include "osif_pre_cac.h"
+ #include "wlan_hdd_pre_cac.h"
+@@ -256,6 +278,26 @@
  #include "wifi_pos_api.h"
  #include "wlan_mgmt_rx_srng_ucfg_api.h"
  
 +void dp_try_set_rps_cpu_mask(struct wlan_objmgr_psoc *psoc);
++QDF_STATUS p2p_psoc_object_open(struct wlan_objmgr_psoc *soc);
++QDF_STATUS p2p_psoc_object_close(struct wlan_objmgr_psoc *soc);
++void wlan_mlme_psoc_flush_peer_trans_history(struct wlan_objmgr_psoc *psoc);
++
++struct hdd_cfg_value_store {
++	char *path;
++	qdf_list_node_t node;
++	qdf_atomic_t users;
++	struct cfg_values values;
++};
++
++struct hdd_cfg_psoc_ctx {
++	struct hdd_cfg_value_store *store;
++};
++
++#define hdd_cfg_get_values(psoc) \
++	(&((struct hdd_cfg_psoc_ctx *)wlan_objmgr_psoc_get_comp_private_obj( \
++		(psoc), WLAN_UMAC_COMP_CONFIG))->store->values)
 +
  #ifdef MULTI_CLIENT_LL_SUPPORT
  #define WLAM_WLM_HOST_DRIVER_PORT_ID 0xFFFFFF
  #endif
-@@ -4069,7 +4073,7 @@ void hdd_update_hw_sw_info(struct hdd_context *hdd_ctx)
+@@ -348,7 +390,7 @@ static bool is_mode_change_psoc_idle_shutdown;
+ 
+ #define WLAN_NLINK_CESIUM 30
+ 
+-static qdf_wake_lock_t wlan_wake_lock;
++qdf_wake_lock_t wlan_wake_lock;
+ 
+ /* The valid PCIe gen speeds are 1, 2, 3 */
+ #define HDD_INVALID_MIN_PCIE_GEN_SPEED (0)
+@@ -482,7 +524,7 @@ struct sock *cesium_nl_srv_sock;
+ static void wlan_hdd_auto_shutdown_cb(void);
+ #endif
+ 
+-static void hdd_dp_register_callbacks(struct hdd_context *hdd_ctx);
++static __always_inline void hdd_dp_register_callbacks(struct hdd_context *hdd_ctx);
+ 
+ /**
+  * wlan_hdd_deinit_port_id_info()- Initialize/deinitialize
+@@ -4080,13 +4122,15 @@ void hdd_update_hw_sw_info(struct hdd_context *hdd_ctx)
   *
   * Return: none
   */
@@ -29,7 +779,133 @@ diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/w
  hdd_update_cds_ac_specs_params(struct hdd_context *hdd_ctx)
  {
  	uint8_t tx_sched_wrr_param[TX_SCHED_WRR_PARAMS_NUM] = {0};
-@@ -5252,31 +5252,21 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 	qdf_size_t out_size = 0;
+ 	int i;
+ 	struct cds_context *cds_ctx;
++	struct cfg_values *cfg_values;
++	const char *tx_sched_wrr_param_str;
+ 
+ 	if (!hdd_ctx)
+ 		return;
+@@ -4101,44 +4145,43 @@ hdd_update_cds_ac_specs_params(struct hdd_context *hdd_ctx)
+ 	if (!cds_ctx)
+ 		return;
+ 
++	#pragma clang loop unroll(disable)
+ 	for (i = 0; i < QCA_WLAN_AC_ALL; i++) {
+ 		switch (i) {
+ 		case QCA_WLAN_AC_BE:
+-			qdf_uint8_array_parse(
+-				cfg_get(hdd_ctx->psoc,
+-					CFG_DP_ENABLE_TX_SCHED_WRR_BE),
+-				tx_sched_wrr_param,
+-				sizeof(tx_sched_wrr_param),
+-				&out_size);
+-			break;
++			cfg_values = hdd_cfg_get_values(hdd_ctx->psoc);
++			barrier();
++			tx_sched_wrr_param_str =
++				cfg_values->__CFG_DP_ENABLE_TX_SCHED_WRR_BE_internal;
++			goto parse;
+ 		case QCA_WLAN_AC_BK:
+-			qdf_uint8_array_parse(
+-				cfg_get(hdd_ctx->psoc,
+-					CFG_DP_ENABLE_TX_SCHED_WRR_BK),
+-				tx_sched_wrr_param,
+-				sizeof(tx_sched_wrr_param),
+-				&out_size);
+-			break;
++			cfg_values = hdd_cfg_get_values(hdd_ctx->psoc);
++			barrier();
++			tx_sched_wrr_param_str =
++				cfg_values->__CFG_DP_ENABLE_TX_SCHED_WRR_BK_internal;
++			goto parse;
+ 		case QCA_WLAN_AC_VI:
+-			qdf_uint8_array_parse(
+-				cfg_get(hdd_ctx->psoc,
+-					CFG_DP_ENABLE_TX_SCHED_WRR_VI),
+-				tx_sched_wrr_param,
+-				sizeof(tx_sched_wrr_param),
+-				&out_size);
+-			break;
++			cfg_values = hdd_cfg_get_values(hdd_ctx->psoc);
++			barrier();
++			tx_sched_wrr_param_str =
++				cfg_values->__CFG_DP_ENABLE_TX_SCHED_WRR_VI_internal;
++			goto parse;
+ 		case QCA_WLAN_AC_VO:
+-			qdf_uint8_array_parse(
+-				cfg_get(hdd_ctx->psoc,
+-					CFG_DP_ENABLE_TX_SCHED_WRR_VO),
+-				tx_sched_wrr_param,
+-				sizeof(tx_sched_wrr_param),
+-				&out_size);
+-			break;
++			cfg_values = hdd_cfg_get_values(hdd_ctx->psoc);
++			barrier();
++			tx_sched_wrr_param_str =
++				cfg_values->__CFG_DP_ENABLE_TX_SCHED_WRR_VO_internal;
++			goto parse;
+ 		default:
+-			break;
++			goto next;
+ 		}
+ 
++parse:
++		qdf_uint8_array_parse(tx_sched_wrr_param_str,
++				      tx_sched_wrr_param,
++				      sizeof(tx_sched_wrr_param),
++				      &out_size);
++
+ 		if (out_size == TX_SCHED_WRR_PARAMS_NUM) {
+ 			cds_ctx->ac_specs[i].wrr_skip_weight =
+ 						tx_sched_wrr_param[0];
+@@ -4152,6 +4195,7 @@ hdd_update_cds_ac_specs_params(struct hdd_context *hdd_ctx)
+ 						tx_sched_wrr_param[4];
+ 		}
+ 
++next:
+ 		out_size = 0;
+ 	}
+ }
+@@ -5008,11 +5052,12 @@ static int hdd_deconfigure_cds(struct hdd_context *hdd_ctx)
+  *
+  * Return: None
+  */
+-static inline void hdd_qmi_register_callbacks(struct hdd_context *hdd_ctx)
++static __always_inline void hdd_qmi_register_callbacks(struct hdd_context *hdd_ctx)
+ {
+ 	struct wlan_qmi_psoc_callbacks cb_obj;
+ 
+-	os_if_qmi_register_callbacks(hdd_ctx->psoc, &cb_obj);
++	os_if_qmi_wfds_register_callbacks(&cb_obj);
++	ucfg_qmi_register_os_if_callbacks(hdd_ctx->psoc, &cb_obj);
+ }
+ 
+ /**
+@@ -5026,8 +5071,9 @@ static inline void hdd_qmi_register_callbacks(struct hdd_context *hdd_ctx)
+  *
+  * Return: 0 on success and errno on failure.
+  */
+-static int hdd_set_pcie_params(struct hdd_context *hdd_ctx,
+-			       uint8_t index, struct dev_set_param *param)
++static noinline int hdd_set_pcie_params(struct hdd_context *hdd_ctx,
++					uint8_t index,
++					struct dev_set_param *param)
+ {
+ 	int ret = 0;
+ 	uint8_t check_value = 0;
+@@ -5189,7 +5235,8 @@ static void
+ hdd_init_max_chipset_log_size_enable_cfg(struct hdd_context *hdd_ctx)
+ {
+ 	hdd_ctx->max_chipset_log_size_enable =
+-		cfg_get(hdd_ctx->psoc, CFG_MAX_CHIPSET_LOG_SIZE_ENABLE);
++		hdd_cfg_get_values(hdd_ctx->psoc)->
++		__CFG_MAX_CHIPSET_LOG_SIZE_ENABLE_internal;
+ }
+ #else
+ static inline void
+@@ -5263,21 +5310,13 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  			goto power_down;
  		}
  
@@ -52,7 +928,7 @@ diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/w
  			}
  
  			status = epping_enable(qdf_dev->dev, false);
- 			if (status) {
+@@ -5285,20 +5324,15 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  				hdd_err("Failed to enable in epping mode : %d",
  					status);
  				epping_close();
@@ -61,7 +937,7 @@ diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/w
  			}
  
  			hdd_info("epping mode enabled");
-@@ -5286,14 +5276,8 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 			break;
  		}
  
 -		if (pld_is_ipa_offload_disabled(qdf_dev->dev))
@@ -76,7 +952,7 @@ diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/w
  
  		hdd_update_cds_ac_specs_params(hdd_ctx);
  
-@@ -5308,14 +5292,14 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+@@ -5311,14 +5345,14 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
  			hdd_err("Failed to Open legacy components; status: %d",
  				status);
  			ret = qdf_status_to_os_return(status);
@@ -93,7 +969,84 @@ diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/w
  		}
  
  		status = wbuff_module_init();
-@@ -5537,12 +5521,6 @@ psoc_close:
+@@ -5381,7 +5415,7 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 
+ 		hdd_son_register_callbacks(hdd_ctx);
+ 
+-		hdd_sr_register_callbacks(hdd_ctx);
++		wlan_sr_register_callback(hdd_ctx->psoc, hdd_sr_osif_events);
+ 
+ 		wlan_hdd_register_btc_chain_mode_handler(hdd_ctx->psoc);
+ 
+@@ -5402,7 +5436,7 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 		 * it is required to trigger WMI_PDEV_DMA_RING_CFG_REQ_CMDID
+ 		 * to FW when power save isn't enable.
+ 		 */
+-		hdd_spectral_register_to_dbr(hdd_ctx);
++		spectral_pdev_open(hdd_ctx->pdev);
+ 
+ 		hdd_init_max_chipset_log_size_enable_cfg(hdd_ctx);
+ 		hdd_create_sysfs_files(hdd_ctx);
+@@ -5421,7 +5455,7 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 			if (QDF_IS_STATUS_ERROR(ret))
+ 				break;
+ 			index++;
+-			ret = sme_send_multi_pdev_vdev_set_params(
++			ret = wma_send_multi_pdev_vdev_set_params(
+ 					MLME_PDEV_SETPARAM,
+ 					WMI_PDEV_ID_SOC, setparam, index);
+ 			if (QDF_IS_STATUS_ERROR(ret)) {
+@@ -5452,7 +5486,7 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 
+ 		hdd_skip_acs_scan_timer_init(hdd_ctx);
+ 
+-		hdd_set_hif_init_phase(hif_ctx, false);
++		hif_srng_init_phase(hif_ctx, false);
+ 		hdd_hif_set_enable_detection(hif_ctx, true);
+ 
+ 		wlan_hdd_start_connectivity_logging(hdd_ctx);
+@@ -5476,8 +5510,6 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 				 hdd_softap_ipa_start_xmit);
+ 	ucfg_ipa_reg_send_to_nw_cb(hdd_ctx->pdev,
+ 				   hdd_ipa_send_nbuf_to_network);
+-	ucfg_dp_reg_ipa_rsp_ind(hdd_ctx->pdev);
+-
+ 	if (!pld_get_thermal_state(hdd_ctx->parent_dev, &thermal_state,
+ 				   THERMAL_MONITOR_APPS)) {
+ 		if (thermal_state > QCA_WLAN_VENDOR_THERMAL_LEVEL_NONE)
+@@ -5492,6 +5524,13 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 			hdd_send_thermal_mitigation_val(hdd_ctx, thermal_state,
+ 							THERMAL_MONITOR_WPSS);
+ 	}
++
++	if (!pld_get_thermal_state(hdd_ctx->parent_dev, &thermal_state,
++				   THERMAL_MONITOR_DDR_BWM)) {
++		if (thermal_state > QCA_WLAN_VENDOR_THERMAL_LEVEL_NONE)
++			hdd_send_ddr_bw_mitigation_level(hdd_ctx, thermal_state,
++						THERMAL_MONITOR_DDR_BWM);
++	}
+ 	hdd_register_get_port_status_notifier(hdd_ctx);
+ 
+ 	hdd_exit();
+@@ -5505,7 +5544,7 @@ sched_disable:
+ 	 * Disable scheduler 1st so that scheduler thread doesn't send messages
+ 	 * to fw in parallel to the cleanup
+ 	 */
+-	dispatcher_disable();
++	scheduler_disable();
+ 	hdd_destroy_sysfs_files();
+ 	cds_post_disable();
+ unregister_notifiers:
+@@ -5529,7 +5568,7 @@ cds_txrx_free:
+ 	cds_dp_close(hdd_ctx->psoc);
+ 
+ close:
+-	dispatcher_disable();
++	scheduler_disable();
+ 	hdd_ctx->driver_status = DRIVER_MODULES_CLOSED;
+ 	hdd_info("Wlan transition aborted (now CLOSED)");
+ 
+@@ -5540,12 +5579,6 @@ psoc_close:
  	wlan_global_lmac_if_close(hdd_ctx->psoc);
  	cds_deinit_ini_config();
  
@@ -106,7 +1059,51 @@ diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/w
  hif_close:
  	hif_ctx = cds_get_context(QDF_MODULE_ID_HIF);
  	hdd_hif_close(hdd_ctx, hif_ctx);
-@@ -15225,7 +15203,7 @@ void hdd_psoc_idle_timer_stop(struct hdd_context *hdd_ctx)
+@@ -9948,7 +9981,7 @@ void hdd_close_adapter(struct hdd_context *hdd_ctx,
+ 	 * Stop the global bus bandwidth timer while touching the adapter list
+ 	 * to avoid bad memory access by the timer handler.
+ 	 */
+-	ucfg_dp_bus_bw_compute_timer_stop(hdd_ctx->psoc);
++	dp_bus_bw_compute_timer_stop(hdd_ctx->psoc);
+ 
+ 	hdd_check_for_net_dev_ref_leak(adapter);
+ 	hdd_clear_usd_adapter(hdd_ctx, adapter);
+@@ -12536,12 +12569,11 @@ void hdd_wlan_exit(struct hdd_context *hdd_ctx)
+ 
+ 	hdd_enter();
+ 
+-	ucfg_dp_wait_complete_tasks();
+-	wlan_hdd_destroy_mib_stats_lock();
+-	hdd_debugfs_ini_config_deinit(hdd_ctx);
+-	hdd_debugfs_mws_coex_info_deinit(hdd_ctx);
++	dp_wait_complete_tasks(gp_dp_ctx);
++	qdf_mutex_destroy(&mibstats_lock);
+ 	hdd_psoc_idle_timer_stop(hdd_ctx);
+-	hdd_regulatory_deinit(hdd_ctx);
++	qdf_flush_work(&hdd_ctx->country_change_work);
++	qdf_destroy_work(0, &hdd_ctx->country_change_work);
+ 
+ 	/*
+ 	 * Powersave Offload Case
+@@ -12598,7 +12630,7 @@ void hdd_wlan_exit(struct hdd_context *hdd_ctx)
+ 	qdf_spinlock_destroy(&hdd_ctx->connection_status_lock);
+ 	wlan_hdd_cache_chann_mutex_destroy(hdd_ctx);
+ 
+-	osif_request_manager_deinit();
++	osif_request_manager_is_initialized = false;
+ 
+ 	hdd_close_all_adapters(hdd_ctx, false);
+ 
+@@ -13660,7 +13692,7 @@ static QDF_STATUS wlan_hdd_get_netdev_by_vdev_id(uint32_t vdev_id,
+  *
+  * Return: None
+  */
+-static void hdd_dp_register_callbacks(struct hdd_context *hdd_ctx)
++static __always_inline void hdd_dp_register_callbacks(struct hdd_context *hdd_ctx)
+ {
+ 	struct wlan_dp_psoc_callbacks cb_obj = {0};
+ 
+@@ -15226,7 +15258,7 @@ void hdd_psoc_idle_timer_start(struct hdd_context *hdd_ctx)
  
  void hdd_psoc_idle_timer_stop(struct hdd_context *hdd_ctx)
  {
@@ -115,7 +1112,142 @@ diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/w
  	hdd_allow_suspend(WIFI_POWER_EVENT_WAKELOCK_IFACE_CHANGE_TIMER);
  	hdd_debug("Stopped psoc idle timer");
  }
-@@ -19017,7 +18995,7 @@ QDF_STATUS hdd_psoc_create_vdevs(struct hdd_context *hdd_ctx)
+@@ -16488,6 +16520,12 @@ stop_ap_link:
+ 	return qdf_status_to_os_return(status);
+ }
+ 
++/* stock parity: keep CDS config accesses close to stock codegen */
++#define HDD_CAT3_INNER(a, b, c) a##b##c
++#define HDD_CAT3(a, b, c) HDD_CAT3_INNER(a, b, c)
++#define HDD_CFG_FW_PART FW_DEBUG_ENABLE
++#define HDD_CFG_PMO_DEBUG_FIELD HDD_CAT3(__CFG_PMO_, HDD_CFG_FW_PART, _internal)
++
+ #if defined(QCA_LL_TX_FLOW_CONTROL_V2) || defined(QCA_LL_PDEV_TX_FLOW_CONTROL)
+ /**
+  * hdd_txrx_populate_cds_config() - Populate txrx cds configuration
+@@ -16496,14 +16534,16 @@ stop_ap_link:
+  *
+  * Return: none
+  */
+-static inline void hdd_txrx_populate_cds_config(struct cds_config_info
+-						*cds_cfg,
+-						struct hdd_context *hdd_ctx)
++static __always_inline void hdd_txrx_populate_cds_config(struct cds_config_info
++							 *cds_cfg,
++							 struct hdd_context *hdd_ctx)
+ {
+ 	cds_cfg->tx_flow_stop_queue_th =
+-		cfg_get(hdd_ctx->psoc, CFG_DP_TX_FLOW_STOP_QUEUE_TH);
++		hdd_cfg_get_values(hdd_ctx->psoc)->
++		__CFG_DP_TX_FLOW_STOP_QUEUE_TH_internal;
+ 	cds_cfg->tx_flow_start_queue_offset =
+-		cfg_get(hdd_ctx->psoc, CFG_DP_TX_FLOW_START_QUEUE_OFFSET);
++		hdd_cfg_get_values(hdd_ctx->psoc)->
++		__CFG_DP_TX_FLOW_START_QUEUE_OFFSET_internal;
+ 	/* configuration for DP RX Threads */
+ 	cds_cfg->enable_dp_rx_threads =
+ 		ucfg_dp_is_rx_threads_enabled(hdd_ctx->psoc);
+@@ -16593,7 +16633,8 @@ static int hdd_update_cds_config(struct hdd_context *hdd_ctx)
+ 	cds_cfg->max_station = value;
+ 	cds_cfg->sub_20_channel_width = hdd_ctx->config->sub_20_ch_width;
+ 	cds_cfg->max_msdus_per_rxinorderind =
+-		cfg_get(hdd_ctx->psoc, CFG_DP_MAX_MSDUS_PER_RXIND);
++		hdd_cfg_get_values(hdd_ctx->psoc)->
++		__CFG_DP_MAX_MSDUS_PER_RXIND_internal;
+ 	cds_cfg->self_recovery_enabled = self_recovery;
+ 	cds_cfg->fw_timeout_crash = fw_timeout_crash;
+ 
+@@ -16605,7 +16646,8 @@ static int hdd_update_cds_config(struct hdd_context *hdd_ctx)
+ 	hdd_txrx_populate_cds_config(cds_cfg, hdd_ctx);
+ 	hdd_lpass_populate_cds_config(cds_cfg, hdd_ctx);
+ 	cds_cfg->is_pm_fw_debug_enable =
+-				ucfg_pmo_is_fw_debug_enable(hdd_ctx->psoc);
++		hdd_cfg_get_values(hdd_ctx->psoc)->
++		HDD_CFG_PMO_DEBUG_FIELD;
+ 	cds_init_ini_config(cds_cfg);
+ 	return 0;
+ 
+@@ -16648,7 +16690,7 @@ static int hdd_update_user_config(struct hdd_context *hdd_ctx)
+ 	if (!QDF_IS_STATUS_SUCCESS(status))
+ 		hdd_err("Invalid 11h_enable flag");
+ 	user_config->is_11h_support_enabled = value;
+-	band_capability = wlan_reg_band_bitmap_to_band_info(band_bitmap);
++	band_capability = reg_band_bitmap_to_band_info(band_bitmap);
+ 	user_config->band_capability = band_capability;
+ 	wlan_objmgr_psoc_set_user_config(hdd_ctx->psoc, user_config);
+ 
+@@ -17252,12 +17294,27 @@ static int hdd_pre_enable_configure(struct hdd_context *hdd_ctx)
+ 		}
+ 	}
+ 
+-	ret = hdd_set_pcie_params(hdd_ctx, index, setparam);
++	check_value = false;
++	ret = ucfg_fwol_get_pcie_config(hdd_ctx->psoc, &check_value);
+ 	if (QDF_IS_STATUS_ERROR(ret))
+ 		goto out;
++
++	if (QDF_GLOBAL_FTM_MODE == hdd_get_conparam())
++		ret = mlme_check_index_setparam(setparam,
++						wmi_pdev_param_pcie_config,
++						(int)check_value, index++,
++						FTM_MAX_PDEV_PARAMS);
+ 	else
+-		index++;
+-	ret = sme_send_multi_pdev_vdev_set_params(MLME_PDEV_SETPARAM,
++		ret = mlme_check_index_setparam(setparam,
++						wmi_pdev_param_pcie_config,
++						(int)check_value, index++,
++						MAX_PDEV_PRE_ENABLE_PARAMS);
++	if (QDF_IS_STATUS_ERROR(ret)) {
++		hdd_err("failed to set wmi_pdev_param_pcie_config");
++		goto out;
++	}
++
++	ret = wma_send_multi_pdev_vdev_set_params(MLME_PDEV_SETPARAM,
+ 						  WMI_PDEV_ID_SOC, setparam,
+ 						  index);
+ 	if (QDF_IS_STATUS_ERROR(ret)) {
+@@ -17287,7 +17344,6 @@ static int hdd_pre_enable_configure(struct hdd_context *hdd_ctx)
+ out:
+ 	return ret;
+ }
+-
+ #ifdef FEATURE_P2P_LISTEN_OFFLOAD
+ /**
+  * wlan_hdd_p2p_lo_event_callback - P2P listen offload stop event handler
+@@ -18240,7 +18296,7 @@ int hdd_wlan_stop_modules(struct hdd_context *hdd_ctx, bool ftm_mode)
+ 
+ 	cds_set_driver_state_module_stop(true);
+ 
+-	debugfs_threads = hdd_return_debugfs_threads_count();
++	debugfs_threads = qdf_atomic_read(&debugfs_thread_count);
+ 
+ 	if (debugfs_threads > 0 || hdd_ctx->is_wiphy_suspended) {
+ 		hdd_warn("Debugfs threads %d, wiphy suspend %d",
+@@ -18250,12 +18306,12 @@ int hdd_wlan_stop_modules(struct hdd_context *hdd_ctx, bool ftm_mode)
+ 			hdd_psoc_idle_timer_start(hdd_ctx);
+ 			cds_set_driver_state_module_stop(false);
+ 
+-			ucfg_dp_bus_bw_compute_timer_stop(hdd_ctx->psoc);
++			dp_bus_bw_compute_timer_stop(hdd_ctx->psoc);
+ 			return -EAGAIN;
+ 		}
+ 	}
+ 
+-	ucfg_dp_bus_bw_compute_timer_stop(hdd_ctx->psoc);
++	dp_bus_bw_compute_timer_stop(hdd_ctx->psoc);
+ 	hdd_deregister_policy_manager_callback(hdd_ctx->psoc);
+ 
+ 	/* free user wowl patterns */
+@@ -18331,7 +18387,6 @@ int hdd_wlan_stop_modules(struct hdd_context *hdd_ctx, bool ftm_mode)
+ 		}
+ 
+ 		hdd_component_pdev_close(hdd_ctx->pdev);
+-		dispatcher_pdev_close(hdd_ctx->pdev);
+ 		ret = hdd_objmgr_release_and_destroy_pdev(hdd_ctx);
+ 		if (ret) {
+ 			hdd_err("Failed to destroy pdev; errno:%d", ret);
+@@ -19016,7 +19071,7 @@ QDF_STATUS hdd_psoc_create_vdevs(struct hdd_context *hdd_ctx)
  		return status;
  	}
  
@@ -124,7 +1256,111 @@ diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/w
  
  	if (driver_mode != QDF_GLOBAL_FTM_MODE &&
  	    driver_mode != QDF_GLOBAL_EPPING_MODE)
-@@ -22357,9 +22335,11 @@ static int hdd_update_dp_config(struct hdd_context *hdd_ctx)
+@@ -21034,7 +21089,12 @@ QDF_STATUS hdd_component_psoc_open(struct wlan_objmgr_psoc *psoc)
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		return status;
+ 
+-	status = ucfg_dlm_psoc_open(psoc);
++	pmo_register_suspend_handler(WLAN_UMAC_COMP_DENYLIST_MGR,
++				     ucfg_dlm_suspend_handler, NULL);
++	pmo_register_resume_handler(WLAN_UMAC_COMP_DENYLIST_MGR,
++				    ucfg_dlm_resume_handler, NULL);
++
++	status = dlm_cfg_psoc_open(psoc);
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		goto err_dlm;
+ 
+@@ -21042,7 +21102,7 @@ QDF_STATUS hdd_component_psoc_open(struct wlan_objmgr_psoc *psoc)
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		goto err_fwol;
+ 
+-	status = ucfg_pmo_psoc_open(psoc);
++	status = pmo_psoc_open(psoc);
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		goto err_pmo;
+ 
+@@ -21050,7 +21110,7 @@ QDF_STATUS hdd_component_psoc_open(struct wlan_objmgr_psoc *psoc)
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		goto err_plcy_mgr;
+ 
+-	status = ucfg_p2p_psoc_open(psoc);
++	status = p2p_psoc_object_open(psoc);
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		goto err_p2p;
+ 
+@@ -21062,9 +21122,9 @@ QDF_STATUS hdd_component_psoc_open(struct wlan_objmgr_psoc *psoc)
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		goto err_nan;
+ 
+-	status = ucfg_twt_psoc_open(psoc);
++	status = wlan_twt_cfg_init(psoc);
+ 	if (QDF_IS_STATUS_ERROR(status))
+-		goto err_twt;
++		goto err_nan;
+ 
+ 	status = ucfg_wifi_pos_psoc_open(psoc);
+ 	if (QDF_IS_STATUS_ERROR(status))
+@@ -21079,23 +21139,23 @@ QDF_STATUS hdd_component_psoc_open(struct wlan_objmgr_psoc *psoc)
+ err_dp:
+ 	ucfg_wifi_pos_psoc_close(psoc);
+ err_wifi_pos:
+-	ucfg_twt_psoc_close(psoc);
++	wlan_twt_cfg_deinit(psoc);
+ err_twt:
+-	ucfg_nan_psoc_close(psoc);
+ err_nan:
+ 	ucfg_tdls_psoc_close(psoc);
+ err_tdls:
+-	ucfg_p2p_psoc_close(psoc);
++	p2p_psoc_object_close(psoc);
+ err_p2p:
+ 	ucfg_policy_mgr_psoc_close(psoc);
+ err_plcy_mgr:
+-	ucfg_pmo_psoc_close(psoc);
+ err_pmo:
+-	ucfg_fwol_psoc_close(psoc);
+ err_fwol:
+-	ucfg_dlm_psoc_close(psoc);
++	pmo_unregister_suspend_handler(WLAN_UMAC_COMP_DENYLIST_MGR,
++				       ucfg_dlm_suspend_handler);
++	pmo_unregister_resume_handler(WLAN_UMAC_COMP_DENYLIST_MGR,
++				      ucfg_dlm_resume_handler);
+ err_dlm:
+-	ucfg_mlme_psoc_close(psoc);
++	wlan_mlme_psoc_flush_peer_trans_history(psoc);
+ 
+ 	return status;
+ }
+@@ -21153,7 +21213,9 @@ QDF_STATUS hdd_component_pdev_open(struct wlan_objmgr_pdev *pdev)
+ 
+ void hdd_component_pdev_close(struct wlan_objmgr_pdev *pdev)
+ {
+-	ucfg_mlme_pdev_close(pdev);
++	wlan_mgmt_txrx_pdev_close(pdev);
++	wlan_cfr_pdev_close(pdev);
++	regulatory_pdev_close(pdev);
+ }
+ 
+ static QDF_STATUS hdd_qdf_print_init(void)
+@@ -21887,7 +21949,7 @@ void hdd_driver_unload(void)
+ 		 * Runtime PM sync resume may have started the bus bandwidth
+ 		 * periodic work hence stop it.
+ 		 */
+-		ucfg_dp_bus_bw_compute_timer_stop(hdd_ctx->psoc);
++		dp_bus_bw_compute_timer_stop(hdd_ctx->psoc);
+ 	}
+ 
+ 	/*
+@@ -22317,7 +22379,7 @@ static void hdd_update_hif_config(struct hdd_context *hdd_ctx)
+ 		ucfg_dp_get_rx_softirq_yield_duration(hdd_ctx->psoc);
+ 	hdd_populate_ce_dp_irq_affine_cfg(hdd_ctx, &cfg);
+ 
+-	hif_init_ini_config(scn, &cfg);
++	qdf_mem_copy(scn, &cfg, sizeof(cfg));
+ 	hif_set_enable_rpm(scn);
+ 
+ 	if (prevent_link_down)
+@@ -22357,9 +22419,11 @@ static int hdd_update_dp_config(struct hdd_context *hdd_ctx)
   */
  int hdd_update_config(struct hdd_context *hdd_ctx)
  {
@@ -133,66 +1369,95 @@ diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/w
  
 -	if (ucfg_pmo_is_ns_offloaded(hdd_ctx->psoc))
 +	pmo_psoc_ctx = pmo_psoc_get_priv(hdd_ctx->psoc);
-+	if (pmo_psoc_ctx && pmo_psoc_ctx->psoc_cfg.ns_offload_enable_static)
++	if (pmo_psoc_ctx->psoc_cfg.ns_offload_enable_static)
  		hdd_ctx->ns_offload_enable = true;
  
  	hdd_update_ol_config(hdd_ctx);
-diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
---- a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
-+++ b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
-@@ -44,6 +44,7 @@
- #include "wlan_ipa_ucfg_api.h"
- #include "wlan_hdd_debugfs.h"
- #include "cfg_ucfg_api.h"
-+#include "wlan_dp_prealloc.h"
-+#include "wlan_pmo_main.h"
- #include <linux/suspend.h>
- #include <qdf_notifier.h>
- #include <qdf_hang_event_notifier.h>
-@@ -610,7 +612,7 @@ int hdd_hif_open(struct device *dev, void *bdev, const struct hif_bus_id *bid,
- 	hdd_hif_set_ce_max_yield_time(
- 				hif_ctx, bus_type,
- 				cfg_get(hdd_ctx->psoc,
- 					CFG_DP_CE_SERVICE_MAX_YIELD_TIME));
--	ucfg_pmo_psoc_set_hif_handle(hdd_ctx->psoc, hif_ctx);
-+	pmo_core_psoc_set_hif_handle(hdd_ctx->psoc, hif_ctx);
- 	ucfg_dp_set_hif_handle(hdd_ctx->psoc, hif_ctx);
- 	hif_set_ce_service_max_rx_ind_flush(hif_ctx,
- 				cfg_get(hdd_ctx->psoc,
-@@ -646,7 +648,7 @@ void hdd_hif_close(struct hdd_context *hdd_ctx, void *hif_ctx)
- 	hdd_deinit_cds_hif_context();
- 	hif_close(hif_ctx);
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_power.c b/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
+index 8a86a0b6..b32e6f4f 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
+@@ -41,6 +41,7 @@
+ #include <mac_init_api.h>
+ #include <wlan_qct_sys.h>
+ #include <wlan_hdd_main.h>
++extern qdf_wake_lock_t wlan_wake_lock;
+ #include <wlan_hdd_assoc.h>
+ #include <wlan_nlink_srv.h>
+ #include <wlan_hdd_misc.h>
+@@ -2200,7 +2201,8 @@ QDF_STATUS hdd_wlan_re_init(void)
+ 	bool bug_on_reinit_failure = CFG_BUG_ON_REINIT_FAILURE_DEFAULT;
+ 	bool value;
  
--	ucfg_pmo_psoc_set_hif_handle(hdd_ctx->psoc, NULL);
-+	pmo_core_psoc_set_hif_handle(hdd_ctx->psoc, NULL);
+-	hdd_prevent_suspend(WIFI_POWER_EVENT_WAKELOCK_DRIVER_REINIT);
++	qdf_wake_lock_acquire(&wlan_wake_lock,
++			      WIFI_POWER_EVENT_WAKELOCK_DRIVER_REINIT);
+ 
+ 	/* Get the HDD context */
+ 	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
+@@ -2231,7 +2233,8 @@ QDF_STATUS hdd_wlan_re_init(void)
+ 	hdd_ctx->bt_coex_mode_set = false;
+ 
+ 	/* Allow the phone to go to sleep */
+-	hdd_allow_suspend(WIFI_POWER_EVENT_WAKELOCK_DRIVER_REINIT);
++	qdf_wake_lock_release(&wlan_wake_lock,
++			      WIFI_POWER_EVENT_WAKELOCK_DRIVER_REINIT);
+ 	/* set chip power save failure detected callback */
+ 	sme_set_chip_pwr_save_fail_cb(hdd_ctx->mac_handle,
+ 				      hdd_chip_pwr_save_fail_detected_cb);
+@@ -2262,7 +2265,8 @@ err_re_init:
+ 
+ err_ctx_null:
+ 	/* Allow the phone to go to sleep */
+-	hdd_allow_suspend(WIFI_POWER_EVENT_WAKELOCK_DRIVER_REINIT);
++	qdf_wake_lock_release(&wlan_wake_lock,
++			      WIFI_POWER_EVENT_WAKELOCK_DRIVER_REINIT);
+ 	if (bug_on_reinit_failure)
+ 		QDF_BUG(0);
+ 	return -EPERM;
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.c b/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.c
+index 530a7294..74903335 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.c
+@@ -157,6 +157,13 @@ hdd_send_thermal_mitigation_val(struct hdd_context *hdd_ctx, uint32_t level,
+ 	return QDF_STATUS_SUCCESS;
  }
  
++QDF_STATUS
++hdd_send_ddr_bw_mitigation_level(struct hdd_context *hdd_ctx, uint32_t level,
++				 uint8_t mon_id)
++{
++	return QDF_STATUS_SUCCESS;
++}
++
  /**
-@@ -801,8 +802,7 @@ static int __hdd_soc_probe(struct device *dev,
- 		goto assert_fail_count;
- 	}
+  * convert_level_to_vendor_thermal_level() - convert internal thermal level
+  *  to vendor command attribute enum qca_wlan_vendor_thermal_level
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.h b/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.h
+index 01f64ce4..438591d9 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.h
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.h
+@@ -59,10 +59,12 @@ enum hdd_thermal_states {
+  * thermal_monitor_id: enum of thermal client
+  * @THERMAL_MONITOR_APPS: Thermal monitor client of APPS
+  * @THERMAL_MONITOR_WPSS: Thermal monitor client for WPSS
++ * @THERMAL_MONITOR_DDR_BWM: Thermal monitor client for DDR bandwidth mitigation
+  */
+ enum thermal_monitor_id {
+ 	THERMAL_MONITOR_APPS = 1,
+ 	THERMAL_MONITOR_WPSS,
++	THERMAL_MONITOR_DDR_BWM,
+ };
  
--	status = ucfg_dp_prealloc_init((struct cdp_ctrl_objmgr_psoc *)
--					hdd_ctx->psoc);
-+	status = dp_prealloc_init((struct cdp_ctrl_objmgr_psoc *)hdd_ctx->psoc);
- 
- 	if (status != QDF_STATUS_SUCCESS) {
- 		errno = qdf_status_to_os_return(status);
-@@ -833,7 +833,7 @@ wlan_exit:
- 	hdd_wlan_exit(hdd_ctx);
- 
- hdd_context_destroy:
--	ucfg_dp_prealloc_deinit();
-+	dp_prealloc_deinit();
- 
- dp_prealloc_fail:
- 	hdd_context_destroy(hdd_ctx);
-@@ -1039,7 +1039,7 @@ static void __hdd_soc_remove(struct device *dev)
- 	cds_set_driver_in_bad_state(false);
- 	cds_set_unload_in_progress(false);
- 
--	ucfg_dp_prealloc_deinit();
-+	dp_prealloc_deinit();
- 
- 	pr_info("%s: Driver De-initialized\n", WLAN_MODULE_NAME);
- }
+ #ifdef FW_THERMAL_THROTTLE_SUPPORT
+@@ -161,6 +163,10 @@ int wlan_hdd_pld_set_thermal_mitigation(struct device *dev,
+ QDF_STATUS
+ hdd_send_thermal_mitigation_val(struct hdd_context *hdd_ctx, uint32_t level,
+ 				uint8_t mon_id);
++
++QDF_STATUS
++hdd_send_ddr_bw_mitigation_level(struct hdd_context *hdd_ctx, uint32_t level,
++				 uint8_t mon_id);
+ #ifdef FEATURE_WPSS_THERMAL_MITIGATION
+ /**
+  * hdd_thermal_fill_clientid_priority() - fill the client id/priority
