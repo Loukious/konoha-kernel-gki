@@ -254,6 +254,15 @@ jobs:
           git apply "$patch"
           git diff --check
 
+      - name: Apply WCN7750 WMA codegen stock parity
+        if: ${{ inputs.enable_injection == false && inputs.apply_compat_patch }}
+        working-directory: gki-clo/vendor/qcom/opensource/wlan
+        run: |
+          patch="$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-wma-codegen-parity.patch"
+          git apply --check "$patch"
+          git apply "$patch"
+          git diff --check
+
       - name: Apply WCN7750 enable trace markers
         if: ${{ inputs.enable_trace }}
         working-directory: gki-clo/vendor/qcom/opensource/wlan

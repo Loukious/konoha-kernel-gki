@@ -1,0 +1,9 @@
+--- a/qcacld-3.0/Kbuild
++++ b/qcacld-3.0/Kbuild
+@@ -5264,3 +5264,6 @@
+ CLEAN_DIRS := $(addsuffix *.o,$(sort $(OBJS_DIRS))) \
+ 	      $(addsuffix .*.o.cmd,$(sort $(OBJS_DIRS)))
+ clean-files := $(CLEAN_DIRS)
++
++# WCN7750 stock parity: keep WMA message-handler layout closer to stock
++CFLAGS_core/wma/src/wma_main.o += -fno-jump-tables -mllvm -enable-tail-merge=false
