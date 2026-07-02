@@ -1,0 +1,938 @@
+diff --git a/fw-api/fw/wmi_unified.h b/fw-api/fw/wmi_unified.h
+index 2cc50cc..b1690bc 100644
+--- a/fw-api/fw/wmi_unified.h
++++ b/fw-api/fw/wmi_unified.h
+@@ -37751,6 +37751,8 @@ typedef enum {
+     WMI_THERMAL_CLIENT_APPS        = 1,
+     WMI_THERMAL_CLIENT_WPSS        = 2,
+     WMI_THERMAL_CLIENT_FW          = 3,
++    /* WMI_THERMAL_CLIENT_DDR_BWM: client is for DDR bandwidth mitigation */
++    WMI_THERMAL_CLIENT_DDR_BWM     = 4,
+     WMI_THERMAL_CLIENT_MAX
+ } WMI_THERMAL_MITIGATION_CLIENTS;
+ 
+diff --git a/qca-wifi-host-cmn/wmi/inc/wmi_unified_param.h b/qca-wifi-host-cmn/wmi/inc/wmi_unified_param.h
+index 76760cd..eee0d0c 100644
+--- a/qca-wifi-host-cmn/wmi/inc/wmi_unified_param.h
++++ b/qca-wifi-host-cmn/wmi/inc/wmi_unified_param.h
+@@ -3402,6 +3402,20 @@ typedef struct {
+ 	uint32_t pout_reduction_db;
+ } tt_level_config;
+ 
++/*
++ * wmi_thermal_monitor_id: enum of thermal client
++ * @WMI_HOST_THERMAL_MONITOR_APPS: Thermal monitor client of APPS
++ * @WMI_HOST_THERMAL_MONITOR_WPSS: Thermal monitor client for WPSS
++ * @WMI_HOST_THERMAL_MONITOR_DDR_BWM: Client for DDR BW mitigation
++ * @WMI_HOST_THERMAL_MONITOR_INVALID: Invalid client
++ */
++enum wmi_thermal_monitor_id {
++	WMI_HOST_THERMAL_MONITOR_APPS = 1,
++	WMI_HOST_THERMAL_MONITOR_WPSS,
++	WMI_HOST_THERMAL_MONITOR_DDR_BWM,
++	WMI_HOST_THERMAL_MONITOR_INVALID,
++};
++
+ /**
+  * struct thermal_mitigation_params - Thermal mitigation params
+  * @pdev_id: pdev identifier
+diff --git a/qca-wifi-host-cmn/wmi/src/wmi_unified_tlv.c b/qca-wifi-host-cmn/wmi/src/wmi_unified_tlv.c
+index 0a206c9..1e59e4b 100644
+--- a/qca-wifi-host-cmn/wmi/src/wmi_unified_tlv.c
++++ b/qca-wifi-host-cmn/wmi/src/wmi_unified_tlv.c
+@@ -9780,7 +9780,20 @@ static inline void
+ wmi_fill_client_id_priority(wmi_therm_throt_config_request_fixed_param *tt_conf,
+ 			    struct thermal_mitigation_params *param)
+ {
+-	tt_conf->client_id = param->client_id;
++	switch (param->client_id) {
++	case WMI_HOST_THERMAL_MONITOR_APPS:
++		tt_conf->client_id = WMI_THERMAL_CLIENT_APPS;
++		break;
++	case WMI_HOST_THERMAL_MONITOR_WPSS:
++		tt_conf->client_id = WMI_THERMAL_CLIENT_WPSS;
++		break;
++	case WMI_HOST_THERMAL_MONITOR_DDR_BWM:
++		tt_conf->client_id = WMI_THERMAL_CLIENT_DDR_BWM;
++		break;
++	default:
++		wmi_debug("Invalid client_id");
++		break;
++	}
+ 	tt_conf->priority = param->priority;
+ }
+ #else
+diff --git a/qcacld-3.0/Kbuild b/qcacld-3.0/Kbuild
+index 6c4ffb0..935169c 100644
+--- a/qcacld-3.0/Kbuild
++++ b/qcacld-3.0/Kbuild
+@@ -3827,6 +3827,7 @@ ccflags-$(CONFIG_WLAN_SYSFS_HE_BSS_COLOR) += -DWLAN_SYSFS_HE_BSS_COLOR
+ ccflags-$(CONFIG_WLAN_SYSFS_STA_INFO) += -DWLAN_SYSFS_STA_INFO
+ ccflags-$(CONFIG_WLAN_DL_MODES) += -DCONFIG_WLAN_DL_MODES
+ ccflags-$(CONFIG_WLAN_THERMAL_MULTI_CLIENT_SUPPORT) += -DFEATURE_WPSS_THERMAL_MITIGATION
++ccflags-$(CONFIG_WLAN_DDR_BW_MITIGATION) += -DWLAN_DDR_BW_MITIGATION
+ ccflags-$(CONFIG_WLAN_DUMP_IN_PROGRESS) += -DCONFIG_WLAN_DUMP_IN_PROGRESS
+ ccflags-$(CONFIG_WLAN_CHIPSET_LOG_MAX_SIZE) += -DWLAN_CHIPSET_LOG_MAX_SIZE=50
+ ccflags-$(CONFIG_WLAN_BMISS) += -DCONFIG_WLAN_BMISS
+diff --git a/qcacld-3.0/Kconfig b/qcacld-3.0/Kconfig
+index 271ad6c..6dc9400 100644
+--- a/qcacld-3.0/Kconfig
++++ b/qcacld-3.0/Kconfig
+@@ -570,6 +570,10 @@ config FW_THERMAL_THROTTLE
+ 	bool "Enable FW_THERMAL_THROTTLE"
+ 	default n
+ 
++config WLAN_DDR_BW_MITIGATION
++	bool "enable WLAN_DDR_BW_MITIGATION"
++	default n
++
+ config GET_DRIVER_MODE
+ 	bool "Enable GET_DRIVER_MODE"
+ 	default n
+diff --git a/qcacld-3.0/components/fw_offload/core/inc/wlan_fw_offload_main.h b/qcacld-3.0/components/fw_offload/core/inc/wlan_fw_offload_main.h
+index 281448e..2b94476 100644
+--- a/qcacld-3.0/components/fw_offload/core/inc/wlan_fw_offload_main.h
++++ b/qcacld-3.0/components/fw_offload/core/inc/wlan_fw_offload_main.h
+@@ -145,6 +145,22 @@ struct wlan_fwol_thermal_temp {
+ #endif
+ };
+ 
++#ifdef WLAN_DDR_BW_MITIGATION
++/**
++ * struct wlan_fwol_bwm_params - BW mitigation related config items
++ * @bw_mitigation_enable: To control bw mitigation feature
++ * @throttle_dutycycle_level: Array of throttle duty cycle levels
++ * @bw_sampling_time: sampling time for bw mitigation in ms
++ * @priority_bwm: priority of the bw mitigation to consider by fw
++ */
++struct wlan_fwol_bwm_params {
++	bool bw_mitigation_enable;
++	uint32_t throttle_dutycycle_level[FWOL_THERMAL_THROTTLE_LEVEL_MAX];
++	uint16_t bw_sampling_time;
++	uint8_t priority_bwm;
++};
++#endif
++
+ /**
+  * struct wlan_fwol_ie_allowlist - Probe request IE allowlist config items
+  * @ie_allowlist: IE allowlist flag
+@@ -263,6 +279,9 @@ struct wlan_fwol_cfg {
+ 	/* Add CFG and INI items here */
+ 	struct wlan_fwol_coex_config coex_config;
+ 	struct wlan_fwol_thermal_temp thermal_temp_cfg;
++#ifdef WLAN_DDR_BW_MITIGATION
++	struct wlan_fwol_bwm_params bwm_params_cfg;
++#endif
+ 	struct wlan_fwol_ie_allowlist ie_allowlist_cfg;
+ 	struct wlan_fwol_neighbor_report_cfg neighbor_report_cfg;
+ 	bool ani_enabled;
+diff --git a/qcacld-3.0/components/fw_offload/core/src/wlan_fw_offload_main.c b/qcacld-3.0/components/fw_offload/core/src/wlan_fw_offload_main.c
+index d121b08..1de3d1e 100644
+--- a/qcacld-3.0/components/fw_offload/core/src/wlan_fw_offload_main.c
++++ b/qcacld-3.0/components/fw_offload/core/src/wlan_fw_offload_main.c
+@@ -633,6 +633,46 @@ static inline void fwol_ofdm_scrambler_init(struct wlan_fwol_cfg *fwol_cfg,
+ }
+ #endif
+ 
++#ifdef WLAN_DDR_BW_MITIGATION
++/**
++ * fwol_init_bw_mitigation_param_in_cfg() - set bw mitigation related parameters
++ * @psoc: The global psoc handler
++ * @fwol_cfg: fwol config params
++ *
++ * Return: none
++ */
++static void
++fwol_init_bw_mitigation_param_in_cfg(struct wlan_objmgr_psoc *psoc,
++				     struct wlan_fwol_cfg *fwol_cfg)
++{
++	struct wlan_fwol_bwm_params *bwm_param = &fwol_cfg->bwm_params_cfg;
++
++	bwm_param->bw_mitigation_enable =
++				cfg_get(psoc, CFG_DDR_BW_MITIGATION_ENABLE);
++	bwm_param->bw_sampling_time =
++				cfg_get(psoc, CFG_DDR_BWM_SAMPLING_TIME);
++	bwm_param->throttle_dutycycle_level[0] =
++			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL0);
++	bwm_param->throttle_dutycycle_level[1] =
++			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL1);
++	bwm_param->throttle_dutycycle_level[2] =
++			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL2);
++	bwm_param->throttle_dutycycle_level[3] =
++			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL3);
++	bwm_param->throttle_dutycycle_level[4] =
++			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL4);
++	bwm_param->throttle_dutycycle_level[5] =
++			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL5);
++	bwm_param->priority_bwm = cfg_get(psoc, CFG_DDR_BWM_PRIORITY);
++}
++#else
++static inline void
++fwol_init_bw_mitigation_param_in_cfg(struct wlan_objmgr_psoc *psoc,
++				     struct wlan_fwol_cfg *fwol_cfg)
++{
++}
++#endif
++
+ QDF_STATUS fwol_cfg_on_psoc_enable(struct wlan_objmgr_psoc *psoc)
+ {
+ 	QDF_STATUS status = QDF_STATUS_SUCCESS;
+@@ -651,6 +691,7 @@ QDF_STATUS fwol_cfg_on_psoc_enable(struct wlan_objmgr_psoc *psoc)
+ 
+ 	fwol_init_coex_config_in_cfg(psoc, &fwol_cfg->coex_config);
+ 	fwol_init_thermal_temp_in_cfg(psoc, &fwol_cfg->thermal_temp_cfg);
++	fwol_init_bw_mitigation_param_in_cfg(psoc, fwol_cfg);
+ 	fwol_init_ie_whiltelist_in_cfg(psoc, &fwol_cfg->ie_allowlist_cfg);
+ 	fwol_init_neighbor_report_cfg(psoc, &fwol_cfg->neighbor_report_cfg);
+ 	fwol_cfg->ani_enabled = cfg_get(psoc, CFG_ENABLE_ANI);
+diff --git a/qcacld-3.0/components/fw_offload/dispatcher/inc/cfg_thermal_temp.h b/qcacld-3.0/components/fw_offload/dispatcher/inc/cfg_thermal_temp.h
+index 2e223c6..f5f2585 100644
+--- a/qcacld-3.0/components/fw_offload/dispatcher/inc/cfg_thermal_temp.h
++++ b/qcacld-3.0/components/fw_offload/dispatcher/inc/cfg_thermal_temp.h
+@@ -536,6 +536,199 @@
+ 					CFG_VALUE_OR_DEFAULT, \
+ 					"Thermal Stats Temperature Offset")
+ 
++/* <ini>
++ *ddr_bwm_sampling_time - Configure the ddr bw mitigation sampling time in ms.
++ *
++ * @Min: 10
++ * @Max: 100
++ * @Default: 100
++ *
++ * This INI controls the sampling time that the DDR BW mitigation in the
++ * firmware considers while applying the duty cycle.
++ *
++ * Usage: External
++ *
++ * Supported features: Bandwidth Mitigation
++ *
++ * </ini>
++ */
++#define CFG_DDR_BWM_SAMPLING_TIME CFG_INI_UINT( \
++				"ddr_bwm_sampling_time", \
++				10, \
++				100, \
++				100, \
++				CFG_VALUE_OR_DEFAULT, \
++				"ddr bw mitigation sampling time")
++
++/*
++ * <ini>
++ * ddr_bw_mitigation_enable - To control DDR BW mitigation feature
++ * @Min: 0
++ * @Max: 1
++ * @Default: 0
++ *
++ * Usage: External
++ *
++ * Supported features: Bandwidth Mitigation
++ *
++ * </ini>
++ */
++#define CFG_DDR_BW_MITIGATION_ENABLE CFG_INI_BOOL( \
++			"ddr_bw_mitigation_enable", \
++			0, \
++			"DDR BW mitigation feature control")
++
++/* <ini>
++ * ddr_bwm_priority - Configure the BW mitigation priority
++ *
++ * @Min: 1
++ * @Max: 10
++ * @Default: 1
++ *
++ * This INI controls the priority of DDR BW mitigation in the firmware.
++ * The firmware considers this priority when applying the duty cycle from
++ * multiple clients, with 1 being the lowest priority and 10 being the highest.
++ *
++ * Usage: External
++ *
++ * Supported features: BW Mitigation
++ *
++ * </ini>
++ */
++#define CFG_DDR_BWM_PRIORITY CFG_INI_UINT( \
++				"ddr_bwm_priority", \
++				1, \
++				10, \
++				1, \
++				CFG_VALUE_OR_DEFAULT, \
++				"ddr bw mitigation priority")
++
++/*
++ * <ini>
++ * bwm_throttle_duty_cycle_level_0 - BW mitigation throttle duty cycle level0
++ * @Min: 0
++ * @Max: 0
++ * @Default: 0
++ *
++ * Usage: External
++ *
++ * Supported features: BW Mitigation
++ *
++ * </ini>
++ */
++#define CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL0 CFG_INI_UINT( \
++			"bwm_throttle_duty_cycle_level_0", \
++			0, \
++			0, \
++			0, \
++			CFG_VALUE_OR_DEFAULT, \
++			"BW mitigation throttle duty cycle level0")
++
++/*
++ * <ini>
++ * bwm_throttle_duty_cycle_level_1 - BW mitigation throttle duty cycle level1
++ * @Min: 0
++ * @Max: 100
++ * @Default: 10
++ *
++ * Usage: External
++ *
++ * Supported features: BW Mitigation
++ *
++ * </ini>
++ */
++#define CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL1 CFG_INI_UINT( \
++			"bwm_throttle_duty_cycle_level_1", \
++			0, \
++			100, \
++			10, \
++			CFG_VALUE_OR_DEFAULT, \
++			"BW mitigation throttle duty cycle level1")
++
++/*
++ * <ini>
++ * bwm_throttle_duty_cycle_level_2 - BW mitigation throttle duty cycle level2
++ * @Min: 0
++ * @Max: 100
++ * @Default: 30
++ *
++ * Usage: External
++ *
++ * Supported features: BW Mitigation
++ *
++ * </ini>
++ */
++#define CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL2 CFG_INI_UINT( \
++			"bwm_throttle_duty_cycle_level_2", \
++			0, \
++			100, \
++			30, \
++			CFG_VALUE_OR_DEFAULT, \
++			"BW mitigation throttle duty cycle level2")
++
++/*
++ * <ini>
++ * bwm_throttle_duty_cycle_level_3 - BW mitigation throttle duty cycle level3
++ * @Min: 0
++ * @Max: 100
++ * @Default: 50
++ *
++ * Usage: External
++ *
++ * Supported features: BW Mitigation
++ *
++ * </ini>
++ */
++#define CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL3 CFG_INI_UINT( \
++			"bwm_throttle_duty_cycle_level_3", \
++			0, \
++			100, \
++			50, \
++			CFG_VALUE_OR_DEFAULT, \
++			"BW mitigation throttle duty cycle level3")
++
++/*
++ * <ini>
++ * bwm_throttle_duty_cycle_level_4 - BW mitigation throttle duty cycle level4
++ * @Min: 0
++ * @Max: 100
++ * @Default: 70
++ *
++ * Usage: External
++ *
++ * Supported features: BW Mitigation
++ *
++ * </ini>
++ */
++#define CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL4 CFG_INI_UINT( \
++			"bwm_throttle_duty_cycle_level_4", \
++			0, \
++			100, \
++			70, \
++			CFG_VALUE_OR_DEFAULT, \
++			"BW mitigation throttle duty cycle level4")
++
++/*
++ * <ini>
++ * bwm_throttle_duty_cycle_level_5 - BW mitigation throttle duty cycle level5
++ * @Min: 0
++ * @Max: 100
++ * @Default: 90
++ *
++ * Usage: External
++ *
++ * Supported features: BW Mitigation
++ *
++ * </ini>
++ */
++#define CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL5 CFG_INI_UINT( \
++			"bwm_throttle_duty_cycle_level_5", \
++			0, \
++			100, \
++			90, \
++			CFG_VALUE_OR_DEFAULT, \
++			"BW mitigation throttle duty cycle level5")
++
+ #define CFG_THERMAL_TEMP_ALL \
+ 	CFG(CFG_THERMAL_TEMP_MIN_LEVEL0) \
+ 	CFG(CFG_THERMAL_TEMP_MAX_LEVEL0) \
+@@ -561,6 +754,15 @@
+ 	CFG(CFG_THERMAL_APPS_PRIORITY) \
+ 	CFG(CFG_THERMAL_WPPS_PRIOITY) \
+ 	CFG(CFG_THERMAL_MGMT_ACTION) \
+-	CFG(CFG_THERMAL_STATS_TEMP_OFFSET)\
++	CFG(CFG_THERMAL_STATS_TEMP_OFFSET) \
++	CFG(CFG_DDR_BWM_SAMPLING_TIME) \
++	CFG(CFG_DDR_BW_MITIGATION_ENABLE) \
++	CFG(CFG_DDR_BWM_PRIORITY) \
++	CFG(CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL0) \
++	CFG(CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL1) \
++	CFG(CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL2) \
++	CFG(CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL3) \
++	CFG(CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL4) \
++	CFG(CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL5)
+ 
+ #endif
+diff --git a/qcacld-3.0/components/fw_offload/dispatcher/inc/wlan_fwol_ucfg_api.h b/qcacld-3.0/components/fw_offload/dispatcher/inc/wlan_fwol_ucfg_api.h
+index fef65f6..8c24550 100644
+--- a/qcacld-3.0/components/fw_offload/dispatcher/inc/wlan_fwol_ucfg_api.h
++++ b/qcacld-3.0/components/fw_offload/dispatcher/inc/wlan_fwol_ucfg_api.h
+@@ -166,6 +166,19 @@ QDF_STATUS
+ ucfg_fwol_get_thermal_temp(struct wlan_objmgr_psoc *psoc,
+ 			   struct wlan_fwol_thermal_temp *thermal_temp);
+ 
++#ifdef WLAN_DDR_BW_MITIGATION
++/**
++ * ucfg_fwol_get_ddr_bwm_config() - Get bw mitigation config params
++ * @psoc: Pointer to psoc object
++ * @ddr_bwm_info: Pointer to struct wlan_fwol_bwm_params
++ *
++ * Return: QDF Status
++ */
++QDF_STATUS
++ucfg_fwol_get_ddr_bwm_config(struct wlan_objmgr_psoc *psoc,
++			     struct wlan_fwol_bwm_params *ddr_bwm_info);
++#endif
++
+ /**
+  * ucfg_fwol_is_neighbor_report_req_supported() - Get neighbor report request
+  *                                                supported bit
+diff --git a/qcacld-3.0/components/fw_offload/dispatcher/src/wlan_fwol_ucfg_api.c b/qcacld-3.0/components/fw_offload/dispatcher/src/wlan_fwol_ucfg_api.c
+index da529b5..a4a55f4 100644
+--- a/qcacld-3.0/components/fw_offload/dispatcher/src/wlan_fwol_ucfg_api.c
++++ b/qcacld-3.0/components/fw_offload/dispatcher/src/wlan_fwol_ucfg_api.c
+@@ -252,6 +252,25 @@ ucfg_fwol_get_thermal_temp(struct wlan_objmgr_psoc *psoc,
+ 	return QDF_STATUS_SUCCESS;
+ }
+ 
++#ifdef WLAN_DDR_BW_MITIGATION
++QDF_STATUS
++ucfg_fwol_get_ddr_bwm_config(struct wlan_objmgr_psoc *psoc,
++			     struct wlan_fwol_bwm_params *ddr_bwm_info)
++{
++	struct wlan_fwol_psoc_obj *fwol_obj;
++
++	fwol_obj = fwol_get_psoc_obj(psoc);
++	if (!fwol_obj) {
++		fwol_err("Failed to get fwol obj");
++		return QDF_STATUS_E_FAILURE;
++	}
++
++	*ddr_bwm_info = fwol_obj->cfg.bwm_params_cfg;
++
++	return QDF_STATUS_SUCCESS;
++}
++#endif
++
+ QDF_STATUS
+ ucfg_fwol_is_neighbor_report_req_supported(struct wlan_objmgr_psoc *psoc,
+ 					   bool *neighbor_report_req)
+diff --git a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig b/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
+index 37ef0eb..0ea033f 100644
+--- a/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
++++ b/qcacld-3.0/configs/sun_gki_wcn7750_defconfig
+@@ -94,6 +94,7 @@ CONFIG_FEATURE_WLAN_WAPI=y
+ CONFIG_FIX_TXDMA_LIMITATION=y
+ CONFIG_FOURTH_CONNECTION=y
+ CONFIG_FW_THERMAL_THROTTLE=y
++CONFIG_WLAN_DDR_BW_MITIGATION=y
+ CONFIG_GTK_OFFLOAD=y
+ CONFIG_HAL_DISABLE_NON_BA_2K_JUMP_ERROR=y
+ CONFIG_HANDLE_BC_EAP_TX_FRM=y
+diff --git a/qcacld-3.0/core/hdd/inc/wlan_hdd_main.h b/qcacld-3.0/core/hdd/inc/wlan_hdd_main.h
+index bbf9f4c..3c3a250 100644
+--- a/qcacld-3.0/core/hdd/inc/wlan_hdd_main.h
++++ b/qcacld-3.0/core/hdd/inc/wlan_hdd_main.h
+@@ -2117,6 +2117,7 @@ enum wlan_state_ctrl_str_id {
+  * @max_chipset_log_size: Stores max chipset log size value
+  * @dual_sta_policy: Concurrent STA policy configuration
+  * @is_therm_stats_in_progress:
++ * @bwm_dutycycle_off_percent: bandwidth mitigation dutycycle off percent
+  * @is_vdev_macaddr_dynamic_update_supported:
+  * @power_type:
+  * @is_wlan_disabled: if wlan is disabled by userspace
+@@ -2405,6 +2406,9 @@ struct hdd_context {
+ #ifdef THERMAL_STATS_SUPPORT
+ 	bool is_therm_stats_in_progress;
+ #endif
++#ifdef WLAN_DDR_BW_MITIGATION
++	uint8_t bwm_dutycycle_off_percent;
++#endif
+ #ifdef WLAN_FEATURE_DYNAMIC_MAC_ADDR_UPDATE
+ 	bool is_vdev_macaddr_dynamic_update_supported;
+ #endif
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
+index 26b619e..cef61ac 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
+@@ -824,6 +824,7 @@ static int __hdd_soc_probe(struct device *dev,
+ 	cds_set_driver_loaded(true);
+ 	cds_set_load_in_progress(false);
+ 	hdd_thermal_mitigation_register(hdd_ctx, dev);
++	hdd_ddr_bw_mitigation_register(hdd_ctx, dev);
+ 
+ 	hdd_set_sar_init_index(hdd_ctx);
+ 	hdd_soc_load_unlock(dev);
+@@ -1032,6 +1033,7 @@ static void __hdd_soc_remove(struct device *dev)
+ 		qdf_nbuf_deinit_replenish_timer();
+ 	} else {
+ 		hdd_thermal_mitigation_unregister(hdd_ctx, dev);
++		hdd_ddr_bw_mitigation_unregister(hdd_ctx, dev);
+ 		hdd_wlan_exit(hdd_ctx);
+ 	}
+ 
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+index 6e29032..ebf285b 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -5530,6 +5530,13 @@ int hdd_wlan_start_modules(struct hdd_context *hdd_ctx, bool reinit)
+ 			hdd_send_thermal_mitigation_val(hdd_ctx, thermal_state,
+ 							THERMAL_MONITOR_WPSS);
+ 	}
++
++	if (!pld_get_thermal_state(hdd_ctx->parent_dev, &thermal_state,
++				   THERMAL_MONITOR_DDR_BWM)) {
++		if (thermal_state > QCA_WLAN_VENDOR_THERMAL_LEVEL_NONE)
++			hdd_send_ddr_bw_mitigation_level(hdd_ctx, thermal_state,
++						THERMAL_MONITOR_DDR_BWM);
++	}
+ 	hdd_register_get_port_status_notifier(hdd_ctx);
+ 
+ 	hdd_exit();
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_power.c b/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
+index a75ee94..09bb840 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
+@@ -2231,6 +2231,7 @@ QDF_STATUS hdd_wlan_re_init(void)
+ 				      hdd_chip_pwr_save_fail_detected_cb);
+ 
+ 	hdd_restore_thermal_mitigation_config(hdd_ctx);
++	hdd_restore_ddr_bw_mitigation_config(hdd_ctx);
+ 	hdd_restore_sar_config(hdd_ctx);
+ 
+ 	hdd_send_default_scan_ies(hdd_ctx);
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.c b/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.c
+index 530a729..2c21efb 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.c
+@@ -56,6 +56,28 @@ const struct nla_policy
+ 		[QCA_WLAN_VENDOR_ATTR_THERMAL_STATS] = {.type = NLA_NESTED},
+ };
+ 
++/**
++ * hdd_convert_monitor_id_to_wmi_monitor_id() - convert thermal_monitor_id
++ *  to wmi_thermal_monitor_id
++ * @monitor_id: monitor id of type thermal_monitor_id
++ *
++ * Return: wmi_thermal_monitor_id
++ */
++static enum wmi_thermal_monitor_id
++hdd_convert_monitor_id_to_wmi_monitor_id(enum thermal_monitor_id monitor_id)
++{
++	switch (monitor_id) {
++	case THERMAL_MONITOR_APPS:
++		return WMI_HOST_THERMAL_MONITOR_APPS;
++	case THERMAL_MONITOR_WPSS:
++		return WMI_HOST_THERMAL_MONITOR_WPSS;
++	case THERMAL_MONITOR_DDR_BWM:
++		return WMI_HOST_THERMAL_MONITOR_DDR_BWM;
++	default:
++		return WMI_HOST_THERMAL_MONITOR_INVALID;
++	}
++}
++
+ #ifdef FEATURE_WPSS_THERMAL_MITIGATION
+ void
+ hdd_thermal_fill_clientid_priority(struct hdd_context *hdd_ctx, uint8_t mon_id,
+@@ -157,6 +179,105 @@ hdd_send_thermal_mitigation_val(struct hdd_context *hdd_ctx, uint32_t level,
+ 	return QDF_STATUS_SUCCESS;
+ }
+ 
++#ifdef WLAN_DDR_BW_MITIGATION
++/**
++ * wlan_hdd_send_ddr_bw_mitigation_level() - send DDR BW mitigation level
++ * to the firmware
++ * @hdd_ctx: pointer to hdd context
++ * @level: Thermal mitigation level to set
++ * @mon_id: Thermal monitor id ie.. apps or wpss
++ *
++ * Send the requested bw mitigation value to the firmware for the
++ * requested BW mitigation monitor id.
++ *
++ * Return: QDF_STATUS
++ */
++static QDF_STATUS
++wlan_hdd_send_ddr_bw_mitigation_level(struct hdd_context *hdd_ctx,
++				      uint32_t level, uint8_t mon_id)
++{
++	uint32_t dc_off_percent;
++	uint32_t prio = 0, target_temp = 0;
++	struct wlan_fwol_bwm_params bwm_config = {0};
++	QDF_STATUS status;
++	bool enable = true;
++	struct thermal_mitigation_params therm_cfg_params = {0};
++
++	status = ucfg_fwol_get_ddr_bwm_config(hdd_ctx->psoc, &bwm_config);
++	if (QDF_IS_STATUS_ERROR(status)) {
++		hdd_err_rl("Failed to get fwol thermal obj");
++		return status;
++	}
++
++	if (!bwm_config.bw_mitigation_enable) {
++		hdd_debug("BW Mitigation feature is disabled via INI");
++		return QDF_STATUS_E_NOSUPPORT;
++	}
++
++	switch (level) {
++	case HDD_DDR_BWM_THERMAL_LEVEL_EMERGENCY:
++		dc_off_percent = bwm_config.throttle_dutycycle_level[5];
++		break;
++	case HDD_DDR_BWM_THERMAL_LEVEL_CRITICAL:
++		dc_off_percent = bwm_config.throttle_dutycycle_level[4];
++		break;
++	case HDD_DDR_BWM_THERMAL_LEVEL_SEVERE:
++		dc_off_percent = bwm_config.throttle_dutycycle_level[3];
++		break;
++	case HDD_DDR_BWM_THERMAL_LEVEL_MODERATE:
++		dc_off_percent = bwm_config.throttle_dutycycle_level[2];
++		break;
++	case HDD_DDR_BWM_THERMAL_LEVEL_LIGHT:
++		dc_off_percent = bwm_config.throttle_dutycycle_level[1];
++		break;
++	case HDD_DDR_BWM_THERMAL_LEVEL_NONE:
++		enable = false;
++		dc_off_percent = bwm_config.throttle_dutycycle_level[0];
++		break;
++	default:
++		hdd_debug("Invalid bw mitigation state");
++		return QDF_STATUS_E_INVAL;
++	}
++
++	therm_cfg_params.enable = enable;
++	therm_cfg_params.dc = bwm_config.bw_sampling_time;
++	therm_cfg_params.levelconf[0].dcoffpercent = dc_off_percent;
++	therm_cfg_params.levelconf[0].priority = prio;
++	therm_cfg_params.levelconf[0].tmplwm = target_temp;
++	therm_cfg_params.num_thermal_conf = 1;
++	therm_cfg_params.pdev_id = 0;
++	therm_cfg_params.priority = bwm_config.priority_bwm;
++	therm_cfg_params.client_id =
++	      hdd_convert_monitor_id_to_wmi_monitor_id(THERMAL_MONITOR_DDR_BWM);
++
++	hdd_debug("sampling_time %d dc_off_per %d", bwm_config.bw_sampling_time,
++		  dc_off_percent);
++
++	status = sme_set_thermal_throttle_cfg(hdd_ctx->mac_handle,
++					      &therm_cfg_params);
++	if (QDF_IS_STATUS_ERROR(status))
++		hdd_err_rl("Failed to set throttle configuration %d", status);
++	else
++		hdd_ctx->bwm_dutycycle_off_percent = dc_off_percent;
++
++	return QDF_STATUS_SUCCESS;
++}
++#else
++static inline QDF_STATUS
++wlan_hdd_send_ddr_bw_mitigation_level(struct hdd_context *hdd_ctx,
++				      uint32_t level, uint8_t mon_id)
++{
++	return QDF_STATUS_SUCCESS;
++}
++#endif
++
++QDF_STATUS
++hdd_send_ddr_bw_mitigation_level(struct hdd_context *hdd_ctx, uint32_t level,
++				 uint8_t mon_id)
++{
++	return wlan_hdd_send_ddr_bw_mitigation_level(hdd_ctx, level, mon_id);
++}
++
+ /**
+  * convert_level_to_vendor_thermal_level() - convert internal thermal level
+  *  to vendor command attribute enum qca_wlan_vendor_thermal_level
+@@ -638,6 +759,69 @@ QDF_STATUS hdd_restore_thermal_mitigation_config(struct hdd_context *hdd_ctx)
+ 	return status;
+ }
+ 
++#ifdef WLAN_DDR_BW_MITIGATION
++/**
++ * wlan_hdd_restore_ddr_bw_mitigation_config - Restore the saved thermal config
++ * @hdd_ctx: HDD context
++ *
++ * Restore the thermal mitigation config after SSR.
++ *
++ * Return: QDF_STATUS
++ */
++static QDF_STATUS
++wlan_hdd_restore_ddr_bw_mitigation_config(struct hdd_context *hdd_ctx)
++{
++	bool enable = true;
++	uint32_t dc, dc_off_percent = 0;
++	uint32_t prio = 0, target_temp = 0;
++	struct wlan_fwol_bwm_params thermal_temp = {0};
++	QDF_STATUS status;
++	struct thermal_mitigation_params therm_cfg_params = {0};
++
++	status = ucfg_fwol_get_ddr_bwm_config(hdd_ctx->psoc, &thermal_temp);
++	if (QDF_IS_STATUS_ERROR(status)) {
++		hdd_err_rl("Failed to get fwol thermal obj");
++		return status;
++	}
++
++	dc_off_percent = hdd_ctx->bwm_dutycycle_off_percent;
++	dc = thermal_temp.bw_sampling_time;
++
++	if (!dc_off_percent)
++		enable = false;
++
++	therm_cfg_params.enable = enable;
++	therm_cfg_params.dc = dc;
++	therm_cfg_params.levelconf[0].dcoffpercent = dc_off_percent;
++	therm_cfg_params.levelconf[0].priority = prio;
++	therm_cfg_params.levelconf[0].tmplwm = target_temp;
++	therm_cfg_params.num_thermal_conf = 1;
++	therm_cfg_params.client_id =
++	     hdd_convert_monitor_id_to_wmi_monitor_id(THERMAL_MONITOR_DDR_BWM);
++	therm_cfg_params.priority = 0;
++
++	hdd_debug("dc %d dc_off_per %d enable %d", dc, dc_off_percent, enable);
++
++	status = sme_set_thermal_throttle_cfg(hdd_ctx->mac_handle,
++					      &therm_cfg_params);
++	if (QDF_IS_STATUS_ERROR(status))
++		hdd_err_rl("Failed to set throttle configuration %d", status);
++
++	return status;
++}
++#else
++static inline QDF_STATUS
++wlan_hdd_restore_ddr_bw_mitigation_config(struct hdd_context *hdd_ctx)
++{
++	return QDF_STATUS_SUCCESS;
++}
++#endif
++
++QDF_STATUS hdd_restore_ddr_bw_mitigation_config(struct hdd_context *hdd_ctx)
++{
++	return wlan_hdd_restore_ddr_bw_mitigation_config(hdd_ctx);
++}
++
+ static int
+ __wlan_hdd_pld_set_thermal_mitigation(struct device *dev, unsigned long state,
+ 				      int mon_id)
+@@ -653,7 +837,21 @@ __wlan_hdd_pld_set_thermal_mitigation(struct device *dev, unsigned long state,
+ 	if (hdd_ctx->driver_status == DRIVER_MODULES_CLOSED)
+ 		return -EINVAL;
+ 
+-	status = hdd_send_thermal_mitigation_val(hdd_ctx, state, mon_id);
++	hdd_debug("PDL_SET for monitor_id: %d, state: %lu", mon_id, state);
++	switch (mon_id) {
++	case THERMAL_MONITOR_APPS:
++	case THERMAL_MONITOR_WPSS:
++		status = hdd_send_thermal_mitigation_val(hdd_ctx, state,
++							 mon_id);
++		break;
++	case THERMAL_MONITOR_DDR_BWM:
++		status = hdd_send_ddr_bw_mitigation_level(hdd_ctx, state,
++							  mon_id);
++		break;
++	default:
++		hdd_debug("Invalid monitor ID");
++		return -EINVAL;
++	}
+ 
+ 	return qdf_status_to_os_return(status);
+ }
+@@ -721,6 +919,63 @@ void hdd_thermal_mitigation_unregister(struct hdd_context *hdd_ctx,
+ 	pld_thermal_unregister(dev, THERMAL_MONITOR_APPS);
+ }
+ 
++#ifdef WLAN_DDR_BW_MITIGATION
++/**
++ * hdd_ddr_bw_mitigation_register_bwm() - Register the new cooling device
++ * (THERMAL_MONITOR_DDR_BWM) for platform-specific DDR BW mitigation support.
++ * @hdd_ctx: Pointer to Hdd context
++ * @dev: Pointer to the device
++ *
++ * Return: None
++ */
++static void hdd_ddr_bw_mitigation_register_bwm(struct hdd_context *hdd_ctx,
++					       struct device *dev)
++{
++	if (hdd_ctx->multi_client_thermal_mitigation)
++		pld_thermal_register(dev, HDD_THERMAL_STATE_EMERGENCY,
++				     THERMAL_MONITOR_DDR_BWM);
++}
++
++/**
++ * hdd_ddr_bw_mitigation_unregister_bwm() - Un-register the new cooling device
++ * (THERMAL_MONITOR_DDR_BWM) for platform-specific DDR BW mitigation support.
++ * @hdd_ctx: Pointer to Hdd context
++ * @dev: Pointer to the device
++ *
++ * Return: None
++ */
++static void hdd_ddr_bw_mitigation_unregister_bwm(struct hdd_context *hdd_ctx,
++						 struct device *dev)
++{
++	if (hdd_ctx->multi_client_thermal_mitigation)
++		pld_thermal_unregister(dev, THERMAL_MONITOR_DDR_BWM);
++}
++#else
++static inline void
++hdd_ddr_bw_mitigation_register_bwm(struct hdd_context *hdd_ctx,
++				   struct device *dev)
++{
++}
++
++static inline void
++hdd_ddr_bw_mitigation_unregister_bwm(struct hdd_context *hdd_ctx,
++				     struct device *dev)
++{
++}
++#endif
++
++void hdd_ddr_bw_mitigation_register(struct hdd_context *hdd_ctx,
++				    struct device *dev)
++{
++	hdd_ddr_bw_mitigation_register_bwm(hdd_ctx, dev);
++}
++
++void hdd_ddr_bw_mitigation_unregister(struct hdd_context *hdd_ctx,
++				      struct device *dev)
++{
++	hdd_ddr_bw_mitigation_unregister_bwm(hdd_ctx, dev);
++}
++
+ #ifdef FW_THERMAL_THROTTLE_SUPPORT
+ /**
+  * hdd_notify_thermal_throttle_handler() - Thermal throttle event handler
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.h b/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.h
+index 01f64ce..3d8d8cc 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.h
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_thermal.h
+@@ -59,13 +59,59 @@ enum hdd_thermal_states {
+  * thermal_monitor_id: enum of thermal client
+  * @THERMAL_MONITOR_APPS: Thermal monitor client of APPS
+  * @THERMAL_MONITOR_WPSS: Thermal monitor client for WPSS
++ * @THERMAL_MONITOR_DDR_BWM: Thermal monitor client for DDR bandwidth mitigation
+  */
+ enum thermal_monitor_id {
+ 	THERMAL_MONITOR_APPS = 1,
+ 	THERMAL_MONITOR_WPSS,
++	THERMAL_MONITOR_DDR_BWM,
+ };
+ 
+ #ifdef FW_THERMAL_THROTTLE_SUPPORT
++/**
++ * enum qca_wlan_ddr_bwm_thermal_level - Defines various thermal levels
++ * configured by userspace to the driver/firmware.
++ * The driver/firmware takes necessary actions requested by userspace
++ * such as throttling wifi tx etc. in order to mitigate high temperature.
++ *
++ * @HDD_DDR_BWM_THERMAL_LEVEL_NONE: Stop/clear all throttling actions.
++ * @HDD_DDR_BWM_THERMAL_LEVEL_LIGHT: Throttle tx lightly.
++ * @HDD_DDR_BWM_THERMAL_LEVEL_MODERATE: Throttle tx moderately.
++ * @HDD_DDR_BWM_THERMAL_LEVEL_SEVERE: Throttle tx severely.
++ * @HDD_DDR_BWM_THERMAL_LEVEL_CRITICAL: Critical thermal level reached.
++ * @HDD_DDR_BWM_THERMAL_LEVEL_EMERGENCY: Emergency thermal level reached.
++ */
++enum qca_wlan_ddr_bwm_thermal_level {
++	HDD_DDR_BWM_THERMAL_LEVEL_NONE = 0,
++	HDD_DDR_BWM_THERMAL_LEVEL_LIGHT = 1,
++	HDD_DDR_BWM_THERMAL_LEVEL_MODERATE = 2,
++	HDD_DDR_BWM_THERMAL_LEVEL_SEVERE = 3,
++	HDD_DDR_BWM_THERMAL_LEVEL_CRITICAL = 4,
++	HDD_DDR_BWM_THERMAL_LEVEL_EMERGENCY = 5,
++};
++
++/**
++ * hdd_ddr_bw_mitigation_register() - Register the new cooling device
++ * (THERMAL_MONITOR_DDR_BWM) for platform-specific DDR BW mitigation support.
++ * @hdd_ctx: Pointer to Hdd context
++ * @dev: Pointer to the device
++ *
++ * Return: None
++ */
++void hdd_ddr_bw_mitigation_register(struct hdd_context *hdd_ctx,
++				    struct device *dev);
++
++/**
++ * hdd_ddr_bw_mitigation_unregister() - Un-register the new cooling device
++ * (THERMAL_MONITOR_DDR_BWM) for platform-specific DDR BW mitigation support.
++ * @hdd_ctx: Pointer to Hdd context
++ * @dev: Pointer to the device
++ *
++ * Return: None
++ */
++void hdd_ddr_bw_mitigation_unregister(struct hdd_context *hdd_ctx,
++				      struct device *dev);
++
+ int
+ wlan_hdd_cfg80211_set_thermal_mitigation_policy(struct wiphy *wiphy,
+ 						struct wireless_dev *wdev,
+@@ -88,6 +134,31 @@ bool wlan_hdd_thermal_config_support(void);
+  */
+ QDF_STATUS hdd_restore_thermal_mitigation_config(struct hdd_context *hdd_ctx);
+ 
++/**
++ * hdd_restore_ddr_bw_mitigation_config - Restore the saved bw mitigation config
++ * @hdd_ctx: HDD context
++ *
++ * wrapper API for wlan_hdd_restore_thermal_mitigation_config()
++ *
++ * Return: QDF_STATUS
++ */
++QDF_STATUS hdd_restore_ddr_bw_mitigation_config(struct hdd_context *hdd_ctx);
++
++/**
++ * hdd_send_ddr_bw_mitigation_level() - send DDR BW mitigation level
++ * to the firmware
++ * @hdd_ctx: pointer to hdd context
++ * @level: Thermal mitigation level to set
++ * @mon_id: Thermal monitor id ie.. apps or wpss
++ *
++ * wrapper API for wlan_hdd_send_ddr_bw_mitigation_level()
++ *
++ * Return: QDF_STATUS
++ */
++QDF_STATUS
++hdd_send_ddr_bw_mitigation_level(struct hdd_context *hdd_ctx, uint32_t level,
++				 uint8_t mon_id);
++
+ extern const struct nla_policy
+ 	wlan_hdd_thermal_mitigation_policy
+ 	[QCA_WLAN_VENDOR_ATTR_THERMAL_CMD_MAX + 1];
