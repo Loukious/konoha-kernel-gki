@@ -1,0 +1,233 @@
+--- a/qca-wifi-host-cmn/hif/src/hif_main.c
++++ b/qca-wifi-host-cmn/hif/src/hif_main.c
+@@ -2079,13 +2079,17 @@
+ 		return QDF_STATUS_E_NULL_VALUE;
+ 	}
+ 
++	pr_info("konoha_wlan_trace: hif_enable bus begin type=%d\n", type);
+ 	status = hif_enable_bus(scn, dev, bdev, bid, type);
++	pr_info("konoha_wlan_trace: hif_enable bus status=%d\n", status);
+ 	if (status != QDF_STATUS_SUCCESS) {
+ 		hif_err("hif_enable_bus error = %d", status);
+ 		return status;
+ 	}
+ 
++	pr_info("konoha_wlan_trace: hif_enable hal_attach begin\n");
+ 	status = hif_hal_attach(scn);
++	pr_info("konoha_wlan_trace: hif_enable hal_attach status=%d\n", status);
+ 	if (status != QDF_STATUS_SUCCESS) {
+ 		hif_err("hal attach failed");
+ 		goto disable_bus;
+@@ -2096,11 +2100,13 @@
+ 		goto hal_detach;
+ 	}
+ 
++	pr_info("konoha_wlan_trace: hif_enable bus_configure begin\n");
+ 	if (hif_bus_configure(scn)) {
+ 		hif_err("Target probe failed");
+ 		status = QDF_STATUS_E_FAILURE;
+ 		goto hal_detach;
+ 	}
++	pr_info("konoha_wlan_trace: hif_enable bus_configure done\n");
+ 
+ 	hif_ut_suspend_init(scn);
+ 	hif_register_recovery_notifier(scn);
+--- a/qca-wifi-host-cmn/hif/src/ipcie/if_ipci.c
++++ b/qca-wifi-host-cmn/hif/src/ipcie/if_ipci.c
+@@ -104,7 +104,10 @@
+ 
+ 	hif_ce_prepare_config(hif_sc);
+ 
++	pr_info("konoha_wlan_trace: hif_ipci_bus_configure wlan_enable begin\n");
+ 	status = hif_wlan_enable(hif_sc);
++	pr_info("konoha_wlan_trace: hif_ipci_bus_configure wlan_enable status=%d\n",
++		status);
+ 	if (status) {
+ 		hif_err("hif_wlan_enable error = %d", status);
+ 		return status;
+@@ -112,7 +115,10 @@
+ 
+ 	A_TARGET_ACCESS_LIKELY(hif_sc);
+ 
++	pr_info("konoha_wlan_trace: hif_ipci_bus_configure config_ce begin\n");
+ 	status = hif_config_ce(hif_sc);
++	pr_info("konoha_wlan_trace: hif_ipci_bus_configure config_ce status=%d\n",
++		status);
+ 	if (status)
+ 		goto disable_wlan;
+ 
+--- a/qcacld-3.0/core/pld/src/pld_ipci.c
++++ b/qcacld-3.0/core/pld/src/pld_ipci.c
+@@ -549,6 +549,7 @@
+ {
+ 	struct icnss_wlan_enable_cfg cfg;
+ 	enum icnss_driver_mode icnss_mode;
++	int ret;
+ 
+ 	if (!dev)
+ 		return -ENODEV;
+@@ -587,7 +588,12 @@
+ 		break;
+ 	}
+ 
+-	return icnss_wlan_enable(dev, &cfg, icnss_mode, host_version);
++	pr_info("konoha_wlan_trace: pld_ipci_wlan_enable icnss begin mode=%d ce=%u svc=%u shadow_v3=%u\n",
++		icnss_mode, cfg.num_ce_tgt_cfg, cfg.num_ce_svc_pipe_cfg,
++		cfg.num_shadow_reg_v3_cfg);
++	ret = icnss_wlan_enable(dev, &cfg, icnss_mode, host_version);
++	pr_info("konoha_wlan_trace: pld_ipci_wlan_enable icnss ret=%d\n", ret);
++	return ret;
+ }
+ 
+ int pld_ipci_wlan_disable(struct device *dev, enum pld_driver_mode mode)
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
+@@ -575,6 +575,8 @@
+ 	uint32_t mode = curr_con_mode;
+ 	struct hdd_context *hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
+ 
++	pr_info("konoha_wlan_trace: hdd_hif_open begin mode=%u reinit=%d\n",
++		mode, reinit);
+ 	if (!hdd_ctx)
+ 		return -EFAULT;
+ 
+@@ -600,9 +602,11 @@
+ 
+ 	hdd_hif_set_attribute(hif_ctx);
+ 
++	pr_info("konoha_wlan_trace: hdd_hif_open hif_enable begin\n");
+ 	status = hif_enable(hif_ctx, dev, bdev, bid, bus_type,
+ 			    (reinit == true) ?  HIF_ENABLE_TYPE_REINIT :
+ 			    HIF_ENABLE_TYPE_PROBE);
++	pr_info("konoha_wlan_trace: hdd_hif_open hif_enable status=%d\n", status);
+ 	if (!QDF_IS_STATUS_SUCCESS(status)) {
+ 		hdd_err("hif_enable failed status: %d, reinit: %d",
+ 			status, reinit);
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -5288,10 +5288,12 @@
+ 		hdd_init_adapter_ops_wq(hdd_ctx);
+ 		pld_set_fw_log_mode(hdd_ctx->parent_dev,
+ 				    hdd_ctx->config->enable_fw_log);
++		pr_info("konoha_wlan_trace: hdd_start hif_open begin\n");
+ 		ret = hdd_hif_open(qdf_dev->dev, qdf_dev->drv_hdl, qdf_dev->bid,
+ 				   qdf_dev->bus_type,
+ 				   (reinit == true) ?  HIF_ENABLE_TYPE_REINIT :
+ 				   HIF_ENABLE_TYPE_PROBE);
++		pr_info("konoha_wlan_trace: hdd_start hif_open ret=%d\n", ret);
+ 		if (ret) {
+ 			hdd_err("Failed to open hif; errno: %d", ret);
+ 			goto power_down;
+@@ -5365,7 +5367,9 @@
+ 		if (QDF_IS_STATUS_ERROR(status))
+ 			hdd_err("WBUFF init unsuccessful; status: %d", status);
+ 
++		pr_info("konoha_wlan_trace: hdd_start cds_open begin\n");
+ 		status = cds_open(hdd_ctx->psoc);
++		pr_info("konoha_wlan_trace: hdd_start cds_open status=%d\n", status);
+ 		if (QDF_IS_STATUS_ERROR(status)) {
+ 			hdd_err("Failed to Open CDS; status: %d", status);
+ 			ret = qdf_status_to_os_return(status);
+@@ -5427,7 +5431,9 @@
+ 
+ 		wlan_hdd_register_afc_pld_cb(hdd_ctx->psoc);
+ 
++		pr_info("konoha_wlan_trace: hdd_start cds_pre_enable begin\n");
+ 		status = cds_pre_enable();
++		pr_info("konoha_wlan_trace: hdd_start cds_pre_enable status=%d\n", status);
+ 		if (!QDF_IS_STATUS_SUCCESS(status)) {
+ 			hdd_err("Failed to pre-enable CDS; status: %d", status);
+ 			ret = qdf_status_to_os_return(status);
+@@ -5471,7 +5477,9 @@
+ 			break;
+ 		}
+ 
++		pr_info("konoha_wlan_trace: hdd_start configure_cds begin\n");
+ 		ret = hdd_configure_cds(hdd_ctx);
++		pr_info("konoha_wlan_trace: hdd_start configure_cds ret=%d\n", ret);
+ 		if (ret) {
+ 			hdd_err("Failed to Enable cds modules; errno: %d", ret);
+ 			goto sched_disable;
+--- a/qcacld-3.0/core/cds/src/cds_api.c
++++ b/qcacld-3.0/core/cds/src/cds_api.c
+@@ -772,6 +772,7 @@
+ 	mac_handle_t mac_handle;
+ 
+ 	cds_debug("Opening CDS");
++	pr_info("konoha_wlan_trace: cds_open enter\n");
+ 
+ 	cds_ctx = cds_get_context(QDF_MODULE_ID_QDF);
+ 	if (!cds_ctx)
+@@ -825,7 +826,9 @@
+ 
+ 	/* Initialize BMI and Download firmware */
+ 	ol_ctx = cds_get_context(QDF_MODULE_ID_BMI);
++	pr_info("konoha_wlan_trace: cds_open bmi_download begin\n");
+ 	status = bmi_download_firmware(ol_ctx);
++	pr_info("konoha_wlan_trace: cds_open bmi_download status=%d\n", status);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		cds_alert("BMI FIALED status:%d", status);
+ 		goto err_bmi_close;
+@@ -863,8 +866,10 @@
+ 				hdd_ctx->config->exclude_selftx_from_cca_busy,
+ 				cds_cfg);
+ 	/*Open the WMA module */
++	pr_info("konoha_wlan_trace: cds_open wma_open begin\n");
+ 	status = wma_open(psoc, hdd_update_tgt_cfg, cds_cfg,
+ 			  hdd_ctx->target_type);
++	pr_info("konoha_wlan_trace: cds_open wma_open status=%d\n", status);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		cds_alert("Failed to open WMA module");
+ 		goto err_htc_close;
+@@ -889,7 +894,9 @@
+ 		goto err_wma_close;
+ 	}
+ 
++	pr_info("konoha_wlan_trace: cds_open htc_wait_target begin\n");
+ 	status = htc_wait_target(HTCHandle);
++	pr_info("konoha_wlan_trace: cds_open htc_wait_target status=%d\n", status);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		cds_alert("Failed to complete BMI phase. status: %d", status);
+ 		QDF_BUG(status == QDF_STATUS_E_NOMEM || cds_is_fw_down());
+@@ -1180,6 +1187,7 @@
+ 	struct hif_softc *hif_sc;
+ 
+ 	cds_enter();
++	pr_info("konoha_wlan_trace: cds_pre_enable enter\n");
+ 
+ 	if (!gp_cds_context) {
+ 		cds_err("cds context is null");
+@@ -1206,25 +1214,33 @@
+ 					scn);
+ 
+ 	/*call WMA pre start */
++	pr_info("konoha_wlan_trace: cds_pre_enable wma_pre_start begin\n");
+ 	status = wma_pre_start();
++	pr_info("konoha_wlan_trace: cds_pre_enable wma_pre_start status=%d\n", status);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		cds_err("Failed to WMA prestart");
+ 		goto exit_pkt_log;
+ 	}
+ 
++	pr_info("konoha_wlan_trace: cds_pre_enable htc_start begin\n");
+ 	status = htc_start(gp_cds_context->htc_ctx);
++	pr_info("konoha_wlan_trace: cds_pre_enable htc_start status=%d\n", status);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		cds_err("Failed to Start HTC");
+ 		goto exit_pkt_log;
+ 	}
+ 
++	pr_info("konoha_wlan_trace: cds_pre_enable wma_wait_ready begin\n");
+ 	status = wma_wait_for_ready_event(gp_cds_context->wma_context);
++	pr_info("konoha_wlan_trace: cds_pre_enable wma_wait_ready status=%d\n", status);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		cds_err("Failed to wait for ready event; status: %u", status);
+ 		goto stop_wmi;
+ 	}
+ 
++	pr_info("konoha_wlan_trace: cds_pre_enable pdev_post_attach begin\n");
+ 	errno = cdp_pdev_post_attach(soc, OL_TXRX_PDEV_ID);
++	pr_info("konoha_wlan_trace: cds_pre_enable pdev_post_attach ret=%d\n", errno);
+ 	if (errno) {
+ 		cds_err("Failed to attach pdev");
+ 		status = qdf_status_from_os_return(errno);
