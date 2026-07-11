@@ -141,6 +141,34 @@ diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c b/qcacld-3.0/core/hdd
  #include <linux/suspend.h>
  #include <qdf_notifier.h>
  #include <qdf_hang_event_notifier.h>
+@@ -65,12 +69,29 @@
+ #define SSR_MAX_FAIL_CNT 3
+ static uint8_t re_init_fail_cnt, probe_fail_cnt;
+ 
+ /* An atomic flag to check if SSR cleanup has been done or not */
+ static qdf_atomic_t is_recovery_cleanup_done;
+ 
+ /* firmware/host hang event data */
+ static uint8_t g_fw_host_hang_event[QDF_HANG_EVENT_DATA_SIZE];
+ 
++struct hdd_cfg_value_store {
++	char *path;
++	qdf_list_node_t node;
++	qdf_atomic_t users;
++	struct cfg_values values;
++};
++
++struct hdd_cfg_psoc_ctx {
++	struct hdd_cfg_value_store *store;
++};
++
++#define hdd_cfg_get_values(psoc) \
++	(&((struct hdd_cfg_psoc_ctx *)wlan_objmgr_psoc_get_comp_private_obj( \
++		(psoc), WLAN_UMAC_COMP_CONFIG))->store->values)
++
+ /*
+  * In BMI Phase we are only sending small chunk (256 bytes) of the FW image at
+  * a time, and wait for the completion interrupt to start the next transfer.
 @@ -552,7 +552,8 @@ int hdd_hif_open(struct device *dev, void *bdev, const struct hif_bus_id *bid,
  	struct hif_opaque_softc *hif_ctx;
  	qdf_device_t qdf_ctx = cds_get_context(QDF_MODULE_ID_QDF_DEVICE);
