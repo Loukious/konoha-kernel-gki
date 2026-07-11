@@ -1,0 +1,321 @@
+diff --git a/qca-wifi-host-cmn/qdf/src/qdf_hang_event_notifier.c b/qca-wifi-host-cmn/qdf/src/qdf_hang_event_notifier.c
+index 09b1761b6517..dab477109c2a 100644
+--- a/qca-wifi-host-cmn/qdf/src/qdf_hang_event_notifier.c
++++ b/qca-wifi-host-cmn/qdf/src/qdf_hang_event_notifier.c
+@@ -23,7 +23,7 @@
+ #include <qdf_notifier.h>
+ #include <qdf_hang_event_notifier.h>
+ 
+-static qdf_atomic_notifier_init(qdf_hang_event_notif_head)
++qdf_atomic_notifier_init(qdf_hang_event_notif_head)
+ 
+ QDF_STATUS qdf_hang_event_register_notifier(qdf_notif_block *nb)
+ {
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_hang_event.c b/qcacld-3.0/core/hdd/src/wlan_hdd_hang_event.c
+index 81fee2be56a1..066f5ebb16b9 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_hang_event.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_hang_event.c
+@@ -113,7 +113,7 @@ static int wlan_hdd_recovery_notifier_call(struct notifier_block *block,
+ 	return NOTIFY_OK;
+ }
+ 
+-static qdf_notif_block hdd_recovery_notifier = {
++qdf_notif_block hdd_recovery_notifier = {
+ 	.notif_block.notifier_call = wlan_hdd_recovery_notifier_call,
+ };
+ 
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+index 0fb7eaca17dc..a0b060b02609 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -195,6 +195,8 @@
+ #include <wlan_hdd_debugfs_coex.h>
+ #include <wlan_hdd_debugfs_config.h>
+ #include "wlan_dlm_ucfg_api.h"
++#include "wlan_dlm_core.h"
++#include "wlan_dlm_main.h"
+ #include "ftm_time_sync_ucfg_api.h"
+ #include "wlan_pre_cac_ucfg_api.h"
+ #include "ol_txrx.h"
+@@ -263,6 +265,7 @@ QDF_STATUS regulatory_pdev_close(struct wlan_objmgr_pdev *pdev);
+ #include "os_if_qmi.h"
+ #include "wlan_qmi_ucfg_api.h"
+ #include "wlan_psoc_mlme_ucfg_api.h"
++#include "wlan_psoc_mlme_api.h"
+ #include "wlan_ll_sap_ucfg_api.h"
+ #include "wlan_hdd_tx_rx.h"
+ #include "p2phc.h"
+@@ -273,10 +276,17 @@ QDF_STATUS regulatory_pdev_close(struct wlan_objmgr_pdev *pdev);
+ #include "os_if_ll_sap.h"
+ #include "wlan_crypto_obj_mgr_i.h"
+ #include "wlan_p2p_ucfg_api.h"
++#include "../../components/p2p/core/src/wlan_p2p_main.h"
++#include "wlan_pmo_main.h"
++#include "wlan_pmo_obj_mgmt_api.h"
++#include "twt/core/src/wlan_twt_cfg.h"
++#include "wlan_crypto_global_api.h"
+ #include "wifi_pos_api.h"
+ #include "wlan_mgmt_rx_srng_ucfg_api.h"
+ 
+ void dp_try_set_rps_cpu_mask(struct wlan_objmgr_psoc *psoc);
++extern qdf_atomic_notif_head qdf_hang_event_notif_head;
++extern qdf_notif_block hdd_recovery_notifier;
+ 
+ struct hdd_cfg_value_store {
+ 	char *path;
+@@ -18002,7 +18012,7 @@ int hdd_configure_cds(struct hdd_context *hdd_ctx)
+ 	uint8_t next_index = 0;
+ 	mac_handle = hdd_ctx->mac_handle;
+ 
+-	status = ucfg_policy_mgr_get_force_1x1(hdd_ctx->psoc, &is_force_1x1);
++	status = policy_mgr_get_force_1x1(hdd_ctx->psoc, &is_force_1x1);
+ 	if (status != QDF_STATUS_SUCCESS) {
+ 		hdd_err("Failed to get force 1x1 value");
+ 		goto out;
+@@ -18115,16 +18125,16 @@ int hdd_configure_cds(struct hdd_context *hdd_ctx)
+ 	/* Send some pdev params to maintain legacy order of pdev set params
+ 	 * at hdd_pre_enable_configure
+ 	 */
+-	status = sme_send_multi_pdev_vdev_set_params(MLME_PDEV_SETPARAM,
++	status = wma_send_multi_pdev_vdev_set_params(MLME_PDEV_SETPARAM,
+ 						     WMI_PDEV_ID_SOC, setparam,
+ 						     index);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		hdd_err("Failed to send 1st set of pdev params");
+ 		goto out;
+ 	}
+-	if (!ucfg_reg_is_regdb_offloaded(hdd_ctx->psoc))
+-		ucfg_reg_program_default_cc(hdd_ctx->pdev,
+-					    hdd_ctx->reg.reg_domain);
++	if (!reg_is_regdb_offloaded(hdd_ctx->psoc))
++		reg_program_default_cc(hdd_ctx->pdev,
++				       hdd_ctx->reg.reg_domain);
+ 
+ 	ret = hdd_pre_enable_configure(hdd_ctx);
+ 	if (ret) {
+@@ -18211,15 +18221,18 @@ int hdd_configure_cds(struct hdd_context *hdd_ctx)
+ 	status = mlme_check_index_setparam(
+ 				      setparam + index,
+ 				      wmi_pdev_param_gcmp_support_enable,
+-				      ucfg_fwol_get_gcmp_enable(hdd_ctx->psoc),
++				      hdd_cfg_get_values(hdd_ctx->psoc)->
++				      __CFG_ENABLE_GCMP_internal,
+ 				      next_index++, max_index);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		hdd_err("failed at wmi_pdev_param_gcmp_support_enable");
+ 		goto out;
+ 	}
+ 
+-	 auto_power_fail_mode =
+-		ucfg_pmo_get_auto_power_fail_mode(hdd_ctx->psoc);
++	auto_power_fail_mode =
++		((struct pmo_psoc_priv_obj *)
++		 pmo_psoc_get_priv_nolock(hdd_ctx->psoc))->
++		psoc_cfg.auto_power_save_fail_mode;
+ 	status = mlme_check_index_setparam(
+ 				      setparam + index,
+ 				      wmi_pdev_auto_detect_power_failure,
+@@ -18248,7 +18261,7 @@ int hdd_configure_cds(struct hdd_context *hdd_ctx)
+ 		}
+ 	}
+ 	/*Send remaining pdev setparams from array*/
+-	status = sme_send_multi_pdev_vdev_set_params(MLME_PDEV_SETPARAM,
++	status = wma_send_multi_pdev_vdev_set_params(MLME_PDEV_SETPARAM,
+ 						     WMI_PDEV_ID_SOC,
+ 						     setparam + index,
+ 						     next_index);
+@@ -18259,7 +18272,9 @@ int hdd_configure_cds(struct hdd_context *hdd_ctx)
+ 
+ 	hdd_hastings_bt_war_initialize(hdd_ctx);
+ 
+-	wlan_hdd_hang_event_notifier_register(hdd_ctx);
++	hdd_recovery_notifier.priv_data = hdd_ctx;
++	qdf_register_atomic_notifier_chain(&qdf_hang_event_notif_head,
++					   &hdd_recovery_notifier);
+ 	return 0;
+ 
+ cds_disable:
+@@ -21090,6 +21105,23 @@ static void hdd_component_deinit(void)
+ 	ucfg_mlme_global_deinit();
+ }
+ 
++static QDF_STATUS hdd_dlm_suspend_handler(struct wlan_objmgr_psoc *psoc,
++					  void *arg)
++{
++	ucfg_dlm_psoc_set_suspended(psoc, true);
++
++	return QDF_STATUS_SUCCESS;
++}
++
++static QDF_STATUS hdd_dlm_resume_handler(struct wlan_objmgr_psoc *psoc,
++					 void *arg)
++{
++	ucfg_dlm_psoc_set_suspended(psoc, false);
++	dlm_update_reject_ap_list_to_fw(psoc);
++
++	return QDF_STATUS_SUCCESS;
++}
++
+ QDF_STATUS hdd_component_psoc_open(struct wlan_objmgr_psoc *psoc)
+ {
+ 	QDF_STATUS status;
+@@ -21098,7 +21130,12 @@ QDF_STATUS hdd_component_psoc_open(struct wlan_objmgr_psoc *psoc)
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		return status;
+ 
+-	status = ucfg_dlm_psoc_open(psoc);
++	pmo_register_suspend_handler(WLAN_UMAC_COMP_DENYLIST_MGR,
++				     hdd_dlm_suspend_handler, NULL);
++	pmo_register_resume_handler(WLAN_UMAC_COMP_DENYLIST_MGR,
++				    hdd_dlm_resume_handler, NULL);
++
++	status = dlm_cfg_psoc_open(psoc);
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		goto err_dlm;
+ 
+@@ -21106,7 +21143,7 @@ QDF_STATUS hdd_component_psoc_open(struct wlan_objmgr_psoc *psoc)
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		goto err_fwol;
+ 
+-	status = ucfg_pmo_psoc_open(psoc);
++	status = pmo_psoc_open(psoc);
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		goto err_pmo;
+ 
+@@ -21114,7 +21151,7 @@ QDF_STATUS hdd_component_psoc_open(struct wlan_objmgr_psoc *psoc)
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		goto err_plcy_mgr;
+ 
+-	status = ucfg_p2p_psoc_open(psoc);
++	status = p2p_psoc_object_open(psoc);
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		goto err_p2p;
+ 
+@@ -21126,7 +21163,7 @@ QDF_STATUS hdd_component_psoc_open(struct wlan_objmgr_psoc *psoc)
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		goto err_nan;
+ 
+-	status = ucfg_twt_psoc_open(psoc);
++	status = wlan_twt_cfg_init(psoc);
+ 	if (QDF_IS_STATUS_ERROR(status))
+ 		goto err_twt;
+ 
+@@ -21143,23 +21180,23 @@ QDF_STATUS hdd_component_psoc_open(struct wlan_objmgr_psoc *psoc)
+ err_dp:
+ 	ucfg_wifi_pos_psoc_close(psoc);
+ err_wifi_pos:
+-	ucfg_twt_psoc_close(psoc);
++	wlan_twt_cfg_deinit(psoc);
+ err_twt:
+-	ucfg_nan_psoc_close(psoc);
+ err_nan:
+ 	ucfg_tdls_psoc_close(psoc);
+ err_tdls:
+-	ucfg_p2p_psoc_close(psoc);
++	p2p_psoc_object_close(psoc);
+ err_p2p:
+ 	ucfg_policy_mgr_psoc_close(psoc);
+ err_plcy_mgr:
+-	ucfg_pmo_psoc_close(psoc);
+ err_pmo:
+-	ucfg_fwol_psoc_close(psoc);
+ err_fwol:
+-	ucfg_dlm_psoc_close(psoc);
++	pmo_unregister_suspend_handler(WLAN_UMAC_COMP_DENYLIST_MGR,
++				       hdd_dlm_suspend_handler);
++	pmo_unregister_resume_handler(WLAN_UMAC_COMP_DENYLIST_MGR,
++				      hdd_dlm_resume_handler);
+ err_dlm:
+-	ucfg_mlme_psoc_close(psoc);
++	wlan_mlme_psoc_flush_peer_trans_history(psoc);
+ 
+ 	return status;
+ }
+@@ -21168,18 +21205,18 @@ void hdd_component_psoc_close(struct wlan_objmgr_psoc *psoc, bool is_recovering)
+ {
+ 	ucfg_dp_psoc_close(psoc);
+ 	ucfg_wifi_pos_psoc_close(psoc);
+-	ucfg_twt_psoc_close(psoc);
+-	ucfg_nan_psoc_close(psoc);
++	wlan_twt_cfg_deinit(psoc);
+ 	ucfg_tdls_psoc_close(psoc);
+-	ucfg_p2p_psoc_close(psoc);
++	p2p_psoc_object_close(psoc);
+ 	ucfg_policy_mgr_psoc_close(psoc);
+-	ucfg_pmo_psoc_close(psoc);
+-	ucfg_fwol_psoc_close(psoc);
+-	ucfg_dlm_psoc_close(psoc);
+-	ucfg_mlme_psoc_close(psoc);
++	pmo_unregister_suspend_handler(WLAN_UMAC_COMP_DENYLIST_MGR,
++				       hdd_dlm_suspend_handler);
++	pmo_unregister_resume_handler(WLAN_UMAC_COMP_DENYLIST_MGR,
++				      hdd_dlm_resume_handler);
++	wlan_mlme_psoc_flush_peer_trans_history(psoc);
+ 
+ 	if (!is_recovering || cds_is_driver_unloading())
+-		ucfg_crypto_flush_entries(psoc);
++		crypto_flush_entries(psoc);
+ }
+ 
+ void hdd_component_psoc_enable(struct wlan_objmgr_psoc *psoc)
+diff --git a/qcacld-3.0/core/cds/src/cds_api.c b/qcacld-3.0/core/cds/src/cds_api.c
+index fd8bafcd3f34..9dd7144feffc 100644
+--- a/qcacld-3.0/core/cds/src/cds_api.c
++++ b/qcacld-3.0/core/cds/src/cds_api.c
+@@ -90,6 +90,7 @@
+ #include "wlan_dp_ucfg_api.h"
+ #include "wlan_dp_prealloc.h"
+ #include "wlan_dp_api.h"
++#include "wlan_pmo_main.h"
+ #include "qdf_ipa.h"
+ 
+ /* Preprocessor Definitions and Constants */
+@@ -103,6 +104,12 @@ static struct __qdf_device g_qdf_ctx;
+ 
+ static uint8_t cds_multicast_logging;
+ 
++QDF_STATUS wlan_dp_txrx_pdev_attach(ol_txrx_soc_handle soc);
++QDF_STATUS wlan_dp_txrx_pdev_detach(ol_txrx_soc_handle soc, uint8_t pdev_id,
++				    int force);
++QDF_STATUS dp_txrx_init(ol_txrx_soc_handle soc, uint8_t pdev_id,
++			struct dp_txrx_config *config);
++
+ #define DRIVER_VER_LEN (11)
+ #define HANG_EVENT_VER_LEN (1)
+ 
+@@ -1002,7 +1009,7 @@ QDF_STATUS cds_dp_open(struct wlan_objmgr_psoc *psoc)
+ 	}
+ 
+ 	qdf_status =
+-		ucfg_dp_txrx_pdev_attach(cds_get_context(QDF_MODULE_ID_SOC));
++		wlan_dp_txrx_pdev_attach(cds_get_context(QDF_MODULE_ID_SOC));
+ 	if (!QDF_IS_STATUS_SUCCESS(qdf_status)) {
+ 		/* Critical Error ...  Cannot proceed further */
+ 		cds_alert("Failed to open TXRX");
+@@ -1043,14 +1050,13 @@ QDF_STATUS cds_dp_open(struct wlan_objmgr_psoc *psoc)
+ 		(cds_get_conparam() == QDF_GLOBAL_MONITOR_MODE) ?
+ 		false : gp_cds_context->cds_cfg->enable_dp_rx_threads;
+ 
+-	qdf_status = ucfg_dp_txrx_init(cds_get_context(QDF_MODULE_ID_SOC),
+-				       OL_TXRX_PDEV_ID,
+-				       &dp_config);
++	qdf_status = dp_txrx_init(cds_get_context(QDF_MODULE_ID_SOC),
++				  OL_TXRX_PDEV_ID, &dp_config);
+ 
+ 	if (!QDF_IS_STATUS_SUCCESS(qdf_status))
+ 		goto intr_close;
+ 
+-	ucfg_pmo_psoc_set_txrx_pdev_id(psoc, OL_TXRX_PDEV_ID);
++	pmo_core_psoc_set_txrx_pdev_id(psoc, OL_TXRX_PDEV_ID);
+ 	ucfg_ocb_set_txrx_pdev_id(psoc, OL_TXRX_PDEV_ID);
+ 
+ 	cdp_set_rtpm_tput_policy_requirement(cds_get_context(QDF_MODULE_ID_SOC),
+@@ -1076,7 +1082,7 @@ QDF_STATUS cds_dp_open(struct wlan_objmgr_psoc *psoc)
+ 			OL_TXRX_PDEV_ID, false);
+ 
+ pdev_detach:
+-	ucfg_dp_txrx_pdev_detach(gp_cds_context->dp_soc, OL_TXRX_PDEV_ID,
++	wlan_dp_txrx_pdev_detach(gp_cds_context->dp_soc, OL_TXRX_PDEV_ID,
+ 				 false);
+ 
+ close:
