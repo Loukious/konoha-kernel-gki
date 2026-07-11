@@ -7,3 +7,23 @@
 +
 +# WCN7750 stock parity: keep WMA message-handler layout closer to stock
 +CFLAGS_core/wma/src/wma_main.o += -fno-jump-tables -mllvm -enable-tail-merge=false
+diff --git a/qcacld-3.0/core/wma/src/wma_main.c b/qcacld-3.0/core/wma/src/wma_main.c
+--- a/qcacld-3.0/core/wma/src/wma_main.c
++++ b/qcacld-3.0/core/wma/src/wma_main.c
+@@ -9314,7 +9314,7 @@
+  *
+  * Return: QDF_SUCCESS for success otherwise failure
+  */
+-static QDF_STATUS wma_mc_process_msg(struct scheduler_msg *msg)
++static __always_inline QDF_STATUS wma_mc_process_msg(struct scheduler_msg *msg)
+ {
+ 	QDF_STATUS qdf_status = QDF_STATUS_SUCCESS;
+ 	tp_wma_handle wma_handle;
+@@ -1352,7 +1352,7 @@
+  *
+  * Return: none
+  */
+-static void wma_process_cli_set_cmd(tp_wma_handle wma,
++static __always_inline void wma_process_cli_set_cmd(tp_wma_handle wma,
+ 				    wma_cli_set_cmd_t *privcmd)
+ {

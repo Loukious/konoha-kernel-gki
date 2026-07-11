@@ -1,0 +1,221 @@
+diff --git a/qcacld-3.0/core/cds/src/cds_api.c b/qcacld-3.0/core/cds/src/cds_api.c
+--- a/qcacld-3.0/core/cds/src/cds_api.c
++++ b/qcacld-3.0/core/cds/src/cds_api.c
+@@ -50,6 +50,7 @@
+ #include "ol_fw.h"
+ #include "ol_if_athvar.h"
+ #include "hif.h"
++#include "hif_main.h"
+ #include "wlan_policy_mgr_api.h"
+ #include "cds_utils.h"
+ #include "wlan_logging_sock_svc.h"
+@@ -108,6 +109,11 @@ QDF_STATUS wlan_dp_txrx_pdev_attach(ol_txrx_soc_handle soc);
+ QDF_STATUS wlan_dp_txrx_pdev_detach(ol_txrx_soc_handle soc, uint8_t pdev_id,
+ 				    int force);
+ QDF_STATUS dp_txrx_init(ol_txrx_soc_handle soc, uint8_t pdev_id,
+ 			struct dp_txrx_config *config);
++void *wlan_dp_txrx_soc_attach(struct dp_txrx_soc_attach_params *params,
++				      bool *is_wifi3_0_target);
++void wlan_dp_txrx_soc_detach(ol_txrx_soc_handle soc);
++void wlan_dp_fb_update_num_rx_rings(struct wlan_objmgr_psoc *psoc);
++extern qdf_atomic_notif_head qdf_hang_event_notif_head;
++extern int curr_con_mode;
+ 
+ #define DRIVER_VER_LEN (11)
+ #define HANG_EVENT_VER_LEN (1)
+@@ -776,7 +782,7 @@ QDF_STATUS cds_open(struct wlan_objmgr_psoc *psoc)
+ 		return status;
+ 	}
+ 
+-	status = dispatcher_enable();
++	status = scheduler_enable();
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		cds_err("Failed to enable dispatcher; status:%d", status);
+ 		return status;
+@@ -896,7 +902,7 @@ QDF_STATUS cds_open(struct wlan_objmgr_psoc *psoc)
+ 	soc_attach_params.target_psoc = htcInfo.target_psoc;
+ 	soc_attach_params.dp_ol_if_ops = &dp_ol_if_ops;
+ 	gp_cds_context->dp_soc =
+-		ucfg_dp_txrx_soc_attach(&soc_attach_params,
++		wlan_dp_txrx_soc_attach(&soc_attach_params,
+ 					&hdd_ctx->is_wifi3_0_target);
+ 	if (!gp_cds_context->dp_soc) {
+ 		status = QDF_STATUS_E_FAILURE;
+@@ -905,7 +911,7 @@ QDF_STATUS cds_open(struct wlan_objmgr_psoc *psoc)
+ 
+ 	wlan_psoc_set_dp_handle(psoc, gp_cds_context->dp_soc);
+ 	ucfg_dp_set_cmn_dp_handle(psoc, gp_cds_context->dp_soc);
+-	ucfg_dp_update_num_rx_rings(psoc);
++	wlan_dp_fb_update_num_rx_rings(psoc);
+ 	ucfg_pmo_psoc_update_dp_handle(psoc, gp_cds_context->dp_soc);
+ 	ucfg_ocb_update_dp_handle(psoc, gp_cds_context->dp_soc);
+ 	ucfg_dp_recover_mon_conf_flags(psoc);
+@@ -943,7 +949,9 @@ QDF_STATUS cds_open(struct wlan_objmgr_psoc *psoc)
+ 	}
+ 
+ 	ucfg_mc_cp_stats_register_pmo_handler();
+-	qdf_hang_event_register_notifier(&cds_hang_event_notifier);
++	qdf_status_from_os_return(
++		atomic_notifier_chain_register(&qdf_hang_event_notif_head,
++			&cds_hang_event_notifier.notif_block));
+ 
+ 	return QDF_STATUS_SUCCESS;
+ 
+@@ -956,7 +964,7 @@ err_mac_close:
+ 	gp_cds_context->mac_context = NULL;
+ 
+ err_soc_detach:
+-	ucfg_dp_txrx_soc_detach(gp_cds_context->dp_soc);
++	wlan_dp_txrx_soc_detach(gp_cds_context->dp_soc);
+ 	gp_cds_context->dp_soc = NULL;
+ 
+ 	ucfg_ocb_update_dp_handle(psoc, NULL);
+@@ -983,7 +991,7 @@ err_sched_close:
+ 		QDF_DEBUG_PANIC("Failed to close CDS Scheduler");
+ 
+ err_dispatcher_disable:
+-	if (QDF_IS_STATUS_ERROR(dispatcher_disable()))
++	if (QDF_IS_STATUS_ERROR(scheduler_disable()))
+ 		QDF_DEBUG_PANIC("Failed to disable dispatcher");
+ 
+ 	return status;
+@@ -1160,6 +1168,7 @@ QDF_STATUS cds_pre_enable(void)
+ 	void *scn;
+ 	void *soc;
+ 	void *hif_ctx;
++	struct hif_softc *hif_sc;
+ 
+ 	cds_enter();
+ 
+@@ -1182,8 +1191,8 @@ QDF_STATUS cds_pre_enable(void)
+ 		return QDF_STATUS_E_INVAL;
+ 
+ 	/* call Packetlog connect service */
+-	if (QDF_GLOBAL_FTM_MODE != cds_get_conparam() &&
+-	    QDF_GLOBAL_EPPING_MODE != cds_get_conparam())
++	if (QDF_GLOBAL_FTM_MODE != curr_con_mode &&
++	    QDF_GLOBAL_EPPING_MODE != curr_con_mode)
+ 		cdp_pkt_log_con_service(soc, OL_TXRX_PDEV_ID,
+ 					scn);
+ 
+@@ -1228,16 +1237,17 @@ stop_wmi:
+ 
+ 	if (hif_ctx) {
+ 		cds_err("Disable the isr & reset the soc!");
+-		hif_disable_isr(hif_ctx);
+-		hif_reset_soc(hif_ctx);
++		hif_sc = HIF_GET_SOFTC(hif_ctx);
++		hif_sc->bus_ops.hif_disable_isr(hif_sc);
++		hif_sc->bus_ops.hif_reset_soc(hif_sc);
+ 	}
+ 	htc_stop(gp_cds_context->htc_ctx);
+ 
+ 	wma_wmi_work_close();
+ 
+ exit_pkt_log:
+-	if (QDF_GLOBAL_FTM_MODE != cds_get_conparam() &&
+-	    QDF_GLOBAL_EPPING_MODE != cds_get_conparam())
++	if (QDF_GLOBAL_FTM_MODE != curr_con_mode &&
++	    QDF_GLOBAL_EPPING_MODE != curr_con_mode)
+ 		cdp_pkt_log_exit(soc, OL_TXRX_PDEV_ID);
+ 
+ 	return status;
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_driver_ops.c
+@@ -25,6 +25,7 @@
+ #include "cds_sched.h"
+ #include "osdep.h"
+ #include "hif.h"
++#include "hif_main.h"
+ #include "htc.h"
+ #include "epping_main.h"
+ #include "osif_sync.h"
+@@ -44,6 +45,9 @@
+ #include "wlan_ipa_ucfg_api.h"
+ #include "wlan_hdd_debugfs.h"
+ #include "cfg_ucfg_api.h"
++#include "i_cfg.h"
++#include "i_cfg_objmgr.h"
++#include "wlan_pmo_main.h"
+ #include <linux/suspend.h>
+ #include <qdf_notifier.h>
+ #include <qdf_hang_event_notifier.h>
+@@ -65,12 +69,29 @@
+ #define SSR_MAX_FAIL_CNT 3
+ static uint8_t re_init_fail_cnt, probe_fail_cnt;
+ 
++extern int curr_con_mode;
++
+ /* An atomic flag to check if SSR cleanup has been done or not */
+ static qdf_atomic_t is_recovery_cleanup_done;
+ 
+ /* firmware/host hang event data */
+ static uint8_t g_fw_host_hang_event[QDF_HANG_EVENT_DATA_SIZE];
+ 
++struct hdd_cfg_value_store {
++	char *path;
++	qdf_list_node_t node;
++	qdf_atomic_t users;
++	struct cfg_values values;
++};
++
++struct hdd_cfg_psoc_ctx {
++	struct hdd_cfg_value_store *store;
++};
++
++#define hdd_cfg_get_values(psoc) \
++	(&((struct hdd_cfg_psoc_ctx *)wlan_objmgr_psoc_get_comp_private_obj( \
++		(psoc), WLAN_UMAC_COMP_CONFIG))->store->values)
++
+ /*
+  * In BMI Phase we are only sending small chunk (256 bytes) of the FW image at
+  * a time, and wait for the completion interrupt to start the next transfer.
+@@ -552,7 +573,7 @@ int hdd_hif_open(struct device *dev, void *bdev, const struct hif_bus_id *bid,
+ 	struct hif_opaque_softc *hif_ctx;
+ 	qdf_device_t qdf_ctx = cds_get_context(QDF_MODULE_ID_QDF_DEVICE);
+ 	struct hif_driver_state_callbacks cbk;
+-	uint32_t mode = cds_get_conparam();
++	uint32_t mode = curr_con_mode;
+ 	struct hdd_context *hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
+ 
+ 	if (!hdd_ctx)
+@@ -606,15 +627,14 @@ int hdd_hif_open(struct device *dev, void *bdev, const struct hif_bus_id *bid,
+ 		}
+ 	}
+ 
+-	hdd_hif_set_ce_max_yield_time(
+-				hif_ctx, bus_type,
+-				cfg_get(hdd_ctx->psoc,
+-					CFG_DP_CE_SERVICE_MAX_YIELD_TIME));
+-	ucfg_pmo_psoc_set_hif_handle(hdd_ctx->psoc, hif_ctx);
++	HIF_GET_SOFTC(hif_ctx)->ce_service_max_yield_time =
++		(unsigned long long)hdd_cfg_get_values(hdd_ctx->psoc)->
++		__CFG_DP_CE_SERVICE_MAX_YIELD_TIME_internal * 1000;
++	pmo_core_psoc_set_hif_handle(hdd_ctx->psoc, hif_ctx);
+ 	ucfg_dp_set_hif_handle(hdd_ctx->psoc, hif_ctx);
+ 	hif_set_ce_service_max_rx_ind_flush(hif_ctx,
+-				cfg_get(hdd_ctx->psoc,
+-					CFG_DP_CE_SERVICE_MAX_RX_IND_FLUSH));
++				hdd_cfg_get_values(hdd_ctx->psoc)->
++				__CFG_DP_CE_SERVICE_MAX_RX_IND_FLUSH_internal);
+ 	return 0;
+ 
+ mark_target_not_ready:
+@@ -646,7 +666,7 @@ void hdd_hif_close(struct hdd_context *hdd_ctx, void *hif_ctx)
+ 	hdd_deinit_cds_hif_context();
+ 	hif_close(hif_ctx);
+ 
+-	ucfg_pmo_psoc_set_hif_handle(hdd_ctx->psoc, NULL);
++	pmo_core_psoc_set_hif_handle(hdd_ctx->psoc, NULL);
+ }
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -1272,7 +1272,7 @@ static struct target_wake_time target_wake_time;
+ 
+ /* Variable to hold connection mode including module parameter con_mode */
+-static int curr_con_mode;
++int curr_con_mode;
+ 
+ #if defined(WLAN_FEATURE_11BE) && defined(CFG80211_11BE_BASIC)
