@@ -9,10 +9,15 @@ on:
         type: string
         default: sixteen-qpr2
       wlan_branch:
-        description: MiCode WLAN branch used for the replacement vendor driver
+        description: WLAN source branch used for the replacement vendor driver
         required: true
         type: string
-        default: annibale-w-oss
+        default: konoha-stock-parity-v46
+      wlan_repo:
+        description: WLAN source repository
+        required: true
+        type: string
+        default: https://github.com/Loukious/vendor_qcom_opensource_wlan.git
       enable_injection:
         description: Apply the injection port (disable for a source/ABI control build)
         required: true
@@ -22,12 +27,12 @@ on:
         description: Apply the neutral 6.6 compatibility patch to a control build
         required: true
         type: boolean
-        default: true
+        default: false
       apply_p2phc_patch:
         description: Add Xiaomi p2phc stock-driver hooks to a control build
         required: true
         type: boolean
-        default: true
+        default: false
       enable_trace:
         description: Add printk breadcrumbs around WLAN enable/startup paths
         required: true
@@ -126,13 +131,14 @@ jobs:
           KERNEL_SOURCE_REPO: ${{ inputs.kernel_source_repo }}
           PIXELOS_BRANCH: ${{ inputs.pixelos_branch }}
           WLAN_BRANCH: ${{ inputs.wlan_branch }}
+          WLAN_REPO: ${{ inputs.wlan_repo }}
         run: |
           mkdir -p gki-clo/vendor/qcom/opensource gki-clo/sources/pixelos
           git clone --depth=1 --filter=blob:none --single-branch \
             --branch "$KERNEL_SOURCE_BRANCH" "$KERNEL_SOURCE_REPO" \
             gki-clo/sources/xiaomi-kernel
           git clone --depth=1 --branch "$WLAN_BRANCH" \
-            https://github.com/MiCode/vendor_qcom_opensource_wlan.git \
+            "$WLAN_REPO" \
             gki-clo/vendor/qcom/opensource/wlan
           git clone --depth=1 --branch "$PIXELOS_BRANCH" \
             https://github.com/PixelOS-Devices/android_device_xiaomi_onyx-kernel.git \
@@ -143,7 +149,7 @@ jobs:
           wlan_version="$(sed -n 's/.*QWLAN_VERSIONSTR[[:space:]]*"\([^"]*\)".*/\1/p' \
             gki-clo/vendor/qcom/opensource/wlan/qcacld-3.0/core/mac/inc/qwlan_version.h)"
           kernel_device="${KERNEL_SOURCE_BRANCH%%-*}"
-          echo "WLAN source branch: $WLAN_BRANCH"
+          echo "WLAN source: $WLAN_REPO@$WLAN_BRANCH"
           echo "WLAN source version: $wlan_version"
           echo "Kernel source device config: $kernel_device"
           test -n "$wlan_version"
