@@ -12,11 +12,13 @@ fi
 
 echo "[+] Applying Kali NetHunter kernel configs"
 
+# PixelOS usb_f_gsi.ko provides RNDIS and owns rndis_add_hdr.
 scripts/config --file "$CONFIG_FILE" \
 	-e CONFIG_USB_CONFIGFS \
 	-e CONFIG_USB_CONFIGFS_F_HID \
 	-e CONFIG_USB_F_HID \
-	-e CONFIG_USB_CONFIGFS_RNDIS \
+	-d CONFIG_USB_CONFIGFS_RNDIS \
+	-d CONFIG_USB_F_RNDIS \
 	-e CONFIG_USB_CONFIGFS_EEM \
 	-e CONFIG_USB_CONFIGFS_ECM \
 	-m CONFIG_USB_NET_CDC_SUBSET \
