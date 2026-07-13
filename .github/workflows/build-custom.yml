@@ -32,8 +32,38 @@ on:
         type: choice
         options:
           - stock
+          - root
           - susfs
-        default: susfs
+        default: root
+      root:
+        description: 'Root Solution'
+        required: true
+        type: choice
+        options:
+          - ksu-next
+          - ksu
+          - sukisu
+          - yukisu
+          - resukisu
+          - mambosu
+        default: ksu-next
+      nethunter:
+        description: 'Kali NetHunter Support'
+        required: true
+        type: choice
+        options:
+          - 'off'
+          - 'on'
+        default: 'on'
+      lto:
+        description: 'LTO Type'
+        required: true
+        type: choice
+        options:
+          - thin
+          - none
+          - full
+        default: thin
       kpm:
         description: 'Kernel Patch Module (KPM)'
         required: true
@@ -134,6 +164,8 @@ jobs:
         env:
           INPUT_HZ: ${{ inputs.hz }}
           INPUT_VARIANT: ${{ inputs.variant }}
+          INPUT_ROOT: ${{ inputs.root }}
+          INPUT_NETHUNTER: ${{ inputs.nethunter }}
           INPUT_KPM: ${{ inputs.kpm }}
           INPUT_NOMOUNT: ${{ inputs.nomount }}
           INPUT_HARDENED: ${{ inputs.hardened }}
@@ -154,7 +186,7 @@ jobs:
           fi
           echo "HZ_ID=$HZ_ID" >> $GITHUB_ENV
 
-          ACTUAL_ROOT="resukisu"
+          ACTUAL_ROOT="$INPUT_ROOT"
           if [ "$INPUT_VARIANT" == "stock" ]; then
             ACTUAL_ROOT="none"
           fi
@@ -178,6 +210,7 @@ jobs:
           if [ "$INPUT_KGSL" == "off" ]; then BUILD_NAME="${BUILD_NAME}-nokgsl"; fi
           if [ "$INPUT_DATA" == "off" ]; then BUILD_NAME="${BUILD_NAME}-nodata"; fi
           if [ "$INPUT_DEBUG" == "on" ]; then BUILD_NAME="${BUILD_NAME}-debug"; fi
+          if [ "$INPUT_NETHUNTER" == "on" ]; then BUILD_NAME="${BUILD_NAME}-nethunter"; fi
           
           echo "BUILD_NAME=$BUILD_NAME" >> $GITHUB_ENV
           
@@ -214,10 +247,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ inputs.variant }}-resukisu-${{ inputs.hardened }}-${{ github.sha }}
+          key: ccache-${{ inputs.variant }}-${{ inputs.root }}-${{ inputs.hardened }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ inputs.variant }}-resukisu-${{ inputs.hardened }}-
-            ccache-${{ inputs.variant }}-resukisu-
+            ccache-${{ inputs.variant }}-${{ inputs.root }}-${{ inputs.hardened }}-
+            ccache-${{ inputs.variant }}-${{ inputs.root }}-
             ccache-${{ inputs.variant }}-
             ccache-
 
@@ -264,6 +297,8 @@ jobs:
         env:
           KPM_SUPERKEY_SECRET: ${{ secrets.KPM_SUPERKEY }}
           INPUT_VARIANT: ${{ inputs.variant }}
+          INPUT_NETHUNTER: ${{ inputs.nethunter }}
+          INPUT_LTO: ${{ inputs.lto }}
           INPUT_KPM: ${{ inputs.kpm }}
           INPUT_HARDENED: ${{ inputs.hardened }}
           INPUT_HTSR: ${{ inputs.htsr }}
@@ -287,7 +322,7 @@ jobs:
             KPM_PATCH="off"
           fi
           
-          LTO_VAL="full"
+          LTO_VAL="$INPUT_LTO"
           if [ "$INPUT_KPM" == "on" ]; then
             LTO_VAL="thin"
           fi
@@ -307,6 +342,7 @@ jobs:
             hardened="$INPUT_HARDENED" \
             bypasscharging="$INPUT_BYPASS" \
             droidspaces="$INPUT_DROIDSPACES" \
+            nethunter="$INPUT_NETHUNTER" \
             htsr="$INPUT_HTSR" \
             wifi_exploit="$INPUT_WIFI" \
             kgsl_exploit="$INPUT_KGSL" \
@@ -354,7 +390,9 @@ jobs:
             Automated Custom Kernel Build.
             Variant: **${{ inputs.variant }}**
             HZ: **${{ inputs.hz }}**
-            Root: **ReSukiSU** (if variant != stock)
+            Root: **${{ inputs.root }}** (if variant != stock)
+            NetHunter: **${{ inputs.nethunter }}**
+            LTO: **${{ inputs.lto }}**
             NoMount VFS: **${{ inputs.nomount }}**
             KPM: **${{ inputs.kpm }}**
             Hardened: **${{ inputs.hardened }}**

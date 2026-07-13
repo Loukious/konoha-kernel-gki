@@ -931,10 +931,8 @@ static int ieee80211_set_monitor_channel(struct wiphy *wiphy,
 		}
 	} else {
 		mutex_lock(&local->mtx);
-		if (local->open_count == local->monitors) {
-			local->_oper_chandef = *chandef;
-			ieee80211_hw_config(local, 0);
-		}
+		local->_oper_chandef = *chandef;
+		ieee80211_hw_config(local, 0);
 		mutex_unlock(&local->mtx);
 	}
 

@@ -8,8 +8,6 @@ cleanup() {
     # Revert dynamic Baseband-guard modifications to keep git tree clean
     git checkout security/Kconfig security/Makefile security/selinux/ include/linux/sched.h 2>/dev/null || true
     rm -f security/baseband-guard
-    # Revert NetHunter WiFi injection source patches
-    git checkout -- net/wireless/chan.c net/mac80211/cfg.c net/mac80211/tx.c 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -719,7 +717,7 @@ fi
 
 # Setup NetHunter Support
 if [ "$NETHUNTER" == "on" ]; then
-    ./nethunter_patch.sh "$OUT_DIR"
+    ./nethunter_patch.sh "$OUT_DIR" "$ROOT"
 fi
 
 # Single olddefconfig to finalize all changes
