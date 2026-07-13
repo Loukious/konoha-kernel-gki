@@ -177,8 +177,16 @@ jobs:
         if: ${{ inputs.enable_injection }}
         working-directory: gki-clo/vendor/qcom/opensource/wlan
         run: |
-          git apply --check "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-packet-injection.patch"
-          git apply "$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-packet-injection.patch"
+          if grep -q 'hdd_monitor_mode_tx_inject' \
+               qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c &&
+             grep -qx 'CONFIG_FEATURE_FRAME_INJECTION_SUPPORT=y' \
+               qcacld-3.0/configs/sun_gki_wcn7750_defconfig; then
+            echo "Packet injection is already integrated in the WLAN source."
+          else
+            patch="$GITHUB_WORKSPACE/gki-clo/docs/nethunter/wcn7750-6.6-packet-injection.patch"
+            git apply --check "$patch"
+            git apply "$patch"
+          fi
           git diff --check
 
       - name: Apply WCN7750 6.6 build compatibility
