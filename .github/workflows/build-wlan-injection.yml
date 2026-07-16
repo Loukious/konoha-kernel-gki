@@ -427,7 +427,16 @@ jobs:
           chmod +x tools/*.sh
           tools/make_pixelos_wlan_symvers.sh
 
-          if [[ "$ENABLE_INJECTION" == "true" ]]; then
+          if grep -q 'hdd_monitor_mode_tx_inject' \
+               vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c &&
+             grep -qx 'CONFIG_FEATURE_FRAME_INJECTION_SUPPORT=y' \
+               vendor/qcom/opensource/wlan/qcacld-3.0/configs/sun_gki_wcn7750_defconfig; then
+            effective_injection=true
+          else
+            effective_injection=false
+          fi
+
+          if [[ "$effective_injection" == "true" ]]; then
             mode=injection
           elif [[ "$APPLY_COMPAT_PATCH" == "true" ]]; then
             mode=control-compat
@@ -442,7 +451,7 @@ jobs:
           fi
           mode="${mode}-${WLAN_BRANCH}-${KERNEL_SOURCE_BRANCH}"
           module="artifacts/wlan/qca_cld3_wcn7750-konoha-${mode}.ko"
-          REQUIRE_INJECTION="$ENABLE_INJECTION" \
+          REQUIRE_INJECTION="$effective_injection" \
             tools/build_wlan_injection_module.sh "$module"
 
           echo "WLAN_MODE=$mode" >> "$GITHUB_ENV"
@@ -462,7 +471,7 @@ jobs:
               exit 1
               ;;
           esac
-          if [[ "$ENABLE_INJECTION" == "true" ]]; then
+          if [[ "$effective_injection" == "true" ]]; then
             if ! grep -a -q hdd_monitor_mode_tx_inject "$module"; then
               echo "Injection module is missing hdd_monitor_mode_tx_inject" >&2
               exit 1
