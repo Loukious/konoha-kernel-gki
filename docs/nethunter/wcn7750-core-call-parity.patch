@@ -1,0 +1,49 @@
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+index ebf285b..25ca38c 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -221,6 +221,8 @@
+ #include "wlan_dp_ucfg_api.h"
+ 
+ void dp_bus_bw_compute_timer_stop(struct wlan_objmgr_psoc *psoc);
++void dp_bbm_apply_independent_policy(struct wlan_objmgr_psoc *psoc,
++				     struct bbm_params *params);
+ extern qdf_atomic_t debugfs_thread_count;
+ extern qdf_mutex_t mibstats_lock;
+ struct wlan_dp_psoc_context;
+@@ -3496,7 +3498,7 @@ static int __hdd_mon_open(struct net_device *dev)
+ 	if (!ret) {
+ 		param.policy = BBM_DRIVER_MODE_POLICY;
+ 		param.policy_info.driver_mode = QDF_GLOBAL_MONITOR_MODE;
+-		ucfg_dp_bbm_apply_independent_policy(hdd_ctx->psoc, &param);
++		dp_bbm_apply_independent_policy(hdd_ctx->psoc, &param);
+ 		ucfg_dp_set_current_throughput_level(hdd_ctx->psoc,
+ 						     PLD_BUS_WIDTH_VERY_HIGH);
+ 	}
+@@ -15270,7 +15272,7 @@ void hdd_psoc_idle_timer_start(struct hdd_context *hdd_ctx)
+ 
+ void hdd_psoc_idle_timer_stop(struct hdd_context *hdd_ctx)
+ {
+-	qdf_delayed_work_stop_sync(&hdd_ctx->psoc_idle_timeout_work);
++	cancel_delayed_work_sync(&hdd_ctx->psoc_idle_timeout_work.dwork);
+ 	hdd_allow_suspend(WIFI_POWER_EVENT_WAKELOCK_IFACE_CHANGE_TIMER);
+ 	hdd_debug("Stopped psoc idle timer");
+ }
+@@ -18475,7 +18477,7 @@ int hdd_wlan_stop_modules(struct hdd_context *hdd_ctx, bool ftm_mode)
+ 	 */
+ 	param.policy = BBM_DRIVER_MODE_POLICY;
+ 	param.policy_info.driver_mode = QDF_GLOBAL_MAX_MODE;
+-	ucfg_dp_bbm_apply_independent_policy(hdd_ctx->psoc, &param);
++	dp_bbm_apply_independent_policy(hdd_ctx->psoc, &param);
+ 
+ 	hdd_deinit_adapter_ops_wq(hdd_ctx);
+ 	hdd_deinit_qdf_ctx(hdd_debug_domain_get());
+@@ -21597,7 +21599,7 @@ static int __hdd_driver_mode_change(struct hdd_context *hdd_ctx,
+ 
+ 	param.policy = BBM_DRIVER_MODE_POLICY;
+ 	param.policy_info.driver_mode = con_mode;
+-	ucfg_dp_bbm_apply_independent_policy(hdd_ctx->psoc, &param);
++	dp_bbm_apply_independent_policy(hdd_ctx->psoc, &param);
+ 
+ 	return 0;
+ }

@@ -1,0 +1,41 @@
+diff --git a/qca-wifi-host-cmn/qdf/linux/src/qdf_mc_timer.c b/qca-wifi-host-cmn/qdf/linux/src/qdf_mc_timer.c
+--- a/qca-wifi-host-cmn/qdf/linux/src/qdf_mc_timer.c
++++ b/qca-wifi-host-cmn/qdf/linux/src/qdf_mc_timer.c
+@@ -60,6 +60,6 @@
+ /* Static Variable Definitions */
+ static unsigned int persistent_timer_count;
+-static qdf_mutex_t persistent_timer_count_lock;
++qdf_mutex_t persistent_timer_count_lock;
+ 
+ static void (*scheduler_timer_callback)(qdf_mc_timer_t *);
+diff --git a/qcacld-3.0/core/cds/src/cds_api.c b/qcacld-3.0/core/cds/src/cds_api.c
+--- a/qcacld-3.0/core/cds/src/cds_api.c
++++ b/qcacld-3.0/core/cds/src/cds_api.c
+@@ -113,6 +113,7 @@ QDF_STATUS dp_txrx_init(ol_txrx_soc_handle soc, uint8_t pdev_id,
+ void wlan_dp_txrx_soc_detach(ol_txrx_soc_handle soc);
+ void wlan_dp_fb_update_num_rx_rings(struct wlan_objmgr_psoc *psoc);
+ extern qdf_atomic_notif_head qdf_hang_event_notif_head;
+ extern int curr_con_mode;
++extern qdf_mutex_t persistent_timer_count_lock;
+ 
+ #define DRIVER_VER_LEN (11)
+@@ -777,8 +778,9 @@ QDF_STATUS cds_open(struct wlan_objmgr_psoc *psoc)
+ 	if (!cds_ctx)
+ 		return QDF_STATUS_E_FAILURE;
+ 
+-	/* Initialize the timer module */
+-	qdf_timer_module_init();
++	QDF_TRACE(QDF_MODULE_ID_QDF, QDF_TRACE_LEVEL_INFO_HIGH,
++		  "Initializing the QDF MC timer module");
++	qdf_mutex_create(&persistent_timer_count_lock);
+ 
+ 	/* Initialize bug reporting structure */
+ 	cds_init_log_completion();
+@@ -836,7 +838,7 @@ QDF_STATUS cds_open(struct wlan_objmgr_psoc *psoc)
+ 
+ 	/* Create HTC */
+ 	gp_cds_context->htc_ctx =
+-		htc_create(scn, &htcInfo, qdf_ctx, cds_get_conparam());
++		htc_create(scn, &htcInfo, qdf_ctx, curr_con_mode);
+ 	if (!gp_cds_context->htc_ctx) {
+ 		cds_alert("Failed to Create HTC");

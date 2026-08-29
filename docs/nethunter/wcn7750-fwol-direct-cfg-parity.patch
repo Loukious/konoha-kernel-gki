@@ -1,0 +1,480 @@
+diff --git a/qcacld-3.0/components/fw_offload/core/src/wlan_fw_offload_main.c b/qcacld-3.0/components/fw_offload/core/src/wlan_fw_offload_main.c
+index 1de3d1e..c1626f4 100644
+--- a/qcacld-3.0/components/fw_offload/core/src/wlan_fw_offload_main.c
++++ b/qcacld-3.0/components/fw_offload/core/src/wlan_fw_offload_main.c
+@@ -24,6 +24,24 @@
+ #include "cds_api.h"
+ #include "wma.h"
+ #include "wlan_fwol_tgt_api.h"
++#include "i_cfg.h"
++#include "i_cfg_objmgr.h"
++
++struct fwol_cfg_value_store {
++	char *path;
++	qdf_list_node_t node;
++	qdf_atomic_t users;
++	struct cfg_values values;
++};
++
++struct fwol_cfg_psoc_ctx {
++	struct fwol_cfg_value_store *store;
++};
++
++#define fwol_cfg_values(psoc) \
++	(&((struct fwol_cfg_psoc_ctx *)wlan_objmgr_psoc_get_comp_private_obj( \
++		(psoc), WLAN_UMAC_COMP_CONFIG))->store->values)
++#define fwol_cfg_get(psoc, id) (fwol_cfg_values(psoc)->__##id##_internal)
+ 
+ struct wlan_fwol_psoc_obj *fwol_get_psoc_obj(struct wlan_objmgr_psoc *psoc)
+ {
+@@ -44,7 +62,7 @@ fwol_mpta_helper_config_get(struct wlan_objmgr_psoc *psoc,
+ 			    struct wlan_fwol_coex_config *coex_config)
+ {
+ 	coex_config->btc_mpta_helper_enable =
+-				cfg_get(psoc, CFG_COEX_MPTA_HELPER);
++				fwol_cfg_get(psoc, CFG_COEX_MPTA_HELPER);
+ }
+ #else
+ static void
+@@ -69,7 +87,7 @@ fwol_three_way_coex_config_legacy_config_get(
+ 			struct wlan_fwol_coex_config *coex_config)
+ {
+ 	coex_config->btc_three_way_coex_config_legacy_enable =
+-			cfg_get(psoc, CFG_THREE_WAY_COEX_CONFIG_LEGACY);
++			fwol_cfg_get(psoc, CFG_THREE_WAY_COEX_CONFIG_LEGACY);
+ }
+ #else
+ static void
+@@ -84,35 +102,34 @@ static void
+ fwol_init_coex_config_in_cfg(struct wlan_objmgr_psoc *psoc,
+ 			     struct wlan_fwol_coex_config *coex_config)
+ {
+-	coex_config->btc_mode = cfg_get(psoc, CFG_BTC_MODE);
+-	coex_config->antenna_isolation = cfg_get(psoc, CFG_ANTENNA_ISOLATION);
++	coex_config->btc_mode = fwol_cfg_get(psoc, CFG_BTC_MODE);
++	coex_config->antenna_isolation = fwol_cfg_get(psoc, CFG_ANTENNA_ISOLATION);
+ 	coex_config->max_tx_power_for_btc =
+-				cfg_get(psoc, CFG_MAX_TX_POWER_FOR_BTC);
++				fwol_cfg_get(psoc, CFG_MAX_TX_POWER_FOR_BTC);
+ 	coex_config->wlan_low_rssi_threshold =
+-				cfg_get(psoc, CFG_WLAN_LOW_RSSI_THRESHOLD);
++				fwol_cfg_get(psoc, CFG_WLAN_LOW_RSSI_THRESHOLD);
+ 	coex_config->bt_low_rssi_threshold =
+-				cfg_get(psoc, CFG_BT_LOW_RSSI_THRESHOLD);
++				fwol_cfg_get(psoc, CFG_BT_LOW_RSSI_THRESHOLD);
+ 	coex_config->bt_interference_low_ll =
+-				cfg_get(psoc, CFG_BT_INTERFERENCE_LOW_LL);
++				fwol_cfg_get(psoc, CFG_BT_INTERFERENCE_LOW_LL);
+ 	coex_config->bt_interference_low_ul =
+-				cfg_get(psoc, CFG_BT_INTERFERENCE_LOW_UL);
++				fwol_cfg_get(psoc, CFG_BT_INTERFERENCE_LOW_UL);
+ 	coex_config->bt_interference_medium_ll =
+-				cfg_get(psoc, CFG_BT_INTERFERENCE_MEDIUM_LL);
++				fwol_cfg_get(psoc, CFG_BT_INTERFERENCE_MEDIUM_LL);
+ 	coex_config->bt_interference_medium_ul =
+-				cfg_get(psoc, CFG_BT_INTERFERENCE_MEDIUM_UL);
++				fwol_cfg_get(psoc, CFG_BT_INTERFERENCE_MEDIUM_UL);
+ 	coex_config->bt_interference_high_ll =
+-				cfg_get(psoc, CFG_BT_INTERFERENCE_HIGH_LL);
++				fwol_cfg_get(psoc, CFG_BT_INTERFERENCE_HIGH_LL);
+ 	coex_config->bt_interference_high_ul =
+-				cfg_get(psoc, CFG_BT_INTERFERENCE_HIGH_UL);
++				fwol_cfg_get(psoc, CFG_BT_INTERFERENCE_HIGH_UL);
+ 	fwol_mpta_helper_config_get(psoc, coex_config);
+ 	coex_config->bt_sco_allow_wlan_2g_scan =
+-				cfg_get(psoc, CFG_BT_SCO_ALLOW_WLAN_2G_SCAN);
++				fwol_cfg_get(psoc, CFG_BT_SCO_ALLOW_WLAN_2G_SCAN);
+ 	fwol_three_way_coex_config_legacy_config_get(psoc, coex_config);
+-	coex_config->ble_scan_coex_policy = cfg_get(psoc,
+-						    CFG_BLE_SCAN_COEX_POLICY);
++	coex_config->ble_scan_coex_policy = fwol_cfg_get(psoc, CFG_BLE_SCAN_COEX_POLICY);
+ #ifdef FEATURE_COEX_TPUT_SHAPING_CONFIG
+ 	coex_config->coex_tput_shaping_enable =
+-				cfg_get(psoc, CFG_TPUT_SHAPING_ENABLE);
++				fwol_cfg_get(psoc, CFG_TPUT_SHAPING_ENABLE);
+ #endif
+ }
+ 
+@@ -122,7 +139,7 @@ fwol_init_thermal_stats_in_cfg(struct wlan_objmgr_psoc *psoc,
+ 			       struct wlan_fwol_thermal_temp *thermal_temp)
+ {
+ 	thermal_temp->therm_stats_offset =
+-				cfg_get(psoc, CFG_THERMAL_STATS_TEMP_OFFSET);
++				fwol_cfg_get(psoc, CFG_THERMAL_STATS_TEMP_OFFSET);
+ }
+ #else
+ static void
+@@ -137,53 +154,53 @@ fwol_init_thermal_temp_in_cfg(struct wlan_objmgr_psoc *psoc,
+ 			      struct wlan_fwol_thermal_temp *thermal_temp)
+ {
+ 	thermal_temp->thermal_temp_min_level[0] =
+-				cfg_get(psoc, CFG_THERMAL_TEMP_MIN_LEVEL0);
++				fwol_cfg_get(psoc, CFG_THERMAL_TEMP_MIN_LEVEL0);
+ 	thermal_temp->thermal_temp_max_level[0] =
+-				cfg_get(psoc, CFG_THERMAL_TEMP_MAX_LEVEL0);
++				fwol_cfg_get(psoc, CFG_THERMAL_TEMP_MAX_LEVEL0);
+ 	thermal_temp->thermal_temp_min_level[1] =
+-				cfg_get(psoc, CFG_THERMAL_TEMP_MIN_LEVEL1);
++				fwol_cfg_get(psoc, CFG_THERMAL_TEMP_MIN_LEVEL1);
+ 	thermal_temp->thermal_temp_max_level[1] =
+-				cfg_get(psoc, CFG_THERMAL_TEMP_MAX_LEVEL1);
++				fwol_cfg_get(psoc, CFG_THERMAL_TEMP_MAX_LEVEL1);
+ 	thermal_temp->thermal_temp_min_level[2] =
+-				cfg_get(psoc, CFG_THERMAL_TEMP_MIN_LEVEL2);
++				fwol_cfg_get(psoc, CFG_THERMAL_TEMP_MIN_LEVEL2);
+ 	thermal_temp->thermal_temp_max_level[2] =
+-				cfg_get(psoc, CFG_THERMAL_TEMP_MAX_LEVEL2);
++				fwol_cfg_get(psoc, CFG_THERMAL_TEMP_MAX_LEVEL2);
+ 	thermal_temp->thermal_temp_min_level[3] =
+-				cfg_get(psoc, CFG_THERMAL_TEMP_MIN_LEVEL3);
++				fwol_cfg_get(psoc, CFG_THERMAL_TEMP_MIN_LEVEL3);
+ 	thermal_temp->thermal_temp_max_level[3] =
+-				cfg_get(psoc, CFG_THERMAL_TEMP_MAX_LEVEL3);
++				fwol_cfg_get(psoc, CFG_THERMAL_TEMP_MAX_LEVEL3);
+ 	thermal_temp->thermal_temp_min_level[4] =
+-				cfg_get(psoc, CFG_THERMAL_TEMP_MIN_LEVEL4);
++				fwol_cfg_get(psoc, CFG_THERMAL_TEMP_MIN_LEVEL4);
+ 	thermal_temp->thermal_temp_max_level[4] =
+-				cfg_get(psoc, CFG_THERMAL_TEMP_MAX_LEVEL4);
++				fwol_cfg_get(psoc, CFG_THERMAL_TEMP_MAX_LEVEL4);
+ 	thermal_temp->thermal_temp_min_level[5] =
+-				cfg_get(psoc, CFG_THERMAL_TEMP_MIN_LEVEL5);
++				fwol_cfg_get(psoc, CFG_THERMAL_TEMP_MIN_LEVEL5);
+ 	thermal_temp->thermal_temp_max_level[5] =
+-				cfg_get(psoc, CFG_THERMAL_TEMP_MAX_LEVEL5);
++				fwol_cfg_get(psoc, CFG_THERMAL_TEMP_MAX_LEVEL5);
+ 
+ 	thermal_temp->thermal_mitigation_enable =
+-				cfg_get(psoc, CFG_THERMAL_MITIGATION_ENABLE);
+-	thermal_temp->throttle_period = cfg_get(psoc, CFG_THROTTLE_PERIOD);
++				fwol_cfg_get(psoc, CFG_THERMAL_MITIGATION_ENABLE);
++	thermal_temp->throttle_period = fwol_cfg_get(psoc, CFG_THROTTLE_PERIOD);
+ 	thermal_temp->thermal_sampling_time =
+-				cfg_get(psoc, CFG_THERMAL_SAMPLING_TIME);
++				fwol_cfg_get(psoc, CFG_THERMAL_SAMPLING_TIME);
+ 	thermal_temp->throttle_dutycycle_level[0] =
+-				cfg_get(psoc, CFG_THROTTLE_DUTY_CYCLE_LEVEL0);
++				fwol_cfg_get(psoc, CFG_THROTTLE_DUTY_CYCLE_LEVEL0);
+ 	thermal_temp->throttle_dutycycle_level[1] =
+-				cfg_get(psoc, CFG_THROTTLE_DUTY_CYCLE_LEVEL1);
++				fwol_cfg_get(psoc, CFG_THROTTLE_DUTY_CYCLE_LEVEL1);
+ 	thermal_temp->throttle_dutycycle_level[2] =
+-				cfg_get(psoc, CFG_THROTTLE_DUTY_CYCLE_LEVEL2);
++				fwol_cfg_get(psoc, CFG_THROTTLE_DUTY_CYCLE_LEVEL2);
+ 	thermal_temp->throttle_dutycycle_level[3] =
+-				cfg_get(psoc, CFG_THROTTLE_DUTY_CYCLE_LEVEL3);
++				fwol_cfg_get(psoc, CFG_THROTTLE_DUTY_CYCLE_LEVEL3);
+ 	thermal_temp->throttle_dutycycle_level[4] =
+-				cfg_get(psoc, CFG_THROTTLE_DUTY_CYCLE_LEVEL4);
++				fwol_cfg_get(psoc, CFG_THROTTLE_DUTY_CYCLE_LEVEL4);
+ 	thermal_temp->throttle_dutycycle_level[5] =
+-				cfg_get(psoc, CFG_THROTTLE_DUTY_CYCLE_LEVEL5);
++				fwol_cfg_get(psoc, CFG_THROTTLE_DUTY_CYCLE_LEVEL5);
+ 	thermal_temp->priority_apps =
+-				cfg_get(psoc, CFG_THERMAL_APPS_PRIORITY);
++				fwol_cfg_get(psoc, CFG_THERMAL_APPS_PRIORITY);
+ 	thermal_temp->priority_wpps =
+-				cfg_get(psoc, CFG_THERMAL_WPPS_PRIOITY);
++				fwol_cfg_get(psoc, CFG_THERMAL_WPPS_PRIOITY);
+ 	thermal_temp->thermal_action =
+-				cfg_get(psoc, CFG_THERMAL_MGMT_ACTION);
++				fwol_cfg_get(psoc, CFG_THERMAL_MGMT_ACTION);
+ 	fwol_init_thermal_stats_in_cfg(psoc, thermal_temp);
+ }
+ 
+@@ -240,21 +257,21 @@ QDF_STATUS fwol_init_neighbor_report_cfg(struct wlan_objmgr_psoc *psoc,
+ 	}
+ 
+ 	fwol_neighbor_report_cfg->enable_bitmask =
+-		cfg_get(psoc, CFG_OFFLOAD_11K_ENABLE_BITMASK);
++		fwol_cfg_get(psoc, CFG_OFFLOAD_11K_ENABLE_BITMASK);
+ 	fwol_neighbor_report_cfg->params_bitmask =
+-		cfg_get(psoc, CFG_OFFLOAD_NEIGHBOR_REPORT_PARAMS_BITMASK);
++		fwol_cfg_get(psoc, CFG_OFFLOAD_NEIGHBOR_REPORT_PARAMS_BITMASK);
+ 	fwol_neighbor_report_cfg->time_offset =
+-		cfg_get(psoc, CFG_OFFLOAD_NEIGHBOR_REPORT_TIME_OFFSET);
++		fwol_cfg_get(psoc, CFG_OFFLOAD_NEIGHBOR_REPORT_TIME_OFFSET);
+ 	fwol_neighbor_report_cfg->low_rssi_offset =
+-		cfg_get(psoc, CFG_OFFLOAD_NEIGHBOR_REPORT_LOW_RSSI_OFFSET);
++		fwol_cfg_get(psoc, CFG_OFFLOAD_NEIGHBOR_REPORT_LOW_RSSI_OFFSET);
+ 	fwol_neighbor_report_cfg->bmiss_count_trigger =
+-		cfg_get(psoc, CFG_OFFLOAD_NEIGHBOR_REPORT_BMISS_COUNT_TRIGGER);
++		fwol_cfg_get(psoc, CFG_OFFLOAD_NEIGHBOR_REPORT_BMISS_COUNT_TRIGGER);
+ 	fwol_neighbor_report_cfg->per_threshold_offset =
+-		cfg_get(psoc, CFG_OFFLOAD_NEIGHBOR_REPORT_PER_THRESHOLD_OFFSET);
++		fwol_cfg_get(psoc, CFG_OFFLOAD_NEIGHBOR_REPORT_PER_THRESHOLD_OFFSET);
+ 	fwol_neighbor_report_cfg->cache_timeout =
+-		cfg_get(psoc, CFG_OFFLOAD_NEIGHBOR_REPORT_CACHE_TIMEOUT);
++		fwol_cfg_get(psoc, CFG_OFFLOAD_NEIGHBOR_REPORT_CACHE_TIMEOUT);
+ 	fwol_neighbor_report_cfg->max_req_cap =
+-		cfg_get(psoc, CFG_OFFLOAD_NEIGHBOR_REPORT_MAX_REQ_CAP);
++		fwol_cfg_get(psoc, CFG_OFFLOAD_NEIGHBOR_REPORT_MAX_REQ_CAP);
+ 
+ 	fwol_set_neighbor_report_offload_params(psoc, fwol_neighbor_report_cfg);
+ 
+@@ -271,15 +288,15 @@ fwol_init_adapt_dwelltime_in_cfg(
+ 		return QDF_STATUS_E_FAILURE;
+ 	}
+ 	dwelltime_params->is_enabled =
+-			cfg_get(psoc, CFG_ADAPTIVE_DWELL_MODE_ENABLED);
++			fwol_cfg_get(psoc, CFG_ADAPTIVE_DWELL_MODE_ENABLED);
+ 	dwelltime_params->dwelltime_mode =
+-			cfg_get(psoc, CFG_GLOBAL_ADAPTIVE_DWELL_MODE);
++			fwol_cfg_get(psoc, CFG_GLOBAL_ADAPTIVE_DWELL_MODE);
+ 	dwelltime_params->lpf_weight =
+-			cfg_get(psoc, CFG_ADAPT_DWELL_LPF_WEIGHT);
++			fwol_cfg_get(psoc, CFG_ADAPT_DWELL_LPF_WEIGHT);
+ 	dwelltime_params->passive_mon_intval =
+-			cfg_get(psoc, CFG_ADAPT_DWELL_PASMON_INTVAL);
++			fwol_cfg_get(psoc, CFG_ADAPT_DWELL_PASMON_INTVAL);
+ 	dwelltime_params->wifi_act_threshold =
+-			cfg_get(psoc, CFG_ADAPT_DWELL_WIFI_THRESH);
++			fwol_cfg_get(psoc, CFG_ADAPT_DWELL_WIFI_THRESH);
+ 
+ 	return QDF_STATUS_SUCCESS;
+ }
+@@ -324,7 +341,7 @@ static void fwol_parse_probe_req_ouis(struct wlan_objmgr_psoc *psoc,
+ 	int ret;
+ 	uint32_t hex_value;
+ 
+-	qdf_str_lcopy(probe_req_ouis, cfg_get(psoc, CFG_PROBE_REQ_OUI),
++	qdf_str_lcopy(probe_req_ouis, fwol_cfg_get(psoc, CFG_PROBE_REQ_OUI),
+ 		      MAX_PRB_REQ_VENDOR_OUI_INI_LEN);
+ 	str = probe_req_ouis;
+ 	allowlist->no_of_probe_req_ouis = 0;
+@@ -381,12 +398,12 @@ static bool fwol_validate_ie_bitmaps(struct wlan_objmgr_psoc *psoc,
+ 	 * is checked for minimum of 8
+ 	 */
+ 	if ((allowlist->ie_bitmap_6 & VENDOR_SPECIFIC_IE_BITMAP) &&
+-	    (qdf_str_len(cfg_get(psoc, CFG_PROBE_REQ_OUI)) < 8))
++	    (qdf_str_len(fwol_cfg_get(psoc, CFG_PROBE_REQ_OUI)) < 8))
+ 		return false;
+ 
+ 	/* check whether vendor oui IE is not set but OUIs are present */
+ 	if (!(allowlist->ie_bitmap_6 & VENDOR_SPECIFIC_IE_BITMAP) &&
+-	    (qdf_str_len(cfg_get(psoc, CFG_PROBE_REQ_OUI)) > 0))
++	    (qdf_str_len(fwol_cfg_get(psoc, CFG_PROBE_REQ_OUI)) > 0))
+ 		return false;
+ 
+ 	return true;
+@@ -396,15 +413,15 @@ static void
+ fwol_init_ie_whiltelist_in_cfg(struct wlan_objmgr_psoc *psoc,
+ 			       struct wlan_fwol_ie_allowlist *allowlist)
+ {
+-	allowlist->ie_allowlist = cfg_get(psoc, CFG_PROBE_REQ_IE_ALLOWLIST);
+-	allowlist->ie_bitmap_0 = cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP0);
+-	allowlist->ie_bitmap_1 = cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP1);
+-	allowlist->ie_bitmap_2 = cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP2);
+-	allowlist->ie_bitmap_3 = cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP3);
+-	allowlist->ie_bitmap_4 = cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP4);
+-	allowlist->ie_bitmap_5 = cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP5);
+-	allowlist->ie_bitmap_6 = cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP6);
+-	allowlist->ie_bitmap_7 = cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP7);
++	allowlist->ie_allowlist = fwol_cfg_get(psoc, CFG_PROBE_REQ_IE_ALLOWLIST);
++	allowlist->ie_bitmap_0 = fwol_cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP0);
++	allowlist->ie_bitmap_1 = fwol_cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP1);
++	allowlist->ie_bitmap_2 = fwol_cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP2);
++	allowlist->ie_bitmap_3 = fwol_cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP3);
++	allowlist->ie_bitmap_4 = fwol_cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP4);
++	allowlist->ie_bitmap_5 = fwol_cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP5);
++	allowlist->ie_bitmap_6 = fwol_cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP6);
++	allowlist->ie_bitmap_7 = fwol_cfg_get(psoc, CFG_PROBE_REQ_IE_BIT_MAP7);
+ 	if (!fwol_validate_ie_bitmaps(psoc, allowlist))
+ 		allowlist->ie_allowlist = false;
+ 	fwol_parse_probe_req_ouis(psoc, allowlist);
+@@ -423,9 +440,9 @@ static void ucfg_fwol_fetch_dhcp_server_settings(struct wlan_objmgr_psoc *psoc,
+ 						 struct wlan_fwol_cfg *fwol_cfg)
+ {
+ 	fwol_cfg->enable_dhcp_server_offload =
+-			cfg_get(psoc, CFG_DHCP_SERVER_OFFLOAD_SUPPORT);
++			fwol_cfg_get(psoc, CFG_DHCP_SERVER_OFFLOAD_SUPPORT);
+ 	fwol_cfg->dhcp_max_num_clients =
+-			cfg_get(psoc, CFG_DHCP_SERVER_OFFLOAD_NUM_CLIENT);
++			fwol_cfg_get(psoc, CFG_DHCP_SERVER_OFFLOAD_NUM_CLIENT);
+ }
+ #else
+ static void ucfg_fwol_fetch_dhcp_server_settings(struct wlan_objmgr_psoc *psoc,
+@@ -445,7 +462,7 @@ static void ucfg_fwol_fetch_dhcp_server_settings(struct wlan_objmgr_psoc *psoc,
+ static void ucfg_fwol_fetch_tsf_gpio_pin(struct wlan_objmgr_psoc *psoc,
+ 					 struct wlan_fwol_cfg *fwol_cfg)
+ {
+-	fwol_cfg->tsf_gpio_pin = cfg_get(psoc, CFG_SET_TSF_GPIO_PIN);
++	fwol_cfg->tsf_gpio_pin = fwol_cfg_get(psoc, CFG_SET_TSF_GPIO_PIN);
+ }
+ #else
+ static void ucfg_fwol_fetch_tsf_gpio_pin(struct wlan_objmgr_psoc *psoc,
+@@ -470,7 +487,7 @@ static void fwol_init_tsf_accuracy_configs(struct wlan_objmgr_psoc *psoc,
+ 	int status;
+ 	qdf_size_t len;
+ 
+-	status = qdf_int32_array_parse(cfg_get(psoc, CFG_TSF_ACCURACY_CONFIGS),
++	status = qdf_int32_array_parse(fwol_cfg_get(psoc, CFG_TSF_ACCURACY_CONFIGS),
+ 				       configs,
+ 				       CFG_TSF_ACCURACY_CONFIG_LEN,
+ 				       &len);
+@@ -503,8 +520,8 @@ static void fwol_init_tsf_accuracy_configs(struct wlan_objmgr_psoc *psoc,
+ static void ucfg_fwol_init_tsf_ptp_options(struct wlan_objmgr_psoc *psoc,
+ 					   struct wlan_fwol_cfg *fwol_cfg)
+ {
+-	fwol_cfg->tsf_ptp_options = cfg_get(psoc, CFG_SET_TSF_PTP_OPT);
+-	fwol_cfg->tsf_sync_enable = cfg_get(psoc, CFG_TSF_SYNC_ENABLE);
++	fwol_cfg->tsf_ptp_options = fwol_cfg_get(psoc, CFG_SET_TSF_PTP_OPT);
++	fwol_cfg->tsf_sync_enable = fwol_cfg_get(psoc, CFG_TSF_SYNC_ENABLE);
+ 	fwol_init_tsf_accuracy_configs(psoc, fwol_cfg);
+ }
+ #else
+@@ -531,7 +548,7 @@ ucfg_fwol_fetch_tsf_irq_host_gpio_pin(struct wlan_objmgr_psoc *psoc,
+ 				      struct wlan_fwol_cfg *fwol_cfg)
+ {
+ 	fwol_cfg->tsf_irq_host_gpio_pin =
+-		cfg_get(psoc, CFG_SET_TSF_IRQ_HOST_GPIO_PIN);
++		fwol_cfg_get(psoc, CFG_SET_TSF_IRQ_HOST_GPIO_PIN);
+ }
+ #else
+ static void
+@@ -558,7 +575,7 @@ ucfg_fwol_fetch_tsf_sync_host_gpio_pin(struct wlan_objmgr_psoc *psoc,
+ 				       struct wlan_fwol_cfg *fwol_cfg)
+ {
+ 	fwol_cfg->tsf_sync_host_gpio_pin =
+-		cfg_get(psoc, CFG_SET_TSF_SYNC_HOST_GPIO_PIN);
++		fwol_cfg_get(psoc, CFG_SET_TSF_SYNC_HOST_GPIO_PIN);
+ }
+ #else
+ static void
+@@ -578,7 +595,7 @@ ucfg_fwol_fetch_tsf_sync_host_gpio_pin(struct wlan_objmgr_psoc *psoc,
+ static void ucfg_fwol_init_sae_cfg(struct wlan_objmgr_psoc *psoc,
+ 				   struct wlan_fwol_cfg *fwol_cfg)
+ {
+-	fwol_cfg->sae_enable = cfg_get(psoc, CFG_IS_SAE_ENABLED);
++	fwol_cfg->sae_enable = fwol_cfg_get(psoc, CFG_IS_SAE_ENABLED);
+ }
+ #else
+ static void ucfg_fwol_init_sae_cfg(struct wlan_objmgr_psoc *psoc,
+@@ -598,7 +615,7 @@ static void ucfg_fwol_init_sae_cfg(struct wlan_objmgr_psoc *psoc,
+ static void ucfg_fwol_fetch_ra_filter(struct wlan_objmgr_psoc *psoc,
+ 				      struct wlan_fwol_cfg *fwol_cfg)
+ {
+-	fwol_cfg->is_rate_limit_enabled = cfg_get(psoc, CFG_RA_FILTER_ENABLE);
++	fwol_cfg->is_rate_limit_enabled = fwol_cfg_get(psoc, CFG_RA_FILTER_ENABLE);
+ }
+ #else
+ static void ucfg_fwol_fetch_ra_filter(struct wlan_objmgr_psoc *psoc,
+@@ -624,7 +641,7 @@ static inline void fwol_ofdm_scrambler_init(struct wlan_fwol_cfg *fwol_cfg,
+ 					    struct wlan_objmgr_psoc *psoc)
+ {
+ 	fwol_cfg->enable_ofdm_scrambler_seed =
+-				cfg_get(psoc, CFG_ENABLE_OFDM_SCRAMBLER_SEED);
++				fwol_cfg_get(psoc, CFG_ENABLE_OFDM_SCRAMBLER_SEED);
+ }
+ #else
+ static inline void fwol_ofdm_scrambler_init(struct wlan_fwol_cfg *fwol_cfg,
+@@ -648,22 +665,22 @@ fwol_init_bw_mitigation_param_in_cfg(struct wlan_objmgr_psoc *psoc,
+ 	struct wlan_fwol_bwm_params *bwm_param = &fwol_cfg->bwm_params_cfg;
+ 
+ 	bwm_param->bw_mitigation_enable =
+-				cfg_get(psoc, CFG_DDR_BW_MITIGATION_ENABLE);
++				fwol_cfg_get(psoc, CFG_DDR_BW_MITIGATION_ENABLE);
+ 	bwm_param->bw_sampling_time =
+-				cfg_get(psoc, CFG_DDR_BWM_SAMPLING_TIME);
++				fwol_cfg_get(psoc, CFG_DDR_BWM_SAMPLING_TIME);
+ 	bwm_param->throttle_dutycycle_level[0] =
+-			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL0);
++			fwol_cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL0);
+ 	bwm_param->throttle_dutycycle_level[1] =
+-			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL1);
++			fwol_cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL1);
+ 	bwm_param->throttle_dutycycle_level[2] =
+-			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL2);
++			fwol_cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL2);
+ 	bwm_param->throttle_dutycycle_level[3] =
+-			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL3);
++			fwol_cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL3);
+ 	bwm_param->throttle_dutycycle_level[4] =
+-			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL4);
++			fwol_cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL4);
+ 	bwm_param->throttle_dutycycle_level[5] =
+-			cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL5);
+-	bwm_param->priority_bwm = cfg_get(psoc, CFG_DDR_BWM_PRIORITY);
++			fwol_cfg_get(psoc, CFG_DDR_BWM_THROTTLE_DUTY_CYCLE_LEVEL5);
++	bwm_param->priority_bwm = fwol_cfg_get(psoc, CFG_DDR_BWM_PRIORITY);
+ }
+ #else
+ static inline void
+@@ -694,32 +711,32 @@ QDF_STATUS fwol_cfg_on_psoc_enable(struct wlan_objmgr_psoc *psoc)
+ 	fwol_init_bw_mitigation_param_in_cfg(psoc, fwol_cfg);
+ 	fwol_init_ie_whiltelist_in_cfg(psoc, &fwol_cfg->ie_allowlist_cfg);
+ 	fwol_init_neighbor_report_cfg(psoc, &fwol_cfg->neighbor_report_cfg);
+-	fwol_cfg->ani_enabled = cfg_get(psoc, CFG_ENABLE_ANI);
+-	fwol_cfg->pcie_config = cfg_get(psoc, CFG_PCIE_CONFIG);
++	fwol_cfg->ani_enabled = fwol_cfg_get(psoc, CFG_ENABLE_ANI);
++	fwol_cfg->pcie_config = fwol_cfg_get(psoc, CFG_PCIE_CONFIG);
+ 	fwol_cfg->enable_rts_sifsbursting =
+-				cfg_get(psoc, CFG_SET_RTS_FOR_SIFS_BURSTING);
+-	fwol_cfg->enable_sifs_burst = cfg_get(psoc, CFG_SET_SIFS_BURST);
+-	fwol_cfg->max_mpdus_inampdu = cfg_get(psoc, CFG_MAX_MPDUS_IN_AMPDU);
+-	fwol_cfg->enable_phy_reg_retention = cfg_get(psoc, CFG_ENABLE_PHY_REG);
+-	fwol_cfg->upper_brssi_thresh = cfg_get(psoc, CFG_UPPER_BRSSI_THRESH);
+-	fwol_cfg->lower_brssi_thresh = cfg_get(psoc, CFG_LOWER_BRSSI_THRESH);
+-	fwol_cfg->enable_dtim_1chrx = cfg_get(psoc, CFG_DTIM_1CHRX_ENABLE);
+-	fwol_cfg->dynamic_bw_switch = cfg_get(psoc, CFG_DYNAMIC_BW_SWITCH);
++				fwol_cfg_get(psoc, CFG_SET_RTS_FOR_SIFS_BURSTING);
++	fwol_cfg->enable_sifs_burst = fwol_cfg_get(psoc, CFG_SET_SIFS_BURST);
++	fwol_cfg->max_mpdus_inampdu = fwol_cfg_get(psoc, CFG_MAX_MPDUS_IN_AMPDU);
++	fwol_cfg->enable_phy_reg_retention = fwol_cfg_get(psoc, CFG_ENABLE_PHY_REG);
++	fwol_cfg->upper_brssi_thresh = fwol_cfg_get(psoc, CFG_UPPER_BRSSI_THRESH);
++	fwol_cfg->lower_brssi_thresh = fwol_cfg_get(psoc, CFG_LOWER_BRSSI_THRESH);
++	fwol_cfg->enable_dtim_1chrx = fwol_cfg_get(psoc, CFG_DTIM_1CHRX_ENABLE);
++	fwol_cfg->dynamic_bw_switch = fwol_cfg_get(psoc, CFG_DYNAMIC_BW_SWITCH);
+ 	fwol_cfg->alternative_chainmask_enabled =
+-				cfg_get(psoc, CFG_ENABLE_COEX_ALT_CHAINMASK);
++				fwol_cfg_get(psoc, CFG_ENABLE_COEX_ALT_CHAINMASK);
+ 	fwol_cfg->smart_chainmask_enabled =
+-				cfg_get(psoc, CFG_ENABLE_SMART_CHAINMASK);
+-	fwol_cfg->get_rts_profile = cfg_get(psoc, CFG_ENABLE_FW_RTS_PROFILE);
++				fwol_cfg_get(psoc, CFG_ENABLE_SMART_CHAINMASK);
++	fwol_cfg->get_rts_profile = fwol_cfg_get(psoc, CFG_ENABLE_FW_RTS_PROFILE);
+ 	fwol_cfg->enable_fw_log_level =
+-				cfg_get(psoc, CFG_ENABLE_FW_DEBUG_LOG_LEVEL);
+-	fwol_cfg->enable_fw_log_type = cfg_get(psoc, CFG_ENABLE_FW_LOG_TYPE);
+-	qdf_uint8_array_parse(cfg_get(psoc, CFG_ENABLE_FW_MODULE_LOG_LEVEL),
++				fwol_cfg_get(psoc, CFG_ENABLE_FW_DEBUG_LOG_LEVEL);
++	fwol_cfg->enable_fw_log_type = fwol_cfg_get(psoc, CFG_ENABLE_FW_LOG_TYPE);
++	qdf_uint8_array_parse(fwol_cfg_get(psoc, CFG_ENABLE_FW_MODULE_LOG_LEVEL),
+ 			      fwol_cfg->enable_fw_module_log_level,
+ 			      FW_MODULE_LOG_LEVEL_STRING_LENGTH,
+ 			      &enable_fw_module_log_level_num);
+ 	fwol_cfg->enable_fw_module_log_level_num =
+ 				(uint8_t)enable_fw_module_log_level_num;
+-	qdf_uint8_array_parse(cfg_get(psoc, CFG_ENABLE_FW_WOW_MODULE_LOG_LEVEL),
++	qdf_uint8_array_parse(fwol_cfg_get(psoc, CFG_ENABLE_FW_WOW_MODULE_LOG_LEVEL),
+ 			      fwol_cfg->enable_fw_mod_wow_log_level,
+ 			      FW_MODULE_LOG_LEVEL_STRING_LENGTH,
+ 			      &enable_fw_wow_mod_log_level_num);
+@@ -727,20 +744,19 @@ QDF_STATUS fwol_cfg_on_psoc_enable(struct wlan_objmgr_psoc *psoc)
+ 				(uint8_t)enable_fw_wow_mod_log_level_num;
+ 	ucfg_fwol_init_tsf_ptp_options(psoc, fwol_cfg);
+ 	ucfg_fwol_init_sae_cfg(psoc, fwol_cfg);
+-	fwol_cfg->gcmp_enable = cfg_get(psoc, CFG_ENABLE_GCMP);
+-	fwol_cfg->enable_tx_sch_delay = cfg_get(psoc, CFG_TX_SCH_DELAY);
+-	fwol_cfg->enable_secondary_rate = cfg_get(psoc,
+-						  CFG_ENABLE_SECONDARY_RATE);
++	fwol_cfg->gcmp_enable = fwol_cfg_get(psoc, CFG_ENABLE_GCMP);
++	fwol_cfg->enable_tx_sch_delay = fwol_cfg_get(psoc, CFG_TX_SCH_DELAY);
++	fwol_cfg->enable_secondary_rate = fwol_cfg_get(psoc, CFG_ENABLE_SECONDARY_RATE);
+ 	fwol_init_adapt_dwelltime_in_cfg(psoc, &fwol_cfg->dwelltime_params);
+ 	ucfg_fwol_fetch_ra_filter(psoc, fwol_cfg);
+ 	ucfg_fwol_fetch_tsf_gpio_pin(psoc, fwol_cfg);
+ 	ucfg_fwol_fetch_tsf_irq_host_gpio_pin(psoc, fwol_cfg);
+ 	ucfg_fwol_fetch_tsf_sync_host_gpio_pin(psoc, fwol_cfg);
+ 	ucfg_fwol_fetch_dhcp_server_settings(psoc, fwol_cfg);
+-	fwol_cfg->sap_xlna_bypass = cfg_get(psoc, CFG_SET_SAP_XLNA_BYPASS);
+-	fwol_cfg->enable_ilp = cfg_get(psoc, CFG_SET_ENABLE_ILP);
+-	fwol_cfg->sap_sho = cfg_get(psoc, CFG_SAP_SHO_CONFIG);
+-	fwol_cfg->disable_hw_assist = cfg_get(psoc, CFG_DISABLE_HW_ASSIST);
++	fwol_cfg->sap_xlna_bypass = fwol_cfg_get(psoc, CFG_SET_SAP_XLNA_BYPASS);
++	fwol_cfg->enable_ilp = fwol_cfg_get(psoc, CFG_SET_ENABLE_ILP);
++	fwol_cfg->sap_sho = fwol_cfg_get(psoc, CFG_SAP_SHO_CONFIG);
++	fwol_cfg->disable_hw_assist = fwol_cfg_get(psoc, CFG_DISABLE_HW_ASSIST);
+ 	fwol_thermal_init(fwol_obj);
+ 	fwol_ofdm_scrambler_init(fwol_cfg, psoc);
+ 
