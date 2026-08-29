@@ -417,19 +417,15 @@ jobs:
           test -f gki-clo/sources/xiaomi-kernel/build.config.msm.onyx
           test -f gki-clo/sources/pixelos/android_device_xiaomi_onyx-kernel/modules/vendor_dlkm/qca_cld3_wcn7750.ko
 
-      - name: Download vendor_dlkm template and busybox
+      - name: Download vendor_dlkm template
         if: ${{ inputs.nethunter == 'on' }}
         env:
           TEMPLATE_URL: ${{ inputs.vendor_dlkm_template_url }}
           TEMPLATE_SHA256: ${{ inputs.vendor_dlkm_template_sha256 }}
-          BUSYBOX_URL: https://github.com/Loukious/konoha-kernel-gki/releases/download/vendor-dlkm-template-evolution-20260829/busybox-arm64-libbusybox.so
-          BUSYBOX_SHA256: f213df9c0f8faa0c1f2de6d7a6f5e9c2d2f5f3bbd30f4dde38b0c05ce7dfd17c
         run: |
           mkdir -p gki-clo/sources/pixelos
           curl -fL --retry 3 "$TEMPLATE_URL" -o gki-clo/sources/pixelos/vendor_dlkm-template.img
           echo "$TEMPLATE_SHA256  gki-clo/sources/pixelos/vendor_dlkm-template.img" | sha256sum -c -
-          curl -fL --retry 3 "$BUSYBOX_URL" -o gki-clo/sources/pixelos/libbusybox.so
-          echo "$BUSYBOX_SHA256  gki-clo/sources/pixelos/libbusybox.so" | sha256sum -c -
 
           # The repack script requires an AVB vendor_dlkm descriptor on the base image.
           python3 gki-clo/sources/avb/avbtool.py info_image \
@@ -559,13 +555,12 @@ jobs:
           esac
           echo "module vermagic: $module_vermagic"
 
-      - name: Build and package vendor_dlkm
+      - name: Package combined kernel + vendor_dlkm zip
         if: ${{ inputs.nethunter == 'on' }}
         working-directory: gki-clo
         run: |
           module="artifacts/wlan/qca_cld3_wcn7750-nethunter-${WLAN_KERNEL_RELEASE}.ko"
           img="Kono-Ha-Release/vendor_dlkm-onyx-nethunter-${WLAN_KERNEL_RELEASE}.img"
-          zip_out="Kono-Ha-Release/Kono-Ha-vendor_dlkm-wlan-${WLAN_KERNEL_RELEASE}.zip"
 
           # The template's WLAN module carries the tree-kernel vermagic; the
           # replacement is built for THIS kernel, so the mismatch is expected.
@@ -589,16 +584,24 @@ jobs:
           (cd "$verify_dir" && python3 "$GITHUB_WORKSPACE/gki-clo/sources/avb/avbtool.py" \
             verify_image --image vendor_dlkm.img)
 
-          tools/make_vendor_dlkm_flash_zip.sh \
-            "$img" \
-            sources/pixelos/libbusybox.so \
-            "$zip_out" \
-            "$WLAN_KERNEL_RELEASE"
+          # Rebuild the AnyKernel3 zip as a SINGLE zip that flashes the kernel
+          # AND vendor_dlkm in one install, replacing the kernel-only zip.
+          mapfile -t ak3_zips < <(find Kono-Ha-Release -maxdepth 1 -name 'Kono-Ha-*.zip' | sort)
+          if [[ "${#ak3_zips[@]}" -ne 1 ]]; then
+            echo "Expected exactly one AK3 kernel zip in Kono-Ha-Release, found: ${ak3_zips[*]:-none}" >&2
+            exit 1
+          fi
+          ak3_zip="${ak3_zips[0]}"
+          combined_zip="${ak3_zip%.zip}-wlan.zip"
+          tools/make_combined_ak3_zip.sh \
+            "$ak3_zip" "$img" "$WLAN_KERNEL_RELEASE" "$combined_zip"
+          rm -f "$ak3_zip"
 
           echo "## vendor_dlkm (nethunter WLAN)" >> "$GITHUB_STEP_SUMMARY"
           echo "- kernel release: ${WLAN_KERNEL_RELEASE}" >> "$GITHUB_STEP_SUMMARY"
           echo "- module vermagic: $(modinfo -F vermagic "$module")" >> "$GITHUB_STEP_SUMMARY"
-          sha256sum "$module" "$img" "$zip_out" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- combined zip: $(basename "$combined_zip") (flashes kernel + vendor_dlkm in one flash)" >> "$GITHUB_STEP_SUMMARY"
+          sha256sum "$module" "$img" "$combined_zip" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -638,11 +641,11 @@ jobs:
             NetHunter: **${{ inputs.nethunter }}**
             LTO: **${{ inputs.lto }}**
 
-            > When NetHunter is on, the release also carries a repacked
-            > `vendor_dlkm` image + recovery-flashable zip with a
-            > `qca_cld3_wcn7750.ko` rebuilt for this kernel's ABI
-            > (monitor mode + packet injection). Flash it alongside the
-            > kernel zip — Wi-Fi will not come up without it.
+            > When NetHunter is on, the kernel zip itself also flashes a
+            > repacked `vendor_dlkm` (single zip: kernel + WLAN module in one
+            > install — `qca_cld3_wcn7750.ko` rebuilt for this kernel's ABI,
+            > monitor mode + packet injection). The separate
+            > `vendor_dlkm-*.img` is the same image for fastboot users.
             NoMount VFS: **${{ inputs.nomount }}**
             KPM: **${{ inputs.kpm }}**
             Hardened: **${{ inputs.hardened }}**
