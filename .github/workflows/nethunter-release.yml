@@ -212,9 +212,8 @@ jobs:
           tools/make_combined_ak3_zip.sh \
             "$kernel_zip" "$vdlkm_img" "$KERNEL_RELEASE" "$out_zip"
 
-          # The raw image rides along for fastboot users; the combined zip is
-          # the artifact people flash from recovery.
-          cp "$vdlkm_img" "release/$(basename "$vdlkm_img")"
+          # Single deliverable: the combined zip. The vendor_dlkm image is
+          # inside it; no separate img asset.
           (cd release && sha256sum ./* | tee SHA256SUMS)
           ls -lh release/
 
@@ -225,15 +224,14 @@ jobs:
           name: NetHunter Combined ${{ needs.resolve-kernel.outputs.kernel_release }}
           body: |
             Single recovery-flashable zip: **kernel + matching vendor_dlkm**
-            (WLAN module rebuilt for this exact kernel's ABI, monitor mode +
-            frame injection). Flash the `*-wlan.zip` from recovery — it writes
-            the kernel AND vendor_dlkm in one install. Wi-Fi will not come up
-            on a Kono-Ha nethunter kernel without this vendor_dlkm.
+            (WLAN module rebuilt for this exact kernel's ABI with monitor
+            mode + frame injection). Flash the `*-wlan.zip` from recovery —
+            it writes the kernel AND vendor_dlkm in one install. Wi-Fi works
+            on the stock vendor_dlkm too; this one adds monitor mode and
+            packet injection on the internal Wi-Fi.
 
             - Kernel build run: ${{ needs.resolve-kernel.outputs.kernel_run_id }}
             - Kernel release: `${{ needs.resolve-kernel.outputs.kernel_release }}`
             - WLAN source: ${{ inputs.wlan_repo }}@${{ inputs.wlan_branch }}
-            - The bare `vendor_dlkm-*.img` is included for fastboot users
-              (`fastboot flash vendor_dlkm vendor_dlkm-*.img`).
           prerelease: true
           files: release/*
