@@ -59,7 +59,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       kernel_run_id: ${{ steps.resolve.outputs.kernel_run_id }}
-      kernel_release: ${{ steps.resolve.outputs.kernel_release }}
+      kernel_release: ${{ steps.release.outputs.kernel_release }}
     timeout-minutes: 360
     steps:
       - name: Resolve and wait for the kernel build run
@@ -196,7 +196,9 @@ jobs:
         run: |
           set -euo pipefail
           kernel_zip="$(find kernel-build -maxdepth 2 -name 'Kono-Ha-*.zip' | head -1)"
-          vdlkm_img="$(find wlan-build -name '*.img' -path '*vendor_dlkm*' | head -1)"
+          # The raw EROFS image, not the Android sparse one - the anykernel
+          # installer dd's it straight to the block device.
+          vdlkm_img="$(find wlan-build -name '*.img' -path '*vendor_dlkm*' ! -name '*sparse*' | head -1)"
           [[ -n "$kernel_zip" ]] || { echo "kernel zip not found in kernel-build/" >&2; exit 1; }
           [[ -n "$vdlkm_img" ]] || { echo "vendor_dlkm image not found in wlan-build/" >&2; exit 1; }
 
