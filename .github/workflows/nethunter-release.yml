@@ -1,0 +1,237 @@
+name: NetHunter Combined Release (kernel + vendor_dlkm)
+
+# Builds ONE recovery-flashable zip: the Kono-Ha AnyKernel3 kernel zip with
+# the matching vendor_dlkm (rebuilt WLAN module) folded in, so flashing the
+# kernel always installs the WLAN driver that matches its ABI.
+#
+# Flow: resolve a kernel build run (wait for it if in progress, optionally
+# dispatch a fresh one) -> call build-wlan-injection.yml with that run's
+# kernel-abi artifact (Module.symvers + kernel.release + .config) ->
+# combine the kernel zip + vendor_dlkm.img -> release the single zip.
+#
+# The kernel build itself stays in build-custom.yml; the WLAN module +
+# vendor_dlkm repack stays in build-wlan-injection.yml. This workflow only
+# orchestrates and packages.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_run_id:
+        description: "Specific build-custom.yml run id (empty = latest on this branch; waits if still running)"
+        required: false
+        type: string
+        default: ""
+      trigger_new_build:
+        description: "Dispatch a fresh kernel build (needs DISPATCH_TOKEN secret; otherwise dispatch build-custom.yml yourself)"
+        required: true
+        type: choice
+        options:
+          - "off"
+          - "on"
+        default: "off"
+      wlan_branch:
+        description: "WLAN source branch for the replacement vendor driver"
+        required: true
+        type: string
+        default: "onyx-v-oss-monitor-direct"
+      wlan_repo:
+        description: "WLAN source repository"
+        required: true
+        type: string
+        default: "https://github.com/Loukious/vendor_qcom_opensource_wlan.git"
+      wait_timeout_minutes:
+        description: "Max minutes to wait for the kernel build to finish"
+        required: true
+        type: string
+        default: "300"
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: nethunter-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve-kernel:
+    name: Resolve kernel build run
+    runs-on: ubuntu-24.04
+    outputs:
+      kernel_run_id: ${{ steps.resolve.outputs.kernel_run_id }}
+      kernel_release: ${{ steps.resolve.outputs.kernel_release }}
+    timeout-minutes: 360
+    steps:
+      - name: Resolve and wait for the kernel build run
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # GITHUB_TOKEN cannot trigger workflow_dispatch (recursion guard) -
+          # a PAT with workflow scope is needed for trigger_new_build.
+          DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+          INPUT_RUN_ID: ${{ inputs.kernel_run_id }}
+          TRIGGER_NEW: ${{ inputs.trigger_new_build }}
+          WAIT_TIMEOUT: ${{ inputs.wait_timeout_minutes }}
+        run: |
+          if [[ -n "$INPUT_RUN_ID" ]]; then
+            run_id="$INPUT_RUN_ID"
+            echo "Using caller-specified kernel build run: $run_id"
+          else
+            # Latest run of build-custom.yml on this branch (any status).
+            run_id="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow build-custom.yml \
+              --branch "${GITHUB_REF_NAME}" \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // empty')"
+            if [[ -z "$run_id" && "$TRIGGER_NEW" == "on" ]]; then
+              if [[ -z "$DISPATCH_TOKEN" ]]; then
+                echo "trigger_new_build=on requires the DISPATCH_TOKEN secret (PAT with workflow scope)." >&2
+                exit 1
+              fi
+              echo "No prior kernel build run - dispatching one"
+              GH_TOKEN="$DISPATCH_TOKEN" gh workflow run build-custom.yml \
+                --repo "$GITHUB_REPOSITORY" \
+                --ref "${GITHUB_REF_NAME}"
+              sleep 30
+              run_id="$(gh run list \
+                --repo "$GITHUB_REPOSITORY" \
+                --workflow build-custom.yml \
+                --branch "${GITHUB_REF_NAME}" \
+                --limit 1 \
+                --json databaseId \
+                --jq '.[0].databaseId // empty')"
+            elif [[ -z "$run_id" ]]; then
+              echo "No build-custom.yml run found on this branch." >&2
+              echo "Set trigger_new_build=on or pass kernel_run_id." >&2
+              exit 1
+            fi
+          fi
+
+          deadline=$(( $(date +%s) + WAIT_TIMEOUT * 60 ))
+          while :; do
+            read -r status conclusion <<<"$(gh run view "$run_id" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json status,conclusion \
+              --jq '.status + " " + (.conclusion // "")')"
+            echo "kernel run $run_id: status=$status conclusion=${conclusion:-none}"
+            if [[ "$status" == "completed" ]]; then
+              [[ "$conclusion" == "success" ]] || {
+                echo "Kernel build run $run_id ended with: $conclusion" >&2
+                exit 1
+              }
+              break
+            fi
+            if (( $(date +%s) > deadline )); then
+              echo "Timed out waiting for kernel build run $run_id" >&2
+              exit 1
+            fi
+            sleep 60
+          done
+
+          echo "kernel_run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "Resolved kernel build run: $run_id"
+
+      - name: Download kernel ABI
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-abi
+          run-id: ${{ steps.resolve.outputs.kernel_run_id }}
+          path: kernel-abi
+          github-token: ${{ github.token }}
+
+      - name: Read kernel release
+        id: release
+        run: |
+          release="$(cat kernel-abi/kernel.release)"
+          [[ -n "$release" ]] || { echo "kernel.release is empty" >&2; exit 1; }
+          echo "kernel_release=$release" >> "$GITHUB_OUTPUT"
+          echo "Kernel release: $release"
+
+  build-wlan:
+    name: WLAN module + vendor_dlkm
+    needs: resolve-kernel
+    uses: ./.github/workflows/build-wlan-injection.yml
+    with:
+      kernel_run_id: ${{ needs.resolve-kernel.outputs.kernel_run_id }}
+      wlan_branch: ${{ inputs.wlan_branch }}
+      wlan_repo: ${{ inputs.wlan_repo }}
+      enable_injection: true
+      enable_trace: false
+      trace_icnss: false
+      apply_compat_patch: false
+      apply_p2phc_patch: false
+
+  combine-release:
+    name: Combine into one flashable zip and release
+    needs: [resolve-kernel, build-wlan]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download kernel zip from the kernel build run
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "Kono-Ha-*"
+          run-id: ${{ needs.resolve-kernel.outputs.kernel_run_id }}
+          path: kernel-build
+          merge-multiple: true
+          github-token: ${{ github.token }}
+
+      - name: Download vendor_dlkm from the WLAN build
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "PixelOS-onyx-WCN7750-*"
+          path: wlan-build
+          merge-multiple: true
+
+      - name: Build the combined zip
+        env:
+          KERNEL_RELEASE: ${{ needs.resolve-kernel.outputs.kernel_release }}
+        run: |
+          set -euo pipefail
+          kernel_zip="$(find kernel-build -maxdepth 2 -name 'Kono-Ha-*.zip' | head -1)"
+          vdlkm_img="$(find wlan-build -name '*.img' -path '*vendor_dlkm*' | head -1)"
+          [[ -n "$kernel_zip" ]] || { echo "kernel zip not found in kernel-build/" >&2; exit 1; }
+          [[ -n "$vdlkm_img" ]] || { echo "vendor_dlkm image not found in wlan-build/" >&2; exit 1; }
+
+          echo "kernel zip:     $kernel_zip"
+          echo "vendor_dlkm:    $vdlkm_img"
+          echo "kernel release: $KERNEL_RELEASE"
+
+          out_zip="release/$(basename "${kernel_zip%.zip}")-wlan.zip"
+          mkdir -p release
+          chmod +x tools/make_combined_ak3_zip.sh
+          tools/make_combined_ak3_zip.sh \
+            "$kernel_zip" "$vdlkm_img" "$KERNEL_RELEASE" "$out_zip"
+
+          # The raw image rides along for fastboot users; the combined zip is
+          # the artifact people flash from recovery.
+          cp "$vdlkm_img" "release/$(basename "$vdlkm_img")"
+          (cd release && sha256sum ./* | tee SHA256SUMS)
+          ls -lh release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nethunter-${{ needs.resolve-kernel.outputs.kernel_release }}-${{ github.run_number }}
+          name: NetHunter Combined ${{ needs.resolve-kernel.outputs.kernel_release }}
+          body: |
+            Single recovery-flashable zip: **kernel + matching vendor_dlkm**
+            (WLAN module rebuilt for this exact kernel's ABI, monitor mode +
+            frame injection). Flash the `*-wlan.zip` from recovery — it writes
+            the kernel AND vendor_dlkm in one install. Wi-Fi will not come up
+            on a Kono-Ha nethunter kernel without this vendor_dlkm.
+
+            - Kernel build run: ${{ needs.resolve-kernel.outputs.kernel_run_id }}
+            - Kernel release: `${{ needs.resolve-kernel.outputs.kernel_release }}`
+            - WLAN source: ${{ inputs.wlan_repo }}@${{ inputs.wlan_branch }}
+            - The bare `vendor_dlkm-*.img` is included for fastboot users
+              (`fastboot flash vendor_dlkm vendor_dlkm-*.img`).
+          prerelease: true
+          files: release/*
