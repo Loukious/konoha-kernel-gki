@@ -73,13 +73,22 @@ flash_generic vendor_dlkm
 
 ui_print " verifying..."
 VD_DEV=""
-for vd_d in "/dev/block/mapper/vendor_dlkm$slot" "/dev/block/by-name/vendor_dlkm$slot" "/dev/block/mapper/vendor_dlkm" "/dev/block/by-name/vendor_dlkm"; do
+# flash_generic's lptools create/replace path flashes to a NEW mapping named
+# ${1}_ak3, so probe that first -- vendor_dlkm$slot may still be the old,
+# smaller partition that was replaced.
+for vd_d in "/dev/block/mapper/vendor_dlkm_ak3" "/dev/block/mapper/vendor_dlkm$slot" "/dev/block/by-name/vendor_dlkm$slot" "/dev/block/mapper/vendor_dlkm" "/dev/block/by-name/vendor_dlkm"; do
 	[ -b "$vd_d" ] && { VD_DEV="$vd_d"; break; }
 done
 if [ -n "$VD_DEV" ]; then
-	VD_BACK=$(head -c "$VD_SIZE" "$VD_DEV" | md5sum | cut -d' ' -f1)
-	[ "$VD_BACK" = "$VDMD5" ] || abort "vendor_dlkm readback md5 mismatch ($VD_BACK) - reflash vendor_dlkm via fastboot before rebooting"
-	ui_print " vendor_dlkm verified ($VD_DEV)."
+	VD_PSIZE=$(blockdev --getsize64 "$VD_DEV" 2>/dev/null || wc -c < "$VD_DEV")
+	if [ "$VD_PSIZE" -ge "$VD_SIZE" ]; then
+		VD_BACK=$(head -c "$VD_SIZE" "$VD_DEV" | md5sum | cut -d' ' -f1)
+		[ "$VD_BACK" = "$VDMD5" ] || abort "vendor_dlkm readback md5 mismatch ($VD_BACK) - reflash vendor_dlkm via fastboot before rebooting"
+		ui_print " vendor_dlkm verified ($VD_DEV)."
+	else
+		ui_print " note: $VD_DEV is still $VD_PSIZE bytes; the resized"
+		ui_print " mapping appears after reboot - verify Wi-Fi once booted."
+	fi
 else
 	ui_print " note: vendor_dlkm is not mapped after install - readback skipped"
 	ui_print " (a resize takes effect after reboot; verify Wi-Fi once booted)"
