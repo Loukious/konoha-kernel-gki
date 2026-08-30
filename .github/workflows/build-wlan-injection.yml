@@ -69,15 +69,15 @@ on:
         type: string
         default: https://github.com/Loukious/konoha-kernel-gki/releases/download/wlan-kernel-symbols/Module.symvers.sha256
       stock_vendor_dlkm_url:
-        description: Matching PixelOS onyx stock vendor_dlkm template
-        required: true
+        description: Optional vendor_dlkm template override; empty = use the Evolution template committed in vendor_dlkm-templates/
+        required: false
         type: string
-        default: https://github.com/Loukious/konoha-kernel-gki/releases/download/vendor-dlkm-template-20260613/vendor_dlkm-stock.img
+        default: ""
       stock_vendor_dlkm_sha256:
         description: SHA-256 of the stock vendor_dlkm template
-        required: true
+        required: false
         type: string
-        default: 7ab9cbc6ecd05e6321daf25706a0fdcdd6b625e39aeab0ecfa1a71cbf3757c2e
+        default: 897334474453521b50f31c76df095a363be97bd3f66d1f1943ede391768a186a
       kernel_run_id:
         description: build-custom.yml run id to take Module.symvers/kernel.release/.config from (overrides the pinned symbol URLs)
         required: false
@@ -152,15 +152,15 @@ on:
         type: string
         default: https://github.com/Loukious/konoha-kernel-gki/releases/download/wlan-kernel-symbols/Module.symvers.sha256
       stock_vendor_dlkm_url:
-        description: Matching PixelOS onyx stock vendor_dlkm template
+        description: Optional vendor_dlkm template override; empty = use the Evolution template committed in vendor_dlkm-templates/
         required: false
         type: string
-        default: https://github.com/Loukious/konoha-kernel-gki/releases/download/vendor-dlkm-template-20260613/vendor_dlkm-stock.img
+        default: ""
       stock_vendor_dlkm_sha256:
         description: SHA-256 of the stock vendor_dlkm template
         required: false
         type: string
-        default: 7ab9cbc6ecd05e6321daf25706a0fdcdd6b625e39aeab0ecfa1a71cbf3757c2e
+        default: 897334474453521b50f31c76df095a363be97bd3f66d1f1943ede391768a186a
       kernel_run_id:
         description: build-custom.yml run id to take Module.symvers/kernel.release/.config from (overrides the pinned symbol URLs)
         required: false
@@ -282,8 +282,17 @@ jobs:
             (cd gki-clo/out && sha256sum -c Module.symvers.sha256)
           fi
 
-          curl -fL --retry 3 "$STOCK_URL" \
-            -o gki-clo/sources/pixelos/vendor_dlkm-stock.img
+          # Default template ships with the repo (vendor_dlkm-templates/):
+          # it must be from the ROM family the device runs — a PixelOS-built
+          # image bootlooped an Evolution X install on 2026-08-30. STOCK_URL,
+          # when set, overrides it.
+          if [[ -n "$STOCK_URL" ]]; then
+            curl -fL --retry 3 "$STOCK_URL" \
+              -o gki-clo/sources/pixelos/vendor_dlkm-stock.img
+          else
+            cp vendor_dlkm-templates/vendor_dlkm-evolution-20260828.img \
+              gki-clo/sources/pixelos/vendor_dlkm-stock.img
+          fi
           echo "$STOCK_SHA256  gki-clo/sources/pixelos/vendor_dlkm-stock.img" | sha256sum -c -
 
       - name: Apply WCN7750 packet-injection port
@@ -722,16 +731,16 @@ jobs:
             --cluster-size 4096 \
             --allow-vermagic-mismatch \
             --avbtool sources/avb/avbtool.py \
-            --out "artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-${WLAN_MODE}-erofs.img" \
-            --sparse-out "artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-${WLAN_MODE}-erofs-sparse.img"
+            --out "artifacts/vendor_dlkm/vendor_dlkm-evo-onyx-qca-${WLAN_MODE}-erofs.img" \
+            --sparse-out "artifacts/vendor_dlkm/vendor_dlkm-evo-onyx-qca-${WLAN_MODE}-erofs-sparse.img"
 
       - name: Verify artifacts
         working-directory: gki-clo
         run: |
           module="$WLAN_MODULE"
           stock=sources/pixelos/vendor_dlkm-stock.img
-          raw="artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-${WLAN_MODE}-erofs.img"
-          sparse="artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-${WLAN_MODE}-erofs-sparse.img"
+          raw="artifacts/vendor_dlkm/vendor_dlkm-evo-onyx-qca-${WLAN_MODE}-erofs.img"
+          sparse="artifacts/vendor_dlkm/vendor_dlkm-evo-onyx-qca-${WLAN_MODE}-erofs-sparse.img"
           roundtrip="$RUNNER_TEMP/vendor_dlkm-roundtrip.img"
           extracted_root="$RUNNER_TEMP/vendor_dlkm-extracted"
           verify_dir="$RUNNER_TEMP/avb-verify"
@@ -769,7 +778,7 @@ jobs:
       - name: Upload WLAN module and image
         uses: actions/upload-artifact@v4
         with:
-          name: PixelOS-onyx-WCN7750-${{ env.WLAN_MODE }}
+          name: Evo-onyx-WCN7750-${{ env.WLAN_MODE }}
           path: |
             gki-clo/artifacts/SHA256SUMS
             gki-clo/artifacts/wlan/*.ko

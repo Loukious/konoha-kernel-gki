@@ -474,8 +474,7 @@ jobs:
 
       - name: Install kernel symbols and stock vendor_dlkm template
         env:
-          STOCK_URL: https://github.com/Loukious/konoha-kernel-gki/releases/download/vendor-dlkm-template-20260613/vendor_dlkm-stock.img
-          STOCK_SHA256: 7ab9cbc6ecd05e6321daf25706a0fdcdd6b625e39aeab0ecfa1a71cbf3757c2e
+          STOCK_SHA256: 897334474453521b50f31c76df095a363be97bd3f66d1f1943ede391768a186a
         run: |
           mkdir -p gki-clo/out
           # Symbols straight from the kernel job of THIS run.
@@ -487,8 +486,11 @@ jobs:
           [[ "$got" == "$want" ]] || { echo "Module.symvers checksum mismatch ($got != $want)" >&2; exit 1; }
           echo "Using Module.symvers from the kernel job of this run"
 
-          curl -fL --retry 3 "$STOCK_URL" \
-            -o gki-clo/sources/pixelos/vendor_dlkm-stock.img
+          # Template ships with the repo (vendor_dlkm-templates/): it must be
+          # from the ROM family the device runs — a PixelOS-built image
+          # bootlooped an Evolution X install on 2026-08-30. See its README.
+          cp gki-clo/vendor_dlkm-templates/vendor_dlkm-evolution-20260828.img \
+            gki-clo/sources/pixelos/vendor_dlkm-stock.img
           echo "$STOCK_SHA256  gki-clo/sources/pixelos/vendor_dlkm-stock.img" | sha256sum -c -
 
       - name: Apply WCN7750 packet-injection port
@@ -698,7 +700,7 @@ jobs:
           echo "module vermagic: $module_vermagic"
           echo "cfg80211_ops:    $module_ops_size bytes (PixelOS stock: $stock_ops_size)"
 
-      - name: Build PixelOS vendor_dlkm images
+      - name: Build vendor_dlkm image (Evolution template)
         working-directory: gki-clo
         run: |
           tools/make_pixelos_vendor_dlkm_img.sh \
@@ -707,16 +709,16 @@ jobs:
             --cluster-size 4096 \
             --allow-vermagic-mismatch \
             --avbtool sources/avb/avbtool.py \
-            --out "artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-${WLAN_MODE}-erofs.img" \
-            --sparse-out "artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-${WLAN_MODE}-erofs-sparse.img"
+            --out "artifacts/vendor_dlkm/vendor_dlkm-evo-onyx-qca-${WLAN_MODE}-erofs.img" \
+            --sparse-out "artifacts/vendor_dlkm/vendor_dlkm-evo-onyx-qca-${WLAN_MODE}-erofs-sparse.img"
 
       - name: Verify artifacts
         working-directory: gki-clo
         run: |
           module="$WLAN_MODULE"
           stock=sources/pixelos/vendor_dlkm-stock.img
-          raw="artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-${WLAN_MODE}-erofs.img"
-          sparse="artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-${WLAN_MODE}-erofs-sparse.img"
+          raw="artifacts/vendor_dlkm/vendor_dlkm-evo-onyx-qca-${WLAN_MODE}-erofs.img"
+          sparse="artifacts/vendor_dlkm/vendor_dlkm-evo-onyx-qca-${WLAN_MODE}-erofs-sparse.img"
           roundtrip="$RUNNER_TEMP/vendor_dlkm-roundtrip.img"
           extracted_root="$RUNNER_TEMP/vendor_dlkm-extracted"
           verify_dir="$RUNNER_TEMP/avb-verify"
@@ -747,7 +749,7 @@ jobs:
       - name: Upload WLAN module and image
         uses: actions/upload-artifact@v4
         with:
-          name: PixelOS-onyx-WCN7750-${{ env.WLAN_MODE }}
+          name: Evo-onyx-WCN7750-${{ env.WLAN_MODE }}
           path: |
             gki-clo/artifacts/SHA256SUMS
             gki-clo/artifacts/wlan/*.ko
@@ -774,7 +776,7 @@ jobs:
       - name: Download vendor_dlkm from the WLAN job
         uses: actions/download-artifact@v4
         with:
-          pattern: "PixelOS-onyx-WCN7750-*"
+          pattern: "Evo-onyx-WCN7750-*"
           path: wlan-build
           merge-multiple: true
 
