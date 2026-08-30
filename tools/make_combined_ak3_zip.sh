@@ -36,6 +36,13 @@ trap 'rm -rf "$STAGE"' EXIT
 unzip -q "$AK3_ZIP" -d "$STAGE"
 [[ -f "$STAGE/anykernel.sh" ]] || { echo "anykernel.sh not found inside $AK3_ZIP — not an AnyKernel3 zip?" >&2; exit 1; }
 
+# The resize path needs AK3's logical-partition machinery: flash_generic()
+# plus the lptools/snapshotupdater/httools static binaries it drives.
+grep -q "flash_generic()" "$STAGE/tools/ak3-core.sh" || { echo "tools/ak3-core.sh has no flash_generic() — AK3 too old for logical-partition resize" >&2; exit 1; }
+for tool in lptools_static snapshotupdater_static httools_static busybox; do
+	[[ -f "$STAGE/tools/$tool" ]] || { echo "AK3 is missing tools/$tool — cannot resize logical partitions" >&2; exit 1; }
+done
+
 # The section must run after AK3 has flashed the kernel: anykernel.sh sources
 # tools/ak3-core.sh (which defines ui_print/abort and sets $slot/$AKHOME) and
 # then runs its install commands, so appending to the end of the file is
@@ -44,7 +51,13 @@ cat >>"$STAGE/anykernel.sh" <<'VD_BLOCK'
 
 ## vendor_dlkm install (konoha-ABI WLAN module — @KERNEL_RELEASE@)
 ## Appended by tools/make_combined_ak3_zip.sh. Runs after the kernel write;
-## uses AK3's busybox (on PATH), ui_print/abort and the detected $slot.
+## uses AK3's own flash_generic() so a size mismatch with the current
+## logical partition is handled properly instead of aborting: dm-verity
+## detection + AVB patching (httools), and when the image is larger than
+## the partition, a Virtual A/B snapshot update or an lptools resize/
+## replace inside super. The image may be built from a different ROM's
+## vendor_dlkm template than the one installed — that is fine, the
+## container just has to land on the device whole.
 VDIMG="$AKHOME/vendor_dlkm.img"
 VDMD5=@IMG_MD5@
 
@@ -56,26 +69,21 @@ vd_got=$(md5sum "$VDIMG" | cut -d' ' -f1)
 [ "$vd_got" = "$VDMD5" ] || abort "vendor_dlkm image md5 mismatch ($vd_got) - aborting"
 VD_SIZE=$(stat -c %s "$VDIMG")
 
-VD_DEV=""
-for vd_d in "/dev/block/by-name/vendor_dlkm$slot" "/dev/block/mapper/vendor_dlkm$slot" "/dev/block/by-name/vendor_dlkm" "/dev/block/mapper/vendor_dlkm"; do
-	[ -b "$vd_d" ] && { VD_DEV="$vd_d"; break; }
-done
-[ "$VD_DEV" ] || abort "vendor_dlkm block device not found - recovery did not map the dynamic partition"
-
-VD_PSIZE=$(blockdev --getsize64 "$VD_DEV" 2>/dev/null)
-[ "$VD_PSIZE" -ge "$VD_SIZE" ] || abort "vendor_dlkm partition too small ($VD_PSIZE < $VD_SIZE) - wrong partition?"
-
-VD_MAGIC=$(dd if="$VD_DEV" bs=1 skip=1024 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
-[ "$VD_MAGIC" = "e2e1f5e0" ] || abort "target is not an EROFS image (magic: $VD_MAGIC) - wrong partition?"
-
-ui_print " flashing $VD_DEV ($VD_PSIZE bytes)..."
-dd if="$VDIMG" of="$VD_DEV" bs=4M conv=fsync 2>/dev/null || abort "vendor_dlkm dd failed"
-sync
+flash_generic vendor_dlkm
 
 ui_print " verifying..."
-VD_BACK=$(head -c "$VD_SIZE" "$VD_DEV" | md5sum | cut -d' ' -f1)
-[ "$VD_BACK" = "$VDMD5" ] || abort "vendor_dlkm readback md5 mismatch ($VD_BACK) - reflash vendor_dlkm via fastboot before rebooting"
-ui_print " vendor_dlkm verified."
+VD_DEV=""
+for vd_d in "/dev/block/mapper/vendor_dlkm$slot" "/dev/block/by-name/vendor_dlkm$slot" "/dev/block/mapper/vendor_dlkm" "/dev/block/by-name/vendor_dlkm"; do
+	[ -b "$vd_d" ] && { VD_DEV="$vd_d"; break; }
+done
+if [ -n "$VD_DEV" ]; then
+	VD_BACK=$(head -c "$VD_SIZE" "$VD_DEV" | md5sum | cut -d' ' -f1)
+	[ "$VD_BACK" = "$VDMD5" ] || abort "vendor_dlkm readback md5 mismatch ($VD_BACK) - reflash vendor_dlkm via fastboot before rebooting"
+	ui_print " vendor_dlkm verified ($VD_DEV)."
+else
+	ui_print " note: vendor_dlkm is not mapped after install - readback skipped"
+	ui_print " (a resize takes effect after reboot; verify Wi-Fi once booted)"
+fi
 ui_print " "
 ## end vendor_dlkm install
 VD_BLOCK
