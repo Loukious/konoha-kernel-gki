@@ -789,9 +789,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nethunter-wlan-injection
-          path: |
-            gki-clo/artifacts/SHA256SUMS
-            gki-clo/artifacts/wlan-ksm/*.zip
+          # Single path on purpose: with two paths upload-artifact keeps the
+          # least-common-ancestor prefix, which would nest the zip one
+          # directory deeper on download.
+          path: gki-clo/artifacts/wlan-ksm/*.zip
           retention-days: 7
           if-no-files-found: error
 
