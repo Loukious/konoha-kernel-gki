@@ -16,6 +16,14 @@ set -euo pipefail
 #
 # --ko and --dep take the module name (modinfo -F name) as the key; the
 # dep list names modules, not files. Multiple --ko/--dep pairs allowed.
+#
+# A module given as --swap NAME=path instead of --ko gets "replace the
+# already-loaded stock driver" semantics in service.sh: wait for the stock
+# module, stop Wi-Fi, wait for its refcount to drain, rmmod, insmod ours,
+# restart Wi-Fi. Validated live on onyx 2026-09-11: the swap survives a
+# full Wi-Fi reconnect (11ax, same IP) and monitor mode + injection work
+# after it. If insmod fails, the stock driver is re-insmodded from
+# /vendor_dlkm/lib/modules/ as a best-effort fallback.
 
 OUT_ZIP=""
 MODULE_NAME=""
@@ -23,7 +31,7 @@ MODULE_ID=""
 VERSION=""
 VERSION_CODE=""
 DESCRIPTION=""
-declare -A KO_PATHS DEP_LISTS
+declare -A KO_PATHS DEP_LISTS SWAP_MODULES
 ORDERED_KOS=()
 
 while [[ $# -gt 0 ]]; do
@@ -34,13 +42,16 @@ while [[ $# -gt 0 ]]; do
 		--version) VERSION="$2"; shift 2 ;;
 		--versionCode) VERSION_CODE="$2"; shift 2 ;;
 		--description) DESCRIPTION="$2"; shift 2 ;;
-		--ko)
+		--ko|--swap)
+			swap=0
+			[[ "$1" == "--swap" ]] && swap=1
 			key="${2%%=*}"; path="${2#*=}"
 			[[ "$key" != "$2" && -n "$key" && -n "$path" ]] || {
-				echo "--ko expects NAME=path/to/NAME.ko" >&2; exit 1; }
+				echo "$1 expects NAME=path/to/NAME.ko" >&2; exit 1; }
 			[[ -f "$path" ]] || { echo "Module not found: $path" >&2; exit 1; }
 			KO_PATHS["$key"]="$path"
 			ORDERED_KOS+=("$key")
+			((swap)) && SWAP_MODULES["$key"]=1
 			shift 2 ;;
 		--dep)
 			key="${2%%=*}"; deps="${2#*=}"
@@ -88,7 +99,13 @@ for key in "${ORDERED_KOS[@]}"; do
 	esac
 	install -m 0644 "$ko" "$ROOT/$key.ko"
 	deps="${DEP_LISTS[$key]:-}"
-	if [[ -n "$deps" ]]; then
+	if [[ -n "${SWAP_MODULES[$key]:-}" ]]; then
+		if [[ -n "$deps" ]]; then
+			INSMOD_LINES+=("swap_in \"/system/lib/modules/$KRELEASE/$key.ko\" \"$key\" \"$deps\"")
+		else
+			INSMOD_LINES+=("swap_in \"/system/lib/modules/$KRELEASE/$key.ko\" \"$key\"")
+		fi
+	elif [[ -n "$deps" ]]; then
 		INSMOD_LINES+=("insmod_wait \"/system/lib/modules/$KRELEASE/$key.ko\" \"$deps\"")
 	else
 		INSMOD_LINES+=("insmod \"/system/lib/modules/$KRELEASE/$key.ko\"")
@@ -135,16 +152,60 @@ insmod_wait() {
 		log -p e -t "$MODULE_ID" "failed to load \$ko"
 }
 
+swap_in() {
+	# \$1: our module path, \$2: stock module name to replace,
+	# \$3 (optional): comma-separated dependency module names
+	local ko="\$1" name="\$2" deps="\${3:-}" i wifi_on
+	for dep in \${deps//,/ }; do
+		i=0
+		while [ ! -d "/sys/module/\$dep" ] && [ \$i -lt 60 ]; do
+			sleep 1
+			i=\$((i + 1))
+		done
+	done
+	if [ ! -d "/sys/module/\$name" ]; then
+		# Stock driver not loaded (Wi-Fi stack never came up): load ours
+		# directly. Do NOT touch the Wi-Fi setting in this case.
+		insmod "\$ko" && log -p i -t "$MODULE_ID" "loaded \$(basename "\$ko") (stock was not loaded)" ||
+			log -p e -t "$MODULE_ID" "failed to load \$ko"
+		return
+	fi
+	# Remember whether Wi-Fi was on so it is restored to the same state.
+	wifi_on="\$(settings get global wifi_on 2>/dev/null)"
+	[ "\$wifi_on" = "1" ] && svc wifi disable
+	i=0
+	while [ "\$(cat /sys/module/\$name/refcnt 2>/dev/null)" != "0" ] && [ \$i -lt 30 ]; do
+		sleep 1
+		i=\$((i + 1))
+	done
+	if [ "\$(cat /sys/module/\$name/refcnt 2>/dev/null)" = "0" ]; then
+		rmmod "\$name"
+		if insmod "\$ko"; then
+			log -p i -t "$MODULE_ID" "swapped \$name for \$(basename "\$ko")"
+		else
+			log -p e -t "$MODULE_ID" "failed to load \$ko after rmmod \$name; restoring stock"
+			insmod "/vendor_dlkm/lib/modules/\$name.ko" ||
+				log -p e -t "$MODULE_ID" "could not restore stock \$name"
+		fi
+	else
+		log -p e -t "$MODULE_ID" "refcount of \$name never reached 0; keeping stock driver"
+	fi
+	[ "\$wifi_on" = "1" ] && svc wifi enable
+}
+
 EOF
 for line in "${INSMOD_LINES[@]}"; do
 	printf '%s\n' "$line" >>"$STAGE/service.sh"
 done
 
 # insmod'd modules block their own removal path; uninstall just drops the
-# files (a reboot finishes the job).
+# files. Modules installed with --swap revert to the stock driver on the
+# next reboot (vendor_dlkm loads it again) — no restore needed here.
 cat >"$STAGE/uninstall.sh" <<'EOF'
 #!/system/bin/sh
 # Modules stay resident until reboot; the files are removed with the module.
+# Swapped drivers (qca_cld3 etc.) automatically revert to the stock
+# vendor_dlkm driver on the next reboot.
 true
 EOF
 

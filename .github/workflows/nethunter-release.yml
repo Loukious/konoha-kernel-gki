@@ -1,17 +1,22 @@
-name: NetHunter Combined Release (kernel + vendor_dlkm)
+name: NetHunter Combined Release (kernel + module zips)
 
 # One workflow, one run, one set of artifacts:
-#   kernel job  -> builds the kernel, uploads the zip + its ABI files
+#   kernel job  -> builds the kernel, uploads the AK3 zip + its ABI files
 #   wlan job    -> needs kernel; builds the WLAN module against THAT
 #                  build's ABI (same-run artifact, never a previous run's)
-#                  and packages vendor_dlkm
-#   combine job -> needs both; folds kernel + vendor_dlkm into one
-#                  flashable zip and publishes the release
+#                  and packages it + external drivers as KSU module zips
+#   combine job -> needs both; stages the kernel-only zip and the two
+#                  module zips, and publishes the release
 #
 # The WLAN build cannot start before the kernel build: the module is
 # compiled against the kernel's Module.symvers/kernel.release/.config.
 # Keeping everything in a single run is what makes that dependency cheap —
 # no cross-run artifact downloads, nothing to expire.
+#
+# vendor_dlkm is NOT touched: the injection driver is rmmod'd/insmod'd
+# from a KSU module at late_start (validated live on onyx 2026-09-11),
+# which makes the kernel flash ROM-agnostic — no partition image to
+# write, no size-matching against any ROM's vendor_dlkm.
 
 on:
   workflow_dispatch:
@@ -396,7 +401,7 @@ jobs:
           retention-days: 7
 
   wlan:
-    name: Build WLAN module and package vendor_dlkm
+    name: Build WLAN module and package KSU module zips
     needs: kernel
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -734,39 +739,39 @@ jobs:
             --ko 8188eu=artifacts/wlan/8188eu.ko \
             --dep 8188eu=cfg80211
 
-      - name: Build vendor_dlkm image (Evolution template)
+      - name: Package WLAN injection driver as KSU module zip
+        # The injection qca_cld3 ships as a KernelSU/Magisk module that
+        # rmmod's the ROM's stock driver and insmods ours at late_start
+        # (swap validated live on onyx 2026-09-11: clean rmmod/insmod,
+        # full Wi-Fi reconnect, monitor + injection working after swap).
+        # This makes the kernel ROM-agnostic: no vendor_dlkm flash and no
+        # partition-size requirement; any ROM with a stock qca_cld3_wcn7750
+        # vendor_dlkm gets the injection driver through the module.
         working-directory: gki-clo
+        env:
+          WLAN_MODULE: ${{ env.WLAN_MODULE }}
+          WLAN_KERNEL_OUT: ${{ env.WLAN_KERNEL_OUT }}
+          github_run_number: ${{ github.run_number }}
         run: |
-          tools/make_pixelos_vendor_dlkm_img.sh \
-            --stock-image sources/pixelos/vendor_dlkm-stock.img \
-            --wifi-ko "$WLAN_MODULE" \
-            --cluster-size 4096 \
-            --allow-vermagic-mismatch \
-            --avbtool sources/avb/avbtool.py \
-            --out "artifacts/vendor_dlkm/vendor_dlkm-evo-onyx-qca-${WLAN_MODE}-erofs.img" \
-            --sparse-out "artifacts/vendor_dlkm/vendor_dlkm-evo-onyx-qca-${WLAN_MODE}-erofs-sparse.img"
-
-      - name: Verify artifacts
-        working-directory: gki-clo
-        run: |
-          module="$WLAN_MODULE"
-          stock=sources/pixelos/vendor_dlkm-stock.img
-          raw="artifacts/vendor_dlkm/vendor_dlkm-evo-onyx-qca-${WLAN_MODE}-erofs.img"
-          sparse="artifacts/vendor_dlkm/vendor_dlkm-evo-onyx-qca-${WLAN_MODE}-erofs-sparse.img"
-          roundtrip="$RUNNER_TEMP/vendor_dlkm-roundtrip.img"
-          extracted_root="$RUNNER_TEMP/vendor_dlkm-extracted"
-          verify_dir="$RUNNER_TEMP/avb-verify"
-
-          test "$(stat -c %s "$raw")" = "$(stat -c %s "$stock")"
-          mkdir -p "$extracted_root" "$verify_dir"
-          fsck.erofs --extract="$extracted_root" --no-preserve "$raw"
-          cmp "$module" "$extracted_root/lib/modules/qca_cld3_wcn7750.ko"
-          simg2img "$sparse" "$roundtrip"
-          cmp "$raw" "$roundtrip"
-          ln -s "$PWD/$raw" "$verify_dir/vendor_dlkm.img"
-          (cd "$verify_dir" && python3 "$GITHUB_WORKSPACE/gki-clo/sources/avb/avbtool.py" \
-            verify_image --image vendor_dlkm.img)
-          sha256sum "$module" "$raw" "$sparse" | tee artifacts/SHA256SUMS
+          set -euo pipefail
+          chmod +x tools/*.sh
+          kernel_release="$(cat "$WLAN_KERNEL_OUT/include/config/kernel.release")"
+          version_code="$((github_run_number + 100))"
+          tools/make_ksu_module_zip.sh \
+            --out "artifacts/wlan-ksm/nethunter-wlan-injection-${kernel_release}.zip" \
+            --module-name "NetHunter WLAN Injection (internal Wi-Fi)" \
+            --module-id nethunter-wlan-injection \
+            --version "v${kernel_release}.${version_code}" \
+            --versionCode "$version_code" \
+            --description "Internal Wi-Fi driver (qca_cld3_wcn7750) rebuilt for this kernel with monitor mode + frame injection. Replaces the stock driver at boot via rmmod/insmod. Works on any ROM running the matching kernel - no vendor_dlkm flash required." \
+            --swap qca_cld3_wcn7750="$WLAN_MODULE" \
+            --dep qca_cld3_wcn7750=cfg80211
+          # Sanity: the injection marker must be inside the packaged module.
+          unzip -p "artifacts/wlan-ksm/nethunter-wlan-injection-${kernel_release}.zip" \
+            "system/lib/modules/${kernel_release}/qca_cld3_wcn7750.ko" > /tmp/packed.ko
+          cmp "$WLAN_MODULE" /tmp/packed.ko
+          grep -a -q hdd_monitor_mode_tx_inject /tmp/packed.ko
+          sha256sum "$WLAN_MODULE" | tee artifacts/SHA256SUMS
 
       - name: Upload failed WLAN debug files
         if: failure()
@@ -780,14 +785,13 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-      - name: Upload WLAN module and image
+      - name: Upload WLAN injection KSU zip
         uses: actions/upload-artifact@v4
         with:
-          name: Evo-onyx-WCN7750-${{ env.WLAN_MODE }}
+          name: nethunter-wlan-injection
           path: |
             gki-clo/artifacts/SHA256SUMS
-            gki-clo/artifacts/wlan/*.ko
-            gki-clo/artifacts/vendor_dlkm/*.img
+            gki-clo/artifacts/wlan-ksm/*.zip
           retention-days: 7
           if-no-files-found: error
 
@@ -801,7 +805,7 @@ jobs:
           if-no-files-found: error
 
   combine-release:
-    name: Combine into one flashable zip and release
+    name: Combine into release zips and publish
     needs: [kernel, wlan]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -816,12 +820,11 @@ jobs:
           path: kernel-build
           merge-multiple: true
 
-      - name: Download vendor_dlkm from the WLAN job
+      - name: Download WLAN injection KSU zip from the WLAN job
         uses: actions/download-artifact@v4
         with:
-          pattern: "Evo-onyx-WCN7750-*"
-          path: wlan-build
-          merge-multiple: true
+          name: nethunter-wlan-injection
+          path: wlan-ksm
 
       - name: Download extra-modules KSU zip from the WLAN job
         uses: actions/download-artifact@v4
@@ -835,7 +838,7 @@ jobs:
           name: kernel-abi
           path: kernel-abi
 
-      - name: Build the combined zip
+      - name: Stage release zips
         env:
           KERNEL_RELEASE_FILE: kernel-abi/kernel.release
         run: |
@@ -843,33 +846,22 @@ jobs:
           KERNEL_RELEASE="$(cat "$KERNEL_RELEASE_FILE")"
           [[ -n "$KERNEL_RELEASE" ]] || { echo "kernel.release is empty" >&2; exit 1; }
           kernel_zip="$(find kernel-build -maxdepth 2 -name 'Kono-Ha-*.zip' | head -1)"
-          # The raw EROFS image, not the Android sparse one - the anykernel
-          # installer dd's it straight to the block device.
-          vdlkm_img="$(find wlan-build -name '*.img' -path '*vendor_dlkm*' ! -name '*sparse*' | head -1)"
           [[ -n "$kernel_zip" ]] || { echo "kernel zip not found in kernel-build/" >&2; exit 1; }
-          [[ -n "$vdlkm_img" ]] || { echo "vendor_dlkm image not found in wlan-build/" >&2; exit 1; }
 
           echo "kernel zip:     $kernel_zip"
-          echo "vendor_dlkm:    $vdlkm_img"
           echo "kernel release: $KERNEL_RELEASE"
 
-          out_zip="release/$(basename "${kernel_zip%.zip}")-wlan.zip"
+          # Deliverable 1: the kernel itself, AnyKernel3 flashable, ROM-agnostic.
           mkdir -p release
-          chmod +x tools/make_combined_ak3_zip.sh
-          tools/make_combined_ak3_zip.sh \
-            "$kernel_zip" "$vdlkm_img" "$KERNEL_RELEASE" "$out_zip"
+          cp "$kernel_zip" "release/$(basename "${kernel_zip%.zip}")-kernel-only.zip"
 
-          # Extra out-of-tree modules ship as a separate KernelSU-module zip
-          # (install after flashing; vendor_dlkm has no space for them).
-          if ls extra-modules/*.zip >/dev/null 2>&1; then
-            cp extra-modules/*.zip release/
-          else
-            echo "extra-modules zip not found after artifact download" >&2
-            exit 1
-          fi
+          # Deliverables 2 & 3: KSU modules built in this run against this
+          # kernel's ABI (internal Wi-Fi injection driver + external USB
+          # adapter drivers). Installed from the KernelSU/Magisk manager.
+          cp wlan-ksm/*.zip release/
+          cp extra-modules/*.zip release/
+          ls wlan-ksm/ extra-modules/ >/dev/null
 
-          # Single kernel deliverable: the combined zip. The vendor_dlkm image
-          # is inside it; the extra-modules zip is installed separately.
           (cd release && sha256sum ./* | tee SHA256SUMS)
           ls -lh release/
           echo "kernel_release=$KERNEL_RELEASE" >> "$GITHUB_OUTPUT"
@@ -881,19 +873,22 @@ jobs:
           tag_name: nethunter-${{ steps.combine.outputs.kernel_release }}-${{ github.run_number }}
           name: NetHunter Combined ${{ steps.combine.outputs.kernel_release }}
           body: |
-            Single recovery-flashable zip: **kernel + matching vendor_dlkm**
-            (WLAN module rebuilt for this exact kernel's ABI with monitor
-            mode + frame injection). Flash the `*-wlan.zip` from recovery —
-            it writes the kernel AND vendor_dlkm in one install. Wi-Fi works
-            on the stock vendor_dlkm too; this one adds monitor mode and
-            packet injection on the internal Wi-Fi.
+            Three deliverables, all built in one run against the same ABI:
 
-            Also attached: `nethunter-extra-modules-*.zip` — a **KernelSU/
-            Magisk module** (install from the manager after flashing) with
-            extra out-of-tree drivers built for this exact kernel:
-            RTL8188EUS USB Wi-Fi adapter (monitor mode + frame injection).
-            ROM-agnostic: works on any ROM running this kernel, no
-            vendor_dlkm space needed.
+            1. **`*-kernel-only.zip`** — flash from recovery (AnyKernel3).
+               The kernel only: no vendor_dlkm write, no partition-size
+               requirement, works on any ROM.
+            2. **`nethunter-wlan-injection-*.zip`** — KernelSU/Magisk module
+               with the internal Wi-Fi driver (qca_cld3_wcn7750) rebuilt
+               with monitor mode + frame injection. It swaps the ROM's stock
+               driver at boot (rmmod + insmod). Install after flashing the
+               kernel; keep the ROM's own vendor_dlkm.
+            3. **`nethunter-extra-modules-*.zip`** — KernelSU/Magisk module
+               with external USB adapter drivers (currently RTL8188EUS:
+               monitor mode + frame injection).
+
+            Install order: flash zip 1 from recovery, then install zips 2
+            and 3 from the KernelSU/Magisk manager, then reboot.
 
             - Kernel release: `${{ steps.combine.outputs.kernel_release }}`
             - Kernel config: HZ **${{ inputs.hz }}**, root **${{ inputs.root }}**,
@@ -901,6 +896,6 @@ jobs:
               bypass charging **${{ inputs.bypasscharging }}**
             - WLAN source: ${{ inputs.wlan_repo }}@${{ inputs.wlan_branch }}
             - Built entirely in run ${{ github.run_id }} (kernel, WLAN and
-              release from the same artifacts)
+              modules from the same artifacts)
           prerelease: true
           files: release/*
