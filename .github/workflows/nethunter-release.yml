@@ -700,6 +700,40 @@ jobs:
           echo "module vermagic: $module_vermagic"
           echo "cfg80211_ops:    $module_ops_size bytes (PixelOS stock: $stock_ops_size)"
 
+      - name: Build extra kernel modules (KSU module zip)
+        working-directory: gki-clo
+        env:
+          KERNEL_SRC: ${{ env.WLAN_KERNEL_SRC }}
+          KERNEL_OUT: ${{ env.WLAN_KERNEL_OUT }}
+          github_run_number: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          export PATH="$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
+          clang --version
+
+          # External-adapter drivers ship as a KernelSU module instead of
+          # vendor_dlkm: the partition has ~370KB of slack, which no Realtek
+          # USB driver fits into, and a KSU module works on any ROM regardless
+          # of vendor_dlkm size. insmod from service.sh is validated on device.
+          git clone --depth=1 https://github.com/SimplyCEO/rtl8188eus.git \
+            sources/rtl8188eus
+          echo "rtl8188eus commit: $(git -C sources/rtl8188eus rev-parse HEAD)"
+
+          chmod +x tools/*.sh
+          tools/build_rtl8188eus_module.sh artifacts/wlan/8188eu.ko
+
+          kernel_release="$(cat "$KERNEL_OUT/include/config/kernel.release")"
+          version_code="$((github_run_number + 100))"
+          tools/make_ksu_module_zip.sh \
+            --out "artifacts/extra-modules/nethunter-extra-modules-${kernel_release}.zip" \
+            --module-name "NetHunter Extra Kernel Modules" \
+            --module-id nethunter-extra-modules \
+            --version "v${kernel_release}.${version_code}" \
+            --versionCode "$version_code" \
+            --description "Extra out-of-tree kernel modules for kernel release ${kernel_release}: RTL8188EUS USB adapter (monitor mode + frame injection). Install via KernelSU/Magisk manager; modules load from service.sh." \
+            --ko 8188eu=artifacts/wlan/8188eu.ko \
+            --dep 8188eu=cfg80211
+
       - name: Build vendor_dlkm image (Evolution template)
         working-directory: gki-clo
         run: |
@@ -757,6 +791,15 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      - name: Upload extra-modules KSU zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: nethunter-extra-modules
+          path: |
+            gki-clo/artifacts/extra-modules/*.zip
+          retention-days: 7
+          if-no-files-found: error
+
   combine-release:
     name: Combine into one flashable zip and release
     needs: [kernel, wlan]
@@ -779,6 +822,12 @@ jobs:
           pattern: "Evo-onyx-WCN7750-*"
           path: wlan-build
           merge-multiple: true
+
+      - name: Download extra-modules KSU zip from the WLAN job
+        uses: actions/download-artifact@v4
+        with:
+          name: nethunter-extra-modules
+          path: extra-modules
 
       - name: Download kernel ABI for the release string
         uses: actions/download-artifact@v4
@@ -810,8 +859,17 @@ jobs:
           tools/make_combined_ak3_zip.sh \
             "$kernel_zip" "$vdlkm_img" "$KERNEL_RELEASE" "$out_zip"
 
-          # Single deliverable: the combined zip. The vendor_dlkm image is
-          # inside it; no separate img asset.
+          # Extra out-of-tree modules ship as a separate KernelSU-module zip
+          # (install after flashing; vendor_dlkm has no space for them).
+          if ls extra-modules/*.zip >/dev/null 2>&1; then
+            cp extra-modules/*.zip release/
+          else
+            echo "extra-modules zip not found after artifact download" >&2
+            exit 1
+          fi
+
+          # Single kernel deliverable: the combined zip. The vendor_dlkm image
+          # is inside it; the extra-modules zip is installed separately.
           (cd release && sha256sum ./* | tee SHA256SUMS)
           ls -lh release/
           echo "kernel_release=$KERNEL_RELEASE" >> "$GITHUB_OUTPUT"
@@ -829,6 +887,13 @@ jobs:
             it writes the kernel AND vendor_dlkm in one install. Wi-Fi works
             on the stock vendor_dlkm too; this one adds monitor mode and
             packet injection on the internal Wi-Fi.
+
+            Also attached: `nethunter-extra-modules-*.zip` — a **KernelSU/
+            Magisk module** (install from the manager after flashing) with
+            extra out-of-tree drivers built for this exact kernel:
+            RTL8188EUS USB Wi-Fi adapter (monitor mode + frame injection).
+            ROM-agnostic: works on any ROM running this kernel, no
+            vendor_dlkm space needed.
 
             - Kernel release: `${{ steps.combine.outputs.kernel_release }}`
             - Kernel config: HZ **${{ inputs.hz }}**, root **${{ inputs.root }}**,

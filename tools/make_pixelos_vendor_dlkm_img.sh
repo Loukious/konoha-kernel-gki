@@ -6,6 +6,7 @@ STOCK_IMAGE=""
 STOCK_ROOT=""
 WIFI_KO=""
 MODULE_KOS=()
+ADD_KOS=()
 OUT_IMG="$ROOT_DIR/artifacts/vendor_dlkm/vendor_dlkm-pixelos-onyx-qca-injection-erofs.img"
 SPARSE_OUT=""
 AVBTOOL="${AVBTOOL:-avbtool}"
@@ -25,6 +26,8 @@ Options:
   --stock-root DIR                 Optional extracted vendor_dlkm module tree.
   --wifi-ko FILE                   Replacement qca_cld3_wcn7750.ko module.
   --module-ko FILE                 Replacement module named by modinfo, may repeat.
+  --add-ko FILE                    Extra module appended to the image and to
+                                   modules.load (after the Wi-Fi module), may repeat.
   --out FILE                       Output raw EROFS image.
   --sparse-out FILE                Also write an Android sparse image.
   --avbtool FILE                   avbtool executable/script (default: avbtool).
@@ -55,6 +58,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--module-ko)
 			MODULE_KOS+=("$2")
+			shift 2
+			;;
+		--add-ko)
+			ADD_KOS+=("$2")
 			shift 2
 			;;
 		--out)
@@ -251,6 +258,49 @@ for module_ko in "${MODULE_KOS[@]}"; do
 	fi
 	install -m 0644 "$module_ko" "$stock_module"
 done
+for add_ko in "${ADD_KOS[@]}"; do
+	if [[ ! -f "$add_ko" ]]; then
+		echo "Extra module not found: $add_ko" >&2
+		exit 1
+	fi
+	module_name="$(modinfo -F name "$add_ko")"
+	if [[ -z "$module_name" ]]; then
+		echo "Could not read module name from: $add_ko" >&2
+		exit 1
+	fi
+	if [[ -f "$ROOT/lib/modules/$module_name.ko" ]]; then
+		echo "Module already present in image: $module_name" >&2
+		echo "Use --module-ko to replace it." >&2
+		exit 1
+	fi
+	module_vermagic="$(modinfo -F vermagic "$add_ko")"
+	if [[ "$stock_vermagic" != "$module_vermagic" && "$ALLOW_VERMAGIC_MISMATCH" -ne 1 ]]; then
+		echo "Extra module vermagic mismatch for $module_name:" >&2
+		echo "  stock Wi-Fi:  $stock_vermagic" >&2
+		echo "  replacement:  $module_vermagic" >&2
+		exit 1
+	fi
+	install -m 0644 "$add_ko" "$ROOT/lib/modules/$module_name.ko"
+	# modules.load formats differ between ROMs: PixelOS lists "foo.ko",
+	# the Evolution template lists bare "foo". Match whichever is in use.
+	load_name="$module_name"
+	if ! grep -qx "$module_name.ko" "$ROOT/lib/modules/modules.load" && \
+		grep -qx "$module_name" "$ROOT/lib/modules/modules.load"; then
+		load_name="$module_name"
+	fi
+	if grep -qx "$load_name" "$ROOT/lib/modules/modules.load"; then
+		echo "modules.load already lists $module_name; leaving the list untouched." >&2
+		exit 1
+	fi
+	# Append after the Wi-Fi module so dependencies listed earlier (cfg80211,
+	# mac80211) are satisfied when libmodprobe loads the new module.
+	wifi_entry="$(grep -n 'qca_cld3_wcn7750' "$ROOT/lib/modules/modules.load" | tail -1 | cut -d: -f1)"
+	if [[ -n "$wifi_entry" ]]; then
+		sed -i "$((wifi_entry + 1))i $load_name" "$ROOT/lib/modules/modules.load"
+	else
+		echo "$load_name" >> "$ROOT/lib/modules/modules.load"
+	fi
+done
 module_count="$(find "$ROOT/lib/modules" -maxdepth 1 -type f -name '*.ko' | wc -l)"
 if [[ "$module_count" -lt 300 ]]; then
 	echo "Refusing to build: only $module_count modules were extracted." >&2
@@ -294,6 +344,9 @@ echo "  partition bytes:   $partition_size"
 echo "  replacement Wi-Fi: $WIFI_KO"
 for module_ko in "${MODULE_KOS[@]}"; do
 	echo "  replacement mod:  $module_ko"
+done
+for add_ko in "${ADD_KOS[@]}"; do
+	echo "  extra module:     $add_ko"
 done
 echo "  replacement magic: $replacement_vermagic"
 echo "  EROFS cluster:     $CLUSTER_SIZE"
