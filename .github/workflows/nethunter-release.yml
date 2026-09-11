@@ -429,6 +429,28 @@ jobs:
           sudo mkswap /mnt/wlan_swapfile
           sudo swapon /mnt/wlan_swapfile
 
+      - name: Setup WLAN ccache
+        # The qcacld/platform/8188eu compiles are pure .c -> .o work keyed by
+        # source + flags; the same-run Module.symvers only feeds modpost, not
+        # compilation, so entries stay valid across runs. The kernel job has
+        # run at 99.9% hit rate with the same settings; expected saving here
+        # is ~4-5 of the ~6 minutes the qcacld build takes.
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-wlan-${{ inputs.wlan_branch }}-${{ inputs.kernel_source_branch }}-${{ github.sha }}
+          restore-keys: |
+            ccache-wlan-${{ inputs.wlan_branch }}-${{ inputs.kernel_source_branch }}-
+            ccache-wlan-${{ inputs.wlan_branch }}-
+            ccache-wlan-
+
+      - name: Initialize WLAN ccache
+        run: |
+          ccache -z
+          ccache -M ${{ env.CCACHE_MAXSIZE }}
+          ccache -o compiler_check=${{ env.CCACHE_COMPILERCHECK }}
+          ccache -o sloppiness=${{ env.CCACHE_SLOPPINESS }}
+
       - name: Download Neutron Clang Toolchain
         run: |
           mkdir -p toolchains/neutron-clang
@@ -518,7 +540,9 @@ jobs:
         env:
           KERNEL_SOURCE_BRANCH: ${{ inputs.kernel_source_branch }}
         run: |
-          export PATH="$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
+          # /usr/lib/ccache first: "clang" resolves to the ccache shim, which
+          # finds the real (neutron) clang further down PATH.
+          export PATH="/usr/lib/ccache:$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
           clang --version
 
           KERNEL_RELEASE_OVERRIDE="$(cat sources/kernel-abi/kernel.release)"
@@ -621,7 +645,8 @@ jobs:
           KERNEL_SOURCE_BRANCH: ${{ inputs.kernel_source_branch }}
           WLAN_EXTRA_KCFLAGS: ""
         run: |
-          export PATH="$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
+          # ccache shim first, real clang second (see ABI-headers step).
+          export PATH="/usr/lib/ccache:$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
           clang --version
 
           chmod +x tools/*.sh
@@ -713,7 +738,7 @@ jobs:
           github_run_number: ${{ github.run_number }}
         run: |
           set -euo pipefail
-          export PATH="$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
+          export PATH="/usr/lib/ccache:$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
           clang --version
 
           # External-adapter drivers ship as a KernelSU module instead of
@@ -804,6 +829,10 @@ jobs:
             gki-clo/artifacts/extra-modules/*.zip
           retention-days: 7
           if-no-files-found: error
+
+      - name: Show WLAN ccache stats
+        if: always()
+        run: ccache -s
 
   combine-release:
     name: Combine into release zips and publish
