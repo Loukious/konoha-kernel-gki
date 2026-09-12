@@ -59,6 +59,7 @@ for arg in "$@"; do
         droidspaces=*) DROIDSPACES="${arg#*=}" ;;
         nethunter=*) NETHUNTER="${arg#*=}" ;;
         debug=*) DEBUG_MODE="${arg#*=}" ;;
+        diagnostic=*) DIAGNOSTIC="${arg#*=}" ;;
         kernel_name=*) KERNEL_NAME="${arg#*=}" ;;
         spoof_uname=*) SPOOF_UNAME="${arg#*=}" ;;
 
@@ -91,6 +92,7 @@ if [ "$#" -gt 0 ]; then
     [ -z "$DROIDSPACES" ] && DROIDSPACES="off"
     [ -z "$NETHUNTER" ] && NETHUNTER="off"
     [ -z "$DEBUG_MODE" ] && DEBUG_MODE="off"
+    [ -z "$DIAGNOSTIC" ] && DIAGNOSTIC="off"
 else
     NON_INTERACTIVE=0
 fi
@@ -408,6 +410,7 @@ echo " WiFi Exploit: ${WIFI_EXPLOIT^^}"
 echo " KGSL Exploit: ${KGSL_EXPLOIT^^}"
 echo " Data Exploit: ${DATA_EXPLOIT^^}"
 echo " Debug Mode:   ${DEBUG_MODE^^}"
+echo " Diagnostic:   ${DIAGNOSTIC^^}"
 echo " NetHunter: ${NETHUNTER^^}"
 [ "$VARIANT" != "stock" ] && echo " Variant:   ${VARIANT} ($REPO_NAME)" || echo " Variant:   stock"
 echo " LTO:       ${LTO_TYPE^^}"
@@ -650,6 +653,22 @@ case "$LTO_TYPE" in
     *)    scripts/config --file "$OUT_DIR/.config" -d CONFIG_LTO_NONE -d CONFIG_LTO_CLANG_FULL -e CONFIG_LTO_CLANG -e CONFIG_LTO_CLANG_THIN ;;
 esac
 
+# Diagnostic config (temporary forensic kernel — 8188eu freeze hunt)
+# Every pick here is ABI-safe: no spinlock_t/struct device layout impact.
+# ⛔ PROVE_LOCKING / DEBUG_LOCK_ALLOC are FORBIDDEN — they change spinlock_t
+# layout and would break every vendor_dlkm module at load.
+if [ "$DIAGNOSTIC" == "on" ]; then
+    echo "=========================================="
+    echo "[+] Applying diagnostic configs..."
+    echo "=========================================="
+    scripts/config --file "$OUT_DIR/.config" \
+        -e CONFIG_FUNCTION_TRACER \
+        -e CONFIG_FUNCTION_GRAPH_TRACER \
+        -e CONFIG_DEBUG_ATOMIC_SLEEP \
+        -e CONFIG_NETCONSOLE \
+        -e CONFIG_NETCONSOLE_DYNAMIC
+fi
+
 # AutoFDO
 AFDO_PROFILE=""
 if [ "$AUTOFDO" == "on" ]; then
@@ -664,9 +683,6 @@ fi
 # ABI symbols (sched_feat_keys, get_each_object_track, get_slabinfo).
 # CONFIG_KASAN cannot be compiled out — vendor modules depend on
 # kasan_flag_enabled. We disable it at runtime via kasan=off cmdline.
-echo "=========================================="
-echo "[+] Applying debug reduction configs..."
-echo "=========================================="
 DEBUG_REDUCTION_ARGS=(
     -e CONFIG_DEBUG_INFO_REDUCED
     -d CONFIG_DEBUG_MISC
@@ -684,31 +700,76 @@ DEBUG_REDUCTION_ARGS=(
     # ⛔ -d CONFIG_ANDROID_DEBUG_SYMBOLS  # msm_sysstats.ko imports MINIDUMP ns!
     # ⛔ -d CONFIG_ANDROID_DEBUG_KINFO    # ANDROID_GKI_struct_kernel_all_info exported
 )
-scripts/config --file "$OUT_DIR/.config" "${DEBUG_REDUCTION_ARGS[@]}"
+# Diagnostic kernels keep full debug info and printk timestamps — skip the
+# debug-reduction pass entirely.
+if [ "$DIAGNOSTIC" != "on" ]; then
+    echo "=========================================="
+    echo "[+] Applying debug reduction configs..."
+    echo "=========================================="
+    scripts/config --file "$OUT_DIR/.config" "${DEBUG_REDUCTION_ARGS[@]}"
+fi
 
 # KASAN runtime disable (can't compile out — ABI symbol kasan_flag_enabled)
 # Also override bootloader's panic_on_rcu_stall — SUSFS hooks can trigger
 # scheduling-while-atomic BUGs that cascade into false RCU stalls.
 CURRENT_CMDLINE=$(grep '^CONFIG_CMDLINE=' "$OUT_DIR/.config" | sed 's/^CONFIG_CMDLINE="//' | sed 's/"$//')
 CMDLINE_APPEND=""
-echo "$CURRENT_CMDLINE" | grep -q "kasan=off" || CMDLINE_APPEND="$CMDLINE_APPEND kasan=off"
-echo "$CURRENT_CMDLINE" | grep -q "panic_on_rcu_stall" || CMDLINE_APPEND="$CMDLINE_APPEND kernel.panic_on_rcu_stall=0"
 
-# === RUNTIME PERF PARAMS (zero-risk — code stays compiled, just disabled at boot) ===
-# These achieve the same effect as compile-time config disables but without
-# any struct layout changes, KABI breaks, or Kconfig cascades.
-echo "$CURRENT_CMDLINE" | grep -q "init_on_alloc=" || CMDLINE_APPEND="$CMDLINE_APPEND init_on_alloc=0"
-echo "$CURRENT_CMDLINE" | grep -q "page_alloc.shuffle=" || CMDLINE_APPEND="$CMDLINE_APPEND page_alloc.shuffle=0"
-echo "$CURRENT_CMDLINE" | grep -q "randomize_kstack_offset=" || CMDLINE_APPEND="$CMDLINE_APPEND randomize_kstack_offset=0"
-echo "$CURRENT_CMDLINE" | grep -q "loglevel=" || CMDLINE_APPEND="$CMDLINE_APPEND loglevel=0"
-# ⛔ audit=0 — BREAKS SELinux enforcing → bootloop
-# ⛔ nosoftlockup — risky on Qualcomm SoC, vendor drivers may expect watchdog
-
-if [ "$DEBUG_MODE" == "on" ]; then
+if [ "$DIAGNOSTIC" == "on" ]; then
+    # Diagnostic kernel: KASAN must stay ON and the stack depot usable.
+    # Strip the runtime-disable args from the base cmdline, skip the perf
+    # appends, and add tracing helpers. NOTE: CONFIG_CMDLINE_EXTEND=y means
+    # bootloader args are appended AFTER ours — the bootloader's kasan=off
+    # would still win the kasan_arg parse, so the hw_tags.c source patch
+    # below is what actually forces KASAN on.
+    CURRENT_CMDLINE=$(echo "$CURRENT_CMDLINE" | sed -e 's/ *stack_depot_disable=on//' -e 's/ *kasan\.stacktrace=off//')
     echo "$CURRENT_CMDLINE" | grep -q "nokaslr" || CMDLINE_APPEND="$CMDLINE_APPEND nokaslr"
+    echo "$CURRENT_CMDLINE" | grep -q "ftrace_dump_on_oops" || CMDLINE_APPEND="$CMDLINE_APPEND ftrace_dump_on_oops"
+else
+    echo "$CURRENT_CMDLINE" | grep -q "kasan=off" || CMDLINE_APPEND="$CMDLINE_APPEND kasan=off"
+    echo "$CURRENT_CMDLINE" | grep -q "panic_on_rcu_stall" || CMDLINE_APPEND="$CMDLINE_APPEND kernel.panic_on_rcu_stall=0"
+
+    # === RUNTIME PERF PARAMS (zero-risk — code stays compiled, just disabled at boot) ===
+    # These achieve the same effect as compile-time config disables but without
+    # any struct layout changes, KABI breaks, or Kconfig cascades.
+    echo "$CURRENT_CMDLINE" | grep -q "init_on_alloc=" || CMDLINE_APPEND="$CMDLINE_APPEND init_on_alloc=0"
+    echo "$CURRENT_CMDLINE" | grep -q "page_alloc.shuffle=" || CMDLINE_APPEND="$CMDLINE_APPEND page_alloc.shuffle=0"
+    echo "$CURRENT_CMDLINE" | grep -q "randomize_kstack_offset=" || CMDLINE_APPEND="$CMDLINE_APPEND randomize_kstack_offset=0"
+    echo "$CURRENT_CMDLINE" | grep -q "loglevel=" || CMDLINE_APPEND="$CMDLINE_APPEND loglevel=0"
+    # ⛔ audit=0 — BREAKS SELinux enforcing → bootloop
+    # ⛔ nosoftlockup — risky on Qualcomm SoC, vendor drivers may expect watchdog
+
+    if [ "$DEBUG_MODE" == "on" ]; then
+        echo "$CURRENT_CMDLINE" | grep -q "nokaslr" || CMDLINE_APPEND="$CMDLINE_APPEND nokaslr"
+    fi
 fi
 [ -n "$CMDLINE_APPEND" ] && \
     scripts/config --file "$OUT_DIR/.config" --set-str CONFIG_CMDLINE "$CURRENT_CMDLINE$CMDLINE_APPEND"
+
+# KASAN force-on source patch (diagnostic only).
+# CONFIG_CMDLINE_EXTEND=y appends bootloader args AFTER CONFIG_CMDLINE, so the
+# bootloader's kasan=off always wins the early kasan_arg parse. Neutralize the
+# early-return in mm/kasan/hw_tags.c so HW_TAGS KASAN initializes regardless.
+# Guarded: skipped if already patched; asserts exactly 2 sites exist/patched.
+if [ "$DIAGNOSTIC" == "on" ]; then
+    KASAN_SRC="mm/kasan/hw_tags.c"
+    if grep -q "KONOHA-DIAG" "$KASAN_SRC"; then
+        echo "[+] KASAN force-on patch already present"
+    else
+        SITES=$(grep -c 'if (kasan_arg == KASAN_ARG_OFF)' "$KASAN_SRC")
+        if [ "$SITES" -ne 2 ]; then
+            echo "[-] Expected 2 KASAN_ARG_OFF early-return sites in $KASAN_SRC, found $SITES"
+            exit 1
+        fi
+        sed -i 's/if (kasan_arg == KASAN_ARG_OFF)/if (0 \&\& kasan_arg == KASAN_ARG_OFF) \/* KONOHA-DIAG *\//' "$KASAN_SRC"
+        MARKERS=$(grep -c "KONOHA-DIAG" "$KASAN_SRC")
+        if [ "$MARKERS" -ne 2 ]; then
+            echo "[-] KASAN force-on patch failed ($MARKERS/2 markers in $KASAN_SRC)"
+            exit 1
+        fi
+        echo "[+] KASAN force-on patch applied to $KASAN_SRC"
+    fi
+fi
 
 # Setup Droidspaces Support
 if [ "$DROIDSPACES" == "on" ]; then
@@ -820,6 +881,7 @@ elif [ "$VARIANT" == "susfs" ]; then
 fi
 
 [ "$KPM" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-kpm"
+[ "$DIAGNOSTIC" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-diagnostic"
 [ "$HARDENED" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-hardened"
 [ "$BYPASSCHARGING" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-bypasscharging"
 [ "$DROIDSPACES" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-droidspaces"
