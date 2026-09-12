@@ -57,6 +57,30 @@ else
 	echo "[+] VFS_internal namespace import already present"
 fi
 
+# Optional debug logging (RTW_DEBUG=1). The driver is SILENT by default:
+# with CONFIG_RTW_DEBUG unset, include/rtw_debug.h compiles every logging
+# macro - RTW_PRINT/ERR/WARN/INFO/DBG, error paths included - down to
+# "do {} while (0)", so a released module cannot report anything at all.
+# Turning it on needs BOTH switches: the Makefile only adds the defines
+# under `ifeq ($(CONFIG_RTW_DEBUG), y)`, and the level it bakes in comes
+# from CONFIG_RTW_LOG_LEVEL, whose in-tree default of 0 (_DRV_NONE_) is
+# still silent. Level 4 is _DRV_INFO_ (5 = _DRV_DEBUG_); once built this
+# way, rtw_drv_log_level is also a module_param(0644) and so retunable at
+# insmod time and at runtime without another build.
+debug_args=()
+case "${RTW_DEBUG:-0}" in
+	1 | y | yes | on)
+		debug_args=(
+			CONFIG_RTW_DEBUG=y
+			"CONFIG_RTW_LOG_LEVEL=${RTW_LOG_LEVEL:-4}"
+		)
+		echo "[+] Debug logging ENABLED (level ${RTW_LOG_LEVEL:-4}) - debug build, not for release"
+		;;
+	*)
+		echo "[+] Debug logging disabled (release build; pass RTW_DEBUG=1 to enable)"
+		;;
+esac
+
 echo "[+] Building 8188eu (jobs: $JOBS)"
 # The Realtek Makefile wraps an ordinary external-module build:
 #   make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE -C $KSRC M=$(pwd) modules
@@ -64,6 +88,7 @@ echo "[+] Building 8188eu (jobs: $JOBS)"
 # own (command-line assignments win), which is how we reuse the I386_PC
 # platform block (it only contributes the CONFIG_IOCTL_CFG80211 defines).
 make -C "$DRIVER_SRC" -j"$JOBS" \
+	${debug_args[@]+"${debug_args[@]}"} \
 	ARCH=arm64 \
 	KSRC="$KERNEL_OUT" \
 	CC=clang \
@@ -114,6 +139,26 @@ if [[ "$(modinfo -F depends "$OUT_KO")" != "cfg80211" ]]; then
 	exit 1
 fi
 
+# Prove the logging switch landed rather than trusting it. When the macros
+# are compiled out their format strings vanish from .rodata entirely, so the
+# presence of one is a direct read of what the binary can actually print.
+# (llvm-strip drops symbols, not string literals, so this survives the strip.)
+log_marker="nr_endpoint="
+if [[ ${#debug_args[@]} -gt 0 ]]; then
+	if ! grep -aqF "$log_marker" "$OUT_KO"; then
+		echo "RTW_DEBUG was requested but the module carries no log strings" >&2
+		exit 1
+	fi
+	log_state="enabled (level ${RTW_LOG_LEVEL:-4})"
+else
+	if grep -aqF "$log_marker" "$OUT_KO"; then
+		echo "Release build unexpectedly carries debug log strings" >&2
+		exit 1
+	fi
+	log_state="compiled out"
+fi
+
 echo "[+] Created: $OUT_KO"
 echo "    vermagic:  $module_vermagic"
+echo "    logging:   $log_state"
 echo "    size:      $(stat -c %s "$OUT_KO") bytes"

@@ -124,6 +124,12 @@ on:
         options: ["off", "on"]
         default: "off"
       # ---- WLAN build ----
+      debug_8188eu:
+        description: "8188eu debug logging (diagnostic build, do not release)"
+        required: true
+        type: choice
+        options: ["off", "on"]
+        default: "off"
       wlan_branch:
         description: "WLAN source branch for the replacement vendor driver"
         required: true
@@ -736,6 +742,8 @@ jobs:
           KERNEL_SRC: ${{ env.WLAN_KERNEL_SRC }}
           KERNEL_OUT: ${{ env.WLAN_KERNEL_OUT }}
           github_run_number: ${{ github.run_number }}
+          # The build script treats anything other than on/1/y as off.
+          RTW_DEBUG: ${{ inputs.debug_8188eu }}
         run: |
           set -euo pipefail
           export PATH="/usr/lib/ccache:$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
@@ -754,13 +762,23 @@ jobs:
 
           kernel_release="$(cat "$KERNEL_OUT/include/config/kernel.release")"
           version_code="$((github_run_number + 100))"
+          # A debug module keeps the same module id so it upgrades the release
+          # in place, but is labelled so it can never be mistaken for one.
+          name_suffix=""
+          version_suffix=""
+          desc_prefix=""
+          if [[ "${RTW_DEBUG:-off}" == "on" ]]; then
+            name_suffix=" (DEBUG LOGGING)"
+            version_suffix="-debug"
+            desc_prefix="DIAGNOSTIC BUILD - verbose driver logging compiled in (noisy dmesg, for freeze diagnosis only; replace with a release build afterwards). "
+          fi
           tools/make_ksu_module_zip.sh \
-            --out "artifacts/extra-modules/nethunter-extra-modules-${kernel_release}.zip" \
-            --module-name "NetHunter Extra Kernel Modules" \
+            --out "artifacts/extra-modules/nethunter-extra-modules-${kernel_release}${version_suffix}.zip" \
+            --module-name "NetHunter Extra Kernel Modules${name_suffix}" \
             --module-id nethunter-extra-modules \
-            --version "v${kernel_release}.${version_code}" \
+            --version "v${kernel_release}.${version_code}${version_suffix}" \
             --versionCode "$version_code" \
-            --description "Extra out-of-tree kernel modules for kernel release ${kernel_release}: RTL8188EUS USB adapter (monitor mode + frame injection). Install via KernelSU/Magisk manager; modules load from service.sh." \
+            --description "${desc_prefix}Extra out-of-tree kernel modules for kernel release ${kernel_release}: RTL8188EUS USB adapter (monitor mode + frame injection). Install via KernelSU/Magisk manager; modules load from service.sh." \
             --ko 8188eu=artifacts/wlan/8188eu.ko \
             --dep 8188eu=cfg80211
 
