@@ -661,12 +661,21 @@ if [ "$DIAGNOSTIC" == "on" ]; then
     echo "=========================================="
     echo "[+] Applying diagnostic configs..."
     echo "=========================================="
+    # ⛔ UBSAN stays DISABLED even in diagnostic mode. The release kernel
+    # never runs with UBSAN (debug-reduction kills it), so no boot path on
+    # this device has ever been validated under it — and UBSAN_TRAP turns
+    # any latent UB in early boot into a fatal BRK (bootloops the phone,
+    # verified 2026-09-12: local diagnostic build with UBSAN_TRAP=y would
+    # not boot from either KSU manager or recovery). It provides nothing
+    # for a lockup-class freeze hunt anyway.
     scripts/config --file "$OUT_DIR/.config" \
         -e CONFIG_FUNCTION_TRACER \
         -e CONFIG_FUNCTION_GRAPH_TRACER \
         -e CONFIG_DEBUG_ATOMIC_SLEEP \
         -e CONFIG_NETCONSOLE \
-        -e CONFIG_NETCONSOLE_DYNAMIC
+        -e CONFIG_NETCONSOLE_DYNAMIC \
+        -d CONFIG_UBSAN -d CONFIG_UBSAN_BOUNDS -d CONFIG_UBSAN_ARRAY_BOUNDS \
+        -d CONFIG_UBSAN_LOCAL_BOUNDS -d CONFIG_UBSAN_SANITIZE_ALL -d CONFIG_UBSAN_TRAP
 fi
 
 # AutoFDO
