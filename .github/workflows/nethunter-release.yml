@@ -130,6 +130,12 @@ on:
         type: choice
         options: ["off", "on"]
         default: "off"
+      variant_8188eu:
+        description: "8188eu freeze-bisect variant (A: noautopm, B: no netdev/wiphy reg; implies debug)"
+        required: true
+        type: choice
+        options: ["off", "a-noautopm", "b-nonetdev"]
+        default: "off"
       wlan_branch:
         description: "WLAN source branch for the replacement vendor driver"
         required: true
@@ -744,6 +750,9 @@ jobs:
           github_run_number: ${{ github.run_number }}
           # The build script treats anything other than on/1/y as off.
           RTW_DEBUG: ${{ inputs.debug_8188eu }}
+          # Freeze-bisect variant: a-noautopm / b-nonetdev. The build script
+          # patches the driver source accordingly and forces debug logging on.
+          RTW_VARIANT: ${{ inputs.variant_8188eu }}
         run: |
           set -euo pipefail
           export PATH="/usr/lib/ccache:$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
@@ -771,6 +780,28 @@ jobs:
             name_suffix=" (DEBUG LOGGING)"
             version_suffix="-debug"
             desc_prefix="DIAGNOSTIC BUILD - verbose driver logging compiled in (noisy dmesg, for freeze diagnosis only; replace with a release build afterwards). "
+          fi
+          if [[ "${RTW_VARIANT:-off}" != "off" ]]; then
+            case "$RTW_VARIANT" in
+              a*)
+                variant_label="a-noautopm"
+                variant_desc="VARIANT A: autosuspend enabled + probe autopm get dropped (tests the pinned-active-forever theory)"
+                ;;
+              b*)
+                variant_label="b-nonetdev"
+                variant_desc="VARIANT B: wiphy/netdev registration skipped (tests the Wi-Fi HAL netlink-enumeration theory)"
+                ;;
+              *)
+                echo "Unknown variant_8188eu input: $RTW_VARIANT" >&2
+                exit 1
+                ;;
+            esac
+            # A variant build is always a debug build (the build script
+            # forces logging on), so make sure the label says so.
+            [[ "$version_suffix" == *-debug* ]] || version_suffix="${version_suffix}-debug"
+            version_suffix="${version_suffix}-variant-${variant_label}"
+            name_suffix=" (${variant_desc})"
+            desc_prefix="FREEZE-BISECT ${variant_desc}. ${desc_prefix}"
           fi
           tools/make_ksu_module_zip.sh \
             --out "artifacts/extra-modules/nethunter-extra-modules-${kernel_release}${version_suffix}.zip" \
