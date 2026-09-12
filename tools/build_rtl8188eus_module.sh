@@ -57,6 +57,33 @@ else
 	echo "[+] VFS_internal namespace import already present"
 fi
 
+# USB ID 0bda:8176 (RTL8188EU). Upstream (SimplyCEO, aircrack-ng) omits it
+# deliberately because mainline's in-tree r8188eu driver claims that ID;
+# this kernel ships no r8188eu, so claiming it here is safe. Without a
+# static table entry the dongle never binds, and `usb new_id` cannot stand
+# in: rtw_decide_chip_type_by_usb_info() copies driver_info into
+# chip_type, dynamic IDs always carry driver_info = 0, and a chip_type of
+# 0 hooks no hal ops -> probe fails with -ENODEV ("rtw_hal_ops_check
+# Please hook" wall). driver_info IS the chip type, so the ID must be
+# added to the static table at build time.
+if ! grep -q 'USB_VENDER_ID_REALTEK, 0x8176' "$DRIVER_SRC/os_dep/linux/usb_intf.c"; then
+	patch -s -p1 -d "$DRIVER_SRC" <<'PATCH'
+--- a/os_dep/linux/usb_intf.c
++++ b/os_dep/linux/usb_intf.c
+@@ -147,6 +147,7 @@ static void rtw_dev_shutdown(struct device *dev)
+ static struct usb_device_id rtw_usb_id_tbl[] = {
+ #ifdef CONFIG_RTL8188E
+ 	/*=== Realtek demoboard ===*/
++	{USB_DEVICE(USB_VENDER_ID_REALTEK, 0x8176), .driver_info = RTL8188E}, /* 8188EU */
+ 	{USB_DEVICE(USB_VENDER_ID_REALTEK, 0x8179), .driver_info = RTL8188E}, /* 8188EUS */
+ 	{USB_DEVICE(USB_VENDER_ID_REALTEK, 0x0179), .driver_info = RTL8188E}, /* 8188ETV */
+ 	/*=== Customer ID ===*/
+PATCH
+	echo "[+] Added 0bda:8176 (RTL8188EU) to the USB ID table"
+else
+	echo "[+] 0bda:8176 USB ID already present"
+fi
+
 # Optional debug logging (RTW_DEBUG=1). The driver is SILENT by default:
 # with CONFIG_RTW_DEBUG unset, include/rtw_debug.h compiles every logging
 # macro - RTW_PRINT/ERR/WARN/INFO/DBG, error paths included - down to
@@ -135,8 +162,27 @@ if [[ -n "$variant" ]]; then
 		a) marker="VARIANT-A" ;;
 		b) marker="VARIANT-B" ;;
 	esac
-	if grep -q "$marker" "$DRIVER_SRC/os_dep/linux/usb_intf.c"; then
+	# The variant patch edits more than one file (variant b: usb_intf.c
+	# markers/PM-TRACE + the os_intfs.c registration skip). A guard that
+	# only checked usb_intf.c once let a PARTIALLY applied patch
+	# (usb_intf.c patched, os_intfs.c pristine) pass as "already present"
+	# and shipped a baseline module still carrying the init marker,
+	# poisoning a bisect run on 2026-09-12. Every file the patch edits
+	# must carry the marker before we skip; anything in between aborts.
+	case "$variant" in
+		a) variant_src_files=(os_dep/linux/usb_intf.c) ;;
+		b) variant_src_files=(os_dep/linux/usb_intf.c os_dep/linux/os_intfs.c) ;;
+	esac
+	variant_unpatched=()
+	for f in "${variant_src_files[@]}"; do
+		grep -q "$marker" "$DRIVER_SRC/$f" || variant_unpatched+=("$f")
+	done
+	if [[ ${#variant_unpatched[@]} -eq 0 ]]; then
 		echo "[+] $marker patch already present"
+	elif [[ ${#variant_unpatched[@]} -ne ${#variant_src_files[@]} ]]; then
+		echo "RTW_VARIANT=$variant is only PARTIALLY applied: ${variant_unpatched[*]} lack the $marker marker" >&2
+		echo "Reset the driver tree before rebuilding: git -C $DRIVER_SRC checkout -- ${variant_src_files[*]}" >&2
+		exit 1
 	else
 		case "$variant" in
 			a)
@@ -484,7 +530,13 @@ fi
 # (a variant that silently failed to patch would poison the bisect).
 case "$variant" in
 	a | b)
-		for marker_string in "$marker:" "PM-TRACE tick="; do
+		# "$marker:" alone proves only the usb_intf.c hunks (module-init
+		# marker, PM-TRACE) compiled in. Each variant's BEHAVIORAL marker
+		# lives in its other edit and is what proves the change that
+		# matters actually landed (see the partial-application bug above).
+		behavioral_marker="autopm get skipped"
+		[[ "$variant" == b ]] && behavioral_marker="skipping ndev/wiphy registration"
+		for marker_string in "$marker:" "PM-TRACE tick=" "$behavioral_marker"; do
 			if ! grep -aqF "$marker_string" "$OUT_KO"; then
 				echo "RTW_VARIANT=$variant was requested but the module lacks \"$marker_string\"" >&2
 				exit 1
