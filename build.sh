@@ -97,17 +97,33 @@ else
     NON_INTERACTIVE=0
 fi
 
-# Diagnostic mode helpers: off | trace | kasan | on (=full)
-#   trace = ftrace/fgraph + DEBUG_ATOMIC_SLEEP + netconsole (KASAN stays
-#           runtime-off, exactly like the release kernel)
-#   kasan = KASAN force-on only (hw_tags.c patch + cmdline cleanup)
-#   on    = trace + kasan combined
+# Diagnostic mode: off | trace | kasan | on | comma-list of features
+# (ftrace, sleep, netconsole, kasan). Aliases:
+#   trace = ftrace,sleep,netconsole (KASAN stays runtime-off like release)
+#   kasan = kasan only (KASAN force-on via hw_tags.c patch)
+#   on    = everything
+# Bisect log (2026-09-13, flashed from recovery unless noted):
+#   b792257 full-on local build      → bootloop (KSU mgr + recovery + boot.img)
+#   2d325c85 full-on CI + UBSAN off  → bootloop (fastboot boot.img)
+#   a2fbcd41 trace (ftrace+sleep+netconsole, KASAN off) → bootloop
+DIAGNOSTIC_LABEL=""
 case "$DIAGNOSTIC" in
-    off|trace|kasan|on) ;;
-    *) echo "[-] Invalid diagnostic mode: $DIAGNOSTIC (off|trace|kasan|on)"; exit 1 ;;
+    off)  DIAGNOSTIC_FEATURES="" ;;
+    trace) DIAGNOSTIC_FEATURES="ftrace sleep netconsole"; DIAGNOSTIC_LABEL="trace" ;;
+    kasan) DIAGNOSTIC_FEATURES="kasan"; DIAGNOSTIC_LABEL="kasan" ;;
+    on)    DIAGNOSTIC_FEATURES="ftrace sleep netconsole kasan"; DIAGNOSTIC_LABEL="" ;;
+    *)     DIAGNOSTIC_FEATURES=$(echo "$DIAGNOSTIC" | tr ',' ' ')
+           DIAGNOSTIC_LABEL=$(echo "$DIAGNOSTIC" | tr ',' '-') ;;
 esac
-diag_trace() { [ "$DIAGNOSTIC" == "trace" ] || [ "$DIAGNOSTIC" == "on" ]; }
-diag_kasan() { [ "$DIAGNOSTIC" == "kasan" ] || [ "$DIAGNOSTIC" == "on" ]; }
+for f in $DIAGNOSTIC_FEATURES; do
+    case "$f" in
+        ftrace|sleep|netconsole|kasan) ;;
+        *) echo "[-] Invalid diagnostic feature: $f (ftrace|sleep|netconsole|kasan)"; exit 1 ;;
+    esac
+done
+diag_has() { case " $DIAGNOSTIC_FEATURES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+diag_trace() { diag_has ftrace || diag_has sleep || diag_has netconsole; }
+diag_kasan() { diag_has kasan; }
 # ==========================================
 # Paths
 # ==========================================
@@ -671,7 +687,7 @@ esac
 # layout and would break every vendor_dlkm module at load.
 if [ "$DIAGNOSTIC" != "off" ]; then
     echo "=========================================="
-    echo "[+] Applying diagnostic configs (mode: $DIAGNOSTIC)..."
+    echo "[+] Applying diagnostic configs (mode: $DIAGNOSTIC; features: ${DIAGNOSTIC_FEATURES:-none})..."
     echo "=========================================="
     # ⛔ UBSAN stays DISABLED in every diagnostic mode. The release kernel
     # never runs with UBSAN (debug-reduction kills it), so no boot path on
@@ -683,11 +699,17 @@ if [ "$DIAGNOSTIC" != "off" ]; then
         -d CONFIG_UBSAN -d CONFIG_UBSAN_BOUNDS -d CONFIG_UBSAN_ARRAY_BOUNDS
         -d CONFIG_UBSAN_LOCAL_BOUNDS -d CONFIG_UBSAN_SANITIZE_ALL -d CONFIG_UBSAN_TRAP
     )
-    if diag_trace; then
+    if diag_has ftrace; then
         DIAG_CONFIG_ARGS+=(
             -e CONFIG_FUNCTION_TRACER
             -e CONFIG_FUNCTION_GRAPH_TRACER
-            -e CONFIG_DEBUG_ATOMIC_SLEEP
+        )
+    fi
+    if diag_has sleep; then
+        DIAG_CONFIG_ARGS+=(-e CONFIG_DEBUG_ATOMIC_SLEEP)
+    fi
+    if diag_has netconsole; then
+        DIAG_CONFIG_ARGS+=(
             -e CONFIG_NETCONSOLE
             -e CONFIG_NETCONSOLE_DYNAMIC
         )
@@ -755,7 +777,7 @@ if [ "$DIAGNOSTIC" != "off" ]; then
         echo "$CURRENT_CMDLINE" | grep -q "kasan=off" || CMDLINE_APPEND="$CMDLINE_APPEND kasan=off"
     fi
     echo "$CURRENT_CMDLINE" | grep -q "nokaslr" || CMDLINE_APPEND="$CMDLINE_APPEND nokaslr"
-    if diag_trace; then
+    if diag_has ftrace; then
         echo "$CURRENT_CMDLINE" | grep -q "ftrace_dump_on_oops" || CMDLINE_APPEND="$CMDLINE_APPEND ftrace_dump_on_oops"
     fi
 else
@@ -915,8 +937,9 @@ fi
 
 [ "$KPM" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-kpm"
 case "$DIAGNOSTIC" in
+    off|"") ;;
     on)     ZIP_SUFFIX="${ZIP_SUFFIX}-diagnostic" ;;
-    trace|kasan) ZIP_SUFFIX="${ZIP_SUFFIX}-diagnostic-${DIAGNOSTIC}" ;;
+    *)      ZIP_SUFFIX="${ZIP_SUFFIX}-diagnostic-${DIAGNOSTIC_LABEL}" ;;
 esac
 [ "$HARDENED" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-hardened"
 [ "$BYPASSCHARGING" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-bypasscharging"
