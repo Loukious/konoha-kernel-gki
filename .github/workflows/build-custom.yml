@@ -145,11 +145,13 @@ on:
           - "on"
         default: "off"
       diagnostic_kernel:
-        description: "Diagnostic Kernel (ftrace + KASAN-on + netconsole; 8188eu freeze hunt — NOT for daily use)"
+        description: "Diagnostic Kernel (trace=ftrace+netconsole; kasan=KASAN-force-on; on=both — 8188eu freeze hunt, NOT for daily use)"
         required: true
         type: choice
         options:
           - "off"
+          - "trace"
+          - "kasan"
           - "on"
         default: "off"
 
@@ -220,6 +222,8 @@ jobs:
           if [ "$INPUT_DATA" == "off" ]; then BUILD_NAME="${BUILD_NAME}-nodata"; fi
           if [ "$INPUT_DEBUG" == "on" ]; then BUILD_NAME="${BUILD_NAME}-debug"; fi
           if [ "$INPUT_DIAGNOSTIC" == "on" ]; then BUILD_NAME="${BUILD_NAME}-diagnostic"; fi
+          if [ "$INPUT_DIAGNOSTIC" == "trace" ]; then BUILD_NAME="${BUILD_NAME}-diagnostic-trace"; fi
+          if [ "$INPUT_DIAGNOSTIC" == "kasan" ]; then BUILD_NAME="${BUILD_NAME}-diagnostic-kasan"; fi
           if [ "$INPUT_NETHUNTER" == "on" ]; then BUILD_NAME="${BUILD_NAME}-nethunter"; fi
           
           echo "BUILD_NAME=$BUILD_NAME" >> $GITHUB_ENV

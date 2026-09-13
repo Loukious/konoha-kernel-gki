@@ -96,6 +96,18 @@ if [ "$#" -gt 0 ]; then
 else
     NON_INTERACTIVE=0
 fi
+
+# Diagnostic mode helpers: off | trace | kasan | on (=full)
+#   trace = ftrace/fgraph + DEBUG_ATOMIC_SLEEP + netconsole (KASAN stays
+#           runtime-off, exactly like the release kernel)
+#   kasan = KASAN force-on only (hw_tags.c patch + cmdline cleanup)
+#   on    = trace + kasan combined
+case "$DIAGNOSTIC" in
+    off|trace|kasan|on) ;;
+    *) echo "[-] Invalid diagnostic mode: $DIAGNOSTIC (off|trace|kasan|on)"; exit 1 ;;
+esac
+diag_trace() { [ "$DIAGNOSTIC" == "trace" ] || [ "$DIAGNOSTIC" == "on" ]; }
+diag_kasan() { [ "$DIAGNOSTIC" == "kasan" ] || [ "$DIAGNOSTIC" == "on" ]; }
 # ==========================================
 # Paths
 # ==========================================
@@ -657,25 +669,30 @@ esac
 # Every pick here is ABI-safe: no spinlock_t/struct device layout impact.
 # ⛔ PROVE_LOCKING / DEBUG_LOCK_ALLOC are FORBIDDEN — they change spinlock_t
 # layout and would break every vendor_dlkm module at load.
-if [ "$DIAGNOSTIC" == "on" ]; then
+if [ "$DIAGNOSTIC" != "off" ]; then
     echo "=========================================="
-    echo "[+] Applying diagnostic configs..."
+    echo "[+] Applying diagnostic configs (mode: $DIAGNOSTIC)..."
     echo "=========================================="
-    # ⛔ UBSAN stays DISABLED even in diagnostic mode. The release kernel
+    # ⛔ UBSAN stays DISABLED in every diagnostic mode. The release kernel
     # never runs with UBSAN (debug-reduction kills it), so no boot path on
     # this device has ever been validated under it — and UBSAN_TRAP turns
-    # any latent UB in early boot into a fatal BRK (bootloops the phone,
-    # verified 2026-09-12: local diagnostic build with UBSAN_TRAP=y would
-    # not boot from either KSU manager or recovery). It provides nothing
-    # for a lockup-class freeze hunt anyway.
-    scripts/config --file "$OUT_DIR/.config" \
-        -e CONFIG_FUNCTION_TRACER \
-        -e CONFIG_FUNCTION_GRAPH_TRACER \
-        -e CONFIG_DEBUG_ATOMIC_SLEEP \
-        -e CONFIG_NETCONSOLE \
-        -e CONFIG_NETCONSOLE_DYNAMIC \
-        -d CONFIG_UBSAN -d CONFIG_UBSAN_BOUNDS -d CONFIG_UBSAN_ARRAY_BOUNDS \
+    # any latent UB in early boot into a fatal BRK. Confirmed 2026-09-13:
+    # diagnostic build b79225758b16 (UBSAN_TRAP=y) bootlooped from KSU
+    # manager, recovery, AND a fastboot boot.img.
+    DIAG_CONFIG_ARGS=(
+        -d CONFIG_UBSAN -d CONFIG_UBSAN_BOUNDS -d CONFIG_UBSAN_ARRAY_BOUNDS
         -d CONFIG_UBSAN_LOCAL_BOUNDS -d CONFIG_UBSAN_SANITIZE_ALL -d CONFIG_UBSAN_TRAP
+    )
+    if diag_trace; then
+        DIAG_CONFIG_ARGS+=(
+            -e CONFIG_FUNCTION_TRACER
+            -e CONFIG_FUNCTION_GRAPH_TRACER
+            -e CONFIG_DEBUG_ATOMIC_SLEEP
+            -e CONFIG_NETCONSOLE
+            -e CONFIG_NETCONSOLE_DYNAMIC
+        )
+    fi
+    scripts/config --file "$OUT_DIR/.config" "${DIAG_CONFIG_ARGS[@]}"
 fi
 
 # AutoFDO
@@ -710,8 +727,9 @@ DEBUG_REDUCTION_ARGS=(
     # ⛔ -d CONFIG_ANDROID_DEBUG_KINFO    # ANDROID_GKI_struct_kernel_all_info exported
 )
 # Diagnostic kernels keep full debug info and printk timestamps — skip the
-# debug-reduction pass entirely.
-if [ "$DIAGNOSTIC" != "on" ]; then
+# debug-reduction pass entirely (UBSAN is killed separately in the diagnostic
+# config block above).
+if [ "$DIAGNOSTIC" == "off" ]; then
     echo "=========================================="
     echo "[+] Applying debug reduction configs..."
     echo "=========================================="
@@ -724,16 +742,22 @@ fi
 CURRENT_CMDLINE=$(grep '^CONFIG_CMDLINE=' "$OUT_DIR/.config" | sed 's/^CONFIG_CMDLINE="//' | sed 's/"$//')
 CMDLINE_APPEND=""
 
-if [ "$DIAGNOSTIC" == "on" ]; then
-    # Diagnostic kernel: KASAN must stay ON and the stack depot usable.
-    # Strip the runtime-disable args from the base cmdline, skip the perf
-    # appends, and add tracing helpers. NOTE: CONFIG_CMDLINE_EXTEND=y means
-    # bootloader args are appended AFTER ours — the bootloader's kasan=off
-    # would still win the kasan_arg parse, so the hw_tags.c source patch
-    # below is what actually forces KASAN on.
-    CURRENT_CMDLINE=$(echo "$CURRENT_CMDLINE" | sed -e 's/ *stack_depot_disable=on//' -e 's/ *kasan\.stacktrace=off//')
+if [ "$DIAGNOSTIC" != "off" ]; then
+    # Diagnostic kernel. trace mode keeps KASAN runtime-off exactly like the
+    # release kernel; kasan mode strips the runtime-disable args so the
+    # stack depot is usable. NOTE: CONFIG_CMDLINE_EXTEND=y means bootloader
+    # args are appended AFTER ours — the bootloader's kasan=off would still
+    # win the kasan_arg parse, so the hw_tags.c source patch below is what
+    # actually forces KASAN on.
+    if diag_kasan; then
+        CURRENT_CMDLINE=$(echo "$CURRENT_CMDLINE" | sed -e 's/ *stack_depot_disable=on//' -e 's/ *kasan\.stacktrace=off//')
+    else
+        echo "$CURRENT_CMDLINE" | grep -q "kasan=off" || CMDLINE_APPEND="$CMDLINE_APPEND kasan=off"
+    fi
     echo "$CURRENT_CMDLINE" | grep -q "nokaslr" || CMDLINE_APPEND="$CMDLINE_APPEND nokaslr"
-    echo "$CURRENT_CMDLINE" | grep -q "ftrace_dump_on_oops" || CMDLINE_APPEND="$CMDLINE_APPEND ftrace_dump_on_oops"
+    if diag_trace; then
+        echo "$CURRENT_CMDLINE" | grep -q "ftrace_dump_on_oops" || CMDLINE_APPEND="$CMDLINE_APPEND ftrace_dump_on_oops"
+    fi
 else
     echo "$CURRENT_CMDLINE" | grep -q "kasan=off" || CMDLINE_APPEND="$CMDLINE_APPEND kasan=off"
     echo "$CURRENT_CMDLINE" | grep -q "panic_on_rcu_stall" || CMDLINE_APPEND="$CMDLINE_APPEND kernel.panic_on_rcu_stall=0"
@@ -755,12 +779,12 @@ fi
 [ -n "$CMDLINE_APPEND" ] && \
     scripts/config --file "$OUT_DIR/.config" --set-str CONFIG_CMDLINE "$CURRENT_CMDLINE$CMDLINE_APPEND"
 
-# KASAN force-on source patch (diagnostic only).
+# KASAN force-on source patch (diagnostic kasan mode only).
 # CONFIG_CMDLINE_EXTEND=y appends bootloader args AFTER CONFIG_CMDLINE, so the
 # bootloader's kasan=off always wins the early kasan_arg parse. Neutralize the
 # early-return in mm/kasan/hw_tags.c so HW_TAGS KASAN initializes regardless.
 # Guarded: skipped if already patched; asserts exactly 2 sites exist/patched.
-if [ "$DIAGNOSTIC" == "on" ]; then
+if diag_kasan; then
     KASAN_SRC="mm/kasan/hw_tags.c"
     if grep -q "KONOHA-DIAG" "$KASAN_SRC"; then
         echo "[+] KASAN force-on patch already present"
@@ -890,7 +914,10 @@ elif [ "$VARIANT" == "susfs" ]; then
 fi
 
 [ "$KPM" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-kpm"
-[ "$DIAGNOSTIC" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-diagnostic"
+case "$DIAGNOSTIC" in
+    on)     ZIP_SUFFIX="${ZIP_SUFFIX}-diagnostic" ;;
+    trace|kasan) ZIP_SUFFIX="${ZIP_SUFFIX}-diagnostic-${DIAGNOSTIC}" ;;
+esac
 [ "$HARDENED" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-hardened"
 [ "$BYPASSCHARGING" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-bypasscharging"
 [ "$DROIDSPACES" == "on" ] && ZIP_SUFFIX="${ZIP_SUFFIX}-droidspaces"
