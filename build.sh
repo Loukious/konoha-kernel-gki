@@ -812,7 +812,7 @@ if [ "$DIAGNOSTIC" != "off" ]; then
     fi
 else
     echo "$CURRENT_CMDLINE" | grep -q "kasan=off" || CMDLINE_APPEND="$CMDLINE_APPEND kasan=off"
-    echo "$CURRENT_CMDLINE" | grep -q "panic_on_rcu_stall" || CMDLINE_APPEND="$CMDLINE_APPEND kernel.panic_on_rcu_stall=0"
+    echo "$CURRENT_CMDLINE" | grep -q "panic_on_rcu_stall" || CMDLINE_APPEND="$CMDLINE_APPEND sysctl.kernel.panic_on_rcu_stall=0"
 
     # === RUNTIME PERF PARAMS (zero-risk — code stays compiled, just disabled at boot) ===
     # These achieve the same effect as compile-time config disables but without
