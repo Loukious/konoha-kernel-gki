@@ -220,6 +220,7 @@ jobs:
             CONFIG_RTL8188EU=m CONFIG_RTW_DEBUG=y CONFIG_RTW_LOG_LEVEL=4 \
             USER_EXTRA_CFLAGS="-Wno-error" modules
           cp sources/8188eu-a/8188eu.ko artifacts/8188eu-tdwn-test18-ablation.ko
+          llvm-strip --strip-debug artifacts/8188eu-tdwn-test18-ablation.ko
 
           strings artifacts/8188eu-tdwn-test18-ablation.ko | \
             grep -q "TEST18" || { echo "Module A missing TEST18 marker" >&2; exit 1; }
@@ -238,6 +239,7 @@ jobs:
             CONFIG_RTL8188EU=m CONFIG_RTW_DEBUG=y CONFIG_RTW_LOG_LEVEL=4 \
             KCFLAGS="-Wno-error -Wno-unknown-warning-option" modules
           cp sources/8188eu-b/8188eu.ko artifacts/8188eu-gglluukk-8176.ko
+          llvm-strip --strip-debug artifacts/8188eu-gglluukk-8176.ko
 
           strings artifacts/8188eu-gglluukk-8176.ko | \
             grep -q "RTW: " || { echo "Module B missing RTW debug strings" >&2; exit 1; }
