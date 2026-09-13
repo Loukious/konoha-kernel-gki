@@ -111,13 +111,14 @@ case "$DIAGNOSTIC" in
     off)  DIAGNOSTIC_FEATURES="" ;;
     trace) DIAGNOSTIC_FEATURES="ftrace sleep netconsole"; DIAGNOSTIC_LABEL="trace" ;;
     kasan) DIAGNOSTIC_FEATURES="kasan"; DIAGNOSTIC_LABEL="kasan" ;;
+    kasang3) DIAGNOSTIC_FEATURES="kasang kasang3"; DIAGNOSTIC_LABEL="kasang3" ;;
     on)    DIAGNOSTIC_FEATURES="ftrace sleep netconsole kasan"; DIAGNOSTIC_LABEL="" ;;
     *)     DIAGNOSTIC_FEATURES=$(echo "$DIAGNOSTIC" | tr ',' ' ')
            DIAGNOSTIC_LABEL=$(echo "$DIAGNOSTIC" | tr ',' '-') ;;
 esac
 for f in $DIAGNOSTIC_FEATURES; do
     case "$f" in
-        ftrace|sleep|netconsole|kasan|kasang) ;;
+        ftrace|sleep|netconsole|kasan|kasang|kasang3) ;;
         *) echo "[-] Invalid diagnostic feature: $f (ftrace|sleep|netconsole|kasan|kasang)"; exit 1 ;;
     esac
 done
@@ -728,6 +729,12 @@ if [ "$DIAGNOSTIC" != "off" ]; then
             -d CONFIG_KASAN_INLINE
             -e CONFIG_KASAN_OUTLINE
         )
+    fi
+    if diag_has kasang3; then
+        # kasang minus KASAN_VMALLOC: the vmalloc shadow setup is the most
+        # exotic part of early GENERIC KASAN init on arm64. Not needed for the
+        # 8188eu hunt (probe poison lives in slab/linear-map allocations).
+        DIAG_CONFIG_ARGS+=(-d CONFIG_KASAN_VMALLOC)
     fi
     scripts/config --file "$OUT_DIR/.config" "${DIAG_CONFIG_ARGS[@]}"
 fi
