@@ -467,3 +467,11 @@ void __kasan_unpoison_vmap_areas(struct vm_struct **vms, int nr_vms,
 	}
 }
 #endif
+
+#ifdef CONFIG_KASAN_GENERIC
+/* KONOHA-DIAG-KG: vendor DLKMs import kasan_flag_enabled, which is otherwise
+ * defined only under CONFIG_KASAN_HW_TAGS (mm/kasan/hw_tags.c). */
+#include <linux/jump_label.h>
+DEFINE_STATIC_KEY_FALSE(kasan_flag_enabled);
+EXPORT_SYMBOL(kasan_flag_enabled);
+#endif

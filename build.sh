@@ -117,13 +117,14 @@ case "$DIAGNOSTIC" in
 esac
 for f in $DIAGNOSTIC_FEATURES; do
     case "$f" in
-        ftrace|sleep|netconsole|kasan) ;;
-        *) echo "[-] Invalid diagnostic feature: $f (ftrace|sleep|netconsole|kasan)"; exit 1 ;;
+        ftrace|sleep|netconsole|kasan|kasang) ;;
+        *) echo "[-] Invalid diagnostic feature: $f (ftrace|sleep|netconsole|kasan|kasang)"; exit 1 ;;
     esac
 done
 diag_has() { case " $DIAGNOSTIC_FEATURES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 diag_trace() { diag_has ftrace || diag_has sleep || diag_has netconsole; }
 diag_kasan() { diag_has kasan; }
+diag_kasang() { diag_has kasang; }
 # ==========================================
 # Paths
 # ==========================================
@@ -714,6 +715,20 @@ if [ "$DIAGNOSTIC" != "off" ]; then
             -e CONFIG_NETCONSOLE_DYNAMIC
         )
     fi
+    if diag_kasang; then
+        # KASAN_GENERIC: deterministic shadow-memory checking that works on
+        # Oryon (no FEAT_MTE needed — HW_TAGS KASAN is inert there). Catches
+        # the corrupting WRITE at write time with alloc/free stacks.
+        # Attempt 2: KASAN_OUTLINE — INLINE (inline shadow checks + ThinLTO
+        # codegen) is the prime suspect for the kasang-1 bootloop; outline
+        # does the same runtime detection with plain __asan_* calls.
+        DIAG_CONFIG_ARGS+=(
+            -d CONFIG_KASAN_HW_TAGS
+            -e CONFIG_KASAN_GENERIC
+            -d CONFIG_KASAN_INLINE
+            -e CONFIG_KASAN_OUTLINE
+        )
+    fi
     scripts/config --file "$OUT_DIR/.config" "${DIAG_CONFIG_ARGS[@]}"
 fi
 
@@ -771,8 +786,16 @@ if [ "$DIAGNOSTIC" != "off" ]; then
     # args are appended AFTER ours — the bootloader's kasan=off would still
     # win the kasan_arg parse, so the hw_tags.c source patch below is what
     # actually forces KASAN on.
-    if diag_kasan; then
+    if diag_kasan || diag_kasang; then
         CURRENT_CMDLINE=$(echo "$CURRENT_CMDLINE" | sed -e 's/ *stack_depot_disable=on//' -e 's/ *kasan\.stacktrace=off//')
+        if diag_kasang; then
+            # GENERIC mode never parses kasan=off at all (every kasan=
+            # early_param lives in mm/kasan/hw_tags.c, not built under
+            # CONFIG_KASAN_GENERIC) — the bootloader's kasan=off is inert.
+            # Strip any in-image copy and arm multi-shot reporting.
+            CURRENT_CMDLINE=$(echo "$CURRENT_CMDLINE" | sed -e 's/ *kasan=off//')
+            echo "$CURRENT_CMDLINE" | grep -q "kasan_multi_shot" || CMDLINE_APPEND="$CMDLINE_APPEND kasan_multi_shot"
+        fi
     else
         echo "$CURRENT_CMDLINE" | grep -q "kasan=off" || CMDLINE_APPEND="$CMDLINE_APPEND kasan=off"
     fi
@@ -823,6 +846,37 @@ if diag_kasan; then
             exit 1
         fi
         echo "[+] KASAN force-on patch applied to $KASAN_SRC"
+    fi
+fi
+
+# KASAN_GENERIC vendor-ABI compat (diagnostic kasang mode only).
+# kasan_flag_enabled is defined/exported only in mm/kasan/hw_tags.c, which is
+# NOT built under CONFIG_KASAN_GENERIC — but vendor DLKMs import it (verified
+# against the running cfg80211.ko: it is the only kasan* undefined symbol;
+# also the only one in the dumped vendor_dlkm image). Define it in common.c
+# as a permanently-disabled static key: vendor code sees "KASAN off", exactly
+# like the release kernel's runtime-off state.
+if diag_kasang; then
+    KG_SRC="mm/kasan/common.c"
+    if grep -q "KONOHA-DIAG-KG" "$KG_SRC"; then
+        echo "[+] KASAN_GENERIC compat export already present"
+    else
+        cat >> "$KG_SRC" <<'EOF'
+
+#ifdef CONFIG_KASAN_GENERIC
+/* KONOHA-DIAG-KG: vendor DLKMs import kasan_flag_enabled, which is otherwise
+ * defined only under CONFIG_KASAN_HW_TAGS (mm/kasan/hw_tags.c). */
+#include <linux/jump_label.h>
+DEFINE_STATIC_KEY_FALSE(kasan_flag_enabled);
+EXPORT_SYMBOL(kasan_flag_enabled);
+#endif
+EOF
+        MARKERS=$(grep -c "KONOHA-DIAG-KG" "$KG_SRC")
+        if [ "$MARKERS" -ne 1 ]; then
+            echo "[-] KASAN_GENERIC compat patch failed ($MARKERS/1 markers in $KG_SRC)"
+            exit 1
+        fi
+        echo "[+] KASAN_GENERIC compat export appended to $KG_SRC"
     fi
 fi
 
