@@ -34,7 +34,7 @@ on:
         description: "Module B: branch"
         required: true
         type: string
-        default: master
+        default: v5.3.9
       kernel_release_override:
         description: "Kernel release string to stamp"
         required: true
@@ -194,6 +194,22 @@ jobs:
           echo "Module B USB ID table after patch:"
           grep -A2 'CONFIG_RTL8188E' gki-clo/sources/8188eu-b/os_dep/linux/usb_intf.c | head -8
 
+          # Module B: gglluukk's Makefile ignores USER_EXTRA_CFLAGS, so the
+          # namespace import must be patched in (GKI exports kernel_read and
+          # friends in the VFS_internal namespace — modpost fails otherwise).
+          sed -i 's|^MODULE_LICENSE("GPL");$|MODULE_LICENSE("GPL");\n/* GKI: kernel_read/file-IO symbols live in the VFS_internal namespace */\nMODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);|' \
+            gki-clo/sources/8188eu-b/os_dep/linux/os_intfs.c
+          grep -q 'MODULE_IMPORT_NS' gki-clo/sources/8188eu-b/os_dep/linux/os_intfs.c || {
+            echo "MODULE_IMPORT_NS patch failed to apply" >&2; exit 1; }
+
+          # Module B: drop two GCC-only -Wno-* flags clang hard-rejects
+          # (-Wno-restrict, -Wno-vla-larger-than) — they fail the build under
+          # Werror before any source file compiles.
+          sed -i 's|^ccflags-y += -Wno-restrict$|# konoha-ci: dropped, clang rejects|; s|^ccflags-y += -Wno-vla-larger-than$|# konoha-ci: dropped, clang rejects|' \
+            gki-clo/sources/8188eu-b/Makefile
+          grep -q 'Wno-vla-larger-than' gki-clo/sources/8188eu-b/Makefile && {
+            echo "Makefile flag-drop patch failed to apply" >&2; exit 1; }
+
       - name: Build module A (tdwn test18 ablation)
         working-directory: gki-clo
         run: |
@@ -213,12 +229,18 @@ jobs:
         working-directory: gki-clo
         run: |
           export PATH="$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
+          # KCFLAGS, not USER_EXTRA_CFLAGS: gglluukk's Makefile never consumes
+          # USER_EXTRA_CFLAGS. kbuild appends KCFLAGS last, so -Wno-error
+          # overrides the kernel's Werror (their rtw_mlme_ext.c trips
+          # -Warray-bounds on u8[0] flexible-array members).
           make -j"$(nproc)" -C sources/xiaomi-kernel O="$PWD/out" \
             M="$PWD/sources/8188eu-b" ARCH=arm64 LLVM=1 \
             CONFIG_RTL8188EU=m CONFIG_RTW_DEBUG=y CONFIG_RTW_LOG_LEVEL=4 \
-            USER_EXTRA_CFLAGS="-Wno-error" modules
+            KCFLAGS="-Wno-error -Wno-unknown-warning-option" modules
           cp sources/8188eu-b/8188eu.ko artifacts/8188eu-gglluukk-8176.ko
 
+          strings artifacts/8188eu-gglluukk-8176.ko | \
+            grep -q "RTW: " || { echo "Module B missing RTW debug strings" >&2; exit 1; }
           modinfo -F vermagic artifacts/8188eu-gglluukk-8176.ko
 
       - name: Verify and package
