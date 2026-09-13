@@ -207,8 +207,9 @@ jobs:
           # Werror before any source file compiles.
           sed -i 's|^ccflags-y += -Wno-restrict$|# konoha-ci: dropped, clang rejects|; s|^ccflags-y += -Wno-vla-larger-than$|# konoha-ci: dropped, clang rejects|' \
             gki-clo/sources/8188eu-b/Makefile
-          grep -q 'Wno-vla-larger-than' gki-clo/sources/8188eu-b/Makefile && {
-            echo "Makefile flag-drop patch failed to apply" >&2; exit 1; }
+          if grep -q 'Wno-vla-larger-than' gki-clo/sources/8188eu-b/Makefile; then
+            echo "Makefile flag-drop patch failed to apply" >&2; exit 1
+          fi
 
       - name: Build module A (tdwn test18 ablation)
         working-directory: gki-clo
