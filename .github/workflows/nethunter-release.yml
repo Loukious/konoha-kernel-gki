@@ -5,8 +5,11 @@ name: NetHunter Combined Release (kernel + module zips)
 #   wlan job    -> needs kernel; builds the WLAN module against THAT
 #                  build's ABI (same-run artifact, never a previous run's)
 #                  and packages it + external drivers as KSU module zips
-#   combine job -> needs both; stages the kernel-only zip and the two
-#                  module zips, and publishes the release
+#   combine job -> needs both; stages the kernel-only zip, the two
+#                  module zips, and the kernel's Module.symvers (for
+#                  external-module builds against exactly this kernel,
+#                  e.g. the Evolution X onyx ROM's wlan module), and
+#                  publishes the release
 #
 # The WLAN build cannot start before the kernel build: the module is
 # compiled against the kernel's Module.symvers/kernel.release/.config.
@@ -931,8 +934,18 @@ jobs:
           cp extra-modules/*.zip release/
           ls wlan-ksm/ extra-modules/ >/dev/null
 
+          # Deliverable 4: this build's Module.symvers, so the ROM build can
+          # compile its wlan module against exactly this kernel (SYMVERS_URL
+          # in konoha-abi-prep.sh points at the release asset). The
+          # kernel-abi artifact's own .sha256 records its tree-relative path;
+          # regenerate with the bare name so `sha256sum -c` works in-place
+          # for consumers that download both files into one directory.
+          (cd kernel-abi && sha256sum Module.symvers > Module.symvers.sha256)
+          mkdir -p release-abi
+          cp kernel-abi/Module.symvers kernel-abi/Module.symvers.sha256 release-abi/
+
           (cd release && sha256sum ./* | tee SHA256SUMS)
-          ls -lh release/
+          ls -lh release/ release-abi/
           echo "kernel_release=$KERNEL_RELEASE" >> "$GITHUB_OUTPUT"
         id: combine
 
@@ -946,7 +959,7 @@ jobs:
           tag_name: nethunter-${{ steps.combine.outputs.kernel_release }}-${{ github.run_number }}
           name: NetHunter Combined ${{ steps.combine.outputs.kernel_release }}
           body: |
-            Three deliverables, all built in one run against the same ABI:
+            Four deliverables, all built in one run against the same ABI:
 
             1. **`*-kernel-only.zip`** — flash from recovery (AnyKernel3).
                The kernel only: no vendor_dlkm write, no partition-size
@@ -960,6 +973,10 @@ jobs:
                with external USB adapter drivers (currently RTL8188EUS:
                monitor mode + frame injection).
 
+            4. **`Module.symvers`** (+ `.sha256`) — the kernel's symbol
+               table, for building external modules against exactly this
+               kernel (used by the Evolution X onyx ROM build).
+
             Install order: flash zip 1 from recovery, then install zips 2
             and 3 from the KernelSU/Magisk manager, then reboot.
 
@@ -971,4 +988,7 @@ jobs:
             - Built entirely in run ${{ github.run_id }} (kernel, WLAN and
               modules from the same artifacts)
           prerelease: true
-          files: release/*
+          files: |
+            release/*
+            release-abi/Module.symvers
+            release-abi/Module.symvers.sha256

@@ -399,6 +399,18 @@ jobs:
           mkdir -p release_assets
           find artifacts -type f -name "*.zip" -exec mv {} release_assets/ \; || true
           find artifacts -type f -name "*.img" -exec mv {} release_assets/ \; || true
+          # Attach the kernel's Module.symvers so external modules (the
+          # Evolution X onyx ROM's wlan module via konoha-abi-prep.sh's
+          # SYMVERS_URL) can be built against exactly this kernel. The
+          # kernel-abi artifact's own .sha256 records its tree-relative
+          # path; regenerate with the bare name so `sha256sum -c` works
+          # in-place for consumers.
+          if [ -f artifacts/Module.symvers ]; then
+            (cd artifacts && sha256sum Module.symvers > Module.symvers.sha256)
+            cp artifacts/Module.symvers artifacts/Module.symvers.sha256 release_assets/
+          else
+            echo "WARNING: kernel-abi artifact had no Module.symvers" >&2
+          fi
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
