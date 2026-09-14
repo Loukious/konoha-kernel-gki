@@ -15,6 +15,12 @@ set -euo pipefail
 #   - MODULE_IMPORT_NS(VFS_internal...): GKI kernels export kernel_read and
 #     file-IO symbols in that namespace; modpost fails without it.
 #   - clang-hostile -Wno-* flags dropped so LLVM=1 builds pass.
+# NOTE on USB IDs: this driver supports RTL8188EU-family dongles only
+# (0bda:8179 etc.). 0bda:8176 is an RTL8188CU/8192CU chip - a different
+# family this driver cannot drive (it fails the radio power-on poll,
+# reads a blank EFUSE and drops the device after ~2s); those dongles
+# are served by the in-tree rtl8xxxu module built by
+# tools/build_rtl8xxxu_module.sh instead.
 #
 # The build invocation is the recipe CI-validated against the gglluukk
 # lineage (2026-09-13): kbuild-style make from the kernel source with

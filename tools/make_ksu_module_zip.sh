@@ -24,6 +24,16 @@ set -euo pipefail
 # full Wi-Fi reconnect (11ax, same IP) and monitor mode + injection work
 # after it. If insmod fails, the stock driver is re-insmodded from
 # /vendor_dlkm/lib/modules/ as a best-effort fallback.
+#
+# --fw DIR ships a firmware directory (e.g. tools/firmware, containing
+# rtlwifi/*.bin) inside the module and wires service.sh to make it
+# reachable for request_firmware(): the ROM's firmware search path is
+# /odm/firmware/o10u (read-only erofs), so service.sh bind-mounts an
+# overlay of it (ROM's own files + ours, labeled vendor_file to satisfy
+# enforcing SELinux) before any module is loaded. Validated on onyx
+# 2026-09-14: RTL8188CU dongle firmware loads and the device probes under
+# enforcing SELinux. Modules whose driver requests firmware MUST be
+# listed after it in --ko order (service.sh runs fw_setup first).
 
 OUT_ZIP=""
 MODULE_NAME=""
@@ -31,6 +41,7 @@ MODULE_ID=""
 VERSION=""
 VERSION_CODE=""
 DESCRIPTION=""
+FW_DIR=""
 declare -A KO_PATHS DEP_LISTS SWAP_MODULES
 ORDERED_KOS=()
 
@@ -42,6 +53,9 @@ while [[ $# -gt 0 ]]; do
 		--version) VERSION="$2"; shift 2 ;;
 		--versionCode) VERSION_CODE="$2"; shift 2 ;;
 		--description) DESCRIPTION="$2"; shift 2 ;;
+		--fw)
+			[[ -d "$2" ]] || { echo "Firmware directory not found: $2" >&2; exit 1; }
+			FW_DIR="$2"; shift 2 ;;
 		--ko|--swap)
 			swap=0
 			[[ "$1" == "--swap" ]] && swap=1
@@ -113,6 +127,11 @@ for key in "${ORDERED_KOS[@]}"; do
 done
 
 mkdir -p "$STAGE/META-INF/com/google/android"
+
+if [[ -n "$FW_DIR" ]]; then
+	mkdir -p "$STAGE/firmware"
+	cp -r "$FW_DIR"/. "$STAGE/firmware/"
+fi
 
 cat >"$STAGE/module.prop" <<EOF
 id=$MODULE_ID
@@ -194,6 +213,41 @@ swap_in() {
 }
 
 EOF
+if [[ -n "$FW_DIR" ]]; then
+	cat >>"$STAGE/service.sh" <<EOF
+fw_setup() {
+	# Make the shipped firmware (firmware/rtlwifi/*.bin) reachable by the
+	# kernel's request_firmware(). The ROM's firmware search path is
+	# /odm/firmware/o10u on a read-only erofs partition, so bind-mount an
+	# overlay of it: the ROM's own files plus ours, labeled vendor_file
+	# (the label the ROM's firmware carries) to satisfy enforcing SELinux.
+	# Validated on onyx 2026-09-14 under enforcing SELinux.
+	local ov="\$MODDIR/odm-firmware-overlay" rom="/odm/firmware/o10u" f
+	mkdir -p "\$ov"
+	for f in "\$rom"/*; do
+		[ -f "\$f" ] && cp -f "\$f" "\$ov/" 2>/dev/null
+	done
+	rm -rf "\$ov/rtlwifi"
+	cp -r "\$MODDIR/firmware/rtlwifi" "\$ov/"
+	chown -R root:root "\$ov"
+	chmod 0755 "\$ov" "\$ov/rtlwifi"
+	chmod 0644 "\$ov"/* "\$ov/rtlwifi"/*
+	chcon -R u:object_r:vendor_file:s0 "\$ov" 2>/dev/null
+	if grep -q " \$rom " /proc/mounts; then
+		# Already mounted from a previous service run (e.g. KSU re-exec):
+		# the overlay files were just refreshed in place, nothing to do.
+		return
+	fi
+	if mount --bind "\$ov" "\$rom"; then
+		log -p i -t "$MODULE_ID" "firmware overlay mounted at \$rom"
+	else
+		log -p e -t "$MODULE_ID" "firmware overlay mount at \$rom failed"
+	fi
+}
+
+fw_setup
+EOF
+fi
 for line in "${INSMOD_LINES[@]}"; do
 	printf '%s\n' "$line" >>"$STAGE/service.sh"
 done
@@ -201,11 +255,16 @@ done
 # insmod'd modules block their own removal path; uninstall just drops the
 # files. Modules installed with --swap revert to the stock driver on the
 # next reboot (vendor_dlkm loads it again) — no restore needed here.
+# The firmware overlay bind-mount (if any) is detached so the ROM's
+# original /odm/firmware/o10u becomes visible again.
 cat >"$STAGE/uninstall.sh" <<'EOF'
 #!/system/bin/sh
 # Modules stay resident until reboot; the files are removed with the module.
 # Swapped drivers (qca_cld3 etc.) automatically revert to the stock
 # vendor_dlkm driver on the next reboot.
+if grep -q " /odm/firmware/o10u " /proc/mounts; then
+	umount /odm/firmware/o10u 2>/dev/null
+fi
 true
 EOF
 

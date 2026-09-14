@@ -760,14 +760,23 @@ jobs:
           # USB driver fits into, and a KSU module works on any ROM regardless
           # of vendor_dlkm size. insmod from service.sh is validated on device.
           # The konoha fork carries the STA-ALIGN8 freeze fix and the GKI
-          # namespace import baked in; the build script asserts both
-          # instead of patching.
+          # namespace import baked in; the build script asserts both instead
+          # of patching.
           git clone --depth=1 -b konoha https://github.com/Loukious/rtl8188eus.git \
             sources/rtl8188eus
           echo "rtl8188eus (konoha fork) commit: $(git -C sources/rtl8188eus rev-parse HEAD)"
 
           chmod +x tools/*.sh
           tools/build_rtl8188eus_module.sh artifacts/wlan/8188eu.ko
+
+          # rtl8xxxu (in-tree source, built from the ABI tree) covers the
+          # Realtek dongles the 8188eu vendor driver does not: RTL8188CU/
+          # 8192CU (0bda:8176 - a DIFFERENT chip family from 8188EU/8179),
+          # 8188FU, 8192EU/FU, 8723AU/BU, 8710BU. Device-validated on onyx
+          # 2026-09-14 (RTL8188CU dongle: probe, firmware, scan, clean
+          # teardown). The build script asserts the ieee80211_ops layout
+          # the ROM vendor mac80211 module expects.
+          tools/build_rtl8xxxu_module.sh artifacts/wlan/rtl8xxxu.ko
 
           kernel_release="$(cat "$KERNEL_OUT/include/config/kernel.release")"
           version_code="$((github_run_number + 100))"
@@ -787,9 +796,12 @@ jobs:
             --module-id nethunter-extra-modules \
             --version "v${kernel_release}.${version_code}${version_suffix}" \
             --versionCode "$version_code" \
-            --description "${desc_prefix}Extra out-of-tree kernel modules for kernel release ${kernel_release}: RTL8188EUS USB adapter (monitor mode + frame injection). Install via KernelSU/Magisk manager; modules load from service.sh." \
+            --description "${desc_prefix}Extra out-of-tree kernel modules for kernel release ${kernel_release}: RTL8188EUS USB adapter (monitor mode + frame injection) and rtl8xxxu (RTL8188CU/8192CU and other Realtek USB adapters). Install via KernelSU/Magisk manager; modules load from service.sh." \
+            --fw tools/firmware \
             --ko 8188eu=artifacts/wlan/8188eu.ko \
-            --dep 8188eu=cfg80211
+            --dep 8188eu=cfg80211 \
+            --ko rtl8xxxu=artifacts/wlan/rtl8xxxu.ko \
+            --dep rtl8xxxu=cfg80211,mac80211
 
       - name: Package WLAN injection driver as KSU module zip
         # The injection qca_cld3 ships as a KernelSU/Magisk module that
