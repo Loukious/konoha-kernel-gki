@@ -52,10 +52,17 @@ if [[ ! -f "$KERNEL_OUT/.config" || ! -f "$KERNEL_OUT/Module.symvers" ]]; then
 fi
 
 echo "[+] Building rtl8xxxu from the kernel tree (jobs: $JOBS)"
+# -fdata-sections is load-bearing for the ieee80211_ops layout check below:
+# it puts rtl8xxxu_ops in a dedicated .rodata.rtl8xxxu_ops section so the
+# wake_tx_queue relocation offset equals the struct slot offset. The CI ABI
+# tree (defconfig merge) has CONFIG_LTO off, where nothing adds section
+# splitting and the ops struct would merge into plain .rodata; the locally
+# validated build had LTO on, whose ld -r splits sections implicitly. Ask
+# for it explicitly so the check works on either tree.
 make -j"$JOBS" -C "$KERNEL_SRC" O="$KERNEL_OUT" M="$DRIVER_SRC" \
 	ARCH=arm64 LLVM=1 LLVM_IAS=1 \
 	CONFIG_RTL8XXXU=m \
-	KCFLAGS="-DCONFIG_RTL8XXXU_UNTESTED -DCONFIG_NL80211_TESTMODE -Wno-error -Wno-unknown-warning-option" \
+	KCFLAGS="-DCONFIG_RTL8XXXU_UNTESTED -DCONFIG_NL80211_TESTMODE -fdata-sections -Wno-error -Wno-unknown-warning-option" \
 	modules
 
 BUILT_KO="$DRIVER_SRC/rtl8xxxu.ko"
@@ -140,18 +147,23 @@ ops_relocs="$(printf '%s\n' "$reloc_dump" \
 	| awk '/^RELOCATION RECORDS FOR \[\.rodata\.rtl8xxxu_ops\]/ {inrel = 1; next}
 		/^RELOCATION RECORDS/ {inrel = 0}
 		inrel')"
-# llvm-objdump does not emit the GNU group headers - fall back to the whole
-# dump. That stays unambiguous because the driver references
-# ieee80211_handle_wake_tx_queue exactly once, in the ops struct; a match at
-# 0x2f0 can only be the wake_tx_queue slot. Assert the uniqueness so a driver
-# update that adds a second reference fails here instead of lying.
-ref_count="$(printf '%s\n' "$reloc_dump" | grep -c 'ieee80211_handle_wake_tx_queue' || true)"
-if [[ "$ref_count" != "1" ]]; then
-	echo "Expected exactly 1 ieee80211_handle_wake_tx_queue reference in the unlinked object, found $ref_count" >&2
-	echo "The layout check's whole-dump fallback depends on it being unique." >&2
+if [[ -z "$ops_relocs" ]]; then
+	echo "No .rodata.rtl8xxxu_ops section in the unlinked object." >&2
+	echo "The build passes -fdata-sections to create it - without the dedicated" >&2
+	echo "section the ops struct merges into .rodata and its slot offsets cannot" >&2
+	echo "be checked (this is how CI runs 34836547402/34839284156 failed before" >&2
+	echo "the flag was added: the ABI tree's defconfig merge has CONFIG_LTO off," >&2
+	echo "so nothing split the sections)." >&2
 	exit 1
 fi
-[[ -n "$ops_relocs" ]] || ops_relocs="$reloc_dump"
+# The driver references ieee80211_handle_wake_tx_queue exactly once, in the
+# ops struct - assert that so a driver update adding a second reference
+# fails here instead of silently weakening the check.
+ref_count="$(printf '%s\n' "$ops_relocs" | grep -c 'ieee80211_handle_wake_tx_queue' || true)"
+if [[ "$ref_count" != "1" ]]; then
+	echo "Expected exactly 1 ieee80211_handle_wake_tx_queue reference in the ops section, found $ref_count" >&2
+	exit 1
+fi
 if ! printf '%s\n' "$ops_relocs" \
 	| grep -q '^[[:space:]]*00000000000002f0[[:space:]].*ieee80211_handle_wake_tx_queue'; then
 	echo "ieee80211_ops layout mismatch: wake_tx_queue is not at 0x2f0" >&2
