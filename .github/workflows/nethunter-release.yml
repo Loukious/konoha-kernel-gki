@@ -130,6 +130,12 @@ on:
         type: choice
         options: ["off", "on"]
         default: "off"
+      publish_release:
+        description: "Publish a GitHub release (off = zips stay as private run artifacts only)"
+        required: true
+        type: choice
+        options: ["off", "on"]
+        default: "off"
       wlan_branch:
         description: "WLAN source branch for the replacement vendor driver"
         required: true
@@ -919,6 +925,10 @@ jobs:
         id: combine
 
       - name: Create Release
+        # Off by default: the zips are always uploaded as run artifacts, so
+        # test runs stay private. Flip publish_release=on for a real release
+        # only after the module has been device-tested.
+        if: inputs.publish_release == 'on'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nethunter-${{ steps.combine.outputs.kernel_release }}-${{ github.run_number }}
