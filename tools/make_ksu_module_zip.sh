@@ -221,7 +221,9 @@ fw_setup() {
 	# /odm/firmware/o10u on a read-only erofs partition, so bind-mount an
 	# overlay of it: the ROM's own files plus ours, labeled vendor_file
 	# (the label the ROM's firmware carries) to satisfy enforcing SELinux.
-	# Validated on onyx 2026-09-14 under enforcing SELinux.
+	# Validated on onyx 2026-09-14 with SELinux ENFORCING: dongle probes,
+	# firmware loads ("Firmware revision 80.0"), wlan1 registers. Both the
+	# label AND the directory execute bits are load-bearing (see below).
 	local ov="\$MODDIR/odm-firmware-overlay" rom="/odm/firmware/o10u" f
 	mkdir -p "\$ov"
 	for f in "\$rom"/*; do
@@ -230,8 +232,18 @@ fw_setup() {
 	rm -rf "\$ov/rtlwifi"
 	cp -r "\$MODDIR/firmware/rtlwifi" "\$ov/"
 	chown -R root:root "\$ov"
-	chmod 0755 "\$ov" "\$ov/rtlwifi"
-	chmod 0644 "\$ov"/* "\$ov/rtlwifi"/*
+	# Modes per file TYPE, never by glob: "\$ov"/* matches the rtlwifi
+	# DIRECTORY too, so a blanket "chmod 0644 \$ov/*" strips its execute bit
+	# and makes it untraversable. The kernel reads firmware from a kworker in
+	# the "kernel" SELinux domain, which policy denies CAP_DAC_OVERRIDE /
+	# CAP_DAC_READ_SEARCH - so root cannot paper over the missing +x and
+	# request_firmware() fails with -EACCES (-13) while the file itself is
+	# perfectly labeled. Diagnosed on onyx 2026-09-14: the dongle probed,
+	# read its MAC, then died at "loading .../rtl8192cufw_TMSC.bin failed
+	# with error -13" under enforcing, and the only audit trace was a
+	# dac_override denial against scontext=u:r:kernel:s0 (no AVC on the file).
+	find "\$ov" -type d -exec chmod 0755 {} +
+	find "\$ov" -type f -exec chmod 0644 {} +
 	chcon -R u:object_r:vendor_file:s0 "\$ov" 2>/dev/null
 	if grep -q " \$rom " /proc/mounts; then
 		# Already mounted from a previous service run (e.g. KSU re-exec):
