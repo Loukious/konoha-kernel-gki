@@ -109,9 +109,10 @@ done
 # The ieee80211_ops layout must match the ROM vendor mac80211 module:
 # its ieee80211_alloc_hw_nm reads wake_tx_queue at offset 0x2f0 (see
 # header comment). In the unlinked object rtl8xxxu_ops is a dedicated
-# section, so the relocation offset can be checked directly. A mismatch
-# here means the vendor mac80211 ABI changed (or TESTMODE drifted) -
-# do not ship, re-derive the layout from the vendor module.
+# section (compiler -fdata-sections), so the relocation offset can be
+# checked directly. A mismatch here means the vendor mac80211 ABI changed
+# (or TESTMODE drifted) - do not ship, re-derive the layout from the
+# vendor module.
 OBJDUMP=""
 for cand in llvm-objdump aarch64-linux-gnu-objdump objdump; do
 	if command -v "$cand" >/dev/null 2>&1; then
@@ -123,7 +124,35 @@ if [[ -z "$OBJDUMP" ]]; then
 	echo "No objdump available for the ieee80211_ops layout check" >&2
 	exit 1
 fi
-if ! "$OBJDUMP" -r -j .rela.rodata.rtl8xxxu_ops "$DRIVER_SRC/rtl8xxxu.o" 2>/dev/null \
+# Dump every relocation and scope to the ops section by group header.
+# Deliberately NOT "objdump -r -j <section>": the -j section name is
+# tool-dependent (GNU objdump wants the TARGET section .rodata.rtl8xxxu_ops,
+# llvm-objdump the .rela.rodata.rtl8xxxu_ops relocation section), and the
+# wrong form silently prints nothing - which is exactly how the first CI
+# run of this check failed (2026-09-14, run 34836547402) while the local
+# llvm build passed.
+reloc_dump="$("$OBJDUMP" -r "$DRIVER_SRC/rtl8xxxu.o" 2>/dev/null || true)"
+if [[ -z "$reloc_dump" ]]; then
+	echo "Could not read relocations from $DRIVER_SRC/rtl8xxxu.o with $OBJDUMP" >&2
+	exit 1
+fi
+ops_relocs="$(printf '%s\n' "$reloc_dump" \
+	| awk '/^RELOCATION RECORDS FOR \[\.rodata\.rtl8xxxu_ops\]/ {inrel = 1; next}
+		/^RELOCATION RECORDS/ {inrel = 0}
+		inrel')"
+# llvm-objdump does not emit the GNU group headers - fall back to the whole
+# dump. That stays unambiguous because the driver references
+# ieee80211_handle_wake_tx_queue exactly once, in the ops struct; a match at
+# 0x2f0 can only be the wake_tx_queue slot. Assert the uniqueness so a driver
+# update that adds a second reference fails here instead of lying.
+ref_count="$(printf '%s\n' "$reloc_dump" | grep -c 'ieee80211_handle_wake_tx_queue' || true)"
+if [[ "$ref_count" != "1" ]]; then
+	echo "Expected exactly 1 ieee80211_handle_wake_tx_queue reference in the unlinked object, found $ref_count" >&2
+	echo "The layout check's whole-dump fallback depends on it being unique." >&2
+	exit 1
+fi
+[[ -n "$ops_relocs" ]] || ops_relocs="$reloc_dump"
+if ! printf '%s\n' "$ops_relocs" \
 	| grep -q '^[[:space:]]*00000000000002f0[[:space:]].*ieee80211_handle_wake_tx_queue'; then
 	echo "ieee80211_ops layout mismatch: wake_tx_queue is not at 0x2f0" >&2
 	echo "The ROM vendor mac80211 expects it at 0x2f0 (CONFIG_NL80211_TESTMODE=y," >&2
