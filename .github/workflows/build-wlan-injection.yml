@@ -68,6 +68,16 @@ on:
         required: true
         type: string
         default: https://github.com/Loukious/konoha-kernel-gki/releases/download/wlan-kernel-symbols/Module.symvers.sha256
+      vendor_symvers_url:
+        description: Optional matching vendor Module.symvers override
+        required: false
+        type: string
+        default: ""
+      vendor_symvers_sha256:
+        description: Required SHA-256 when vendor_symvers_url is set
+        required: false
+        type: string
+        default: ""
       stock_vendor_dlkm_url:
         description: Optional vendor_dlkm template override; empty = use the Evolution template committed in vendor_dlkm-templates/
         required: false
@@ -151,6 +161,16 @@ on:
         required: false
         type: string
         default: https://github.com/Loukious/konoha-kernel-gki/releases/download/wlan-kernel-symbols/Module.symvers.sha256
+      vendor_symvers_url:
+        description: Optional matching vendor Module.symvers override
+        required: false
+        type: string
+        default: ""
+      vendor_symvers_sha256:
+        description: Required SHA-256 when vendor_symvers_url is set
+        required: false
+        type: string
+        default: ""
       stock_vendor_dlkm_url:
         description: Optional vendor_dlkm template override; empty = use the Evolution template committed in vendor_dlkm-templates/
         required: false
@@ -600,12 +620,25 @@ jobs:
           KERNEL_SOURCE_BRANCH: ${{ inputs.kernel_source_branch }}
           WLAN_BRANCH: ${{ inputs.wlan_branch }}
           WLAN_EXTRA_KCFLAGS: ""
+          VENDOR_SYMVERS_URL: ${{ inputs.vendor_symvers_url }}
+          VENDOR_SYMVERS_SHA256: ${{ inputs.vendor_symvers_sha256 }}
         run: |
           export PATH="$GITHUB_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
           clang --version
 
           chmod +x tools/*.sh
-          tools/make_pixelos_wlan_symvers.sh
+          if [[ -n "$VENDOR_SYMVERS_URL" ]]; then
+            [[ "$VENDOR_SYMVERS_SHA256" =~ ^[a-fA-F0-9]{64}$ ]] || {
+              echo "A valid vendor_symvers_sha256 is required for the override." >&2
+              exit 1
+            }
+            mkdir -p artifacts/wlan/vendor-abi
+            export VENDOR_SYMVERS="$GITHUB_WORKSPACE/gki-clo/artifacts/wlan/vendor-abi/override.symvers"
+            curl -fL --retry 3 "$VENDOR_SYMVERS_URL" -o "$VENDOR_SYMVERS"
+            echo "$VENDOR_SYMVERS_SHA256  $VENDOR_SYMVERS" | sha256sum -c -
+          else
+            tools/make_pixelos_wlan_symvers.sh
+          fi
 
           if grep -q 'hdd_monitor_mode_tx_inject' \
                vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c &&
