@@ -249,6 +249,39 @@ jobs:
           test -f gki-clo/sources/xiaomi-kernel/include/linux/qcom-iommu-util.h
           test -f gki-clo/sources/xiaomi-kernel/kernel/sched/walt/walt.c
 
+      - name: Fetch pinned Onyx dataipa headers when required
+        run: |
+          wlan_tree="$GITHUB_WORKSPACE/gki-clo/vendor/qcom/opensource/wlan"
+          if ! grep -q 'dataipa/config/dataipa_vendor.h' "$wlan_tree/qcacld-3.0/Kbuild"; then
+            echo "This WLAN source does not require out-of-tree dataipa headers."
+            exit 0
+          fi
+          dataipa_tree="$GITHUB_WORKSPACE/gki-clo/vendor/qcom/opensource/dataipa"
+          modules_tree="$RUNNER_TEMP/onyx-dataipa-source"
+          modules_revision=8500748dae32f10507c02f1c94bc971553cb525b
+          git init "$modules_tree"
+          git -C "$modules_tree" remote add origin \
+            https://github.com/crdroidandroid/android_kernel_xiaomi_sm8735-modules.git
+          git -C "$modules_tree" sparse-checkout set \
+            qcom/opensource/dataipa/config \
+            qcom/opensource/dataipa/drivers/platform/msm/include
+          git -C "$modules_tree" fetch --depth=1 --filter=blob:none origin "$modules_revision"
+          git -C "$modules_tree" checkout --detach FETCH_HEAD
+          test "$(git -C "$modules_tree" rev-parse HEAD)" = "$modules_revision"
+          mkdir -p "$dataipa_tree"
+          cp -a "$modules_tree/qcom/opensource/dataipa/." "$dataipa_tree/"
+          test -s "$dataipa_tree/config/dataipa_vendor.h"
+          test -d "$dataipa_tree/drivers/platform/msm/include/uapi"
+          echo "Onyx dataipa headers: $modules_revision"
+          sha256sum "$dataipa_tree/config/dataipa_vendor.h"
+
+      - name: Run spectral host regression tests when present
+        working-directory: gki-clo/vendor/qcom/opensource/wlan
+        run: |
+          if [[ -f tests/spectral/test_wmi_guards.py ]]; then
+            python3 -m unittest discover -s tests/spectral -v
+          fi
+
       - name: Download kernel ABI from kernel build run
         if: ${{ inputs.kernel_run_id != '' }}
         uses: actions/download-artifact@v4
