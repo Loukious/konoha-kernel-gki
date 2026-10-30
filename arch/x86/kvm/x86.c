@@ -7727,13 +7727,7 @@ static int emulator_read_write_onepage(unsigned long addr, void *val,
 	WARN_ON(vcpu->mmio_nr_fragments >= KVM_MAX_MMIO_FRAGMENTS);
 	frag = &vcpu->mmio_fragments[vcpu->mmio_nr_fragments++];
 	frag->gpa = gpa;
-	if (write && bytes <= 8u) {
-		frag->val = 0;
-		frag->data = &frag->val;
-		memcpy(&frag->val, val, bytes);
-	} else {
-		frag->data = val;
-	}
+	frag->data = val;
 	frag->len = bytes;
 	return X86EMUL_CONTINUE;
 }
@@ -7747,9 +7741,6 @@ static int emulator_read_write(struct x86_emulate_ctxt *ctxt,
 	struct kvm_vcpu *vcpu = emul_to_vcpu(ctxt);
 	gpa_t gpa;
 	int rc;
-
-	if (WARN_ON_ONCE((bytes > 8u || !ops->write) && object_is_on_stack(val)))
-		return X86EMUL_UNHANDLEABLE;
 
 	if (ops->read_write_prepare &&
 		  ops->read_write_prepare(vcpu, val, bytes))
@@ -10426,9 +10417,16 @@ void __kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
 	 * pending. At the same time, KVM_REQ_EVENT may not be set as APICv was
 	 * still active when the interrupt got accepted. Make sure
 	 * kvm_check_and_inject_events() is called to check for that.
+	 *
+	 * Update SVI when APICv gets enabled, otherwise SVI won't reflect the
+	 * highest bit in vISR and the next accelerated EOI in the guest won't
+	 * be virtualized correctly (the CPU uses SVI to determine which vISR
+	 * vector to clear).
 	 */
 	if (!apic->apicv_active)
 		kvm_make_request(KVM_REQ_EVENT, vcpu);
+	else
+		kvm_apic_update_hwapic_isr(vcpu);
 
 out:
 	preempt_enable();
@@ -11159,9 +11157,6 @@ static int complete_emulated_mmio(struct kvm_vcpu *vcpu)
 		frag++;
 		vcpu->mmio_cur_fragment++;
 	} else {
-		if (WARN_ON_ONCE(frag->data == &frag->val))
-			return -EIO;
-
 		/* Go forward to the next mmio piece. */
 		frag->data += len;
 		frag->gpa += len;

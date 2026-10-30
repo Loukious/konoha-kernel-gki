@@ -748,21 +748,6 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 		} else if (anon_vma_fork(tmp, mpnt))
 			goto fail_nomem_anon_vma_fork;
 		vm_flags_clear(tmp, VM_LOCKED_MASK);
-		/*
-		 * Copy/update hugetlb private vma information.
-		 */
-		if (is_vm_hugetlb_page(tmp))
-			hugetlb_dup_vma_private(tmp);
-
-		/* Link the vma into the MT */
-		if (vma_iter_bulk_store(&vmi, tmp))
-			goto fail_nomem_vmi_store;
-
-		mm->map_count++;
-
-		if (tmp->vm_ops && tmp->vm_ops->open)
-			tmp->vm_ops->open(tmp);
-
 		file = tmp->vm_file;
 		if (file) {
 			struct address_space *mapping = file->f_mapping;
@@ -779,11 +764,28 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 			i_mmap_unlock_write(mapping);
 		}
 
+		/*
+		 * Copy/update hugetlb private vma information.
+		 */
+		if (is_vm_hugetlb_page(tmp))
+			hugetlb_dup_vma_private(tmp);
+		/*
+		 * Link the vma into the MT. After using __mt_dup(), memory
+		 * allocation is not necessary here, so it cannot fail.
+		 */
+		vma_iter_bulk_store(&vmi, tmp);
+
+		mm->map_count++;
 		if (!(tmp->vm_flags & VM_WIPEONFORK))
 			retval = copy_page_range(tmp, mpnt);
 
-		if (retval)
+		if (tmp->vm_ops && tmp->vm_ops->open)
+			tmp->vm_ops->open(tmp);
+
+		if (retval) {
+			mpnt = vma_next(&vmi);
 			goto loop_out;
+		}
 	}
 	/* a new mm has just been created */
 	retval = arch_dup_mmap(oldmm, mm);
@@ -812,7 +814,6 @@ out:
 		dup_userfaultfd_fail(&uf);
 	return retval;
 
-fail_nomem_vmi_store:
 fail_nomem_anon_vma_fork:
 	mpol_put(vma_policy(tmp));
 fail_nomem_policy:
@@ -957,6 +958,7 @@ void __mmdrop(struct mm_struct *mm)
 	mm_pasid_drop(mm);
 	mm_destroy_cid(mm);
 	percpu_counter_destroy_many(mm->rss_stat, NR_MM_COUNTERS);
+	trace_android_vh_mmap_lock_free(&mm->mmap_lock);
 
 	trace_android_vh_mm_free(mm);
 	free_mm(mm);
@@ -1293,6 +1295,12 @@ static void mm_init_uprobes_state(struct mm_struct *mm)
 #ifdef CONFIG_UPROBES
 	mm->uprobes_state.xol_area = NULL;
 #endif
+}
+
+static void mmap_init_lock(struct mm_struct *mm)
+{
+	init_rwsem(&mm->mmap_lock);
+	trace_android_vh_mmap_lock_init(&mm->mmap_lock);
 }
 
 static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
@@ -3452,6 +3460,7 @@ int ksys_unshare(unsigned long unshare_flags)
 	struct files_struct *new_fd = NULL;
 	struct cred *new_cred = NULL;
 	struct nsproxy *new_nsproxy = NULL;
+	struct task_dma_buf_info *dmabuf_info = NULL;
 	int do_sysvsem = 0;
 	int err;
 
@@ -3537,10 +3546,22 @@ int ksys_unshare(unsigned long unshare_flags)
 			spin_unlock(&fs->lock);
 		}
 
-		if (new_fd)
+		if (new_fd) {
 			swap(current->files, new_fd);
 
+			/*
+			 * This is a new partial sharing relationship for the current task, since we
+			 * have a new files_struct (and the MM might still be shared). Since partial
+			 * sharing is not supported for dmabuf accounting, we need to remove the
+			 * accounting info from the task. Leave the mm->dmabuf_info so any existing
+			 * accounting can be unaccounted properly.
+			 */
+			dmabuf_info = current->dmabuf_info;
+			current->dmabuf_info = NULL;
+		}
+
 		task_unlock(current);
+		put_dmabuf_info(dmabuf_info);
 
 		if (new_cred) {
 			/* Install the new user namespace */
@@ -3583,6 +3604,7 @@ int unshare_files(void)
 {
 	struct task_struct *task = current;
 	struct files_struct *old, *copy = NULL;
+	struct task_dma_buf_info *dmabuf_info;
 	int error;
 
 	error = unshare_fd(CLONE_FILES, &copy);
@@ -3594,16 +3616,17 @@ int unshare_files(void)
 	task->files = copy;
 
 	/*
-	 * This is a new partial sharing relationship for task, since we have a new
-	 * files_struct (but the MM is still used). Since partial sharing is not
-	 * supported for dmabuf accounting, we need to remove the accounting info
-	 * from the task. Leave the mm->dmabuf_info so any existing accounting can
-	 * be unaccounted properly. The fixup for this new files_struct happens
-	 * externally with appropriate locking.
+	 * This is a new partial sharing relationship for the current task, since we have a new
+	 * files_struct (and the MM might still be shared). Since partial sharing is not
+	 * supported for dmabuf accounting, we need to remove the accounting info from the task.
+	 * Leave the mm->dmabuf_info so any existing accounting can be unaccounted properly. For
+	 * execs where we also have a new MM, the fixup for this new files_struct happens externally
+	 * with appropriate locking in dma_buf_begin_new_exec.
 	 */
-	put_dmabuf_info(task->dmabuf_info);
+	dmabuf_info = task->dmabuf_info;
 	task->dmabuf_info = NULL;
 	task_unlock(task);
+	put_dmabuf_info(dmabuf_info);
 	put_files_struct(old);
 	return 0;
 }

@@ -10,11 +10,7 @@
 struct optee_supp_req {
 	struct list_head link;
 
-	int id;
-
 	bool in_queue;
-	bool processed;
-
 	u32 func;
 	u32 ret;
 	size_t num_params;
@@ -22,9 +18,6 @@ struct optee_supp_req {
 
 	struct completion c;
 };
-
-/* It is temporary request used for revoked pending request in supp->idr. */
-#define INVALID_REQ_PTR ((struct optee_supp_req *)ERR_PTR(-EBADF))
 
 void optee_supp_init(struct optee_supp *supp)
 {
@@ -46,23 +39,21 @@ void optee_supp_release(struct optee_supp *supp)
 {
 	int id;
 	struct optee_supp_req *req;
+	struct optee_supp_req *req_tmp;
 
 	mutex_lock(&supp->mutex);
 
-	/* Abort all request */
+	/* Abort all request retrieved by supplicant */
 	idr_for_each_entry(&supp->idr, req, id) {
 		idr_remove(&supp->idr, id);
-		/* Skip if request was already marked invalid */
-		if (IS_ERR(req))
-			continue;
+		req->ret = TEEC_ERROR_COMMUNICATION;
+		complete(&req->c);
+	}
 
-		/* For queued requests where supplicant has not seen it */
-		if (req->in_queue) {
-			list_del(&req->link);
-			req->in_queue = false;
-		}
-
-		req->processed = true;
+	/* Abort all queued requests */
+	list_for_each_entry_safe(req, req_tmp, &supp->reqs, link) {
+		list_del(&req->link);
+		req->in_queue = false;
 		req->ret = TEEC_ERROR_COMMUNICATION;
 		complete(&req->c);
 	}
@@ -89,6 +80,7 @@ u32 optee_supp_thrd_req(struct tee_context *ctx, u32 func, size_t num_params,
 	struct optee *optee = tee_get_drvdata(ctx->teedev);
 	struct optee_supp *supp = &optee->supp;
 	struct optee_supp_req *req;
+	bool interruptable;
 	u32 ret;
 
 	/*
@@ -109,16 +101,8 @@ u32 optee_supp_thrd_req(struct tee_context *ctx, u32 func, size_t num_params,
 
 	/* Insert the request in the request list */
 	mutex_lock(&supp->mutex);
-	req->id = idr_alloc(&supp->idr, req, 1, 0, GFP_KERNEL);
-	if (req->id < 0) {
-		mutex_unlock(&supp->mutex);
-		kfree(req);
-		return TEEC_ERROR_OUT_OF_MEMORY;
-	}
-
 	list_add_tail(&req->link, &supp->reqs);
 	req->in_queue = true;
-	req->processed = false;
 	mutex_unlock(&supp->mutex);
 
 	/* Tell an eventual waiter there's a new request */
@@ -127,50 +111,46 @@ u32 optee_supp_thrd_req(struct tee_context *ctx, u32 func, size_t num_params,
 	/*
 	 * Wait for supplicant to process and return result, once we've
 	 * returned from wait_for_completion(&req->c) successfully we have
-	 * exclusive access again. Allow the wait to be killable such that
-	 * the wait doesn't turn into an indefinite state if the supplicant
-	 * gets hung for some reason.
+	 * exclusive access again.
 	 */
-	if (wait_for_completion_killable(&req->c)) {
+	while (wait_for_completion_interruptible(&req->c)) {
 		mutex_lock(&supp->mutex);
-		if (req->in_queue) {
-			/* Supplicant has not seen this request yet. */
-			idr_remove(&supp->idr, req->id);
-			list_del(&req->link);
-			req->in_queue = false;
-
-			ret = TEEC_ERROR_COMMUNICATION;
-		} else if (req->processed) {
+		interruptable = !supp->ctx;
+		if (interruptable) {
 			/*
-			 * Supplicant has processed this request. Ignore the
-			 * kill signal for now and submit the result. req is not
-			 * in supp->reqs (removed by supp_pop_entry()) nor in
-			 * supp->idr (removed by supp_pop_req()).
+			 * There's no supplicant available and since the
+			 * supp->mutex currently is held none can
+			 * become available until the mutex released
+			 * again.
+			 *
+			 * Interrupting an RPC to supplicant is only
+			 * allowed as a way of slightly improving the user
+			 * experience in case the supplicant hasn't been
+			 * started yet. During normal operation the supplicant
+			 * will serve all requests in a timely manner and
+			 * interrupting then wouldn't make sense.
 			 */
-			ret = req->ret;
-		} else {
-			/*
-			 * Supplicant is in the middle of processing this
-			 * request. Replace req with INVALID_REQ_PTR so that
-			 * the ID remains busy, causing optee_supp_send() to
-			 * fail on the next call to supp_pop_req() with this ID.
-			 */
-			idr_replace(&supp->idr, INVALID_REQ_PTR, req->id);
-			ret = TEEC_ERROR_COMMUNICATION;
+			if (req->in_queue) {
+				list_del(&req->link);
+				req->in_queue = false;
+			}
 		}
-
 		mutex_unlock(&supp->mutex);
-	} else {
-		ret = req->ret;
+
+		if (interruptable) {
+			req->ret = TEEC_ERROR_COMMUNICATION;
+			break;
+		}
 	}
 
+	ret = req->ret;
 	kfree(req);
 
 	return ret;
 }
 
 static struct optee_supp_req  *supp_pop_entry(struct optee_supp *supp,
-					      int num_params)
+					      int num_params, int *id)
 {
 	struct optee_supp_req *req;
 
@@ -191,6 +171,10 @@ static struct optee_supp_req  *supp_pop_entry(struct optee_supp *supp,
 		/* Not enough room for parameters */
 		return ERR_PTR(-EINVAL);
 	}
+
+	*id = idr_alloc(&supp->idr, req, 1, 0, GFP_KERNEL);
+	if (*id < 0)
+		return ERR_PTR(-ENOMEM);
 
 	list_del(&req->link);
 	req->in_queue = false;
@@ -249,6 +233,7 @@ int optee_supp_recv(struct tee_context *ctx, u32 *func, u32 *num_params,
 	struct optee *optee = tee_get_drvdata(teedev);
 	struct optee_supp *supp = &optee->supp;
 	struct optee_supp_req *req = NULL;
+	int id;
 	size_t num_meta;
 	int rc;
 
@@ -258,10 +243,14 @@ int optee_supp_recv(struct tee_context *ctx, u32 *func, u32 *num_params,
 
 	while (true) {
 		mutex_lock(&supp->mutex);
-		req = supp_pop_entry(supp, *num_params - num_meta);
-		if (req)
-			break; /* Keep mutex held. */
+		req = supp_pop_entry(supp, *num_params - num_meta, &id);
 		mutex_unlock(&supp->mutex);
+
+		if (req) {
+			if (IS_ERR(req))
+				return PTR_ERR(req);
+			break;
+		}
 
 		/*
 		 * If we didn't get a request we'll block in
@@ -275,13 +264,6 @@ int optee_supp_recv(struct tee_context *ctx, u32 *func, u32 *num_params,
 			return -ERESTARTSYS;
 	}
 
-	/* supp->mutex held and req != NULL. */
-
-	if (IS_ERR(req)) {
-		mutex_unlock(&supp->mutex);
-		return PTR_ERR(req);
-	}
-
 	if (num_meta) {
 		/*
 		 * tee-supplicant support meta parameters -> requsts can be
@@ -289,11 +271,13 @@ int optee_supp_recv(struct tee_context *ctx, u32 *func, u32 *num_params,
 		 */
 		param->attr = TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT |
 			      TEE_IOCTL_PARAM_ATTR_META;
-		param->u.value.a = req->id;
+		param->u.value.a = id;
 		param->u.value.b = 0;
 		param->u.value.c = 0;
 	} else {
-		supp->req_id = req->id;
+		mutex_lock(&supp->mutex);
+		supp->req_id = id;
+		mutex_unlock(&supp->mutex);
 	}
 
 	*func = req->func;
@@ -301,7 +285,6 @@ int optee_supp_recv(struct tee_context *ctx, u32 *func, u32 *num_params,
 	memcpy(param + num_meta, req->param,
 	       sizeof(struct tee_param) * req->num_params);
 
-	mutex_unlock(&supp->mutex);
 	return 0;
 }
 
@@ -333,17 +316,12 @@ static struct optee_supp_req *supp_pop_req(struct optee_supp *supp,
 	if (!req)
 		return ERR_PTR(-ENOENT);
 
-	/* optee_supp_thrd_req() already returned to optee. */
-	if (IS_ERR(req))
-		goto failed_req;
-
 	if ((num_params - nm) != req->num_params)
 		return ERR_PTR(-EINVAL);
 
-	*num_meta = nm;
-failed_req:
 	idr_remove(&supp->idr, id);
 	supp->req_id = -1;
+	*num_meta = nm;
 
 	return req;
 }
@@ -369,9 +347,10 @@ int optee_supp_send(struct tee_context *ctx, u32 ret, u32 num_params,
 
 	mutex_lock(&supp->mutex);
 	req = supp_pop_req(supp, num_params, param, &num_meta);
+	mutex_unlock(&supp->mutex);
+
 	if (IS_ERR(req)) {
-		mutex_unlock(&supp->mutex);
-		/* Something is wrong, let supplicant handel it. */
+		/* Something is wrong, let supplicant restart. */
 		return PTR_ERR(req);
 	}
 
@@ -395,10 +374,9 @@ int optee_supp_send(struct tee_context *ctx, u32 ret, u32 num_params,
 		}
 	}
 	req->ret = ret;
-	req->processed = true;
+
 	/* Let the requesting thread continue */
 	complete(&req->c);
-	mutex_unlock(&supp->mutex);
 
 	return 0;
 }

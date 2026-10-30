@@ -901,7 +901,7 @@ struct task_struct {
 	 */
 	unsigned			sched_remote_wakeup:1;
 
-	/* Save user-dumpable when mm goes away */
+	/* Save user-dumpable when mm goes away; retain the released ABI. */
 	unsigned			user_dumpable:1;
 
 	/* Bit to tell LSMs we're in execve(): */
@@ -1492,6 +1492,7 @@ struct task_struct {
 #endif
 
 #ifdef CONFIG_RANDOMIZE_KSTACK_OFFSET
+	/* Keep per-task randomization and the released task layout. */
 	u32				kstack_offset;
 #endif
 

@@ -658,4 +658,15 @@ __naked int stack_slot_aliases_precision(void)
 	);
 }
 
+__naked __noinline __used
+static __u64 subprog_with_checkpoint(void)
+{
+	asm volatile (
+		"r0 = 0;"
+		/* guaranteed checkpoint if BPF_F_TEST_STATE_FREQ is used */
+		"goto +0;"
+		"exit;"
+	);
+}
+
 char _license[] SEC("license") = "GPL";

@@ -450,7 +450,7 @@ static void serdev_drv_shutdown(struct device *dev)
 		sdrv->shutdown(to_serdev_device(dev));
 }
 
-static const struct bus_type serdev_bus_type = {
+static struct bus_type serdev_bus_type = {
 	.name		= "serial",
 	.match		= serdev_device_match,
 	.probe		= serdev_drv_probe,

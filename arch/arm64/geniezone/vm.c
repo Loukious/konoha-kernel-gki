@@ -353,6 +353,7 @@ int gzvm_vm_populate_mem_region(struct gzvm *gzvm, int slot_id)
 	int max_nr_consti, remain_pages;
 	u64 gfn, gfn_end;
 	u32 buf_size;
+	int ret = 0;
 
 	buf_size = PAGE_SIZE * 2;
 	region = alloc_pages_exact(buf_size, GFP_KERNEL);
@@ -367,6 +368,7 @@ int gzvm_vm_populate_mem_region(struct gzvm *gzvm, int slot_id)
 	gfn = memslot->base_gfn;
 	gfn_end = gfn + remain_pages;
 
+	mutex_lock(&gzvm->mem_lock);
 	while (gfn < gfn_end) {
 		int nr_pages;
 
@@ -377,8 +379,8 @@ int gzvm_vm_populate_mem_region(struct gzvm *gzvm, int slot_id)
 
 		if (nr_pages < 0) {
 			pr_err("Failed to fill constituents\n");
-			free_pages_exact(region, buf_size);
-			return -EFAULT;
+			ret = -EFAULT;
+			goto err_unlock;
 		}
 
 		region->gpa = PFN_PHYS(gfn);
@@ -389,13 +391,14 @@ int gzvm_vm_populate_mem_region(struct gzvm *gzvm, int slot_id)
 		if (gzvm_arch_set_memregion(gzvm->vm_id, buf_size,
 					    virt_to_phys(region))) {
 			pr_err("Failed to register memregion to hypervisor\n");
-			free_pages_exact(region, buf_size);
-			return -EFAULT;
+			ret = -EFAULT;
+			goto err_unlock;
 		}
 	}
+err_unlock:
+	mutex_unlock(&gzvm->mem_lock);
 	free_pages_exact(region, buf_size);
-
-	return 0;
+	return ret;
 }
 
 static int populate_all_mem_regions(struct gzvm *gzvm)
@@ -453,18 +456,13 @@ static int gzvm_vm_ioctl_cap_pvm(struct gzvm *gzvm,
 	return -EINVAL;
 }
 
-int gzvm_vm_ioctl_arch_enable_cap(struct gzvm *gzvm,
-				  struct gzvm_enable_cap *cap,
-				  void __user *argp)
+int gzvm_vm_internal_arch_enable_cap(struct gzvm *gzvm,
+				     struct gzvm_enable_cap *cap)
 {
 	struct arm_smccc_res res = {0};
 	int ret;
 
 	switch (cap->cap) {
-	case GZVM_CAP_PROTECTED_VM:
-		ret = gzvm_vm_ioctl_cap_pvm(gzvm, cap, argp);
-		return ret;
-
 	case GZVM_CAP_ENABLE_DEMAND_PAGING:
 		fallthrough;
 	case GZVM_CAP_BLOCK_BASED_DEMAND_PAGING:
@@ -478,6 +476,21 @@ int gzvm_vm_ioctl_arch_enable_cap(struct gzvm *gzvm,
 	}
 
 	return -EINVAL;
+}
+
+int gzvm_vm_ioctl_arch_enable_cap(struct gzvm *gzvm,
+				  struct gzvm_enable_cap *cap,
+				  void __user *argp)
+{
+	int ret;
+
+	switch (cap->cap) {
+	case GZVM_CAP_PROTECTED_VM:
+		ret = gzvm_vm_ioctl_cap_pvm(gzvm, cap, argp);
+		return ret;
+	default:
+		return -EINVAL;
+	}
 }
 
 int gzvm_arch_map_guest(u16 vm_id, int memslot_id, u64 pfn, u64 gfn,

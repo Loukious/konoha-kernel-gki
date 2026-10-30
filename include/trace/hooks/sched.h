@@ -281,6 +281,14 @@ DECLARE_HOOK(android_vh_free_task,
 	TP_PROTO(struct task_struct *p),
 	TP_ARGS(p));
 
+DECLARE_HOOK(android_vh_mmap_lock_init,
+	TP_PROTO(struct rw_semaphore *sem),
+	TP_ARGS(sem));
+
+DECLARE_HOOK(android_vh_mmap_lock_free,
+	TP_PROTO(struct rw_semaphore *sem),
+	TP_ARGS(sem));
+
 DECLARE_HOOK(android_vh_copy_process,
 	TP_PROTO(struct task_struct *p, int nr_threads),
 	TP_ARGS(p, nr_threads));
@@ -480,6 +488,10 @@ DECLARE_RESTRICTED_HOOK(android_rvh_set_iowait,
 DECLARE_RESTRICTED_HOOK(android_rvh_update_rt_rq_load_avg,
 	TP_PROTO(u64 now, struct rq *rq, struct task_struct *tsk, int running),
 	TP_ARGS(now, rq, tsk, running), 1);
+
+DECLARE_RESTRICTED_HOOK(android_rvh_update_rq_clock_pelt,
+	TP_PROTO(struct rq *rq, s64 delta, int *ret),
+	TP_ARGS(rq, delta, ret), 1);
 
 DECLARE_HOOK(android_vh_prio_inheritance,
 	TP_PROTO(struct task_struct *p, int *saved_prio, bool *prio_inherited),

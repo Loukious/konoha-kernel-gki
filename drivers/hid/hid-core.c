@@ -1986,8 +1986,8 @@ out:
 }
 EXPORT_SYMBOL_GPL(__hid_request);
 
-int hid_report_raw_event(struct hid_device *hid, enum hid_report_type type, u8 *data,
-			 size_t bufsize, u32 size, int interrupt)
+int __hid_report_raw_event(struct hid_device *hid, enum hid_report_type type, u8 *data,
+			   size_t bufsize, u32 size, int interrupt)
 {
 	struct hid_report_enum *report_enum = hid->report_enum + type;
 	struct hid_report *report;
@@ -1997,6 +1997,13 @@ int hid_report_raw_event(struct hid_device *hid, enum hid_report_type type, u8 *
 	size_t bsize = bufsize;
 	u8 *cdata = data;
 	int ret = 0;
+
+	if (report_enum->numbered && (size < 1 || bufsize < 1)) {
+		hid_warn_ratelimited(hid,
+				     "Event data for numbered report is too short (%d vs %zu)\n",
+				     size, bufsize);
+		return -EINVAL;
+	}
 
 	report = hid_get_report(report_enum, data);
 	if (!report)
@@ -2055,6 +2062,14 @@ int hid_report_raw_event(struct hid_device *hid, enum hid_report_type type, u8 *
 		hidinput_report_event(hid, report);
 
 	return ret;
+}
+EXPORT_SYMBOL_GPL(__hid_report_raw_event);
+
+/* Preserve the released API while sharing upstream's report validation. */
+int hid_report_raw_event(struct hid_device *hid, enum hid_report_type type, u8 *data,
+			 size_t bufsize, u32 size, int interrupt)
+{
+	return __hid_report_raw_event(hid, type, data, bufsize, size, interrupt);
 }
 EXPORT_SYMBOL_GPL(hid_report_raw_event);
 
@@ -2120,7 +2135,7 @@ int hid_input_report(struct hid_device *hid, enum hid_report_type type, u8 *data
 			goto unlock;
 	}
 
-	ret = hid_report_raw_event(hid, type, data, bufsize, size, interrupt);
+	ret = __hid_report_raw_event(hid, type, data, bufsize, size, interrupt);
 
 unlock:
 	up(&hid->driver_input_lock);

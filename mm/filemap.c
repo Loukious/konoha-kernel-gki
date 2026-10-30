@@ -1014,6 +1014,7 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 				return ret;
 			}
 		}
+		trace_android_vh_filemap_adjust_folio_flags(mapping, folio, index);
 		folio_add_lru(folio);
 	}
 	return ret;
@@ -1699,6 +1700,7 @@ void folio_end_writeback(struct folio *folio)
 		BUG();
 
 	smp_mb__after_atomic();
+	trace_android_vh_folio_end_writeback(folio);
 	folio_wake(folio, PG_writeback);
 	acct_reclaim_writeback(folio);
 	folio_put(folio);
@@ -3324,6 +3326,7 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 	trace_android_vh_tune_mmap_readaround(ra->ra_pages, vmf->pgoff,
 			&ra->start, &ra->size, &ra->async_size);
 	ractl._index = ra->start;
+	trace_android_vh_page_cache_read(file->f_inode, ra->start, ra->size);
 	trace_android_vh_page_cache_readahead_start(file, vmf->pgoff,
 			ra->size, true);
 	page_cache_ra_order(&ractl, ra, 0);
@@ -3873,6 +3876,7 @@ static struct folio *do_read_cache_folio(struct address_space *mapping,
 	struct folio *folio;
 	int err;
 
+	trace_android_vh_page_cache_read(mapping->host, index, 1);
 	if (!filler)
 		filler = mapping->a_ops->read_folio;
 repeat:

@@ -4134,7 +4134,6 @@ static int drm_dp_mst_handle_up_req(struct drm_dp_mst_topology_mgr *mgr)
 			    conn_stat->message_capability_status,
 			    conn_stat->input_port,
 			    conn_stat->peer_device_type);
-
 	} else if (up_req->msg.req_type == DP_RESOURCE_STATUS_NOTIFY) {
 		const struct drm_dp_resource_status_notify *res_stat =
 			&up_req->msg.u.resource_stat;
@@ -4528,7 +4527,8 @@ int drm_dp_atomic_release_time_slots(struct drm_atomic_state *state,
 	if (!payload->delete) {
 		payload->pbn = 0;
 		payload->delete = true;
-		topology_state->payload_mask &= ~BIT(payload->vcpi - 1);
+		if (payload->vcpi > 0)
+			topology_state->payload_mask &= ~BIT(payload->vcpi - 1);
 	}
 
 	return 0;

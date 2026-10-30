@@ -190,6 +190,12 @@ static bool remove_migration_pte(struct folio *dst,
 {
 	struct folio *src = arg;
 	DEFINE_FOLIO_VMA_WALK(pvmw, src, vma, addr, PVMW_SYNC | PVMW_MIGRATION);
+	bool bypass = false;
+
+	trace_android_vh_mm_remove_migration_pte_bypass(dst, vma, addr,
+							src, &bypass);
+	if (bypass)
+		return true;
 
 	while (page_vma_mapped_walk(&pvmw)) {
 		rmap_t rmap_flags = RMAP_NONE;
@@ -328,6 +334,8 @@ void migration_entry_wait(struct mm_struct *mm, pmd_t *pmd,
 	pte_t *ptep;
 	pte_t pte;
 	swp_entry_t entry;
+	int zonenum = -1;
+	u64 time = 0;
 
 	ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
 	if (!ptep)
@@ -343,7 +351,9 @@ void migration_entry_wait(struct mm_struct *mm, pmd_t *pmd,
 	if (!is_migration_entry(entry))
 		goto out;
 
+	trace_android_vh_migration_entry_wait_enter(entry, &time, &zonenum);
 	migration_entry_wait_on_locked(entry, ptl);
+	trace_android_vh_migration_entry_wait_exit(time, zonenum);
 	return;
 out:
 	spin_unlock(ptl);
@@ -1498,14 +1508,14 @@ out:
 		list_move_tail(&src->lru, ret);
 
 	/*
-	 * If migration was not successful and there's a freeing callback, use
-	 * it.  Otherwise, put_page() will drop the reference grabbed during
-	 * isolation.
+	 * If migration was not successful and there's a freeing callback,
+	 * return the folio to that special allocator. Otherwise, simply drop
+	 * our additional reference.
 	 */
 	if (put_new_folio)
 		put_new_folio(dst, private);
 	else
-		folio_putback_hugetlb(dst);
+		folio_put(dst);
 
 	return rc;
 }
@@ -1514,6 +1524,11 @@ static inline int try_split_folio(struct folio *folio, struct list_head *split_f
 				  int reason)
 {
 	int rc;
+	bool bypass = false;
+
+	trace_android_vh_mm_try_split_folio_bypass(folio, &bypass);
+	if (bypass)
+		return -EBUSY;
 
 	if (!folio_can_split(folio)) {
 		LIST_HEAD(head);
@@ -1687,6 +1702,8 @@ static int migrate_pages_batch(struct list_head *from,
 	LIST_HEAD(unmap_folios);
 	LIST_HEAD(dst_folios);
 	bool nosplit = (reason == MR_NUMA_MISPLACED);
+	bool migrate_break;
+	int nr_left;
 
 	VM_WARN_ON_ONCE(mode != MIGRATE_ASYNC &&
 			!list_empty(from) && !list_is_singular(from));
@@ -1695,6 +1712,7 @@ static int migrate_pages_batch(struct list_head *from,
 		retry = 0;
 		thp_retry = 0;
 		nr_retry_pages = 0;
+		migrate_break = false;
 
 		list_for_each_entry_safe(folio, folio2, from, lru) {
 			is_large = folio_test_large(folio);
@@ -1710,6 +1728,10 @@ static int migrate_pages_batch(struct list_head *from,
 			 * migrate_pages() may report success with (split but
 			 * unmigrated) pages still on its fromlist; whereas it
 			 * always reports success when its fromlist is empty.
+			 * stats->nr_thp_failed should be increased too,
+			 * otherwise stats inconsistency will happen when
+			 * migrate_pages_batch is called via migrate_pages()
+			 * with MIGRATE_SYNC and MIGRATE_ASYNC.
 			 *
 			 * Only check it without removing it from the list.
 			 * Since the folio can be on deferred_split_scan()
@@ -1727,6 +1749,7 @@ static int migrate_pages_batch(struct list_head *from,
 			   folio_test_partially_mapped(folio)) {
 				if (!try_split_folio(folio, split_folios, mode)) {
 					nr_failed++;
+					stats->nr_thp_failed += is_thp;
 					stats->nr_thp_split += is_thp;
 					continue;
 				}
@@ -1819,6 +1842,12 @@ static int migrate_pages_batch(struct list_head *from,
 			case MIGRATEPAGE_UNMAP:
 				list_move_tail(&folio->lru, &unmap_folios);
 				list_add_tail(&dst->lru, &dst_folios);
+				trace_android_vh_migrate_pages_batch_break(folio, from,
+						reason, &migrate_break, &nr_left);
+				if (migrate_break) {
+					nr_failed += nr_left;
+					goto batch_break;
+				}
 				break;
 			default:
 				/*
@@ -1834,6 +1863,7 @@ static int migrate_pages_batch(struct list_head *from,
 			}
 		}
 	}
+batch_break:
 	nr_failed += retry;
 	stats->nr_thp_failed += thp_retry;
 	stats->nr_failed_pages += nr_retry_pages;
@@ -1997,6 +2027,7 @@ int migrate_pages(struct list_head *from, new_folio_t get_new_folio,
 	LIST_HEAD(ret_folios);
 	LIST_HEAD(split_folios);
 	struct migrate_pages_stats stats;
+	int nr_batch_pages = NR_MAX_BATCHED_MIGRATION;
 
 	trace_mm_migrate_pages_start(mode, reason);
 
@@ -2009,6 +2040,7 @@ int migrate_pages(struct list_head *from, new_folio_t get_new_folio,
 
 again:
 	nr_pages = 0;
+	trace_android_vh_migrate_batch_nr_pages(from, &nr_batch_pages);
 	list_for_each_entry_safe(folio, folio2, from, lru) {
 		/* Retried hugetlb folios will be kept in list  */
 		if (folio_test_hugetlb(folio)) {
@@ -2017,10 +2049,10 @@ again:
 		}
 
 		nr_pages += folio_nr_pages(folio);
-		if (nr_pages >= NR_MAX_BATCHED_MIGRATION)
+		if (nr_pages >= nr_batch_pages)
 			break;
 	}
-	if (nr_pages >= NR_MAX_BATCHED_MIGRATION)
+	if (nr_pages >= nr_batch_pages)
 		list_cut_before(&folios, from, &folio2->lru);
 	else
 		list_splice_init(from, &folios);

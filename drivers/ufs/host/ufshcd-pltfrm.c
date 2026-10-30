@@ -339,17 +339,21 @@ int ufshcd_pltfrm_init(struct platform_device *pdev,
 	struct device *dev = &pdev->dev;
 
 	mmio_base = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(mmio_base))
-		return PTR_ERR(mmio_base);
+	if (IS_ERR(mmio_base)) {
+		err = PTR_ERR(mmio_base);
+		goto out;
+	}
 
 	irq = platform_get_irq(pdev, 0);
-	if (irq < 0)
-		return irq;
+	if (irq < 0) {
+		err = irq;
+		goto out;
+	}
 
 	err = ufshcd_alloc_host(dev, &hba);
 	if (err) {
 		dev_err(dev, "Allocation failed\n");
-		return err;
+		goto out;
 	}
 
 	hba->vops = vops;
@@ -358,13 +362,13 @@ int ufshcd_pltfrm_init(struct platform_device *pdev,
 	if (err) {
 		dev_err(dev, "%s: clock parse failed %d\n",
 				__func__, err);
-		return err;
+		goto dealloc_host;
 	}
 	err = ufshcd_parse_regulator_info(hba);
 	if (err) {
 		dev_err(dev, "%s: regulator init failed %d\n",
 				__func__, err);
-		return err;
+		goto dealloc_host;
 	}
 
 	ufshcd_init_lanes_per_dir(hba);
@@ -373,13 +377,18 @@ int ufshcd_pltfrm_init(struct platform_device *pdev,
 	if (err) {
 		dev_err_probe(dev, err, "Initialization failed with error %d\n",
 			      err);
-		return err;
+		goto dealloc_host;
 	}
 
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
 
 	return 0;
+
+dealloc_host:
+	ufshcd_dealloc_host(hba);
+out:
+	return err;
 }
 EXPORT_SYMBOL_GPL(ufshcd_pltfrm_init);
 

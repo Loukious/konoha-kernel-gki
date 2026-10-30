@@ -441,7 +441,7 @@ static DECLARE_WORK(sync_filesystems, sync_filesystems_fn);
  * Return 0 on successful file system sync, otherwise returns -EBUSY if file
  * system sync was aborted.
  */
-static int suspend_fs_sync_with_abort(void)
+static int __maybe_unused suspend_fs_sync_with_abort(void)
 {
 	if (!pm_fs_abort) {
 		ksys_sync_helper();

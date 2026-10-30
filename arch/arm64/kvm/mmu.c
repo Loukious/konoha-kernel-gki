@@ -1686,7 +1686,7 @@ static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t *fault_ipa,
 {
 	unsigned int flags = FOLL_HWPOISON | FOLL_LONGTERM | FOLL_WRITE;
 	struct kvm_hyp_memcache *hyp_memcache = &vcpu->arch.stage2_mc;
-	unsigned long page_size = PAGE_SIZE;
+	long page_size = PAGE_SIZE;
 	struct mm_struct *mm = current->mm;
 	struct kvm_pinned_page *ppage;
 	struct kvm *kvm = vcpu->kvm;
@@ -1709,14 +1709,15 @@ static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t *fault_ipa,
 
 	mmap_read_lock(mm);
 	ret = pin_user_pages(hva, 1, flags, &page);
-	mmap_read_unlock(mm);
 
 	if (ret == -EHWPOISON) {
 		kvm_send_hwpoison_signal(hva, PAGE_SHIFT);
 		ret = 0;
+		mmap_read_unlock(mm);
 		goto free_ppage;
 	} else if (ret != 1) {
 		ret = -EFAULT;
+		mmap_read_unlock(mm);
 		goto free_ppage;
 	} else if (kvm->arch.pkvm.enabled && !PageSwapBacked(page)) {
 		/*
@@ -1734,6 +1735,7 @@ static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t *fault_ipa,
 		 * prevent try_to_unmap() from succeeding.
 		 */
 		ret = -EIO;
+		mmap_read_unlock(mm);
 		goto unpin;
 	}
 
@@ -1750,6 +1752,13 @@ static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t *fault_ipa,
 	 * host_map_guest HVC
 	 */
 	read_unlock(&kvm->mmu_lock);
+	mmap_read_unlock(mm);
+
+	/* Stage-1 mapping missing. Retry the fault. */
+	if (page_size < 0) {
+		ret = page_size == -EAGAIN ? 0 : page_size;
+		goto unpin;
+	}
 
 	page = pfn_to_page(pfn);
 
@@ -1865,9 +1874,8 @@ static int __pkvm_pin_user_pages(struct kvm *kvm, struct kvm_memory_slot *memslo
 	if (!pages)
 		return -ENOMEM;
 
-	mmap_read_lock(mm);
+	mmap_assert_locked(mm);
 	ret = pin_user_pages(hva, nr_pages, flags, pages);
-	mmap_read_unlock(mm);
 
 	if (ret == -EHWPOISON) {
 		kvm_send_hwpoison_signal(hva, PAGE_SHIFT);
@@ -1947,7 +1955,9 @@ int __pkvm_pgtable_stage2_split(struct kvm_vcpu *vcpu, phys_addr_t ipa, size_t s
 
 	idx = srcu_read_lock(&vcpu->kvm->srcu);
 	memslot = gfn_to_memslot(vcpu->kvm, gfn);
+	mmap_read_lock(current->mm);
 	ret = __pkvm_pin_user_pages(kvm, memslot, gfn, nr_pages, &pages);
+	mmap_read_unlock(current->mm);
 	if (ret)
 		goto unlock_srcu;
 
@@ -1960,6 +1970,17 @@ int __pkvm_pgtable_stage2_split(struct kvm_vcpu *vcpu, phys_addr_t ipa, size_t s
 	} else if (!ppage->order) {
 		ret = 0;
 		goto end;
+	}
+
+	/*
+	 * Ensure userspace has not remapped the HVA since the huge page was
+	 * donated; every newly pinned page's PFN (HPA) must match ppage.
+	 */
+	for (p = 0; p < nr_pages; p++) {
+		if (page_to_pfn(pages[p]) != page_to_pfn(ppage->page) + 1 + p) {
+			ret = -EFAULT;
+			goto end;
+		}
 	}
 
 	ret = kvm_call_hyp_nvhe(__pkvm_host_split_guest, page_to_pfn(ppage->page),

@@ -107,29 +107,6 @@ static int imx_ocotp_reg_read(void *context, unsigned int offset, void *val, siz
 	return 0;
 };
 
-static int imx_ocotp_cell_pp(void *context, const char *id, int index,
-			     unsigned int offset, void *data, size_t bytes)
-{
-	u8 *buf = data;
-	int i;
-
-	/* Deal with some post processing of nvmem cell data */
-	if (id && !strcmp(id, "mac-address")) {
-		bytes = min(bytes, ETH_ALEN);
-		for (i = 0; i < bytes / 2; i++)
-			swap(buf[i], buf[bytes - i - 1]);
-	}
-
-	return 0;
-}
-
-static void imx_ocotp_fixup_dt_cell_info(struct nvmem_device *nvmem,
-					 struct nvmem_cell_info *cell)
-{
-	cell->raw_len = round_up(cell->bytes, 4);
-	cell->read_post_process = imx_ocotp_cell_pp;
-}
-
 static int imx_ele_ocotp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;

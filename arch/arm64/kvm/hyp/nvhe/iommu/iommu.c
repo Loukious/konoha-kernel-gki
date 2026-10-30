@@ -411,6 +411,9 @@ int kvm_iommu_free_domain(pkvm_handle_t domain_id)
 	int ret = 0;
 	struct kvm_hyp_iommu_domain *domain;
 
+	if (domain_id == KVM_IOMMU_DOMAIN_IDMAP_ID)
+		return -EINVAL;
+
 	domain = handle_to_domain(domain_id);
 	if (!domain)
 		return -EINVAL;
@@ -497,6 +500,9 @@ int kvm_iommu_map_pages(pkvm_handle_t domain_id, unsigned long iova,
 	if (__builtin_mul_overflow(pgsize, pgcount, &size) ||
 	    iova + size < iova || paddr + size < paddr)
 		return -E2BIG;
+
+	if (!IS_ALIGNED(iova | paddr, pgsize))
+		return -EINVAL;
 
 	if (domain_id == KVM_IOMMU_DOMAIN_IDMAP_ID)
 		return -EINVAL;
@@ -600,6 +606,9 @@ size_t kvm_iommu_unmap_pages(pkvm_handle_t domain_id,
 
 	if (__builtin_mul_overflow(pgsize, pgcount, &size) ||
 	    iova + size < iova)
+		return 0;
+
+	if (!IS_ALIGNED(iova, pgsize))
 		return 0;
 
 	if (domain_id == KVM_IOMMU_DOMAIN_IDMAP_ID)

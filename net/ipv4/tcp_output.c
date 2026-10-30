@@ -47,6 +47,7 @@
 #include <linux/static_key.h>
 
 #include <trace/events/tcp.h>
+#include <trace/hooks/net.h>
 
 /* Refresh clocks of a TCP socket,
  * ensuring monotically increasing values.
@@ -171,10 +172,10 @@ static void tcp_event_data_sent(struct tcp_sock *tp,
 	tp->lsndtime = now;
 
 	/* If it is a reply for ato after last received
-	 * packet, increase pingpong count.
+	 * packet, enter pingpong mode.
 	 */
 	if ((u32)(now - icsk->icsk_ack.lrcvtime) < icsk->icsk_ack.ato)
-		inet_csk_inc_pingpong_cnt(sk);
+		inet_csk_enter_pingpong_mode(sk);
 }
 
 /* Account for an ACK we sent. */
@@ -275,6 +276,9 @@ static u16 tcp_select_window(struct sock *sk)
 
 	cur_win = tcp_receive_window(tp);
 	new_win = __tcp_select_window(sk);
+
+	trace_android_vh_tcp_select_window(sk, &new_win);
+
 	if (new_win < cur_win) {
 		/* Danger Will Robinson!
 		 * Don't update rcv_wup/rcv_wnd here or else
@@ -293,6 +297,8 @@ static u16 tcp_select_window(struct sock *sk)
 
 	tp->rcv_wnd = new_win;
 	tp->rcv_wup = tp->rcv_nxt;
+
+	trace_android_rvh_tcp_select_window(sk, &new_win);
 
 	/* Make sure we do not exceed the maximum possible
 	 * scaled window.
@@ -1084,8 +1090,7 @@ static void tcp_tasklet_func(struct tasklet_struct *t)
 #define TCP_DEFERRED_ALL (TCPF_TSQ_DEFERRED |		\
 			  TCPF_WRITE_TIMER_DEFERRED |	\
 			  TCPF_DELACK_TIMER_DEFERRED |	\
-			  TCPF_MTU_REDUCED_DEFERRED |	\
-			  TCPF_ACK_DEFERRED)
+			  TCPF_MTU_REDUCED_DEFERRED)
 /**
  * tcp_release_cb - tcp release_sock() callback
  * @sk: socket
@@ -1132,8 +1137,6 @@ void tcp_release_cb(struct sock *sk)
 		inet_csk(sk)->icsk_af_ops->mtu_reduced(sk);
 		__sock_put(sk);
 	}
-	if ((flags & TCPF_ACK_DEFERRED) && inet_csk_ack_scheduled(sk))
-		tcp_send_ack(sk);
 }
 EXPORT_SYMBOL(tcp_release_cb);
 
@@ -3605,6 +3608,7 @@ void tcp_send_active_reset(struct sock *sk, gfp_t priority)
 	 */
 	trace_tcp_send_reset(sk, NULL);
 }
+EXPORT_SYMBOL_GPL(tcp_send_active_reset);
 
 /* Send a crossed SYN-ACK during socket establishment.
  * WARNING: This routine must only be called when we have already sent
@@ -4014,6 +4018,9 @@ int tcp_connect(struct sock *sk)
 	 */
 	WRITE_ONCE(tp->snd_nxt, tp->write_seq);
 	tp->pushed_seq = tp->write_seq;
+
+	trace_android_vh_tcp_connect(buff);
+
 	buff = tcp_send_head(sk);
 	if (unlikely(buff)) {
 		WRITE_ONCE(tp->snd_nxt, TCP_SKB_CB(buff)->seq);

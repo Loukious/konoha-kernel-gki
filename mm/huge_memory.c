@@ -2602,7 +2602,9 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 			if (!folio_test_referenced(folio) && pmd_young(old_pmd))
 				folio_set_referenced(folio);
 			folio_remove_rmap_pmd(folio, page, vma);
+			add_mm_counter(mm, mm_counter_file(folio), -HPAGE_PMD_NR);
 			folio_put(folio);
+			return;
 		}
 		add_mm_counter(mm, mm_counter_file(folio), -HPAGE_PMD_NR);
 		return;
@@ -3394,6 +3396,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 	int extra_pins, ret;
 	pgoff_t end;
 	bool is_hzp;
+	bool bypass = false;
 
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 	VM_BUG_ON_FOLIO(!folio_test_large(folio), folio);
@@ -3463,6 +3466,10 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 		if (shmem_mapping(mapping))
 			end = shmem_fallocend(mapping->host, end);
 	}
+
+	trace_android_vh_mm_split_huge_page_bypass(page, list, &ret, &bypass);
+	if (bypass)
+		goto out_unlock;
 
 	/*
 	 * Racy check if we can split the page, before unmap_folio() will

@@ -498,8 +498,8 @@ static void ufshcd_add_command_trace(struct ufs_hba *hba, unsigned int tag,
 
 	if (is_mcq_enabled(hba)) {
 		struct ufs_hw_queue *hwq = ufshcd_mcq_req_to_hwq(hba, rq);
-
-		hwq_id = hwq->id;
+		if (hwq)
+			hwq_id = hwq->id;
 	} else {
 		doorbell = ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL);
 	}
@@ -3131,16 +3131,10 @@ static int ufshcd_wait_for_dev_cmd(struct ufs_hba *hba,
 	int err;
 
 retry:
-	time_left = wait_for_completion_timeout(hba->dev_cmd.complete,
+	time_left = wait_for_completion_timeout(&to_hba_priv(hba)->dev_cmd_compl,
 						time_left);
 
 	if (likely(time_left)) {
-		/*
-		 * The completion handler called complete() and the caller of
-		 * this function still owns the @lrbp tag so the code below does
-		 * not trigger any race conditions.
-		 */
-		hba->dev_cmd.complete = NULL;
 		err = ufshcd_get_tr_ocs(lrbp, NULL);
 		if (!err)
 			err = ufshcd_dev_cmd_completion(hba, lrbp);
@@ -3154,7 +3148,6 @@ retry:
 			/* successfully cleared the command, retry if needed */
 			if (ufshcd_clear_cmd(hba, lrbp->task_tag) == 0)
 				err = -EAGAIN;
-			hba->dev_cmd.complete = NULL;
 			return err;
 		}
 
@@ -3170,11 +3163,9 @@ retry:
 			spin_lock_irqsave(&hba->outstanding_lock, flags);
 			pending = test_bit(lrbp->task_tag,
 					   &hba->outstanding_reqs);
-			if (pending) {
-				hba->dev_cmd.complete = NULL;
+			if (pending)
 				__clear_bit(lrbp->task_tag,
 					    &hba->outstanding_reqs);
-			}
 			spin_unlock_irqrestore(&hba->outstanding_lock, flags);
 
 			if (!pending) {
@@ -3192,8 +3183,6 @@ retry:
 			spin_lock_irqsave(&hba->outstanding_lock, flags);
 			pending = test_bit(lrbp->task_tag,
 					   &hba->outstanding_reqs);
-			if (pending)
-				hba->dev_cmd.complete = NULL;
 			spin_unlock_irqrestore(&hba->outstanding_lock, flags);
 
 			if (!pending) {
@@ -3224,7 +3213,6 @@ retry:
 static int ufshcd_exec_dev_cmd(struct ufs_hba *hba,
 		enum dev_cmd_type cmd_type, int timeout)
 {
-	DECLARE_COMPLETION_ONSTACK(wait);
 	const u32 tag = hba->reserved_slot;
 	struct ufshcd_lrb *lrbp;
 	int err;
@@ -3240,10 +3228,7 @@ static int ufshcd_exec_dev_cmd(struct ufs_hba *hba,
 	if (unlikely(err))
 		goto out;
 
-	hba->dev_cmd.complete = &wait;
-
 	ufshcd_add_query_upiu_trace(hba, UFS_QUERY_SEND, lrbp->ucd_req_ptr);
-
 	ufshcd_send_command(hba, tag, hba->dev_cmd_queue);
 	err = ufshcd_wait_for_dev_cmd(hba, lrbp, timeout);
 	ufshcd_add_query_upiu_trace(hba, err ? UFS_QUERY_ERR : UFS_QUERY_COMP,
@@ -4289,14 +4274,6 @@ out:
 out_unlock:
 	spin_unlock_irqrestore(hba->host->host_lock, flags);
 	mutex_unlock(&hba->uic_cmd_mutex);
-
-	/*
-	 * If the h8 exit fails during the runtime resume process, it becomes
-	 * stuck and cannot be recovered through the error handler.  To fix
-	 * this, use link recovery instead of the error handler.
-	 */
-	if (ret && hba->pm_op_in_progress)
-		ret = ufshcd_link_recovery(hba);
 
 	return ret;
 }
@@ -5561,14 +5538,12 @@ void ufshcd_compl_one_cqe(struct ufs_hba *hba, int task_tag,
 		scsi_done(cmd);
 	} else if (lrbp->command_type == UTP_CMD_TYPE_DEV_MANAGE ||
 		   lrbp->command_type == UTP_CMD_TYPE_UFS_STORAGE) {
-		if (hba->dev_cmd.complete) {
-			trace_android_vh_ufs_compl_command(hba, lrbp);
-			if (cqe) {
-				ocs = le32_to_cpu(cqe->status) & MASK_OCS;
-				lrbp->utr_descriptor_ptr->header.ocs = ocs;
-			}
-			complete(hba->dev_cmd.complete);
+		trace_android_vh_ufs_compl_command(hba, lrbp);
+		if (cqe) {
+			ocs = le32_to_cpu(cqe->status) & MASK_OCS;
+			lrbp->utr_descriptor_ptr->header.ocs = ocs;
 		}
+		complete(&to_hba_priv(hba)->dev_cmd_compl);
 	}
 }
 
@@ -6978,7 +6953,7 @@ static irqreturn_t ufshcd_handle_mcq_cq_events(struct ufs_hba *hba)
 
 	ret = ufshcd_vops_get_outstanding_cqs(hba, &outstanding_cqs);
 	if (ret)
-		outstanding_cqs = (1U << hba->nr_hw_queues) - 1;
+		outstanding_cqs = (1ULL << hba->nr_hw_queues) - 1;
 
 	/* Exclude the poll queues */
 	nr_queues = hba->nr_hw_queues - hba->nr_queues[HCTX_TYPE_POLL];
@@ -7257,7 +7232,6 @@ static int ufshcd_issue_devman_upiu_cmd(struct ufs_hba *hba,
 					enum dev_cmd_type cmd_type,
 					enum query_opcode desc_op)
 {
-	DECLARE_COMPLETION_ONSTACK(wait);
 	const u32 tag = hba->reserved_slot;
 	struct ufshcd_lrb *lrbp;
 	int err = 0;
@@ -7299,10 +7273,7 @@ static int ufshcd_issue_devman_upiu_cmd(struct ufs_hba *hba,
 
 	memset(lrbp->ucd_rsp_ptr, 0, sizeof(struct utp_upiu_rsp));
 
-	hba->dev_cmd.complete = &wait;
-
 	ufshcd_add_query_upiu_trace(hba, UFS_QUERY_SEND, lrbp->ucd_req_ptr);
-
 	ufshcd_send_command(hba, tag, hba->dev_cmd_queue);
 	/*
 	 * ignore the returning value here - ufshcd_check_query_response is
@@ -7427,7 +7398,6 @@ int ufshcd_advanced_rpmb_req_handler(struct ufs_hba *hba, struct utp_upiu_req *r
 			 struct ufs_ehs *rsp_ehs, int sg_cnt, struct scatterlist *sg_list,
 			 enum dma_data_direction dir)
 {
-	DECLARE_COMPLETION_ONSTACK(wait);
 	const u32 tag = hba->reserved_slot;
 	struct ufshcd_lrb *lrbp;
 	int err = 0;
@@ -7475,8 +7445,6 @@ int ufshcd_advanced_rpmb_req_handler(struct ufs_hba *hba, struct utp_upiu_req *r
 		ufshcd_sgl_to_prdt(hba, lrbp, sg_cnt, sg_list);
 
 	memset(lrbp->ucd_rsp_ptr, 0, sizeof(struct utp_upiu_rsp));
-
-	hba->dev_cmd.complete = &wait;
 
 	ufshcd_send_command(hba, tag, hba->dev_cmd_queue);
 
@@ -9819,6 +9787,8 @@ static int __ufshcd_wl_suspend(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 
 	if (req_dev_pwr_mode == UFS_ACTIVE_PWR_MODE &&
 			req_link_state == UIC_LINK_ACTIVE_STATE) {
+		ufshcd_disable_auto_bkops(hba);
+		flush_work(&hba->eeh_work);
 		goto vops_suspend;
 	}
 
@@ -9924,6 +9894,7 @@ vops_suspend:
 	ret = ufshcd_vops_suspend(hba, pm_op, POST_CHANGE);
 	if (ret)
 		goto set_link_active;
+
 	goto out;
 
 set_link_active:
@@ -9995,7 +9966,15 @@ static int __ufshcd_wl_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 		} else {
 			dev_err(hba->dev, "%s: hibern8 exit failed %d\n",
 					__func__, ret);
-			goto vendor_suspend;
+			/*
+			 * If the h8 exit fails during the runtime resume
+			 * process, it becomes stuck and cannot be recovered
+			 * through the error handler. To fix this, use link
+			 * recovery instead of the error handler.
+			 */
+			ret = ufshcd_link_recovery(hba);
+			if (ret)
+				goto vendor_suspend;
 		}
 	} else if (ufshcd_is_link_off(hba)) {
 		/*
@@ -10452,6 +10431,16 @@ EXPORT_SYMBOL_GPL(ufshcd_system_thaw);
 #endif /* CONFIG_PM_SLEEP  */
 
 /**
+ * ufshcd_dealloc_host - deallocate Host Bus Adapter (HBA)
+ * @hba: pointer to Host Bus Adapter (HBA)
+ */
+void ufshcd_dealloc_host(struct ufs_hba *hba)
+{
+	scsi_host_put(hba->host);
+}
+EXPORT_SYMBOL_GPL(ufshcd_dealloc_host);
+
+/**
  * ufshcd_set_dma_mask - Set dma mask based on the controller
  *			 addressing capability
  * @hba: per adapter instance
@@ -10470,25 +10459,11 @@ static int ufshcd_set_dma_mask(struct ufs_hba *hba)
 }
 
 /**
- * ufshcd_devres_release - devres cleanup handler, invoked during release of
- *			   hba->dev
- * @host: pointer to SCSI host
- */
-static void ufshcd_devres_release(void *host)
-{
-	scsi_host_put(host);
-}
-
-/**
  * ufshcd_alloc_host - allocate Host Bus Adapter (HBA)
  * @dev: pointer to device handle
  * @hba_handle: driver private handle
  *
  * Return: 0 on success, non-zero value on failure.
- *
- * NOTE: There is no corresponding ufshcd_dealloc_host() because this function
- * keeps track of its allocations using devres and deallocates everything on
- * device removal automatically.
  */
 int ufshcd_alloc_host(struct device *dev, struct ufs_hba **hba_handle)
 {
@@ -10510,13 +10485,6 @@ int ufshcd_alloc_host(struct device *dev, struct ufs_hba **hba_handle)
 		err = -ENOMEM;
 		goto out_error;
 	}
-
-	err = devm_add_action_or_reset(dev, ufshcd_devres_release,
-				       host);
-	if (err)
-		return dev_err_probe(dev, err,
-				     "failed to add ufshcd dealloc action\n");
-
 	host->nr_maps = HCTX_TYPE_POLL + 1;
 	hba = shost_priv(host);
 	hba->host = host;
@@ -10578,6 +10546,8 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
 	hba->mmio_base = mmio_base;
 	hba->irq = irq;
 	hba->vps = &ufs_hba_vps;
+
+	init_completion(&to_hba_priv(hba)->dev_cmd_compl);
 
 	err = ufshcd_hba_init(hba);
 	if (err)

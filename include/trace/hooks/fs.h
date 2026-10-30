@@ -16,6 +16,10 @@ DECLARE_HOOK(android_vh_f2fs_file_open,
 	TP_PROTO(struct inode *inode, struct file *filp),
 	TP_ARGS(inode, filp));
 
+DECLARE_HOOK(android_vh_f2fs_ioc_set_pin_file,
+	TP_PROTO(struct inode *inode, bool has_blkzoned, bool *allow_pin_big_file),
+	TP_ARGS(inode, has_blkzoned, allow_pin_big_file));
+
 DECLARE_RESTRICTED_HOOK(android_rvh_f2fs_down_read,
 	TP_PROTO(wait_queue_head_t *read_waiters, struct rw_semaphore *rwsem, bool *skip),
 	TP_ARGS(read_waiters, rwsem, skip), 1);
@@ -39,6 +43,26 @@ DECLARE_HOOK(android_vh_ep_create_wakeup_source,
 DECLARE_HOOK(android_vh_timerfd_create,
 	TP_PROTO(char *name, int len),
 	TP_ARGS(name, len));
+
+DECLARE_HOOK(android_vh_f2fs_set_bio_flag,
+	TP_PROTO(struct folio *folio, struct bio *bio),
+	TP_ARGS(folio, bio));
+
+DECLARE_HOOK(android_vh_erofs_iostat_submit,
+	TP_PROTO(struct super_block *sb, struct bio *bio),
+	TP_ARGS(sb, bio));
+
+DECLARE_HOOK(android_vh_erofs_iostat_update,
+	TP_PROTO(struct super_block *sb, struct bio *bio),
+	TP_ARGS(sb, bio));
+
+DECLARE_HOOK(android_vh_f2fs_iostat_submit,
+	TP_PROTO(struct super_block *sb, int type, struct bio *bio),
+	TP_ARGS(sb, type, bio));
+
+DECLARE_HOOK(android_vh_f2fs_iostat_update,
+	TP_PROTO(struct super_block *sb, struct bio *bio, bool *skip),
+	TP_ARGS(sb, bio, skip));
 #endif /* _TRACE_HOOK_FS_H */
 
 /* This part must be outside protection */

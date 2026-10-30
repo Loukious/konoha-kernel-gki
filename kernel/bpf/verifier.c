@@ -1347,24 +1347,6 @@ static bool is_spilled_scalar_reg(const struct bpf_stack_state *stack)
 	       stack->spilled_ptr.type == SCALAR_VALUE;
 }
 
-/* Mark stack slot as STACK_MISC, unless it is already STACK_INVALID, in which
- * case they are equivalent, or it's STACK_ZERO, in which case we preserve
- * more precise STACK_ZERO.
- * Regardless of allow_ptr_leaks setting (i.e., privileged or unprivileged
- * mode), we won't promote STACK_INVALID to STACK_MISC. In privileged case it is
- * unnecessary as both are considered equivalent when loading data and pruning,
- * in case of unprivileged mode it will be incorrect to allow reads of invalid
- * slots.
- */
-static void mark_stack_slot_misc(struct bpf_verifier_env *env, u8 *stype)
-{
-	if (*stype == STACK_ZERO)
-		return;
-	if (*stype == STACK_INVALID)
-		return;
-	*stype = STACK_MISC;
-}
-
 static void scrub_spilled_slot(u8 *stype)
 {
 	if (*stype != STACK_INVALID)
@@ -4575,8 +4557,7 @@ static void copy_register_state(struct bpf_reg_state *dst, const struct bpf_reg_
 	dst->live = live;
 }
 
-static void save_register_state(struct bpf_verifier_env *env,
-				struct bpf_func_state *state,
+static void save_register_state(struct bpf_func_state *state,
 				int spi, struct bpf_reg_state *reg,
 				int size)
 {
@@ -4591,7 +4572,7 @@ static void save_register_state(struct bpf_verifier_env *env,
 
 	/* size < 8 bytes spill */
 	for (; i; i--)
-		mark_stack_slot_misc(env, &state->stack[spi].slot_type[i - 1]);
+		scrub_spilled_slot(&state->stack[spi].slot_type[i - 1]);
 }
 
 static bool is_bpf_st_mem(struct bpf_insn *insn)
@@ -4649,8 +4630,9 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 		return err;
 
 	mark_stack_slot_scratched(env, spi);
-	if (reg && !(off % BPF_REG_SIZE) && register_is_bounded(reg) && env->bpf_capable) {
-		save_register_state(env, state, spi, reg, size);
+	if (reg && !(off % BPF_REG_SIZE) && register_is_bounded(reg) &&
+	    !register_is_null(reg) && env->bpf_capable) {
+		save_register_state(state, spi, reg, size);
 		/* Break the relation on a narrowing spill. */
 		if (fls64(reg->umax_value) > BITS_PER_BYTE * size)
 			state->stack[spi].spilled_ptr.id = 0;
@@ -4660,7 +4642,8 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 
 		__mark_reg_known(&fake_reg, insn->imm);
 		fake_reg.type = SCALAR_VALUE;
-		save_register_state(env, state, spi, &fake_reg, size);
+		save_register_state(state, spi, &fake_reg, size);
+		insn_flags = 0; /* not a register spill */
 	} else if (reg && is_spillable_regtype(reg->type)) {
 		/* register containing pointer is being spilled into stack */
 		if (size != BPF_REG_SIZE) {
@@ -4672,7 +4655,7 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 			verbose(env, "cannot spill pointers to stack into stack frame of the caller\n");
 			return -EINVAL;
 		}
-		save_register_state(env, state, spi, reg, size);
+		save_register_state(state, spi, reg, size);
 	} else {
 		u8 type = STACK_MISC;
 
@@ -4697,12 +4680,7 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 		/* when we zero initialize stack slots mark them as such */
 		if ((reg && register_is_null(reg)) ||
 		    (!reg && is_bpf_st_mem(insn) && insn->imm == 0)) {
-			/* STACK_ZERO case happened because register spill
-			 * wasn't properly aligned at the stack slot boundary,
-			 * so it's not a register spill anymore; force
-			 * originating register to be precise to make
-			 * STACK_ZERO correct for subsequent states
-			 */
+			/* backtracking doesn't work for STACK_ZERO yet. */
 			err = mark_chain_precision(env, value_regno);
 			if (err)
 				return err;
@@ -4938,39 +4916,20 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 				copy_register_state(&state->regs[dst_regno], reg);
 				state->regs[dst_regno].subreg_def = subreg_def;
 			} else {
-				int spill_cnt = 0, zero_cnt = 0;
-
 				for (i = 0; i < size; i++) {
 					type = stype[(slot - i) % BPF_REG_SIZE];
-					if (type == STACK_SPILL) {
-						spill_cnt++;
+					if (type == STACK_SPILL)
 						continue;
-					}
 					if (type == STACK_MISC)
 						continue;
-					if (type == STACK_ZERO) {
-						zero_cnt++;
-						continue;
-					}
 					if (type == STACK_INVALID && env->allow_uninit_stack)
 						continue;
 					verbose(env, "invalid read from stack off %d+%d size %d\n",
 						off, i, size);
 					return -EACCES;
 				}
-
-				if (spill_cnt == size &&
-				    tnum_is_const(reg->var_off) && reg->var_off.value == 0) {
-					__mark_reg_const_zero(&state->regs[dst_regno]);
-					/* this IS register fill, so keep insn_flags */
-				} else if (zero_cnt == size) {
-					/* similarly to mark_reg_stack_read(), preserve zeroes */
-					__mark_reg_const_zero(&state->regs[dst_regno]);
-					insn_flags = 0; /* not restoring original register state */
-				} else {
-					mark_reg_unknown(env, state->regs, dst_regno);
-					insn_flags = 0; /* not restoring original register state */
-				}
+				mark_reg_unknown(env, state->regs, dst_regno);
+				insn_flags = 0; /* not restoring original register state */
 			}
 			state->regs[dst_regno].live |= REG_LIVE_WRITTEN;
 		} else if (dst_regno >= 0) {
