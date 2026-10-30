@@ -1,0 +1,105 @@
+diff --git a/drivers/pinctrl/qcom/pinctrl-msm.c b/drivers/pinctrl/qcom/pinctrl-msm.c
+index 3923e9c..eada569 100644
+--- a/drivers/pinctrl/qcom/pinctrl-msm.c
++++ b/drivers/pinctrl/qcom/pinctrl-msm.c
+@@ -356,7 +356,7 @@ static int msm_config_reg(struct msm_pinctrl *pctrl,
+ 		*bit = g->drv_bit;
+ 		*mask = 7;
+ 		break;
+-	case PIN_CONFIG_OUTPUT:
++	case PIN_CONFIG_LEVEL:
+ 	case PIN_CONFIG_INPUT_ENABLE:
+ 	case PIN_CONFIG_OUTPUT_ENABLE:
+ 		*bit = g->oe_bit;
+@@ -451,7 +451,7 @@ static int msm_config_group_get(struct pinctrl_dev *pctldev,
+ 	case PIN_CONFIG_DRIVE_STRENGTH:
+ 		arg = msm_regval_to_drive(arg);
+ 		break;
+-	case PIN_CONFIG_OUTPUT:
++	case PIN_CONFIG_LEVEL:
+ 		/* Pin is not output */
+ 		if (!arg)
+ 			return -EINVAL;
+@@ -548,7 +548,7 @@ static int msm_config_group_set(struct pinctrl_dev *pctldev,
+ 			else
+ 				arg = (arg / 2) - 1;
+ 			break;
+-		case PIN_CONFIG_OUTPUT:
++		case PIN_CONFIG_LEVEL:
+ 			/* set output value */
+ 			raw_spin_lock_irqsave(&pctrl->lock, flags);
+ 			val = msm_readl_io(pctrl, g);
+@@ -725,7 +725,7 @@ static int msm_gpio_get(struct gpio_chip *chip, unsigned offset)
+ 	return !!(val & BIT(g->in_bit));
+ }
+ 
+-static void msm_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
++static int msm_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
+ {
+ 	const struct msm_pingroup *g;
+ 	struct msm_pinctrl *pctrl = gpiochip_get_data(chip);
+@@ -744,6 +744,8 @@ static void msm_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
+ 	msm_writel_io(val, pctrl, g);
+ 
+ 	raw_spin_unlock_irqrestore(&pctrl->lock, flags);
++
++	return 0;
+ }
+ 
+ static void msm_gpio_pin_status_get(struct msm_pinctrl *pctrl, const struct msm_pingroup *g,
+@@ -862,8 +864,6 @@ static int msm_gpio_init_valid_mask(struct gpio_chip *gc,
+ 	int ret;
+ 	unsigned int len, i;
+ 	const int *reserved = pctrl->soc->reserved_gpios;
+-	struct property *prop;
+-	const __be32 *p;
+ 	u16 *tmp;
+ 
+ 	/* Remove driver-provided reserved GPIOs from valid_mask */
+@@ -881,7 +881,7 @@ static int msm_gpio_init_valid_mask(struct gpio_chip *gc,
+ 
+ 	if (of_property_count_u32_elems(pctrl->dev->of_node, "qcom,gpios-reserved") > 0) {
+ 		bitmap_fill(valid_mask, ngpios);
+-		of_property_for_each_u32(pctrl->dev->of_node, "qcom,gpios-reserved", prop, p, i) {
++		of_property_for_each_u32(pctrl->dev->of_node, "qcom,gpios-reserved", i) {
+ 			if (i >= ngpios) {
+ 				dev_err(pctrl->dev, "invalid list of reserved GPIOs\n");
+ 				return -EINVAL;
+diff --git a/drivers/pinctrl/qcom/pinctrl-tuna.c b/drivers/pinctrl/qcom/pinctrl-tuna.c
+index 3d39782..b81d2ec 100644
+--- a/drivers/pinctrl/qcom/pinctrl-tuna.c
++++ b/drivers/pinctrl/qcom/pinctrl-tuna.c
+@@ -98,7 +98,6 @@
+ 			pg_name##_pins,			\
+ 			ARRAY_SIZE(pg_name##_pins)),	\
+ 		.ctl_reg = offset,			\
+-		.io_reg = offset + 0x4,			\
+ 		.io_reg = io,				\
+ 		.intr_cfg_reg = 0,			\
+ 		.intr_status_reg = 0,			\
+@@ -2348,7 +2347,7 @@ static struct platform_driver tuna_pinctrl_driver = {
+ 		.of_match_table = tuna_pinctrl_of_match,
+ 	},
+ 	.probe = tuna_pinctrl_probe,
+-	.remove_new = msm_pinctrl_remove,
++	.remove = msm_pinctrl_remove,
+ };
+ 
+ static int __init tuna_pinctrl_init(void)
+diff --git a/include/linux/pinctrl/qcom-pinctrl.h b/include/linux/pinctrl/qcom-pinctrl.h
+index aeb2182..66f3606 100644
+--- a/include/linux/pinctrl/qcom-pinctrl.h
++++ b/include/linux/pinctrl/qcom-pinctrl.h
+@@ -9,6 +9,12 @@
+ 
+ #include <linux/types.h>
+ 
++struct resource;
++
++/* APIs to control the suspend-time GPIO diagnostic dump */
++void debug_pintctrl_msm_enable(void);
++void debug_pintctrl_msm_disable(void);
++
+ /* APIS to access qup_i3c registers */
+ int msm_qup_write(u32 mode, u32 val);
+ int msm_qup_read(u32 mode);

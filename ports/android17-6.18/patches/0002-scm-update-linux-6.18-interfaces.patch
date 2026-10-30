@@ -1,0 +1,51 @@
+diff --git a/drivers/firmware/qcom_scm.c b/drivers/firmware/qcom_scm.c
+index 7bbaf60..4151d74 100644
+--- a/drivers/firmware/qcom_scm.c
++++ b/drivers/firmware/qcom_scm.c
+@@ -1042,7 +1042,7 @@ bool qcom_scm_is_mode_switch_available(void)
+ }
+ EXPORT_SYMBOL(qcom_scm_is_mode_switch_available);
+ 
+-int __qcom_scm_get_feat_version(struct device *dev, u64 feat_id, u64 *version)
++static int __qcom_scm_get_feat_version(struct device *dev, u64 feat_id, u64 *version)
+ {
+ 	int ret;
+ 	struct qcom_scm_desc desc = {
+@@ -1070,7 +1070,7 @@ int __qcom_scm_get_feat_version(struct device *dev, u64 feat_id, u64 *version)
+  * SPMI lockup on certain PMIC chips if PS_HOLD is lowered in the middle of
+  * an SPMI transaction.
+  */
+-void qcom_scm_halt_spmi_pmic_arbiter(void)
++static void qcom_scm_halt_spmi_pmic_arbiter(void)
+ {
+ 	int ret;
+ 	struct qcom_scm_desc desc = {
+@@ -2135,7 +2135,7 @@ static int qcom_scm_reboot(struct device *dev)
+ 	return qcom_scm_call_atomic(dev, &desc, NULL);
+ }
+ 
+-int qcom_scm_custom_reboot(struct device *dev,
++static int qcom_scm_custom_reboot(struct device *dev,
+ 			enum qcom_scm_custom_reset_type reboot_type)
+ {
+ 	struct qcom_scm_desc desc = {
+diff --git a/drivers/firmware/qtee_shmbridge.c b/drivers/firmware/qtee_shmbridge.c
+index 5e8434d..c2077de 100644
+--- a/drivers/firmware/qtee_shmbridge.c
++++ b/drivers/firmware/qtee_shmbridge.c
+@@ -588,14 +588,13 @@ static int qtee_shmbridge_probe(struct platform_device *pdev)
+ 	return qtee_shmbridge_init(pdev);
+ }
+ 
+-static int qtee_shmbridge_remove(struct platform_device *pdev)
++static void qtee_shmbridge_remove(struct platform_device *pdev)
+ {
+ 	qtee_shmbridge_deregister(default_bridge.handle);
+ 	gen_pool_destroy(default_bridge.genpool);
+ 	dma_unmap_single(&pdev->dev, default_bridge.paddr, default_bridge.size,
+ 			DMA_TO_DEVICE);
+ 	free_pages((long)default_bridge.vaddr, get_order(default_bridge.size));
+-	return 0;
+ }
+ 
+ static const struct of_device_id qtee_shmbridge_of_match[] = {

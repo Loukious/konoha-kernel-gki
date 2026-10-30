@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: GPL-2.0-only
+load("//build/kernel/kleaf:kernel.bzl", "ddk_headers", "ddk_module", "kernel_module_group")
+load("@rules_pkg//pkg:install.bzl", "pkg_install")
+load("@rules_pkg//pkg:mappings.bzl", "pkg_files", "strip_prefix")
+
+ddk_headers(
+    name = "scm_headers",
+    hdrs = glob([
+        "include/dt-bindings/firmware/*.h",
+        "include/linux/firmware/qcom/*.h",
+        "include/linux/gunyah/*.h",
+        "include/soc/qcom/*.h",
+        "include/uapi/linux/*.h",
+    ]) + ["include/linux/gunyah.h", "include/linux/qtee_shmbridge.h"],
+    linux_includes = ["include", "include/uapi"],
+)
+
+ddk_module(
+    name = "qcom_scm",
+    srcs = [
+        "drivers/firmware/qcom_scm.c",
+        "drivers/firmware/qcom_scm-smc.c",
+        "drivers/firmware/qcom_scm-legacy.c",
+        "drivers/firmware/qcom_scm.h",
+        "drivers/firmware/qtee_shmbridge.c",
+        "drivers/firmware/qtee_shmbridge_internal.h",
+    ],
+    out = "qcom-scm.ko",
+    kconfig = "Kconfig",
+    defconfig = "scm_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":scm_headers"],
+)
+
+ddk_headers(
+    name = "pinctrl_headers",
+    hdrs = [
+        "drivers/pinctrl/core.h",
+        "drivers/pinctrl/pinconf.h",
+        "drivers/pinctrl/pinctrl-utils.h",
+        "drivers/pinctrl/qcom/pinctrl-msm.h",
+        "include/linux/pinctrl/qcom-pinctrl.h",
+    ],
+    includes = ["include"],
+)
+
+ddk_module(
+    name = "pinctrl_msm",
+    srcs = ["drivers/pinctrl/qcom/pinctrl-msm.c"],
+    out = "pinctrl-msm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":pinctrl_headers", ":qcom_scm"],
+)
+
+ddk_module(
+    name = "pinctrl_tuna",
+    srcs = ["drivers/pinctrl/qcom/pinctrl-tuna.c"],
+    out = "pinctrl-tuna.ko",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":pinctrl_headers", ":pinctrl_msm"],
+)
+
+ddk_module(
+    name = "hwid",
+    srcs = ["drivers/misc/hwid/hwid.c", "drivers/misc/hwid/hwid.h"],
+    out = "hwid.ko",
+    kernel_build = "//common:kernel_aarch64",
+)
+
+kernel_module_group(
+    name = "platform_modules",
+    srcs = [":hwid", ":qcom_scm", ":pinctrl_msm", ":pinctrl_tuna"],
+)
+
+pkg_files(
+    name = "platform_files",
+    srcs = [":platform_modules"],
+    strip_prefix = strip_prefix.files_only(),
+)
+
+pkg_install(
+    name = "platform_dist",
+    srcs = [":platform_files"],
+)
