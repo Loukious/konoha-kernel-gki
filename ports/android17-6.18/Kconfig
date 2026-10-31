@@ -309,3 +309,48 @@ config QCOM_QFPROM_SYS
 config QCOM_DEBUG_SYMBOL
 	tristate "Onyx crash diagnostic symbol lookup"
 	depends on ANDROID_DEBUG_KINFO && KALLSYMS
+
+config QCOM_MINIDUMP
+	tristate "Onyx qcom minidump"
+	depends on QCOM_SMEM && GH_RM_DRV && QCOM_DEBUG_SYMBOL
+
+config QCOM_MINIDUMP_FTRACE
+	bool "Onyx qcom minidump ftrace"
+	depends on QCOM_MINIDUMP
+
+config QCOM_MINIDUMP_PANIC_DUMP
+	bool "Onyx qcom minidump panic dump"
+	depends on QCOM_MINIDUMP
+
+config QCOM_MINIDUMP_PANIC_CPU_CONTEXT
+	bool "Onyx qcom minidump panic cpu context"
+	depends on QCOM_MINIDUMP_PANIC_DUMP
+
+config QCOM_MINIDUMP_PANIC_MEMORY_INFO
+	bool "Onyx qcom minidump panic memory info"
+	depends on QCOM_MINIDUMP_PANIC_DUMP
+
+config QCOM_MINIDUMP_PANIC_CPUFREQ_INFO
+	bool "Onyx qcom minidump panic cpufreq info"
+	depends on QCOM_MINIDUMP_PANIC_DUMP
+
+config QCOM_MINIDUMP_PANIC_KTASK_STACK
+	bool "Onyx qcom minidump panic ktask stack"
+	depends on QCOM_MINIDUMP_PANIC_DUMP && DETECT_HUNG_TASK
+
+config QCOM_MINIDUMP_PSTORE
+	bool "Onyx qcom minidump pstore"
+	depends on QCOM_MINIDUMP
+
+config QCOM_LOGBUF_VENDOR_HOOKS
+	tristate "Onyx qcom logbuf vendor hooks"
+	depends on QCOM_MINIDUMP
+
+config QCOM_LOGBUF_BOOTLOG
+	tristate "Onyx qcom logbuf bootlog"
+	depends on QCOM_MINIDUMP
+
+config MINIDUMP_MAX_ENTRIES
+	int "Onyx minidump table capacity"
+	depends on QCOM_MINIDUMP
+	default 200

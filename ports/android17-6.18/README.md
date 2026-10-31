@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 88 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 91 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 88 platform `.ko` files, their symbol tables and DDK configurations.
+- 91 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 3863
-imported symbol CRCs across all 88 modules.
+used. The current [validation report](validation-20261031.json) checks 4027
+imported symbol CRCs across all 91 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -82,8 +82,8 @@ The adapters retain Onyx RPMh/CRM transactions and the 5000 ms timeout. They
 update IRQCHIP probing, trace-string assignment, platform removal callbacks,
 the SPMI device lookup and unaligned access headers for 6.18. Private hwspinlock
 and regmap headers come from the pinned 6.18 common to match core layouts.
-Regmap debug writes remain disabled, and IPC minidump registration still uses
-the vendor header's optional fallback until the minidump provider is ported.
+Regmap debug writes remain disabled. IPC logging and UFS link to the minidump
+provider and enable their vendor crash-buffer registrations.
 
 The regulator group builds the vendor RPMh regulators plus debug/proxy-consumer
 libraries. Legacy proxy cleanup remains disabled, matching the Onyx baseline;
@@ -230,7 +230,7 @@ wake, receive threads stop, and queued memory work drains before descriptors
 are freed. The deferred-free worker also supports stop and drain. Unknown queue
 names fail cleanly, and receiver allocation/thread failures unwind registration.
 These adaptations pass checkpatch with no errors, warnings or style checks;
-the full build passes 3863 imported-symbol CRC checks without compiler/modpost
+the full build passes 4027 imported-symbol CRC checks without compiler/modpost
 warnings. Cross-VM sharing, secure-display allocation and memory pressure still
 require device testing. `ZONE_DEVICE` and reserved-IPA support remain disabled,
 matching the Onyx HLOS baseline; guest-only mapping paths are not validated.
@@ -341,3 +341,28 @@ changes are captured for later porting; they are not in this initial group.
 Compilation, matching CRCs and preserved tables do not validate firmware
 protocols, device-tree compatibility, probe ordering or hardware behavior.
 No 6.18 image has been flashed or booted on the phone.
+
+The crash-dump group adds `minidump`, `qcom_logbuf_vendor_hooks` and
+`qcom_logbuf_boot_log`. It preserves the Onyx 200-entry SMEM table and panic,
+ftrace, CPU-context, CPU-frequency, memory and boot-log capture configuration.
+Private printk, scheduler, time and MM layouts come from pinned 6.18 common.
+Slab diagnostics use the exported object/track iterators, and DMA-BUF iteration
+retains references and copies names under their lock. WALT-specific fields
+remain conditional until the scheduler module is ported.
+
+Registration publishes completed tables under the pending-list lock. Pending
+SMEM entries receive distinct slots and matching ELF headers. Region updates
+serialize with registration/removal, reject mismatched indices/sizes, and keep
+physical and virtual addresses distinct. ELF allocation accounts for metadata
+headers at full capacity; failed removals preserve existing tables. The RM
+workqueue is ordered and allocates pending requests before firmware registration.
+The minidump and boot-log services remain resident while firmware and callbacks
+retain their data; log-buffer probing defers until debug symbols are available.
+
+`verify_minidump.py WORKSPACE/onyx` compiles the actual table helpers into a host
+harness and exercises 400 SMEM/RM full-capacity, update, removal and refill
+scenarios with AddressSanitizer and UndefinedBehaviorSanitizer. The recorded
+result is in [minidump-validation-20261031.json](minidump-validation-20261031.json).
+The harness also rejects the former pending-slot indexing bug. These checks
+cover table arithmetic, not locking, firmware, panic handling or phone operation.
+This adaptation passes checkpatch without errors, warnings or style checks.
