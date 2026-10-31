@@ -1,0 +1,157 @@
+{
+  "tests": {
+    "module": {
+      "module_init_failure_cases": 5,
+      "genl_exists_during_probe_and_remove": true,
+      "unwind_balanced": true
+    },
+    "qmi": {
+      "qmi_rebind_cycles": 400,
+      "handle_and_lookup_failures_unwind": true,
+      "duplicate_release_safe": true,
+      "stop_rejects_registration": true,
+      "dms_reconnect_is_per_device": true,
+      "dms_stop_rejects_requeue": true,
+      "failed_optional_service_unregister_safe": true
+    },
+    "smem": {
+      "secure_smem_length_and_flag_cases": 260,
+      "unsupported_feature_cached": true
+    },
+    "misc": {
+      "misc_acquisition_failures": 5,
+      "lifecycle_cycles": 100,
+      "callback_withdrawal_precedes_timer_and_work_drain": true,
+      "stop_completes_waiters": true,
+      "resources_outlive_bus_shutdown": true
+    },
+    "thermal": {
+      "thermal_failure_cases": 8,
+      "per_device_and_id_ownership": true,
+      "core_callbacks_outside_list_lock": true,
+      "failed_bus_update_retains_state": true,
+      "node_refs_balanced": true
+    },
+    "event": {
+      "event_ownership_wait_and_stop_cases": 242,
+      "async_payloads_released_on_failure": true,
+      "borrowed_driver_ops_retained": true,
+      "stop_drops_queued_events_and_completes_sync_waiters": true
+    },
+    "genl": {
+      "native_fragmentation_cases": 61445,
+      "retry_preserves_segment_identity": true,
+      "terminal_error_propagated": true,
+      "null_payload_rejected": true
+    },
+    "pci": {
+      "pci_device_cases": 10,
+      "mhi_unregister_before_dma_free": true,
+      "timers_stopped_before_shutdown": true,
+      "stale_drvdata_cleared": true,
+      "hardware_operations_mocked": true
+    }
+  },
+  "negative_controls": {
+    "thermal_wrong_id": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "thermal_wrong_id: /tmp/onyx-cnss2-test-8kxlo97b/thermal_wrong_id.c:274: main: Assertion `!removed' failed."
+    },
+    "thermal_unregister_lock": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "thermal_unregister_lock: /tmp/onyx-cnss2-test-8kxlo97b/thermal_unregister_lock.c:257: thermal_cooling_device_unregister: Assertion `!c->plat_priv->tcdev_lock.held' failed."
+    },
+    "smem_short_descriptor": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "smem_short_descriptor: /tmp/onyx-cnss2-test-8kxlo97b/smem_short_descriptor.c:48: main: Assertion `cnss_wlan_hw_disable_check(&p)==-EMSGSIZE' failed."
+    },
+    "qmi_lookup_leak": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "qmi_lookup_leak: /tmp/onyx-cnss2-test-8kxlo97b/qmi_lookup_leak.c:212: main: Assertion `init_count==release_count' failed."
+    },
+    "dms_lookup_leak": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "dms_lookup_leak: /tmp/onyx-cnss2-test-8kxlo97b/dms_lookup_leak.c:219: main: Assertion `init_count==release_count' failed."
+    },
+    "ims_failed_init_release": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "ims_failed_init_release: /tmp/onyx-cnss2-test-8kxlo97b/ims_failed_init_release.c:23: qmi_handle_release: Assertion `q->active' failed."
+    },
+    "misc_callback_not_withdrawn": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "misc_callback_not_withdrawn: /tmp/onyx-cnss2-test-8kxlo97b/misc_callback_not_withdrawn.c:30: cnss_plat_ipc_unregister: Assertion `ipc && !fmd' failed."
+    },
+    "module_failure_masked": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "module_failure_masked: /tmp/onyx-cnss2-test-8kxlo97b/module_failure_masked.c:47: main: Assertion `cnss_initialize()==errors[failure-1]' failed."
+    },
+    "event_stop_ignored": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "event_stop_ignored: /tmp/onyx-cnss2-test-8kxlo97b/event_stop_ignored.c:338: main: Assertion `cnss_driver_event_post(&context,type,0,data_for(type))==-ESHUTDOWN && !live && list_empty(&context.event_list)' failed."
+    },
+    "queued_event_stop_ignored": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "queued_event_stop_ignored: /tmp/onyx-cnss2-test-8kxlo97b/queued_event_stop_ignored.c:337: main: Assertion `handled==before && !live && !context.awake' failed."
+    },
+    "pci_early_dma_release": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "pci_early_dma_release: /tmp/onyx-cnss2-test-8kxlo97b/pci_early_dma_release.c:25: release: Assertion `stopped && !p->mhi_ctrl' failed."
+    },
+    "genl_null_payload": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "genl_null_payload: /tmp/onyx-cnss2-test-8kxlo97b/genl_null_payload.c:8: cnss_genl_send_data: Assertion `total==size && segment==expected_segment && data==original+expected_offset' failed."
+    }
+  },
+  "source_sha256": {
+    "platform/cnss2/Kconfig": "8fe2649694a9198875b52134c7206faf00a75ef360a738ae6a550a1d6486ecca",
+    "platform/cnss2/Makefile": "aca0f4c1226742e71fbce140f7e42cca5f76a27af4b93e51236277c53a5a2721",
+    "platform/cnss2/bus.c": "2d21589a020e61abb95c6502ec122dcbd8047e30a41e19503d4a8752ba97c8fc",
+    "platform/cnss2/bus.h": "e6aea83c0864adba997219675292b41fee1c1b9b3f0e4e8529fb6ee0337f4d60",
+    "platform/cnss2/coexistence_service_v01.c": "32815da82d27dc6965f8f393500ac1ce5bdd5bbb5e7ad17a1c0ab2d30c3eba9f",
+    "platform/cnss2/coexistence_service_v01.h": "02b3b0a830f410ea38ca0bb9aef559df14bf394e553121973e6cf8a72a78cce7",
+    "platform/cnss2/debug.c": "8917371e577c8967746c16164dc3699b867f8e79e2300996e6949a0f3a64a7e4",
+    "platform/cnss2/debug.h": "824d49817506526ae8b1454deef72c2708635bd3169cf8d07fd30c6af03d870f",
+    "platform/cnss2/genl.c": "7ee8a7c1d2f1ca14c38614d0020352bd89a1ee1545c005944428f569a2b3071a",
+    "platform/cnss2/genl.h": "c4526c1758431e8993bb30deac4d370a9fa0fd54109bb1ed7ba582ff57b7cc21",
+    "platform/cnss2/main.c": "757f2b8b2a65c768ac0f5a3b7c9ada5bfc56bfd340fb50a5862788425aeb070a",
+    "platform/cnss2/main.h": "a337807fb450a5edc153405710969a8f81666d37ef620b12e9121d164e1eaf3a",
+    "platform/cnss2/pci.c": "df90e29f8e6bb470abd95e6320cf685f969674696ee7c15cd456a7a2cbd3c2ea",
+    "platform/cnss2/pci.h": "f785a8972b62aee88f837dfb3da8e616b2971531e93693ae2fc3fb82c858677a",
+    "platform/cnss2/pci_platform.h": "0fabcfff7b3cf46c28170068de7b3945a3ef948a7459d5c5e175eb80912debd3",
+    "platform/cnss2/pci_qcom.c": "1fa6a8d601e5a141067aff299f107584ab827d3fcf8bbc58774d52ff4ed3f23c",
+    "platform/cnss2/power.c": "9fdcd5abdd8d3a5b0c4c6343545da88bb51fdaa896cfcb81a176cf0adcd9847d",
+    "platform/cnss2/qmi.c": "f8e7d268570f107d797e9729e7197d33a07b2a85623567a9ce4963a5436f8bd2",
+    "platform/cnss2/qmi.h": "c47fa9854201dc044e7716dfce81da2fd10cd09809a6ca597836b4c9f03767c3",
+    "platform/cnss2/reg.h": "60b8626f28c2895512d5d10dd6449d459169cd31d6eff3f9c3c90a1c10347720",
+    "platform/cnss2/sun_gki_defconfig": "ff5a820bb28524e47c109f7521fbfc1e887e327f52e547968f54e16bb5667bc8",
+    "platform/inc/cnss2.h": "cb748547741835efa0f1409f966bbcc209885da1b03704b41e826133bbc3eec4"
+  },
+  "harness_sha256": {
+    "cnss2_event.c": "38175b83fbec3d591b29d36f451694927c7764119b53f99bf40dad4a8d9cdcfd",
+    "cnss2_genl.c": "919aca46276f39842e841963862e9d54eb6c1dd5025c7f3d0e9f437ebd786767",
+    "cnss2_misc.c": "db534986e6988dee4c6dc9f6414b1a46041dd99676d6113c9b092f8bd66dc3fc",
+    "cnss2_mock.h": "b6bf3ae7fc7846778eb7032de45425647e2c7206094346082a8f2de260b30083",
+    "cnss2_module.c": "79ae42dd38d695a555d1524356cd70390f60fb3c7f11f6a8da49b0a9bd0466b6",
+    "cnss2_pci.c": "50f0cce329d278273cb7284ae98f55802143fb740df5e2ec935cd20e897454ee",
+    "cnss2_qmi.c": "7ac2df9d07799ba68e0cc1d0051ddb6bf044ea9eeeb411449fcbc98e1e523b70",
+    "cnss2_smem.c": "afa030e5db4490e527b46a6053b76b1df831daeb20fc8356544331ec5017d799",
+    "cnss2_thermal.c": "70ce024f6da2500816c7eb9b6481a6120208f8a71bebcd7f4cd5f2c5e503eea2"
+  },
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Extracted production functions with mocked Linux services. Event handlers, firmware/PCIe/MHI, thermal core, callback providers and IRQ/workqueue scheduling are simulated; no device or hardware validation."
+}

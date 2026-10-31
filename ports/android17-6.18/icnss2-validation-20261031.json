@@ -1,0 +1,143 @@
+{
+  "tests": {
+    "module": {
+      "module_failure_and_order_cases": 9,
+      "auxiliary_before_irreversible_main_probe": true
+    },
+    "qmi": {
+      "qmi_lifecycle_cycles": 300,
+      "all_handle_lookup_failures_balanced": true,
+      "stop_rejects_registration": true,
+      "shutdown_reconnect_does_not_assert": true
+    },
+    "protocol": {
+      "protocol_cases": 174,
+      "both_aop_transports_zero_padded": true,
+      "aop_bounds_and_error_propagation": true,
+      "doorbell_mapping_suspend_and_register_order": true,
+      "feature_and_timestamp_bounds": true
+    },
+    "event": {
+      "event_ownership_wait_and_stop_cases": 216,
+      "async_payloads_released_on_failure": true,
+      "borrowed_driver_ops_retained": true,
+      "stop_drops_queued_events_and_completes_sync_waiters": true
+    },
+    "diag": {
+      "diagnostic_cases": 28,
+      "response_copy_bounded_by_request": true,
+      "request_bounds_and_failures": true
+    },
+    "icc": {
+      "icc_failure_and_overflow_cases": 21,
+      "deferred_paths_released": true,
+      "node_refs_balanced": true,
+      "bandwidth_table_preserved": true
+    },
+    "publication": {
+      "fault_publication_cases": 20,
+      "all_native_variants_retain_module": true,
+      "failed_irq_publication_keeps_no_reference": true
+    },
+    "teardown": {
+      "teardown_variants": 64,
+      "producers_and_work_stopped_before_resources": true,
+      "power_supply_unregistered_before_drain_and_put": true,
+      "optional_handles_guarded": true
+    }
+  },
+  "negative_controls": {
+    "module_main_error_masked": {
+      "rejected": true,
+      "diagnostic": "module_main_error_masked: /tmp/icnss2-tests-hzt06zq_/module_main_error_masked.c:49: main: Assertion `ret==(aux&&x?-ENOMEM:m?-EIO:0)' failed."
+    },
+    "qmi_lookup_leak": {
+      "rejected": true,
+      "diagnostic": "qmi_lookup_leak: /tmp/icnss2-tests-hzt06zq_/qmi_lookup_leak.c:162: main: Assertion `initialized==released' failed."
+    },
+    "dms_lookup_leak": {
+      "rejected": true,
+      "diagnostic": "dms_lookup_leak: /tmp/icnss2-tests-hzt06zq_/dms_lookup_leak.c:162: main: Assertion `initialized==released' failed."
+    },
+    "ims_failed_init_release": {
+      "rejected": true,
+      "diagnostic": "ims_failed_init_release: /tmp/icnss2-tests-hzt06zq_/ims_failed_init_release.c:24: qmi_handle_release: Assertion `q->active' failed."
+    },
+    "event_negative_type": {
+      "rejected": true,
+      "diagnostic": "/tmp/icnss2-tests-hzt06zq_/event_negative_type.c:157:20: runtime error: index 4294967295 out of bounds for type '<unknown> [18]'"
+    },
+    "event_queued_after_stop": {
+      "rejected": true,
+      "diagnostic": "event_queued_after_stop: /tmp/icnss2-tests-hzt06zq_/event_queued_after_stop.c:334: main: Assertion `handled==before && !live && !context.awake' failed."
+    },
+    "event_atomic_wait": {
+      "rejected": true,
+      "diagnostic": "event_atomic_wait: /tmp/icnss2-tests-hzt06zq_/event_atomic_wait.c:330: main: Assertion `icnss_driver_event_post(&context,type,ICNSS_EVENT_SYNC,data_for(type))==-EWOULDBLOCK&&!live' failed."
+    },
+    "diag_oversized_response_copy": {
+      "rejected": true,
+      "diagnostic": "==271274==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x752b133e0011 at pc 0x790b15128d2d bp 0x7ffde71b5090 sp 0x7ffde71b4838"
+    },
+    "doorbell_null_mapping": {
+      "rejected": true,
+      "diagnostic": "doorbell_null_mapping: /tmp/icnss2-tests-hzt06zq_/doorbell_null_mapping.c:168: main: Assertion `icnss_ring_doorbell(&p,MSG)==-ENODEV&&!writes' failed."
+    },
+    "aop_negative_parameter": {
+      "rejected": true,
+      "diagnostic": "/tmp/icnss2-tests-hzt06zq_/aop_negative_parameter.c:41:24: runtime error: index 4294967294 out of bounds for type 'char *[3]'"
+    },
+    "teardown_early_handles": {
+      "rejected": true,
+      "diagnostic": "teardown_early_handles: /tmp/icnss2-tests-hzt06zq_/teardown_early_handles.c:33: icnss_unregister_fw_service: Assertion `drained' failed."
+    },
+    "fault_callback_module_not_retained": {
+      "rejected": true,
+      "diagnostic": "fault_callback_module_not_retained: /tmp/icnss2-tests-hzt06zq_/fault_callback_module_not_retained.c:34: main: Assertion `self_module.refs==publishes' failed."
+    },
+    "icc_error_path_reference_leak": {
+      "rejected": true,
+      "diagnostic": "icc_error_path_reference_leak: /tmp/icnss2-tests-hzt06zq_/icc_error_path_reference_leak.c:174: clean: Assertion `!live&&!paths&&!refs' failed."
+    },
+    "qmi_shutdown_reconnect_assertion": {
+      "rejected": true,
+      "diagnostic": "qmi_shutdown_reconnect_assertion: /tmp/icnss2-tests-hzt06zq_/qmi_shutdown_reconnect_assertion.c:157: icnss_clear_server: Assertion `0' failed."
+    },
+    "feature_narrow_shift": {
+      "rejected": true,
+      "diagnostic": "/tmp/icnss2-tests-hzt06zq_/feature_narrow_shift.c:152:28: runtime error: shift exponent 32 is too large for 32-bit type 'unsigned int'"
+    }
+  },
+  "source_sha256": {
+    "platform/icnss2/main.c": "17a09ec7af1fe13a340a3cfb82debd6864fcb32812d37763f3d1179207525c2b",
+    "platform/icnss2/debug.c": "428ec66a049e41c2ebfba3879d660b4e9998f20fe3c5f2073fd754d87e92ac98",
+    "platform/icnss2/power.c": "4df3ed6f672fbc8a7202c90c2105648a77081c8549f2c5f50bbce82279d66931",
+    "platform/icnss2/genl.c": "5d4a7443b35d34c306ece775714de9a8d6c215ba665abc80a857de2dd7d4929b",
+    "platform/icnss2/qmi.c": "885285c35f3282daa1c0897192f6347213cb526441840fcf4109c0aef6b226ed",
+    "platform/icnss2/main.h": "17f5af194b8e77556644cb9468a01875b5b4baefd28c1b24bb13cb0af409d3ec",
+    "platform/icnss2/debug.h": "90f2a1e2f3a8e7c121d14e3a21f868ffa84ada43178af72ce3e531e2601cc20e",
+    "platform/icnss2/power.h": "7df6d51e84122607f6ba93c1695629f62f9f9a5cd17fa5b8a0286351e2d8bac3",
+    "platform/icnss2/genl.h": "dbc4c39baac95aabaf156ad737328c165479bd7783bde29a4058ebe899dae271",
+    "platform/icnss2/qmi.h": "e8994fbcc5d4ea49899c0d669644f23e5577da92442fd390df6a72d3b6518ea3",
+    "platform/icnss2/Kconfig": "2de8fbfe60dbe74b13b9d446a06045a8e790ef150dea9b788a99bce4be7aee34",
+    "platform/icnss2/Makefile": "72ac4319a42a2d54d62798c0091162e9c67db5cc4711f4e194d73ae3092aaff4",
+    "platform/icnss2/sun_gki_defconfig": "c93bcff9b6599b50c29a24cd1c3937a423cd7a08a65fee4601856bd1cb391b2e",
+    "platform/inc/icnss2.h": "f685fef3c076c26e925f3be9ed0d03c677e9ba21b29cbf3d826414b3bc7eb284"
+  },
+  "harness_sha256": {
+    "icnss2_diag.c": "bfcf32ceb54d12fa253c401317d829e73232b41b8e4fabf9b6f779b70c76cc9a",
+    "icnss2_event.c": "03b22841c2a907149d53e533d19f16eea25e770bac3112755b3ecb0de98d5009",
+    "icnss2_icc.c": "e220ea53ce2a3c667c822452be2657d3a6eef20962d7dd42f14b0c603bba62fd",
+    "icnss2_mock.h": "c55e31a1c9360df65f0d7a6f535d428e41f9b96540bed9fd63076ec5a80e08aa",
+    "icnss2_module.c": "a2ee7d2bd5c343665499b3d25f7dda0ddf162b3235dd4585f14dab2be26a508e",
+    "icnss2_protocol.c": "26b8b1752f0e6c6bfffbf2feadf69a0a132b44dbc3d65215bbcb784f2e58df4a",
+    "icnss2_publication.c": "2598236cb08ef6516e163727826e09135ae28d907dc95879bbf2fb1b93258118",
+    "icnss2_qmi.c": "be77364fcbac560e79d32c42fe95219803fb11899bfab9bfdafa3cadb5e375e2",
+    "icnss2_teardown.c": "a5e80fd180cd8a069a4e44f3f882dbe52d54e3d70a1f7a383f2d027a1a708866"
+  },
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Extracted production functions with mocked Linux services. IRQ/workqueue concurrency, hardware DMA, firmware boot and physical removal are not established."
+}

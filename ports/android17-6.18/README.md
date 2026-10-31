@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 244 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 246 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 244 platform `.ko` files, their symbol tables and DDK configurations.
+- 246 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 13,703
-imported symbol CRCs across all 244 modules.
+used. The current [validation report](validation-20261031.json) checks 14,382
+imported symbol CRCs across all 246 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1523,3 +1523,49 @@ helpers. Keep the distinction between those link-time PCI core references and a
 runtime requirement for a standard PCIe root or MHI host driver. The source
 inventory does not establish that runtime requirement or authorize removing
 other ROM-listed hardware support.
+
+
+## ICNSS2 and CNSS2 platform providers
+
+ICNSS2 supplies the integrated platform route required by the selected native
+WCN7750 WLAN module. The port retains its five native compilation units, QMI
+schemas and public API. Firmware-service publication follows queue/timer setup;
+failure paths release acquired QMI handles. Event posting rejects shutdown and
+invalid atomic waits, and teardown stops producers before freeing queues.
+Athdiag response copies respect the caller's buffer length; AOP frames are
+bounded and initialized. ICC parsing preserves deferral and reference ownership.
+[ICNSS2 tests](icnss2-validation-20261031.json) pass eight sanitizer suites and
+fifteen fault controls.
+
+The native WCN7750 SMMU doorbell callback is restored for 6.18. All native SMMU
+callback variants publish only after fallible probe setup. The auxiliary driver
+registers first so a later module-init failure cannot leave a published callback
+pointing at freed state. ICNSS2 retains its module after callback publication;
+the current IOMMU provider has no synchronized withdrawal API. Manual binding is
+suppressed. Safe unload and physical platform removal require further provider
+lifetime work; none is established by the host tests.
+
+CNSS2 is an independently listed ROM module with nine native compilation units.
+It preserves firmware/QMI/PCIe/MHI behavior, all 74 exports and 32 aliases.
+Initialization checks errors and orders user entrypoints and firmware activity.
+Shutdown closes event gates, completes waiters, withdraws callbacks and drains
+work/timers before releasing bus resources. Thermal devices retain platform/ID
+ownership and unregister outside the callback mutex. WLFW, DMS, coexistence and
+IMS handles track initialization and release; DMS reconnect work belongs to its
+device. [CNSS2 tests](cnss2-validation-20261031.json) pass eight sanitizer suites
+and twelve fault controls. A separate review found no high-confidence defect in
+the introduced module, event, QMI/DMS, MHI timer and thermal ownership changes.
+Live DMA quiescence, firmware recovery and physical hot-removal remain untested.
+
+Shared SMMU, dump and secure flags use one Kconfig definition that permits either
+provider. Both archived configurations retain the selected native features.
+The main WLAN module still needs its own 6.18 API port; compiling its platform
+provider does not establish working Wi-Fi or monitor mode on the phone.
+
+The combined 246-module archive `artifacts/20261031T160121430678Z` passes
+14,382 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
+and overlay checks pass with 1,084 existing vendor DTC warnings.
+ROM module build coverage is 244/466 (52.4%), leaving 222 names to
+assess or port, including alternative hardware. Main WLAN, remaining Bluetooth
+and audio consumers, camera/video, device interfaces and image/installer work
+remain. No flashable 6.18 ZIP or phone validation exists yet.

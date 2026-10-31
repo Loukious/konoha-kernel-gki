@@ -3167,6 +3167,41 @@ ddk_module(
     copts = ["-DCONFIG_MSM_BT_POWER", "-DCONFIG_FMD_ENABLE"],
 )
 
+ddk_headers(
+    name = "cnss2_headers",
+    hdrs = ["platform/cnss2/bus.h", "platform/cnss2/coexistence_service_v01.h", "platform/cnss2/debug.h", "platform/cnss2/genl.h", "platform/cnss2/main.h", "platform/cnss2/pci.h", "platform/cnss2/pci_platform.h", "platform/cnss2/qmi.h", "platform/cnss2/reg.h", "platform/inc/cnss2.h"],
+    includes = ["platform/inc", "platform/cnss2"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "cnss2",
+    srcs = ["platform/cnss2/main.c", "platform/cnss2/bus.c", "platform/cnss2/debug.c", "platform/cnss2/pci.c", "platform/cnss2/power.c", "platform/cnss2/genl.c", "platform/cnss2/qmi.c", "platform/cnss2/coexistence_service_v01.c", "platform/cnss2/pci_qcom.c"],
+    out = "cnss2.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":cnss2_headers", ":wlan_base_headers", ":wlan_utils_headers", ":wlan_qmi_headers", ":pcie_mhi_headers", ":iommu_headers", ":platform_headers", ":scm_headers", ":mailbox_headers", ":minidump_headers", ":secure_headers", ":pinctrl_headers", ":remote_headers", ":soc_headers", ":cnss_prealloc", ":cnss_utils", ":wlan_firmware_service", ":cnss_plat_ipc_qmi_svc", ":pci_msm_drv", ":mhi", ":qcom_iommu_util", ":qcom_aoss", ":qcom_ipc_logging", ":minidump", ":smem", ":qmi_helpers", ":pinctrl_msm", ":smcinvoke_dlkm", ":qcom_ramdump", ":memory_dump_v2", ":cmd_db"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_headers(
+    name = "icnss2_headers",
+    hdrs = ["platform/icnss2/main.h", "platform/icnss2/debug.h", "platform/icnss2/power.h", "platform/icnss2/genl.h", "platform/icnss2/qmi.h", "platform/inc/icnss2.h"],
+    includes = ["platform/inc", "platform/icnss2"],
+)
+
+ddk_module(
+    name = "icnss2",
+    srcs = ["platform/icnss2/main.c", "platform/icnss2/debug.c", "platform/icnss2/power.c", "platform/icnss2/genl.c", "platform/icnss2/qmi.c"],
+    out = "icnss2.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":icnss2_headers", ":platform_headers", ":soc_headers", ":rproc_headers", ":remote_headers", ":wlan_base_headers", ":wlan_utils_headers", ":iommu_headers", ":pinctrl_headers", ":dcvs_headers", ":mailbox_headers", ":memory_dump_headers", ":loader_headers", ":qcom_ipc_logging", ":qcom_ramdump", ":socinfo", ":pdr_interface", ":cnss_prealloc", ":rproc_qcom_common", ":qcom_iommu_util", ":pinctrl_msm", ":qcom_aoss", ":wlan_firmware_service", ":qmi_helpers"],
+    copts = ["-DCONFIG_CNSS_OUT_OF_TREE", "-DCONFIG_ICNSS2_QMI", "-DCONFIG_CNSS2_SMMU_DB_SUPPORT", "-DCONFIG_CNSS2_SSR_DRIVER_DUMP", "-DCONFIG_CNSS_HW_SECURE_DISABLE", "-DCONFIG_CNSS_HW_SECURE_SMEM", "-DCONFIG_CNSS_PLAT_IPC_QMI_SVC", "-DCONFIG_WCNSS_MEM_PRE_ALLOC"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3401,6 +3436,8 @@ kernel_module_group(
         ":rmnet_mem",
         ":swr_dlkm",
         ":btpower",
+        ":cnss2",
+        ":icnss2",
     ],
 )
 
