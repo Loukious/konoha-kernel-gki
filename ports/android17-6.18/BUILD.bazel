@@ -1297,6 +1297,16 @@ ddk_module(
     deps = [":thermal_headers", ":platform_headers"],
 )
 
+ddk_module(
+    name = "qcom_spmi_temp_alarm",
+    srcs = ["drivers/thermal/qcom/qcom-spmi-temp-alarm.c"],
+    out = "qcom-spmi-temp-alarm.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":thermal_headers", ":platform_headers"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1382,6 +1392,7 @@ kernel_module_group(
         ":qcom_tsens",
         ":bcl_pmic5",
         ":bcl_soc",
+        ":qcom_spmi_temp_alarm",
         ":nvmem_qfprom",
         ":qcom_cpufreq_thermal",
         ":qcom_cpufreq_hw",

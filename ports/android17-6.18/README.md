@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 98 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 99 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 98 platform `.ko` files, their symbol tables and DDK configurations.
+- 99 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 4284
-imported symbol CRCs across all 98 modules.
+used. The current [validation report](validation-20261031.json) checks 4308
+imported symbol CRCs across all 99 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -230,7 +230,7 @@ wake, receive threads stop, and queued memory work drains before descriptors
 are freed. The deferred-free worker also supports stop and drain. Unknown queue
 names fail cleanly, and receiver allocation/thread failures unwind registration.
 These adaptations pass checkpatch with no errors, warnings or style checks;
-the full build passes 4284 imported-symbol CRC checks without compiler/modpost
+the full build passes 4308 imported-symbol CRC checks without compiler/modpost
 warnings. Cross-VM sharing, secure-display allocation and memory pressure still
 require device testing. `ZONE_DEVICE` and reserved-IPA support remain disabled,
 matching the Onyx HLOS baseline; guest-only mapping paths are not validated.
@@ -324,8 +324,8 @@ changes are captured for later porting; they are not in this initial group.
 
 ## Next implementation gates
 
-1. Complete the VM IRQ-chip, CPU power-control and remaining dependencies
-   needed for Onyx early boot.
+1. Complete the remaining first-stage dependencies, starting with PMIC ADC
+   and GPIO support needed by Onyx sensors and peripherals.
    Test UFS/encryption, probe ordering, GPIO wakeups, SCM wait queues and
    shared-memory operations.
 2. Port the device trees and remaining first-stage list; produce matching
@@ -459,3 +459,20 @@ and cancels work before unregistering the zone. The module includes its OF
 autoload alias. The adaptation passes checkpatch and the full platform build
 without warnings; capacity notifications and low-charge cooling still need
 phone validation.
+
+
+The PMIC temperature-alarm group adds `qcom-spmi-temp-alarm`. It retains the
+Onyx GEN1, GEN2, TEMP_DAC and TEMP_LITE tables, stage-2 shutdown requirements,
+optional IIO readings and hardware-monitor sysfs interface. Trip callbacks use
+6.18 descriptors, and initialization bounds the hardware trip count before
+writing thresholds. The early GEN2 revision uses the same legacy threshold
+table as pinned common.
+
+Initialization takes the thermal-zone lock before the driver lock, matching
+runtime callbacks. Temperature reads serialize with setup, failed reads leave
+the result untouched, and the initialized flag is set only after the alarm
+enable write succeeds. IRQ handlers are registered after the thermal zone and
+hwmon setup, so managed teardown stops handlers first. The Onyx main/Lite
+three-trip tables remain unchanged. The adapter passes checkpatch and the full platform
+build without warnings; register access, ADC readings and hardware shutdown
+need phone tests.
