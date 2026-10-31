@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and four vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 15 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- Four platform `.ko` files, their symbol tables and DDK configurations.
+- 15 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes and imported-CRC checks.
 
@@ -56,7 +56,7 @@ replace a staged tree with local edits. Preserve such edits as a patch before
 restaging. The imported pin-control private headers come from the exact 6.18
 common revision, not the older vendor kernel.
 
-## Initial driver group
+## Platform driver groups
 
 | Output | Implementation | Adaptation |
 | --- | --- | --- |
@@ -65,12 +65,24 @@ common revision, not the older vendor kernel.
 | `pinctrl-tuna.ko` | Pinned Tuna pin/function/PDC/I3C tables | 6.18 removal callback; remove an overwritten initializer while retaining its effective value |
 | `hwid.ko` | Pinned Xiaomi hardware-ID parameters and exports | Module description |
 
-All four appear in the ROM's first-stage module lists. SCM depends on GKI
+The original four appear in the ROM's first-stage module lists. SCM depends on GKI
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 178
-imported symbol CRCs across these modules.
+used. The current [validation report](validation-20261031.json) checks 638
+imported symbol CRCs across all 15 modules.
+
+The platform group also builds IPC logging, PDC interrupts, command DB,
+CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
+Qualcomm regmap debugfs and the PMIC MFD. `modules.json` records the expected
+outputs, and `build.py` verifies this set before archiving any successful build.
+
+The adapters retain Onyx RPMh/CRM transactions and the 5000 ms timeout. They
+update IRQCHIP probing, trace-string assignment, platform removal callbacks,
+the SPMI device lookup and unaligned access headers for 6.18. Private hwspinlock
+and regmap headers come from the pinned 6.18 common to match core layouts.
+Regmap debug writes remain disabled, and IPC minidump registration still uses
+the vendor header's optional fallback until the minidump provider is ported.
 
 `CONFIG_QCOM_SCM=m` and `CONFIG_QTEE_SHM_BRIDGE=y` are set in the DDK module
 configuration. Common Kconfig also selects `QCOM_TZMEM`; the vendor composite
@@ -104,7 +116,7 @@ changes are captured for later porting; they are not in this initial group.
 
 ## Next implementation gates
 
-1. Complete the IRQ/PDC, Gunyah host/VM, clock, RPMh, regulator, interconnect,
+1. Complete the Gunyah host/VM, clock, regulator, interconnect,
    IOMMU and storage dependencies needed for Onyx early boot. Test probe
    ordering, GPIO wakeups, SCM wait queues and shared-memory operations.
 2. Port the device trees and remaining first-stage list; produce matching
@@ -114,7 +126,8 @@ changes are captured for later porting; they are not in this initial group.
    [feasibility study](../../Documentation/konoha/android17-6.18-feasibility.md)
    still need semantic fixes.
 4. Integrate KernelSU/NetHunter after the device baseline works. Perform boot,
-   hardware and suspend/resume validation before preparing a flashable release.
+   hardware and suspend/resume validation using the resulting test package before
+   declaring a stable release.
 
 Compilation, matching CRCs and preserved tables do not validate firmware
 protocols, device-tree compatibility, probe ordering or hardware behavior.

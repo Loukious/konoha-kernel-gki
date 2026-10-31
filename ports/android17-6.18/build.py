@@ -33,7 +33,7 @@ def main():
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     artifacts = workspace / "artifacts" / stamp
     artifacts.mkdir(parents=True)
-    command = ["tools/bazel", "build", f"--jobs={args.jobs}",
+    command = ["tools/bazel", "build", "--keep_going", f"--jobs={args.jobs}",
                f"--local_resources=memory={args.memory_mb}",
                "//common:kernel_aarch64", "//onyx:platform_modules"]
     print(f"Building; log: {artifacts / 'build.log'}", flush=True)
@@ -51,7 +51,8 @@ def main():
     kernel_dir = next(p.parent for p in outputs if p.name == "Image")
     release = (kernel_dir / "include/config/kernel.release").read_text().strip()
     modules = [p for p in outputs if p.suffix == ".ko"]
-    if {p.name for p in modules} != {"hwid.ko", "qcom-scm.ko", "pinctrl-msm.ko", "pinctrl-tuna.ko"}:
+    catalog = json.loads((HERE / "modules.json").read_text())
+    if {p.name for p in modules} != {entry["output"] for entry in catalog}:
         raise ValueError("unexpected platform module set")
     symvers = [p for p in outputs if p.name.endswith("_Module.symvers")]
     verification = verify(modules, symvers, release)
@@ -64,14 +65,15 @@ def main():
             shutil.copyfile(path, target)
     for name in ["modules_staging_dir.tar.gz", "out-dir-kernel-headers.tar.gz"]:
         shutil.copyfile(kernel_dir / name, artifacts / "gki" / name)
-    for target in ["hwid", "qcom_scm", "pinctrl_msm", "pinctrl_tuna"]:
+    for entry in catalog:
+        target = entry["target"]
         config = kernel_dir.parent.parent / "onyx" / (target + "_config") / "out_dir/.config"
         shutil.copyfile(config, artifacts / "platform" / (target + ".config"))
     (artifacts / "gki/kernel.release").write_text(release + "\n")
     inputs = artifacts / "inputs"
     inputs.mkdir()
     for name in ["sources.json", "imports.json", "onyx-port.xml", "dependency-lock.xml",
-                 "BUILD.bazel", "Kconfig", "scm_defconfig"]:
+                 "BUILD.bazel", "Kconfig", "scm_defconfig", "platform_defconfig", "modules.json"]:
         shutil.copyfile(HERE / name, inputs / name)
     shutil.copytree(HERE / "patches", inputs / "patches")
     shutil.copyfile(workspace / "onyx/.staged-files.json", inputs / "staged-files.json")

@@ -1,0 +1,127 @@
+diff --git a/drivers/soc/qcom/smem.c b/drivers/soc/qcom/smem.c
+index 7e9d638..af6ff50 100644
+--- a/drivers/soc/qcom/smem.c
++++ b/drivers/soc/qcom/smem.c
+@@ -1253,13 +1253,11 @@ static int qcom_smem_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
+-static int qcom_smem_remove(struct platform_device *pdev)
++static void qcom_smem_remove(struct platform_device *pdev)
+ {
+ 	platform_device_unregister(__smem->socinfo);
+ 
+ 	__smem = NULL;
+-
+-	return 0;
+ }
+ 
+ static const struct of_device_id qcom_smem_of_match[] = {
+diff --git a/drivers/soc/qcom/socinfo.c b/drivers/soc/qcom/socinfo.c
+index a019380..f740d91 100644
+--- a/drivers/soc/qcom/socinfo.c
++++ b/drivers/soc/qcom/socinfo.c
+@@ -19,7 +19,7 @@
+ #include <linux/types.h>
+ #include <soc/qcom/socinfo.h>
+ 
+-#include <asm/unaligned.h>
++#include <linux/unaligned.h>
+ 
+ #include <dt-bindings/arm/qcom,ids.h>
+ 
+@@ -1367,7 +1367,7 @@ static void socinfo_populate_sysfs(struct qcom_socinfo *qcom_socinfo)
+ 	qcom_socinfo->attr.custom_attr_group = &custom_soc_attr_group;
+ }
+ 
+-void socinfo_enumerate_partinfo_details(void)
++static void socinfo_enumerate_partinfo_details(void)
+ {
+ 	unsigned int partinfo_array_offset;
+ 	unsigned int nnum_partname_mapping;
+@@ -1776,15 +1776,13 @@ static int qcom_socinfo_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
+-static int qcom_socinfo_remove(struct platform_device *pdev)
++static void qcom_socinfo_remove(struct platform_device *pdev)
+ {
+ 	struct qcom_socinfo *qs = platform_get_drvdata(pdev);
+ 
+ 	soc_device_unregister(qs->soc_dev);
+ 
+ 	socinfo_debugfs_exit(qs);
+-
+-	return 0;
+ }
+ 
+ static struct platform_driver qcom_socinfo_driver = {
+diff --git a/drivers/spmi/spmi-pmic-arb.c b/drivers/spmi/spmi-pmic-arb.c
+index d344cbf..741127d 100644
+--- a/drivers/spmi/spmi-pmic-arb.c
++++ b/drivers/spmi/spmi-pmic-arb.c
+@@ -2019,7 +2019,7 @@ MODULE_DEVICE_TABLE(of, spmi_pmic_arb_match_table);
+ 
+ static struct platform_driver spmi_pmic_arb_driver = {
+ 	.probe		= spmi_pmic_arb_probe,
+-	.remove_new	= spmi_pmic_arb_remove,
++	.remove		= spmi_pmic_arb_remove,
+ 	.driver		= {
+ 		.name	= "spmi_pmic_arb",
+ 		.of_match_table = spmi_pmic_arb_match_table,
+@@ -2028,5 +2028,6 @@ static struct platform_driver spmi_pmic_arb_driver = {
+ };
+ module_platform_driver(spmi_pmic_arb_driver);
+ 
++MODULE_DESCRIPTION("Qualcomm SPMI PMIC arbiter");
+ MODULE_LICENSE("GPL v2");
+ MODULE_ALIAS("platform:spmi_pmic_arb");
+diff --git a/drivers/mfd/qcom-spmi-pmic.c b/drivers/mfd/qcom-spmi-pmic.c
+index 623c5e7..c662ea2 100644
+--- a/drivers/mfd/qcom-spmi-pmic.c
++++ b/drivers/mfd/qcom-spmi-pmic.c
+@@ -12,6 +12,8 @@
+ #include <linux/spmi.h>
+ #include <linux/types.h>
+ #include <linux/regmap.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
+ #include <linux/of_platform.h>
+ #include <linux/qti-regmap-debugfs.h>
+ #include <soc/qcom/qcom-spmi-pmic.h>
+@@ -116,7 +118,7 @@ static struct spmi_device *qcom_pmic_get_base_usid(struct spmi_device *sdev, str
+ 		}
+ 
+ 		if (pmic_addr == function_parent_usid - (ctx->num_usids - 1)) {
+-			sdev = spmi_device_from_of(child);
++			sdev = spmi_find_device_by_of_node(child);
+ 			if (!sdev) {
+ 				/*
+ 				 * If the base USID for this PMIC hasn't been
+diff --git a/drivers/base/regmap/qti-regmap-debugfs.c b/drivers/base/regmap/qti-regmap-debugfs.c
+index ead979c..4fdd779 100644
+--- a/drivers/base/regmap/qti-regmap-debugfs.c
++++ b/drivers/base/regmap/qti-regmap-debugfs.c
+@@ -329,8 +329,8 @@ static ssize_t regmap_read_debugfs(struct regmap *map, unsigned int from,
+ 	if (*ppos < 0 || !count)
+ 		return -EINVAL;
+ 
+-	if (count > (PAGE_SIZE << (MAX_ORDER - 1)))
+-		count = PAGE_SIZE << (MAX_ORDER - 1);
++	if (count > (PAGE_SIZE << (MAX_PAGE_ORDER - 1)))
++		count = PAGE_SIZE << (MAX_PAGE_ORDER - 1);
+ 
+ 	buf = kzalloc(count, GFP_KERNEL);
+ 	if (!buf)
+diff --git a/include/soc/qcom/socinfo.h b/include/soc/qcom/socinfo.h
+index 4e170e3..dd7651b 100644
+--- a/include/soc/qcom/socinfo.h
++++ b/include/soc/qcom/socinfo.h
+@@ -118,6 +118,7 @@ enum subset_part_type {
+ 
+ #if IS_ENABLED(CONFIG_QCOM_SOCINFO)
+ uint32_t socinfo_get_id(void);
++uint32_t socinfo_get_package_type(void);
+ uint32_t socinfo_get_serial_number(void);
+ const char *socinfo_get_id_string(void);
+ int socinfo_get_feature_code(void);

@@ -67,9 +67,148 @@ ddk_module(
     kernel_build = "//common:kernel_aarch64",
 )
 
+ddk_headers(
+    name = "platform_headers",
+    hdrs = [
+        "include/linux/ipc_logging.h",
+        "include/soc/qcom/cmd-db.h",
+        "include/soc/qcom/crm.h",
+        "include/soc/qcom/rpmh.h",
+        "include/soc/qcom/tcs.h",
+        "include/soc/qcom/minidump.h",
+        "include/dt-bindings/soc/qcom,rpmh-rsc.h",
+    ],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "qcom_ipc_logging",
+    srcs = [
+        "kernel/trace/ipc_logging.c",
+        "kernel/trace/ipc_logging_debug.c",
+        "kernel/trace/ipc_logging_private.h",
+    ],
+    out = "qcom_ipc_logging.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":platform_headers"],
+)
+
+ddk_module(
+    name = "qcom_pdc",
+    srcs = ["drivers/irqchip/qcom-pdc.c"],
+    out = "qcom-pdc.ko",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":scm_headers", ":platform_headers", ":qcom_scm", ":qcom_ipc_logging"],
+)
+
+ddk_module(
+    name = "cmd_db",
+    srcs = ["drivers/soc/qcom/cmd-db.c"],
+    out = "cmd-db.ko",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":platform_headers", ":qcom_ipc_logging"],
+)
+
+ddk_module(
+    name = "crm_v2",
+    srcs = ["drivers/soc/qcom/crm-v2.c", "drivers/soc/qcom/trace-crm.h"],
+    includes = ["drivers/soc/qcom"],
+    out = "crm-v2.ko",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":platform_headers", ":qcom_ipc_logging"],
+)
+
+ddk_module(
+    name = "qcom_rpmh",
+    srcs = [
+        "drivers/soc/qcom/rpmh.c",
+        "drivers/soc/qcom/rpmh-rsc.c",
+        "drivers/soc/qcom/rpmh-internal.h",
+        "drivers/soc/qcom/trace-rpmh.h",
+    ],
+    includes = ["drivers/soc/qcom"],
+    out = "qcom_rpmh.ko",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":platform_headers", ":cmd_db", ":crm_v2", ":qcom_ipc_logging"],
+)
+
+ddk_headers(
+    name = "soc_headers",
+    hdrs = [
+        "include/linux/soc/qcom/smem.h",
+        "include/linux/soc/qcom/socinfo.h",
+        "include/linux/soc/qcom/spmi-pmic-arb.h",
+        "include/linux/qti-regmap-debugfs.h",
+        "include/soc/qcom/socinfo.h",
+        "include/soc/qcom/qcom-spmi-pmic.h",
+        "include/dt-bindings/arm/qcom,ids.h",
+    ],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "qcom_hwspinlock",
+    srcs = ["drivers/hwspinlock/qcom_hwspinlock.c", "drivers/hwspinlock/hwspinlock_internal.h"],
+    out = "qcom_hwspinlock.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+)
+
+ddk_module(
+    name = "smem",
+    srcs = ["drivers/soc/qcom/smem.c"],
+    out = "smem.ko",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":soc_headers", ":qcom_hwspinlock"],
+)
+
+ddk_module(
+    name = "socinfo",
+    srcs = ["drivers/soc/qcom/socinfo.c"],
+    out = "socinfo.ko",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":soc_headers", ":smem"],
+)
+
+ddk_module(
+    name = "spmi_pmic_arb",
+    srcs = ["drivers/spmi/spmi-pmic-arb.c"],
+    out = "spmi-pmic-arb.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":soc_headers"],
+)
+
+ddk_module(
+    name = "qti_regmap_debugfs",
+    srcs = ["drivers/base/regmap/qti-regmap-debugfs.c", "drivers/base/regmap/internal.h"],
+    out = "qti-regmap-debugfs.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":soc_headers"],
+)
+
+ddk_module(
+    name = "qcom_spmi_pmic",
+    srcs = ["drivers/mfd/qcom-spmi-pmic.c"],
+    out = "qcom-spmi-pmic.ko",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":soc_headers", ":spmi_pmic_arb", ":qti_regmap_debugfs"],
+)
+
 kernel_module_group(
     name = "platform_modules",
-    srcs = [":hwid", ":qcom_scm", ":pinctrl_msm", ":pinctrl_tuna"],
+    srcs = [
+        ":hwid", ":qcom_scm", ":pinctrl_msm", ":pinctrl_tuna",
+        ":qcom_ipc_logging", ":qcom_pdc", ":cmd_db", ":crm_v2", ":qcom_rpmh",
+        ":qcom_hwspinlock", ":smem", ":socinfo", ":spmi_pmic_arb",
+        ":qti_regmap_debugfs", ":qcom_spmi_pmic",
+    ],
 )
 
 pkg_files(
