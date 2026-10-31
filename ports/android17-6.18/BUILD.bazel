@@ -1040,6 +1040,42 @@ ddk_module(
     deps = [":mem_buf_headers", ":scm_headers", ":gunyah_headers", ":loader_headers", ":mem_buf_dev", ":mem_buf_msgq", ":gh_msgq", ":gh_rm_drv", ":qcom_dma_heaps"],
 )
 
+ddk_headers(
+    name = "scmi_vendor_headers",
+    hdrs = ["include/linux/qcom_scmi_vendor.h", "drivers/firmware/arm_scmi/protocols.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "qcom_cpucp",
+    srcs = ["drivers/soc/qcom/qcom_cpucp.c"],
+    out = "qcom_cpucp.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":scmi_vendor_headers"],
+)
+
+ddk_module(
+    name = "qcom_scmi_vendor",
+    srcs = ["drivers/firmware/arm_scmi/qcom_scmi_vendor.c"],
+    out = "qcom_scmi_vendor.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":scmi_vendor_headers"],
+)
+
+ddk_module(
+    name = "qcom_scmi_client",
+    srcs = ["drivers/soc/qcom/dcvs/qcom_scmi_client.c"],
+    out = "qcom_scmi_client.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":scmi_vendor_headers"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1107,6 +1143,9 @@ kernel_module_group(
         ":deferred_free_helper",
         ":qcom_dma_heaps",
         ":mem_buf",
+        ":qcom_cpucp",
+        ":qcom_scmi_vendor",
+        ":qcom_scmi_client",
     ],
 )
 

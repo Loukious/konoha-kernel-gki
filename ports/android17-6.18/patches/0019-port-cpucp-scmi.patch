@@ -1,0 +1,331 @@
+--- a/drivers/soc/qcom/qcom_cpucp.c
++++ b/drivers/soc/qcom/qcom_cpucp.c
+@@ -11,11 +11,13 @@
+ #include <linux/platform_device.h>
+ #include <linux/mailbox_controller.h>
+ 
++/* Serialize registers shared by the v2 PDP mailbox instances. */
++static DEFINE_SPINLOCK(cpucp_reg_lock);
++
+ /* CPUCP Register values */
+ #define CPUCP_SEND_IRQ_VAL		BIT(28)
+ #define CPUCP_CLEAR_IRQ_VAL		BIT(3)
+ #define CPUCP_STATUS_IRQ_VAL		BIT(3)
+-#define APSS_CPUCP_RX_MBOX_CMD_MASK	0xFFFFFFFFFFFFFFFF
+ 
+ /**
+  * struct cpucp_ipc     ipc per channel
+@@ -37,6 +39,7 @@
+ 	struct device *dev;
+ 	int irq;
+ 	u32 rx_chans;
++	bool ready;
+ };
+ 
+ struct qcom_cpucp_mbox_desc {
+@@ -56,12 +59,18 @@
+ 	struct qcom_cpucp_ipc *cpucp_ipc = p;
+ 	const struct qcom_cpucp_mbox_desc *desc = cpucp_ipc->desc;
+ 	u32 val;
++	irqreturn_t ret = IRQ_NONE;
+ 	int i;
+ 	unsigned long flags;
++
++	/* Paired with publication after mailbox channel initialization. */
++	if (!smp_load_acquire(&cpucp_ipc->ready))
++		return IRQ_NONE;
+ 
+ 	for (i = 0; i < desc->num_chans; i++) {
+ 		val = readl(cpucp_ipc->rx_irq_base + desc->status_reg + (i * desc->chan_stride));
+ 		if (val & CPUCP_STATUS_IRQ_VAL) {
++			ret = IRQ_HANDLED;
+ 			writel(CPUCP_CLEAR_IRQ_VAL,
+ 			       cpucp_ipc->rx_irq_base + desc->clear_reg + (i * desc->chan_stride));
+ 			/* Make sure reg write is complete before proceeding */
+@@ -73,7 +82,7 @@
+ 		}
+ 	}
+ 
+-	return IRQ_HANDLED;
++	return ret;
+ }
+ 
+ static irqreturn_t qcom_cpucp_v2_mbox_rx_interrupt(int irq, void *p)
+@@ -84,6 +93,10 @@
+ 	u64 status, data;
+ 	int i;
+ 	unsigned long flags;
++
++	/* Paired with publication after mailbox channel initialization. */
++	if (!smp_load_acquire(&cpucp_ipc->ready))
++		return IRQ_NONE;
+ 
+ 	status = readq(cpucp_ipc->rx_irq_base + desc->status_reg);
+ 
+@@ -93,7 +106,7 @@
+ 		if (status & ((u64)1 << i)) {
+ 			data = readq(cpucp_ipc->rx_irq_base + desc->rx_reg +
+ 						(i * desc->chan_stride));
+-			writeq(status, cpucp_ipc->rx_irq_base + desc->clear_reg);
++			writeq(BIT_ULL(i), cpucp_ipc->rx_irq_base + desc->clear_reg);
+ 			/* Make sure reg write is complete before proceeding */
+ 			mb();
+ 			spin_lock_irqsave(&cpucp_ipc->chans[i].lock, flags);
+@@ -112,12 +125,15 @@
+ 	struct qcom_cpucp_ipc *cpucp_ipc = container_of(chan->mbox, struct qcom_cpucp_ipc, mbox);
+ 	unsigned long chan_id = (unsigned long)chan->con_priv;
+ 	const struct qcom_cpucp_mbox_desc *desc = cpucp_ipc->desc;
++	unsigned long flags;
+ 	u64 val;
+ 
+ 	if (desc->v2_mbox) {
++		spin_lock_irqsave(&cpucp_reg_lock, flags);
+ 		val = readq(cpucp_ipc->rx_irq_base + desc->enable_reg);
+ 		val |= ((u64)1 << chan_id);
+ 		writeq(val, cpucp_ipc->rx_irq_base + desc->enable_reg);
++		spin_unlock_irqrestore(&cpucp_reg_lock, flags);
+ 	}
+ 
+ 	return 0;
+@@ -132,9 +148,11 @@
+ 	u64 val;
+ 
+ 	if (desc->v2_mbox) {
++		spin_lock_irqsave(&cpucp_reg_lock, flags);
+ 		val = readq(cpucp_ipc->rx_irq_base + desc->enable_reg);
+ 		val &= ~((u64)1 << chan_id);
+ 		writeq(val, cpucp_ipc->rx_irq_base + desc->enable_reg);
++		spin_unlock_irqrestore(&cpucp_reg_lock, flags);
+ 	}
+ 
+ 	spin_lock_irqsave(&chan->lock, flags);
+@@ -209,6 +227,8 @@
+ 	struct resource *res;
+ 	unsigned long flags = IRQF_TRIGGER_HIGH | IRQF_NO_SUSPEND;
+ 	int ret;
++	unsigned long reg_flags;
++	u64 val, rx_mask;
+ 
+ 	desc = device_get_match_data(&pdev->dev);
+ 	if (!desc)
+@@ -252,12 +272,6 @@
+ 	if (!cpucp_ipc->chans)
+ 		return -ENOMEM;
+ 
+-	if (desc->v2_mbox) {
+-		writeq(0, cpucp_ipc->rx_irq_base + desc->enable_reg);
+-		writeq(0, cpucp_ipc->rx_irq_base + desc->clear_reg);
+-		writeq(0, cpucp_ipc->rx_irq_base + desc->map_reg);
+-	}
+-
+ 	cpucp_ipc->irq = platform_get_irq(pdev, 0);
+ 	if (cpucp_ipc->irq < 0) {
+ 		dev_err(&pdev->dev, "Failed to get the IRQ\n");
+@@ -265,11 +279,24 @@
+ 	}
+ 
+ 	ret = of_property_read_u32(cpucp_ipc->dev->of_node, "qcom,rx-chans",
+-						&cpucp_ipc->rx_chans);
+-	if (ret < 0 || !cpucp_ipc->rx_chans)
+-		dev_dbg(&pdev->dev, "Missing chans mask. Skipping\n");
+-	else
++				   &cpucp_ipc->rx_chans);
++	if (ret && ret != -EINVAL)
++		return ret;
++	if (cpucp_ipc->rx_chans & ~GENMASK(desc->num_chans - 1, 0))
++		return -EINVAL;
++	if (cpucp_ipc->rx_chans)
+ 		flags |= IRQF_SHARED;
++
++	rx_mask = cpucp_ipc->rx_chans ?: GENMASK_ULL(desc->num_chans - 1, 0);
++	if (desc->v2_mbox) {
++		spin_lock_irqsave(&cpucp_reg_lock, reg_flags);
++		val = readq(cpucp_ipc->rx_irq_base + desc->enable_reg);
++		writeq(val & ~rx_mask, cpucp_ipc->rx_irq_base + desc->enable_reg);
++		writeq(rx_mask, cpucp_ipc->rx_irq_base + desc->clear_reg);
++		val = readq(cpucp_ipc->rx_irq_base + desc->map_reg);
++		writeq(val | rx_mask, cpucp_ipc->rx_irq_base + desc->map_reg);
++		spin_unlock_irqrestore(&cpucp_reg_lock, reg_flags);
++	}
+ 	ret = devm_request_irq(&pdev->dev, cpucp_ipc->irq,
+ 			desc->v2_mbox ? qcom_cpucp_v2_mbox_rx_interrupt : qcom_cpucp_rx_interrupt,
+ 			flags, "qcom_cpucp", cpucp_ipc);
+@@ -277,25 +304,24 @@
+ 	if (ret < 0)
+ 		return dev_err_probe(&pdev->dev, ret, "Failed to register the irq\n");
+ 
+-	if (desc->v2_mbox)
+-		writeq(APSS_CPUCP_RX_MBOX_CMD_MASK, cpucp_ipc->rx_irq_base + desc->map_reg);
+-
+ 	ret = qcom_cpucp_ipc_setup_mbox(cpucp_ipc);
+ 	if (ret)
+ 		return dev_err_probe(&pdev->dev, ret, "Failed to create mailbox\n");
+ 
++	/* IRQ handlers may use channel locks only after registration completes. */
++	smp_store_release(&cpucp_ipc->ready, true);
+ 	platform_set_drvdata(pdev, cpucp_ipc);
+ 
+ 	return 0;
+ }
+ 
+-static int qcom_cpucp_remove(struct platform_device *pdev)
++static void qcom_cpucp_remove(struct platform_device *pdev)
+ {
+ 	struct qcom_cpucp_ipc *cpucp_ipc = platform_get_drvdata(pdev);
+ 
++	WRITE_ONCE(cpucp_ipc->ready, false);
++	devm_free_irq(&pdev->dev, cpucp_ipc->irq, cpucp_ipc);
+ 	mbox_controller_unregister(&cpucp_ipc->mbox);
+-
+-	return 0;
+ }
+ 
+ static const struct qcom_cpucp_mbox_desc cpucp_mbox_desc = {
+--- a/drivers/firmware/arm_scmi/qcom_scmi_vendor.c
++++ b/drivers/firmware/arm_scmi/qcom_scmi_vendor.c
+@@ -3,7 +3,7 @@
+  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
+-#include "common.h"
++#include "protocols.h"
+ #include <linux/qcom_scmi_vendor.h>
+ 
+ #define	EXTENDED_MSG_ID			0
+@@ -21,8 +21,10 @@
+ 	struct scmi_xfer *t;
+ 	uint32_t *msg;
+ 
+-	if (!ph || !ph->xops)
++	if (!ph || !ph->xops || (size && !buf))
+ 		return ret;
++	if (size > SCMI_MAX_TX_RX_SIZE - PROTOCOL_PAYLOAD_SIZE)
++		return -EMSGSIZE;
+ 	ret = ph->xops->xfer_get_init(ph, SET_PARAM, size + PROTOCOL_PAYLOAD_SIZE,
+ 			SCMI_MAX_TX_RX_SIZE, &t);
+ 	if (ret)
+@@ -48,6 +50,8 @@
+ 
+ 	if (!ph || !ph->xops || !buf)
+ 		return ret;
++	if (tx_size > SCMI_MAX_TX_RX_SIZE - PROTOCOL_PAYLOAD_SIZE)
++		return -EMSGSIZE;
+ 	ret = ph->xops->xfer_get_init(ph, GET_PARAM, tx_size + PROTOCOL_PAYLOAD_SIZE,
+ 			SCMI_MAX_TX_RX_SIZE, &t);
+ 	if (ret)
+@@ -63,10 +67,12 @@
+ 		if (t->rx.len > rx_size) {
+ 			pr_err("SCMI received buffer size %lu is more than expected size %lu\n",
+ 				t->rx.len, rx_size);
+-			return -EMSGSIZE;
++			ret = -EMSGSIZE;
++			goto out;
+ 		}
+ 		memcpy(buf, t->rx.buf, t->rx.len);
+ 	}
++out:
+ 	ph->xops->xfer_put(ph, t);
+ 
+ 	return ret;
+@@ -79,8 +85,10 @@
+ 	struct scmi_xfer *t;
+ 	uint32_t *msg;
+ 
+-	if (!ph || !ph->xops)
++	if (!ph || !ph->xops || (size && !buf))
+ 		return ret;
++	if (size > SCMI_MAX_TX_RX_SIZE - PROTOCOL_PAYLOAD_SIZE)
++		return -EMSGSIZE;
+ 	ret = ph->xops->xfer_get_init(ph, START_ACTIVITY, size + PROTOCOL_PAYLOAD_SIZE,
+ 			SCMI_MAX_TX_RX_SIZE, &t);
+ 	if (ret)
+@@ -104,8 +112,10 @@
+ 	struct scmi_xfer *t;
+ 	uint32_t *msg;
+ 
+-	if (!ph || !ph->xops)
++	if (!ph || !ph->xops || (size && !buf))
+ 		return ret;
++	if (size > SCMI_MAX_TX_RX_SIZE - PROTOCOL_PAYLOAD_SIZE)
++		return -EMSGSIZE;
+ 	ret = ph->xops->xfer_get_init(ph, STOP_ACTIVITY, size + PROTOCOL_PAYLOAD_SIZE,
+ 			SCMI_MAX_TX_RX_SIZE, &t);
+ 	if (ret)
+@@ -145,12 +155,14 @@
+ 
+ static const struct scmi_protocol qcom_scmi_vendor = {
+ 	.id = QCOM_SCMI_VENDOR_PROTOCOL,
++	.vendor_id = "Qualcomm",
+ 	.owner = THIS_MODULE,
+ 	.instance_init = &qcom_scmi_vendor_protocol_init,
+ 	.ops = &qcom_proto_ops,
+ };
+ module_scmi_protocol(qcom_scmi_vendor);
+ 
++MODULE_ALIAS("scmi-protocol-0x80-Qualcomm");
+ MODULE_SOFTDEP("pre: qcom_cpucp");
+ MODULE_DESCRIPTION("qcom scmi vendor Protocol");
+ MODULE_LICENSE("GPL");
+--- a/drivers/soc/qcom/dcvs/qcom_scmi_client.c
++++ b/drivers/soc/qcom/dcvs/qcom_scmi_client.c
+@@ -12,29 +12,31 @@
+ #include <linux/errno.h>
+ #include <linux/platform_device.h>
+ 
+-struct scmi_device *scmi_dev;
+-static int scmi_client_inited;
++static struct scmi_device *scmi_dev;
+ 
+ struct scmi_device *get_qcom_scmi_device(void)
+ {
+-	if (!scmi_client_inited)
++	struct scmi_device *sdev;
++
++	/* Paired with publication of the initialized SCMI client. */
++	sdev = smp_load_acquire(&scmi_dev);
++	if (!sdev)
+ 		return ERR_PTR(-EPROBE_DEFER);
+ 
+-	if (!scmi_dev || !scmi_dev->handle)
+-		return ERR_PTR(-ENODEV);
+-	return scmi_dev;
++	return sdev;
+ }
+ EXPORT_SYMBOL_GPL(get_qcom_scmi_device);
+ 
+ static int scmi_client_probe(struct scmi_device *sdev)
+ {
+-	int ret = 0;
++	if (!sdev->handle)
++		return -ENODEV;
++	if (READ_ONCE(scmi_dev))
++		return -EBUSY;
+ 
+-	scmi_dev = sdev;
+-	if (!sdev)
+-		ret = -ENODEV;
+-	scmi_client_inited = 1;
+-	return ret;
++	/* Publish the handle only after the SCMI core has initialized it. */
++	smp_store_release(&scmi_dev, sdev);
++	return 0;
+ }
+ 
+ static const struct scmi_device_id scmi_id_table[] = {
+@@ -47,8 +49,15 @@
+ 	.name		= "qcom-scmi-driver",
+ 	.probe		= scmi_client_probe,
+ 	.id_table	= scmi_id_table,
++	.driver.suppress_bind_attrs = true,
+ };
+-module_scmi_driver(qcom_scmi_client_drv);
++
++/* Consumers retain the platform's SCMI handle for their lifetime. */
++static int __init qcom_scmi_client_init(void)
++{
++	return scmi_register(&qcom_scmi_client_drv);
++}
++module_init(qcom_scmi_client_init);
+ 
+ MODULE_SOFTDEP("pre: qcom_scmi_vendor");
+ MODULE_DESCRIPTION("QCOM SCMI client driver");

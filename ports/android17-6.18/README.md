@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 77 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 80 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 77 platform `.ko` files, their symbol tables and DDK configurations.
+- 80 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 3464
-imported symbol CRCs across all 77 modules.
+used. The current [validation report](validation-20261031.json) checks 3500
+imported symbol CRCs across all 80 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -230,10 +230,26 @@ wake, receive threads stop, and queued memory work drains before descriptors
 are freed. The deferred-free worker also supports stop and drain. Unknown queue
 names fail cleanly, and receiver allocation/thread failures unwind registration.
 These adaptations pass checkpatch with no errors, warnings or style checks;
-the full build passes 3464 imported-symbol CRC checks without compiler/modpost
+the full build passes 3500 imported-symbol CRC checks without compiler/modpost
 warnings. Cross-VM sharing, secure-display allocation and memory pressure still
 require device testing. `ZONE_DEVICE` and reserved-IPA support remain disabled,
 matching the Onyx HLOS baseline; guest-only mapping paths are not validated.
+
+The CPU power-control group adds `qcom_cpucp`, `qcom_scmi_vendor` and
+`qcom_scmi_client`. Tuna uses the original two-channel CPUCP mailbox and
+vendor SCMI protocol 0x80. The Sun FAST mailbox client is not required by
+Tuna's device tree. Interrupt handlers wait for channel initialization and
+are freed before controller teardown; v2 shared receivers acknowledge only
+their channels and serialize shared register updates.
+
+The vendor SCMI protocol uses private definitions from pinned 6.18 common and
+the required `Qualcomm` vendor identity/module alias. Requests retain their
+16-byte vendor header and command IDs. Payload sizes are bounded before buffer
+allocation, and oversized replies release the transfer before returning an
+error. The client remains resident with bind attributes suppressed because
+consumers retain its handle; the built-in SCMI parent also suppresses unbind.
+This group builds and passes checkpatch without warnings. Firmware replies,
+DCVS decisions and suspend/resume still require phone validation.
 
 ## Baseline inventory
 
