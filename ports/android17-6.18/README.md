@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 115 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 118 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 115 platform `.ko` files, their symbol tables and DDK configurations.
+- 118 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 5264
-imported symbol CRCs across all 115 modules.
+used. The current [validation report](validation-20261031.json) checks 5568
+imported symbol CRCs across all 118 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -325,17 +325,15 @@ changes are captured for later porting; they are not in this initial group.
 
 ## Next implementation gates
 
-1. Complete the remaining first-stage dependencies, including CPU thermal controls.
-   Test UFS/encryption, probe ordering, GPIO wakeups, SCM wait queues and
-   shared-memory operations.
-2. Port the device trees and remaining first-stage list; produce matching
-   vendor_boot, DTBO and DLKM images with complete dependency/load lists.
-3. Validate WALT scheduling and port KGSL/display, thermal, audio, camera, touch,
-   fingerprint, WLAN and other device modules. The hook mismatches in the
-   [feasibility study](../../Documentation/konoha/android17-6.18-feasibility.md)
-   still need semantic fixes.
-4. Integrate KernelSU/NetHunter after the device baseline works. Perform boot,
-   hardware and suspend/resume validation using the resulting test package before
+1. Finish applicable second-stage buses, remote processor/GLINK services, USB
+   controller/ADB and charging. Applicable first-stage modules and device-tree
+   assembly now build; storage and other hardware still need device validation.
+2. Port GPU/display, audio, camera, touch, fingerprint, WLAN and remaining device
+   modules. Semantic fixes to the vendor interfaces remain necessary.
+3. Produce matching boot/vendor_boot, DTBO and DLKM images with complete load
+   lists. Preserve the required WALT kernel command-line allocation parameter.
+4. Integrate KernelSU/NetHunter and validate the installer. Perform boot,
+   hardware and suspend/resume validation with the resulting test package before
    declaring a stable release.
 
 Compilation, matching CRCs and preserved tables do not validate firmware
@@ -689,3 +687,39 @@ kernel compiler or modpost warnings; the adaptation passes checkpatch. Both
 device-tree overlay checks also pass, with the unchanged vendor DTC warnings
 recorded separately. The USB controller, its charging services and other
 peripheral drivers still need porting before image assembly.
+
+
+## GENI I2C/SPI and GPI DMA
+
+The bus group adds `msm_gpi`, `i2c-msm-geni` and `spi-msm-geni`. It uses pinned
+common GENI interfaces and DMA private headers. Wrapper diagnostics use the
+actual common wrapper layout instead of treating it as a serial-engine object.
+SPI uses the current controller/target API and explicit chip-select accessors;
+trace assignments follow the current tracepoint API.
+
+GPI validates DT channel masks, static channel indexes and event-ring expansion.
+Ring sizes use wide multiplication, power-of-two rounding and the hardware's
+16-bit length bound. SG entries are checked before copying into rings. Failure
+unwind addresses each initialized channel, diagnostics exist before publication,
+and removal preserves other controllers' debugfs directories. Reset IRQs and
+event/descriptor tasklets drain before their backing storage is freed. A DMA
+synchronization callback drains IRQ, event and relevant descriptor callbacks
+following successful termination.
+
+I2C removes clients before turning off the bus. SPI's managed controller storage
+survives unregister and cleanup. Probe errors unwind runtime PM and bandwidth
+votes; channel acquisition errors propagate. Clock references belong to the
+consumer rather than accumulating on its parent. DMA mapping failures unwind
+earlier mappings, including successful DMA address zero, and unmapping is
+idempotent. Resume errors stop before accessing unclocked registers. SPI tracks
+IRQ enable state explicitly, and timeout calculations use wide arithmetic.
+
+`verify_geni.py WORKSPACE` executes staged helpers under AddressSanitizer and
+UndefinedBehaviorSanitizer: 4,263,779 ring cases, 111,537 mapping-failure cases,
+four clock sequences, 131,072 IRQ sequences and eight DMA synchronization
+sequences. It also compares the private wrapper declaration with pinned common.
+The [recorded results](geni-validation-20261031.json) model kernel services;
+they do not exercise bus transfers, real interrupts, runtime PM or firmware.
+The full 118-module build passes 5,568 imported-symbol CRC checks with no kernel
+compiler or modpost warnings. Device-tree checks pass with the existing 1,084
+vendor DTC warnings recorded separately. The adaptation passes checkpatch.

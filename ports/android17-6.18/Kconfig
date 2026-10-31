@@ -454,3 +454,17 @@ config QTI_PMIC_EUSB2_REPEATER
 config USB_MSM_EUSB2_PHY
 	tristate "Onyx eUSB2 PHY"
 	depends on USB_REPEATER
+
+config MSM_GPI_DMA
+	tristate "Onyx GPI DMA"
+	depends on ARCH_QCOM
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+
+config I2C_MSM_GENI
+	tristate "Onyx GENI I2C"
+	depends on I2C && QCOM_GENI_SE && MSM_GPI_DMA
+
+config SPI_MSM_GENI
+	tristate "Onyx GENI SPI"
+	depends on SPI && QCOM_GENI_SE && MSM_GPI_DMA

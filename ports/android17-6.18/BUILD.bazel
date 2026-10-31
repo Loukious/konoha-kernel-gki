@@ -3,6 +3,9 @@ load("//build/kernel/kleaf:kernel.bzl", "ddk_headers", "ddk_module", "kernel_mod
 load("@rules_pkg//pkg:install.bzl", "pkg_install")
 load("@rules_pkg//pkg:mappings.bzl", "pkg_files", "strip_prefix")
 
+# Allow separately staged peripheral packages to reuse platform providers.
+package(default_visibility = ["//visibility:public"])
+
 ddk_headers(
     name = "scm_headers",
     hdrs = glob([
@@ -1496,6 +1499,44 @@ ddk_module(
     deps = [],
 )
 
+ddk_headers(
+    name = "geni_headers",
+    hdrs = ["include/linux/msm_gpi.h", "include/linux/qcom-geni-se-common.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "msm_gpi",
+    srcs = ["drivers/dma/qcom/msm_gpi.c", "drivers/dma/qcom/msm_gpi_mmio.h", "drivers/dma/dmaengine.h", "drivers/dma/virt-dma.h"],
+    out = "msm_gpi.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":geni_headers", ":platform_headers", ":qcom_ipc_logging"],
+)
+
+ddk_module(
+    name = "i2c_msm_geni",
+    srcs = ["drivers/i2c/busses/i2c-msm-geni.c", "drivers/i2c/busses/i2c-qup-trace.h"],
+    out = "i2c-msm-geni.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":geni_headers", ":platform_headers", ":msm_gpi", ":qcom_ipc_logging"],
+    includes = ["drivers/i2c/busses"],
+)
+
+ddk_module(
+    name = "spi_msm_geni",
+    srcs = ["drivers/spi/spi-msm-geni.c", "drivers/spi/spi-qup-trace.h"],
+    includes = ["drivers/spi"],
+    out = "spi-msm-geni.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":geni_headers", ":platform_headers", ":msm_gpi", ":qcom_ipc_logging"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1594,6 +1635,9 @@ kernel_module_group(
         ":thermal_pause",
         ":cpu_hotplug",
         ":sg",
+        ":msm_gpi",
+        ":i2c_msm_geni",
+        ":spi_msm_geni",
         ":usb_repeater",
         ":eusb2_repeater",
         ":msm_eusb2_phy",

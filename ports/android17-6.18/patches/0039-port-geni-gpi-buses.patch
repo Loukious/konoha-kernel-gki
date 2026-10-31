@@ -1,0 +1,1926 @@
+--- a/drivers/dma/qcom/msm_gpi.c
++++ b/drivers/dma/qcom/msm_gpi.c
+@@ -475,8 +475,6 @@
+ 	struct mutex qup_se_lock; /* qup SE instance lock */
+ };
+ 
+-static struct gpi_dev *gpi_dev_dbg[5];
+-static int arr_idx;
+ 
+ struct reg_info {
+ 	char *name;
+@@ -1515,7 +1513,7 @@
+ 		xfer = &gsi->rx;
+ 
+ 	for (i = 0; i < GSI_MAX_TRE_TYPES; i++) {
+-		if (xfer->tre.flags & (1 << i))
++		if (xfer->tre.flags & BIT(i))
+ 			tre_cnt++;
+ 	}
+ 	sg_init_table(xfer->sg, tre_cnt);
+@@ -1790,7 +1788,7 @@
+  *
+  * Return: Returns success or failure
+  */
+-int gpi_terminate_channel(struct gpii_chan *gpii_chan)
++static int gpi_terminate_channel(struct gpii_chan *gpii_chan)
+ {
+ 	struct gpii *gpii = gpii_chan->gpii;
+ 	int ret = 0;
+@@ -2752,7 +2750,7 @@
+ }
+ 
+ /* marks all pending events for the channel as stale */
+-void gpi_mark_stale_events(struct gpii_chan *gpii_chan)
++static void gpi_mark_stale_events(struct gpii_chan *gpii_chan)
+ {
+ 	struct gpii *gpii = gpii_chan->gpii;
+ 	struct gpi_ring *ev_ring = gpii->ev_ring;
+@@ -3089,9 +3087,22 @@
+ static void gpi_free_ring(struct gpi_ring *ring,
+ 			  struct gpii *gpii)
+ {
+-	dma_free_coherent(gpii->gpi_dev->dev, ring->alloc_size,
+-			  ring->pre_aligned, ring->dma_handle);
++	if (ring->pre_aligned)
++		dma_free_coherent(gpii->gpi_dev->dev, ring->alloc_size,
++				  ring->pre_aligned, ring->dma_handle);
+ 	memset(ring, 0, sizeof(*ring));
++}
++
++/* Both channel and event ring length registers have 16 bits. */
++static int gpi_ring_len(u32 elements, u32 el_size, u32 *len)
++{
++	u64 bytes = (u64)elements * el_size;
++
++	if (elements < 2 || !is_power_of_2(el_size) || !bytes ||
++	    bytes > BIT(15))
++		return -EINVAL;
++	*len = roundup_pow_of_two((u32)bytes);
++	return 0;
+ }
+ 
+ /* allocate memory for transfer and event rings */
+@@ -3100,19 +3111,16 @@
+ 			  u32 el_size,
+ 			  struct gpii *gpii)
+ {
+-	u64 len = elements * el_size;
+-	int bit;
+-
+-	/* ring len must be power of 2 */
+-	bit = find_last_bit((unsigned long *)&len, 32);
+-	if (((1 << bit) - 1) & len)
+-		bit++;
+-	len = 1 << bit;
+-	ring->alloc_size = (len + (len - 1));
+-	GPII_INFO(gpii, GPI_DBG_COMMON,
+-		  "#el:%u el_size:%u len:%u actual_len:%llu alloc_size:%lu\n",
+-		  elements, el_size, (elements * el_size), len,
+-		  ring->alloc_size);
++	u32 len;
++	int ret;
++
++	ret = gpi_ring_len(elements, el_size, &len);
++	if (ret)
++		return ret;
++	if (ring->pre_aligned)
++		return -EBUSY;
++	ring->alloc_size = 2 * len - 1;
++
+ 	ring->pre_aligned = dma_alloc_coherent(gpii->gpi_dev->dev,
+ 					       ring->alloc_size,
+ 					       &ring->dma_handle, GFP_KERNEL);
+@@ -3124,7 +3132,7 @@
+ 	}
+ 
+ 	/* align the physical mem */
+-	ring->phys_addr = (ring->dma_handle + (len - 1)) & ~(len - 1);
++	ring->phys_addr = ALIGN(ring->dma_handle, (dma_addr_t)len);
+ 	ring->base = ring->pre_aligned + (ring->phys_addr - ring->dma_handle);
+ 	ring->rp = ring->base;
+ 	ring->wp = ring->base;
+@@ -3173,7 +3181,7 @@
+  *
+  * Return: Returns success or failure
+  */
+-int gpi_terminate_all(struct dma_chan *chan)
++static int gpi_terminate_all(struct dma_chan *chan)
+ {
+ 	struct gpii_chan *gpii_chan = to_gpii_chan(chan);
+ 	struct gpii *gpii = gpii_chan->gpii;
+@@ -3545,7 +3553,7 @@
+ 	return 0;
+ }
+ 
+-void gpi_desc_free(struct virt_dma_desc *vd)
++static void gpi_desc_free(struct virt_dma_desc *vd)
+ {
+ 	struct gpi_desc *gpi_desc = to_gpi_desc(vd);
+ 
+@@ -3554,7 +3562,7 @@
+ }
+ 
+ /* copy tre into transfer ring */
+-struct dma_async_tx_descriptor *gpi_prep_slave_sg(struct dma_chan *chan,
++static struct dma_async_tx_descriptor *gpi_prep_slave_sg(struct dma_chan *chan,
+ 					struct scatterlist *sgl,
+ 					unsigned int sg_len,
+ 					enum dma_transfer_direction direction,
+@@ -3582,6 +3590,9 @@
+ 		return NULL;
+ 	}
+ 
++	if (!sg_len || !ch_ring->configured)
++		return NULL;
++
+ 	ch_state = gpi_read_ch_state(gpii_chan);
+ 	GPII_VERB(gpii, gpii_chan->chid, "enter_c wp:0x%0llx rp:0x%0llx state:%s\n",
+ 		  to_physical(ch_ring, ch_ring->wp), to_physical(ch_ring, ch_ring->rp),
+@@ -3595,7 +3606,10 @@
+ 	for_each_sg(sgl, sg, sg_len, i) {
+ 		GPII_VERB(gpii, gpii_chan->chid,
+ 			  "%d of %u len:%u\n", i, sg_len, sg->length);
+-		nr_req += (sg->length / ch_ring->el_size);
++		if (!sg->length || sg->length % ch_ring->el_size || !sg_virt(sg) ||
++		    sg->length / ch_ring->el_size > nr - nr_req)
++			return NULL;
++		nr_req += sg->length / ch_ring->el_size;
+ 	}
+ 	GPII_VERB(gpii, gpii_chan->chid, "el avail:%u req:%u\n", nr, nr_req);
+ 
+@@ -3812,13 +3826,15 @@
+ 
+ error_start_chan:
+ 	for (i = i - 1; i >= 0; i--) {
+-		gpi_send_cmd(gpii, gpii_chan, GPI_CH_CMD_STOP);
+-		gpi_send_cmd(gpii, gpii_chan, GPI_CH_CMD_RESET);
+-	}
+-	i = 2;
++		gpi_send_cmd(gpii, &gpii->gpii_chan[i], GPI_CH_CMD_STOP);
++		gpi_send_cmd(gpii, &gpii->gpii_chan[i], GPI_CH_CMD_RESET);
++	}
++
++	i = MAX_CHANNELS_PER_GPII;
+ error_alloc_chan:
+ 	for (i = i - 1; i >= 0; i--)
+-		gpi_reset_chan(gpii_chan, GPI_CH_CMD_DE_ALLOC);
++		gpi_reset_chan(&gpii->gpii_chan[i], GPI_CH_CMD_DE_ALLOC);
++	gpi_send_cmd(gpii, NULL, GPI_EV_CMD_DEALLOC);
+ error_alloc_ev_ring:
+ 	gpi_disable_interrupts(gpii);
+ error_config_int:
+@@ -3862,6 +3878,9 @@
+ 		gpi_reset_chan(gpii_chan, GPI_CH_CMD_DE_ALLOC);
+ 	}
+ 
++	/* Drain deferred descriptor callbacks before releasing their storage. */
++	vchan_synchronize(&gpii_chan->vc);
++
+ 	/* free all allocated memory */
+ 	gpi_free_ring(gpii_chan->ch_ring, gpii);
+ 	vchan_free_chan_resources(&gpii_chan->vc);
+@@ -3890,11 +3909,11 @@
+ 	if (cur_state == ACTIVE_STATE)
+ 		gpi_send_cmd(gpii, NULL, GPI_EV_CMD_DEALLOC);
+ 
++	/* Deallocation IRQs can schedule work after the first tasklet drain. */
++	if (gpii->configured_irq)
++		gpi_disable_interrupts(gpii);
++	tasklet_kill(&gpii->ev_task);
+ 	gpi_free_ring(gpii->ev_ring, gpii);
+-
+-	/* disable interrupts */
+-	if (cur_state == ACTIVE_STATE)
+-		gpi_disable_interrupts(gpii);
+ 
+ 	/* set final state to disable */
+ 	write_lock_irq(&gpii->pm_lock);
+@@ -3903,6 +3922,24 @@
+ 
+ exit_free:
+ 	mutex_unlock(&gpii->ctrl_lock);
++}
++
++/* Called after successful termination and before the client unmaps buffers. */
++static void gpi_synchronize(struct dma_chan *chan)
++{
++	struct gpii_chan *gpii_chan = to_gpii_chan(chan);
++	struct gpii *gpii = gpii_chan->gpii;
++	int first, last, i;
++
++	if (READ_ONCE(gpii->configured_irq))
++		synchronize_irq(gpii->irq);
++	tasklet_kill(&gpii->ev_task);
++
++	/* Non-UART termination resets the TX/RX pair together. */
++	first = gpii->protocol == SE_PROTOCOL_UART ? gpii_chan->chid : 0;
++	last = gpii->protocol == SE_PROTOCOL_UART ? first + 1 : MAX_CHANNELS_PER_GPII;
++	for (i = first; i < last; i++)
++		vchan_synchronize(&gpii->gpii_chan[i].vc);
+ }
+ 
+ /* allocate channel resources */
+@@ -3935,7 +3972,8 @@
+ 
+ static int gpi_find_static_gpii(struct gpi_dev *gpi_dev, int gpii_no)
+ {
+-	if ((gpi_dev->static_gpii_mask) & (1<<gpii_no))
++	if (gpii_no >= 0 && gpii_no < gpi_dev->max_gpii &&
++	    (gpi_dev->static_gpii_mask & BIT(gpii_no)))
+ 		return gpii_no;
+ 
+ 	return -EIO;
+@@ -3949,7 +3987,7 @@
+ 
+ 	/* check if same seid is already configured for another chid */
+ 	for (gpii = 0; gpii < gpi_dev->max_gpii; gpii++) {
+-		if (!((1 << gpii) & gpii_mask))
++		if (!(BIT(gpii) & gpii_mask))
+ 			continue;
+ 
+ 		tx_chan = &gpi_dev->gpiis[gpii].gpii_chan[GPI_TX_CHAN];
+@@ -3963,7 +4001,7 @@
+ 
+ 	/* no channels configured with same seid, return next avail gpii */
+ 	for (gpii = 0; gpii < gpi_dev->max_gpii; gpii++) {
+-		if (!((1 << gpii) & gpii_mask))
++		if (!(BIT(gpii) & gpii_mask))
+ 			continue;
+ 
+ 		tx_chan = &gpi_dev->gpiis[gpii].gpii_chan[GPI_TX_CHAN];
+@@ -4067,7 +4105,7 @@
+ 
+ 	if (args->args_count < REQ_OF_DMA_ARGS) {
+ 		GPI_ERR(gpi_dev,
+-			"gpii require minimum 6 args, client passed:%d args\n",
++			"gpii requires 5 args, client passed:%d args\n",
+ 			args->args_count);
+ 		return NULL;
+ 	}
+@@ -4077,6 +4115,11 @@
+ 		GPI_ERR(gpi_dev, "gpii channel:%d not valid\n", chid);
+ 		return NULL;
+ 	}
++
++	/* Check event-ring expansion before shifting or allocating memory. */
++	if (args->args[3] < 2 ||
++	    args->args[3] > (BIT(15) / sizeof(union gpi_event)) >> gpi_dev->ev_factor)
++		return NULL;
+ 
+ 	mutex_lock(&gpi_dev->qup_se_lock);
+ 	seid = args->args[1];
+@@ -4114,6 +4157,10 @@
+ 		gpii, chid, gpii_chan->req_tres, gpii_chan->priority,
+ 		gpii_chan->protocol, gpii_chan->seid, gpii_chan->init_config);
+ 	dma_chan = dma_get_slave_channel(&gpii_chan->vc.chan);
++	if (!dma_chan) {
++		mutex_unlock(&gpi_dev->qup_se_lock);
++		return NULL;
++	}
+ 
+ 	if (gpi_dev->is_le_vm) {
+ 		/* Power on case expecting channel state should be NOT allocated.
+@@ -4128,6 +4175,7 @@
+ 			if (ret) {
+ 				GPII_ERR(gpii_chan->gpii, gpii_chan->chid,
+ 					 "gpi_cleanup_hw_channel failed\n");
++				dma_release_channel(dma_chan);
+ 				mutex_unlock(&gpi_dev->qup_se_lock);
+ 				return NULL;
+ 			}
+@@ -4166,8 +4214,8 @@
+ 	for (i = 0; i < gpi_dev->max_gpii; i++) {
+ 		struct gpii *gpii;
+ 
+-		if (!(((1 << i) & gpi_dev->gpii_mask)  ||
+-				((1 << i) & gpi_dev->static_gpii_mask)))
++		if (!((BIT(i) & gpi_dev->gpii_mask)  ||
++				(BIT(i) & gpi_dev->static_gpii_mask)))
+ 			continue;
+ 
+ 		gpii = &gpi_dev->gpiis[i];
+@@ -4194,6 +4242,20 @@
+ 	}
+ }
+ 
++static void gpi_cleanup_debug(void *data)
++{
++	struct gpi_dev *gpi_dev = data;
++	int i;
++
++	debugfs_remove_recursive(gpi_dev->dentry);
++	for (i = 0; i < gpi_dev->max_gpii; i++) {
++		if (gpi_dev->gpiis[i].ilctxt)
++			ipc_log_context_destroy(gpi_dev->gpiis[i].ilctxt);
++	}
++	if (gpi_dev->ilctxt)
++		ipc_log_context_destroy(gpi_dev->ilctxt);
++}
++
+ static int gpi_probe(struct platform_device *pdev)
+ {
+ 	struct gpi_dev *gpi_dev;
+@@ -4203,9 +4265,6 @@
+ 	gpi_dev = devm_kzalloc(&pdev->dev, sizeof(*gpi_dev), GFP_KERNEL);
+ 	if (!gpi_dev)
+ 		return -ENOMEM;
+-
+-	/* debug purpose */
+-	gpi_dev_dbg[arr_idx++] = gpi_dev;
+ 
+ 	gpi_dev->dev = &pdev->dev;
+ 	gpi_dev->klog_lvl = DEFAULT_KLOG_LVL;
+@@ -4258,15 +4317,22 @@
+ 		return ret;
+ 	}
+ 
+-	ret = dma_set_mask(gpi_dev->dev, DMA_BIT_MASK(64));
++	if (!gpi_dev->max_gpii || gpi_dev->max_gpii > 32 ||
++	    gpi_dev->ev_factor > 10 ||
++	    ((u64)(gpi_dev->gpii_mask | gpi_dev->static_gpii_mask) >>
++	     gpi_dev->max_gpii) ||
++	    (gpi_dev->gpii_mask & gpi_dev->static_gpii_mask))
++		return -EINVAL;
++
++	ret = dma_set_mask_and_coherent(gpi_dev->dev, DMA_BIT_MASK(64));
+ 	if (ret) {
+ 		GPI_ERR(gpi_dev,
+ 		"Error setting dma_mask to 64, ret:%d\n", ret);
+ 		return ret;
+ 	}
+ 
+-	gpi_dev->gpiis = devm_kzalloc(gpi_dev->dev,
+-				sizeof(*gpi_dev->gpiis) * gpi_dev->max_gpii,
++	gpi_dev->gpiis = devm_kcalloc(gpi_dev->dev, gpi_dev->max_gpii,
++				 sizeof(*gpi_dev->gpiis),
+ 				GFP_KERNEL);
+ 	if (!gpi_dev->gpiis)
+ 		return -ENOMEM;
+@@ -4308,8 +4374,8 @@
+ 
+ 		gpii->is_resumed = true;
+ 
+-		if (!(((1 << i) & gpi_dev->gpii_mask)  ||
+-				((1 << i) & gpi_dev->static_gpii_mask)))
++		if (!((BIT(i) & gpi_dev->gpii_mask)  ||
++				(BIT(i) & gpi_dev->static_gpii_mask)))
+ 			continue;
+ 
+ 		/* set up ev cntxt register map */
+@@ -4389,8 +4455,8 @@
+ 		BIT(DMA_DEV_TO_MEM) | BIT(DMA_MEM_TO_DEV);
+ 	gpi_dev->dma_device.residue_granularity =
+ 		DMA_RESIDUE_GRANULARITY_DESCRIPTOR;
+-	gpi_dev->dma_device.src_addr_widths = DMA_SLAVE_BUSWIDTH_8_BYTES;
+-	gpi_dev->dma_device.dst_addr_widths = DMA_SLAVE_BUSWIDTH_8_BYTES;
++	gpi_dev->dma_device.src_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_8_BYTES);
++	gpi_dev->dma_device.dst_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_8_BYTES);
+ 	gpi_dev->dma_device.device_alloc_chan_resources =
+ 		gpi_alloc_chan_resources;
+ 	gpi_dev->dma_device.device_free_chan_resources =
+@@ -4400,9 +4466,16 @@
+ 	gpi_dev->dma_device.device_prep_slave_sg = gpi_prep_slave_sg;
+ 	gpi_dev->dma_device.device_config = gpi_config;
+ 	gpi_dev->dma_device.device_terminate_all = gpi_terminate_all;
++	gpi_dev->dma_device.device_synchronize = gpi_synchronize;
+ 	gpi_dev->dma_device.dev = gpi_dev->dev;
+ 	gpi_dev->dma_device.device_pause = gpi_pause;
+ 	gpi_dev->dma_device.device_resume = gpi_resume;
++
++	/* Publish diagnostics before clients can request channels. */
++	gpi_setup_debug(gpi_dev);
++	ret = devm_add_action_or_reset(gpi_dev->dev, gpi_cleanup_debug, gpi_dev);
++	if (ret)
++		return ret;
+ 
+ 	/* register with dmaengine framework */
+ 	ret = dma_async_device_register(&gpi_dev->dma_device);
+@@ -4415,17 +4488,16 @@
+ 					 gpi_of_dma_xlate, gpi_dev);
+ 	if (ret) {
+ 		GPI_ERR(gpi_dev, "of_dma_controller_reg failed ret:%d", ret);
++		dma_async_device_unregister(&gpi_dev->dma_device);
+ 		return ret;
+ 	}
+ 
+-	/* setup debug capabilities */
+-	gpi_setup_debug(gpi_dev);
+ 	GPI_LOG(gpi_dev, "%s: probe success\n", __func__);
+ 
+ 	return ret;
+ }
+ 
+-static int gpi_remove(struct platform_device *pdev)
++static void gpi_remove(struct platform_device *pdev)
+ {
+ 	struct gpi_dev *gpi_dev = platform_get_drvdata(pdev);
+ 	int i;
+@@ -4437,8 +4509,8 @@
+ 		struct gpii *gpii = &gpi_dev->gpiis[i];
+ 		int chan;
+ 
+-		if (!(((1 << i) & gpi_dev->gpii_mask)  ||
+-				((1 << i) & gpi_dev->static_gpii_mask)))
++		if (!((BIT(i) & gpi_dev->gpii_mask)  ||
++				(BIT(i) & gpi_dev->static_gpii_mask)))
+ 			continue;
+ 
+ 		for (chan = 0; chan < MAX_CHANNELS_PER_GPII; chan++) {
+@@ -4446,20 +4518,7 @@
+ 
+ 			gpi_free_chan_resources(&gpii_chan->vc.chan);
+ 		}
+-
+-		if (gpii->ilctxt)
+-			ipc_log_context_destroy(gpii->ilctxt);
+-	}
+-
+-	for (i = 0; i < arr_idx; i++)
+-		gpi_dev_dbg[i] = NULL;
+-	arr_idx = 0;
+-
+-	if (gpi_dev->ilctxt)
+-		ipc_log_context_destroy(gpi_dev->ilctxt);
+-
+-	debugfs_remove(pdentry);
+-	return 0;
++	}
+ }
+ 
+ static const struct of_device_id gpi_of_match[] = {
+@@ -4479,13 +4538,19 @@
+ 
+ static int __init gpi_init(void)
+ {
++	int ret;
++
+ 	pdentry = debugfs_create_dir(GPI_DMA_DRV_NAME, NULL);
+-	return platform_driver_register(&gpi_driver);
++	ret = platform_driver_register(&gpi_driver);
++	if (ret)
++		debugfs_remove_recursive(pdentry);
++	return ret;
+ }
+ 
+ static void __exit gpi_exit(void)
+ {
+ 	platform_driver_unregister(&gpi_driver);
++	debugfs_remove_recursive(pdentry);
+ }
+ 
+ module_init(gpi_init);
+--- a/drivers/i2c/busses/i2c-msm-geni.c
++++ b/drivers/i2c/busses/i2c-msm-geni.c
+@@ -34,7 +34,6 @@
+ #define SE_I2C_TX_TRANS_LEN		(0x26C)
+ #define SE_I2C_RX_TRANS_LEN		(0x270)
+ #define SE_I2C_SCL_COUNTERS		(0x278)
+-#define SE_GENI_M_GP_LENGTH		(0x910)
+ 
+ /* M_CMD OP codes for I2C */
+ #define I2C_WRITE		(0x1)
+@@ -131,7 +130,7 @@
+ };
+ 
+ /* FTRACE Logging */
+-void i2c_trace_log(struct device *dev, const char *fmt, ...)
++static void i2c_trace_log(struct device *dev, const char *fmt, ...)
+ {
+ 	struct va_format vaf = {
+ 		.fmt = fmt,
+@@ -240,8 +239,6 @@
+ 	bool old_i2c_freq; /* Configure the I2C bus speed using the older counter settings. */
+ };
+ 
+-static struct geni_i2c_dev *gi2c_dev_dbg[MAX_SE];
+-static int arr_idx;
+ static int geni_i2c_runtime_suspend(struct device *dev);
+ 
+ struct geni_i2c_err_log {
+@@ -358,7 +355,7 @@
+  *
+  * Return:	None
+  */
+-void geni_i2c_se_dump_dbg_regs(struct geni_se *se, void __iomem *base,
++static void geni_i2c_se_dump_dbg_regs(struct geni_se *se, void __iomem *base,
+ 				void *ipc)
+ {
+ 	u32 m_cmd0 = 0;
+@@ -504,7 +501,6 @@
+ {
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	struct geni_i2c_dev *gi2c = platform_get_drvdata(pdev);
+-	char name[36];
+ 
+ 	if (!gi2c)
+ 		return -EINVAL;
+@@ -514,20 +510,12 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	/* ipc logs for kpi's measure */
+-	if (gi2c->i2c_kpi && !gi2c->ipc_log_kpi) {
+-		memset(name, 0, sizeof(name));
+-		scnprintf(name, sizeof(name), "%s%s", dev_name(gi2c->dev), "_kpi");
+-		gi2c->ipc_log_kpi = ipc_log_context_create(IPC_LOG_KPI_PAGES, name, 0);
+-		if (!gi2c->ipc_log_kpi && IS_ENABLED(CONFIG_IPC_LOGGING))
+-			dev_err(&pdev->dev, "Error creating kpi IPC logs\n");
+-	}
+ 
+ 	return size;
+ }
+ static DEVICE_ATTR_RW(capture_kpi);
+ 
+-struct geni_i2c_clk_fld *geni_i2c_get_itr_value(struct geni_i2c_dev *gi2c)
++static struct geni_i2c_clk_fld *geni_i2c_get_itr_value(struct geni_i2c_dev *gi2c)
+ {
+ 	struct geni_i2c_clk_fld *itr;
+ 
+@@ -1190,7 +1178,7 @@
+  *
+  * Return:  None.
+  */
+-void gi2c_gsi_tx_unmap(struct geni_i2c_dev *gi2c, u32 msg_idx, u32 wr_idx)
++static void gi2c_gsi_tx_unmap(struct geni_i2c_dev *gi2c, u32 msg_idx, u32 wr_idx)
+ {
+ 	if (gi2c->msgs[msg_idx].len > IMMEDIATE_DMA_LEN) {
+ 		geni_se_common_iommu_unmap_buf(gi2c->wrapper_dev, &gi2c->tx_ph[wr_idx],
+@@ -1449,7 +1437,7 @@
+ 	return rx_t;
+ }
+ 
+-void geni_i2c_get_immediate_dma_data(u8 *dword, int len, uint8_t *buf)
++static void geni_i2c_get_immediate_dma_data(u8 *dword, int len, uint8_t *buf)
+ {
+ 	int i = 0;
+ 
+@@ -2467,7 +2455,7 @@
+  *
+  * Return: None
+  */
+-void geni_i2c_fifo_dma_rw(struct geni_i2c_dev *gi2c, struct i2c_msg msgs[], u32 msg_idx,
++static void geni_i2c_fifo_dma_rw(struct geni_i2c_dev *gi2c, struct i2c_msg msgs[], u32 msg_idx,
+ 			  enum geni_se_xfer_mode *mode, dma_addr_t *rx_dma, dma_addr_t *tx_dma,
+ 			  u8 *dma_buf, u32 m_param)
+ {
+@@ -2920,14 +2908,14 @@
+ 		return ret;
+ 	}
+ 
+-	gi2c->m_ahb_clk = devm_clk_get(gi2c->dev->parent, "m-ahb");
++	gi2c->m_ahb_clk = devm_get_clk_from_child(gi2c->dev, gi2c->dev->parent->of_node, "m-ahb");
+ 	if (IS_ERR(gi2c->m_ahb_clk)) {
+ 		ret = PTR_ERR(gi2c->m_ahb_clk);
+ 		dev_err(&pdev->dev, "Err getting M AHB clk %d\n", ret);
+ 		return ret;
+ 	}
+ 
+-	gi2c->s_ahb_clk = devm_clk_get(gi2c->dev->parent, "s-ahb");
++	gi2c->s_ahb_clk = devm_get_clk_from_child(gi2c->dev, gi2c->dev->parent->of_node, "s-ahb");
+ 	if (IS_ERR(gi2c->s_ahb_clk)) {
+ 		ret = PTR_ERR(gi2c->s_ahb_clk);
+ 		dev_err(&pdev->dev, "Err getting S AHB clk %d\n", ret);
+@@ -3003,14 +2991,11 @@
+ 	struct resource *res;
+ 	int ret;
+ 	struct device *dev = &pdev->dev;
++	char ipc_name[I2C_NAME_SIZE];
+ 
+ 	gi2c = devm_kzalloc(&pdev->dev, sizeof(*gi2c), GFP_KERNEL);
+ 	if (!gi2c)
+ 		return -ENOMEM;
+-
+-	if (arr_idx < MAX_SE)
+-		/* Debug purpose */
+-		gi2c_dev_dbg[arr_idx++] = gi2c;
+ 
+ 	gi2c->dev = dev;
+ 
+@@ -3115,6 +3100,7 @@
+ 		return -ENOMEM;
+ 	}
+ 
++	gi2c->adap.owner = THIS_MODULE;
+ 	gi2c->adap.algo = &geni_i2c_algo;
+ 	init_completion(&gi2c->xfer);
+ 	init_completion(&gi2c->m_cancel_cmd);
+@@ -3131,15 +3117,21 @@
+ 		pm_runtime_set_autosuspend_delay(gi2c->dev, I2C_AUTO_SUSPEND_DELAY);
+ 		pm_runtime_use_autosuspend(gi2c->dev);
+ 	}
++	scnprintf(ipc_name, sizeof(ipc_name), "%s_kpi", dev_name(dev));
++	gi2c->ipc_log_kpi = ipc_log_context_create(IPC_LOG_KPI_PAGES, ipc_name, 0);
++	atomic_set(&gi2c->is_xfer_in_progress, 0);
+ 	pm_runtime_enable(gi2c->dev);
+ 	ret = i2c_add_adapter(&gi2c->adap);
+ 	if (ret) {
+ 		dev_err(gi2c->dev, "Add adapter failed, ret=%d\n", ret);
++		pm_runtime_disable(gi2c->dev);
++		if (gi2c->ipc_log_kpi)
++			ipc_log_context_destroy(gi2c->ipc_log_kpi);
+ 		return ret;
+ 	}
+ 
+-	device_create_file(gi2c->dev, &dev_attr_capture_kpi);
+-	atomic_set(&gi2c->is_xfer_in_progress, 0);
++	if (device_create_file(gi2c->dev, &dev_attr_capture_kpi))
++		dev_warn(gi2c->dev, "Could not create KPI attribute\n");
+ 	if (gi2c->i2c_test_dev) {
+ 		/* configure Test bus to dump test bus later, only once */
+ 		test_bus_enable_per_qupv3(gi2c->wrapper_dev, gi2c->ipcl);
+@@ -3150,16 +3142,14 @@
+ 	return 0;
+ }
+ 
+-static int geni_i2c_remove(struct platform_device *pdev)
++static void geni_i2c_remove(struct platform_device *pdev)
+ {
+ 	struct geni_i2c_dev *gi2c = platform_get_drvdata(pdev);
+-	int i;
+-
+-	if (atomic_read(&gi2c->is_xfer_in_progress)) {
+-		I2C_LOG_ERR(gi2c->ipcl, true, gi2c->dev,
+-			    "%s: Xfer is in progress\n", __func__);
+-		return -EBUSY;
+-	}
++
++	/* Remove clients and drain transfers before disabling the bus. */
++	i2c_del_adapter(&gi2c->adap);
++	pm_runtime_get_noresume(gi2c->dev);
++	pm_runtime_barrier(gi2c->dev);
+ 
+ 	if (!pm_runtime_status_suspended(gi2c->dev)) {
+ 		if (geni_i2c_runtime_suspend(gi2c->dev))
+@@ -3183,20 +3173,18 @@
+ 	pm_runtime_put_noidle(gi2c->dev);
+ 	pm_runtime_set_suspended(gi2c->dev);
+ 	pm_runtime_disable(gi2c->dev);
+-	i2c_del_adapter(&gi2c->adap);
+-
+-	for (i = 0; i < arr_idx; i++)
+-		gi2c_dev_dbg[i] = NULL;
+-	arr_idx = 0;
+ 
+ 	device_remove_file(gi2c->dev, &dev_attr_capture_kpi);
++
++	if (!gi2c->is_le_vm)
++		devm_free_irq(gi2c->dev, gi2c->irq, gi2c);
+ 
+ 	if (gi2c->ipc_log_kpi)
+ 		ipc_log_context_destroy(gi2c->ipc_log_kpi);
+ 
+ 	if (gi2c->ipcl)
+ 		ipc_log_context_destroy(gi2c->ipcl);
+-	return 0;
++	return;
+ }
+ 
+ /**
+@@ -3287,7 +3275,9 @@
+ 			geni_se_common_clks_off(gi2c->i2c_rsc.clk,
+ 						gi2c->m_ahb_clk, gi2c->s_ahb_clk);
+ 		} else if (!gi2c->is_le_vm) {
+-			geni_se_resources_off(&gi2c->i2c_rsc);
++			ret = geni_se_resources_off(&gi2c->i2c_rsc);
++			if (ret)
++				goto resume_dma;
+ 		}
+ 
+ 		goto skip_bw_vote;
+@@ -3318,7 +3308,9 @@
+ 			I2C_LOG_DBG(gi2c->ipcl, false, gi2c->dev,
+ 			"%s failing at geni_icc_disable ret=%d\n", __func__, ret);
+ 	} else if (!gi2c->is_le_vm) {
+-		geni_se_resources_off(&gi2c->i2c_rsc);
++		ret = geni_se_resources_off(&gi2c->i2c_rsc);
++		if (ret)
++			goto resume_dma;
+ 		ret = geni_icc_disable(&gi2c->i2c_rsc);
+ 		if (ret)
+ 			I2C_LOG_DBG(gi2c->ipcl, false, gi2c->dev,
+@@ -3333,6 +3325,13 @@
+ 	geni_capture_stop_time(&gi2c->i2c_rsc, gi2c->ipc_log_kpi, __func__,
+ 			       gi2c->i2c_kpi, start_time, 0, 0);
+ 	return 0;
++
++resume_dma:
++	if (gi2c->se_mode == GSI_ONLY)
++		geni_i2c_gpi_pause_resume(gi2c, false);
++	if (gi2c->se_mode == FIFO_SE_DMA)
++		enable_irq(gi2c->irq);
++	return ret;
+ }
+ 
+ static int geni_i2c_runtime_resume(struct device *dev)
+@@ -3366,7 +3365,7 @@
+ 		if (ret) {
+ 			I2C_LOG_ERR(gi2c->ipcl, true, gi2c->dev,
+ 			"%s failing at icc set bw ret=%d\n", __func__, ret);
+-			return ret;
++			goto disable_icc;
+ 		}
+ 
+ skip_bw_vote:
+@@ -3375,19 +3374,19 @@
+ 			if (ret) {
+ 				I2C_LOG_DBG(gi2c->ipcl, false, gi2c->dev,
+ 				"%s failing at core clk prepare enable ret=%d\n", __func__, ret);
+-				return ret;
++				goto disable_icc;
+ 			}
+ 		}
+ 
+ 		/* Do not control clk/gpio/icb for LE-VM */
+ 		ret = geni_se_resources_on(&gi2c->i2c_rsc);
+ 		if (ret)
+-			return ret;
++			goto disable_core;
+ 
+ 		ret = geni_i2c_prepare(gi2c);
+ 		if (ret) {
+ 			dev_err(gi2c->dev, "I2C prepare failed: %d\n", ret);
+-			return ret;
++			goto disable_resources;
+ 		}
+ 
+ 		geni_write_reg(0x7f, gi2c->base, GENI_OUTPUT_CTRL);
+@@ -3405,7 +3404,7 @@
+ 			if (ret) {
+ 				I2C_LOG_ERR(gi2c->ipcl, false, gi2c->dev,
+ 					"%s: ret:%d\n", __func__, ret);
+-				return ret;
++				goto disable_resources;
+ 			}
+ 		}
+ 
+@@ -3446,6 +3445,18 @@
+ 	geni_capture_stop_time(&gi2c->i2c_rsc, gi2c->ipc_log_kpi, __func__,
+ 			       gi2c->i2c_kpi, start_time, 0, 0);
+ 	return 0;
++
++disable_resources:
++	if (geni_se_resources_off(&gi2c->i2c_rsc))
++		geni_se_common_clks_off(gi2c->i2c_rsc.clk,
++				       gi2c->m_ahb_clk, gi2c->s_ahb_clk);
++disable_core:
++	if (gi2c->is_i2c_hub)
++		clk_disable_unprepare(gi2c->core_clk);
++disable_icc:
++	if (!gi2c->skip_bw_vote)
++		geni_icc_disable(&gi2c->i2c_rsc);
++	return ret;
+ }
+ 
+ static int geni_i2c_suspend_late(struct device *device)
+@@ -3557,5 +3568,6 @@
+ 
+ module_init(i2c_dev_init);
+ module_exit(i2c_dev_exit);
++MODULE_DESCRIPTION("Onyx GENI I2C controller");
+ MODULE_LICENSE("GPL");
+ MODULE_ALIAS("platform:i2c_geni");
+--- a/drivers/i2c/busses/i2c-qup-trace.h
++++ b/drivers/i2c/busses/i2c-qup-trace.h
+@@ -27,7 +27,7 @@
+ 		),
+ 
+ 		TP_fast_assign(
+-			__assign_str(name, name);
++			__assign_str(name);
+ 			WARN_ON_ONCE(vsnprintf(__get_dynamic_array(msg),
+ 									MAX_MSG_LEN, vaf->fmt,
+ 									*vaf->va) >= MAX_MSG_LEN);
+--- a/drivers/spi/spi-msm-geni.c
++++ b/drivers/spi/spi-msm-geni.c
+@@ -16,6 +16,7 @@
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/pm_runtime.h>
++#include <linux/platform_device.h>
+ #include <linux/soc/qcom/geni-se.h>
+ #include <linux/qcom-geni-se-common.h>
+ #include <linux/msm_gpi.h>
+@@ -134,7 +135,7 @@
+ #include "spi-qup-trace.h"
+ 
+ /* FTRACE Logging */
+-void spi_trace_log(struct device *dev, const char *fmt, ...)
++static void spi_trace_log(struct device *dev, const char *fmt, ...)
+ {
+ 	struct va_format vaf = {
+ 		.fmt = fmt,
+@@ -149,7 +150,7 @@
+ }
+ 
+ struct gsi_desc_cb {
+-	struct spi_master *spi;
++	struct spi_controller *spi;
+ 	struct spi_transfer *xfer;
+ };
+ 
+@@ -188,6 +189,7 @@
+ 	resource_size_t size;
+ 	void __iomem *base;
+ 	int irq;
++	bool irq_enabled;
+ 	struct device *dev;
+ 	int rx_fifo_depth;
+ 	int tx_fifo_depth;
+@@ -250,7 +252,7 @@
+  *
+  * Return:	None
+  */
+-void geni_spi_se_dump_dbg_regs(struct geni_se *se, void __iomem *base,
++static void geni_spi_se_dump_dbg_regs(struct geni_se *se, void __iomem *base,
+ 				void *ipc)
+ {
+ 	u32 m_cmd0 = 0;
+@@ -433,12 +435,12 @@
+ {
+ 	struct platform_device *pdev = container_of(dev, struct
+ 						platform_device, dev);
+-	struct spi_master *spi = platform_get_drvdata(pdev);
++	struct spi_controller *spi = platform_get_drvdata(pdev);
+ 	struct spi_geni_master *geni_mas;
+ 
+-	geni_mas = spi_master_get_devdata(spi);
+-
+-	return scnprintf(buf, sizeof(int), "%d\n", geni_mas->max_data_dump_size);
++	geni_mas = spi_controller_get_devdata(spi);
++
++	return sysfs_emit(buf, "%d\n", geni_mas->max_data_dump_size);
+ }
+ 
+ /*
+@@ -456,10 +458,10 @@
+ {
+ 	struct platform_device *pdev = container_of(dev, struct
+ 						platform_device, dev);
+-	struct spi_master *spi = platform_get_drvdata(pdev);
++	struct spi_controller *spi = platform_get_drvdata(pdev);
+ 	struct spi_geni_master *geni_mas;
+ 
+-	geni_mas = spi_master_get_devdata(spi);
++	geni_mas = spi_controller_get_devdata(spi);
+ 
+ 	spin_lock(&geni_mas->data_dump_lock);
+ 	if (kstrtoint(buf, 0, &geni_mas->max_data_dump_size)) {
+@@ -484,13 +486,13 @@
+ 	ssize_t ret = 0;
+ 	struct platform_device *pdev = container_of(dev, struct
+ 						platform_device, dev);
+-	struct spi_master *spi = platform_get_drvdata(pdev);
++	struct spi_controller *spi = platform_get_drvdata(pdev);
+ 	struct spi_geni_master *geni_mas;
+ 
+-	geni_mas = spi_master_get_devdata(spi);
++	geni_mas = spi_controller_get_devdata(spi);
+ 
+ 	if (geni_mas)
+-		ret = scnprintf(buf, sizeof(int), "%d\n",
++		ret = sysfs_emit(buf, "%d\n",
+ 				geni_mas->slave_state);
+ 	return ret;
+ }
+@@ -517,14 +519,14 @@
+ 				struct device_attribute *attr, char *buf)
+ {
+ 	struct platform_device *pdev = to_platform_device(dev);
+-	struct spi_master *spi = platform_get_drvdata(pdev);
++	struct spi_controller *spi = platform_get_drvdata(pdev);
+ 	struct spi_geni_master *geni_mas;
+ 
+-	geni_mas = spi_master_get_devdata(spi);
++	geni_mas = spi_controller_get_devdata(spi);
+ 	if (!geni_mas)
+ 		return -EINVAL;
+ 
+-	return scnprintf(buf, sizeof(int), "%d\n", geni_mas->spi_kpi);
++	return sysfs_emit(buf, "%d\n", geni_mas->spi_kpi);
+ }
+ 
+ /*
+@@ -542,11 +544,10 @@
+ 				 size_t size)
+ {
+ 	struct platform_device *pdev = to_platform_device(dev);
+-	struct spi_master *spi = platform_get_drvdata(pdev);
++	struct spi_controller *spi = platform_get_drvdata(pdev);
+ 	struct spi_geni_master *geni_mas;
+-	char name[36];
+-
+-	geni_mas = spi_master_get_devdata(spi);
++
++	geni_mas = spi_controller_get_devdata(spi);
+ 	if (!geni_mas)
+ 		return -EINVAL;
+ 
+@@ -555,13 +556,6 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (geni_mas->spi_kpi && !geni_mas->ipc_log_kpi) {
+-		memset(name, 0, sizeof(name));
+-		scnprintf(name, sizeof(name), "%s%s", dev_name(geni_mas->dev), "_kpi");
+-		geni_mas->ipc_log_kpi = ipc_log_context_create(IPC_LOG_KPI_PAGES, name, 0);
+-		if (!geni_mas->ipc_log_kpi && IS_ENABLED(CONFIG_IPC_LOGGING))
+-			dev_err(&pdev->dev, "Error creating kpi IPC logs\n");
+-	}
+ 
+ 	return size;
+ }
+@@ -596,19 +590,19 @@
+ 	dev_info(mas->dev, "spi slave setup done\n");
+ }
+ 
+-static int spi_slv_abort(struct spi_master *spi)
+-{
+-	struct spi_geni_master *mas = spi_master_get_devdata(spi);
++static int spi_slv_abort(struct spi_controller *spi)
++{
++	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+ 
+ 	complete_all(&mas->tx_cb);
+ 	complete_all(&mas->rx_cb);
+ 	return 0;
+ }
+ 
+-static struct spi_master *get_spi_master(struct device *dev)
++static struct spi_controller *get_spi_master(struct device *dev)
+ {
+ 	struct platform_device *pdev = to_platform_device(dev);
+-	struct spi_master *spi = platform_get_drvdata(pdev);
++	struct spi_controller *spi = platform_get_drvdata(pdev);
+ 
+ 	return spi;
+ }
+@@ -620,6 +614,10 @@
+ 	unsigned long res_freq;
+ 	struct geni_se *se = &mas->spi_rsc;
+ 	int ret = 0;
++
++	if (!speed_hz || !mas->oversampling ||
++	    speed_hz > UINT_MAX / mas->oversampling)
++		return -EINVAL;
+ 
+ 	ret = geni_se_clk_freq_match(&mas->spi_rsc,
+ 				(speed_hz * mas->oversampling), clk_idx,
+@@ -675,9 +673,9 @@
+ }
+ 
+ static int setup_fifo_params(struct spi_device *spi_slv,
+-					struct spi_master *spi)
+-{
+-	struct spi_geni_master *mas = spi_master_get_devdata(spi);
++					struct spi_controller *spi)
++{
++	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+ 	u16 mode = spi_slv->mode;
+ 	u32 loopback_cfg = geni_read_reg(mas->base, SE_SPI_LOOPBACK);
+ 	u32 cpol = geni_read_reg(mas->base, SE_SPI_CPOL);
+@@ -706,7 +704,7 @@
+ 		cpha |= CPHA;
+ 
+ 	if (spi_slv->mode & SPI_CS_HIGH)
+-		demux_output_inv |= BIT(spi_slv->chip_select);
++		demux_output_inv |= BIT(spi_get_chipselect(spi_slv, 0));
+ 
+ 	if (spi_slv->controller_data) {
+ 		u32 cs_clk_delay = 0;
+@@ -724,7 +722,7 @@
+ 		(inter_words_delay | cs_clk_delay);
+ 	}
+ 
+-	demux_sel = spi_slv->chip_select;
++	demux_sel = spi_get_chipselect(spi_slv, 0);
+ 	mas->cur_speed_hz = spi_slv->max_speed_hz;
+ 	mas->cur_word_len = spi_slv->bits_per_word;
+ 
+@@ -759,10 +757,10 @@
+ }
+ 
+ 
+-static int select_xfer_mode(struct spi_master *spi,
++static int select_xfer_mode(struct spi_controller *spi,
+ 				struct spi_message *spi_msg)
+ {
+-	struct spi_geni_master *mas = spi_master_get_devdata(spi);
++	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+ 	int mode = GENI_SE_DMA;
+ 	int fifo_disable = (geni_read_reg(mas->base,  GENI_IF_DISABLE_RO) &
+ 							FIFO_IF_DISABLE);
+@@ -917,7 +915,7 @@
+ static void spi_gsi_ch_cb(struct dma_chan *ch, struct msm_gpi_cb const *cb,
+ 				void *ptr)
+ {
+-	struct spi_master *spi = ptr;
++	struct spi_controller *spi = ptr;
+ 	struct spi_geni_master *mas;
+ 
+ 	if (!ptr || !cb) {
+@@ -925,7 +923,7 @@
+ 		return;
+ 	}
+ 
+-	mas = spi_master_get_devdata(spi);
++	mas = spi_controller_get_devdata(spi);
+ 	switch (cb->cb_event) {
+ 	case MSM_GPI_QUP_NOTIFY:
+ 	case MSM_GPI_QUP_MAX_EVENT:
+@@ -966,7 +964,7 @@
+ 	struct msm_gpi_dma_async_tx_cb_param *cb_param =
+ 			(struct msm_gpi_dma_async_tx_cb_param *)cb;
+ 	struct gsi_desc_cb *desc_cb;
+-	struct spi_master *spi;
++	struct spi_controller *spi;
+ 	struct spi_transfer *xfer;
+ 	struct spi_geni_master *mas;
+ 
+@@ -978,7 +976,7 @@
+ 	desc_cb = (struct gsi_desc_cb *)cb_param->userdata;
+ 	spi = desc_cb->spi;
+ 	xfer = desc_cb->xfer;
+-	mas = spi_master_get_devdata(spi);
++	mas = spi_controller_get_devdata(spi);
+ 
+ 	if (xfer->rx_buf) {
+ 		if (cb_param->status == MSM_GPI_TCE_UNEXP_ERR) {
+@@ -1005,7 +1003,7 @@
+ {
+ 	struct msm_gpi_dma_async_tx_cb_param *cb_param = cb;
+ 	struct gsi_desc_cb *desc_cb;
+-	struct spi_master *spi;
++	struct spi_controller *spi;
+ 	struct spi_transfer *xfer;
+ 	struct spi_geni_master *mas;
+ 
+@@ -1017,7 +1015,7 @@
+ 	desc_cb = (struct gsi_desc_cb *)cb_param->userdata;
+ 	spi = desc_cb->spi;
+ 	xfer = desc_cb->xfer;
+-	mas = spi_master_get_devdata(spi);
++	mas = spi_controller_get_devdata(spi);
+ 
+ 	/*
+ 	 * Case when lock/unlock support is required:
+@@ -1062,9 +1060,9 @@
+  * Lock bus is done in runtime_resume and unlock
+  * bus is done in runtime_suspend.
+  */
+-static int spi_geni_lock_bus(struct spi_master *spi)
+-{
+-	struct spi_geni_master *mas = spi_master_get_devdata(spi);
++static int spi_geni_lock_bus(struct spi_controller *spi)
++{
++	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+ 	struct msm_gpi_tre *lock_t = NULL;
+ 	int ret = 0, timeout = 0;
+ 	struct scatterlist *xfer_tx_sg = mas->gsi_lock_unlock->tx_sg;
+@@ -1120,9 +1118,9 @@
+ 	return ret;
+ }
+ 
+-static void spi_geni_unlock_bus(struct spi_master *spi)
+-{
+-	struct spi_geni_master *mas = spi_master_get_devdata(spi);
++static void spi_geni_unlock_bus(struct spi_controller *spi)
++{
++	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+ 	struct msm_gpi_tre *unlock_t = NULL;
+ 	int ret = 0, timeout = 0;
+ 	struct scatterlist *xfer_tx_sg = mas->gsi_lock_unlock->tx_sg;
+@@ -1187,7 +1185,7 @@
+ static int setup_gsi_xfer(struct spi_transfer *xfer,
+ 				struct spi_geni_master *mas,
+ 				struct spi_device *spi_slv,
+-				struct spi_master *spi)
++				struct spi_controller *spi)
+ {
+ 	int ret = 0;
+ 	struct msm_gpi_tre *c0_tre = NULL;
+@@ -1265,7 +1263,7 @@
+ 		rx_nent++;
+ 	}
+ 
+-	cs |= spi_slv->chip_select;
++	cs |= spi_get_chipselect(spi_slv, 0);
+ 	if (!xfer->cs_change) {
+ 		if (!list_is_last(&xfer->transfer_list,
+ 					&spi->cur_msg->transfers))
+@@ -1355,11 +1353,18 @@
+ 	return ret;
+ }
+ 
++static void spi_geni_unmap_buf(struct spi_geni_master *mas, struct spi_message *msg);
++
+ static int spi_geni_map_buf(struct spi_geni_master *mas,
+ 				struct spi_message *msg)
+ {
+ 	struct spi_transfer *xfer;
+ 	int ret = 0;
++
++	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
++		xfer->rx_dma = DMA_MAPPING_ERROR;
++		xfer->tx_dma = DMA_MAPPING_ERROR;
++	}
+ 
+ 	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
+ 		if (xfer->rx_buf) {
+@@ -1369,7 +1374,7 @@
+ 			if (ret) {
+ 				SPI_LOG_ERR(mas->ipc, true, mas->dev,
+ 					    "%s: Mapping Rx buffer %d\n", __func__, ret);
+-				return ret;
++				goto unmap;
+ 			}
+ 		}
+ 
+@@ -1381,11 +1386,14 @@
+ 			if (ret) {
+ 				SPI_LOG_ERR(mas->ipc, true, mas->dev,
+ 					    "%s: Mapping Tx buffer %d\n", __func__, ret);
+-				return ret;
++				goto unmap;
+ 			}
+ 		}
+ 	}
+ 	return 0;
++unmap:
++	spi_geni_unmap_buf(mas, msg);
++	return ret;
+ }
+ 
+ static void spi_geni_unmap_buf(struct spi_geni_master *mas,
+@@ -1403,11 +1411,11 @@
+ 	}
+ }
+ 
+-static int spi_geni_prepare_message(struct spi_master *spi,
++static int spi_geni_prepare_message(struct spi_controller *spi,
+ 					struct spi_message *spi_msg)
+ {
+ 	int ret = 0;
+-	struct spi_geni_master *mas = spi_master_get_devdata(spi);
++	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+ 	int count;
+ 	unsigned long long start_time;
+ 
+@@ -1501,10 +1509,10 @@
+ 	return ret;
+ }
+ 
+-static int spi_geni_unprepare_message(struct spi_master *spi_mas,
++static int spi_geni_unprepare_message(struct spi_controller *spi_mas,
+ 					struct spi_message *spi_msg)
+ {
+-	struct spi_geni_master *mas = spi_master_get_devdata(spi_mas);
++	struct spi_geni_master *mas = spi_controller_get_devdata(spi_mas);
+ 	int count = 0;
+ 	unsigned long long start_time;
+ 
+@@ -1596,16 +1604,16 @@
+  * is called before any actual transfer begins as it involves
+  * generic SW/HW intializations required for a spi transfer.
+  */
+-static int spi_geni_mas_setup(struct spi_master *spi)
+-{
+-	struct spi_geni_master *mas = spi_master_get_devdata(spi);
++static int spi_geni_mas_setup(struct spi_controller *spi)
++{
++	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+ 	int proto = geni_se_read_proto(&mas->spi_rsc);
+ 	unsigned int major;
+ 	unsigned int minor;
+ 	int hw_ver;
+ 	int ret = 0;
+ 
+-	if (spi->slave) {
++	if (spi_controller_is_target(spi)) {
+ 		if (mas->slave_setup)
+ 			goto setup_ipc;
+ 		if (unlikely(proto != GENI_SE_SPI_SLAVE)) {
+@@ -1615,12 +1623,12 @@
+ 	}
+ 
+ 	if (unlikely(!mas->setup)) {
+-		if ((unlikely(proto != GENI_SE_SPI)) && (!spi->slave)) {
++		if ((unlikely(proto != GENI_SE_SPI)) && (!spi_controller_is_target(spi))) {
+ 			dev_err(mas->dev, "Invalid proto %d\n", proto);
+ 			return -ENXIO;
+ 		}
+ 
+-		if (spi->slave)
++		if (spi_controller_is_target(spi))
+ 			spi_slv_setup(mas);
+ 
+ 		if (mas->master_cross_connect)
+@@ -1635,23 +1643,29 @@
+ 
+ 	if (mas->gsi_mode) {
+ 		SPI_LOG_DBG(mas->ipc, false, mas->dev, "%s:GSI mode\n", __func__);
+-		mas->tx = dma_request_slave_channel(mas->dev, "tx");
++		mas->tx = dma_request_chan(mas->dev, "tx");
+ 		if (IS_ERR_OR_NULL(mas->tx)) {
+ 			dev_info(mas->dev, "Failed to get tx DMA ch %ld\n",
+ 						PTR_ERR(mas->tx));
+-			goto setup_ipc;
+-		}
+-		mas->rx = dma_request_slave_channel(mas->dev, "rx");
++			ret = PTR_ERR(mas->tx);
++			mas->tx = NULL;
++			return ret;
++		}
++		mas->rx = dma_request_chan(mas->dev, "rx");
+ 		if (IS_ERR_OR_NULL(mas->rx)) {
+ 			dev_info(mas->dev, "Failed to get rx DMA ch %ld\n",
+ 						PTR_ERR(mas->rx));
++			ret = PTR_ERR(mas->rx);
+ 			dma_release_channel(mas->tx);
+-			goto setup_ipc;
++			mas->tx = NULL;
++			mas->rx = NULL;
++			return ret;
+ 		}
+ 		mas->gsi = devm_kzalloc(mas->dev,
+ 			(sizeof(struct spi_geni_gsi) * NUM_SPI_XFER),
+ 			GFP_KERNEL);
+ 		if (IS_ERR_OR_NULL(mas->gsi)) {
++			ret = -ENOMEM;
+ 			dev_err(mas->dev, "Failed to get GSI mem\n");
+ 			dma_release_channel(mas->tx);
+ 			dma_release_channel(mas->rx);
+@@ -1664,6 +1678,7 @@
+ 				(sizeof(struct spi_geni_gsi)),
+ 				GFP_KERNEL);
+ 			if (IS_ERR_OR_NULL(mas->gsi_lock_unlock)) {
++				ret = -ENOMEM;
+ 				dev_err(mas->dev, "Failed to get GSI lock mem\n");
+ 				dma_release_channel(mas->tx);
+ 				dma_release_channel(mas->rx);
+@@ -1707,6 +1722,8 @@
+ 		mas->tx_wm = 1;
+ 	}
+ setup_ipc:
++	if (ret)
++		return ret;
+ 	dev_info(mas->dev, "tx_fifo %d rx_fifo %d tx_width %d\n",
+ 		mas->tx_fifo_depth, mas->rx_fifo_depth,
+ 		mas->tx_fifo_width);
+@@ -1746,9 +1763,9 @@
+ 	return ret;
+ }
+ 
+-static int spi_geni_prepare_transfer_hardware(struct spi_master *spi)
+-{
+-	struct spi_geni_master *mas = spi_master_get_devdata(spi);
++static int spi_geni_prepare_transfer_hardware(struct spi_controller *spi)
++{
++	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+ 	int ret = 0, count = 0;
+ 	unsigned long long start_time;
+ 
+@@ -1824,9 +1841,9 @@
+ 	return ret;
+ }
+ 
+-static int spi_geni_unprepare_transfer_hardware(struct spi_master *spi)
+-{
+-	struct spi_geni_master *mas = spi_master_get_devdata(spi);
++static int spi_geni_unprepare_transfer_hardware(struct spi_controller *spi)
++{
++	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+ 	int count = 0;
+ 	unsigned long long start_time;
+ 
+@@ -1872,7 +1889,7 @@
+ 
+ static int setup_fifo_xfer(struct spi_transfer *xfer,
+ 				struct spi_geni_master *mas, u16 mode,
+-				struct spi_master *spi)
++				struct spi_controller *spi)
+ {
+ 	int ret = 0;
+ 	u32 m_cmd = 0;
+@@ -1916,7 +1933,7 @@
+ 	else if (xfer->rx_buf)
+ 		m_cmd = SPI_RX_ONLY;
+ 
+-	if (!spi->slave)
++	if (!spi_controller_is_target(spi))
+ 		spi_tx_cfg &= ~CS_TOGGLE;
+ 
+ 	if (!(mas->cur_word_len % MIN_WORD_LEN)) {
+@@ -1953,13 +1970,13 @@
+ 	 * mode for transfers or select the mode dynamically based on
+ 	 * size of data.
+ 	 */
+-	if (spi->slave)
++	if (spi_controller_is_target(spi))
+ 		mas->cur_xfer_mode = GENI_SE_DMA;
+ 	if (mas->disable_dma || trans_len <= fifo_size)
+ 		mas->cur_xfer_mode = GENI_SE_FIFO;
+ 	geni_se_select_mode(&mas->spi_rsc, mas->cur_xfer_mode);
+ 
+-	if (!spi->slave)
++	if (!spi_controller_is_target(spi))
+ 		geni_write_reg(spi_tx_cfg, mas->base, SE_SPI_TRANS_CFG);
+ 	geni_se_setup_m_cmd(&mas->spi_rsc, m_cmd, m_param);
+ 	SPI_LOG_DBG(mas->ipc, false, mas->dev,
+@@ -2001,10 +2018,10 @@
+ 	return ret;
+ }
+ 
+-static void handle_fifo_timeout(struct spi_master *spi,
++static void handle_fifo_timeout(struct spi_controller *spi,
+ 					struct spi_transfer *xfer)
+ {
+-	struct spi_geni_master *mas = spi_master_get_devdata(spi);
++	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+ 	unsigned long timeout;
+ 	u32 rx_fifo_status;
+ 	int rx_wc, i;
+@@ -2013,7 +2030,7 @@
+ 
+ 	if (mas->cur_xfer_mode == GENI_SE_FIFO)
+ 		geni_write_reg(0, mas->base, SE_GENI_TX_WATERMARK_REG);
+-	if (spi->slave)
++	if (spi_controller_is_target(spi))
+ 		goto dma_unprep;
+ 
+ 	reinit_completion(&mas->xfer_done);
+@@ -2069,7 +2086,7 @@
+ 				xfer->rx_dma, xfer->len);
+ 		}
+ 	}
+-	if (spi->slave && !mas->dis_autosuspend)
++	if (spi_controller_is_target(spi) && !mas->dis_autosuspend)
+ 		pm_runtime_put_sync_suspend(mas->dev);
+ 
+ }
+@@ -2122,13 +2139,13 @@
+ 	return ret;
+ }
+ 
+-static int spi_geni_transfer_one(struct spi_master *spi,
++static int spi_geni_transfer_one(struct spi_controller *spi,
+ 				struct spi_device *slv,
+ 				struct spi_transfer *xfer)
+ {
+ 	int ret = 0;
+ 	unsigned int xfer_timeout;
+-	struct spi_geni_master *mas = spi_master_get_devdata(spi);
++	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+ 	unsigned long timeout, xfer_timeout_jiffies;
+ 	unsigned long long start_time;
+ 
+@@ -2157,12 +2174,16 @@
+ 		return -EACCES;
+ 	}
+ 
+-	xfer_timeout = (1000 * xfer->len * BITS_PER_BYTE) / xfer->speed_hz;
++	if (!xfer->speed_hz)
++		return -EINVAL;
++	xfer_timeout = min_t(u64,
++		div_u64((u64)1000 * xfer->len * BITS_PER_BYTE, xfer->speed_hz),
++		UINT_MAX - max_t(u32, mas->xfer_timeout_offset, SPI_XFER_TIMEOUT_OFFSET));
+ 	if (mas->xfer_timeout_offset) {
+ 		xfer_timeout += mas->xfer_timeout_offset;
+ 	} else {
+ 		/* Master <-> slave sync will be valid for smaller time */
+-		if (spi->slave)
++		if (spi_controller_is_target(spi))
+ 			xfer_timeout += SPI_SLAVE_SYNC_XFER_TIMEOUT_OFFSET;
+ 		else
+ 			xfer_timeout += SPI_XFER_TIMEOUT_OFFSET;
+@@ -2182,10 +2203,10 @@
+ 			goto err_fifo_geni_transfer_one;
+ 		}
+ 
+-		if (spi->slave)
++		if (spi_controller_is_target(spi))
+ 			mas->slave_state = true;
+ 		timeout = wait_for_completion_timeout(&mas->xfer_done, xfer_timeout_jiffies);
+-		if (spi->slave)
++		if (spi_controller_is_target(spi))
+ 			mas->slave_state = false;
+ 
+ 		if (!timeout) {
+@@ -2437,7 +2458,7 @@
+  */
+ static void spi_get_dt_property(struct platform_device *pdev,
+ 				struct spi_geni_master *geni_mas,
+-				struct spi_master *spi)
++				struct spi_controller *spi)
+ {
+ 	if (of_property_read_bool(pdev->dev.of_node, "qcom,le-vm")) {
+ 		geni_mas->is_le_vm = true;
+@@ -2495,10 +2516,12 @@
+ 		of_property_read_bool(pdev->dev.of_node, "slv-cross-connected");
+ }
+ 
+-void create_ipc_context(struct spi_geni_master *geni_mas, struct device *dev)
++static void create_ipc_context(struct spi_geni_master *geni_mas, struct device *dev)
+ {
+ 	char name[MAX_IPC_NAME_BUF];
+ 
++	scnprintf(name, sizeof(name), "%s_kpi", dev_name(dev));
++	geni_mas->ipc_log_kpi = ipc_log_context_create(IPC_LOG_KPI_PAGES, name, 0);
+ 	geni_mas->ipc = ipc_log_context_create(4, dev_name(geni_mas->dev), 0);
+ 	if (!geni_mas->ipc && IS_ENABLED(CONFIG_IPC_LOGGING))
+ 		dev_err(dev, "Error creating IPC logs\n");
+@@ -2509,33 +2532,47 @@
+ 		dev_err(dev, "Error creating IPC TX/RX logs\n");
+ }
+ 
++static void spi_geni_set_irq(struct spi_geni_master *mas, bool enable)
++{
++	if (mas->is_le_vm || enable == mas->irq_enabled)
++		return;
++	if (enable)
++		enable_irq(mas->irq);
++	else
++		disable_irq(mas->irq);
++	mas->irq_enabled = enable;
++}
++
++static int spi_geni_runtime_suspend(struct device *dev);
++
+ static int spi_geni_probe(struct platform_device *pdev)
+ {
+ 	int ret;
+-	struct spi_master *spi;
++	struct spi_controller *spi;
+ 	struct spi_geni_master *geni_mas;
+ 	struct resource *res;
+ 	bool slave_en;
++	bool icc_voted = false, pm_enabled = false;
+ 	struct device *dev = &pdev->dev;
+ 	struct geni_se *spi_rsc;
+ 
+ 	slave_en  = of_property_read_bool(pdev->dev.of_node,
+ 			 "qcom,slv-ctrl");
+ 
+-	spi = __spi_alloc_controller(&pdev->dev, sizeof(struct spi_geni_master), slave_en);
++	spi = __devm_spi_alloc_controller(&pdev->dev, sizeof(struct spi_geni_master), slave_en);
+ 	if (!spi) {
+ 		ret = -ENOMEM;
+ 		dev_err(&pdev->dev, "Failed to alloc spi struct\n");
+-		goto spi_geni_probe_err;
++		return ret;
+ 	}
+ 
+ 	if (slave_en)
+-		spi->slave_abort = spi_slv_abort;
++		spi->target_abort = spi_slv_abort;
+ 
+ 	pr_info("boot_kpi: M - DRIVER GENI_SPI Init\n");
+ 
+ 	platform_set_drvdata(pdev, spi);
+-	geni_mas = spi_master_get_devdata(spi);
++	geni_mas = spi_controller_get_devdata(spi);
+ 	geni_mas->dev = dev;
+ 	geni_mas->spi_rsc.dev = dev;
+ 	geni_mas->spi_rsc.wrapper = dev_get_drvdata(dev->parent);
+@@ -2543,7 +2580,8 @@
+ 
+ 	if (!geni_mas->spi_rsc.wrapper) {
+ 		dev_err(&pdev->dev, "SE Wrapper is NULL, deferring probe\n");
+-		return -EPROBE_DEFER;
++		ret = -EPROBE_DEFER;
++		goto spi_geni_probe_err;
+ 	}
+ 
+ 	spi_get_dt_property(pdev, geni_mas, spi);
+@@ -2570,7 +2608,7 @@
+ 		if (ret) {
+ 			dev_err(&pdev->dev, "%s: icc set bw failed ret:%d\n",
+ 				__func__, ret);
+-			return ret;
++			goto spi_geni_probe_err;
+ 		}
+ 
+ 		/* to remove the votes doing icc enable/disable */
+@@ -2578,8 +2616,10 @@
+ 		if (ret) {
+ 			dev_err(&pdev->dev, "%s: icc enable failed ret:%d\n",
+ 				__func__, ret);
+-			return ret;
+-		}
++			goto spi_geni_probe_err;
++		}
++
++		icc_voted = true;
+ 
+ 		geni_mas->geni_pinctrl = devm_pinctrl_get(&pdev->dev);
+ 		if (IS_ERR_OR_NULL(geni_mas->geni_pinctrl)) {
+@@ -2619,14 +2659,14 @@
+ 			goto spi_geni_probe_err;
+ 		}
+ 
+-		geni_mas->m_ahb_clk = devm_clk_get(dev->parent, "m-ahb");
++		geni_mas->m_ahb_clk = devm_get_clk_from_child(dev, dev->parent->of_node, "m-ahb");
+ 		if (IS_ERR(geni_mas->m_ahb_clk)) {
+ 			ret = PTR_ERR(geni_mas->m_ahb_clk);
+ 			dev_err(&pdev->dev, "Err getting M AHB clk %d\n", ret);
+ 			goto spi_geni_probe_err;
+ 		}
+ 
+-		geni_mas->s_ahb_clk = devm_clk_get(dev->parent, "s-ahb");
++		geni_mas->s_ahb_clk = devm_get_clk_from_child(dev, dev->parent->of_node, "s-ahb");
+ 		if (IS_ERR(geni_mas->s_ahb_clk)) {
+ 			ret = PTR_ERR(geni_mas->s_ahb_clk);
+ 			dev_err(&pdev->dev, "Err getting S AHB clk %d\n", ret);
+@@ -2707,6 +2747,7 @@
+ 		pm_runtime_use_autosuspend(&pdev->dev);
+ 	}
+ 	pm_runtime_enable(&pdev->dev);
++	pm_enabled = true;
+ 
+ 	if (!geni_mas->is_le_vm)
+ 		SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev,
+@@ -2720,11 +2761,14 @@
+ 		if (ret) {
+ 			dev_err(&pdev->dev, "%s: icc disable failed ret:%d\n",
+ 				__func__, ret);
+-			return ret;
+-		}
+-	}
+-
+-	ret = spi_register_master(spi);
++			goto spi_geni_probe_err;
++		}
++		icc_voted = false;
++	}
++
++	geni_mas->max_data_dump_size = SPI_DATA_DUMP_SIZE;
++	create_ipc_context(geni_mas, &pdev->dev);
++	ret = spi_register_controller(spi);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "Failed to register SPI master\n");
+ 		goto spi_geni_probe_err;
+@@ -2733,56 +2777,65 @@
+ 	if (device_create_file(geni_mas->dev, &dev_attr_spi_max_dump_size))
+ 		dev_err(&pdev->dev, "Unable to create device file for max_dump_size\n");
+ 
+-	geni_mas->max_data_dump_size = SPI_DATA_DUMP_SIZE;
+-
+-	create_ipc_context(geni_mas, &pdev->dev);
+ 
+ 	ret = sysfs_create_file(&(geni_mas->dev->kobj),
+ 			&dev_attr_spi_slave_state.attr);
+-	device_create_file(geni_mas->dev, &dev_attr_capture_kpi);
+-
+-	geni_mas->is_xfer_in_progress = false;
++	if (ret)
++		dev_warn(dev, "Could not create SPI state attribute\n");
++	if (device_create_file(geni_mas->dev, &dev_attr_capture_kpi))
++		dev_warn(dev, "Could not create KPI attribute\n");
+ 
+ 	dev_info(&pdev->dev, "%s: completed %d\n", __func__, ret);
+ 
+ 	pr_info("boot_kpi: M - DRIVER GENI_SPI_%d Ready\n", spi->bus_num);
+ 
+-	return ret;
++	return 0;
+ spi_geni_probe_err:
+ 	dev_info(&pdev->dev, "%s: ret:%d\n", __func__, ret);
+-	spi_master_put(spi);
+-	return ret;
+-}
+-
+-static int spi_geni_remove(struct platform_device *pdev)
+-{
+-	int ret;
+-	struct spi_master *master = platform_get_drvdata(pdev);
+-	struct spi_geni_master *geni_mas = spi_master_get_devdata(master);
+-
+-	sysfs_remove_file(&pdev->dev.kobj, &dev_attr_spi_slave_state.attr);
+-	device_remove_file(geni_mas->dev, &dev_attr_capture_kpi);
+-	geni_se_common_clks_off(geni_mas->spi_rsc.clk, geni_mas->m_ahb_clk, geni_mas->s_ahb_clk);
+-	ret = geni_icc_disable(&geni_mas->spi_rsc);
+-	if (ret)
+-		SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev,
+-		"%s failing at geni_icc_disable ret=%d\n", __func__, ret);
+-	spi_unregister_master(master);
+-	pm_runtime_put_noidle(&pdev->dev);
+-	pm_runtime_disable(&pdev->dev);
+-
++	if (pm_enabled)
++		pm_runtime_disable(dev);
++	if (icc_voted)
++		geni_icc_disable(&geni_mas->spi_rsc);
+ 	if (geni_mas->ipc)
+ 		ipc_log_context_destroy(geni_mas->ipc);
+-
+ 	if (geni_mas->ipc_log_kpi)
+ 		ipc_log_context_destroy(geni_mas->ipc_log_kpi);
+-
+ 	if (geni_mas->ipc_log_tx_rx)
+ 		ipc_log_context_destroy(geni_mas->ipc_log_tx_rx);
+-
+-	device_remove_file(&pdev->dev, &dev_attr_spi_max_dump_size);
+-
+-	return 0;
++	return ret;
++}
++
++static void spi_geni_remove(struct platform_device *pdev)
++{
++	struct spi_controller *ctlr = platform_get_drvdata(pdev);
++	struct spi_geni_master *mas = spi_controller_get_devdata(ctlr);
++	struct device *dev = &pdev->dev;
++
++	sysfs_remove_file(&dev->kobj, &dev_attr_spi_slave_state.attr);
++	device_remove_file(dev, &dev_attr_capture_kpi);
++	device_remove_file(dev, &dev_attr_spi_max_dump_size);
++	/* Unregister clients and drain queued transfers while resources exist. */
++	spi_unregister_controller(ctlr);
++	pm_runtime_get_noresume(dev);
++	pm_runtime_barrier(dev);
++	if (!pm_runtime_status_suspended(dev)) {
++		if (spi_geni_runtime_suspend(dev))
++			dev_warn(dev, "Could not suspend SPI during removal\n");
++	}
++	pm_runtime_disable(dev);
++	pm_runtime_put_noidle(dev);
++	if (mas->tx)
++		dma_release_channel(mas->tx);
++	if (mas->rx)
++		dma_release_channel(mas->rx);
++	if (!mas->is_le_vm)
++		devm_free_irq(dev, mas->irq, mas);
++	if (mas->ipc)
++		ipc_log_context_destroy(mas->ipc);
++	if (mas->ipc_log_kpi)
++		ipc_log_context_destroy(mas->ipc_log_kpi);
++	if (mas->ipc_log_tx_rx)
++		ipc_log_context_destroy(mas->ipc_log_tx_rx);
+ }
+ 
+ #if IS_ENABLED(CONFIG_PM)
+@@ -2806,7 +2859,7 @@
+ 	return 0;
+ }
+ 
+-static int spi_geni_levm_suspend_proc(struct spi_geni_master *geni_mas, struct spi_master *spi,
++static int spi_geni_levm_suspend_proc(struct spi_geni_master *geni_mas, struct spi_controller *spi,
+ 				      unsigned long long start_time)
+ {
+ 	int ret = 0;
+@@ -2843,14 +2896,15 @@
+ static int spi_geni_runtime_suspend(struct device *dev)
+ {
+ 	int ret = 0;
+-	struct spi_master *spi = get_spi_master(dev);
+-	struct spi_geni_master *geni_mas = spi_master_get_devdata(spi);
++	struct spi_controller *spi = get_spi_master(dev);
++	struct spi_geni_master *geni_mas = spi_controller_get_devdata(spi);
+ 	unsigned long long start_time;
++	bool irq_was_enabled = geni_mas->irq_enabled;
+ 
+ 	start_time = geni_capture_start_time(&geni_mas->spi_rsc, geni_mas->ipc_log_kpi, __func__,
+ 					     geni_mas->spi_kpi);
+ 
+-	disable_irq(geni_mas->irq);
++	spi_geni_set_irq(geni_mas, false);
+ 	if (geni_mas->is_le_vm)
+ 		return spi_geni_levm_suspend_proc(geni_mas, spi, start_time);
+ 
+@@ -2858,8 +2912,10 @@
+ 
+ 	if (geni_mas->gsi_mode) {
+ 		ret = spi_geni_gpi_pause_resume(geni_mas, true);
+-		if (ret)
++		if (ret) {
++			spi_geni_set_irq(geni_mas, irq_was_enabled);
+ 			return ret;
++		}
+ 	}
+ 
+ 	/* For tui usecase LA should control clk/gpio/icb */
+@@ -2877,11 +2933,17 @@
+ 		if (ret)
+ 			SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev,
+ 			"%s failing at geni_icc_disable ret=%d\n", __func__, ret);
+-		return ret;
++		return 0;
+ 	}
+ 
+ exit_rt_suspend:
+ 	ret = geni_se_resources_off(&geni_mas->spi_rsc);
++	if (ret) {
++		if (geni_mas->gsi_mode)
++			spi_geni_gpi_pause_resume(geni_mas, false);
++		spi_geni_set_irq(geni_mas, irq_was_enabled);
++		return ret;
++	}
+ 	ret = geni_icc_disable(&geni_mas->spi_rsc);
+ 	if (ret)
+ 		SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev,
+@@ -2889,10 +2951,10 @@
+ 
+ 	geni_capture_stop_time(&geni_mas->spi_rsc, geni_mas->ipc_log_kpi, __func__,
+ 			       geni_mas->spi_kpi, start_time, 0, 0);
+-	return ret;
+-}
+-
+-static int spi_geni_levm_resume_proc(struct spi_geni_master *geni_mas, struct spi_master *spi,
++	return 0;
++}
++
++static int spi_geni_levm_resume_proc(struct spi_geni_master *geni_mas, struct spi_controller *spi,
+ 				     unsigned long long start_time)
+ {
+ 	int ret = 0;
+@@ -2926,14 +2988,13 @@
+ 			       geni_mas->spi_kpi, start_time, 0, 0);
+ 	/* Return here as LE VM doesn't need resourc/clock management */
+ 	return ret;
+-	return ret;
+ }
+ 
+ static int spi_geni_runtime_resume(struct device *dev)
+ {
+ 	int ret = 0;
+-	struct spi_master *spi = get_spi_master(dev);
+-	struct spi_geni_master *geni_mas = spi_master_get_devdata(spi);
++	struct spi_controller *spi = get_spi_master(dev);
++	struct spi_geni_master *geni_mas = spi_controller_get_devdata(spi);
+ 	unsigned long long start_time;
+ 
+ 	start_time = geni_capture_start_time(&geni_mas->spi_rsc, geni_mas->ipc_log_kpi, __func__,
+@@ -2951,6 +3012,7 @@
+ 			if (ret) {
+ 				SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev,
+ 				"%s dmaengine_resume failed: %d\n", __func__, ret);
++				return ret;
+ 			}
+ 			SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev,
+ 			"%s: Shared_SE dma_resume call\n", __func__);
+@@ -2969,11 +3031,17 @@
+ 		}
+ 		ret = geni_se_common_clks_on(geni_mas->spi_rsc.clk, geni_mas->m_ahb_clk,
+ 						geni_mas->s_ahb_clk);
+-		if (ret)
+-			SPI_LOG_ERR(geni_mas->ipc, false, geni_mas->dev,
+-			"%s: Error %d turning on clocks\n", __func__, ret);
++		if (ret) {
++			geni_icc_disable(&geni_mas->spi_rsc);
++			return ret;
++		}
+ 
+ 		ret = spi_geni_gpi_pause_resume(geni_mas, false);
++		if (ret) {
++			geni_se_common_clks_off(geni_mas->spi_rsc.clk,
++					       geni_mas->m_ahb_clk, geni_mas->s_ahb_clk);
++			geni_icc_disable(&geni_mas->spi_rsc);
++		}
+ 		return ret;
+ 	}
+ 
+@@ -2985,15 +3053,28 @@
+ 		return ret;
+ 	}
+ 	ret = geni_se_resources_on(&geni_mas->spi_rsc);
++	if (ret) {
++		geni_icc_disable(&geni_mas->spi_rsc);
++		return ret;
++	}
+ 
+ 	geni_write_reg(0x7f, geni_mas->base, GENI_OUTPUT_CTRL);
+ 	/* Added 10 us delay to settle the write of the register as per HW team recommendation */
+ 	udelay(10);
+ 
+-	enable_irq(geni_mas->irq);
+-
+-	if (geni_mas->gsi_mode)
++	spi_geni_set_irq(geni_mas, true);
++
++	if (geni_mas->gsi_mode) {
+ 		ret = spi_geni_gpi_pause_resume(geni_mas, false);
++		if (ret) {
++			spi_geni_set_irq(geni_mas, false);
++			if (geni_se_resources_off(&geni_mas->spi_rsc))
++				geni_se_common_clks_off(geni_mas->spi_rsc.clk,
++						       geni_mas->m_ahb_clk,
++						       geni_mas->s_ahb_clk);
++			geni_icc_disable(&geni_mas->spi_rsc);
++		}
++	}
+ 
+ 	geni_capture_stop_time(&geni_mas->spi_rsc, geni_mas->ipc_log_kpi, __func__,
+ 			       geni_mas->spi_kpi, start_time, 0, 0);
+@@ -3008,8 +3089,8 @@
+ static int spi_geni_suspend(struct device *dev)
+ {
+ 	int ret = 0;
+-	struct spi_master *spi = get_spi_master(dev);
+-	struct spi_geni_master *geni_mas = spi_master_get_devdata(spi);
++	struct spi_controller *spi = get_spi_master(dev);
++	struct spi_geni_master *geni_mas = spi_controller_get_devdata(spi);
+ 	unsigned long long start_time;
+ 
+ 	start_time = geni_capture_start_time(&geni_mas->spi_rsc, geni_mas->ipc_log_kpi, __func__,
+--- a/include/linux/qcom-geni-se-common.h
++++ b/include/linux/qcom-geni-se-common.h
+@@ -12,6 +12,15 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/sched/clock.h>
+ #include <linux/ipc_logging.h>
++#include <linux/soc/qcom/geni-se.h>
++
++/* Private wrapper layout from the pinned common GENI core. */
++struct geni_wrapper {
++	struct device *dev;
++	void __iomem *base;
++	struct clk_bulk_data clks[2];
++	unsigned int num_clks;
++};
+ 
+ #ifdef CONFIG_ARM64
+ #define GENI_SE_DMA_PTR_L(ptr) ((u32)ptr)
+@@ -242,8 +251,8 @@
+ 					struct clk *s_ahb_clk)
+ {
+ 	clk_disable_unprepare(se_clk);
++	clk_disable_unprepare(s_ahb_clk);
+ 	clk_disable_unprepare(m_ahb_clk);
+-	clk_disable_unprepare(s_ahb_clk);
+ }
+ 
+ /**
+@@ -320,7 +329,7 @@
+ static inline int geni_se_common_iommu_map_buf(struct device *wrapper_dev, dma_addr_t *iova,
+ 			  void *buf, size_t size, enum dma_data_direction dir)
+ {
+-	if (!wrapper_dev)
++	if (!wrapper_dev || !iova || !buf || !size)
+ 		return -EINVAL;
+ 
+ 	*iova = dma_map_single(wrapper_dev, buf, size, dir);
+@@ -345,8 +354,12 @@
+ static inline int geni_se_common_iommu_unmap_buf(struct device *wrapper_dev, dma_addr_t *iova,
+ 			    size_t size, enum dma_data_direction dir)
+ {
+-	if (!dma_mapping_error(wrapper_dev, *iova))
+-		dma_unmap_single(wrapper_dev, *iova,  size, dir);
++	if (!wrapper_dev || !iova)
++		return -EINVAL;
++	if (!dma_mapping_error(wrapper_dev, *iova)) {
++		dma_unmap_single(wrapper_dev, *iova, size, dir);
++		*iova = DMA_MAPPING_ERROR;
++	}
+ 	return 0;
+ }
+ 
+@@ -454,9 +467,11 @@
+  */
+ static inline void test_bus_enable_per_qupv3(struct device *wrapper_dev, void *ipc)
+ {
+-	struct geni_se *geni_se_dev;
++	struct geni_wrapper *geni_se_dev;
+ 
+ 	geni_se_dev = dev_get_drvdata(wrapper_dev);
++	if (!geni_se_dev)
++		return;
+ 	//Enablement of test bus is required only once.
+ 	//TEST_BUS_EN:4, TEST_BUS_REG_EN:0
+ 	geni_write_reg(0x11, geni_se_dev->base, QUPV3_TEST_BUS_EN);
+@@ -475,9 +490,11 @@
+  */
+ static inline void test_bus_select_per_qupv3(struct device *wrapper_dev, u8 test_bus_num, void *ipc)
+ {
+-	struct geni_se *geni_se_dev;
++	struct geni_wrapper *geni_se_dev;
+ 
+ 	geni_se_dev = dev_get_drvdata(wrapper_dev);
++	if (!geni_se_dev)
++		return;
+ 
+ 	geni_write_reg(test_bus_num, geni_se_dev->base, QUPV3_TEST_BUS_SEL);
+ 	GENI_SE_ERR(ipc, false, geni_se_dev->dev,
+@@ -494,9 +511,11 @@
+  */
+ static inline void test_bus_read_per_qupv3(struct device *wrapper_dev, void *ipc)
+ {
+-	struct geni_se *geni_se_dev;
++	struct geni_wrapper *geni_se_dev;
+ 
+ 	geni_se_dev = dev_get_drvdata(wrapper_dev);
++	if (!geni_se_dev)
++		return;
+ 	GENI_SE_ERR(ipc, false, geni_se_dev->dev,
+ 		    "%s: dump QUPV3_TEST_BUS_REG:0x%x\n",
+ 		    __func__, geni_read_reg(geni_se_dev->base, QUPV3_TEST_BUS_REG));
+--- a/drivers/spi/spi-qup-trace.h
++++ b/drivers/spi/spi-qup-trace.h
+@@ -27,7 +27,7 @@
+ 		),
+ 
+ 		TP_fast_assign(
+-			__assign_str(name, name);
++			__assign_str(name);
+ 			WARN_ON_ONCE(vsnprintf(__get_dynamic_array(msg),
+ 									MAX_MSG_LEN, vaf->fmt,
+ 									*vaf->va) >= MAX_MSG_LEN);
