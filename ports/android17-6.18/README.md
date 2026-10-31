@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 99 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 102 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 99 platform `.ko` files, their symbol tables and DDK configurations.
+- 102 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 4308
-imported symbol CRCs across all 99 modules.
+used. The current [validation report](validation-20261031.json) checks 4418
+imported symbol CRCs across all 102 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -324,8 +324,8 @@ changes are captured for later porting; they are not in this initial group.
 
 ## Next implementation gates
 
-1. Complete the remaining first-stage dependencies, starting with PMIC ADC
-   and GPIO support needed by Onyx sensors and peripherals.
+1. Complete the remaining first-stage dependencies, including boot diagnostics, crash capture
+   and scheduler/thermal controls.
    Test UFS/encryption, probe ordering, GPIO wakeups, SCM wait queues and
    shared-memory operations.
 2. Port the device trees and remaining first-stage list; produce matching
@@ -476,3 +476,30 @@ hwmon setup, so managed teardown stops handlers first. The Onyx main/Lite
 three-trip tables remain unchanged. The adapter passes checkpatch and the full platform
 build without warnings; register access, ADC readings and hardware shutdown
 need phone tests.
+
+
+The PMIC GPIO and ADC group adds `pinctrl-spmi-gpio`, `qcom-vadc-common`
+and `qcom-spmi-adc5-gen3`. GPIO writes return register errors and defer until
+the parent IRQ domain exists. ADC channel tables, timing and scale constants
+retain the Onyx Gen3/Gen4 variants. Thermistor resistance stays 64-bit through
+interpolation, fixing a cold-to-hot wrap near the Gen4 open-circuit limit.
+Scale dispatch validates its inputs before accessing tables.
+
+ADC conversion IRQs are available during zone registration, while thermal work
+starts only after all zones exist. Teardown stops new submissions, completes
+pending waits, removes IRQ handlers, drains work and disables hardware without
+holding a mutex across joins. Hibernation freeze, thaw and restore balance IRQ
+state. DT addresses, channel types and interrupt indices are bounded.
+Nonthermal clients own copied registrations, can rearm or remove themselves
+from callbacks, and drain callbacks when released. Failed requests remove their
+registration. Managed device links acquired under the supplier device lock
+prevent retained ADC handles from outliving their consumer; concurrent supplier
+probe or unbind defers acquisition.
+
+`verify_adc_scaling.py WORKSPACE/onyx` builds the actual scaling source with
+AddressSanitizer and UndefinedBehaviorSanitizer. It checks 3,145,728 scale/code
+cases, thermistor monotonicity over each generation's raw range, and 330,002
+threshold pairs at every integer millidegree from -40000 to 125000. The
+[recorded result](adc-scaling-validation-20261031.json) covers host arithmetic;
+ADC calibration, callbacks, IRQ delivery and hardware behavior need phone tests.
+Both patches pass checkpatch and the full module build without warnings.

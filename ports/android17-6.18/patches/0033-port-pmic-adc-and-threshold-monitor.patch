@@ -1,0 +1,902 @@
+--- a/drivers/iio/adc/qcom-spmi-adc5-gen3.c
++++ b/drivers/iio/adc/qcom-spmi-adc5-gen3.c
+@@ -21,12 +21,14 @@
+ #include <linux/regmap.h>
+ #include <linux/thermal.h>
+ #include <linux/slab.h>
++#include <linux/workqueue.h>
+ #include <linux/iio/iio.h>
+ #include <linux/iio/adc/qcom-vadc-common.h>
+ 
+ #include <dt-bindings/iio/qcom,spmi-vadc.h>
+ 
+ static LIST_HEAD(adc_tm_device_list);
++static DEFINE_MUTEX(adc_tm_devices_lock);
+ 
+ #define ADC5_GEN3_REGMAP_ID			0x40
+ 
+@@ -223,6 +225,7 @@
+ 	struct workqueue_struct		*req_wq;
+ 	struct work_struct		work;
+ 	struct list_head		thr_list;
++	struct mutex			notify_lock;
+ 	enum adc_tm_rscale_fn_type	adc_rscale_fn;
+ };
+ 
+@@ -271,11 +274,24 @@
+ 	struct work_struct		tm_err_handler_work;
+ 	u8				*conv_err;
+ 	spinlock_t			tm_lock;
++	unsigned int			irqs_requested;
++	bool				ready;
++	bool				stopping;
++	bool				frozen;
+ };
+ 
++static bool adc5_gen3_ready(struct adc5_chip *adc)
++{
++	/* Pairs with publication after registering every thermal zone. */
++	return smp_load_acquire(&adc->ready);
++}
++
+ static int adc5_read(struct adc5_chip *adc, unsigned int sdam_index, u16 offset, u8 *data, int len)
+ {
+ 	int ret;
++
++	if (sdam_index >= adc->num_sdams)
++		return -EINVAL;
+ 
+ 	ret = regmap_bulk_read(adc->regmap, adc->base[sdam_index].base_addr + offset, data, len);
+ 	if (ret < 0)
+@@ -287,6 +303,9 @@
+ static int adc5_write(struct adc5_chip *adc, unsigned int sdam_index, u16 offset, u8 *data, int len)
+ {
+ 	int ret;
++
++	if (sdam_index >= adc->num_sdams)
++		return -EINVAL;
+ 
+ 	ret = regmap_bulk_write(adc->regmap, adc->base[sdam_index].base_addr + offset, data, len);
+ 	if (ret < 0)
+@@ -539,6 +558,10 @@
+ 		sdam_index = 0;
+ 
+ 	mutex_lock(&adc->lock);
++	if (READ_ONCE(adc->stopping) || READ_ONCE(adc->frozen)) {
++		ret = -ESHUTDOWN;
++		goto unlock;
++	}
+ 	ret = adc5_gen3_poll_wait_hs(adc, 0);
+ 	if (ret < 0)
+ 		goto unlock;
+@@ -553,6 +576,10 @@
+ 		/* Trying both polling and waiting for interrupt */
+ 		rc = wait_for_completion_timeout(&adc->complete,
+ 						msecs_to_jiffies(ADC5_GEN3_CONV_TIMEOUT_MS));
++		if (READ_ONCE(adc->stopping) || READ_ONCE(adc->frozen)) {
++			ret = -ESHUTDOWN;
++			goto unlock;
++		}
+ 		if (rc) {
+ 			pr_debug("Got EOC interrupt after %d polling attempts\n", i);
+ 			break;
+@@ -693,7 +720,7 @@
+ 
+ 		if (sdam_num == 0 && (conv_err & BIT(0))) {
+ 			return IRQ_HANDLED;
+-		} else if (conv_err) {
++		} else if (conv_err && adc5_gen3_ready(adc)) {
+ 			spin_lock(&adc->tm_lock);
+ 			adc->conv_err[sdam_num] |= conv_err;
+ 			spin_unlock(&adc->tm_lock);
+@@ -708,7 +735,7 @@
+ 		goto handler_end;
+ 	}
+ 
+-	if (tm_status[0] || tm_status[1])
++	if ((tm_status[0] || tm_status[1]) && adc5_gen3_ready(adc))
+ 		schedule_work(&adc->tm_handler_work);
+ 
+ 	return IRQ_HANDLED;
+@@ -859,8 +886,10 @@
+ 				continue;
+ 			}
+ 			pr_debug("notifying thermal, temp:%d\n", temp);
++			mutex_lock(&adc->lock);
+ 			chan_prop->last_temp = temp;
+ 			chan_prop->last_temp_set = true;
++			mutex_unlock(&adc->lock);
+ 			thermal_zone_device_update(chan_prop->tzd, THERMAL_TRIP_VIOLATED);
+ 		}
+ 	}
+@@ -876,6 +905,9 @@
+ {
+ 	struct adc5_chip *adc = iio_priv(indio_dev);
+ 	int i, v_channel;
++
++	if (iiospec->nargs != 1)
++		return -EINVAL;
+ 
+ 	for (i = 0; i < adc->nchannels; i++) {
+ 		v_channel = V_CHAN(adc->chan_props[i]);
+@@ -934,10 +966,10 @@
+ };
+ 
+ /* Used by thermal clients to read ADC channel temperature */
+-int adc_tm_gen3_get_temp(struct thermal_zone_device *tz, int *temp)
++static int adc_tm_gen3_get_temp(struct thermal_zone_device *tz, int *temp)
+ {
+ 	int ret;
+-	struct adc5_channel_prop *prop = tz->devdata;
++	struct adc5_channel_prop *prop = thermal_zone_device_priv(tz);
+ 	struct adc5_chip *adc;
+ 	u16 adc_code_volt;
+ 
+@@ -946,12 +978,14 @@
+ 
+ 	adc = prop->chip;
+ 
++	mutex_lock(&adc->lock);
+ 	if (prop->last_temp_set) {
+-		pr_debug("last_temp: %d\n", prop->last_temp);
+ 		prop->last_temp_set = false;
+ 		*temp = prop->last_temp;
++		mutex_unlock(&adc->lock);
+ 		return 0;
+ 	}
++	mutex_unlock(&adc->lock);
+ 
+ 	ret = adc5_gen3_do_conversion(adc, prop, &adc_code_volt);
+ 	if (ret < 0)
+@@ -968,6 +1002,9 @@
+ 	u8 conv_req = 0, buf[12];
+ 	u32 mask = 0;
+ 	struct adc5_chip *adc = prop->chip;
++
++	if (READ_ONCE(adc->stopping) || READ_ONCE(adc->frozen))
++		return -ESHUTDOWN;
+ 
+ 	ret = adc5_gen3_poll_wait_hs(adc, prop->sdam_index);
+ 	if (ret < 0)
+@@ -1020,19 +1057,14 @@
+ 	return adc5_write(adc, prop->sdam_index, ADC5_GEN3_CONV_REQ, &conv_req, 1);
+ }
+ 
+-/* WA to add writable trip_temp_*_hyst sysfs node till core has proper fix */
+-static int adc_tm5_gen3_set_trip_hyst(struct thermal_zone_device *tz,
+-					int trip, int hysteresis)
+-{
+-	return 0;
+-}
++
+ 
+ static int adc_tm5_gen3_set_trip_temp(struct thermal_zone_device *tz,
+ 					int low_temp, int high_temp)
+ {
+-	struct adc5_channel_prop *prop = tz->devdata;
++	struct adc5_channel_prop *prop = thermal_zone_device_priv(tz);
+ 	struct adc5_chip *adc;
+-	struct adc_tm_config tm_config;
++	struct adc_tm_config tm_config = {};
+ 	int ret;
+ 
+ 	if (!prop)
+@@ -1045,13 +1077,8 @@
+ 	tm_config.high_thr_temp = tm_config.low_thr_temp = 0;
+ 	if (high_temp != INT_MAX)
+ 		tm_config.high_thr_temp = high_temp;
+-	if (low_temp != INT_MIN)
++	if (low_temp > -INT_MAX)
+ 		tm_config.low_thr_temp = low_temp;
+-
+-	if ((high_temp == INT_MAX) && (low_temp == INT_MIN)) {
+-		pr_err("No trips to set\n");
+-		return -EINVAL;
+-	}
+ 
+ 	pr_debug("requested a low temp- %d and high temp- %d\n",
+ 			tm_config.low_thr_temp, tm_config.high_thr_temp);
+@@ -1092,64 +1119,71 @@
+ }
+ 
+ #define MAX_PROP_NAME_LEN		32
++/* Acquire during consumer probe; the handle lasts until consumer unbind. */
+ struct adc5_chip *get_adc_tm_gen3(struct device *dev, const char *name)
+ {
+-	struct platform_device *pdev;
+-	struct adc5_chip *chip;
+-	struct device_node *node = NULL;
++	struct adc5_chip *chip, *found = ERR_PTR(-EPROBE_DEFER);
++	struct device_node *node;
+ 	char prop_name[MAX_PROP_NAME_LEN];
+ 
+-	scnprintf(prop_name, MAX_PROP_NAME_LEN, "qcom,%s-adc_tm", name);
+-
++	if (!dev || !name)
++		return ERR_PTR(-EINVAL);
++	if (snprintf(prop_name, sizeof(prop_name), "qcom,%s-adc_tm", name) >= sizeof(prop_name))
++		return ERR_PTR(-EINVAL);
+ 	node = of_parse_phandle(dev->of_node, prop_name, 0);
+-	if (node == NULL)
++	if (!node)
+ 		return ERR_PTR(-ENODEV);
+ 
++	mutex_lock(&adc_tm_devices_lock);
+ 	list_for_each_entry(chip, &adc_tm_device_list, list) {
+-		pdev = to_platform_device(chip->dev);
+-		if (pdev->dev.of_node == node) {
+-			of_node_put(node);
+-			return chip;
+-		}
+-	}
++		if (chip->dev->of_node != node)
++			continue;
++		/*
++		 * Removal takes the supplier lock before the list lock. Never
++		 * wait for it here, including during concurrent supplier probe.
++		 * An unbind already waiting for consumers has dropped that lock
++		 * but left DL_DEV_UNBINDING set; reject that case as well.
++		 */
++		if (!device_trylock(chip->dev))
++			break;
++		if (chip->dev->links.status == DL_DEV_DRIVER_BOUND &&
++		    device_link_add(dev, chip->dev, DL_FLAG_AUTOREMOVE_CONSUMER))
++			found = chip;
++		device_unlock(chip->dev);
++		break;
++	}
++	mutex_unlock(&adc_tm_devices_lock);
+ 	of_node_put(node);
+-	return ERR_PTR(-EPROBE_DEFER);
++	return found;
+ }
+ EXPORT_SYMBOL_GPL(get_adc_tm_gen3);
+ 
+-static int32_t adc_tm_add_to_list(struct adc5_chip *chip,
+-				uint32_t dt_index,
+-				struct adc_tm_param *param)
+-{
+-	struct adc_tm_client_info *client_info = NULL;
+-	bool client_info_exists = false;
+-
+-	list_for_each_entry(client_info,
+-			&chip->chan_props[dt_index].thr_list, list) {
+-		if (client_info->param->id == param->id) {
+-			client_info->low_thr_requested = param->low_thr;
+-			client_info->high_thr_requested = param->high_thr;
+-			client_info->state_request = param->state_request;
+-			client_info->notify_low_thr = false;
+-			client_info->notify_high_thr = false;
+-			client_info_exists = true;
+-		}
+-	}
+-
+-	if (!client_info_exists) {
+-		client_info = devm_kzalloc(chip->dev,
+-			sizeof(struct adc_tm_client_info), GFP_KERNEL);
+-		if (!client_info)
+-			return -ENOMEM;
+-
+-		client_info->param->id = (uintptr_t) client_info;
+-		client_info->low_thr_requested = param->low_thr;
+-		client_info->high_thr_requested = param->high_thr;
+-		client_info->state_request = param->state_request;
+-
+-		list_add_tail(&client_info->list,
+-					&chip->chan_props[dt_index].thr_list);
+-	}
++static int32_t adc_tm_add_to_list(struct adc5_chip *chip, uint32_t index,
++				  struct adc_tm_param *param)
++{
++	struct adc_tm_client_info *client;
++
++	list_for_each_entry(client, &chip->chan_props[index].thr_list, list) {
++		if (client->param->id == param->id)
++			goto update;
++	}
++	client = devm_kzalloc(chip->dev, sizeof(*client), GFP_KERNEL);
++	if (!client)
++		return -ENOMEM;
++	client->param = devm_kmemdup(chip->dev, param, sizeof(*param), GFP_KERNEL);
++	if (!client->param) {
++		devm_kfree(chip->dev, client);
++		return -ENOMEM;
++	}
++	param->id = (uintptr_t)client;
++	list_add_tail(&client->list, &chip->chan_props[index].thr_list);
++update:
++	*client->param = *param;
++	client->low_thr_requested = param->low_thr;
++	client->high_thr_requested = param->high_thr;
++	client->state_request = param->state_request;
++	client->notify_low_thr = false;
++	client->notify_high_thr = false;
+ 	return 0;
+ }
+ 
+@@ -1159,7 +1193,7 @@
+ 	struct adc_tm_client_info *client_info = NULL;
+ 	struct list_head *thr_list;
+ 	uint32_t scale_type = 0;
+-	struct adc_tm_config tm_config;
++	struct adc_tm_config tm_config = {};
+ 
+ 	prop->high_thr_en = 0;
+ 	prop->low_thr_en = 0;
+@@ -1228,6 +1262,8 @@
+ 	if (scale_type >= SCALE_RSCALE_NONE)
+ 		return -EBADF;
+ 
++	if (!prop->low_thr_en && !prop->high_thr_en)
++		return 0;
+ 	adc_tm_rscale_fn[scale_type].chan(&tm_config);
+ 
+ 	prop->low_thr_voltage = tm_config.low_thr_voltage;
+@@ -1240,17 +1276,21 @@
+ }
+ 
+ /* Used to notify non-thermal clients of threshold crossing */
+-void notify_adc_tm_fn(struct work_struct *work)
++static void notify_adc_tm_fn(struct work_struct *work)
+ {
+ 	struct adc5_channel_prop *prop = container_of(work,
+ 		struct adc5_channel_prop, work);
+ 	struct adc_tm_client_info *client_info = NULL;
+ 	struct adc5_chip *chip;
+ 	struct list_head *thr_list;
++	void (*notify)(enum adc_tm_state state, void *context);
++	void *context;
++	enum adc_tm_state state;
+ 	int ret;
+ 
+ 	chip = prop->chip;
+ 
++	mutex_lock(&prop->notify_lock);
+ 	mutex_lock(&chip->lock);
+ 	if (prop->low_thr_triggered) {
+ 		/* adjust thr, calling manage_thr */
+@@ -1299,29 +1339,31 @@
+ 	if (ret < 0)
+ 		pr_err("Error during adc-tm configure:%d\n", ret);
+ 
++	for (;;) {
++		notify = NULL;
++		list_for_each_entry(client_info, &prop->thr_list, list) {
++			if (client_info->notify_low_thr) {
++				client_info->notify_low_thr = false;
++				state = ADC_TM_LOW_STATE;
++			} else if (client_info->notify_high_thr) {
++				client_info->notify_high_thr = false;
++				state = ADC_TM_HIGH_STATE;
++			} else {
++				continue;
++			}
++			notify = client_info->param->threshold_notification;
++			context = client_info->param->btm_ctx;
++			break;
++		}
++		if (!notify)
++			break;
++		mutex_unlock(&chip->lock);
++		notify(state, context);
++		mutex_lock(&chip->lock);
++		/* A callback may rearm or remove its own registration. */
++	}
+ 	mutex_unlock(&chip->lock);
+-
+-	list_for_each_entry(client_info, &prop->thr_list, list) {
+-		if (client_info->notify_low_thr &&
+-				client_info->param->threshold_notification != NULL) {
+-			pr_debug("notify kernel with low state for channel 0x%x\n",
+-					prop->channel);
+-			client_info->param->threshold_notification(
+-				ADC_TM_LOW_STATE,
+-				client_info->param->btm_ctx);
+-			client_info->notify_low_thr = false;
+-		}
+-
+-		if (client_info->notify_high_thr &&
+-				client_info->param->threshold_notification != NULL) {
+-			pr_debug("notify kernel with high state for channel 0x%x\n",
+-					prop->channel);
+-			client_info->param->threshold_notification(
+-				ADC_TM_HIGH_STATE,
+-				client_info->param->btm_ctx);
+-			client_info->notify_high_thr = false;
+-		}
+-	}
++	mutex_unlock(&prop->notify_lock);
+ }
+ 
+ /* Used by non-thermal clients to configure an ADC_TM channel */
+@@ -1333,7 +1375,7 @@
+ 	uint32_t v_channel, dt_index = 0;
+ 	bool chan_found = false;
+ 
+-	if (param == NULL)
++	if (!chip || !param || param->state_request >= ADC_TM_THR_NUM)
+ 		return -EINVAL;
+ 
+ 	if (param->threshold_notification == NULL) {
+@@ -1350,20 +1392,30 @@
+ 		}
+ 	}
+ 
+-	if (!chan_found)  {
++	if (!chan_found || chip->chan_props[dt_index].adc_tm != ADC_TM_NON_THERMAL) {
+ 		pr_err("not a valid ADC_TM channel\n");
+ 		return -EINVAL;
+ 	}
+ 
+ 	mutex_lock(&chip->lock);
+ 
+-	/* add channel client to channel list */
+-	adc_tm_add_to_list(chip, dt_index, param);
++	if (READ_ONCE(chip->stopping)) {
++		ret = -ESHUTDOWN;
++		goto fail_unlock;
++	}
++	/* Add a client only after its configuration is known to be supported. */
++	if (chip->chan_props[dt_index].adc_rscale_fn >= SCALE_RSCALE_NONE) {
++		ret = -EINVAL;
++		goto fail_unlock;
++	}
++	ret = adc_tm_add_to_list(chip, dt_index, param);
++	if (ret)
++		goto fail_unlock;
+ 
+ 	/* set right thresholds for the sensor */
+ 	ret = adc_tm_gen3_manage_thresholds(&chip->chan_props[dt_index]);
+ 	if (ret < 0)
+-		pr_err("Error in reverse scaling:%d\n", ret);
++		goto fail_unlock;
+ 
+ 	/* configure channel */
+ 	ret = adc_tm5_gen3_configure(&chip->chan_props[dt_index]);
+@@ -1374,57 +1426,51 @@
+ 
+ fail_unlock:
+ 	mutex_unlock(&chip->lock);
++	/* A rejected request must not retain a callback into its caller. */
++	if (ret)
++		adc_tm_disable_chan_meas_gen3(chip, param);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(adc_tm_channel_measure_gen3);
+ 
+ /* Used by non-thermal clients to release an ADC_TM channel */
+ int32_t adc_tm_disable_chan_meas_gen3(struct adc5_chip *chip,
+-					struct adc_tm_param *param)
+-{
+-	int ret = 0, i;
+-	uint32_t dt_index = 0, v_channel;
+-	struct adc_tm_client_info *client_info = NULL;
+-
+-	if (param == NULL)
++				     struct adc_tm_param *param)
++{
++	struct adc5_channel_prop *prop = NULL;
++	struct adc_tm_client_info *client;
++	bool from_callback;
++	int i, ret = 0;
++
++	if (!chip || !param)
+ 		return -EINVAL;
+-
+ 	for (i = 0; i < chip->nchannels; i++) {
+-		v_channel = V_CHAN(chip->chan_props[i]);
+-		if (v_channel == param->channel) {
+-			dt_index = i;
++		if (V_CHAN(chip->chan_props[i]) == param->channel) {
++			prop = &chip->chan_props[i];
+ 			break;
+ 		}
+ 	}
+-
+-	if (i == chip->nchannels)  {
+-		pr_err("not a valid ADC_TM channel\n");
++	if (!prop || prop->adc_tm != ADC_TM_NON_THERMAL)
+ 		return -EINVAL;
+-	}
+-
++	from_callback = current_work() == &prop->work;
++	if (!from_callback)
++		mutex_lock(&prop->notify_lock);
+ 	mutex_lock(&chip->lock);
+-	list_for_each_entry(client_info,
+-			&chip->chan_props[i].thr_list, list) {
+-		if (client_info->param->id == param->id) {
+-			client_info->state_request =
+-				ADC_TM_HIGH_LOW_THR_DISABLE;
+-			ret = adc_tm_gen3_manage_thresholds(&chip->chan_props[i]);
+-			if (ret < 0) {
+-				pr_err("Error in reverse scaling:%d\n",
+-						ret);
+-				goto fail;
+-			}
+-			ret = adc_tm5_gen3_configure(&chip->chan_props[i]);
+-			if (ret < 0) {
+-				pr_err("Error during adc-tm configure:%d\n",
+-						ret);
+-				goto fail;
+-			}
+-		}
+-	}
+-
+-fail:
++	list_for_each_entry(client, &prop->thr_list, list) {
++		if (client->param->id != param->id)
++			continue;
++		list_del(&client->list);
++		devm_kfree(chip->dev, client->param);
++		devm_kfree(chip->dev, client);
++		param->id = 0;
++		ret = adc_tm_gen3_manage_thresholds(prop);
++		if (!ret && !READ_ONCE(chip->stopping))
++			ret = adc_tm5_gen3_configure(prop);
++		break;
++	}
+ 	mutex_unlock(&chip->lock);
++	if (!from_callback)
++		mutex_unlock(&prop->notify_lock);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(adc_tm_disable_chan_meas_gen3);
+@@ -1432,12 +1478,10 @@
+ static struct thermal_zone_device_ops adc_tm_ops = {
+ 	.get_temp = adc_tm_gen3_get_temp,
+ 	.set_trips = adc_tm5_gen3_set_trip_temp,
+-	.set_trip_hyst = adc_tm5_gen3_set_trip_hyst,
+ };
+ 
+ static struct thermal_zone_device_ops adc_tm_ops_iio = {
+ 	.get_temp = adc_tm_gen3_get_temp,
+-	.set_trip_hyst = adc_tm5_gen3_set_trip_hyst,
+ };
+ 
+ static int adc_tm_register_tzd(struct adc5_chip *adc)
+@@ -1681,7 +1725,7 @@
+ 	sid = (chan >> ADC5_GEN3_SID_OFFSET);
+ 	chan = (chan & ADC5_GEN3_CHANNEL_MASK);
+ 
+-	if (chan > ADC5_OFFSET_EXT2 ||
++	if (sid > ADC5_GEN3_SID_MASK || chan > ADC5_OFFSET_EXT2 ||
+ 	    !prop->data->adc_chans[chan].datasheet_name) {
+ 		dev_err(dev, "%s invalid channel number %d\n", name, chan);
+ 		return -EINVAL;
+@@ -1701,7 +1745,7 @@
+ 
+ 	ret = of_property_read_u32(node, "qcom,decimation", &value);
+ 	if (!ret) {
+-		ret = adc5_decimation_from_dt(value, data->decimation);
++		ret = adc5_decimation_from_dt(value, prop->data->decimation);
+ 		if (ret < 0) {
+ 			dev_err(dev, "%02x invalid decimation %d\n",
+ 				chan, value);
+@@ -1770,8 +1814,11 @@
+ 	prop->adc_tm = ADC_TM_NONE;
+ 
+ 	ret = of_property_read_u32(node, "qcom,adc-tm-type", &value);
+-	if (!ret && value < ADC_TM_INVALID)
++	if (!ret) {
++		if (value >= ADC_TM_INVALID)
++			return -EINVAL;
+ 		prop->adc_tm = value;
++	}
+ 
+ 	if (prop->adc_tm == ADC_TM_NON_THERMAL) {
+ 		ret = of_property_read_u32(node, "qcom,rscale-type",
+@@ -1791,6 +1838,8 @@
+ 		val = adc->n_tm_channels / 8;
+ 		prop->sdam_index = val;
+ 		prop->tm_chan_index = adc->n_tm_channels - (8*val);
++		if (prop->sdam_index >= adc->num_interrupts)
++			return -EINVAL;
+ 
+ 		prop->timer = MEAS_INT_1S;
+ 
+@@ -1802,6 +1851,7 @@
+ 				return -ENOMEM;
+ 			}
+ 			INIT_WORK(&prop->work, notify_adc_tm_fn);
++			mutex_init(&prop->notify_lock);
+ 		}
+ 		INIT_LIST_HEAD(&prop->thr_list);
+ 	}
+@@ -1871,6 +1921,46 @@
+ 	return 0;
+ }
+ 
++static void adc5_gen3_stop(struct adc5_chip *adc)
++{
++	u8 data;
++	int i, sdam_index;
++
++	WRITE_ONCE(adc->stopping, true);
++	WRITE_ONCE(adc->ready, false);
++	complete_all(&adc->complete);
++	while (adc->irqs_requested) {
++		i = --adc->irqs_requested;
++		devm_free_irq(adc->dev, adc->base[i].irq, adc);
++	}
++	cancel_work_sync(&adc->tm_err_handler_work);
++	cancel_work_sync(&adc->tm_handler_work);
++	if (adc->chan_props) {
++		for (i = 0; i < adc->nchannels; i++) {
++			if (adc->chan_props[i].req_wq) {
++				destroy_workqueue(adc->chan_props[i].req_wq);
++				adc->chan_props[i].req_wq = NULL;
++			}
++		}
++	}
++	mutex_lock(&adc->lock);
++	for (i = 0; i < adc->num_sdams * 8; i++) {
++		sdam_index = i / 8;
++		data = MEAS_INT_DISABLE;
++		adc5_write(adc, sdam_index, ADC5_GEN3_TIMER_SEL, &data, 1);
++		data = ADC5_GEN3_CHAN_CONV_REQ | (i % 8);
++		adc5_write(adc, sdam_index, ADC5_GEN3_PERPH_CH, &data, 1);
++		data = ADC5_GEN3_CONV_REQ_REQ;
++		adc5_write(adc, sdam_index, ADC5_GEN3_CONV_REQ, &data, 1);
++	}
++	mutex_unlock(&adc->lock);
++}
++
++static void adc5_gen3_ipc_destroy(void *data)
++{
++	ipc_log_context_destroy(data);
++}
++
+ static int adc5_gen3_probe(struct platform_device *pdev)
+ {
+ 	struct device_node *node = pdev->dev.of_node;
+@@ -1895,8 +1985,8 @@
+ 	adc->dev = dev;
+ 
+ 	ret = of_property_count_u32_elems(node, "reg");
+-	if (ret < 0)
+-		return ret;
++	if (ret <= 0)
++		return ret ? ret : -EINVAL;
+ 
+ 	adc->num_sdams = ret;
+ 
+@@ -1926,12 +2016,14 @@
+ 		if (ret < 0)
+ 			return ret;
+ 
++		if (reg > U16_MAX - ADC5_GEN3_CONV_REQ)
++			return -EINVAL;
+ 		adc->base[i].base_addr = reg;
+ 	}
+ 
+ 	for (i = 0; i < adc->num_interrupts; i++) {
+ 		scnprintf(buf, sizeof(buf), "adc-sdam%d", i);
+-		ret = of_irq_get_byname(node, buf);
++		ret = platform_get_irq_byname(pdev, buf);
+ 		if (ret < 0) {
+ 			pr_err("Failed to get irq for ADC5 GEN3 SDAM%d, ret=%d\n", i, ret);
+ 			return ret;
+@@ -1953,6 +2045,15 @@
+ 	init_completion(&adc->complete);
+ 	mutex_init(&adc->lock);
+ 	spin_lock_init(&adc->tm_lock);
++	INIT_LIST_HEAD(&adc->list);
++	INIT_WORK(&adc->tm_handler_work, tm_handler_work);
++	INIT_WORK(&adc->tm_err_handler_work, tm_err_handler_work);
++	adc->ipc_log = ipc_log_context_create(10, "adc5-gen3", 0);
++	if (adc->ipc_log) {
++		ret = devm_add_action_or_reset(dev, adc5_gen3_ipc_destroy, adc->ipc_log);
++		if (ret)
++			return ret;
++	}
+ 
+ 	ret = adc5_get_dt_data(adc, node);
+ 	if (ret < 0) {
+@@ -1961,20 +2062,16 @@
+ 	}
+ 
+ 	for (i = 0; i < adc->num_interrupts; i++) {
+-		ret = devm_request_irq(dev, adc->base[i].irq, adc5_gen3_isr,
+-					0, adc->base[i].irq_name, adc);
++		ret = devm_request_threaded_irq(dev, adc->base[i].irq, NULL, adc5_gen3_isr,
++					IRQF_ONESHOT, adc->base[i].irq_name, adc);
+ 		if (ret < 0)
+ 			goto fail;
++		adc->irqs_requested++;
+ 	}
+ 
+ 	ret = adc_tm_register_tzd(adc);
+ 	if (ret < 0)
+ 		goto fail;
+-
+-	if (adc->n_tm_channels) {
+-		INIT_WORK(&adc->tm_handler_work, tm_handler_work);
+-		INIT_WORK(&adc->tm_err_handler_work, tm_err_handler_work);
+-	}
+ 
+ 	indio_dev->dev.parent = dev;
+ 	indio_dev->dev.of_node = node;
+@@ -1983,129 +2080,78 @@
+ 	indio_dev->channels = adc->iio_chans;
+ 	indio_dev->num_channels = adc->nchannels;
+ 
++	ret = devm_iio_device_register(dev, indio_dev);
++	if (ret)
++		goto fail;
++	/* Publish the fully initialized thermal-zone pointers to IRQ readers. */
++	smp_store_release(&adc->ready, true);
++	schedule_work(&adc->tm_handler_work);
++	mutex_lock(&adc_tm_devices_lock);
+ 	list_add_tail(&adc->list, &adc_tm_device_list);
+-	adc->device_list = &adc_tm_device_list;
+-
+-	adc->ipc_log = ipc_log_context_create(10, "adc5-gen3", 0);
+-	if (!adc->ipc_log)
+-		pr_warn("Error in creating ipc_log for adc5-gen3\n");
+-
+-	return devm_iio_device_register(dev, indio_dev);
+-
++	mutex_unlock(&adc_tm_devices_lock);
++	return 0;
+ fail:
+-	i = 0;
+-	while (i < adc->nchannels) {
++	adc5_gen3_stop(adc);
++	return ret;
++}
++
++static void adc5_gen3_exit(struct platform_device *pdev)
++{
++	struct adc5_chip *adc = platform_get_drvdata(pdev);
++
++	mutex_lock(&adc_tm_devices_lock);
++	list_del_init(&adc->list);
++	mutex_unlock(&adc_tm_devices_lock);
++	adc5_gen3_stop(adc);
++}
++
++static int __maybe_unused adc5_gen3_freeze(struct device *dev)
++{
++	struct adc5_chip *adc = dev_get_drvdata(dev);
++	int i;
++
++	if (READ_ONCE(adc->frozen))
++		return 0;
++	WRITE_ONCE(adc->frozen, true);
++	WRITE_ONCE(adc->ready, false);
++	complete_all(&adc->complete);
++	for (i = 0; i < adc->irqs_requested; i++)
++		disable_irq(adc->base[i].irq);
++	cancel_work_sync(&adc->tm_err_handler_work);
++	cancel_work_sync(&adc->tm_handler_work);
++	for (i = 0; i < adc->nchannels; i++)
+ 		if (adc->chan_props[i].req_wq)
+-			destroy_workqueue(adc->chan_props[i].req_wq);
+-		i++;
+-	}
+-	return ret;
+-}
+-
+-static int adc5_gen3_exit(struct platform_device *pdev)
+-{
+-	struct adc5_chip *adc = platform_get_drvdata(pdev);
+-	u8 data = 0;
+-	int i, sdam_index;
+-
++			flush_workqueue(adc->chan_props[i].req_wq);
++	/* Wait for any in-flight conversion to finish. */
+ 	mutex_lock(&adc->lock);
+-	for (i = 0; i < adc->nchannels; i++) {
+-		if (adc->chan_props[i].req_wq)
+-			destroy_workqueue(adc->chan_props[i].req_wq);
+-		adc->chan_props[i].timer = MEAS_INT_DISABLE;
+-	}
+-
+-	/* Disable all available channels */
+-	for (i = 0; i < adc->num_sdams * 8; i++) {
+-		sdam_index = i / 8;
+-		data = MEAS_INT_DISABLE;
+-		adc5_write(adc, sdam_index, ADC5_GEN3_TIMER_SEL, &data, 1);
+-
+-		/* To indicate there is an actual conversion request */
+-		data = ADC5_GEN3_CHAN_CONV_REQ | (i - (sdam_index*8));
+-		adc5_write(adc, sdam_index, ADC5_GEN3_PERPH_CH, &data, 1);
+-
+-		data = ADC5_GEN3_CONV_REQ_REQ;
+-		adc5_write(adc, sdam_index, ADC5_GEN3_CONV_REQ, &data, 1);
+-	}
+-
+ 	mutex_unlock(&adc->lock);
+-
+-	if (adc->n_tm_channels) {
+-		cancel_work_sync(&adc->tm_err_handler_work);
+-		cancel_work_sync(&adc->tm_handler_work);
+-	}
+-
+-	mutex_destroy(&adc->lock);
+-
+-	list_del(&adc->list);
+-
+-	ipc_log_context_destroy(adc->ipc_log);
+-
+ 	return 0;
+ }
+ 
+-static int __maybe_unused adc5_gen3_freeze(struct device *dev)
++static int __maybe_unused adc5_gen3_restore(struct device *dev)
+ {
+ 	struct adc5_chip *adc = dev_get_drvdata(dev);
+-	int i = 0;
+-
+-	mutex_lock(&adc->lock);
+-
+-	for (i = 0; i < adc->num_interrupts; i++)
+-		devm_free_irq(dev, adc->base[i].irq, adc);
+-
+-	mutex_unlock(&adc->lock);
+-
++	int i;
++
++	if (!READ_ONCE(adc->frozen) || READ_ONCE(adc->stopping))
++		return 0;
++	WRITE_ONCE(adc->frozen, false);
++	/* Publish the fully initialized thermal-zone pointers to IRQ readers. */
++	smp_store_release(&adc->ready, true);
++	for (i = 0; i < adc->irqs_requested; i++)
++		enable_irq(adc->base[i].irq);
++	schedule_work(&adc->tm_handler_work);
+ 	return 0;
+ }
+ 
+-static int __maybe_unused adc5_gen3_restore(struct device *dev)
+-{
+-	struct adc5_chip *adc = dev_get_drvdata(dev);
+-	int i = 0;
+-	int ret = 0;
+-
+-	for (i = 0; i < adc->num_interrupts; i++) {
+-		ret = devm_request_irq(dev, adc->base[i].irq, adc5_gen3_isr,
+-				0, adc->base[i].irq_name, adc);
+-		if (ret < 0)
+-			return ret;
+-	}
+-
+-	return ret;
+-}
+-
+ static void adc5_gen3_shutdown(struct platform_device *pdev)
+ {
+-	struct adc5_chip *adc = platform_get_drvdata(pdev);
+-	u8 data = 0;
+-	int i, sdam_index;
+-
+-	mutex_lock(&adc->lock);
+-
+-	for (i = 0; i < adc->num_interrupts; i++)
+-		devm_free_irq(adc->dev, adc->base[i].irq, adc);
+-
+-	/* Disable all available channels */
+-	for (i = 0; i < adc->num_sdams * 8; i++) {
+-		sdam_index = i / 8;
+-		data = MEAS_INT_DISABLE;
+-		adc5_write(adc, sdam_index, ADC5_GEN3_TIMER_SEL, &data, 1);
+-
+-		/* To indicate there is an actual conversion request */
+-		data = ADC5_GEN3_CHAN_CONV_REQ | (i - (sdam_index*8));
+-		adc5_write(adc, sdam_index, ADC5_GEN3_PERPH_CH, &data, 1);
+-
+-		data = ADC5_GEN3_CONV_REQ_REQ;
+-		adc5_write(adc, sdam_index, ADC5_GEN3_CONV_REQ, &data, 1);
+-	}
+-
+-	mutex_unlock(&adc->lock);
++	adc5_gen3_stop(platform_get_drvdata(pdev));
+ }
+ 
+ static const struct dev_pm_ops __maybe_unused adc5_gen3_pm_ops = {
+ 	.freeze = pm_ptr(adc5_gen3_freeze),
++	.thaw = pm_ptr(adc5_gen3_restore),
+ 	.restore = pm_ptr(adc5_gen3_restore),
+ };
+ 

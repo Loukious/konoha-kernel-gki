@@ -1307,6 +1307,42 @@ ddk_module(
     deps = [":thermal_headers", ":platform_headers"],
 )
 
+ddk_headers(
+    name = "adc_headers",
+    hdrs = ["include/linux/iio/adc/qcom-vadc-common.h", "include/linux/adc-tm-clients.h", "include/dt-bindings/iio/qcom,spmi-vadc.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "pinctrl_spmi_gpio",
+    srcs = ["drivers/pinctrl/qcom/pinctrl-spmi-gpio.c"],
+    out = "pinctrl-spmi-gpio.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":pinctrl_headers", ":platform_headers"],
+)
+
+ddk_module(
+    name = "qcom_vadc_common",
+    srcs = ["drivers/iio/adc/qcom-vadc-common.c"],
+    out = "qcom-vadc-common.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":adc_headers"],
+)
+
+ddk_module(
+    name = "qcom_spmi_adc5_gen3",
+    srcs = ["drivers/iio/adc/qcom-spmi-adc5-gen3.c"],
+    out = "qcom-spmi-adc5-gen3.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":thermal_headers", ":adc_headers", ":platform_headers", ":qcom_vadc_common", ":qcom_ipc_logging"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1393,6 +1429,9 @@ kernel_module_group(
         ":bcl_pmic5",
         ":bcl_soc",
         ":qcom_spmi_temp_alarm",
+        ":pinctrl_spmi_gpio",
+        ":qcom_vadc_common",
+        ":qcom_spmi_adc5_gen3",
         ":nvmem_qfprom",
         ":qcom_cpufreq_thermal",
         ":qcom_cpufreq_hw",

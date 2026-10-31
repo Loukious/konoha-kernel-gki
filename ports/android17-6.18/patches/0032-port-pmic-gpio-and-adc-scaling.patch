@@ -1,0 +1,108 @@
+--- a/drivers/pinctrl/qcom/pinctrl-spmi-gpio.c
++++ b/drivers/pinctrl/qcom/pinctrl-spmi-gpio.c
+@@ -440,7 +440,7 @@
+ 	case PIN_CONFIG_OUTPUT_ENABLE:
+ 		arg = pad->output_enabled;
+ 		break;
+-	case PIN_CONFIG_OUTPUT:
++	case PIN_CONFIG_LEVEL:
+ 		arg = pad->out_value;
+ 		break;
+ 	case PMIC_GPIO_CONF_PULL_UP:
+@@ -533,7 +533,7 @@
+ 		case PIN_CONFIG_OUTPUT_ENABLE:
+ 			pad->output_enabled = arg ? true : false;
+ 			break;
+-		case PIN_CONFIG_OUTPUT:
++		case PIN_CONFIG_LEVEL:
+ 			pad->output_enabled = true;
+ 			pad->out_value = arg;
+ 			break;
+@@ -740,7 +740,7 @@
+ 	struct pmic_gpio_state *state = gpiochip_get_data(chip);
+ 	unsigned long config;
+ 
+-	config = pinconf_to_config_packed(PIN_CONFIG_OUTPUT, val);
++	config = pinconf_to_config_packed(PIN_CONFIG_LEVEL, val);
+ 
+ 	return pmic_gpio_config_set(state->ctrl, pin, &config, 1);
+ }
+@@ -767,14 +767,14 @@
+ 	return !!pad->out_value;
+ }
+ 
+-static void pmic_gpio_set(struct gpio_chip *chip, unsigned pin, int value)
++static int pmic_gpio_set(struct gpio_chip *chip, unsigned int pin, int value)
+ {
+ 	struct pmic_gpio_state *state = gpiochip_get_data(chip);
+ 	unsigned long config;
+ 
+-	config = pinconf_to_config_packed(PIN_CONFIG_OUTPUT, value);
+-
+-	pmic_gpio_config_set(state->ctrl, pin, &config, 1);
++	config = pinconf_to_config_packed(PIN_CONFIG_LEVEL, value);
++
++	return pmic_gpio_config_set(state->ctrl, pin, &config, 1);
+ }
+ 
+ static int pmic_gpio_of_xlate(struct gpio_chip *chip,
+@@ -1111,6 +1111,8 @@
+ 
+ 	state->dev = &pdev->dev;
+ 	state->map = dev_get_regmap(dev->parent, NULL);
++	if (!state->map)
++		return -ENODEV;
+ 	parent_spmi_dev = to_spmi_device(dev->parent);
+ 	state->usid = parent_spmi_dev->usid;
+ 	state->pid_base = reg >> 8;
+@@ -1172,7 +1174,7 @@
+ 	parent_domain = irq_find_host(parent_node);
+ 	of_node_put(parent_node);
+ 	if (!parent_domain)
+-		return -ENXIO;
++		return -EPROBE_DEFER;
+ 
+ 	girq = &state->chip.irq;
+ 	gpio_irq_chip_set_chip(girq, &spmi_gpio_irq_chip);
+@@ -1217,12 +1219,11 @@
+ 	return ret;
+ }
+ 
+-static int pmic_gpio_remove(struct platform_device *pdev)
++static void pmic_gpio_remove(struct platform_device *pdev)
+ {
+ 	struct pmic_gpio_state *state = platform_get_drvdata(pdev);
+ 
+ 	gpiochip_remove(&state->chip);
+-	return 0;
+ }
+ 
+ static const struct of_device_id pmic_gpio_of_match[] = {
+--- a/drivers/iio/adc/qcom-vadc-common.c
++++ b/drivers/iio/adc/qcom-vadc-common.c
+@@ -767,7 +767,7 @@
+ };
+ 
+ static int qcom_vadc_map_voltage_temp(const struct vadc_map_pt *pts,
+-				      u32 tablesize, s32 input, int *output)
++				      u32 tablesize, s64 input, int *output)
+ {
+ 	u32 i = 0;
+ 
+@@ -1533,10 +1533,14 @@
+ 		    const struct adc5_data *data,
+ 		    u16 adc_code, int *result)
+ {
+-	const struct u32_fract *prescale = &adc5_prescale_ratios[prescale_ratio];
++	const struct u32_fract *prescale;
++
++	if (prescale_ratio >= ARRAY_SIZE(adc5_prescale_ratios) || !data || !result)
++		return -EINVAL;
++	prescale = &adc5_prescale_ratios[prescale_ratio];
+ 
+ 	if (!(scaletype >= SCALE_HW_CALIB_DEFAULT &&
+-		scaletype < SCALE_HW_CALIB_INVALID)) {
++		scaletype < SCALE_HW_CALIB_INVALID) || !scale_adc5_fn[scaletype].scale_fn) {
+ 		pr_err("Invalid scale type %d\n", scaletype);
+ 		return -EINVAL;
+ 	}
