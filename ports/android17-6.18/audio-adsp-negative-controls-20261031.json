@@ -1,0 +1,63 @@
+{
+  "tests": {
+    "votes": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-adsp-tests-dck2ng6h/test.c:655: votes: Assertion `command(\"boot\",\"0\\n\")==2&&adsp.power==2' failed."
+    },
+    "idempotent": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-adsp-tests-dck2ng6h/test.c:656: idempotent: Assertion `adsp.power==1&&adsp.boots==1' failed."
+    },
+    "restart": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-adsp-tests-dck2ng6h/test.c:657: restart: Assertion `adsp.power==2&&adsp.recoveries==1&&adsp.recovery_disabled' failed."
+    },
+    "firmware": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "/tmp/onyx-audio-adsp-tests-dck2ng6h/test.c:593:19: runtime error: null pointer passed as argument 1, which is declared to never be null"
+    },
+    "provider": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-adsp-tests-dck2ng6h/test.c:663: provider: Assertion `bind()<0&&adsp.refs==1&&!live' failed."
+    },
+    "cleanup": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-adsp-tests-dck2ng6h/test.c:664: cleanup: Assertion `bind()==-ENOMEM&&adsp.refs==1&&!published&&!live' failed."
+    },
+    "parsing": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-adsp-tests-dck2ng6h/test.c:665: parsing: Assertion `command(\"boot\",*s)==-EINVAL&&!loader_work()->queued' failed."
+    },
+    "optional": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-adsp-tests-dck2ng6h/test.c:666: optional: Assertion `adsp.power==1&&modem.power==1&&adsp.refs==2&&modem.refs==2' failed."
+    },
+    "publication": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-adsp-tests-dck2ng6h/test.c:54: schedule_work: Assertion `w->initialized' failed."
+    },
+    "removal": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-adsp-tests-dck2ng6h/test.c:686: removal: Assertion `!READ_ONCE(removal_done)' failed."
+    }
+  },
+  "source_sha256": {
+    "qcom/opensource/audio-kernel/dsp/adsp-loader.c": "fccc11446d3f897ba8773a640fc76764383d5114c4f967efe4293556a69160f0"
+  },
+  "harness_sha256": "a0a246b80b9b240a17d2513477aa84746a4811c5c11db8572c0d4911c7b7434a",
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Full ADSP source with simulated DT/NVMEM/GPR-ready/remoteproc/sysfs behavior and real pthread worker/removal locking; no real kernel kernfs scheduling, Qualcomm DSP recovery, firmware execution, suspend/resume, IRQ or hardware verification."
+}

@@ -1,0 +1,66 @@
+{
+  "module_sha256": "657a0a792b418399cea6260fdf6b6f5eecdbd8c031025da3bc24e8eab665b9ac",
+  "depends": "spf_core_dlkm",
+  "aliases": [
+    "of:N*T*Cqcom,adsp-loader",
+    "of:N*T*Cqcom,adsp-loaderC*"
+  ],
+  "exports": [],
+  "imports": [
+    "0x279498f1\t__platform_driver_register",
+    "0xf5ab7c57\tplatform_driver_unregister",
+    "0x8a964733\tof_find_property",
+    "0xb9f04906\trproc_get_by_phandle",
+    "0x9360f980\tdevm_kmalloc",
+    "0x47f1766b\tkernel_kobj",
+    "0x270c763e\tkobject_create_and_add",
+    "0x31b8c566\tsysfs_create_group",
+    "0x1cc4995f\tnvmem_cell_get",
+    "0x99f018c4\tnvmem_cell_read",
+    "0x85540ebc\tnvmem_cell_put",
+    "0x037a0cba\tkfree",
+    "0x94c5c4a4\tof_property_read_variable_u32_array",
+    "0xd2555b9d\tof_property_read_string",
+    "0x98cf60b3\tstrlen",
+    "0xa916b694\tstrnlen",
+    "0xdd64e639\tstrscpy",
+    "0x3b00ee3e\t_dev_err",
+    "0xa7d60d36\tkobject_del",
+    "0x4b6b9c79\trproc_put",
+    "0x4829a47e\tmemcpy",
+    "0x2137b691\t_dev_info",
+    "0xeb381163\tof_property_read_string_helper",
+    "0xadd4c239\tdevm_kfree",
+    "0xf0fdf6cb\t__stack_chk_fail",
+    "0xcbd4898c\tfortify_panic",
+    "0x1e9e1fac\trproc_shutdown",
+    "0x3ff466d3\tsysfs_remove_group",
+    "0xe2d5255a\tstrcmp",
+    "0xdcd5024e\trproc_boot",
+    "0x8d8c0146\tspf_core_is_apm_ready",
+    "0x42eb25ce\trproc_set_firmware",
+    "0xbcab6ee6\tsscanf",
+    "0x2d3385d3\tsystem_wq",
+    "0x732ac580\tqueue_work_on",
+    "0x92997ed8\t_printk",
+    "0x8c8569cb\tkstrtoint",
+    "0x4e276f37\tmodule_layout"
+  ],
+  "linked_objects": [
+    "../sm8735-modules/qcom/opensource/audio-kernel/dsp/adsp-loader.o"
+  ],
+  "command_sha256": "fb479f6ef3c948b802513e89ff5e43ecc587899e3cb7c2fde88a8b8f7fd7129b",
+  "new_source": "qcom/opensource/audio-kernel/dsp/adsp-loader.c",
+  "existing_audio_header_groups": [
+    "audio_spf_headers",
+    "audio_gpr_headers"
+  ],
+  "existing_platform_header": "include/linux/remoteproc/qcom_rproc.h",
+  "read_only_findings": [
+    "Global platform pointer and global work item outlive removal; sysfs callbacks can race the provider lifetime.",
+    "A remoteproc handle is overwritten by an optional proc-img-to-load without balancing ownership; shutdown can run without a matching successful boot.",
+    "Firmware-name arrays accept a partial string count before dereferencing every requested entry.",
+    "Remoteproc lookup, phandle payload sizes, strict command parsing and sysfs kobject release need checked unwind paths."
+  ],
+  "next_stage": "After SPF freezes: import only the new ROM-proven ADSP source, preserve the root-owned remoteproc provider and implement source-level lifecycle tests."
+}

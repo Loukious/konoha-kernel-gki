@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 221 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 226 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 221 platform `.ko` files, their symbol tables and DDK configurations.
+- 226 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 11,983
-imported symbol CRCs across all 221 modules.
+used. The current [validation report](validation-20261031.json) checks 12,244
+imported symbol CRCs across all 226 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1296,3 +1296,48 @@ Built ROM module coverage is 219/466 (47.0%), leaving 247 names to assess or
 port, including alternative hardware. Main WLAN/Bluetooth, remaining audio,
 camera/video and device interfaces, boot/DLKM images and the installer still need
 completion. No flashable 6.18 ZIP or phone validation exists yet.
+
+
+## ADSP loading and remaining charging interfaces
+
+The native ADSP loader owns its boot votes, optional firmware handle and sysfs
+work. Stop drains commands and releases only acquired resources. Native core SSR
+recovery retains its power votes and uses the existing remoteproc recovery path.
+[Full-source tests](audio-adsp-validation-20261031.json) pass thirteen ASan/UBSan
+groups; ten original-source controls reject their targeted faults, including a
+partial firmware-name array. Live DSP recovery and firmware remain untested.
+
+Charger business uses an owned bounded FIFO, six notifier registrations and
+per-device supply descriptors. Stop withdraws callbacks, drains work and tears
+down supplies. The pinned Onyx profile disables wireless support; reverse-wireless
+coordination remains behind a disabled configuration option. Four extension
+controls return EOPNOTSUPP until their real HANDLE_ALLOW_CHARGE,
+START_QUICK_REVCHG and REVCHG_BCL handlers exist. Notification-only forwarding
+retains nontransactional sink semantics. [Business tests](businesscharger-validation-20261031.json)
+cover probe failures, concurrent enqueue, supply ownership, controls and provider
+errors against the actual Onyx properties.
+
+The BMD provider retains the native [3,1] IIC/GPIO sensor scheme and underscore
+GPIO binding, checks sensor failures and continues monitoring while connected.
+[BMD tests](bmd-validation-20261031.json) cover eight probe faults, 2,014 sensor
+cases and worker removal. PD authentication preserves native VDM commands and
+uses validated, aligned payloads; state changes follow successful provider calls.
+[PD interface tests](pdauth-validation-20261031.json) cover 105 hex boundaries,
+ten invalid commands, errors and an active sysfs reader during removal.
+
+Thermal policy validates the actual table dimensions and levels, retains desired
+controls for deferred voters, propagates vote errors and drains exported setters
+and workers during removal. [Thermal tests](thermal-validation-20261031.json)
+cover nineteen probe faults, 61 control/provider cases and nine malformed schemas
+with the pinned fifteen-row wired profile. The existing raw voter-pointer
+lifetime contract remains, and multiple votes can partially apply on failure.
+These tests mock kernel and provider services; they do not establish electrical
+protection, live authentication, charging or phone operation.
+
+The combined 226-module archive `artifacts/20261031T140821184889Z` passes
+12,244 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
+and overlay checks pass with 1,084 existing vendor DTC warnings.
+ROM module build coverage is 224/466 (48.1%), leaving 242 names to assess or
+port, including alternative hardware. WLAN/Bluetooth, remaining audio,
+camera/video, device interfaces and image/installer work remain. No flashable
+6.18 ZIP or phone validation exists yet.

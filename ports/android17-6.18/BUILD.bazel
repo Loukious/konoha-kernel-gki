@@ -2838,6 +2838,71 @@ ddk_module(
     copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
 )
 
+ddk_headers(
+    name = "businesscharger_headers",
+    hdrs = ["drivers/power/supply/mca/mca_business/business_charger/inc/mca_business_charger.h", "drivers/power/supply/mca/mca_business/business_charger/inc/mca_charger_usb_psy.h", "drivers/power/supply/mca/mca_business/business_charger/inc/mca_charger_wireless_psy.h"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_business_charger_comp",
+    srcs = ["drivers/power/supply/mca/mca_business/business_charger/mca_business_charger.c", "drivers/power/supply/mca/mca_business/business_charger/mca_charger_usb_psy.c", "drivers/power/supply/mca/mca_business/business_charger/mca_charger_wireless_psy.c"],
+    out = "mca_business_charger_comp.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":businesscharger_headers", ":altmode_headers", ":fsa4480_i2c", ":mca_connector_antiburn", ":mca_lpd_detect", ":smartcharge_headers", ":chargebusiness_headers", ":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_common", ":mca_sysfs", ":mca_hwid", ":mca_workqueue", ":mca_qcom_smem", ":mca_charge_interface", ":mca_smart_charge", ":mca_charge_mievent", ":mca_strategy_fg_class", ":mca_strategy_class", ":mca_platform_fg_ic_ops", ":mca_platform_buckchg_class", ":mca_platform_loadsw_class", ":mca_platform_cp_class", ":mca_platform_wireless_class", ":mca_protocol_pd_class", ":mca_protocol_qc_class", ":mca_protocol_class", ":charger_partition", ":mca_qcom_panel"],
+    visibility = ["//visibility:public"],
+)
+
+
+ddk_module(
+    name = "adsp_loader_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/dsp/adsp-loader.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "adsp_loader_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_spf_headers", ":audio_gpr_headers", ":spf_core_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "mca_bmd",
+    srcs = ["drivers/power/supply/mca/mca_hardware_monitor/mca_bmd.c", "drivers/power/supply/mca/mca_hardware_monitor/inc/mca_bmd.h"],
+    out = "mca_bmd.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mca_headers", ":chargebusiness_headers", ":mca_strategy_fg_class", ":chargehw_headers", ":chargepolicy_headers", ":mca_common", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_sysfs", ":mca_hwid", ":mca_workqueue", ":mca_charge_mievent", ":mca_platform_buckchg_class", ":mca_strategy_class", ":mca_protocol_class", ":mca_protocol_pd_class"],
+    visibility = ["//visibility:public"],
+)
+
+
+ddk_module(
+    name = "mca_pd_auth",
+    srcs = ["drivers/power/supply/mca/mca_strategy/strategy_pd/mca_pd_auth.c", "drivers/power/supply/mca/mca_strategy/strategy_pd/pd_auth.h"],
+    out = "mca_pd_auth.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mca_headers", ":chargehw_headers", ":chargepolicy_headers", ":mca_common", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_sysfs", ":mca_hwid", ":mca_workqueue", ":mca_charge_mievent", ":mca_platform_buckchg_class", ":mca_strategy_class", ":mca_protocol_class", ":mca_protocol_pd_class"],
+    visibility = ["//visibility:public"],
+)
+
+
+ddk_module(
+    name = "mca_charger_thermal",
+    srcs = ["drivers/power/supply/mca/mca_strategy/strategy_charger/mca_charger_thermal.c", "drivers/power/supply/mca/mca_strategy/strategy_charger/inc/mca_charger_thermal.h"],
+    out = "mca_charger_thermal.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":smartcharge_headers", ":mca_headers", ":chargebusiness_headers", ":mca_strategy_fg_class", ":chargehw_headers", ":chargepolicy_headers", ":mca_smart_charge", ":mca_qcom_smem", ":mca_platform_fg_ic_ops", ":mca_common", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_sysfs", ":mca_hwid", ":mca_workqueue", ":mca_charge_mievent", ":mca_platform_buckchg_class", ":mca_strategy_class", ":mca_protocol_class", ":mca_protocol_pd_class"],
+    visibility = ["//visibility:public"],
+)
+
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3049,6 +3114,11 @@ kernel_module_group(
         ":pci_msm_drv",
         ":mhi",
         ":spf_core_dlkm",
+        ":mca_business_charger_comp",
+        ":adsp_loader_dlkm",
+        ":mca_bmd",
+        ":mca_pd_auth",
+        ":mca_charger_thermal",
     ],
 )
 
