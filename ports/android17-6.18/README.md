@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 45 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 48 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 45 platform `.ko` files, their symbol tables and DDK configurations.
+- 48 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 1523
-imported symbol CRCs across all 45 modules.
+used. The current [validation report](validation-20261031.json) checks 1799
+imported symbol CRCs across all 48 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -108,7 +108,17 @@ PON and stub-regulator driver. The reboot-mode library comes from 6.18 common.
 The RTC retains its `rtc_us_val` attribute using device sysfs APIs exported by
 GKI, with managed removal before RTC teardown. Onyx's reboot-reason DT node
 uses the NVMEM cell path; the legacy QPNP power-on fallback remains disabled.
-These PHY outputs do not yet provide a working UFS host controller.
+
+The UFS host group adds `ufs-qcom`, `qcom_ice` and `ufshcd-crypto-qti`.
+It retains the Onyx hardware-wrapped-key profile, vendor power negotiation,
+Sun PHY integration and MCQ register layout. The adapters use 6.18 power-mode,
+block-crypto and platform-MSI interfaces. ESI teardown unregisters CPU-hotplug
+callbacks and frees IRQ handlers before MSI descriptors; DT affinity accesses
+are bounded. A failed secure key-programming call now releases its shared
+buffer. Clock scaling retains the baseline min/max frequency tables. These
+build checks do not establish storage or decryption operation on the phone.
+Checkpatch reports no errors and one advisory for the intentional `NR_CPUS`
+bounds check on firmware CPU indices before fused-CPU remapping.
 
 `CONFIG_QCOM_SCM=m` and `CONFIG_QTEE_SHM_BRIDGE=y` are set in the DDK module
 configuration. Common Kconfig also selects `QCOM_TZMEM`; the vendor composite
@@ -142,8 +152,9 @@ changes are captured for later porting; they are not in this initial group.
 
 ## Next implementation gates
 
-1. Complete the Gunyah host/VM, IOMMU and UFS host/encryption dependencies needed for Onyx early boot. Test probe
-   ordering, GPIO wakeups, SCM wait queues and shared-memory operations.
+1. Complete the Gunyah host/VM and IOMMU dependencies needed for Onyx early boot.
+   Test UFS/encryption, probe ordering, GPIO wakeups, SCM wait queues and
+   shared-memory operations.
 2. Port the device trees and remaining first-stage list; produce matching
    vendor_boot, DTBO and DLKM images with complete dependency/load lists.
 3. Port the scheduler, KGSL/display, thermal, audio, camera, touch,

@@ -578,6 +578,49 @@ ddk_module(
     deps = [":storage_pmic_headers", ":platform_headers", ":regulator_headers", ":debug_regulator"],
 )
 
+ddk_headers(
+    name = "ufs_headers",
+    hdrs = glob(["drivers/ufs/host/*.h"]) + [
+        "include/soc/qcom/ice.h",
+        "drivers/ufs/core/ufs_trace_types.h",
+        "include/ufs/ufshcd-crypto-qti.h",
+    ],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "qcom_ice",
+    srcs = ["drivers/soc/qcom/ice.c"],
+    includes = ["drivers/ufs/host"],
+    out = "qcom_ice.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":ufs_headers", ":storage_pmic_headers", ":platform_headers", ":scm_headers", ":clock_headers", ":qcom_scm"],
+)
+
+ddk_module(
+    name = "ufshcd_crypto_qti",
+    srcs = ["drivers/ufs/host/ufshcd-crypto-qti.c"],
+    includes = ["drivers/ufs/host"],
+    out = "ufshcd-crypto-qti.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":ufs_headers", ":storage_pmic_headers", ":platform_headers", ":scm_headers", ":clock_headers", ":qcom_ice"],
+)
+
+ddk_module(
+    name = "ufs_qcom",
+    srcs = ["drivers/ufs/host/ufs-qcom.c"],
+    includes = ["drivers/ufs/host"],
+    out = "ufs-qcom.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":ufs_headers", ":storage_pmic_headers", ":platform_headers", ":scm_headers", ":clock_headers", ":phy_qcom_ufs", ":clk_qcom", ":qcom_ipc_logging", ":qcom_ice", ":ufshcd_crypto_qti"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -613,6 +656,9 @@ kernel_module_group(
         ":qcom_pon",
         ":reboot_mode",
         ":stub_regulator",
+        ":qcom_ice",
+        ":ufshcd_crypto_qti",
+        ":ufs_qcom",
     ],
 )
 
