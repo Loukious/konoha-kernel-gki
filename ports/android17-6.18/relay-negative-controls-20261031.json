@@ -1,0 +1,73 @@
+{
+  "tests": {
+    "wrong_cpu_failure_slot": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "relay: /tmp/onyx-relay-test-yeb77t1f/relay.c:1460: cpu_prepare_test: Assertion `one&&one!=zero&&one->cpu==1' failed."
+    },
+    "legacy_failure_slot_clear": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "relay: /tmp/onyx-relay-test-yeb77t1f/relay.c:1459: cpu_prepare_test: Assertion `*per_cpu_ptr(c->buf,0)==zero&&!*per_cpu_ptr(c->buf,1)' failed."
+    },
+    "missing_hotplug_lock": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "relay: /tmp/onyx-relay-test-yeb77t1f/relay.c:1470: hotplug_order: Assertion `atomic_load(&cpu_readers)==1' failed."
+    },
+    "masked_cpuhp_init_error": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "relay: /tmp/onyx-relay-test-yeb77t1f/relay.c:1458: module_init_test: Assertion `onyx_relay_init()==-ENOMEM&&!hp_live' failed."
+    },
+    "missing_cpuhp_remove": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "relay: /tmp/onyx-relay-test-yeb77t1f/relay.c:1458: module_init_test: Assertion `!hp_live&&hp_remove_count==1' failed."
+    },
+    "missing_file_module_owner": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "relay: /tmp/onyx-relay-test-yeb77t1f/relay.c:1450: vfs_open: Assertion `relay_file_operations.owner==THIS_MODULE' failed."
+    },
+    "missing_channel_module_ref": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "relay: /tmp/onyx-relay-test-yeb77t1f/relay.c:1462: file_mmap_test: Assertion `module_refs==2' failed."
+    },
+    "missing_irq_work_drain": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "relay: /tmp/onyx-relay-test-yeb77t1f/relay.c:1463: ring_test: Assertion `!b->wakeup_work.pending&&b->subbufs_produced==0&&b->read_wait.wakeups==1' failed."
+    },
+    "lost_early_reader_ref": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "relay: /tmp/onyx-relay-test-yeb77t1f/relay.c:1465: publish_open_test: Assertion `b->kref.refs==2&&module_refs==2' failed."
+    },
+    "unchecked_fault_offset": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "relay: /tmp/onyx-relay-test-yeb77t1f/relay.c:1462: file_mmap_test: Assertion `relay_buf_fault(&fault)==VM_FAULT_SIGBUS&&fault_lookups==lookups' failed."
+    },
+    "unchecked_mmap_offset": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "relay: /tmp/onyx-relay-test-yeb77t1f/relay.c:1462: file_mmap_test: Assertion `relay_file_mmap(&f,&v)==-EINVAL' failed."
+    }
+  },
+  "source_sha256": {
+    "kernel/relay.c": "26a77faa508c777981bdebaf8dce28c9d4aea56df7989c9be1d947525225dce6"
+  },
+  "kernel_header_sha256": {
+    "include/linux/relay.h": "eb4aeefd0d110da8e6cd1ac2915cbdffcd67a177b82f36e5c4c82470bd2d5568"
+  },
+  "harness_sha256": {
+    "relay.c": "b0d937d525f2d6975cc5b14a87f29ff4d498693482f77fa7ad032edba8c5b772"
+  },
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Full production relay source and current kernel relay.h; allocation/page mapping/VFS module-file-VMA references/IRQ work/CPU-hotplug services mocked. Pthread synchronization tests CPU preparation serialization. No actual kernel loading, hotplug, mmap or WLAN transport run."
+}

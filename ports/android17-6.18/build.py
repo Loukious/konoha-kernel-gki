@@ -76,7 +76,7 @@ def main():
     inputs = artifacts / "inputs"
     inputs.mkdir()
     for name in ["sources.json", "imports.json", "onyx-port.xml", "dependency-lock.xml",
-                 "BUILD.bazel", "Kconfig", "scm_defconfig", "platform_defconfig", "modules.json",
+                 "BUILD.bazel", "Kconfig", "scm_defconfig", "platform_defconfig", "relay.fragment", "modules.json",
                  "build.py", "prepare.py", "stage.py", "verify_modules.py", "boot-parameters.txt",
                  "build_devicetrees.py", "devicetrees.json"]:
         shutil.copyfile(HERE / name, inputs / name)

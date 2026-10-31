@@ -1,0 +1,1120 @@
+diff --git a/qca-wifi-host-cmn/hif/inc/hif.h b/qca-wifi-host-cmn/hif/inc/hif.h
+--- a/qca-wifi-host-cmn/hif/inc/hif.h
++++ b/qca-wifi-host-cmn/hif/inc/hif.h
+@@ -357,7 +357,7 @@
+  * instances.
+  */
+ struct qca_napi_info {
+-	struct net_device    netdev; /* dummy net_dev */
++	struct net_device    *netdev; /* dummy net_dev */
+ 	void                 *hif_ctx;
+ 	struct napi_struct   napi;
+ 	uint8_t              scale;   /* currently same on all instances */
+@@ -370,7 +370,7 @@
+ 	/* will only be present for data rx CE's */
+ 	void (*offld_flush_cb)(void *);
+ 	struct napi_struct   rx_thread_napi;
+-	struct net_device    rx_thread_netdev;
++	struct net_device    *rx_thread_netdev;
+ #endif /* RECEIVE_OFFLOAD */
+ 	qdf_lro_ctx_t        lro_ctx;
+ #ifdef WLAN_FEATURE_RX_SOFTIRQ_TIME_LIMIT
+diff --git a/qca-wifi-host-cmn/hif/src/hif_exec.c b/qca-wifi-host-cmn/hif/src/hif_exec.c
+--- a/qca-wifi-host-cmn/hif/src/hif_exec.c
++++ b/qca-wifi-host-cmn/hif/src/hif_exec.c
+@@ -920,7 +920,11 @@
+ 		hif_irq_affinity_remove(ctx->os_irq[irq_ind]);
+ 
+ 	hif_core_ctl_set_boost(false);
+-	qdf_netif_napi_del(&(n_ctx->napi));
++	if (n_ctx->netdev) {
++		qdf_netif_napi_del(&n_ctx->napi);
++		qdf_net_if_free_dummy_if((struct qdf_net_if *)n_ctx->netdev);
++		n_ctx->netdev = NULL;
++	}
+ }
+ 
+ struct hif_execution_ops napi_sched_ops = {
+@@ -941,11 +945,16 @@
+ 	if (!ctx)
+ 		return NULL;
+ 
++	ctx->netdev = (struct net_device *)qdf_net_if_create_dummy_if();
++	if (!ctx->netdev) {
++		qdf_mem_free(ctx);
++		return NULL;
++	}
++
+ 	ctx->exec_ctx.sched_ops = &napi_sched_ops;
+ 	ctx->exec_ctx.inited = true;
+ 	ctx->exec_ctx.scale_bin_shift = scale;
+-	qdf_net_if_create_dummy_if((struct qdf_net_if *)&ctx->netdev);
+-	qdf_netif_napi_add(&(ctx->netdev), &(ctx->napi), hif_exec_poll,
++	qdf_netif_napi_add(ctx->netdev, &ctx->napi, hif_exec_poll,
+ 			   QCA_NAPI_BUDGET);
+ 	qdf_napi_enable(&ctx->napi);
+ 
+diff --git a/qca-wifi-host-cmn/hif/src/hif_exec.h b/qca-wifi-host-cmn/hif/src/hif_exec.h
+--- a/qca-wifi-host-cmn/hif/src/hif_exec.h
++++ b/qca-wifi-host-cmn/hif/src/hif_exec.h
+@@ -156,7 +156,7 @@
+  */
+ struct hif_napi_exec_context {
+ 	struct hif_exec_context exec_ctx;
+-	struct net_device    netdev; /* dummy net_dev */
++	struct net_device    *netdev; /* dummy net_dev */
+ 	struct napi_struct   napi;
+ };
+ 
+diff --git a/qca-wifi-host-cmn/hif/src/hif_napi.c b/qca-wifi-host-cmn/hif/src/hif_napi.c
+--- a/qca-wifi-host-cmn/hif/src/hif_napi.c
++++ b/qca-wifi-host-cmn/hif/src/hif_napi.c
+@@ -80,10 +80,7 @@
+  */
+ static void hif_init_rx_thread_napi(struct qca_napi_info *napii)
+ {
+-	struct qdf_net_if *nd = (struct qdf_net_if *)&napii->rx_thread_netdev;
+-
+-	qdf_net_if_create_dummy_if(nd);
+-	qdf_netif_napi_add(&napii->rx_thread_netdev, &napii->rx_thread_napi,
++	qdf_netif_napi_add(napii->rx_thread_netdev, &napii->rx_thread_napi,
+ 			   hif_rxthread_napi_poll, 64);
+ 	qdf_napi_enable(&napii->rx_thread_napi);
+ }
+@@ -96,7 +93,10 @@
+  */
+ static void hif_deinit_rx_thread_napi(struct qca_napi_info *napii)
+ {
++	qdf_napi_disable(&napii->rx_thread_napi);
+ 	qdf_netif_napi_del(&napii->rx_thread_napi);
++	qdf_net_if_free_dummy_if((struct qdf_net_if *)napii->rx_thread_netdev);
++	napii->rx_thread_netdev = NULL;
+ }
+ #else /* RECEIVE_OFFLOAD */
+ static void hif_init_rx_thread_napi(struct qca_napi_info *napii)
+@@ -140,6 +140,7 @@
+ 	struct CE_state      *ce_state;
+ 	struct hif_softc *hif = HIF_GET_SOFTC(hif_ctx);
+ 	int    rc = 0;
++	bool cpu_ready = false;
+ 
+ 	NAPI_DEBUG("-->(budget=%d, scale=%d)",
+ 		   budget, scale);
+@@ -149,6 +150,8 @@
+ 		   hif->napi_data.ce_map);
+ 
+ 	napid = &(hif->napi_data);
++	if (napid->state & HIF_NAPI_INITED)
++		return -EALREADY;
+ 	if (0 == (napid->state &  HIF_NAPI_INITED)) {
+ 		memset(napid, 0, sizeof(struct qca_napi_data));
+ 		qdf_spinlock_create(&(napid->lock));
+@@ -159,11 +162,11 @@
+ 		rc = hif_napi_cpu_init(hif_ctx);
+ 		if (rc != 0 && rc != -EALREADY) {
+ 			hif_err("NAPI_initialization failed(rc=%d)", rc);
+-			rc = napid->ce_map;
+ 			goto hnc_err;
+ 		} else
+ 			rc = 0;
+ 
++		cpu_ready = true;
+ 		hif_debug("NAPI structures initialized, rc=%d", rc);
+ 	}
+ 	for (i = 0; i < hif->ce_count; i++) {
+@@ -185,6 +188,20 @@
+ 			rc = -ENOMEM;
+ 			goto napii_free;
+ 		}
++		/* Allocate all devices before publishing any NAPI context. */
++		napii->netdev = (struct net_device *)qdf_net_if_create_dummy_if();
++		if (!napii->netdev) {
++			rc = -ENOMEM;
++			goto napii_free;
++		}
++#ifdef RECEIVE_OFFLOAD
++		napii->rx_thread_netdev =
++			(struct net_device *)qdf_net_if_create_dummy_if();
++		if (!napii->rx_thread_netdev) {
++			rc = -ENOMEM;
++			goto napii_free;
++		}
++#endif
+ 	}
+ 
+ 	for (i = 0; i < hif->ce_count; i++) {
+@@ -193,7 +210,6 @@
+ 			continue;
+ 
+ 		NAPI_DEBUG("initializing NAPI for pipe %d", i);
+-		memset(napii, 0, sizeof(struct qca_napi_info));
+ 		napii->scale = scale;
+ 		napii->id    = NAPI_PIPE2ID(i);
+ 		napii->hif_ctx = hif_ctx;
+@@ -202,22 +218,20 @@
+ 		if (napii->irq < 0)
+ 			hif_warn("bad IRQ value for CE %d: %d", i, napii->irq);
+ 
+-		qdf_net_if_create_dummy_if((struct qdf_net_if *)&napii->netdev);
+-
+ 		NAPI_DEBUG("adding napi=%pK to netdev=%pK (poll=%pK, bdgt=%d)",
+-			   &(napii->napi), &(napii->netdev), poll, budget);
+-		qdf_netif_napi_add(&(napii->netdev), &(napii->napi),
++			   &napii->napi, napii->netdev, poll, budget);
++		qdf_netif_napi_add(napii->netdev, &napii->napi,
+ 				   poll, budget);
+ 
+ 		NAPI_DEBUG("after napi_add");
+ 		NAPI_DEBUG("napi=0x%pK, netdev=0x%pK",
+-			   &(napii->napi), &(napii->netdev));
++			   &napii->napi, napii->netdev);
+ 		NAPI_DEBUG("napi.dev_list.prev=0x%pK, next=0x%pK",
+ 			   napii->napi.dev_list.prev,
+ 			   napii->napi.dev_list.next);
+ 		NAPI_DEBUG("dev.napi_list.prev=0x%pK, next=0x%pK",
+-			   napii->netdev.napi_list.prev,
+-			   napii->netdev.napi_list.next);
++			   napii->netdev->napi_list.prev,
++			   napii->netdev->napi_list.next);
+ 
+ 		hif_init_rx_thread_napi(napii);
+ 		napii->lro_ctx = qdf_lro_init();
+@@ -246,11 +260,20 @@
+ 	for (i = 0; i < hif->ce_count; i++) {
+ 		napii = napid->napis[i];
+ 		napid->napis[i] = NULL;
+-		if (napii)
++		if (napii) {
++#ifdef RECEIVE_OFFLOAD
++			qdf_net_if_free_dummy_if((void *)napii->rx_thread_netdev);
++#endif
++			qdf_net_if_free_dummy_if((struct qdf_net_if *)napii->netdev);
+ 			qdf_mem_free(napii);
++		}
+ 	}
+ 
+ hnc_err:
++	if (cpu_ready)
++		hif_napi_cpu_deinit(hif_ctx);
++	qdf_spinlock_destroy(&napid->lock);
++	memset(napid, 0, sizeof(*napid));
+ 	NAPI_DEBUG("<--napi_instances_map=%x]", napid->ce_map);
+ 	return rc;
+ }
+@@ -362,9 +385,9 @@
+ 		}
+ 
+ 
+-		if (hif->napi_data.state == HIF_NAPI_CONF_UP) {
++		if (hif->napi_data.state & HIF_NAPI_CONF_UP) {
+ 			if (force) {
+-				qdf_napi_disable(&(napii->napi));
++				qdf_napi_disable(&napii->napi);
+ 				hif_debug("NAPI entry %d force disabled", id);
+ 				NAPI_DEBUG("NAPI %d force disabled", id);
+ 			} else {
+@@ -378,11 +401,13 @@
+ 				  napii->napi.dev_list.prev,
+ 				  napii->napi.dev_list.next);
+ 			NAPI_DEBUG("dev.napi_l.prv=0x%pK, next=0x%pK",
+-				   napii->netdev.napi_list.prev,
+-				   napii->netdev.napi_list.next);
++				   napii->netdev->napi_list.prev,
++				   napii->netdev->napi_list.next);
+ 
+ 			qdf_lro_deinit(napii->lro_ctx);
+-			qdf_netif_napi_del(&(napii->napi));
++			qdf_netif_napi_del(&napii->napi);
++			qdf_net_if_free_dummy_if((struct qdf_net_if *)napii->netdev);
++			napii->netdev = NULL;
+ 			hif_deinit_rx_thread_napi(napii);
+ 
+ 			napid->ce_map &= ~(0x01 << ce);
+@@ -685,7 +710,7 @@
+ 			for (i = 0; i < CE_COUNT_MAX; i++) {
+ 				struct qca_napi_info *napii = napid->napis[i];
+ 				if (napii) {
+-					napi = &(napii->napi);
++					napi = &napii->napi;
+ 					NAPI_DEBUG("%s: enabling NAPI %d",
+ 						   __func__, i);
+ 					qdf_napi_enable(napi);
+@@ -696,7 +721,7 @@
+ 			for (i = 0; i < CE_COUNT_MAX; i++) {
+ 				struct qca_napi_info *napii = napid->napis[i];
+ 				if (napii) {
+-					napi = &(napii->napi);
++					napi = &napii->napi;
+ 					NAPI_DEBUG("%s: disabling NAPI %d",
+ 						   __func__, i);
+ 					qdf_napi_disable(napi);
+@@ -1112,7 +1137,7 @@
+ 	napii->stats[cpu].napi_schedules++;
+ 	NAPI_DEBUG("scheduling napi %d (ce:%d)", napii->id, ce_id);
+ 	hif_napi_latency_profile_start(scn, ce_id);
+-	napi_schedule(&(napii->napi));
++	napi_schedule(&napii->napi);
+ 
+ 	return true;
+ }
+diff --git a/qca-wifi-host-cmn/os_if/linux/wifi_pos/src/os_if_wifi_pos.c b/qca-wifi-host-cmn/os_if/linux/wifi_pos/src/os_if_wifi_pos.c
+--- a/qca-wifi-host-cmn/os_if/linux/wifi_pos/src/os_if_wifi_pos.c
++++ b/qca-wifi-host-cmn/os_if/linux/wifi_pos/src/os_if_wifi_pos.c
+@@ -40,7 +40,7 @@
+ #else
+ #include <net/cnss_nl.h>
+ #endif
+-#include "linux/genetlink.h"
++#include <net/genetlink.h>
+ #include "wifi_pos_utils_pub.h"
+ #endif
+ 
+diff --git a/qca-wifi-host-cmn/qdf/inc/qdf_net_if.h b/qca-wifi-host-cmn/qdf/inc/qdf_net_if.h
+--- a/qca-wifi-host-cmn/qdf/inc/qdf_net_if.h
++++ b/qca-wifi-host-cmn/qdf/inc/qdf_net_if.h
+@@ -34,14 +34,13 @@
+ #ifdef ENHANCED_OS_ABSTRACTION
+ /**
+  * qdf_net_if_create_dummy_if() - create dummy interface
+- * @nif: interface handle
+- *
+- * This function will create a dummy network interface
+- *
+- * Return: QDF_STATUS_SUCCESS on success
+- */
+-QDF_STATUS
+-qdf_net_if_create_dummy_if(struct qdf_net_if *nif);
++ *
++ * Allocate a dummy network interface; remove all NAPI contexts before free.
++ *
++ * Return: interface handle, or NULL on allocation failure
++ */
++struct qdf_net_if *qdf_net_if_create_dummy_if(void);
++void qdf_net_if_free_dummy_if(struct qdf_net_if *nif);
+ 
+ /**
+  * qdf_net_if_get_dev_by_name() - Find a network device by its name
+@@ -140,10 +139,16 @@
+ 				   const void *src_addr,
+ 				   size_t len);
+ #else /* ENHANCED_OS_ABSTRACTION */
+-static inline QDF_STATUS
+-qdf_net_if_create_dummy_if(struct qdf_net_if *nif)
+-{
+-	return __qdf_net_if_create_dummy_if(nif);
++static inline struct qdf_net_if *
++qdf_net_if_create_dummy_if(void)
++{
++	return __qdf_net_if_create_dummy_if();
++}
++
++static inline void
++qdf_net_if_free_dummy_if(struct qdf_net_if *nif)
++{
++	__qdf_net_if_free_dummy_if(nif);
+ }
+ 
+ static inline struct qdf_net_if *
+diff --git a/qca-wifi-host-cmn/qdf/linux/src/i_qdf_hrtimer.h b/qca-wifi-host-cmn/qdf/linux/src/i_qdf_hrtimer.h
+--- a/qca-wifi-host-cmn/qdf/linux/src/i_qdf_hrtimer.h
++++ b/qca-wifi-host-cmn/qdf/linux/src/i_qdf_hrtimer.h
+@@ -164,8 +164,7 @@
+ 		mode |= HRTIMER_MODE_SOFT;
+ 
+ 	hrt_mode = __qdf_hrtimer_get_mode(mode);
+-	hrtimer_init(hrtimer, clock, hrt_mode);
+-	hrtimer->function = __qdf_hrtimer_cb;
++	hrtimer_setup(hrtimer, __qdf_hrtimer_cb, clock, hrt_mode);
+ }
+ #else
+ static inline void  __qdf_hrtimer_init(__qdf_hrtimer_data_t *timer,
+diff --git a/qca-wifi-host-cmn/qdf/linux/src/i_qdf_nbuf.h b/qca-wifi-host-cmn/qdf/linux/src/i_qdf_nbuf.h
+--- a/qca-wifi-host-cmn/qdf/linux/src/i_qdf_nbuf.h
++++ b/qca-wifi-host-cmn/qdf/linux/src/i_qdf_nbuf.h
+@@ -2039,7 +2039,7 @@
+ 					     struct flow_keys *flow)
+ {
+ 	flow->ports.ports = skb_flow_get_ports(skb, flow->control.thoff,
+-				  flow->basic.ip_proto);
++				  flow->basic.ip_proto, NULL, 0);
+ }
+ 
+ /**
+diff --git a/qca-wifi-host-cmn/qdf/linux/src/i_qdf_net_if.h b/qca-wifi-host-cmn/qdf/linux/src/i_qdf_net_if.h
+--- a/qca-wifi-host-cmn/qdf/linux/src/i_qdf_net_if.h
++++ b/qca-wifi-host-cmn/qdf/linux/src/i_qdf_net_if.h
+@@ -35,18 +35,23 @@
+ 
+ /**
+  * __qdf_net_if_create_dummy_if() - create dummy interface
+- * @nif: interface handle
+- *
+- * This function will create a dummy network interface
+- *
+- * Return: QDF_STATUS_SUCCESS on success
+- */
+-static inline QDF_STATUS
+-__qdf_net_if_create_dummy_if(struct qdf_net_if *nif)
+-{
+-	init_dummy_netdev((struct net_device *)nif);
+-
+-	return qdf_status_from_os_return(0);
++ *
++ * Allocate a dummy network interface with the core-owned NAPI state.
++ * The caller must remove its NAPI contexts before freeing the interface.
++ *
++ * Return: interface handle, or NULL on allocation failure
++ */
++static inline struct qdf_net_if *
++__qdf_net_if_create_dummy_if(void)
++{
++	return (struct qdf_net_if *)alloc_netdev_dummy(0);
++}
++
++static inline void
++__qdf_net_if_free_dummy_if(struct qdf_net_if *nif)
++{
++	if (nif)
++		free_netdev((struct net_device *)nif);
+ }
+ 
+ /**
+diff --git a/qca-wifi-host-cmn/qdf/linux/src/i_qdf_timer.h b/qca-wifi-host-cmn/qdf/linux/src/i_qdf_timer.h
+--- a/qca-wifi-host-cmn/qdf/linux/src/i_qdf_timer.h
++++ b/qca-wifi-host-cmn/qdf/linux/src/i_qdf_timer.h
+@@ -49,7 +49,7 @@
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
+ static inline void __os_timer_shim(struct timer_list *os_timer)
+ {
+-	struct __qdf_timer_t *timer = from_timer(timer, os_timer, os_timer);
++	struct __qdf_timer_t *timer = timer_container_of(timer, os_timer, os_timer);
+ 
+ 	timer->callback(timer->context);
+ }
+@@ -156,22 +156,22 @@
+ 
+ static inline bool __qdf_timer_stop(struct __qdf_timer_t *timer)
+ {
+-	return !!del_timer(&timer->os_timer);
++	return !!timer_delete(&timer->os_timer);
+ }
+ 
+ static inline void __qdf_timer_free(struct __qdf_timer_t *timer)
+ {
+ 	struct timer_list *os_timer = &timer->os_timer;
+ 
+-	del_timer_sync(os_timer);
++	timer_delete_sync(os_timer);
+ 
+ 	if (object_is_on_stack(os_timer))
+-		destroy_timer_on_stack(os_timer);
++		timer_destroy_on_stack(os_timer);
+ }
+ 
+ static inline bool __qdf_timer_sync_cancel(struct __qdf_timer_t *timer)
+ {
+-	return del_timer_sync(&timer->os_timer);
++	return timer_delete_sync(&timer->os_timer);
+ }
+ 
+ #endif /* _I_QDF_TIMER_H */
+diff --git a/qca-wifi-host-cmn/qdf/linux/src/qdf_mc_timer.c b/qca-wifi-host-cmn/qdf/linux/src/qdf_mc_timer.c
+--- a/qca-wifi-host-cmn/qdf/linux/src/qdf_mc_timer.c
++++ b/qca-wifi-host-cmn/qdf/linux/src/qdf_mc_timer.c
+@@ -416,7 +416,7 @@
+ 
+ 	case QDF_TIMER_STATE_RUNNING:
+ 		/* Stop the timer first */
+-		del_timer(&(timer->platform_info.timer));
++		timer_delete(&timer->platform_info.timer);
+ 		v_status = QDF_STATUS_SUCCESS;
+ 		break;
+ 	case QDF_TIMER_STATE_STOPPED:
+@@ -482,7 +482,7 @@
+ 
+ 	case QDF_TIMER_STATE_RUNNING:
+ 		/* Stop the timer first */
+-		del_timer(&(timer->platform_info.timer));
++		timer_delete(&timer->platform_info.timer);
+ 		v_status = QDF_STATUS_SUCCESS;
+ 		break;
+ 
+@@ -558,7 +558,7 @@
+ 	}
+ 
+ 	/* start the timer */
+-	mod_timer(&(timer->platform_info.timer),
++	mod_timer(&timer->platform_info.timer,
+ 		  jiffies + __qdf_scaled_msecs_to_jiffies(expiration_time));
+ 
+ 	timer->state = QDF_TIMER_STATE_RUNNING;
+@@ -617,7 +617,7 @@
+ 
+ 	qdf_spin_unlock_irqrestore(&timer->platform_info.spinlock);
+ 
+-	del_timer(&(timer->platform_info.timer));
++	timer_delete(&timer->platform_info.timer);
+ 
+ 	qdf_spin_lock_irqsave(&timer->platform_info.spinlock);
+ 	timer->state = QDF_TIMER_STATE_STOPPED;
+@@ -659,7 +659,7 @@
+ 	timer->state = QDF_TIMER_STATE_STOPPED;
+ 
+ 	qdf_spin_unlock_irqrestore(&timer->platform_info.spinlock);
+-	del_timer_sync(&(timer->platform_info.timer));
++	timer_delete_sync(&timer->platform_info.timer);
+ 
+ 	qdf_try_allowing_sleep(timer->type);
+ 
+diff --git a/qca-wifi-host-cmn/qdf/linux/src/qdf_nbuf_frag.c b/qca-wifi-host-cmn/qdf/linux/src/qdf_nbuf_frag.c
+--- a/qca-wifi-host-cmn/qdf/linux/src/qdf_nbuf_frag.c
++++ b/qca-wifi-host-cmn/qdf/linux/src/qdf_nbuf_frag.c
+@@ -827,13 +827,12 @@
+ #if defined(QDF_FRAG_CACHE_SUPPORT)
+ void __qdf_frag_cache_drain(qdf_frag_cache_t *pf_cache)
+ {
+-	struct page *page;
+-
+-	if (!pf_cache->va)
+-		return;
+-
+-	page  = virt_to_page(pf_cache->va);
+-	__page_frag_cache_drain(page, pf_cache->pagecnt_bias);
++	void *addr = (void *)(pf_cache->encoded_page & PAGE_MASK);
++
++	/* The GKI exports the page-count drain, not the cache wrapper. */
++	if (addr)
++		__page_frag_cache_drain(virt_to_page(addr),
++					pf_cache->pagecnt_bias);
+ 	memset(pf_cache, 0, sizeof(*pf_cache));
+ }
+ #else
+diff --git a/qca-wifi-host-cmn/target_if/direct_buf_rx/inc/target_if_direct_buf_rx_api.h b/qca-wifi-host-cmn/target_if/direct_buf_rx/inc/target_if_direct_buf_rx_api.h
+--- a/qca-wifi-host-cmn/target_if/direct_buf_rx/inc/target_if_direct_buf_rx_api.h
++++ b/qca-wifi-host-cmn/target_if/direct_buf_rx/inc/target_if_direct_buf_rx_api.h
+@@ -85,6 +85,8 @@
+ /**
+  * struct direct_buf_rx_data - direct buffer rx data
+  * @dbr_len: Length of the buffer DMAed
++ * @buffer_capacity: Host allocation size in bytes. Does not imply the
++ *                   firmware filled every byte with valid sample data.
+  * @vaddr: Virtual address of the buffer that has DMAed data
+  * @cookie: Cookie for the buffer rxed from target
+  * @paddr: physical address of buffer corresponding to vaddr
+@@ -99,6 +101,7 @@
+  */
+ struct direct_buf_rx_data {
+ 	size_t dbr_len;
++	size_t buffer_capacity;
+ 	void *vaddr;
+ 	uint32_t cookie;
+ 	qdf_dma_addr_t paddr;
+diff --git a/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.c b/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.c
+--- a/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.c
++++ b/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.c
+@@ -1979,6 +1979,7 @@
+ 
+ 	dbr_data->cookie = *cookie;
+ 	dbr_data->paddr = paddr;
++	dbr_data->buffer_capacity = dbr_ring_cap->min_buf_size;
+ 	direct_buf_rx_debug("Cookie = %d Vaddr look up = %pK",
+ 			    dbr_data->cookie, dbr_data->vaddr);
+ 	dbr_data->dbr_len = dbr_rsp->dbr_entries[idx].len;
+@@ -2256,6 +2257,28 @@
+ 		if (QDF_IS_STATUS_ERROR(status)) {
+ 			direct_buf_rx_err("DBR data get failed");
+ 			goto out;
++		}
++
++		/*
++		 * The WMI release length is firmware-provided, not a DMA
++		 * allocation bound.  target_if_get_dbr_data() has already
++		 * completed the FROM_DEVICE DMA unmap.  Never hand an
++		 * oversized release to Spectral/CFR (or a future consumer).
++		 * Repost the now host-owned buffer without reading its data.
++		 * This is a transport guard, not proof of raw ADC samples.
++		 */
++		if (dbr_data.dbr_len > dbr_data.buffer_capacity) {
++			direct_buf_rx_err("DBR release length %zu exceeds capacity %zu, cookie %u",
++					  dbr_data.dbr_len,
++					  dbr_data.buffer_capacity, cookie);
++			status = target_if_dbr_replenish_ring(pdev, mod_param,
++							      dbr_data.vaddr,
++							      cookie);
++			if (QDF_IS_STATUS_ERROR(status)) {
++				direct_buf_rx_err("Invalid DBR length: ring replenish failed");
++				goto out;
++			}
++			continue;
+ 		}
+ 
+ 		dbr_data.meta_data_valid = false;
+diff --git a/qcacld-3.0/components/dp/core/inc/wlan_dp_rx_thread.h b/qcacld-3.0/components/dp/core/inc/wlan_dp_rx_thread.h
+--- a/qcacld-3.0/components/dp/core/inc/wlan_dp_rx_thread.h
++++ b/qcacld-3.0/components/dp/core/inc/wlan_dp_rx_thread.h
+@@ -141,7 +141,7 @@
+ 	struct dp_rx_tm_handle_cmn *rtm_handle_cmn;
+ 	qdf_napi_struct napi;
+ 	qdf_wait_queue_head_t wait_q;
+-	qdf_dummy_netdev_t netdev;
++	qdf_dummy_netdev_t *netdev;
+ 	qdf_netdev_t net_dev[WLAN_PDEV_MAX_VDEVS];
+ };
+ 
+diff --git a/qcacld-3.0/components/dp/core/src/wlan_dp_rx_thread.c b/qcacld-3.0/components/dp/core/src/wlan_dp_rx_thread.c
+--- a/qcacld-3.0/components/dp/core/src/wlan_dp_rx_thread.c
++++ b/qcacld-3.0/components/dp/core/src/wlan_dp_rx_thread.c
+@@ -842,13 +842,16 @@
+  *
+  * Return: None
+  */
+-static void dp_rx_tm_thread_napi_init(struct dp_rx_thread *rx_thread)
++static QDF_STATUS dp_rx_tm_thread_napi_init(struct dp_rx_thread *rx_thread)
+ {
+ 	/* Todo - optimize to use only one dummy netdev for all thread napis */
+-	qdf_net_if_create_dummy_if((struct qdf_net_if *)&rx_thread->netdev);
+-	qdf_netif_napi_add(&rx_thread->netdev, &rx_thread->napi,
++	rx_thread->netdev = (qdf_dummy_netdev_t *)qdf_net_if_create_dummy_if();
++	if (!rx_thread->netdev)
++		return QDF_STATUS_E_NOMEM;
++	qdf_netif_napi_add(rx_thread->netdev, &rx_thread->napi,
+ 			   dp_rx_tm_thread_napi_poll, 64);
+ 	qdf_napi_enable(&rx_thread->napi);
++	return QDF_STATUS_SUCCESS;
+ }
+ 
+ /**
+@@ -859,7 +862,12 @@
+  */
+ static void dp_rx_tm_thread_napi_deinit(struct dp_rx_thread *rx_thread)
+ {
++	if (!rx_thread->netdev)
++		return;
++	qdf_napi_disable(&rx_thread->napi);
+ 	qdf_netif_napi_del(&rx_thread->napi);
++	qdf_net_if_free_dummy_if((struct qdf_net_if *)rx_thread->netdev);
++	rx_thread->netdev = NULL;
+ }
+ 
+ /*
+@@ -900,8 +908,11 @@
+ 	dp_info("%s %u", thread_name, id);
+ 
+ 	if (cdp_cfg_get(dp_rx_tm_get_soc_handle(rx_thread->rtm_handle_cmn),
+-			cfg_dp_gro_enable))
+-		dp_rx_tm_thread_napi_init(rx_thread);
++			cfg_dp_gro_enable)) {
++		qdf_status = dp_rx_tm_thread_napi_init(rx_thread);
++		if (QDF_IS_STATUS_ERROR(qdf_status))
++			return qdf_status;
++	}
+ 
+ 	rx_thread->task = qdf_create_thread(dp_rx_thread_loop,
+ 					    rx_thread, thread_name);
+@@ -939,9 +950,7 @@
+ 	for (i = 0; i < WLAN_PDEV_MAX_VDEVS; i++)
+ 		qdf_event_destroy(&rx_thread->vdev_del_event[i]);
+ 
+-	if (cdp_cfg_get(dp_rx_tm_get_soc_handle(rx_thread->rtm_handle_cmn),
+-			cfg_dp_gro_enable))
+-		dp_rx_tm_thread_napi_deinit(rx_thread);
++	dp_rx_tm_thread_napi_deinit(rx_thread);
+ 
+ 	return QDF_STATUS_SUCCESS;
+ }
+@@ -1397,7 +1406,7 @@
+ 
+ 	for (i = 0; i < rx_tm_hdl->num_dp_rx_threads; i++) {
+ 		if (!rx_tm_hdl->rx_thread[i] ||
+-		    rx_tm_hdl->state == DP_RX_THREADS_INVALID)
++		    !rx_tm_hdl->rx_thread[i]->task)
+ 			continue;
+ 		qdf_set_bit(RX_SHUTDOWN_EVENT,
+ 			    &rx_tm_hdl->rx_thread[i]->event_flag);
+@@ -1408,11 +1417,12 @@
+ 
+ 	for (i = 0; i < rx_tm_hdl->num_dp_rx_threads; i++) {
+ 		if (!rx_tm_hdl->rx_thread[i] ||
+-		    rx_tm_hdl->state == DP_RX_THREADS_INVALID)
++		    !rx_tm_hdl->rx_thread[i]->task)
+ 			continue;
+ 		dp_debug("waiting for shutdown of thread %d", i);
+ 		qdf_wait_single_event(&rx_tm_hdl->rx_thread[i]->shutdown_event,
+ 				      0);
++		rx_tm_hdl->rx_thread[i]->task = NULL;
+ 	}
+ 	rx_tm_hdl->state = DP_RX_THREADS_INVALID;
+ 	return QDF_STATUS_SUCCESS;
+diff --git a/qcacld-3.0/components/dp/core/src/wlan_dp_txrx.c b/qcacld-3.0/components/dp/core/src/wlan_dp_txrx.c
+--- a/qcacld-3.0/components/dp/core/src/wlan_dp_txrx.c
++++ b/qcacld-3.0/components/dp/core/src/wlan_dp_txrx.c
+@@ -22,6 +22,7 @@
+   *
+   */
+ 
++#include <net/gro.h>
+ #include <wlan_dp_priv.h>
+ #include <wlan_dp_main.h>
+ #include <wlan_dp_txrx.h>
+diff --git a/qcacld-3.0/core/hdd/inc/wlan_hdd_power.h b/qcacld-3.0/core/hdd/inc/wlan_hdd_power.h
+--- a/qcacld-3.0/core/hdd/inc/wlan_hdd_power.h
++++ b/qcacld-3.0/core/hdd/inc/wlan_hdd_power.h
+@@ -416,6 +416,7 @@
+  */
+ int wlan_hdd_cfg80211_get_txpower(struct wiphy *wiphy,
+ 				  struct wireless_dev *wdev,
++				  int radio_idx, unsigned int link_id,
+ 				  int *dbm);
+ 
+ /**
+diff --git a/qcacld-3.0/core/hdd/src/p2phc/dlhc.c b/qcacld-3.0/core/hdd/src/p2phc/dlhc.c
+--- a/qcacld-3.0/core/hdd/src/p2phc/dlhc.c
++++ b/qcacld-3.0/core/hdd/src/p2phc/dlhc.c
+@@ -26,7 +26,7 @@
+ #include <linux/timer.h>
+ #include <linux/uaccess.h>
+ #include <net/checksum.h>
+-#include <asm/unaligned.h>
++#include <linux/unaligned.h>
+ 
+ static unsigned char * put16(unsigned char *cp, unsigned short x);
+ static unsigned char * put32(unsigned char *cp, unsigned int x);
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c b/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+@@ -31149,6 +31149,7 @@
+  * Return: 0 success or error code on failure.
+  */
+ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
++				       struct net_device *dev,
+ 				       struct cfg80211_chan_def *chandef)
+ {
+ 	struct hdd_context *hdd_ctx = wiphy_priv(wiphy);
+@@ -31173,9 +31174,18 @@
+ 
+ 	mac_handle = hdd_ctx->mac_handle;
+ 
+-	adapter = hdd_get_adapter(hdd_ctx, QDF_MONITOR_MODE);
++	if (dev) {
++		if (!dev->ieee80211_ptr || dev->ieee80211_ptr->wiphy != wiphy ||
++		    dev->ieee80211_ptr->iftype != NL80211_IFTYPE_MONITOR)
++			return -EINVAL;
++		adapter = WLAN_HDD_GET_PRIV_PTR(dev);
++		if (adapter->device_mode != QDF_MONITOR_MODE)
++			return -EINVAL;
++	} else {
++		adapter = hdd_get_adapter(hdd_ctx, QDF_MONITOR_MODE);
++	}
+ 	if (!adapter)
+-		return -EIO;
++		return -ENODEV;
+ 
+ 	hdd_debug("%s: set monitor mode freq %d",
+ 		  adapter->dev->name, chandef->chan->center_freq);
+@@ -31346,6 +31356,7 @@
+  * Return: 0 success or error code on failure.
+  */
+ static int wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
++				       struct net_device *dev,
+ 				       struct cfg80211_chan_def *chandef)
+ {
+ 	struct osif_psoc_sync *psoc_sync;
+@@ -31355,7 +31366,7 @@
+ 	if (errno)
+ 		return errno;
+ 
+-	errno = __wlan_hdd_cfg80211_set_mon_ch(wiphy, chandef);
++	errno = __wlan_hdd_cfg80211_set_mon_ch(wiphy, dev, chandef);
+ 
+ 	osif_psoc_sync_op_stop(psoc_sync);
+ 
+@@ -34191,40 +34202,233 @@
+ }
+ #endif
+ 
++/* The selected driver owns netdev-backed interfaces. */
++static struct net_device *hdd_cfg80211_netdev(struct wiphy *wiphy,
++					      struct wireless_dev *wdev)
++{
++	if (!wdev || wdev->wiphy != wiphy || !wdev->netdev ||
++	    wdev->netdev->ieee80211_ptr != wdev)
++		return NULL;
++
++	return wdev->netdev;
++}
++
++static int hdd_cfg80211_change_station(struct wiphy *wiphy,
++				       struct wireless_dev *wdev, const u8 *mac,
++				       struct station_parameters *params)
++{
++	struct net_device *dev = hdd_cfg80211_netdev(wiphy, wdev);
++
++	if (!dev)
++		return -ENODEV;
++
++	return wlan_hdd_change_station(wiphy, dev, mac, params);
++}
++
++static int hdd_cfg80211_add_station(struct wiphy *wiphy,
++				    struct wireless_dev *wdev, const u8 *mac,
++				    struct station_parameters *params)
++{
++	struct net_device *dev = hdd_cfg80211_netdev(wiphy, wdev);
++
++	if (!dev)
++		return -ENODEV;
++
++	return wlan_hdd_cfg80211_add_station(wiphy, dev, mac, params);
++}
++
++static int hdd_cfg80211_del_station(struct wiphy *wiphy,
++				    struct wireless_dev *wdev,
++				    struct station_del_parameters *params)
++{
++	struct net_device *dev = hdd_cfg80211_netdev(wiphy, wdev);
++
++	if (!dev)
++		return -ENODEV;
++
++	return wlan_hdd_cfg80211_del_station(wiphy, dev, params);
++}
++
++static int hdd_cfg80211_dump_station(struct wiphy *wiphy,
++				     struct wireless_dev *wdev, int idx,
++				     u8 *mac, struct station_info *sinfo)
++{
++	struct net_device *dev = hdd_cfg80211_netdev(wiphy, wdev);
++
++	if (!dev)
++		return -ENODEV;
++
++	return wlan_hdd_cfg80211_dump_station(wiphy, dev, idx, mac, sinfo);
++}
++
++static int hdd_cfg80211_get_station(struct wiphy *wiphy,
++				    struct wireless_dev *wdev, const u8 *mac,
++				    struct station_info *sinfo)
++{
++	struct net_device *dev = hdd_cfg80211_netdev(wiphy, wdev);
++
++	if (!dev)
++		return -ENODEV;
++
++	return wlan_hdd_cfg80211_get_station(wiphy, dev, mac, sinfo);
++}
++
++static int hdd_cfg80211_add_key(struct wiphy *wiphy, struct wireless_dev *wdev,
++				int link_id, u8 key_index, bool pairwise,
++				const u8 *mac_addr, struct key_params *params)
++{
++	struct net_device *dev = hdd_cfg80211_netdev(wiphy, wdev);
++
++	if (!dev)
++		return -ENODEV;
++
++	return wlan_hdd_cfg80211_add_key(wiphy, dev, link_id, key_index,
++					 pairwise, mac_addr, params);
++}
++
++static int hdd_cfg80211_get_key(struct wiphy *wiphy, struct wireless_dev *wdev,
++				int link_id, u8 key_index, bool pairwise,
++				const u8 *mac_addr, void *cookie,
++				void (*callback)(void *cookie,
++						 struct key_params *))
++{
++	struct net_device *dev = hdd_cfg80211_netdev(wiphy, wdev);
++
++	if (!dev)
++		return -ENODEV;
++
++	return wlan_hdd_cfg80211_get_key(wiphy, dev, link_id, key_index,
++					 pairwise, mac_addr, cookie, callback);
++}
++
++static int hdd_cfg80211_del_key(struct wiphy *wiphy, struct wireless_dev *wdev,
++				int link_id, u8 key_index, bool pairwise,
++				const u8 *mac_addr)
++{
++	struct net_device *dev = hdd_cfg80211_netdev(wiphy, wdev);
++
++	if (!dev)
++		return -ENODEV;
++
++	return wlan_hdd_cfg80211_del_key(wiphy, dev, link_id, key_index,
++					 pairwise, mac_addr);
++}
++
++static int hdd_cfg80211_set_default_mgmt_key(struct wiphy *wiphy,
++					     struct wireless_dev *wdev,
++					     int link_id, u8 key_index)
++{
++	struct net_device *dev = hdd_cfg80211_netdev(wiphy, wdev);
++
++	if (!dev)
++		return -ENODEV;
++
++	return wlan_hdd_set_default_mgmt_key(wiphy, dev, link_id, key_index);
++}
++
++static int hdd_cfg80211_set_default_beacon_key(struct wiphy *wiphy,
++					       struct wireless_dev *wdev,
++					       int link_id, u8 key_index)
++{
++	struct net_device *dev = hdd_cfg80211_netdev(wiphy, wdev);
++
++	if (!dev)
++		return -ENODEV;
++
++	return wlan_hdd_cfg80211_set_default_beacon_key(wiphy, dev, link_id,
++							key_index);
++}
++
++static int hdd_cfg80211_set_wiphy_params(struct wiphy *wiphy, int radio_idx,
++					 u32 changed)
++{
++	if (radio_idx != -1)
++		return -EOPNOTSUPP;
++
++	return wlan_hdd_cfg80211_set_wiphy_params(wiphy, changed);
++}
++
++static int hdd_cfg80211_set_antenna(struct wiphy *wiphy, int radio_idx,
++				    u32 tx_mask, u32 rx_mask)
++{
++	if (radio_idx != -1)
++		return -EOPNOTSUPP;
++
++	return wlan_hdd_cfg80211_set_chainmask(wiphy, tx_mask, rx_mask);
++}
++
++static int hdd_cfg80211_get_antenna(struct wiphy *wiphy, int radio_idx,
++				    u32 *tx_mask, u32 *rx_mask)
++{
++	if (radio_idx != -1)
++		return -EOPNOTSUPP;
++
++	return wlan_hdd_cfg80211_get_chainmask(wiphy, tx_mask, rx_mask);
++}
++
++static int hdd_cfg80211_set_tx_power(struct wiphy *wiphy,
++				     struct wireless_dev *wdev, int radio_idx,
++				     enum nl80211_tx_power_setting type,
++				     int mbm)
++{
++	if (radio_idx != -1)
++		return -EOPNOTSUPP;
++	if (wdev && !hdd_cfg80211_netdev(wiphy, wdev))
++		return -ENODEV;
++
++	return wlan_hdd_cfg80211_set_txpower(wiphy, wdev, type, mbm);
++}
++
++static int hdd_cfg80211_remain_on_channel(struct wiphy *wiphy,
++					  struct wireless_dev *wdev,
++					  struct ieee80211_channel *chan,
++					  unsigned int duration, u64 *cookie,
++					  const u8 *rx_addr)
++{
++	/* Native ROC does not advertise the optional receive-address filter. */
++	if (rx_addr)
++		return -EOPNOTSUPP;
++	if (!hdd_cfg80211_netdev(wiphy, wdev))
++		return -ENODEV;
++
++	return wlan_hdd_cfg80211_remain_on_channel(wiphy, wdev, chan, duration,
++						   cookie);
++}
++
+ static struct cfg80211_ops wlan_hdd_cfg80211_ops = {
+ 	.add_virtual_intf = wlan_hdd_add_virtual_intf,
+ 	.del_virtual_intf = wlan_hdd_del_virtual_intf,
+ 	.change_virtual_intf = wlan_hdd_cfg80211_change_iface,
+-	.change_station = wlan_hdd_change_station,
++	.change_station = hdd_cfg80211_change_station,
+ 	.start_ap = wlan_hdd_cfg80211_start_ap,
+ 	.change_beacon = wlan_hdd_cfg80211_change_beacon,
+ 	.stop_ap = wlan_hdd_cfg80211_stop_ap,
+ 	.change_bss = wlan_hdd_cfg80211_change_bss,
+-	.add_key = wlan_hdd_cfg80211_add_key,
+-	.get_key = wlan_hdd_cfg80211_get_key,
+-	.del_key = wlan_hdd_cfg80211_del_key,
++	.add_key = hdd_cfg80211_add_key,
++	.get_key = hdd_cfg80211_get_key,
++	.del_key = hdd_cfg80211_del_key,
+ 	.set_default_key = wlan_hdd_cfg80211_set_default_key,
+ 	.scan = wlan_hdd_cfg80211_scan,
+ 	.connect = wlan_hdd_cfg80211_connect,
+ 	.disconnect = wlan_hdd_cfg80211_disconnect,
+-	.set_wiphy_params = wlan_hdd_cfg80211_set_wiphy_params,
+-	.set_tx_power = wlan_hdd_cfg80211_set_txpower,
++	.set_wiphy_params = hdd_cfg80211_set_wiphy_params,
++	.set_tx_power = hdd_cfg80211_set_tx_power,
+ 	.get_tx_power = wlan_hdd_cfg80211_get_txpower,
+-	.remain_on_channel = wlan_hdd_cfg80211_remain_on_channel,
++	.remain_on_channel = hdd_cfg80211_remain_on_channel,
+ 	.cancel_remain_on_channel = wlan_hdd_cfg80211_cancel_remain_on_channel,
+ 	.mgmt_tx = wlan_hdd_mgmt_tx,
+ 	.mgmt_tx_cancel_wait = wlan_hdd_cfg80211_mgmt_tx_cancel_wait,
+-	.set_default_mgmt_key = wlan_hdd_set_default_mgmt_key,
++	.set_default_mgmt_key = hdd_cfg80211_set_default_mgmt_key,
+ #if defined (CFG80211_BIGTK_CONFIGURATION_SUPPORT) || \
+ 	    (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0))
+-	.set_default_beacon_key = wlan_hdd_cfg80211_set_default_beacon_key,
++	.set_default_beacon_key = hdd_cfg80211_set_default_beacon_key,
+ #endif
+ 	.set_txq_params = wlan_hdd_set_txq_params,
+-	.dump_station = wlan_hdd_cfg80211_dump_station,
+-	.get_station = wlan_hdd_cfg80211_get_station,
++	.dump_station = hdd_cfg80211_dump_station,
++	.get_station = hdd_cfg80211_get_station,
+ 	.set_power_mgmt = wlan_hdd_cfg80211_set_power_mgmt,
+-	.del_station = wlan_hdd_cfg80211_del_station,
+-	.add_station = wlan_hdd_cfg80211_add_station,
++	.del_station = hdd_cfg80211_del_station,
++	.add_station = hdd_cfg80211_add_station,
+ 	.set_pmksa = wlan_hdd_cfg80211_set_pmksa,
+ 	.del_pmksa = wlan_hdd_cfg80211_del_pmksa,
+ 	.flush_pmksa = wlan_hdd_cfg80211_flush_pmksa,
+@@ -34283,8 +34487,8 @@
+ 	.del_nan_func = wlan_hdd_cfg80211_del_nan_func,
+ 	.nan_change_conf = wlan_hdd_cfg80211_nan_change_conf,
+ #endif
+-	.set_antenna = wlan_hdd_cfg80211_set_chainmask,
+-	.get_antenna = wlan_hdd_cfg80211_get_chainmask,
++	.set_antenna = hdd_cfg80211_set_antenna,
++	.get_antenna = hdd_cfg80211_get_antenna,
+ 	.get_channel = wlan_hdd_cfg80211_get_channel,
+ 	.set_bitrate_mask = wlan_hdd_cfg80211_set_bitrate_mask,
+ 	.tx_control_port = wlan_hdd_cfg80211_tx_control_port,
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_hostapd.c b/qcacld-3.0/core/hdd/src/wlan_hdd_hostapd.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_hostapd.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_hostapd.c
+@@ -3054,7 +3054,7 @@
+ 			if (notify_new_sta &&
+ 			    hdd_sap_is_recv_assoc_link(hdd_ctx->psoc,
+ 						       event->staMac.bytes))
+-				cfg80211_new_sta(dev,
++				cfg80211_new_sta(dev->ieee80211_ptr,
+ 						 (const u8 *)&event->
+ 						 staMac.bytes[0],
+ 						 sta_info, GFP_KERNEL);
+@@ -3234,7 +3234,7 @@
+ 		if ((adapter->device_mode != QDF_P2P_GO_MODE ||
+ 		     (!cds_is_driver_recovering())) &&
+ 		     is_last_sta_info) {
+-			cfg80211_del_sta(dev,
++			cfg80211_del_sta(dev->ieee80211_ptr,
+ 					 (const u8 *)&sta_addr.bytes[0],
+ 					 GFP_KERNEL);
+ 			hdd_debug("indicate sta deletion event");
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -11486,7 +11486,7 @@
+ 
+ 	hdd_debug("[SSR] send restart supplicant");
+ 	/* event supplicant to restart */
+-	cfg80211_del_sta(adapter->dev,
++	cfg80211_del_sta(adapter->dev->ieee80211_ptr,
+ 			 (const u8 *)&bcast_mac.bytes[0],
+ 			 GFP_KERNEL);
+ }
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_power.c b/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
+@@ -3399,6 +3399,7 @@
+  */
+ static int __wlan_hdd_cfg80211_get_txpower(struct wiphy *wiphy,
+ 				  struct wireless_dev *wdev,
++				  unsigned int link_id,
+ 				  int *dbm)
+ {
+ 
+@@ -3422,6 +3423,15 @@
+ 	ret = wlan_hdd_validate_context(hdd_ctx);
+ 	if (ret)
+ 		return ret;
++
++	/* Native power requests and cache are tied to the default link. */
++	if (wdev->valid_links) {
++		if (hdd_get_link_info_by_ieee_link_id(adapter, link_id, false) !=
++		    adapter->deflink)
++			return -EOPNOTSUPP;
++	} else if (link_id) {
++		return -EINVAL;
++	}
+ 
+ 	/* Validate adapter sessionId */
+ 	ret = wlan_hdd_validate_vdev_id(adapter->deflink->vdev_id);
+@@ -3496,16 +3506,23 @@
+ 
+ int wlan_hdd_cfg80211_get_txpower(struct wiphy *wiphy,
+ 					 struct wireless_dev *wdev,
++				  int radio_idx, unsigned int link_id,
+ 					 int *dbm)
+ {
+ 	struct osif_psoc_sync *psoc_sync;
+ 	int errno;
++
++	if (radio_idx != -1)
++		return -EOPNOTSUPP;
++	if (!wdev || wdev->wiphy != wiphy || !wdev->netdev ||
++	    wdev->netdev->ieee80211_ptr != wdev)
++		return -ENODEV;
+ 
+ 	errno = osif_psoc_sync_op_start(wiphy_dev(wiphy), &psoc_sync);
+ 	if (errno)
+ 		return errno;
+ 
+-	errno = __wlan_hdd_cfg80211_get_txpower(wiphy, wdev, dbm);
++	errno = __wlan_hdd_cfg80211_get_txpower(wiphy, wdev, link_id, dbm);
+ 
+ 	osif_psoc_sync_op_stop(psoc_sync);
+ 
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c b/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+@@ -33,7 +33,7 @@
+ #include <linux/skbuff.h>
+ #include <linux/etherdevice.h>
+ #include <linux/if_ether.h>
+-#include <asm/unaligned.h>
++#include <linux/unaligned.h>
+ #include <linux/inetdevice.h>
+ #include <cds_sched.h>
+ #include <cds_utils.h>
+@@ -1055,7 +1055,7 @@
+ 		 */
+ 		if (!hdd_netdev_queue_is_locked(txq)) {
+ 			if (__netif_tx_trylock(txq)) {
+-				txq_trans_update(txq);
++				txq_trans_update(dev, txq);
+ 				__netif_tx_unlock(txq);
+ 			}
+ 		}
+diff --git a/qcacld-3.0/os_if/dp/src/os_if_dp_txrx.c b/qcacld-3.0/os_if/dp/src/os_if_dp_txrx.c
+--- a/qcacld-3.0/os_if/dp/src/os_if_dp_txrx.c
++++ b/qcacld-3.0/os_if/dp/src/os_if_dp_txrx.c
+@@ -18,6 +18,7 @@
+  *  DOC: osif_dp_txrx.c
+  *  This file contains DP component's TX/RX osif API implementation
+  */
++#include <net/gro.h>
+ #include "os_if_dp.h"
+ #include "os_if_dp_lro.h"
+ #include <wlan_dp_public_struct.h>
+@@ -225,10 +226,10 @@
+ 		if (flush_code != DP_RX_GRO_LOW_TPUT_FLUSH)
+ 			napi_gro_flush(napi, false);
+ 
+-		if (napi->rx_count) {
+-			netif_receive_skb_list(&napi->rx_list);
+-			qdf_init_list_head(&napi->rx_list);
+-			napi->rx_count = 0;
++		if (napi->gro.rx_count) {
++			netif_receive_skb_list(&napi->gro.rx_list);
++			qdf_init_list_head(&napi->gro.rx_list);
++			napi->gro.rx_count = 0;
+ 		}
+ 	}
+ }

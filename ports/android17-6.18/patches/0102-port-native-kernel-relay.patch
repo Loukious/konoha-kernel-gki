@@ -1,0 +1,200 @@
+Subject: Provide pinned relay support as a loadable GKI companion
+
+Register CPU preparation dynamically and retain live channels and files.
+Preserve per-CPU slots on failure and serialize hotplug creation.
+Initialize reader state before publishing files and bound mmap offsets.
+
+---
+
+--- a/kernel/relay.c
++++ b/kernel/relay.c
+@@ -22,6 +22,8 @@
+ #include <linux/mm.h>
+ #include <linux/cpu.h>
+ #include <linux/splice.h>
++#include <linux/module.h>
++#include <linux/cpuhotplug.h>
+ 
+ /* list of open channels, for cpu hotplug */
+ static DEFINE_MUTEX(relay_channels_mutex);
+@@ -38,6 +40,8 @@
+ 
+ 	if (!buf)
+ 		return VM_FAULT_OOM;
++	if (pgoff >= buf->chan->alloc_size >> PAGE_SHIFT)
++		return VM_FAULT_SIGBUS;
+ 
+ 	page = vmalloc_to_page(buf->start + (pgoff << PAGE_SHIFT));
+ 	if (!page)
+@@ -87,7 +91,7 @@
+ 	if (!buf)
+ 		return -EBADF;
+ 
+-	if (length != (unsigned long)buf->chan->alloc_size)
++	if (vma->vm_pgoff || length != (unsigned long)buf->chan->alloc_size)
+ 		return -EINVAL;
+ 
+ 	vma->vm_ops = &relay_file_mmap_ops;
+@@ -183,6 +187,7 @@
+ 	struct rchan *chan = container_of(kref, struct rchan, kref);
+ 	free_percpu(chan->buf);
+ 	kfree(chan);
++	module_put(THIS_MODULE);
+ }
+ 
+ /**
+@@ -200,7 +205,8 @@
+ 			__free_page(buf->page_array[i]);
+ 		relay_free_page_array(buf->page_array);
+ 	}
+-	*per_cpu_ptr(chan->buf, buf->cpu) = NULL;
++	if (*per_cpu_ptr(chan->buf, buf->cpu) == buf)
++		*per_cpu_ptr(chan->buf, buf->cpu) = NULL;
+ 	kfree(buf->padding);
+ 	kfree(buf);
+ 	kref_put(&chan->kref, relay_destroy_channel);
+@@ -280,21 +286,14 @@
+ /**
+  *	__relay_reset - reset a channel buffer
+  *	@buf: the channel buffer
+- *	@init: 1 if this is a first-time initialization
+  *
+  *	See relay_reset() for description of effect.
+  */
+-static void __relay_reset(struct rchan_buf *buf, unsigned int init)
++static void __relay_reset(struct rchan_buf *buf)
+ {
+ 	size_t i;
+ 
+-	if (init) {
+-		init_waitqueue_head(&buf->read_wait);
+-		kref_init(&buf->kref);
+-		init_irq_work(&buf->wakeup_work, wakeup_readers);
+-	} else {
+-		irq_work_sync(&buf->wakeup_work);
+-	}
++	irq_work_sync(&buf->wakeup_work);
+ 
+ 	buf->subbufs_produced = 0;
+ 	buf->subbufs_consumed = 0;
+@@ -331,14 +330,14 @@
+ 		return;
+ 
+ 	if (chan->is_global && (buf = *per_cpu_ptr(chan->buf, 0))) {
+-		__relay_reset(buf, 0);
++		__relay_reset(buf);
+ 		return;
+ 	}
+ 
+ 	mutex_lock(&relay_channels_mutex);
+ 	for_each_possible_cpu(i)
+ 		if ((buf = *per_cpu_ptr(chan->buf, i)))
+-			__relay_reset(buf, 0);
++			__relay_reset(buf);
+ 	mutex_unlock(&relay_channels_mutex);
+ }
+ EXPORT_SYMBOL_GPL(relay_reset);
+@@ -389,6 +388,13 @@
+ 	buf = relay_create_buf(chan);
+ 	if (!buf)
+ 		return NULL;
++	buf->cpu = cpu;
++	/* File creation can publish the buffer to readers immediately. */
++	init_waitqueue_head(&buf->read_wait);
++	kref_init(&buf->kref);
++	init_irq_work(&buf->wakeup_work, wakeup_readers);
++	buf->data = buf->start;
++	memset(buf->padding, 0, chan->n_subbufs * sizeof(*buf->padding));
+ 
+ 	if (chan->has_base_filename) {
+ 		dentry = relay_create_buf_file(chan, buf, cpu);
+@@ -404,8 +410,7 @@
+ 			goto free_buf;
+ 	}
+ 
+- 	buf->cpu = cpu;
+- 	__relay_reset(buf, 1);
++	__relay_reset(buf);
+ 
+  	if(chan->is_global) {
+ 		*per_cpu_ptr(chan->buf, 0) = buf;
+@@ -490,14 +495,16 @@
+ 	if (!cb || !cb->create_buf_file || !cb->remove_buf_file)
+ 		return NULL;
+ 
++	if (!try_module_get(THIS_MODULE))
++		return NULL;
+ 	chan = kzalloc(sizeof(struct rchan), GFP_KERNEL);
+ 	if (!chan)
+-		return NULL;
++		goto put_module;
+ 
+ 	chan->buf = alloc_percpu(struct rchan_buf *);
+ 	if (!chan->buf) {
+ 		kfree(chan);
+-		return NULL;
++		goto put_module;
+ 	}
+ 
+ 	chan->version = RELAYFS_CHANNEL_VERSION;
+@@ -513,6 +520,8 @@
+ 	chan->cb = cb;
+ 	kref_init(&chan->kref);
+ 
++	/* Serialize the online CPU snapshot with the prepare callback. */
++	cpus_read_lock();
+ 	mutex_lock(&relay_channels_mutex);
+ 	for_each_online_cpu(i) {
+ 		buf = relay_open_buf(chan, i);
+@@ -522,6 +531,7 @@
+ 	}
+ 	list_add(&chan->list, &relay_channels);
+ 	mutex_unlock(&relay_channels_mutex);
++	cpus_read_unlock();
+ 
+ 	return chan;
+ 
+@@ -533,6 +543,11 @@
+ 
+ 	kref_put(&chan->kref, relay_destroy_channel);
+ 	mutex_unlock(&relay_channels_mutex);
++	cpus_read_unlock();
++	return NULL;
++
++put_module:
++	module_put(THIS_MODULE);
+ 	return NULL;
+ }
+ EXPORT_SYMBOL_GPL(relay_open);
+@@ -1004,6 +1019,7 @@
+ 
+ 
+ const struct file_operations relay_file_operations = {
++	.owner		= THIS_MODULE,
+ 	.open		= relay_file_open,
+ 	.poll		= relay_file_poll,
+ 	.mmap		= relay_file_mmap,
+@@ -1011,3 +1027,23 @@
+ 	.release	= relay_file_release,
+ };
+ EXPORT_SYMBOL_GPL(relay_file_operations);
++
++/* The stock GKI did not compile its fixed CPUHP_RELAY_PREPARE callback. */
++static int relay_hp_state;
++
++static int __init onyx_relay_init(void)
++{
++	relay_hp_state = cpuhp_setup_state(CPUHP_BP_PREPARE_DYN,
++					   "onyx/relay:prepare", relay_prepare_cpu, NULL);
++	return relay_hp_state < 0 ? relay_hp_state : 0;
++}
++
++static void __exit onyx_relay_exit(void)
++{
++	cpuhp_remove_state(relay_hp_state);
++}
++
++module_init(onyx_relay_init);
++module_exit(onyx_relay_exit);
++MODULE_DESCRIPTION("Onyx native relay provider for the stock GKI");
++MODULE_LICENSE("GPL");

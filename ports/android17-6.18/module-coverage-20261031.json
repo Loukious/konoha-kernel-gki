@@ -6,10 +6,11 @@
     "/home/loukious/Android/custom-rom/out/target/product/onyx/vendor_dlkm/lib/modules/modules.load": "71ddc08a21c19c67a0f5a12fac978ccae626b64adc10b244309764ca7afb24b8"
   },
   "vendor_names": 466,
-  "built_vendor_names": 249,
-  "percent": 53.4,
+  "built_vendor_names": 250,
+  "percent": 53.6,
   "built_extra_names": [
     "deferred-free-helper",
+    "onyx_relay",
     "qseecom_dlkm"
   ],
   "remaining_names": [
@@ -140,7 +141,6 @@
     "platform_mpam",
     "pmic-glink-debug",
     "q2spi-geni",
-    "qca_cld3_wcn7750",
     "qce50_dlkm",
     "qcedev-mod_dlkm",
     "qcom-amoled-regulator",
@@ -242,6 +242,8 @@
     "CNSS2 native module cleanup is compiled and host-tested; physical hot-removal and outstanding external-pointer lifetime are not established. The main Onyx WLAN driver uses ICNSS2 and still requires its own port.",
     "SoundWire controller removal waits for retained master/slave references; LPASS/codec consumers must drop references and synchronize parent IRQ callbacks before removal. Hardware and complete parent/consumer sequencing remain unvalidated.",
     "RMNET core/control are resident because IPA exposes no synchronized withdrawal for pending readiness callbacks. Native data paths compile and tested error paths pass; modem/data-plane behavior remains unvalidated.",
-    "Bluetooth codec and SoundWire consumers preserve the native shared hw_params contract, which has no DAI identifier. Their host tests do not establish real ALSA/SoundWire concurrency, firmware behavior or DMA quiescence."
+    "Bluetooth codec and SoundWire consumers preserve the native shared hw_params contract, which has no DAI identifier. Their host tests do not establish real ALSA/SoundWire concurrency, firmware behavior or DMA quiescence.",
+    "Main WCN7750 WLAN now compiles with native ICNSS2/HIF_IPCI, monitor and management-frame injection paths preserved. Firmware boot, RF, monitor capture, injection and recovery remain unvalidated; arbitrary raw data/control injection is not established.",
+    "Relay requires clients to quiesce producers before close and file-removal callbacks to withdraw and drain new opens. Host tests cover ownership and hotplug serialization but do not establish actual kernel CPU-hotplug or VFS behavior."
   ]
 }

@@ -55,7 +55,7 @@ def main():
         for patch in sorted((HERE / "patches").glob("*.patch")):
             subprocess.run(["patch", "--batch", "--fuzz=0", "-p1", "-i", str(patch)],
                            cwd=root, check=True)
-        for name in ["BUILD.bazel", "Kconfig", "scm_defconfig", "platform_defconfig"]:
+        for name in ["BUILD.bazel", "Kconfig", "scm_defconfig", "platform_defconfig", "relay.fragment"]:
             shutil.copyfile(HERE / name, root / name)
         contents = hashes(root)
         (root / RECEIPT).write_text(json.dumps(contents, indent=2) + "\n")

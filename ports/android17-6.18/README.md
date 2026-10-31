@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 251 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 253 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 251 platform `.ko` files, their symbol tables and DDK configurations.
+- 253 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 14,776
-imported symbol CRCs across all 251 modules.
+used. The current [validation report](validation-20261031.json) checks 15,366
+imported symbol CRCs across all 253 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1605,3 +1605,34 @@ ROM module build coverage is 249/466 (53.4%); this counts module
 names and does not measure overall completion. Main WLAN, remaining audio and
 Bluetooth consumers, camera/video, shared-provider lifetime work, boot/DLKM
 images and the installer remain. No flashable 6.18 ZIP or phone validation exists.
+
+
+## Native WCN7750 WLAN and relay
+
+The main WCN7750 WLAN driver now builds with its exact 813 native compilation
+units and all 993 native exports. Its Onyx transport is ICNSS2/HIF_IPCI. Native
+monitor and management-frame injection code is preserved; arbitrary raw
+data/control injection and actual hardware operation are not established.
+The port adapts NAPI/netdev ownership and cfg80211 request routing, preserves
+link IDs, and checks DBR firmware lengths against the actual allocation.
+Three integrated sanitizer suites pass 196 cases and fifteen rejecting controls.
+See [the WLAN port record](wlan-main-port.md) for contracts and limitations.
+
+The real pinned 6.18 relay implementation supplies WLAN's stream buffers.
+Dynamic CPU-hotplug setup, retained channel/file/VMA ownership, early-reader
+initialization and mmap bounds are checked by ten sanitizer groups (52 cases)
+and eleven rejecting controls. `relay.fragment` is combined with the current
+platform settings for the provider; DDK also propagates it to its dependent
+WLAN targets. Other modules keep RELAY disabled. Main WLAN and cfg80211 both
+enable NL80211_TESTMODE, matching the native driver. See the
+[relay lifetime contract](relay-port.md).
+
+The combined archive `artifacts/20261031T170653275956Z` contains 253 platform
+modules and passes 15,366 imported-symbol CRC checks with no compiler/modpost
+warnings. Device-tree and overlay checks pass with 1,084 existing vendor DTC
+warnings. All 813 WLAN units, per-object feature flags, exports, configurations,
+patch replay, test inputs and archived inputs have been verified.
+ROM module-name coverage is 250/466 (53.6%); this does not measure overall
+completion. Remaining audio/Bluetooth, camera/video/DSP and peripheral work,
+shared clock lifetime fixes, KernelSU/NetHunter requirements and boot/DLKM
+images/installer remain. No flashable 6.18 ZIP or hardware validation exists.
