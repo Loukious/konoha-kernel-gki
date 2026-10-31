@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 205 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 211 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 205 platform `.ko` files, their symbol tables and DDK configurations.
+- 211 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 10,979
-imported symbol CRCs across all 205 modules.
+used. The current [validation report](validation-20261031.json) checks 11,287
+imported symbol CRCs across all 211 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1121,3 +1121,60 @@ and overlay checks pass with 1,084 existing vendor DTC warnings. ROM module buil
 coverage is 203/466 (43.6%), leaving 263 names to assess or port. The denominator
 includes alternative hardware; this measures build coverage. No flashable 6.18
 ZIP or phone validation exists yet.
+
+
+## Audio foundation and service notifications
+
+Four native audio modules add sound-event coordination, PDR registration,
+audio event notifications and audio service restart notifications. Thirteen
+exact source/header inputs preserve the ROM object lists, dependency names,
+notifier exports, aliases and the unchanged forced `sunautoconf.h` configuration.
+The unused blanket include of a private 6.6 regmap header is omitted.
+Sound-event master/client setup holds device references, clears stale slots,
+detaches surviving clients and rolls back partial enable failures. PDR handles
+reject duplicate ownership and release drains active callbacks. Service
+notifications validate domains and event/source combinations, serialize source
+registration and recover failed setup. Removal withdraws access before draining
+PDR/SSR callbacks and freeing owned registry state.
+
+[Foundation validation](audio-foundation-validation-20261031.json) and
+[notifier validation](audio-notifier-validation-20261031.json) pass eighteen
+ASan/UBSan groups, including allocation/enable rollback, repeated partial-master
+removal, registration races and four-thread notifier/registry operations.
+Sixteen original-source negative controls fail their targeted scenarios.
+Callbacks retain the framework's nonreentrant contract; PDR withdrawal occurs
+outside its own callback. The tests use simulated devices and firmware services;
+live kernel callback scheduling, audio firmware, IRQs, suspend and phone audio
+remain untested. DSP runtime, codecs, amplifiers and the machine driver are
+separate remaining work.
+
+## Xiaomi and NT36532 touch
+
+The two ROM-selected touch modules retain THP, TDDI, FOD and Novatek debug
+features, the native panel-ID selection, GPIO/SPI configuration and three-second
+boot-update delay. Knock, stylus, sensorhub and the legacy DRM_MSM notifier
+branch stay disabled. NT36532 uses the real display lockdown and gesture exports.
+The unchanged touch UAPI and all eighteen source/header pins replay exactly.
+Proc SPI operations, all 23 diagnostic readers, CSV dimensions, ring entries,
+report slots, mmap selectors/lengths/permissions and firmware partition/CRC
+arithmetic are bounded. Failed setup unwinds resources. Controller removal
+drains framework, notifier and proc callbacks and workers before releasing IRQ,
+GPIO, input and buffers, and balances IRQ wake.
+
+Published framework pages and raw device/class pointers remain resident until
+reboot; successful module bindings retain references and suppress manual unbind.
+Existing mappings therefore keep valid storage after access is withdrawn.
+Hot removal, unload and rebind remain outside this fixed-device lifecycle.
+[Integrated touch validation](touch-validation-20261031.json) passes nine
+ASan/UBSan groups. All four actual ROM normal/MP firmware files produce the same
+partition maps and CRCs under software and hardware CRC paths; their hashes
+are recorded while the firmware stays outside Git. The tests mock Linux
+services and do not establish live VFS/IRQ/SPI behavior, controller execution,
+timing or phone touch operation.
+
+The combined 211-module archive `artifacts/20261031T130449999212Z` passes
+11,287 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
+and overlay checks pass with 1,084 existing vendor DTC warnings. ROM module build
+coverage is 209/466 (44.8%), leaving 257 names to assess or port. This includes
+alternative hardware and measures built names. No flashable 6.18 ZIP or phone
+validation exists yet.

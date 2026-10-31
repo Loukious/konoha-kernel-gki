@@ -1,0 +1,4160 @@
+--- a/qcom/opensource/touch-drivers/nt36532/nt36xxx.c
++++ b/qcom/opensource/touch-drivers/nt36532/nt36xxx.c
+@@ -238,7 +238,7 @@
+ #endif
+ };
+ 
+-bool check_address(int addr)
++static bool check_address(int addr)
+ {
+ 	switch (addr) {
+ 	case RAW_BTN_PIPE0_ADDR:
+@@ -373,8 +373,8 @@
+ *******************************************************/
+ static void nvt_irq_enable(bool enable)
+ {
+-	struct irq_desc *desc;
+-
++	if (!ts || (enable && READ_ONCE(ts->removing)))
++		return;
+ 	if (enable) {
+ 		if (!ts->irq_enabled) {
+ 			enable_irq(ts->client->irq);
+@@ -387,8 +387,7 @@
+ 		}
+ 	}
+ 
+-	desc = irq_to_desc(ts->client->irq);
+-	NVT_LOG("enable=%d, desc->depth=%d\n", enable, desc->depth);
++	NVT_LOG("enable=%d\n", enable);
+ }
+ 
+ /*******************************************************
+@@ -438,6 +437,10 @@
+ 	int32_t ret = -1;
+ 	int32_t retries = 0;
+ 
++	if (!ts || READ_ONCE(ts->removing) || !client || !buf || !len ||
++	    len > NVT_XBUF_LEN - DUMMY_BYTES ||
++	    len > NVT_READ_LEN - DUMMY_BYTES)
++		return -EINVAL;
+ 	mutex_lock(&ts->xbuf_lock);
+ 
+ 	buf[0] = SPI_READ_MASK(buf[0]);
+@@ -473,6 +476,9 @@
+ 	int32_t ret = -1;
+ 	int32_t retries = 0;
+ 
++	if (!ts || READ_ONCE(ts->removing) || !client || !buf || !len ||
++	    len > NVT_XBUF_LEN - DUMMY_BYTES)
++		return -EINVAL;
+ 	mutex_lock(&ts->xbuf_lock);
+ 
+ 	buf[0] = SPI_WRITE_MASK(buf[0]);
+@@ -553,7 +559,7 @@
+ return:
+ 	Executive outcomes. 0---succeed. -5---access fail.
+ *******************************************************/
+-int32_t nvt_read_reg(nvt_ts_reg_t reg, uint8_t *val)
++static int32_t nvt_read_reg(nvt_ts_reg_t reg, uint8_t *val)
+ {
+ 	int32_t ret = 0;
+ 	uint32_t addr = 0;
+@@ -595,12 +601,12 @@
+ 
+ //thp start 6.8
+ #define MAX_DATA_BUF 256
+-static int16_t integer_conver(u8 *value)
++static int16_t integer_conver(u8 *value, int length)
+ {
+ 	char *p;
+ 	int16_t result = 0;
+-	NVT_LOG("nvt integer is %s\n", value);
+-	for (p = value; *p != '\0'; p++) {
++	NVT_LOG("integer input length=%d\n", length);
++	for (p = value; p < (char *)value + length && *p != '\0'; p++) {
+ 		if (*p >= '0' && *p <= '9') {
+ 			result = result * 10 + (*p - '0');
+ 		} else {
+@@ -612,7 +618,7 @@
+ 	return result;
+ }
+ 
+-static void nvt_parse_open_data(u8 *buf, u8 *input)
++static void nvt_parse_open_data(u8 *buf, u8 *input, int length)
+ {
+ 	const char *p = buf;
+ 	bool new_data = false;
+@@ -621,7 +627,9 @@
+ 	int temp = 0;
+ 
+ 	memset(input, 0x00, MAX_DATA_BUF);
+-	for (p = buf; *p != '\0'; p++) {
++	for (p = buf; p < (char *)buf + length && *p != '\0'; p++) {
++		if (i >= MAX_DATA_BUF)
++			break;
+ 		if (*p >= '0' && *p <= '9') {
+ 			temp = input[i] * 10 + (*p - '0');
+ 			if (temp > 255)
+@@ -653,6 +661,8 @@
+ 	u8 input_data[MAX_DATA_BUF] = { 0 };
+ 	int16_t input = 0;
+ 
++	if (!value || value_len <= 0 || value_len > MAX_DATA_BUF)
++		return -EINVAL;
+ 	if (ts->xm_htc_sw_reset) {
+ 		NVT_ERR("ts->xm_htc_sw_reset=%d\n", ts->xm_htc_sw_reset);
+ 		return -EBUSY;
+@@ -673,13 +683,13 @@
+ 			ret = nvt_set_page(ts->mmap->EVENT_BUF_ADDR |
+ 					   EVENT_MAP_HOST_CMD);
+ 		}
+-		nvt_parse_open_data(value, input_data);
++		nvt_parse_open_data(value, input_data, value_len);
+ 		for (i = 0; i < value_len; i++)
+ 			NVT_LOG("zhangyanan input[i:%d]:%d \n", i,
+ 				input_data[i]);
+ 		ret = CTP_SPI_WRITE(ts->client, input_data, value_len);
+ 	} else {
+-		input = integer_conver(value);
++		input = integer_conver(value, value_len);
+ 		NVT_LOG("cmd: 0x%x input:%d\n", addr & 0xFF, input);
+ 		nvt_set_extend_custom_cmd(addr & 0xFF, input);
+ 	}
+@@ -693,6 +703,8 @@
+ {
+ 	int ret;
+ 
++	if (!value || value_len <= 0 || value_len > MAX_DATA_BUF)
++		return -EINVAL;
+ 	if (ts->xm_htc_sw_reset) {
+ 		NVT_ERR("ts->xm_htc_sw_reset=%d\n", ts->xm_htc_sw_reset);
+ 		return -EBUSY;
+@@ -739,7 +751,7 @@
+ 	return ret;
+ }
+ 
+-int nvt_htc_ic_setModeValue(common_data_t *common_data)
++static int nvt_htc_ic_setModeValue(common_data_t *common_data)
+ {
+ 	int i = 0;
+ 	int mode = common_data->mode;
+@@ -749,7 +761,7 @@
+ 	int ret = 0;
+ 
+ 	addr = ts->mmap->EVENT_BUF_ADDR;
+-	NVT_LOG("mode:%d, value:%s, value_len:%d", mode, value, value_len);
++	NVT_LOG("mode:%d, value:%p, value_len:%d", mode, value, value_len);
+ 	for (i = 0; i < value_len; i++) {
+ 		NVT_LOG("value[i:%d]:%d", i, value[i]);
+ 	}
+@@ -902,7 +914,7 @@
+ 	return ret;
+ }
+ 
+-int nvt_htc_ic_getModeValue(common_data_t *common_data)
++static int nvt_htc_ic_getModeValue(common_data_t *common_data)
+ {
+ 	u_int32_t addr;
+ 	int mode = common_data->mode;
+@@ -910,7 +922,7 @@
+ 	int value_len = common_data->data_len;
+ 
+ 	addr = ts->mmap->EVENT_BUF_ADDR;
+-	NVT_LOG("mode:%d, value:%s, value_len:%d", mode, value, value_len);
++	NVT_LOG("mode:%d, value:%p, value_len:%d", mode, value, value_len);
+ 	if (mode < 3000) {
+ 		NVT_ERR("mode is error!!\n");
+ 		return -1;
+@@ -1141,7 +1153,7 @@
+ return:
+ 	Executive outcomes. 0---succeed. -1---fail.
+ *******************************************************/
+-int32_t nvt_check_spi_dma_tx_info(void)
++static int32_t nvt_check_spi_dma_tx_info(void)
+ {
+ 	uint8_t buf[8] = { 0 };
+ 	int32_t i = 0;
+@@ -1182,7 +1194,7 @@
+ return:
+ 	Executive outcomes. 0---succeed. -1---fail.
+ *******************************************************/
+-int32_t nvt_check_tx_auto_copy(void)
++static int32_t nvt_check_tx_auto_copy(void)
+ {
+ 	uint8_t buf[8] = { 0 };
+ 	int32_t i = 0;
+@@ -1469,6 +1481,14 @@
+ 	ts->fw_ver = buf[1];
+ 	ts->x_num = buf[3];
+ 	ts->y_num = buf[4];
++	if (!ts->x_num || !ts->y_num ||
++	    ts->x_num > TOUCH_RX_NUM || ts->y_num > TOUCH_TX_NUM) {
++		NVT_ERR("invalid firmware sensor dimensions\n");
++		ts->x_num = TOUCH_RX_NUM;
++		ts->y_num = TOUCH_TX_NUM;
++		ret = -EINVAL;
++		goto out;
++	}
+ 	ts->max_button_num = buf[11];
+ 	ts->fw_type = buf[14];
+ 	ts->nvt_pid = (uint16_t)((buf[36] << 8) | buf[35]);
+@@ -1594,6 +1614,11 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
++	if (!((((str[0] & 0x7F) << 8) | str[1])) ||
++	    (((str[0] & 0x7F) << 8) | str[1]) > count - 2) {
++		ret = -EINVAL;
++		goto out;
++	}
+ 	spi_wr = str[0] >> 7;
+ 	memcpy(buf, str + 2, ((str[0] & 0x7F) << 8) | str[1]);
+ 
+@@ -1788,7 +1813,7 @@
+ 
+ extern int update_fod_press_status(int value);
+ 
+-void nvt_ts_fod_down_report(uint16_t fod_x, uint16_t fod_y)
++static void nvt_ts_fod_down_report(uint16_t fod_x, uint16_t fod_y)
+ {
+ 	ts->fod_finger = true;
+ 	update_fod_press_status(1);
+@@ -1802,7 +1827,7 @@
+ 	input_sync(ts->input_dev);
+ }
+ 
+-void nvt_ts_fod_up_report(void)
++static void nvt_ts_fod_up_report(void)
+ {
+ 	input_mt_slot(ts->input_dev, TOUCH_FOD_ID);
+ 	input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, 0);
+@@ -1821,7 +1846,7 @@
+ return:
+ 	n.a.
+ *******************************************************/
+-void nvt_ts_wakeup_gesture_report(uint8_t gesture_id, uint8_t *data)
++static void nvt_ts_wakeup_gesture_report(uint8_t gesture_id, uint8_t *data)
+ {
+ 	uint32_t keycode = 0;
+ 	uint8_t func_type = data[2];
+@@ -2196,7 +2221,7 @@
+ 	return recovery_enable;
+ }
+ 
+-void nvt_clear_aci_error_flag(void)
++static void nvt_clear_aci_error_flag(void)
+ {
+ 	if (ts->mmap->ACI_ERR_CLR_ADDR == 0)
+ 		return;
+@@ -2207,7 +2232,7 @@
+ }
+ #endif /* #if NVT_TOUCH_WDT_RECOVERY */
+ 
+-void nvt_read_fw_history(uint32_t fw_history_addr)
++static void nvt_read_fw_history(uint32_t fw_history_addr)
+ {
+ 	uint8_t i = 0;
+ 	uint8_t buf[65];
+@@ -2347,7 +2372,7 @@
+ //thp start 6.8
+ #if TOUCH_THP_SUPPORT
+ // #define POINT_DATA_LEN 65
+-uint16_t nvt_xm_htc_cal_checksum(uint16_t u16_message[], int data_len)
++static __maybe_unused uint16_t nvt_xm_htc_cal_checksum(uint16_t u16_message[], int data_len)
+ {
+ 	int i;
+ 	uint32_t tmp_val = 0;
+@@ -2363,7 +2388,7 @@
+ }
+ 
+ #define CRC32_POLYNOMIAL 0xE89061DB
+-inline int32_t thp_crc32_check(int s32_message[], int s32_len)
++static inline int32_t thp_crc32_check(int s32_message[], int s32_len)
+ {
+ 	int i;
+ 	int j;
+@@ -2818,7 +2843,7 @@
+ 
+ 
+ //thp start 6.8
+-int nvt_enable_touch_raw(int en)
++static int nvt_enable_touch_raw(int en)
+ {
+ 	// if (en) {
+ 	//cleanUp(0);
+@@ -3632,7 +3657,7 @@
+ 
+ #ifdef CONFIG_TOUCHSCREEN_NVT_DEBUG_FS
+ 
+-void nvt_set_dbgfw_status(bool enable)
++static void nvt_set_dbgfw_status(bool enable)
+ {
+ 	ts->fw_debug = enable;
+ }
+@@ -3681,28 +3706,19 @@
+ 				echo \"tp-suspend-en\" or \"tp-suspend-off\" to ctrl panel in or off suspend status\n \
+ 				echo \"fw-debug-on\" or \"fw-debug-off\" to on or off fw debug function\n";
+ 
+-	loff_t pos = *ppos;
+-	int len = strlen(str);
+-
+-	if (pos < 0)
+-		return -EINVAL;
+-	if (pos >= len)
+-		return 0;
+-
+-	if (copy_to_user(buf, str, len))
+-		return -EFAULT;
+-
+-	*ppos = pos + len;
+-
+-	return len;
++	return simple_read_from_buffer(buf, size, ppos, str, strlen(str));
+ }
+ 
+ static ssize_t tpdbg_write(struct file *file, const char __user *buf,
+ 			   size_t size, loff_t *ppos)
+ {
+ 	struct nvt_ts_data *ts_core = file->private_data;
+-	char *cmd = kzalloc(size + 1, GFP_KERNEL);
++	char *cmd;
+ 	int ret = size;
++
++	if (!size || size > 64)
++		return -EINVAL;
++	cmd = kzalloc(size + 1, GFP_KERNEL);
+ 
+ 	if (!cmd)
+ 		return -ENOMEM;
+@@ -3822,9 +3838,14 @@
+ 	struct sched_param par = { .sched_priority = MAX_RT_PRIO - 1 };
+ 
+ 	NVT_LOG("start\n");
++	if (ts)
++		return -EBUSY;
++	if (!xiaomi_touch_is_ready())
++		return -EPROBE_DEFER;
+ 
+ 	/*set spi controller rt thread priority to 99*/
+-	if (client->controller) {
++	if (client->controller && client->controller->kworker &&
++	    client->controller->kworker->task) {
+ 		ret = sched_setscheduler_nocheck(
+ 			client->controller->kworker->task, SCHED_FIFO, &par);
+ 		if (ret < 0) {
+@@ -3878,7 +3899,7 @@
+ 	spi_set_drvdata(client, ts);
+ 
+ 	//---prepare for spi parameter---
+-	if (ts->client->master->flags & SPI_MASTER_HALF_DUPLEX) {
++	if (ts->client->controller->flags & SPI_CONTROLLER_HALF_DUPLEX) {
+ 		NVT_ERR("Full duplex not supported by master\n");
+ 		ret = -EIO;
+ 		goto err_ckeck_full_duplex;
+@@ -4174,6 +4195,8 @@
+ 	ts->ts_selftest_process = false;
+ 	ts->ts_selftest_process_cmd = false;
+ 
++	INIT_WORK(&ts->power_supply_work, nvt_power_supply_work);
++	INIT_WORK(&ts->resume_work, nvt_resume_work);
+ 	/* event_wq setup */
+ 	ts->event_wq =
+ 		alloc_workqueue("nvt-event-queue",
+@@ -4283,8 +4306,10 @@
+ 	hardware_operation.htc_ic_getModeValue = nvt_htc_ic_getModeValue;
+ #endif /*TOUCH_THP_SUPPORT*/
+ 	nvt_init_touchmode_data();
+-	register_touch_panel(&client->dev, TOUCH_ID, &hardware_param,
+-			     &hardware_operation);
++	ret = register_touch_panel(&client->dev, TOUCH_ID, &hardware_param,
++				   &hardware_operation);
++	if (ret)
++		goto err_alloc_work_thread_failed;
+ 	xiaomi_register_panel_notifier(
+ 		&client->dev, TOUCH_ID, PANEL_EVENT_NOTIFICATION_PRIMARY,
+ 		PANEL_EVENT_NOTIFIER_CLIENT_PRIMARY_TOUCH);
+@@ -4319,12 +4344,14 @@
+ 			       (int *)edge_filter_params);
+ 
+ 	NVT_LOG("end\n");
++	__module_get(THIS_MODULE);
+ 
+ 	return 0;
+ 
+ #ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+ err_alloc_work_thread_failed:
+ 	if (ts->event_wq) {
++		cancel_work_sync(&ts->resume_work);
+ 		cancel_work_sync(&ts->power_supply_work);
+ 		destroy_workqueue(ts->event_wq);
+ 		ts->event_wq = NULL;
+@@ -4344,16 +4371,16 @@
+ err_register_early_suspend_failed:
+ #endif
+ #if NVT_TOUCH_MP
++err_mp_proc_init_failed:
+ 	nvt_mp_proc_deinit();
+-err_mp_proc_init_failed:
+ #endif
+ #if NVT_TOUCH_EXT_PROC
++err_extra_proc_init_failed:
+ 	nvt_extra_proc_deinit();
+-err_extra_proc_init_failed:
+ #endif
+ #if NVT_TOUCH_PROC
++err_flash_proc_init_failed:
+ 	nvt_flash_proc_deinit();
+-err_flash_proc_init_failed:
+ #endif
+ #if NVT_TOUCH_ESD_PROTECT
+ 	if (nvt_esd_check_wq) {
+@@ -4432,18 +4459,25 @@
+ *******************************************************/
+ static void nvt_ts_remove(struct spi_device *client)
+ {
+-	NVT_LOG("Removing driver...\n");
+-
++	struct nvt_ts_data *data = spi_get_drvdata(client);
++
++	if (!data)
++		return;
++	WRITE_ONCE(data->removing, true);
++	complete_all(&data->dev_pm_suspend_completion);
++#ifdef CONFIG_TOUCHSCREEN_NVT_DEBUG_FS
++	debugfs_remove_recursive(data->debugfs);
++#endif
++#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
++	unregister_touch_panel(TOUCH_ID);
++#endif
+ #if defined(_MSM_DRM_NOTIFY_H_)
+-	if (msm_drm_unregister_client(&ts->drm_notif))
+-		NVT_ERR("Error occurred while unregistering drm_notifier.\n");
++	msm_drm_unregister_client(&data->drm_notif);
+ #elif defined(CONFIG_FB)
+-	if (fb_unregister_client(&ts->fb_notif))
+-		NVT_ERR("Error occurred while unregistering fb_notifier.\n");
++	fb_unregister_client(&data->fb_notif);
+ #elif defined(CONFIG_HAS_EARLYSUSPEND)
+-	unregister_early_suspend(&ts->early_suspend);
+-#endif
+-
++	unregister_early_suspend(&data->early_suspend);
++#endif
+ #if NVT_TOUCH_MP
+ 	nvt_mp_proc_deinit();
+ #endif
+@@ -4453,72 +4487,47 @@
+ #if NVT_TOUCH_PROC
+ 	nvt_flash_proc_deinit();
+ #endif
+-
+ #if NVT_TOUCH_ESD_PROTECT
+ 	if (nvt_esd_check_wq) {
+ 		cancel_delayed_work_sync(&nvt_esd_check_work);
+-		nvt_esd_check_enable(false);
+ 		destroy_workqueue(nvt_esd_check_wq);
+ 		nvt_esd_check_wq = NULL;
+ 	}
+ #endif
+-
+ #if BOOT_UPDATE_FIRMWARE
+-	if (nvt_fwu_wq) {
+-		cancel_delayed_work_sync(&ts->nvt_fwu_work);
+-		destroy_workqueue(nvt_fwu_wq);
+-		nvt_fwu_wq = NULL;
+-	}
+-#endif
+-
++	cancel_delayed_work_sync(&data->nvt_fwu_work);
++	destroy_workqueue(nvt_fwu_wq);
++	nvt_fwu_wq = NULL;
++#endif
++#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
++	cancel_work_sync(&data->resume_work);
++	cancel_work_sync(&data->power_supply_work);
++	destroy_workqueue(data->event_wq);
++	data->event_wq = NULL;
++#endif
++	if (data->irq_wake_enabled) {
++		disable_irq_wake(client->irq);
++		data->irq_wake_enabled = false;
++	}
++	nvt_irq_enable(false);
++	free_irq(client->irq, data);
+ #if WAKEUP_GESTURE
+-	device_init_wakeup(&ts->client->dev, 0);
+-#endif
+-
+-	nvt_irq_enable(false);
+-	free_irq(client->irq, ts);
+-
+-	mutex_destroy(&ts->xbuf_lock);
+-	mutex_destroy(&ts->lock);
+-
+-	nvt_gpio_deconfig(ts);
+-
+-	if (ts->input_dev) {
+-		input_unregister_device(ts->input_dev);
+-		ts->input_dev = NULL;
+-	}
+-
++	device_init_wakeup(&client->dev, 0);
++#endif
++	nvt_gpio_deconfig(data);
++	if (data->input_dev)
++		input_unregister_device(data->input_dev);
+ 	spi_set_drvdata(client, NULL);
+-
+-	if (ts->xbuf) {
+-		kfree(ts->xbuf);
+-		ts->xbuf = NULL;
+-	}
+-
+-	if (ts) {
+-		kfree(ts);
+-		ts = NULL;
+-	}
+-
+-#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+-	// if (ts->set_touchfeature_wq)
+-	// 	destroy_workqueue(ts->set_touchfeature_wq);
+-	if (ts->event_wq) {
+-		cancel_work_sync(&ts->power_supply_work);
+-		destroy_workqueue(ts->event_wq);
+-		ts->event_wq = NULL;
+-	}
+-
+-#endif /* #ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE */
+-
+-//thp start 6.8
++	mutex_destroy(&data->xbuf_lock);
++	mutex_destroy(&data->lock);
+ #if TOUCH_THP_SUPPORT
+-	if (ts->data_buf) {
+-		kfree(ts->data_buf);
+-		ts->data_buf = NULL;
+-	}
+-#endif /* #if TOUCH_THP_SUPPORT */
+-	//thp end 6.8
++	kfree(data->eventbuf_debug);
++	kfree(data->data_buf);
++#endif
++	kfree(data->rbuf);
++	kfree(data->xbuf);
++	WRITE_ONCE(ts, NULL);
++	kfree(data);
+ }
+ 
+ static void suspend_mode_proc(enum suspend_state state)
+@@ -4804,7 +4813,11 @@
+ 
+ 	if (device_may_wakeup(dev) && ts->gesture_command) {
+ 		NVT_LOG("enable touch irq wake\n");
+-		enable_irq_wake(ts->client->irq);
++		int ret = enable_irq_wake(ts->client->irq);
++
++		if (ret)
++			return ret;
++		ts->irq_wake_enabled = true;
+ 	}
+ 	ts->dev_pm_suspend = true;
+ 	reinit_completion(&ts->dev_pm_suspend_completion);
+@@ -4818,9 +4831,10 @@
+ {
+ 	NVT_LOG("++\n");
+ 
+-	if (device_may_wakeup(dev) && ts->gesture_command) {
++	if (ts->irq_wake_enabled) {
+ 		NVT_LOG("disable touch irq wake\n");
+ 		disable_irq_wake(ts->client->irq);
++		ts->irq_wake_enabled = false;
+ 	}
+ 	ts->dev_pm_suspend = false;
+ 	complete(&ts->dev_pm_suspend_completion);
+@@ -4842,6 +4856,7 @@
+ 	.id_table	= nvt_ts_id,
+ 	.driver = {
+ 		.name	= NVT_SPI_NAME,
++		.suppress_bind_attrs = true,
+ 		.owner	= THIS_MODULE,
+ #ifdef CONFIG_OF
+ 		.of_match_table = nvt_match_table,
+@@ -4900,5 +4915,5 @@
+ MODULE_DESCRIPTION("Novatek Touchscreen Driver");
+ MODULE_LICENSE("GPL");
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+-MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+-#endif
++MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
++#endif
+--- a/qcom/opensource/touch-drivers/nt36532/nt36xxx.h
++++ b/qcom/opensource/touch-drivers/nt36532/nt36xxx.h
+@@ -247,6 +247,8 @@
+ #define EVENTBUF_DEBUG_LEN 256
+ 
+ struct nvt_ts_data {
++	bool removing;
++	bool irq_wake_enabled;
+ 	struct spi_device *client;
+ 	struct input_dev *input_dev;
+ 	struct delayed_work nvt_fwu_work;
+@@ -510,4 +512,22 @@
+ int32_t nvt_load_mp_setting_criteria_from_csv(void);
+ #endif /* #if TOUCH_THP_SUPPORT */
+ //thp end 6.8
++
++int32_t nvt_mp_proc_init(void);
++int32_t nvt_set_extend_custom_cmd(uint8_t sub_cmd, int16_t value);
++int32_t nvt_xm_htc_set_op_mode(int16_t op_mode);
++uint8_t nvt_get_fw_pipe(void);
++void Boot_Update_Firmware(struct work_struct *work);
++void nvt_change_mode(uint8_t mode);
++void nvt_get_mdata(int32_t *buf, uint8_t *m_x_num, uint8_t *m_y_num);
++void nvt_mp_proc_deinit(void);
++void nvt_read_get_num_mdata(uint32_t xdata_addr, int32_t *buffer, uint32_t num);
++void nvt_read_mdata(uint32_t xdata_addr, uint32_t xdata_btn_addr);
++
++
++int32_t nvt_extra_proc_init(void);
++int32_t nvt_xm_htc_set_idle_baseline_update(void);
++int32_t nvt_xm_htc_set_report_rate(int16_t report_rate);
++void nvt_extra_proc_deinit(void);
++
+ #endif /* _LINUX_NVT_TOUCH_H */
+--- a/qcom/opensource/touch-drivers/nt36532/nt36xxx_ext_proc.c
++++ b/qcom/opensource/touch-drivers/nt36532/nt36xxx_ext_proc.c
+@@ -804,7 +804,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_get_extend_custom_cmd(uint8_t sub_cmd, int16_t *value)
++static int32_t nvt_get_extend_custom_cmd(uint8_t sub_cmd, int16_t *value)
+ {
+ 	int32_t ret = 0;
+ 	uint8_t buf[8] = { 0 };
+@@ -892,7 +892,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_op_mode(int16_t *op_mode)
++static int32_t nvt_xm_htc_get_op_mode(int16_t *op_mode)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -913,9 +913,7 @@
+ static ssize_t xm_htc_op_mode_proc_read(struct file *filp, char __user *buf,
+ 					size_t count, loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t op_mode;
+ 	char tmp_buf[64];
+ 
+@@ -926,12 +924,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -941,20 +933,16 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_op_mode(&op_mode);
++	cnt = nvt_xm_htc_get_op_mode(&op_mode);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "op_mode: %d\n", op_mode);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_op_mode_proc_write(struct file *filp,
+@@ -1046,7 +1034,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_idle_wake_th(int16_t *idle_wake_th)
++static int32_t nvt_xm_htc_get_idle_wake_th(int16_t *idle_wake_th)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -1068,9 +1056,7 @@
+ 					     char __user *buf, size_t count,
+ 					     loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t idle_wake_th;
+ 	char tmp_buf[64];
+ 
+@@ -1081,12 +1067,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -1096,21 +1076,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_idle_wake_th(&idle_wake_th);
++	cnt = nvt_xm_htc_get_idle_wake_th(&idle_wake_th);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "idle_wake_th: %d\n",
+ 		       idle_wake_th);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_idle_wake_th_proc_write(struct file *filp,
+@@ -1185,7 +1161,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_set_raw_data_type(int16_t raw_data_type)
++static int32_t nvt_xm_htc_set_raw_data_type(int16_t raw_data_type)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -1203,7 +1179,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_raw_data_type(int16_t *raw_data_type)
++static int32_t nvt_xm_htc_get_raw_data_type(int16_t *raw_data_type)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -1225,9 +1201,7 @@
+ 					      char __user *buf, size_t count,
+ 					      loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t raw_data_type;
+ 	char tmp_buf[64];
+ 
+@@ -1238,12 +1212,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -1253,21 +1221,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_raw_data_type(&raw_data_type);
++	cnt = nvt_xm_htc_get_raw_data_type(&raw_data_type);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "raw_data_type: %d\n",
+ 		       raw_data_type);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_raw_data_type_proc_write(struct file *filp,
+@@ -1359,7 +1323,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_gesture_switch(int16_t *gesture_switch)
++static int32_t nvt_xm_htc_get_gesture_switch(int16_t *gesture_switch)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -1380,9 +1344,7 @@
+ 					       char __user *buf, size_t count,
+ 					       loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t gesture_switch;
+ 	char tmp_buf[64];
+ 
+@@ -1393,12 +1355,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -1408,21 +1364,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_gesture_switch(&gesture_switch);
++	cnt = nvt_xm_htc_get_gesture_switch(&gesture_switch);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "gesture_switch: %d\n",
+ 		       gesture_switch);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_gesture_switch_proc_write(struct file *filp,
+@@ -1510,7 +1462,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_fod_enable(int16_t *fod_enable)
++static int32_t nvt_xm_htc_get_fod_enable(int16_t *fod_enable)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -1531,20 +1483,12 @@
+ static ssize_t xm_htc_fod_enable_proc_read(struct file *filp, char __user *buf,
+ 					   size_t count, loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t fod_enable;
+ 	char tmp_buf[64];
+ 
+ 	NVT_LOG("++\n");
+ 
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -1554,21 +1498,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_fod_enable(&fod_enable);
++	cnt = nvt_xm_htc_get_fod_enable(&fod_enable);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "fod_enable: %d\n",
+ 		       fod_enable);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_fod_enable_proc_write(struct file *filp,
+@@ -1643,7 +1583,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_set_sw_reset(int16_t sw_reset)
++static int32_t nvt_xm_htc_set_sw_reset(int16_t sw_reset)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -1658,7 +1598,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_sw_reset(int16_t *sw_reset)
++static int32_t nvt_xm_htc_get_sw_reset(int16_t *sw_reset)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -1673,9 +1613,7 @@
+ static ssize_t xm_htc_sw_reset_proc_read(struct file *filp, char __user *buf,
+ 					 size_t count, loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t sw_reset;
+ 	char tmp_buf[64];
+ 
+@@ -1686,12 +1624,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -1701,20 +1633,16 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_sw_reset(&sw_reset);
++	cnt = nvt_xm_htc_get_sw_reset(&sw_reset);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "sw_reset: %d\n", sw_reset);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_sw_reset_proc_write(struct file *filp,
+@@ -1789,7 +1717,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_set_fh_enable(int16_t fh_enable)
++static int32_t nvt_xm_htc_set_fh_enable(int16_t fh_enable)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -1805,7 +1733,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_fh_enable(int16_t *fh_enable)
++static int32_t nvt_xm_htc_get_fh_enable(int16_t *fh_enable)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -1826,9 +1754,7 @@
+ static ssize_t xm_htc_fh_enable_proc_read(struct file *filp, char __user *buf,
+ 					  size_t count, loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t fh_enable;
+ 	char tmp_buf[64];
+ 
+@@ -1839,12 +1765,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -1854,20 +1774,16 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_fh_enable(&fh_enable);
++	cnt = nvt_xm_htc_get_fh_enable(&fh_enable);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "fh_enable: %d\n", fh_enable);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_fh_enable_proc_write(struct file *filp,
+@@ -1942,7 +1858,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_set_scan_freq_no(int16_t scan_freq_no)
++static int32_t nvt_xm_htc_set_scan_freq_no(int16_t scan_freq_no)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -1960,7 +1876,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_scan_freq_no(int16_t *scan_freq_no)
++static int32_t nvt_xm_htc_get_scan_freq_no(int16_t *scan_freq_no)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -1982,9 +1898,7 @@
+ 					     char __user *buf, size_t count,
+ 					     loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t scan_freq_no;
+ 	char tmp_buf[64];
+ 
+@@ -1995,12 +1909,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -2010,21 +1918,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_scan_freq_no(&scan_freq_no);
++	cnt = nvt_xm_htc_get_scan_freq_no(&scan_freq_no);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "scan_freq_no: %d\n",
+ 		       scan_freq_no);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_scan_freq_no_proc_write(struct file *filp,
+@@ -2099,7 +2003,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_get_scan_freq(int16_t *scan_freq)
++static int32_t nvt_xm_htc_get_scan_freq(int16_t *scan_freq)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -2120,9 +2024,7 @@
+ static ssize_t xm_htc_scan_freq_proc_read(struct file *filp, char __user *buf,
+ 					  size_t count, loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t scan_freq;
+ 	char tmp_buf[64];
+ 
+@@ -2133,12 +2035,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -2148,20 +2044,16 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_scan_freq(&scan_freq);
++	cnt = nvt_xm_htc_get_scan_freq(&scan_freq);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "scan_freq: %d\n", scan_freq);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ #ifdef HAVE_PROC_OPS
+@@ -2175,7 +2067,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_get_report_rate(int16_t *report_rate)
++static int32_t nvt_xm_htc_get_report_rate(int16_t *report_rate)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -2216,9 +2108,7 @@
+ 					    char __user *buf, size_t count,
+ 					    loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t report_rate;
+ 	char tmp_buf[64];
+ 
+@@ -2229,12 +2119,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -2244,21 +2128,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_report_rate(&report_rate);
++	cnt = nvt_xm_htc_get_report_rate(&report_rate);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "report_rate: %d\n",
+ 		       report_rate);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_report_rate_proc_write(struct file *filp,
+@@ -2334,7 +2214,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_set_calibration(int16_t calibration)
++static int32_t nvt_xm_htc_set_calibration(int16_t calibration)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -2352,7 +2232,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_calibration(int16_t *calibration)
++static int32_t nvt_xm_htc_get_calibration(int16_t *calibration)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -2373,9 +2253,7 @@
+ static ssize_t xm_htc_calibration_proc_read(struct file *filp, char __user *buf,
+ 					    size_t count, loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t calibration;
+ 	char tmp_buf[64];
+ 
+@@ -2386,12 +2264,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -2401,21 +2273,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_calibration(&calibration);
++	cnt = nvt_xm_htc_get_calibration(&calibration);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "calibration: %d\n",
+ 		       calibration);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_calibration_proc_write(struct file *filp,
+@@ -2490,7 +2358,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_set_int_state(int16_t int_state)
++static int32_t nvt_xm_htc_set_int_state(int16_t int_state)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -2508,7 +2376,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_int_state(int16_t *int_state)
++static int32_t nvt_xm_htc_get_int_state(int16_t *int_state)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -2529,9 +2397,7 @@
+ static ssize_t xm_htc_int_state_proc_read(struct file *filp, char __user *buf,
+ 					  size_t count, loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t int_state;
+ 	char tmp_buf[64];
+ 
+@@ -2542,12 +2408,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -2557,20 +2417,16 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_int_state(&int_state);
++	cnt = nvt_xm_htc_get_int_state(&int_state);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "int_state: %d\n", int_state);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_int_state_proc_write(struct file *filp,
+@@ -2645,7 +2501,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_set_single_step(int16_t single_step)
++static int32_t nvt_xm_htc_set_single_step(int16_t single_step)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -2663,7 +2519,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_single_step(int16_t *single_step)
++static int32_t nvt_xm_htc_get_single_step(int16_t *single_step)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -2684,9 +2540,7 @@
+ static ssize_t xm_htc_single_step_proc_read(struct file *filp, char __user *buf,
+ 					    size_t count, loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t single_step;
+ 	char tmp_buf[64];
+ 
+@@ -2697,12 +2551,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -2712,21 +2560,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_single_step(&single_step);
++	cnt = nvt_xm_htc_get_single_step(&single_step);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "single_step: %d\n",
+ 		       single_step);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_single_step_proc_write(struct file *filp,
+@@ -2801,7 +2645,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_set_game_mode(int16_t game_mode)
++static int32_t nvt_xm_htc_set_game_mode(int16_t game_mode)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -2819,7 +2663,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_game_mode(int16_t *game_mode)
++static int32_t nvt_xm_htc_get_game_mode(int16_t *game_mode)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -2840,9 +2684,7 @@
+ static ssize_t xm_htc_game_mode_proc_read(struct file *filp, char __user *buf,
+ 					  size_t count, loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t game_mode;
+ 	char tmp_buf[64];
+ 
+@@ -2853,12 +2695,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -2868,20 +2704,16 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_game_mode(&game_mode);
++	cnt = nvt_xm_htc_get_game_mode(&game_mode);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "game_mode: %d\n", game_mode);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_game_mode_proc_write(struct file *filp,
+@@ -2956,7 +2788,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_set_charger(int16_t charger)
++static int32_t nvt_xm_htc_set_charger(int16_t charger)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -2974,7 +2806,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_charger(int16_t *charger)
++static int32_t nvt_xm_htc_get_charger(int16_t *charger)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -2995,9 +2827,7 @@
+ static ssize_t xm_htc_charger_proc_read(struct file *filp, char __user *buf,
+ 					size_t count, loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t charger;
+ 	char tmp_buf[64];
+ 
+@@ -3008,12 +2838,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -3023,20 +2847,16 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_charger(&charger);
++	cnt = nvt_xm_htc_get_charger(&charger);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "charger: %d\n", charger);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_charger_proc_write(struct file *filp,
+@@ -3111,7 +2931,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_set_gesture_dbclk(int16_t gesture_dbclk)
++static int32_t nvt_xm_htc_set_gesture_dbclk(int16_t gesture_dbclk)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -3129,7 +2949,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_gesture_dbclk(int16_t *gesture_dbclk)
++static int32_t nvt_xm_htc_get_gesture_dbclk(int16_t *gesture_dbclk)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -3151,9 +2971,7 @@
+ 					      char __user *buf, size_t count,
+ 					      loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t gesture_dbclk;
+ 	char tmp_buf[64];
+ 
+@@ -3164,12 +2982,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -3179,21 +2991,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_gesture_dbclk(&gesture_dbclk);
++	cnt = nvt_xm_htc_get_gesture_dbclk(&gesture_dbclk);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "gesture_dbclk: %d\n",
+ 		       gesture_dbclk);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_gesture_dbclk_proc_write(struct file *filp,
+@@ -3268,7 +3076,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_set_flg_buf(int16_t flg_buf)
++static int32_t nvt_xm_htc_set_flg_buf(int16_t flg_buf)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -3286,7 +3094,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_flg_buf(int16_t *flg_buf)
++static int32_t nvt_xm_htc_get_flg_buf(int16_t *flg_buf)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -3307,9 +3115,7 @@
+ static ssize_t xm_htc_flg_buf_proc_read(struct file *filp, char __user *buf,
+ 					size_t count, loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t flg_buf;
+ 	char tmp_buf[64];
+ 
+@@ -3320,12 +3126,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -3335,20 +3135,16 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_flg_buf(&flg_buf);
++	cnt = nvt_xm_htc_get_flg_buf(&flg_buf);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "flg_buf: %d\n", flg_buf);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_flg_buf_proc_write(struct file *filp,
+@@ -3423,7 +3219,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_set_ic_log_level(int16_t ic_log_level)
++static int32_t nvt_xm_htc_set_ic_log_level(int16_t ic_log_level)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -3441,7 +3237,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_ic_log_level(int16_t *ic_log_level)
++static int32_t nvt_xm_htc_get_ic_log_level(int16_t *ic_log_level)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -3463,9 +3259,7 @@
+ 					     char __user *buf, size_t count,
+ 					     loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t ic_log_level;
+ 	char tmp_buf[64];
+ 
+@@ -3476,12 +3270,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -3491,21 +3279,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_ic_log_level(&ic_log_level);
++	cnt = nvt_xm_htc_get_ic_log_level(&ic_log_level);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "ic_log_level: %d\n",
+ 		       ic_log_level);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_ic_log_level_proc_write(struct file *filp,
+@@ -3580,7 +3364,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_set_filter_level(int16_t filter_level)
++static int32_t nvt_xm_htc_set_filter_level(int16_t filter_level)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -3598,7 +3382,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_filter_level(int16_t *filter_level)
++static int32_t nvt_xm_htc_get_filter_level(int16_t *filter_level)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -3620,9 +3404,7 @@
+ 					     char __user *buf, size_t count,
+ 					     loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t filter_level;
+ 	char tmp_buf[64];
+ 
+@@ -3633,12 +3415,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -3648,21 +3424,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_filter_level(&filter_level);
++	cnt = nvt_xm_htc_get_filter_level(&filter_level);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "filter_level: %d\n",
+ 		       filter_level);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_filter_level_proc_write(struct file *filp,
+@@ -3737,7 +3509,7 @@
+ };
+ #endif
+ 
+-int32_t nvt_xm_htc_set_report_coordinate(int16_t report_coordinate)
++static int32_t nvt_xm_htc_set_report_coordinate(int16_t report_coordinate)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -3756,7 +3528,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_report_coordinate(int16_t *report_coordinate)
++static int32_t nvt_xm_htc_get_report_coordinate(int16_t *report_coordinate)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -3778,9 +3550,7 @@
+ 						  char __user *buf,
+ 						  size_t count, loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t report_coordinate;
+ 	char tmp_buf[64];
+ 
+@@ -3791,12 +3561,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -3806,21 +3570,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_report_coordinate(&report_coordinate);
++	cnt = nvt_xm_htc_get_report_coordinate(&report_coordinate);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "report_coordinate: %d\n",
+ 		       report_coordinate);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_report_coordinate_proc_write(struct file *filp,
+@@ -3911,7 +3671,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_idle_baseline_update(int16_t *idle_baseline_update)
++static int32_t nvt_xm_htc_get_idle_baseline_update(int16_t *idle_baseline_update)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -3934,9 +3694,7 @@
+ 						     size_t count,
+ 						     loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t idle_baseline_update;
+ 	char tmp_buf[64];
+ 
+@@ -3947,12 +3705,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -3962,21 +3714,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_idle_baseline_update(&idle_baseline_update);
++	cnt = nvt_xm_htc_get_idle_baseline_update(&idle_baseline_update);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "idle baseline update: %d\n",
+ 		       idle_baseline_update);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_idle_baseline_update_proc_write(struct file *filp,
+@@ -4051,7 +3799,7 @@
+ 	.write = xm_htc_idle_baseline_update_proc_write,
+ };
+ #endif
+-int32_t nvt_xm_htc_set_click_gesture_enable(int16_t click_gesture_enable)
++static int32_t nvt_xm_htc_set_click_gesture_enable(int16_t click_gesture_enable)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -4068,7 +3816,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_click_gesture_enable(int16_t *click_gesture_enable)
++static int32_t nvt_xm_htc_get_click_gesture_enable(int16_t *click_gesture_enable)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -4091,9 +3839,7 @@
+ 						     size_t count,
+ 						     loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t click_gesture_enable = 0;
+ 	char tmp_buf[64];
+ 
+@@ -4104,12 +3850,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -4119,21 +3859,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_click_gesture_enable(&click_gesture_enable);
++	cnt = nvt_xm_htc_get_click_gesture_enable(&click_gesture_enable);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "click_gesture_enable: %d\n",
+ 		       click_gesture_enable);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_click_gesture_enable_proc_write(struct file *filp,
+@@ -4228,7 +3964,7 @@
+ 	return ret;
+ }
+ 
+-int32_t nvt_xm_htc_get_idle_high_base_en(int16_t *idle_high_base_en)
++static int32_t nvt_xm_htc_get_idle_high_base_en(int16_t *idle_high_base_en)
+ {
+ 	int32_t ret = 0;
+ 
+@@ -4250,9 +3986,7 @@
+ 						  char __user *buf,
+ 						  size_t count, loff_t *f_pos)
+ {
+-	static int finished = 0;
+ 	int32_t cnt = 0;
+-	int32_t len = 0;
+ 	int16_t idle_high_base_en;
+ 	char tmp_buf[64];
+ 
+@@ -4263,12 +3997,6 @@
+ 	* no more information. Otherwise, processes will
+ 	* continue to read from us in an endless loop.
+ 	*/
+-	if (finished) {
+-		NVT_LOG("read END\n");
+-		finished = 0;
+-		return 0;
+-	}
+-	finished = 1;
+ 
+ 	if (mutex_lock_interruptible(&ts->lock)) {
+ 		return -ERESTARTSYS;
+@@ -4278,21 +4006,17 @@
+ 	nvt_esd_check_enable(false);
+ #endif /* #if NVT_TOUCH_ESD_PROTECT */
+ 
+-	nvt_xm_htc_get_idle_high_base_en(&idle_high_base_en);
++	cnt = nvt_xm_htc_get_idle_high_base_en(&idle_high_base_en);
++	if (cnt < 0) {
++		mutex_unlock(&ts->lock);
++		return cnt;
++	}
+ 
+ 	mutex_unlock(&ts->lock);
+ 
+ 	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "idle_high_base_en: %d\n",
+ 		       idle_high_base_en);
+-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
+-		NVT_ERR("copy_to_user() error!\n");
+-		return -EFAULT;
+-	}
+-	buf += cnt;
+-	len += cnt;
+-
+-	NVT_LOG("--\n");
+-	return len;
++	return simple_read_from_buffer(buf, count, f_pos, tmp_buf, cnt);
+ }
+ 
+ static ssize_t xm_htc_idle_high_base_en_proc_write(struct file *filp,
+--- a/qcom/opensource/touch-drivers/nt36532/nt36xxx_fw_update.c
++++ b/qcom/opensource/touch-drivers/nt36532/nt36xxx_fw_update.c
+@@ -122,7 +122,7 @@
+ 
+ static uint32_t byte_to_word(const uint8_t *data)
+ {
+-	return data[0] + (data[1] << 8) + (data[2] << 16) + (data[3] << 24);
++	return data[0] + (data[1] << 8) + (data[2] << 16) + ((u32)data[3] << 24);
+ }
+ 
+ /*******************************************************
+@@ -141,15 +141,19 @@
+ 	uint32_t list = 0;
+ 	uint32_t pos = 0x00;
+ 	uint32_t end = 0x00;
+-	uint8_t info_sec_num = 0;
++	uint32_t info_sec_num = 0;
+ 	uint8_t ovly_sec_num = 0;
+ 	uint8_t ovly_info = 0;
+ 	uint8_t find_bin_header = 0;
+ 
++	if (!fwdata || fwsize < 0x30)
++		return -EINVAL;
+ 	/* Find the header size */
+ 	end = fwdata[0] + (fwdata[1] << 8) + (fwdata[2] << 16) +
+-	      (fwdata[3] << 24);
+-
++	      ((u32)fwdata[3] << 24);
++
++	if (end < 0x30 || end > fwsize || (end - 0x30) % 0x10)
++		return -EINVAL;
+ 	/* update the correct end pointer */
+ 	pos = 0x30; /* info section start at 0x30 offset */
+ 	while (pos < end) {
+@@ -177,6 +181,8 @@
+ 		info_sec_num = info_sec_num + 1; /* next header section */
+ 		spi_dma_div_cnt_val = fwdata[0x29] & 0x01;
+ 		/* update the end pointer for cascade 2nd header */
++		if (end > fwsize / 2)
++			return -EINVAL;
+ 		end = end * 2;
+ 	}
+ 
+@@ -196,6 +202,8 @@
+ 	NVT_LOG("ovly_info = %d, ilm_dlm_num = %d, ovly_sec_num = %d, info_sec_num = %d, partition = %d\n",
+ 		ovly_info, ilm_dlm_num, ovly_sec_num, info_sec_num, partition);
+ 
++	if (partition > NVT_TRANSFER_LEN / sizeof(u32))
++		return -EINVAL;
+ 	/* allocated memory for header info */
+ 	bin_map = (struct nvt_ts_bin_map *)kzalloc(
+ 		(partition + 1) * sizeof(struct nvt_ts_bin_map), GFP_KERNEL);
+@@ -221,8 +229,8 @@
+ 				bin_map[list].crc =
+ 					byte_to_word(&fwdata[0x18 + list * 4]);
+ 			else { //ts->hw_crc
+-				if ((bin_map[list].BIN_addr +
+-				     bin_map[list].size) < fwsize)
++				if (bin_map[list].BIN_addr < fwsize &&
++				    bin_map[list].size < fwsize - bin_map[list].BIN_addr)
+ 					bin_map[list].crc = CheckSum(
+ 						&fwdata[bin_map[list].BIN_addr],
+ 						bin_map[list].size);
+@@ -254,6 +262,8 @@
+ 				pos = end - 0x10;
+ 			}
+ 
++			if (pos > fwsize - 0x10)
++				return -EINVAL;
+ 			bin_map[list].SRAM_addr = byte_to_word(&fwdata[pos]);
+ 			bin_map[list].size = byte_to_word(&fwdata[pos + 4]);
+ 			bin_map[list].BIN_addr = byte_to_word(&fwdata[pos + 8]);
+@@ -261,8 +271,8 @@
+ 				bin_map[list].crc =
+ 					byte_to_word(&fwdata[pos + 12]);
+ 			else { //ts->hw_crc
+-				if ((bin_map[list].BIN_addr +
+-				     bin_map[list].size) < fwsize)
++				if (bin_map[list].BIN_addr < fwsize &&
++				    bin_map[list].size < fwsize - bin_map[list].BIN_addr)
+ 					bin_map[list].crc = CheckSum(
+ 						&fwdata[bin_map[list].BIN_addr],
+ 						bin_map[list].size);
+@@ -291,9 +301,15 @@
+ 		 */
+ 		if (list >= (ilm_dlm_num + info_sec_num)) {
+ 			/* overlay info located at DLM (list = 1) start addr */
++			if (bin_map[1].BIN_addr > fwsize - 0x10 ||
++			    (list - ilm_dlm_num - info_sec_num) >
++			    (fwsize - 0x10 - bin_map[1].BIN_addr) / 0x10)
++				return -EINVAL;
+ 			pos = bin_map[1].BIN_addr +
+ 			      (0x10 * (list - ilm_dlm_num - info_sec_num));
+ 
++			if (pos > fwsize - 0x10)
++				return -EINVAL;
+ 			bin_map[list].SRAM_addr = byte_to_word(&fwdata[pos]);
+ 			bin_map[list].size = byte_to_word(&fwdata[pos + 4]);
+ 			bin_map[list].BIN_addr = byte_to_word(&fwdata[pos + 8]);
+@@ -301,8 +317,8 @@
+ 				bin_map[list].crc =
+ 					byte_to_word(&fwdata[pos + 12]);
+ 			else { //ts->hw_crc
+-				if ((bin_map[list].BIN_addr +
+-				     bin_map[list].size) < fwsize)
++				if (bin_map[list].BIN_addr < fwsize &&
++				    bin_map[list].size < fwsize - bin_map[list].BIN_addr)
+ 					bin_map[list].crc = CheckSum(
+ 						&fwdata[bin_map[list].BIN_addr],
+ 						bin_map[list].size);
+@@ -319,7 +335,9 @@
+ 		}
+ 
+ 		/* BIN size error detect */
+-		if ((bin_map[list].BIN_addr + bin_map[list].size) > fwsize) {
++		if (bin_map[list].BIN_addr >= fwsize ||
++		    bin_map[list].size >= fwsize - bin_map[list].BIN_addr ||
++		    bin_map[list].size > U32_MAX - bin_map[list].SRAM_addr) {
+ 			NVT_ERR("access range (0x%08X to 0x%08X) is larger than bin size!\n",
+ 				bin_map[list].BIN_addr,
+ 				bin_map[list].BIN_addr + bin_map[list].size);
+@@ -372,7 +390,7 @@
+ 		ret = request_firmware(&fw_entry, filename, &ts->client->dev);
+ 		if (ret) {
+ 			NVT_ERR("firmware load failed, ret=%d\n", ret);
+-			goto request_fail;
++			goto invalid;
+ 		}
+ 
+ 		// check FW need to write size
+@@ -383,6 +401,11 @@
+ 		}
+ 
+ 		// check if FW version add FW version bar equals 0xFF
++		if (fw_entry->size <= FW_BIN_VER_OFFSET ||
++		    fw_entry->size <= FW_BIN_VER_BAR_OFFSET) {
++			ret = -EINVAL;
++			goto invalid;
++		}
+ 		if (*(fw_entry->data + FW_BIN_VER_OFFSET) +
+ 			    *(fw_entry->data + FW_BIN_VER_BAR_OFFSET) !=
+ 		    0xFF) {
+@@ -410,7 +433,6 @@
+ 			bin_map = NULL;
+ 		}
+ 
+-request_fail:
+ 		retry++;
+ 		if (unlikely(retry > 2)) {
+ 			NVT_ERR("error, retry=%d\n", retry);
+--- a/qcom/opensource/touch-drivers/nt36532/nt36xxx_mp_ctrlram.c
++++ b/qcom/opensource/touch-drivers/nt36532/nt36xxx_mp_ctrlram.c
+@@ -1874,7 +1874,7 @@
+ return:
+ 	n.a.
+ *******************************************************/
+-void print_selftest_result(struct seq_file *m, int32_t TestResult,
++static void print_selftest_result(struct seq_file *m, int32_t TestResult,
+ 			   uint8_t RecordResult[], int32_t rawdata[],
+ 			   uint8_t x_len, uint8_t y_len)
+ {
+@@ -1949,7 +1949,7 @@
+ 	nvt_mp_seq_printf(m, "\n");
+ }
+ 
+-void nvt_print_selftest_result(int32_t TestResult, uint8_t RecordResult[],
++static void nvt_print_selftest_result(int32_t TestResult, uint8_t RecordResult[],
+ 			       int32_t rawdata[], uint8_t x_len, uint8_t y_len)
+ {
+ 	int32_t i = 0;
+@@ -2899,34 +2899,22 @@
+ *******************************************************/
+ static void goto_next_line(char **ptr)
+ {
+-	if (**ptr == '\n')
+-		goto step_to_next_line;
+-	else {
+-		do {
+-			*ptr = *ptr + 1;
+-		} while (**ptr != '\n');
+-	}
+-	// **ptr is '\n' now
+-step_to_next_line:
+-	*ptr = *ptr + 1;
+-}
+-
+-static void copy_this_line(char *dest, char *src)
+-{
+-	char *copy_from;
+-	char *copy_to;
+-
+-	copy_from = src;
+-	copy_to = dest;
+-	do {
+-		*copy_to = *copy_from;
+-		copy_from++;
+-		copy_to++;
+-	} while ((*copy_from != '\n') && (*copy_from != '\r'));
+-	*copy_to = '\0';
+-}
+-
+-int32_t parse_mp_setting_criteria_item(char **ptr, const char *name,
++	char *next = strchr(*ptr, '\n');
++	*ptr = next ? next + 1 : *ptr + strlen(*ptr);
++}
++
++static int copy_this_line(char *dest, char *src, size_t capacity)
++{
++	size_t length = strcspn(src, "\r\n");
++
++	if (length >= capacity)
++		return -E2BIG;
++	memcpy(dest, src, length);
++	dest[length] = '\0';
++	return 0;
++}
++
++static int32_t parse_mp_setting_criteria_item(char **ptr, const char *name,
+ 				       int32_t *item_value)
+ {
+ 	char *tmp = NULL;
+@@ -2939,13 +2927,14 @@
+ 
+ 	*ptr = tmp;
+ 	goto_next_line(ptr);
+-	sscanf(*ptr, "%d,", item_value);
++	if (sscanf(*ptr, "%d,", item_value) != 1)
++		return -EINVAL;
+ 	NVT_LOG("%s %d\n", name, *item_value);
+ 
+ 	return 0;
+ }
+ 
+-int32_t parse_mp_setting_ain_array(char **ptr, const char *name, uint8_t *array,
++static int32_t parse_mp_setting_ain_array(char **ptr, const char *name, uint8_t *array,
+ 				   uint32_t size)
+ {
+ 	char *tmp = NULL;
+@@ -2976,17 +2965,26 @@
+ 
+ 	// copy this line to tmp_buf
+ 	memset(tmp_buf, 0, (X_Y_MAX * 5 + 1) * sizeof(char));
+-	copy_this_line(tmp_buf, *ptr);
++	if (copy_this_line(tmp_buf, *ptr, X_Y_MAX * 5 + 1)) {
++		ret = -E2BIG;
++		goto failed;
++	}
+ 	offset = strlen(tmp_buf);
+ 	tok_ptr = tmp_buf;
+ 	i = 0;
+ 	while ((token = strsep(&tok_ptr, ", \t\r\0"))) {
+ 		if (strlen(token) == 0)
+ 			continue;
++		if (i >= size || size > X_Y_MAX) {
++			ret = -EINVAL;
++			goto failed;
++		}
+ 		if (!strcmp(token, "0xFF") || !strcmp(token, "0xff"))
+ 			array[i] = 255;
+-		else
+-			array[i] = (uint8_t)simple_strtol(token, NULL, 10);
++		else if (kstrtou8(token, 10, &array[i])) {
++			ret = -EINVAL;
++			goto failed;
++		}
+ 		//printk("%3d, ", array[i]);
+ 
+ 		i++;
+@@ -3015,7 +3013,7 @@
+ 	return ret;
+ }
+ 
+-int32_t parse_mp_criteria_item_array(char **ptr, const char *name,
++static int32_t parse_mp_criteria_item_array(char **ptr, const char *name,
+ 				     int32_t *item_array, int32_t x_ch,
+ 				     int32_t y_ch)
+ {
+@@ -3029,9 +3027,8 @@
+ 	char *tmp_buf = NULL;
+ 
+ 	NVT_LOG("name=%s, x_ch=%d, y_ch=%d\n", name, x_ch, y_ch);
+-	if (x_ch == 0 || y_ch == 0) {
++	if (x_ch <= 0 || y_ch <= 0 || x_ch > X_Y_MAX || y_ch > X_Y_MAX)
+ 		return -EINVAL;
+-	}
+ 
+ 	tmp_buf = (char *)kzalloc(X_Y_MAX * 7 + 1, GFP_KERNEL);
+ 	if (!tmp_buf) {
+@@ -3052,13 +3049,20 @@
+ 		// walk thru this line
+ 		goto_next_line(ptr);
+ 		memset(tmp_buf, 0, (X_Y_MAX * 7 + 1) * sizeof(char));
+-		copy_this_line(tmp_buf, *ptr);
++		if (copy_this_line(tmp_buf, *ptr, X_Y_MAX * 7 + 1)) {
++			ret = -E2BIG;
++			goto failed;
++		}
+ 		offset = strlen(tmp_buf);
+ 		tok_ptr = tmp_buf;
+ 		j = 0;
+ 		while ((token = strsep(&tok_ptr, ", \t\r\0"))) {
+ 			if (strlen(token) == 0)
+ 				continue;
++			if (j >= x_ch) {
++				ret = -EINVAL;
++				goto failed;
++			}
+ 			item_array[i * x_ch + j] =
+ 				(int32_t)simple_strtol(token, NULL, 10);
+ 			//printk("%5d, ", item_array[i * X_Channel + j]);
+@@ -3080,7 +3084,10 @@
+ 	// walk thru this line
+ 	goto_next_line(ptr);
+ 	memset(tmp_buf, 0, sizeof(tmp_buf));
+-	copy_this_line(tmp_buf, *ptr);
++	if (copy_this_line(tmp_buf, *ptr, X_Y_MAX * 7 + 1)) {
++		ret = -E2BIG;
++		goto failed;
++	}
+ 	offset = strlen(tmp_buf);
+ 	tok_ptr = tmp_buf;
+ 	i = 0;
+@@ -3139,6 +3146,10 @@
+ 		return ret;
+ 	}
+ 
++	if (f_file->size > SIZE_MAX - 2 || !f_file->size) {
++		ret = -EINVAL;
++		goto exit_free;
++	}
+ 	fbufp = (char *)kzalloc(f_file->size + 2, GFP_KERNEL);
+ 	if (!fbufp) {
+ 		NVT_ERR("kzalloc %zu bytes failed.\n", f_file->size);
+@@ -3165,6 +3176,13 @@
+ 			break;
+ 
+ 		case TYPE_AIN:
++			if (!IC_X_CFG_SIZE || IC_X_CFG_SIZE > X_Y_MAX ||
++			    !IC_Y_CFG_SIZE || IC_Y_CFG_SIZE > X_Y_MAX ||
++			    !X_Channel || X_Channel > X_Y_MAX ||
++			    !Y_Channel || Y_Channel > X_Y_MAX) {
++				ret = -EINVAL;
++				goto exit_free;
++			}
+ 			if (!strcmp(mp_criteria_item_table[item].name,
+ 				    "AIN_X:"))
+ 				len = IC_X_CFG_SIZE;
+@@ -3233,6 +3251,16 @@
+ 	}
+ 
+ exit_free:
++	if (!ret) {
++		uint32_t i;
++
++		for (i = 0; i < IC_X_CFG_SIZE; i++)
++			if (AIN_X[i] != 0xff && AIN_X[i] >= X_Channel)
++				ret = -EINVAL;
++		for (i = 0; i < IC_Y_CFG_SIZE; i++)
++			if (AIN_Y[i] != 0xff && AIN_Y[i] >= Y_Channel)
++				ret = -EINVAL;
++	}
+ 
+ 	if (f_file) {
+ 		release_firmware(f_file);
+@@ -3259,21 +3287,17 @@
+ *******************************************************/
+ int32_t nvt_mp_proc_init(void)
+ {
++	int ret = nvt_mp_buffer_init();
++
++	if (ret)
++		return ret;
+ 	NVT_proc_selftest_entry =
+ 		proc_create("nvt_selftest", 0444, NULL, &nvt_selftest_fops);
+-	if (NVT_proc_selftest_entry == NULL) {
+-		NVT_ERR("create /proc/nvt_selftest Failed!\n");
+-		return -1;
+-	} else {
+-		if (nvt_mp_buffer_init()) {
+-			NVT_ERR("Allocate mp memory failed\n");
+-			return -1;
+-		} else {
+-			NVT_LOG("create /proc/nvt_selftest Succeeded!\n");
+-		}
+-
+-		return 0;
+-	}
++	if (!NVT_proc_selftest_entry) {
++		nvt_mp_buffer_deinit();
++		return -ENOMEM;
++	}
++	return 0;
+ }
+ 
+ /*******************************************************
+@@ -3286,12 +3310,11 @@
+ *******************************************************/
+ void nvt_mp_proc_deinit(void)
+ {
+-	nvt_mp_buffer_deinit();
+-
+ 	if (NVT_proc_selftest_entry != NULL) {
+ 		remove_proc_entry("nvt_selftest", NULL);
+ 		NVT_proc_selftest_entry = NULL;
+ 		NVT_LOG("Removed /proc/%s\n", "nvt_selftest");
+ 	}
++	nvt_mp_buffer_deinit();
+ }
+ #endif /* #if NVT_TOUCH_MP */
+--- a/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch.h
++++ b/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch.h
+@@ -5,6 +5,8 @@
+ #include <linux/module.h>
+ #include <linux/types.h>
+ #include <linux/wait.h>
++#include <linux/mm.h>
++#include <linux/rwsem.h>
+ #include <asm/atomic.h>
+ #include <linux/workqueue.h>
+ #include <linux/kernel.h>
+@@ -224,8 +226,13 @@
+ 	RAW_DATA_NOTIFY,
+ };
+ 
++extern struct rw_semaphore xiaomi_touch_access_lock;
++bool xiaomi_touch_is_ready(void);
++
+ typedef struct private_data {
+ 	struct list_head node;
++	struct mutex io_lock;
++	bool linked;
+ 	u8 mmap_area;
+ 	s8 touch_id;
+ 	wait_queue_head_t poll_wait_queue_head;
+@@ -240,6 +247,8 @@
+ 
+ typedef struct xiaomi_touch_data {
+ 	s8 touch_id;
++	bool initialized;
++	bool notifier_initialized;
+ 
+ 	atomic_t frame_data_buf_index;
+ 	u32 frame_data_size;
+@@ -445,11 +454,13 @@
+ int xiaomi_touch_operation_remove(void);
+ 
+ int xiaomi_touch_init_touch_mode(s8 touch_id, struct device *dev);
++void xiaomi_touch_mode_remove(s8 touch_id);
+ int xiaomi_touch_mode(private_data_t *client_private_data, u32 user_size,
+ 		      unsigned long arg);
+ 
+ int xiaomi_touch_sys_init(void);
+ int xiaomi_touch_sys_remove(void);
++void xiaomi_touch_sys_pin(void);
+ int xiaomi_touch_evdev_init(xiaomi_touch_t *xiaomi_touch);
+ void add_input_event_timeline_before_event_time(int type, u64 frame_count,
+ 						s64 start_time, s64 end_time);
+--- a/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_core.c
++++ b/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_core.c
+@@ -14,13 +14,22 @@
+ 
+ #include "xiaomi_touch.h"
+ static xiaomi_touch_t xiaomi_touch;
++DECLARE_RWSEM(xiaomi_touch_access_lock);
++static bool touch_ready;
++static bool touch_initialized;
++
++bool xiaomi_touch_is_ready(void)
++{
++	return READ_ONCE(touch_ready);
++}
++EXPORT_SYMBOL_GPL(xiaomi_touch_is_ready);
++
+ static struct task_struct *xiaomi_touch_temp_thread;
+ 
+ #define NETLINK_TEST 24
+ #define MAX_MSGSIZE 16
+-int stringlength(char *s);
+-static int pid = -1;
+-struct sock *nl_sk;
++static u32 pid;
++static struct sock *nl_sk;
+ 
+ void sendnlmsg(char message) //char *message
+ {
+@@ -30,9 +39,8 @@
+ 	int slen = 0;
+ 	int ret = 0;
+ 
+-	if (!nl_sk || !pid) {
+-		return;
+-	}
++	if (!nl_sk || !READ_ONCE(pid))
++		return;
+ 
+ 	skb_1 = alloc_skb(len, GFP_KERNEL);
+ 
+@@ -46,6 +54,7 @@
+ 	NETLINK_CB(skb_1).portid = 0;
+ 	NETLINK_CB(skb_1).dst_group = 0;
+ 	//	message[slen] = '\0';
++	memset(NLMSG_DATA(nlh), 0, MAX_MSGSIZE);
+ 	memcpy(NLMSG_DATA(nlh), &message, slen);
+ 	ret = netlink_unicast(nl_sk, skb_1, pid, MSG_DONTWAIT);
+ 
+@@ -56,30 +65,26 @@
+ 	}
+ }
+ 
+-void nl_data_ready(struct sk_buff *__skb)
+-{
+-	struct sk_buff *skb;
++static void nl_data_ready(struct sk_buff *__skb)
++{
+ 	struct nlmsghdr *nlh;
+-	char str[100] = { '\0' };
+-	skb = skb_get(__skb);
+-
+-	if (skb->len >= NLMSG_SPACE(0)) {
+-		nlh = nlmsg_hdr(skb);
+-		memcpy(str, NLMSG_DATA(nlh), sizeof(str));
+-		pid = nlh->nlmsg_pid;
+-		kfree_skb(skb);
+-	}
+-	LOG_INFO("netlink socket, pid =%d, msg = %d\n", pid, str[0]);
+-}
+-
+-int netlink_init(void)
++
++	if (!__skb || __skb->len < NLMSG_HDRLEN)
++		return;
++	nlh = nlmsg_hdr(__skb);
++	if (!nlmsg_ok(nlh, __skb->len) || !NETLINK_CB(__skb).portid)
++		return;
++	WRITE_ONCE(pid, NETLINK_CB(__skb).portid);
++
++}
++
++static int netlink_init(void)
+ {
+ 	struct netlink_kernel_cfg netlink_cfg;
+ 	memset(&netlink_cfg, 0, sizeof(struct netlink_kernel_cfg));
+ 	netlink_cfg.groups = 0;
+ 	netlink_cfg.flags = 0;
+ 	netlink_cfg.input = nl_data_ready;
+-	netlink_cfg.cb_mutex = NULL;
+ 	nl_sk = netlink_kernel_create(&init_net, NETLINK_TEST, &netlink_cfg);
+ 
+ 	if (!nl_sk) {
+@@ -90,7 +95,7 @@
+ 	return 0;
+ }
+ 
+-void netlink_exit(void)
++static void netlink_exit(void)
+ {
+ 	if (nl_sk != NULL) {
+ 		netlink_kernel_release(nl_sk);
+@@ -196,7 +201,8 @@
+ 
+ 	common_data_t *common_data = NULL;
+ 
+-	if (!xiaomi_touch_data)
++	if (!xiaomi_touch_data || length < 0 ||
++	    length > CMD_DATA_BUF_SIZE || (length && !data))
+ 		return;
+ 
+ 	LOG_DEBUG("add touch id %d common mode: %d to buffer:%d", touch_id,
+@@ -204,6 +210,7 @@
+ 	mutex_lock(&xiaomi_touch_data->common_data_buf_lock);
+ 	common_data = &xiaomi_touch_data->common_data_buf[atomic_read(
+ 		&xiaomi_touch_data->common_data_buf_index)];
++	memset(common_data, 0, sizeof(*common_data));
+ 	common_data->touch_id = touch_id;
+ 	common_data->cmd = cmd;
+ 	common_data->mode = mode;
+@@ -276,6 +283,7 @@
+ 	}
+ 
+ 	ret = power_supply_get_property(battery, POWER_SUPPLY_PROP_TEMP, &prop);
++	power_supply_put(battery);
+ 	if (ret) {
+ 		LOG_INFO("can't read battery temp");
+ 		return -INVAILD_TEMPERATURE;
+@@ -305,8 +313,7 @@
+ 	int temp_n = 0;
+ 	static int last_temp = 1000;
+ 	int cur_temp0, cur_temp = 0;
+-	common_data_t *temp_id = (common_data_t *)data;
+-	s8 touch_id = temp_id->touch_id;
++	s8 touch_id = *(s8 *)data;
+ 	xiaomi_touch_data_t *xiaomi_touch_data =
+ 		get_xiaomi_touch_data(touch_id);
+ 	xiaomi_touch_driver_param_t *xiaomi_touch_driver_param =
+@@ -320,7 +327,10 @@
+ 	while (!kthread_should_stop()) {
+ 		wait_event_interruptible(
+ 			xiaomi_touch_data->temp_detect_wait_queue,
+-			atomic_read(&xiaomi_touch_data->temp_detect_ready));
++			atomic_read(&xiaomi_touch_data->temp_detect_ready) ||
++			kthread_should_stop());
++		if (kthread_should_stop())
++			break;
+ 		if (atomic_read(&xiaomi_touch_data->temp_detect_ready)) {
+ 			cur_temp0 = get_bms_temp_common();
+ 			cur_temp = (cur_temp0 + 5) /
+@@ -351,7 +361,9 @@
+ 
+ 			LOG_DEBUG("cur_temp0:%d, last_temp:%d, sleep %dms",
+ 				  cur_temp0, last_temp, temp_n * 1000);
+-			msleep(temp_n * 1000);
++			wait_event_interruptible_timeout(
++				xiaomi_touch_data->temp_detect_wait_queue,
++				kthread_should_stop(), msecs_to_jiffies(temp_n * 1000));
+ 		}
+ 	}
+ 	LOG_INFO("exit");
+@@ -451,248 +463,133 @@
+ 			 hardware_param_t *hardware_param,
+ 			 hardware_operation_t *hardware_operation)
+ {
+-	xiaomi_touch_driver_param_t *xiaomi_touch_driver_param = NULL;
+-	xiaomi_touch_data_t *xiaomi_touch_data = NULL;
+-	u32 alloc_size = 0;
+-
+-	LOG_INFO("enter");
+-	if (IS_TOUCH_ID_INVALID(touch_id)) {
+-		LOG_ERROR("touch id error, please check it!");
+-		return -1;
+-	}
+-
+-	if (xiaomi_touch.panel_register_mask & (1 << touch_id)) {
+-		LOG_ERROR("touch id %d has register, stop register again!",
+-			  touch_id);
+-		return -1;
+-	}
+-
+-	/* init panel driver param */
+-	if (hardware_param) {
+-		xiaomi_touch_driver_param =
+-			&xiaomi_touch.xiaomi_touch_driver_param[touch_id];
+-		xiaomi_touch_driver_param->touch_id = touch_id;
+-		memcpy(&xiaomi_touch_driver_param->hardware_param,
+-		       hardware_param, sizeof(hardware_param_t));
+-	} else {
+-		LOG_ERROR("param is null");
+-		return -1;
+-	}
++	xiaomi_touch_driver_param_t *param;
++	xiaomi_touch_data_t *data;
++	unsigned long frame_bytes, raw_bytes;
++	int ret = -ENOMEM;
++	bool mode_initialized = false;
++
++	if (!dev || !hardware_param || IS_TOUCH_ID_INVALID(touch_id))
++		return -EINVAL;
++	down_write(&xiaomi_touch_access_lock);
++	data = &xiaomi_touch.xiaomi_touch_data[touch_id];
++	param = &xiaomi_touch.xiaomi_touch_driver_param[touch_id];
++	if (!touch_ready || data->initialized) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	memset(data, 0, sizeof(*data));
++	data->touch_id = touch_id;
++	spin_lock_init(&data->private_data_lock);
++	mutex_init(&data->common_data_buf_lock);
++	INIT_LIST_HEAD(&data->private_data_list);
++	init_waitqueue_head(&data->temp_detect_wait_queue);
++	data->frame_data_size = (u32)hardware_param->frame_data_page_size * PAGE_SIZE;
++	data->frame_data_buf_size = hardware_param->frame_data_buf_size;
++	data->raw_data_size = (u32)hardware_param->raw_data_page_size * PAGE_SIZE;
++	data->raw_data_buf_size = hardware_param->raw_data_buf_size;
++	frame_bytes = (unsigned long)data->frame_data_size * data->frame_data_buf_size;
++	raw_bytes = (unsigned long)data->raw_data_size * data->raw_data_buf_size;
++	if (frame_bytes) {
++		data->frame_data_mmap_base =
++			alloc_pages_exact(frame_bytes, GFP_KERNEL | __GFP_ZERO);
++		if (!data->frame_data_mmap_base)
++			goto unlock;
++		data->frame_data_mmap_phy_base = virt_to_phys(data->frame_data_mmap_base);
++	}
++	if (raw_bytes) {
++		data->raw_data_mmap_base = alloc_pages_exact(raw_bytes, GFP_KERNEL | __GFP_ZERO);
++		if (!data->raw_data_mmap_base)
++			goto free_frame;
++		data->raw_data_mmap_phy_base = virt_to_phys(data->raw_data_mmap_base);
++	}
++	data->event_wq = alloc_ordered_workqueue("xiaomi-touch-event-queue", WQ_HIGHPRI);
++	if (!data->event_wq)
++		goto free_raw;
++	data->poll_data = kzalloc(sizeof(htc_ic_polldata_t), GFP_KERNEL);
++	if (!data->poll_data)
++		goto destroy_queue;
++	param->touch_id = touch_id;
++	param->hardware_param = *hardware_param;
+ 	if (hardware_operation)
+-		memcpy(&xiaomi_touch_driver_param->hardware_operation,
+-		       hardware_operation, sizeof(hardware_operation_t));
+-
+-	/* create proc node */
+-	xiaomi_touch_create_proc(xiaomi_touch_driver_param);
+-
+-	/* init xiaomi touch driver param */
+-	xiaomi_touch_data = &xiaomi_touch.xiaomi_touch_data[touch_id];
+-	memset(xiaomi_touch_data, 0, sizeof(xiaomi_touch_data_t));
+-	xiaomi_touch_data->touch_id = touch_id;
+-	spin_lock_init(&xiaomi_touch_data->private_data_lock);
+-	mutex_init(&xiaomi_touch_data->common_data_buf_lock);
+-	xiaomi_touch_data->frame_data_size =
+-		hardware_param->frame_data_page_size * PAGE_SIZE;
+-	xiaomi_touch_data->frame_data_buf_size =
+-		hardware_param->frame_data_buf_size;
+-	xiaomi_touch_data->raw_data_size =
+-		hardware_param->raw_data_page_size * PAGE_SIZE;
+-	xiaomi_touch_data->raw_data_buf_size =
+-		hardware_param->raw_data_buf_size;
+-
+-	/* The temperature detection function is enabled by default when machine startup */
+-	atomic_set(&xiaomi_touch_data->temp_detect_ready, 1);
+-
+-	/* alloc mmap memory */
+-	xiaomi_touch_data->frame_data_mmap_phy_base = 0;
+-	alloc_size = xiaomi_touch_data->frame_data_size *
+-		     xiaomi_touch_data->frame_data_buf_size;
+-	LOG_DEBUG(
+-		"alloc size = %d, frame data size %d, frame data page size %d, frame data buf size %d",
+-		alloc_size, xiaomi_touch_data->frame_data_size,
+-		hardware_param->frame_data_page_size,
+-		hardware_param->frame_data_buf_size);
+-	if (alloc_size) {
+-		xiaomi_touch_data->frame_data_mmap_base =
+-			kzalloc_retry(alloc_size, 3);
+-		if (!xiaomi_touch_data->frame_data_mmap_base) {
+-			LOG_ERROR("touch id %d alloc frame data memory failed!",
+-				  touch_id);
+-			return -1;
+-		}
+-		LOG_DEBUG("frame data base %p, size %u",
+-			  xiaomi_touch_data->frame_data_mmap_base, alloc_size);
+-		xiaomi_touch_data->frame_data_mmap_phy_base =
+-			virt_to_phys(xiaomi_touch_data->frame_data_mmap_base);
+-	}
+-
+-	xiaomi_touch_data->raw_data_mmap_phy_base = 0;
+-	alloc_size = xiaomi_touch_data->raw_data_size *
+-		     xiaomi_touch_data->raw_data_buf_size;
+-
+-	LOG_DEBUG(
+-		"alloc size = %d, raw data size %d, raw data page size %d, raw data buf size %d",
+-		alloc_size, xiaomi_touch_data->raw_data_size,
+-		hardware_param->raw_data_page_size,
+-		hardware_param->raw_data_buf_size);
+-	if (alloc_size) {
+-		xiaomi_touch_data->raw_data_mmap_base =
+-			kzalloc_retry(alloc_size, 3);
+-		if (!xiaomi_touch_data->raw_data_mmap_base) {
+-			LOG_ERROR("touch id %d alloc raw data memory failed!",
+-				  touch_id);
+-			return -1;
+-		}
+-		LOG_DEBUG("raw data base %p, size %u",
+-			  xiaomi_touch_data->raw_data_mmap_base, alloc_size);
+-		xiaomi_touch_data->raw_data_mmap_phy_base =
+-			virt_to_phys(xiaomi_touch_data->raw_data_mmap_base);
+-	}
+-
+-	xiaomi_touch_data->event_wq =
+-		alloc_workqueue("xiaomi-touch-event-queue",
+-				WQ_UNBOUND | WQ_HIGHPRI | WQ_CPU_INTENSIVE, 1);
+-	if (!xiaomi_touch_data->event_wq) {
+-		LOG_ERROR("ERROR: Cannot create work thread");
+-		return -1;
+-	}
+-
+-	/* alloc poll data memory */
+-	xiaomi_touch_data->poll_data =
+-		kzalloc_retry(sizeof(htc_ic_polldata_t), 3);
+-	if (!xiaomi_touch_data->poll_data) {
+-		LOG_ERROR("alloc poll data memory is failed!");
+-		return -1;
+-	}
+-
+-	/* init list */
+-	INIT_LIST_HEAD(&xiaomi_touch_data->private_data_list);
+-
+-	/* print hardware param*/
+-	if (hardware_operation && hardware_param) {
+-		if (hardware_operation->ic_get_lockdown_info) {
+-			hardware_operation->ic_get_lockdown_info(
+-				hardware_param->lockdown_info);
+-		}
+-		LOG_INFO(
+-			"x_resolution=%d, y_resolution=%d, rx_num=%d, tx_num=%d, "
+-			"super_resolution_factor=%d, "
+-			"frame_data_page_size=%d, frame_data_buf_size=%d, "
+-			"raw_data_page_size=%d, raw_data_buf_size=%d, "
+-			"config_file_name=%s, driver_version=%s, fw_version=%s, "
+-			"lockdown={0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X}",
+-			hardware_param->x_resolution,
+-			hardware_param->y_resolution, hardware_param->rx_num,
+-			hardware_param->tx_num,
+-			hardware_param->super_resolution_factor,
+-			hardware_param->frame_data_page_size,
+-			hardware_param->frame_data_buf_size,
+-			hardware_param->raw_data_page_size,
+-			hardware_param->raw_data_buf_size,
+-			hardware_param->config_file_name,
+-			hardware_param->driver_version,
+-			hardware_param->fw_version,
+-			hardware_param->lockdown_info[0],
+-			hardware_param->lockdown_info[1],
+-			hardware_param->lockdown_info[2],
+-			hardware_param->lockdown_info[3],
+-			hardware_param->lockdown_info[4],
+-			hardware_param->lockdown_info[5],
+-			hardware_param->lockdown_info[6],
+-			hardware_param->lockdown_info[7]);
+-	}
+-	/* init touch mode */
+-	xiaomi_touch_init_touch_mode(touch_id, dev);
+-
+-	/* complete register */
+-	xiaomi_touch.panel_register_mask |= (1 << touch_id);
+-	LOG_INFO("current panel_register_mask is %d",
+-		 xiaomi_touch.panel_register_mask);
+-
+-	/* create a thread for temp detect */
++		param->hardware_operation = *hardware_operation;
++	ret = xiaomi_touch_init_touch_mode(touch_id, dev);
++	if (ret)
++		goto free_poll;
++	mode_initialized = true;
++	ret = xiaomi_touch_create_proc(param);
++	if (ret) {
++		xiaomi_touch_remove_proc(touch_id);
++		goto free_poll;
++	}
++	/* Publish only fully initialized state. Published mappings live until reboot. */
++	data->initialized = true;
++	xiaomi_touch.panel_register_mask |= BIT(touch_id);
+ 	if (hardware_operation && hardware_operation->set_thermal_temp) {
+-		LOG_INFO("startup temperature detect thread");
+-		xiaomi_touch_temp_thread =
+-			kthread_create(xiaomi_touch_temp_thread_func,
+-				       (void *)&xiaomi_touch_data->touch_id,
+-				       "xiaomi_touch_temp_thread");
++		atomic_set(&data->temp_detect_ready, 1);
++		xiaomi_touch_temp_thread = kthread_run(xiaomi_touch_temp_thread_func,
++			&data->touch_id, "xiaomi_touch_temp_thread");
+ 		if (IS_ERR(xiaomi_touch_temp_thread)) {
+-			LOG_ERROR("Failed to create xiaomi_touch_temp_thread");
+-			goto err_out;
+-		}
+-		init_waitqueue_head(&xiaomi_touch_data->temp_detect_wait_queue);
+-		wake_up_process(xiaomi_touch_temp_thread);
+-	}
+-
+-#if defined(TOUCH_PLATFORM_XRING)
+-#ifdef TOUCH_SENSORHUB_SUPPORT
+-	/* NOTE:
+- * This process is used for disabling sensorhub when it running abnormally.
+- * For example, receiving normal touch frames.
+- */
+-	xiaomi_touch_register_ipc_notifier();
+-#endif
+-#endif
+-	return 0;
+-
+-err_out:
+-	if (xiaomi_touch_temp_thread != NULL) {
++			xiaomi_touch_temp_thread = NULL;
++			LOG_ERROR("temperature thread unavailable");
++		}
++	}
++	ret = 0;
++	goto unlock;
++free_poll:
++	if (mode_initialized)
++		xiaomi_touch_mode_remove(touch_id);
++	kfree(data->poll_data);
++	data->poll_data = NULL;
++destroy_queue:
++	destroy_workqueue(data->event_wq);
++	data->event_wq = NULL;
++free_raw:
++	if (data->raw_data_mmap_base)
++		free_pages_exact(data->raw_data_mmap_base, raw_bytes);
++	data->raw_data_mmap_base = NULL;
++free_frame:
++	if (data->frame_data_mmap_base)
++		free_pages_exact(data->frame_data_mmap_base, frame_bytes);
++	data->frame_data_mmap_base = NULL;
++unlock:
++	up_write(&xiaomi_touch_access_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(register_touch_panel);
++
++void unregister_touch_panel(s8 touch_id)
++{
++	xiaomi_touch_data_t *data;
++
++	if (IS_TOUCH_ID_INVALID(touch_id))
++		return;
++	down_write(&xiaomi_touch_access_lock);
++	if (!(xiaomi_touch.panel_register_mask & BIT(touch_id))) {
++		up_write(&xiaomi_touch_access_lock);
++		return;
++	}
++	data = &xiaomi_touch.xiaomi_touch_data[touch_id];
++	/* Block new users, then release the lock before draining sysfs/work. */
++	WRITE_ONCE(touch_ready, false);
++	up_write(&xiaomi_touch_access_lock);
++	xiaomi_unregister_panel_notifier(data->dev, touch_id);
++	xiaomi_touch_remove_proc(touch_id);
++	xiaomi_touch_sys_remove();
++	cancel_work_sync(&xiaomi_touch.power_supply_work);
++	if (xiaomi_touch_temp_thread) {
+ 		kthread_stop(xiaomi_touch_temp_thread);
+-	}
+-
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(register_touch_panel);
+-
+-void unregister_touch_panel(s8 touch_id)
+-{
+-	xiaomi_touch_data_t *xiaomi_touch_data = NULL;
+-	xiaomi_touch_driver_param_t *xiaomi_touch_driver_param = NULL;
+-	if (!(xiaomi_touch.panel_register_mask & (1 << touch_id))) {
+-		LOG_ERROR("touch id %d didn't register, break unregister!",
+-			  touch_id);
+-		return;
+-	}
+-
+-	/* free mmap memory */
+-	xiaomi_touch_data = get_xiaomi_touch_data(touch_id);
+-	if (xiaomi_touch_data) {
+-		kzalloc_free(xiaomi_touch_data->frame_data_mmap_base);
+-		xiaomi_touch_data->frame_data_mmap_base = NULL;
+-		xiaomi_touch_data->frame_data_mmap_phy_base = 0;
+-
+-		kzalloc_free(xiaomi_touch_data->raw_data_mmap_base);
+-		xiaomi_touch_data->raw_data_mmap_base = NULL;
+-		xiaomi_touch_data->raw_data_mmap_phy_base = 0;
+-	}
+-
+-	/* remove proc node */
+-	xiaomi_touch_remove_proc(touch_id);
+-
+-	/* clear driver param */
+-	xiaomi_touch_driver_param = get_xiaomi_touch_driver_param(touch_id);
+-	memset(&xiaomi_touch_driver_param->hardware_param, 0,
+-	       sizeof(hardware_param_t));
+-	memset(&xiaomi_touch_driver_param->hardware_operation, 0,
+-	       sizeof(hardware_operation_t));
+-
+-	/*free poll data memory*/
+-	if (xiaomi_touch_data) {
+-		kzalloc_free(xiaomi_touch_data->poll_data);
+-		xiaomi_touch_data->poll_data = NULL;
+-	}
+-
+-	/* complete unregister */
+-	xiaomi_touch.panel_register_mask &= ~(1 << touch_id);
+-	LOG_INFO("current panel_register_mask is %d",
+-		 xiaomi_touch.panel_register_mask);
+-
+-	/* free temp detect thread */
+-	if (xiaomi_touch_temp_thread != NULL) {
+-		atomic_set(&xiaomi_touch_data->temp_detect_ready, 0);
+-		// kthread_stop(xiaomi_touch_temp_thread); /* Optimize restart time */
+-		LOG_INFO("stop detect temperature");
+-	}
++		xiaomi_touch_temp_thread = NULL;
++	}
++	xiaomi_touch_mode_remove(touch_id);
++	destroy_workqueue(data->event_wq);
++	data->event_wq = NULL;
++	down_write(&xiaomi_touch_access_lock);
++	xiaomi_touch.panel_register_mask &= ~BIT(touch_id);
++	memset(&xiaomi_touch.xiaomi_touch_driver_param[touch_id].hardware_operation,
++		0, sizeof(hardware_operation_t));
++	/* Published data, list heads and PFNs remain valid for old files and VMAs. */
++	up_write(&xiaomi_touch_access_lock);
+ }
+ EXPORT_SYMBOL_GPL(unregister_touch_panel);
+ 
+@@ -1027,13 +924,13 @@
+ 
+ #endif
+ 
+-void schedule_resume_suspend_work(s8 touch_id, bool resume_work)
++static void schedule_resume_suspend_work_locked(s8 touch_id, bool resume_work)
+ {
+ #if defined(CONFIG_DRM)
+ 	xiaomi_touch_data_t *xiaomi_touch_data =
+ 		get_xiaomi_touch_data(touch_id);
+ 	bool queue_work_result = false;
+-	if (!xiaomi_touch_data) {
++	if (!xiaomi_touch_data || !xiaomi_touch_is_ready()) {
+ 		LOG_ERROR("xiaomi_touch_data is NULL!");
+ 		return;
+ 	}
+@@ -1055,6 +952,14 @@
+ 
+ #endif
+ }
++void schedule_resume_suspend_work(s8 touch_id, bool resume_work)
++{
++	if (!down_read_trylock(&xiaomi_touch_access_lock))
++		return;
++	if (xiaomi_touch_is_ready())
++		schedule_resume_suspend_work_locked(touch_id, resume_work);
++	up_read(&xiaomi_touch_access_lock);
++}
+ EXPORT_SYMBOL_GPL(schedule_resume_suspend_work);
+ 
+ /**
+@@ -1070,6 +975,7 @@
+ 	if (xiaomi_touch_data == NULL)
+ 		return;
+ 	xiaomi_touch_data->dev = dev;
++	xiaomi_touch_data->notifier_initialized = true;
+ 	xiaomi_touch_data->panel_event_notifier_tag = panel_event_notifier_tag;
+ 	xiaomi_touch_data->panel_event_notifier_client =
+ 		panel_event_notifier_client;
+@@ -1088,24 +994,26 @@
+ #if defined(CONFIG_DRM)
+ 	xiaomi_touch_data_t *xiaomi_touch_data =
+ 		get_xiaomi_touch_data(touch_id);
+-	if (xiaomi_touch_data == NULL)
+-		return;
++	if (xiaomi_touch_data == NULL || !xiaomi_touch_data->notifier_initialized)
++		return;
++	xiaomi_touch_data->notifier_initialized = false;
+ 	cancel_delayed_work_sync(
+ 		&xiaomi_touch_data->panel_notifier_register_work);
+-	cancel_work_sync(&xiaomi_touch_data->suspend_work);
+-	cancel_work_sync(&xiaomi_touch_data->resume_work);
+ 
+ #if defined(TOUCH_PLATFORM_XRING)
+-	if (!IS_ERR(xiaomi_touch_data->notifier_cookie))
++	if (!IS_ERR_OR_NULL(xiaomi_touch_data->notifier_cookie))
+ 		xring_panel_event_notifier_unregister(
+ 			xiaomi_touch_data->notifier_cookie);
+ #else
+ #if IS_ENABLED(CONFIG_QCOM_PANEL_EVENT_NOTIFIER)
+-	if (!IS_ERR(xiaomi_touch_data->notifier_cookie))
++	if (!IS_ERR_OR_NULL(xiaomi_touch_data->notifier_cookie))
+ 		panel_event_notifier_unregister(
+ 			xiaomi_touch_data->notifier_cookie);
+ #endif
+ #endif
++	cancel_work_sync(&xiaomi_touch_data->suspend_work);
++	cancel_work_sync(&xiaomi_touch_data->resume_work);
++	xiaomi_touch_data->notifier_cookie = NULL;
+ #endif
+ }
+ EXPORT_SYMBOL_GPL(xiaomi_unregister_panel_notifier);
+@@ -1121,6 +1029,7 @@
+ 	if (dc_psy) {
+ 		rc = power_supply_get_property(dc_psy, POWER_SUPPLY_PROP_ONLINE,
+ 					       &val);
++		power_supply_put(dc_psy);
+ 		if (rc < 0)
+ 			LOG_ERROR("Couldn't get DC online status, rc=%d\n", rc);
+ 		else if (val.intval == 1)
+@@ -1131,6 +1040,7 @@
+ 	if (usb_psy) {
+ 		rc = power_supply_get_property(usb_psy,
+ 					       POWER_SUPPLY_PROP_ONLINE, &val);
++		power_supply_put(usb_psy);
+ 		if (rc < 0)
+ 			LOG_ERROR("Couldn't get usb online status, rc=%d\n",
+ 				  rc);
+@@ -1174,7 +1084,8 @@
+ static int xiaomi_power_supply_notifier_callback(struct notifier_block *nb,
+ 						 unsigned long event, void *ptr)
+ {
+-	schedule_work(&xiaomi_touch.power_supply_work);
++	if (xiaomi_touch_is_ready())
++		schedule_work(&xiaomi_touch.power_supply_work);
+ 	return 0;
+ }
+ 
+@@ -1187,19 +1098,19 @@
+ 	xiaomi_touch->charging_status = -1;
+ 	xiaomi_touch->power_supply_notifier.notifier_call =
+ 		xiaomi_power_supply_notifier_callback;
++	INIT_WORK(&xiaomi_touch->power_supply_work, xiaomi_power_supply_work);
+ 	retval =
+ 		power_supply_reg_notifier(&xiaomi_touch->power_supply_notifier);
+ 	if (retval < 0) {
+ 		LOG_ERROR("error:%d\n", retval);
+ 		return;
+ 	}
+-	INIT_WORK(&xiaomi_touch->power_supply_work, xiaomi_power_supply_work);
+ }
+ 
+ static void xiaomi_unregister_power_supply_event(void)
+ {
++	power_supply_unreg_notifier(&xiaomi_touch.power_supply_notifier);
+ 	cancel_work_sync(&xiaomi_touch.power_supply_work);
+-	power_supply_unreg_notifier(&xiaomi_touch.power_supply_notifier);
+ }
+ 
+ #if IS_ENABLED(CONFIG_MIEV)
+@@ -1256,7 +1167,7 @@
+ EXPORT_SYMBOL_GPL(xiaomi_touch_mievent_report_str);
+ #endif
+ 
+-void nfc_to_touch_event(s8 touch_id, u8 val)
++static void nfc_to_touch_event_locked(s8 touch_id, u8 val)
+ {
+ 	xiaomi_touch_driver_param_t *xiaomi_touch_driver_param =
+ 		get_xiaomi_touch_driver_param(touch_id);
+@@ -1272,39 +1183,68 @@
+ 	else
+ 		LOG_INFO("Non-filp models do not support this function");
+ }
++void nfc_to_touch_event(s8 touch_id, u8 val)
++{
++	if (!down_read_trylock(&xiaomi_touch_access_lock))
++		return;
++	if (xiaomi_touch_is_ready())
++		nfc_to_touch_event_locked(touch_id, val);
++	up_read(&xiaomi_touch_access_lock);
++}
+ EXPORT_SYMBOL_GPL(nfc_to_touch_event);
+ 
+ static int xiaomi_touch_probe(struct platform_device *pdev)
+ {
+-	LOG_ALWAYS("xiaomi_touch ver: %s", XIAOMI_TOUCH_VERSION);
+-#ifdef TOUCH_KNOCK_SUPPORT
+-	knock_node_init();
+-#endif
+-	memset(&xiaomi_touch, 0, sizeof(xiaomi_touch_t));
+-	xiaomi_touch_sys_init();
+-	xiaomi_touch_operation_init(&xiaomi_touch);
++	int ret;
++
++	if (touch_initialized)
++		return -EBUSY;
++	ret = xiaomi_touch_sys_init();
++	if (ret)
++		return ret;
+ 	xiaomi_register_power_supply_event(&xiaomi_touch);
+-	netlink_init();
+-	xiaomi_touch_evdev_init(&xiaomi_touch);
+-	LOG_INFO("over");
+-
++	ret = netlink_init();
++	if (ret)
++		goto stop_power;
++	ret = xiaomi_touch_evdev_init(&xiaomi_touch);
++	if (ret)
++		goto stop_netlink;
++	WRITE_ONCE(touch_ready, true);
++	ret = xiaomi_touch_operation_init(&xiaomi_touch);
++	if (ret)
++		goto stop_evdev;
++	touch_initialized = true;
++	xiaomi_touch_sys_pin();
++	/* Exported PFNs and raw provider pointers are retained for device lifetime. */
++	__module_get(THIS_MODULE);
+ 	return 0;
+-}
+-
+-static int xiaomi_touch_remove(struct platform_device *pdev)
+-{
+-	LOG_INFO("enter");
++stop_evdev:
++	WRITE_ONCE(touch_ready, false);
++	xiaomi_touch_evdev_remove();
++stop_netlink:
++	netlink_exit();
++stop_power:
++	xiaomi_unregister_power_supply_event();
++	xiaomi_touch_sys_remove();
++	return ret;
++}
++
++static void xiaomi_touch_remove(struct platform_device *pdev)
++{
++	int i;
++
++	for (i = 0; i < MAX_TOUCH_PANEL_COUNT; i++)
++		unregister_touch_panel(i);
++	WRITE_ONCE(touch_ready, false);
+ 	xiaomi_touch_evdev_remove();
+ 	netlink_exit();
+ 	xiaomi_unregister_power_supply_event();
+ 	xiaomi_touch_operation_remove();
+ 	xiaomi_touch_sys_remove();
+-	memset(&xiaomi_touch, 0, sizeof(xiaomi_touch_t));
+ #ifdef TOUCH_KNOCK_SUPPORT
+ 	knock_node_release();
+ #endif
+ 	LOG_INFO("over");
+-	return 0;
+ }
+ 
+ #if defined(TOUCH_PLATFORM_XRING)
+@@ -1322,6 +1262,7 @@
+ 				       .remove = xiaomi_touch_remove,
+ 				       .driver = {
+ 					       .name = "xiaomi-touch",
++					       .suppress_bind_attrs = true,
+ 					       .of_match_table = of_match_ptr(
+ 						       xiaomi_touch_of_match),
+ 				       } };
+@@ -1337,6 +1278,7 @@
+ }
+ 
+ MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Onyx Xiaomi touch framework");
+ 
+ module_init(xiaomi_touch_init);
+ module_exit(xiaomi_touch_exit);
+--- a/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_device.c
++++ b/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_device.c
+@@ -69,7 +69,7 @@
+ 	if (report_point_mmap_base != NULL) {
+ 		return;
+ 	}
+-	report_point_mmap_base = kzalloc_retry(PAGE_SIZE, 3);
++	report_point_mmap_base = alloc_pages_exact(PAGE_SIZE, GFP_KERNEL | __GFP_ZERO);
+ 	if (!report_point_mmap_base) {
+ 		LOG_ERROR("alloc report point mmap addr failed!");
+ 		return;
+@@ -80,20 +80,9 @@
+ 
+ static void report_point_mmap_addr_release(void)
+ {
+-	int i = 0;
+-	for (i = 0; i < MAX_TOUCH_PANEL_COUNT; i++) {
+-		if (input_devs[i] != NULL) {
+-			return;
+-		}
+-		if (stylus_input_devs[i] != NULL) {
+-			return;
+-		}
+-	}
+-	kzalloc_free(report_point_mmap_base);
+-	report_point_phy_base = 0;
+-	report_point_mmap_base = NULL;
+-	LOG_INFO("release report point mmap");
+-}
++	/* Exported PFNs and mapped report pages are retained until reboot. */
++}
++
+ 
+ dma_addr_t get_report_point_info_phy_addr(void)
+ {
+@@ -273,7 +262,7 @@
+ static struct input_dev *report_finger_event(s8 touch_id,
+ 					     hal_report_piont_t *report_point)
+ {
+-	static u16 finger_report_point_bitmap = 0;
++	static unsigned long finger_report_point_bitmap[MAX_TOUCH_PANEL_COUNT];
+ 	struct input_dev *input_dev = input_devs[touch_id];
+ 	if (input_dev == NULL) {
+ 		LOG_INFO("touch id %d input device is empty ,fail to report!",
+@@ -295,15 +284,15 @@
+ 		input_report_abs(input_dev, ABS_MT_TOUCH_MINOR,
+ 				 report_point->finger.prop[FINGER_MINOR]);
+ 		__set_bit(report_point->finger.prop[FINGER_SLOT],
+-			  (unsigned long *)&finger_report_point_bitmap);
++			  &finger_report_point_bitmap[touch_id]);
+ 	} else {
+ 		input_mt_slot(input_dev,
+ 			      report_point->finger.prop[FINGER_SLOT]);
+ 		input_mt_report_slot_state(input_dev, MT_TOOL_FINGER, 0);
+ 		__clear_bit(report_point->finger.prop[FINGER_SLOT],
+-			    (unsigned long *)&finger_report_point_bitmap);
+-	}
+-	if (finger_report_point_bitmap == 0) {
++			    &finger_report_point_bitmap[touch_id]);
++	}
++	if (finger_report_point_bitmap[touch_id] == 0) {
+ 		input_report_key(input_dev, BTN_TOUCH, 0);
+ 		input_report_key(input_dev, BTN_TOOL_FINGER, 0);
+ 	}
+@@ -354,11 +343,14 @@
+ 	hal_report_piont_t *event =
+ 		(hal_report_piont_t *)report_point_mmap_base;
+ 	int index = 0;
++	hal_report_piont_t point;
+ 
+ 	if (IS_TOUCH_ID_INVALID(touch_id)) {
+ 		LOG_ERROR("touch id %d is invalid", touch_id);
+ 		return -1;
+ 	}
++	if (event_count > PAGE_SIZE / sizeof(*event))
++		return -EINVAL;
+ 	if (event == NULL) {
+ 		LOG_ERROR("event memory is NULL");
+ 		return -1;
+@@ -366,15 +358,20 @@
+ 	mutex_lock(&ts_report_mutex[touch_id]);
+ 
+ 	for (index = 0; index < event_count; index++) {
+-		if (event[index].input_style == INPUT_STYLE_FINGER) {
++		memcpy(&point, &event[index], sizeof(point));
++		if (point.input_style == INPUT_STYLE_FINGER &&
++		    (point.finger.prop[FINGER_SLOT] < 0 ||
++		     point.finger.prop[FINGER_SLOT] >= MAX_TOUCH_ID))
++			continue;
++		if (point.input_style == INPUT_STYLE_FINGER) {
+ 			input_dev =
+-				report_finger_event(touch_id, &event[index]);
+-		} else if (event[index].input_style == INPUT_STYLE_STYLUS) {
++				report_finger_event(touch_id, &point);
++		} else if (point.input_style == INPUT_STYLE_STYLUS) {
+ 			stylus_input_dev =
+-				report_stylus_event(touch_id, &event[index]);
++				report_stylus_event(touch_id, &point);
+ 		} else {
+ 			LOG_ERROR("input style %d is invalid",
+-				  event[index].input_style);
++				  point.input_style);
+ 		}
+ 		cond_resched();
+ 	}
+--- a/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_evdev.c
++++ b/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_evdev.c
+@@ -199,7 +199,7 @@
+ 	return 0;
+ }
+ 
+-void event_stop(struct seq_file *m, void *v)
++static void event_stop(struct seq_file *m, void *v)
+ {
+ }
+ 
+@@ -408,8 +408,9 @@
+ 		return true;
+ 
+ 	xiaomi_touch->input_event_time_line_phy_base = 0;
+-	xiaomi_touch->input_event_time_line_mmap_base =
+-		kzalloc_retry(PAGE_SIZE * 45, 3);
++	if (!xiaomi_touch->input_event_time_line_mmap_base)
++		xiaomi_touch->input_event_time_line_mmap_base =
++			alloc_pages_exact(PAGE_SIZE * 45, GFP_KERNEL | __GFP_ZERO);
+ 	if (!xiaomi_touch->input_event_time_line_mmap_base) {
+ 		LOG_ERROR("alloc input event time line memory failed!");
+ 		return false;
+@@ -431,9 +432,7 @@
+ 	if (!input_event_time_line_base)
+ 		return;
+ 
+-	kzalloc_free(xiaomi_touch->input_event_time_line_mmap_base);
+ 	xiaomi_touch->input_event_time_line_phy_base = 0;
+-	xiaomi_touch->input_event_time_line_mmap_base = NULL;
+ 	input_event_time_line_base = NULL;
+ 	input_event_time_line_index = 0;
+ 	LOG_INFO("input event time line base release");
+@@ -446,6 +445,8 @@
+ 	LOG_ALWAYS("enter");
+ 	xiaomi_touch = _xiaomi_touch;
+ 	ret = input_register_handler(&xiaomitouch_input_handler);
++	if (ret)
++		return ret;
+ 	/* create last_touch_events */
+ 	if (!last_touch_events_pde) {
+ 		last_touch_events_pde =
+@@ -454,7 +455,8 @@
+ 		if (!last_touch_events_pde) {
+ 			LOG_ERROR(
+ 				"last_touch_events_proc create has error, exit!");
+-			return -1;
++			input_unregister_handler(&xiaomitouch_input_handler);
++			return -ENOMEM;
+ 		}
+ 		memset(&last_touch_events, 0, sizeof(struct last_touch_event));
+ 	}
+@@ -464,8 +466,8 @@
+ void xiaomi_touch_evdev_remove(void)
+ {
+ 	LOG_ERROR("enter");
++	input_unregister_handler(&xiaomitouch_input_handler);
+ 	release_input_event_timeline();
+-	input_unregister_handler(&xiaomitouch_input_handler);
+ 	if (last_touch_events_pde) {
+ 		proc_remove(last_touch_events_pde);
+ 		last_touch_events_pde = NULL;
+--- a/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_mode.c
++++ b/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_mode.c
+@@ -59,14 +59,14 @@
+ EXPORT_SYMBOL_GPL(resume_skip);
+ #endif
+ 
+-void driver_update_touch_mode(s8 touch_id, int _touch_mode[Touch_Mode_NUM],
++static void driver_update_touch_mode_locked(s8 touch_id, int _touch_mode[Touch_Mode_NUM],
+ 			      long update_mode_mask)
+ {
+ 	int i = 0;
+ 	xiaomi_touch_data_t *xiaomi_touch_data =
+ 		get_xiaomi_touch_data(touch_id);
+ 
+-	if (!xiaomi_touch_data) {
++	if (!xiaomi_touch_data || !xiaomi_touch_is_ready()) {
+ 		LOG_ERROR("xiaomi_touch_data is NULL");
+ 		return;
+ 	}
+@@ -91,6 +91,14 @@
+ 			   &switch_mode_work[touch_id]);
+ 		LOG_INFO("touch id %d ic switch mode", touch_id);
+ 	}
++}
++void driver_update_touch_mode(s8 touch_id, int modes[Touch_Mode_NUM], long mask)
++{
++	if (!down_read_trylock(&xiaomi_touch_access_lock))
++		return;
++	if (xiaomi_touch_is_ready())
++		driver_update_touch_mode_locked(touch_id, modes, mask);
++	up_read(&xiaomi_touch_access_lock);
+ }
+ EXPORT_SYMBOL_GPL(driver_update_touch_mode);
+ 
+@@ -724,6 +732,17 @@
+ 	return 0;
+ }
+ 
++void xiaomi_touch_mode_remove(s8 touch_id)
++{
++	cancel_work_sync(&switch_mode_work[touch_id]);
++	cancel_work_sync(&cmd_update_work[touch_id]);
++	cancel_work_sync(&grid_update_work[touch_id]);
++	if (cmd_update_wq) {
++		destroy_workqueue(cmd_update_wq);
++		cmd_update_wq = NULL;
++	}
++}
++
+ static void xiaomi_touch_set_mode_long_value(common_data_t *common_data)
+ {
+ 	int mode = common_data->mode;
+@@ -1081,6 +1100,9 @@
+ 				  copy_size);
+ 			return -1;
+ 		}
++
++		if (common_data.data_len > CMD_DATA_BUF_SIZE)
++			return -EINVAL;
+ 
+ 		if (client_private_data->touch_id != common_data.touch_id) {
+ 			LOG_ERROR(
+--- a/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_operations.c
++++ b/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_operations.c
+@@ -15,7 +15,7 @@
+ 
+ static xiaomi_touch_t *xiaomi_touch;
+ 
+-static int xiaomi_touch_dev_open(struct inode *inode, struct file *file)
++static int xiaomi_touch_dev_open_locked(struct inode *inode, struct file *file)
+ {
+ 	private_data_t *client_private_data =
+ 		kzalloc_retry(sizeof(private_data_t), 3);
+@@ -23,7 +23,8 @@
+ 		LOG_ERROR("alloc private memory failed!");
+ 		return -1;
+ 	}
+-	xiaomi_touch->use_count++;
++	INIT_LIST_HEAD(&client_private_data->node);
++	mutex_init(&client_private_data->io_lock);
+ 	client_private_data->touch_id = -1;
+ 
+ 	init_waitqueue_head(&client_private_data->poll_wait_queue_head);
+@@ -43,10 +44,10 @@
+ {
+ 	private_data_t *client_private_data = file->private_data;
+ 	xiaomi_touch_data_t *xiaomi_touch_data =
+-		get_xiaomi_touch_data(client_private_data->touch_id);
+-	if (!xiaomi_touch_data) {
++		IS_TOUCH_ID_INVALID(client_private_data->touch_id) ? NULL :
++		&xiaomi_touch->xiaomi_touch_data[client_private_data->touch_id];
++	if (!xiaomi_touch_data || !client_private_data->linked)
+ 		goto release_end;
+-	}
+ 
+ 	spin_lock(&xiaomi_touch_data->private_data_lock);
+ 	list_del_rcu(&client_private_data->node);
+@@ -54,7 +55,6 @@
+ 	synchronize_rcu();
+ 
+ release_end:
+-	xiaomi_touch->use_count--;
+ 	LOG_DEBUG(
+ 		"close xiaomi_touch sucess! private data is %p, open count %d",
+ 		client_private_data, xiaomi_touch->use_count);
+@@ -62,7 +62,7 @@
+ 	return 0;
+ }
+ 
+-static ssize_t xiaomi_touch_dev_read(struct file *file, char __user *buf,
++static ssize_t xiaomi_touch_dev_read_locked(struct file *file, char __user *buf,
+ 				     size_t count, loff_t *pos)
+ {
+ 	private_data_t *client_private_data = file->private_data;
+@@ -76,7 +76,7 @@
+ 	if (count != sizeof(common_data_t)) {
+ 		LOG_ERROR("error count %zu to read, need %lu", count,
+ 			  sizeof(common_data_t));
+-		return 0;
++		return -EINVAL;
+ 	}
+ 
+ 	mutex_lock(&xiaomi_touch_data->common_data_buf_lock);
+@@ -99,7 +99,7 @@
+ 	if (copy_size) {
+ 		LOG_ERROR("read common data hasn't complete! value %d",
+ 			  copy_size);
+-		count = -1;
++		count = -EFAULT;
+ 		goto read_common_data_end;
+ 	}
+ 
+@@ -115,22 +115,24 @@
+ 	return count;
+ }
+ 
+-static ssize_t xiaomi_touch_dev_write(struct file *file, const char __user *buf,
++static ssize_t xiaomi_touch_dev_write_locked(struct file *file, const char __user *buf,
+ 				      size_t count, loff_t *pos)
+ {
+ 	int copy_size = 0;
+-	static char temp_buf[1024];
++	char temp_buf[1024];
+ 
+ 	if (count >= 1024) {
+-		return count;
++		return -EMSGSIZE;
+ 	}
+ 	copy_size = copy_from_user(temp_buf, (void __user *)buf, count);
+ 	if (copy_size) {
+ 		LOG_ERROR("copy from user failed! copy size %d", copy_size);
+-		return count;
++		return -EFAULT;
+ 	}
+ 	if (count == 32 && !strncmp("thp_time", temp_buf, 8)) {
+-		s64 *time = (s64 *)&temp_buf[8];
++		s64 time[3];
++
++		memcpy(time, temp_buf + 8, sizeof(time));
+ 		add_input_event_timeline_before_event_time(1, time[2], time[0],
+ 							   time[1]);
+ 		/* LOG_INFO("frame count is %ld, time is %ld, %ld", time[2], time[0], time[1]); */
+@@ -152,10 +154,10 @@
+ 	return count;
+ }
+ 
+-static unsigned int xiaomi_touch_dev_poll(struct file *file, poll_table *wait)
++static unsigned int xiaomi_touch_dev_poll_locked(struct file *file, poll_table *wait)
+ {
+ 	static u32 poll_event = POLLPRI | POLLRDNORM | POLLRDBAND;
+-	u32 wait_event = wait->_key & poll_event;
++	u32 wait_event = poll_requested_events(wait) & poll_event;
+ 	unsigned int mask = 0;
+ 	private_data_t *client_private_data = file->private_data;
+ 	xiaomi_touch_data_t *xiaomi_touch_data =
+@@ -198,54 +200,49 @@
+ 	return mask;
+ }
+ 
+-static int xiaomi_touch_dev_mmap(struct file *file, struct vm_area_struct *vma)
++static int xiaomi_touch_dev_mmap_locked(struct file *file, struct vm_area_struct *vma)
+ {
+ 	private_data_t *client_private_data = file->private_data;
+-	unsigned long start = vma->vm_start;
+-	unsigned long size = vma->vm_end - vma->vm_start;
+-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
+-	unsigned long page;
+-	unsigned long pos;
+-	dma_addr_t temp_phy_bas = 0;
+-	xiaomi_touch_data_t *xiaomi_touch_data =
+-		get_xiaomi_touch_data(client_private_data->touch_id);
+-	if (!xiaomi_touch_data && client_private_data->mmap_area != 3) {
+-		LOG_ERROR("please select touch id first!");
+-		return -1;
+-	}
+-
+-	LOG_INFO("select mmap area %d", client_private_data->mmap_area);
+-	if (client_private_data->mmap_area == 1) {
+-		LOG_INFO("mmap frame data mmap");
+-		temp_phy_bas = xiaomi_touch_data->frame_data_mmap_phy_base;
+-	} else if (client_private_data->mmap_area == 2) {
+-		LOG_INFO("mmap raw data mmap");
+-		temp_phy_bas = xiaomi_touch_data->raw_data_mmap_phy_base;
+-	} else if (client_private_data->mmap_area == 3) {
+-		LOG_INFO("mmap input event buf mmap");
+-		temp_phy_bas = xiaomi_touch->input_event_time_line_phy_base;
+-	} else if (client_private_data->mmap_area == 4) {
+-		LOG_INFO("mmap report point buf mmap");
+-		temp_phy_bas = get_report_point_info_phy_addr();
+-	}
+-	if (!temp_phy_bas) {
+-		LOG_ERROR("phy bas is NULL, return!");
+-		return -1;
+-	}
+-	pos = (unsigned long)temp_phy_bas + offset;
+-	page = pos >> PAGE_SHIFT;
+-
+-	if (remap_pfn_range(vma, start, page, size, PAGE_SHARED)) {
+-		LOG_ERROR("remap_pfn_range %u, size:%ld failed\n",
+-			  (unsigned int)page, size);
+-		return -1;
+-	}
+-	LOG_INFO("remap_pfn_range %u, size:%ld, success\n", (unsigned int)page,
+-		 size);
+-	return 0;
+-}
+-
+-static long xiaomi_touch_dev_ioctl(struct file *file, unsigned int cmd,
++	xiaomi_touch_data_t *data = get_xiaomi_touch_data(client_private_data->touch_id);
++	unsigned long length = vma->vm_end - vma->vm_start;
++	unsigned long bytes = 0;
++	dma_addr_t physical = 0;
++
++	if (vma->vm_flags & VM_EXEC)
++		return -EPERM;
++	if (!data && client_private_data->mmap_area != 3)
++		return -ENODEV;
++	switch (client_private_data->mmap_area) {
++	case 1:
++		physical = data->frame_data_mmap_phy_base;
++		bytes = (unsigned long)data->frame_data_size * data->frame_data_buf_size;
++		break;
++	case 2:
++		physical = data->raw_data_mmap_phy_base;
++		bytes = (unsigned long)data->raw_data_size * data->raw_data_buf_size;
++		break;
++	case 3:
++		physical = xiaomi_touch->input_event_time_line_phy_base;
++		bytes = PAGE_SIZE * 45;
++		break;
++	case 4:
++		physical = get_report_point_info_phy_addr();
++		bytes = PAGE_SIZE;
++		break;
++	default:
++		return -EINVAL;
++	}
++	/* Compare pages before shifting an untrusted vm_pgoff. */
++	if (!physical || !length || vma->vm_pgoff >= (bytes >> PAGE_SHIFT) ||
++	    length > bytes - (vma->vm_pgoff << PAGE_SHIFT))
++		return -EINVAL;
++	vm_flags_clear(vma, VM_MAYEXEC);
++	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
++	return remap_pfn_range(vma, vma->vm_start,
++		(physical >> PAGE_SHIFT) + vma->vm_pgoff, length, vma->vm_page_prot);
++}
++
++static long xiaomi_touch_dev_ioctl_locked(struct file *file, unsigned int cmd,
+ 				   unsigned long arg)
+ {
+ 	private_data_t *client_private_data = file->private_data;
+@@ -315,11 +312,14 @@
+ 
+ 	case SELECT_MMAP_CMD:
+ 		LOG_INFO("select mmap area %lu", arg);
++		if (arg < 1 || arg > 4)
++			return -EINVAL;
+ 		client_private_data->mmap_area = arg;
+ 		return 0;
+ 	case UPDATE_REPORT_POINT:
+-		report_touch_event(client_private_data->touch_id, arg);
+-		return 0;
++		if (arg > U8_MAX)
++			return -EINVAL;
++		return report_touch_event(client_private_data->touch_id, arg);
+ 	case SELECT_TOUCH_ID:
+ 		if (client_private_data->touch_id < 0) {
+ 			if (IS_TOUCH_ID_INVALID(arg)) {
+@@ -350,6 +350,7 @@
+ 			list_add_tail_rcu(
+ 				&client_private_data->node,
+ 				&xiaomi_touch_data->private_data_list);
++			client_private_data->linked = true;
+ 			spin_unlock(&xiaomi_touch_data->private_data_lock);
+ 		} else {
+ 			LOG_WARNING("touch id has set, don't select again!");
+@@ -372,7 +373,7 @@
+ 			return copy_to_user(
+ 				(void __user *)arg,
+ 				&xiaomi_touch_driver_param->hardware_param,
+-				user_size);
++				user_size) ? -EFAULT : 0;
+ 		}
+ 		return -1;
+ 	case COMMON_DATA_CMD:
+@@ -384,6 +385,106 @@
+ 		return -EINVAL;
+ 	}
+ 	return -EINVAL;
++}
++
++static int xiaomi_touch_dev_open(struct inode *inode, struct file *file)
++{
++	int ret;
++
++	down_read(&xiaomi_touch_access_lock);
++	if (!xiaomi_touch_is_ready()) {
++		up_read(&xiaomi_touch_access_lock);
++		return -ENODEV;
++	}
++	ret = xiaomi_touch_dev_open_locked(inode, file);
++	up_read(&xiaomi_touch_access_lock);
++	return ret;
++}
++
++static ssize_t xiaomi_touch_dev_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
++{
++	ssize_t ret;
++	private_data_t *data = file->private_data;
++
++	down_read(&xiaomi_touch_access_lock);
++	if (!xiaomi_touch_is_ready()) {
++		up_read(&xiaomi_touch_access_lock);
++		return -ENODEV;
++	}
++	mutex_lock(&data->io_lock);
++	ret = xiaomi_touch_dev_read_locked(file, buf, count, pos);
++	mutex_unlock(&data->io_lock);
++	up_read(&xiaomi_touch_access_lock);
++	return ret;
++}
++
++static ssize_t xiaomi_touch_dev_write(struct file *file, const char __user *buf,
++				      size_t count, loff_t *pos)
++{
++	ssize_t ret;
++	private_data_t *data = file->private_data;
++
++	down_read(&xiaomi_touch_access_lock);
++	if (!xiaomi_touch_is_ready()) {
++		up_read(&xiaomi_touch_access_lock);
++		return -ENODEV;
++	}
++	mutex_lock(&data->io_lock);
++	ret = xiaomi_touch_dev_write_locked(file, buf, count, pos);
++	mutex_unlock(&data->io_lock);
++	up_read(&xiaomi_touch_access_lock);
++	return ret;
++}
++
++static unsigned int xiaomi_touch_dev_poll(struct file *file, poll_table *wait)
++{
++	unsigned int ret;
++	private_data_t *data = file->private_data;
++
++	down_read(&xiaomi_touch_access_lock);
++	if (!xiaomi_touch_is_ready()) {
++		up_read(&xiaomi_touch_access_lock);
++		return POLLERR | POLLHUP;
++	}
++	mutex_lock(&data->io_lock);
++	ret = xiaomi_touch_dev_poll_locked(file, wait);
++	mutex_unlock(&data->io_lock);
++	up_read(&xiaomi_touch_access_lock);
++	return ret;
++}
++
++static int xiaomi_touch_dev_mmap(struct file *file, struct vm_area_struct *vma)
++{
++	int ret;
++	private_data_t *data = file->private_data;
++
++	down_read(&xiaomi_touch_access_lock);
++	if (!xiaomi_touch_is_ready()) {
++		up_read(&xiaomi_touch_access_lock);
++		return -ENODEV;
++	}
++	mutex_lock(&data->io_lock);
++	ret = xiaomi_touch_dev_mmap_locked(file, vma);
++	mutex_unlock(&data->io_lock);
++	up_read(&xiaomi_touch_access_lock);
++	return ret;
++}
++
++static long xiaomi_touch_dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	long ret;
++	private_data_t *data = file->private_data;
++
++	down_read(&xiaomi_touch_access_lock);
++	if (!xiaomi_touch_is_ready()) {
++		up_read(&xiaomi_touch_access_lock);
++		return -ENODEV;
++	}
++	mutex_lock(&data->io_lock);
++	ret = xiaomi_touch_dev_ioctl_locked(file, cmd, arg);
++	mutex_unlock(&data->io_lock);
++	up_read(&xiaomi_touch_access_lock);
++	return ret;
+ }
+ 
+ static const struct file_operations xiaomitouch_dev_fops = {
+@@ -396,7 +497,6 @@
+ 	.unlocked_ioctl = xiaomi_touch_dev_ioctl,
+ 	.compat_ioctl = xiaomi_touch_dev_ioctl,
+ 	.release = xiaomi_touch_dev_release,
+-	.llseek = no_llseek,
+ };
+ 
+ static struct miscdevice misc_dev = {
+@@ -413,8 +513,8 @@
+ 		LOG_ERROR("xiaomi touch is NULL, return!");
+ 		return -1;
+ 	}
++	xiaomi_touch = temp_xiaomi_touch;
+ 	ret = misc_register(&misc_dev);
+-	xiaomi_touch = temp_xiaomi_touch;
+ 	if (ret)
+ 		LOG_ERROR("create misc device err:%d\n", ret);
+ 	return ret;
+--- a/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_proc.c
++++ b/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_proc.c
+@@ -137,6 +137,8 @@
+ 	if (IS_TOUCH_ID_INVALID(touch_id))
+ 		return -EFAULT;
+ 
++	if (*pos < 0)
++		return -EINVAL;
+ 	LOG_DEBUG("*pos is %lld", *pos);
+ 	if (*pos && *pos >= xiaomi_touch_proc_data->tp_proc_result_length) {
+ 		return 0;
+@@ -272,7 +274,7 @@
+ 				 .driver_version);
+ 		LOG_INFO("xiaomi-touch version is %s", XIAOMI_TOUCH_VERSION);
+ 	} else if (!strncmp("tp_selftest", name, 11)) {
+-		static char self_test_cmd[64];
++		char self_test_cmd[64];
+ 		size_t temp_count = count;
+ 		memset(self_test_cmd, 0, 64);
+ 		if (temp_count >= 64) {
+@@ -370,6 +372,10 @@
+ 	tp_pde[touch_id][3] = create_proc_node(proc_name, &proc_tp_ops,
+ 					       xiaomi_touch_driver_param);
+ 
++	for (touch_id = 0; touch_id < PROC_COUNT_FOR_PANEL; touch_id++) {
++		if (!tp_pde[xiaomi_touch_driver_param->touch_id][touch_id])
++			return -ENOMEM;
++	}
+ 	return 0;
+ }
+ 
+--- a/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_sys.c
++++ b/qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_sys.c
+@@ -62,15 +62,32 @@
+ static common_data_t thp_ic_cmd_data_common_data;
+ static int vendor_input = 1;
+ 
+-#define CREATE_ATTR(name, show_func, store_func)                             \
+-	static ssize_t show_##name(struct device *dev,                       \
+-				   struct device_attribute *attr, char *buf) \
+-		show_func static ssize_t store_##name(                       \
+-			struct device *dev, struct device_attribute *attr,   \
+-			const char *buf, size_t count)                       \
+-			store_func static DEVICE_ATTR(                       \
+-				name, (S_IRUGO | S_IWUSR | S_IWGRP),         \
+-				show_##name, store_##name);
++#define CREATE_ATTR(name, show_func, store_func) \
++	static ssize_t impl_show_##name(struct device *dev, \
++		struct device_attribute *attr, char *buf) show_func \
++	static ssize_t impl_store_##name(struct device *dev, \
++		struct device_attribute *attr, const char *buf, size_t count) store_func \
++	static ssize_t show_##name(struct device *dev, \
++		struct device_attribute *attr, char *buf) \
++	{ \
++		ssize_t ret = -ENODEV; \
++		down_read(&xiaomi_touch_access_lock); \
++		if (xiaomi_touch_is_ready() && get_xiaomi_touch_driver_param(TOUCH_ID)) \
++			ret = impl_show_##name(dev, attr, buf); \
++		up_read(&xiaomi_touch_access_lock); \
++		return ret; \
++	} \
++	static ssize_t store_##name(struct device *dev, \
++		struct device_attribute *attr, const char *buf, size_t count) \
++	{ \
++		ssize_t ret = -ENODEV; \
++		down_read(&xiaomi_touch_access_lock); \
++		if (xiaomi_touch_is_ready() && get_xiaomi_touch_driver_param(TOUCH_ID)) \
++			ret = impl_store_##name(dev, attr, buf, count); \
++		up_read(&xiaomi_touch_access_lock); \
++		return ret; \
++	} \
++	static DEVICE_ATTR(name, 0664, show_##name, store_##name)
+ 
+ static int analy_poll_data(char *poll_data_buf, char *buf)
+ {
+@@ -78,7 +95,8 @@
+ 	xiaomi_touch_data_t *xiaomi_touch_data =
+ 		get_xiaomi_touch_data(TOUCH_ID);
+ 
+-	if (!poll_data_buf || !buf)
++	if (!poll_data_buf || !buf || !xiaomi_touch_data ||
++	    !xiaomi_touch_data->poll_data)
+ 		return -1;
+ 	memset(buf, 0x00, PAGE_SIZE);
+ 	memcpy((char *)xiaomi_touch_data->poll_data, poll_data_buf,
+@@ -554,6 +572,10 @@
+ 
+ 		memset(input, 0x00, sizeof(int) * CMD_DATA_BUF_SIZE);
+ 		strbuf = (unsigned char *)kzalloc(count + 1, GFP_KERNEL);
++		if (!strbuf) {
++			mutex_unlock(&thp_ic_mutex);
++			return -ENOMEM;
++		}
+ 		memcpy(strbuf, buf, count);
+ 		strbuf[count] = '\0';
+ 
+@@ -573,6 +595,15 @@
+ 			}
+ 		}
+ 		para_cnt = i;
++		if (para_cnt < 4 || para_cnt > CMD_DATA_BUF_SIZE ||
++		    input[para_cnt - 1] < 0 ||
++		    input[para_cnt - 1] >
++		    sizeof(thp_ic_cmd_data_common_data.data_buf) - sizeof(s32) ||
++		    !xiaomi_touch_driver_param) {
++			kfree(strbuf);
++			mutex_unlock(&thp_ic_mutex);
++			return -EINVAL;
++		}
+ 		for (i = 0; i < para_cnt; ++i) {
+ 			LOG_DEBUG("input[%d] = 0x%x", i, input[i]);
+ 		}
+@@ -583,14 +614,16 @@
+ 		if (input[0] != SET_THP_IC_CUR_VALUE &&
+ 		    input[0] != GET_THP_IC_CUR_VALUE) {
+ 			LOG_ERROR("unsupport cmd!!");
++			kfree(strbuf);
+ 			mutex_unlock(&thp_ic_mutex);
+-			return -1;
++			return -EINVAL;
+ 		}
+ 
+ 		if (para_cnt < 4 || para_cnt > CMD_DATA_BUF_SIZE) {
+ 			LOG_ERROR("input format is error!!");
++			kfree(strbuf);
+ 			mutex_unlock(&thp_ic_mutex);
+-			return -1;
++			return -EINVAL;
+ 		}
+ 
+ 		memset(&thp_ic_cmd_data_common_data, 0x00,
+@@ -671,6 +704,9 @@
+ 			(char *)&thp_ic_cmd_data_common_data.data_buf[1];
+ 		u16 data_len = thp_ic_cmd_data_common_data.data_len;
+ 
++		if (data_len > sizeof(thp_ic_cmd_data_common_data.data_buf) - sizeof(s32))
++			return -EINVAL;
++
+ 		LOG_INFO("mode:%d, cmd:%d\n", mode,
+ 			 thp_ic_cmd_data_common_data.cmd);
+ 
+@@ -705,7 +741,7 @@
+ 		return count;
+ 	},
+ 	{
+-		if (count > MAX_BUF_SIZE) {
++		if (count > sizeof(thp_ic_cmd_data_common_data)) {
+ 			LOG_ERROR("%s memory out of range:%d\n", __func__,
+ 				  (int)count);
+ 			return count;
+@@ -860,24 +896,37 @@
+ 	LOG_ALWAYS("enter");
+ 	xiaomi_touch_class = class_create("touch");
+ 
+-	if (!xiaomi_touch_class) {
++	if (IS_ERR(xiaomi_touch_class)) {
++		ret = PTR_ERR(xiaomi_touch_class);
++		xiaomi_touch_class = NULL;
+ 		LOG_ERROR("create device class err");
+-		return -1;
++		return ret;
+ 	}
+ 
+ 	xiaomi_touch_dev =
+ 		device_create(xiaomi_touch_class, NULL, 'T', NULL, "touch_dev");
+-	if (!xiaomi_touch_dev) {
++	if (IS_ERR(xiaomi_touch_dev)) {
++		ret = PTR_ERR(xiaomi_touch_dev);
++		xiaomi_touch_dev = NULL;
++		class_destroy(xiaomi_touch_class);
++		xiaomi_touch_class = NULL;
+ 		LOG_ERROR("create device dev err");
+-		return -1;
++		return ret;
+ 	}
+ 
+ 	xiaomi_touch_attrs.attrs = touch_attr_group;
+ 	ret = sysfs_create_group(&xiaomi_touch_dev->kobj, &xiaomi_touch_attrs);
+ 	if (ret)
+-		LOG_ERROR("ERROR: Cannot create sysfs structure!:%d", ret);
++		xiaomi_touch_sys_remove();
+ 
+ 	return ret;
++}
++
++static bool sys_pinned;
++
++void xiaomi_touch_sys_pin(void)
++{
++	sys_pinned = true;
+ }
+ 
+ int xiaomi_touch_sys_remove(void)
+@@ -885,6 +934,8 @@
+ 	if (xiaomi_touch_dev) {
+ 		sysfs_remove_group(&xiaomi_touch_dev->kobj,
+ 				   &xiaomi_touch_attrs);
++		if (sys_pinned)
++			return 0;
+ 		device_destroy(xiaomi_touch_class, 'T');
+ 		xiaomi_touch_dev = NULL;
+ 	}

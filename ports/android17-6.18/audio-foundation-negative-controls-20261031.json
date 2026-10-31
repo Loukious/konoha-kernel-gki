@@ -1,0 +1,67 @@
+{
+  "tests": {
+    "snd:lifecycle": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "snd: /tmp/onyx-audio-foundation-tests-0jzekw_d/snd.c:594: lifecycle: Assertion `snd_event_client_register(&clients[0],&ops,NULL)==-EALREADY' failed."
+    },
+    "snd:partial": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "/tmp/onyx-audio-foundation-tests-0jzekw_d/snd.c:328:19: runtime error: member access within null pointer of type 'struct snd_event_client'\n"
+    },
+    "snd:stale": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "==3526318==ERROR: AddressSanitizer: heap-use-after-free on address 0x7923153e0060 at pc 0x55cc45eb798b bp 0x7ffd468a51e0 sp 0x7ffd468a51d0"
+    },
+    "snd:detach": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "snd: /tmp/onyx-audio-foundation-tests-0jzekw_d/snd.c:651: detach: Assertion `master->clients_found' failed."
+    },
+    "snd:faults": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "snd: /tmp/onyx-audio-foundation-tests-0jzekw_d/snd.c:623: faults: Assertion `!atomic_load(&live)' failed."
+    },
+    "snd:races": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "snd: /tmp/onyx-audio-foundation-tests-0jzekw_d/snd.c:681: races: Assertion `(req[0].result==0&&req[1].result==-EALREADY)||(req[1].result==0&&req[0].result==-EALREADY)' failed."
+    },
+    "snd:nulls": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "snd: /tmp/onyx-audio-foundation-tests-0jzekw_d/snd.c:694: main: Assertion `snd_event_client_register(&clients[0],NULL,NULL)==-EINVAL' failed."
+    },
+    "pdr:faults": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "pdr: /tmp/onyx-audio-foundation-tests-0jzekw_d/pdr.c:89: main: Assertion `IS_ERR(p)&&!live&&!audio_pdr_services[0].pdr_handle' failed."
+    },
+    "pdr:lifecycle": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "pdr: /tmp/onyx-audio-foundation-tests-0jzekw_d/pdr.c:96: main: Assertion `IS_ERR(audio_pdr_service_register(0,callback))&&live==1' failed."
+    },
+    "pdr:bounds": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "pdr: /tmp/onyx-audio-foundation-tests-0jzekw_d/pdr.c:25: pdr_handle_alloc: Assertion `cb' failed."
+    }
+  },
+  "source_sha256": {
+    "qcom/opensource/audio-kernel/soc/snd_event.c": "f6d67165d1a1d204b0162d63d8b3a23353860e5175e461489beb8c78eef2fa00",
+    "qcom/opensource/audio-kernel/dsp/audio_pdr.c": "8e52cde786bee7176f06170eef15b8b3995e70e9d83584af2eb0e04ce8664f96"
+  },
+  "harness_sha256": {
+    "audio_foundation_snd.c": "932f37ea0a64f52c86971ed16e8327be6b381a977a824fbbf0730c428725c16b",
+    "audio_foundation_pdr.c": "c99e45da2b231773c4f89353143ff20c2d7b11d2cf6b300d317d0d53bcffd1ff"
+  },
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Actual source bodies run against simulated allocators, devices and PDR services. Includes a two-thread master registration race; no real kernel PDR callbacks, sound firmware, IRQ, suspend/resume or hardware validation."
+}

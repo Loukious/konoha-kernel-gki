@@ -2605,6 +2605,95 @@ ddk_module(
 )
 
 
+ddk_headers(
+    name = "audio_foundation_headers",
+    hdrs = ["qcom/opensource/audio-kernel/config/sunautoconf.h", "qcom/opensource/audio-kernel/dsp/audio_pdr.h", "qcom/opensource/audio-kernel/dsp/q6_init.h", "qcom/opensource/audio-kernel/include/dsp/msm-audio-event-notify.h", "qcom/opensource/audio-kernel/include/soc/snd_event.h"],
+    includes = ["qcom/opensource/audio-kernel/include", "qcom/opensource/audio-kernel/include/uapi/audio", "qcom/opensource/audio-kernel/dsp"],
+)
+
+ddk_module(
+    name = "snd_event_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/soc/snd_event.c", "qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "snd_event_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_foundation_headers"],
+    copts = ["-include", "$(location qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "q6_pdr_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/dsp/audio_pdr.c", "qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "q6_pdr_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_foundation_headers", ":remote_headers", ":pdr_interface"],
+    copts = ["-include", "$(location qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "q6_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/dsp/msm-audio-event-notify.c", "qcom/opensource/audio-kernel/dsp/q6_init.c", "qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "q6_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_foundation_headers"],
+    copts = ["-include", "$(location qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+
+ddk_headers(
+    name = "audio_notifier_headers",
+    hdrs = ["qcom/opensource/audio-kernel/dsp/audio_ssr.h", "qcom/opensource/audio-kernel/include/dsp/audio_notifier.h"],
+    includes = ["qcom/opensource/audio-kernel/include", "qcom/opensource/audio-kernel/dsp"],
+)
+
+ddk_module(
+    name = "q6_notifier_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/dsp/audio_notifier.c", "qcom/opensource/audio-kernel/dsp/audio_ssr.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "q6_notifier_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_notifier_headers", ":audio_foundation_headers", ":q6_pdr_dlkm", ":remote_headers", ":rproc_qcom_common"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_headers(
+    name = "touch_headers",
+    hdrs = ["qcom/opensource/touch-drivers/include/uapi/touch/xiaomi_touch.h", "qcom/opensource/touch-drivers/nt36532/nt36xxx.h", "qcom/opensource/touch-drivers/nt36532/nt36xxx_mem_map.h", "qcom/opensource/touch-drivers/nt36532/nt36xxx_mp_ctrlram.h", "qcom/opensource/touch-drivers/xiaomi/xiaomi_touch.h", "qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_type_common.h"],
+    includes = ["qcom/opensource/touch-drivers/include/uapi"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "xiaomi_touch",
+    srcs = ["qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_core.c", "qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_knock_data.c", "qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_proc.c", "qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_operations.c", "qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_sys.c", "qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_mode.c", "qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_evdev.c", "qcom/opensource/touch-drivers/xiaomi/xiaomi_touch_device.c"],
+    out = "xiaomi_touch.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    copts = ["-DTOUCH_THP_SUPPORT=1", "-DTOUCH_IS_TDDI", "-DTOUCH_FOD_SUPPORT", "-DCONFIG_TOUCHSCREEN_NVT_DEBUG_FS"],
+    deps = [":touch_headers", ":input_headers", ":platform_headers", ":miev", ":smartcharge_headers", ":panel_event_notifier"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "nt36532_touch",
+    srcs = ["qcom/opensource/touch-drivers/nt36532/nt36xxx.c", "qcom/opensource/touch-drivers/nt36532/nt36xxx_fw_update.c", "qcom/opensource/touch-drivers/nt36532/nt36xxx_ext_proc.c", "qcom/opensource/touch-drivers/nt36532/nt36xxx_mp_ctrlram.c"],
+    out = "nt36532_touch.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    copts = ["-DTOUCH_THP_SUPPORT=1", "-DTOUCH_IS_TDDI", "-DTOUCH_FOD_SUPPORT", "-DCONFIG_TOUCHSCREEN_NVT_DEBUG_FS"],
+    deps = [":touch_headers", ":input_headers", ":platform_headers", ":miev", ":smartcharge_headers", ":panel_event_notifier", ":xiaomi_touch", ":msm_drm"],
+    visibility = ["//visibility:public"],
+)
+
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -2800,6 +2889,12 @@ kernel_module_group(
         ":mca_strategy_fg_comp",
         ":mca_buckchg_jeita",
         ":mca_strategy_quickchg",
+        ":snd_event_dlkm",
+        ":q6_pdr_dlkm",
+        ":q6_dlkm",
+        ":q6_notifier_dlkm",
+        ":xiaomi_touch",
+        ":nt36532_touch",
     ],
 )
 
