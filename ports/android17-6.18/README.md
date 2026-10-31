@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 107 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 108 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 107 platform `.ko` files, their symbol tables and DDK configurations.
+- 108 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 4647
-imported symbol CRCs across all 107 modules.
+used. The current [validation report](validation-20261031.json) checks 4957
+imported symbol CRCs across all 108 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -324,13 +324,12 @@ changes are captured for later porting; they are not in this initial group.
 
 ## Next implementation gates
 
-1. Complete the remaining first-stage dependencies, including WALT scheduling
-   and CPU thermal controls.
+1. Complete the remaining first-stage dependencies, including CPU thermal controls.
    Test UFS/encryption, probe ordering, GPIO wakeups, SCM wait queues and
    shared-memory operations.
 2. Port the device trees and remaining first-stage list; produce matching
    vendor_boot, DTBO and DLKM images with complete dependency/load lists.
-3. Port the scheduler, KGSL/display, thermal, audio, camera, touch,
+3. Validate WALT scheduling and port KGSL/display, thermal, audio, camera, touch,
    fingerprint, WLAN and other device modules. The hook mismatches in the
    [feasibility study](../../Documentation/konoha/android17-6.18-feasibility.md)
    still need semantic fixes.
@@ -557,3 +556,37 @@ AddressSanitizer and UndefinedBehaviorSanitizer. The
 [recorded result](xiaomi-diagnostics-validation-20261031.json) covers host data
 paths; module lifecycle, tracepoints and phone operation remain untested. The
 patch passes checkpatch and the full platform build without warnings.
+
+
+The scheduler group adds `sched-walt` and reconnects UFS storage boosting.
+Task data uses GKI's dynamic task allocation, including the special `init_task`
+pad, rather than the six inline vendor words in 6.18. **Boot images must include
+`android_arch_task_struct_size=512` in the kernel command line.** Module loading
+checks the allocator's actual size through the read-only debug-symbol service
+before installing hooks. The module rejects CPU maps beyond its eight-CPU
+storage. Minidump reads WALT task data only after scheduler initialization.
+
+Capacity accounting mirrors current hardware and cpufreq pressure while
+preserving WALT's internal frequency caps. Delayed CFS entities are excluded
+from runnable accounting; fair task replacement leaves entity transitions to
+6.18 core code and rejects delayed or throttled candidates. MVP runtime uses
+the scheduling donor, and proxy RT migrations retain the core's selection.
+Binder boosts restore only when the transaction actually inherited a boost.
+
+Hook errors keep the scheduler disabled. Top-task buffers are allocated before
+`stop_machine`, topology/counter waits are bounded, and counter drivers start
+after cluster discovery. Counter reads use modular subtraction at wraparound;
+removal drains readers before register mappings disappear. Sysctl registration
+uses const counted tables, removes the obsolete null sentinel and unwinds
+partial failures. Input-boost setup releases policy references and unwinds QoS
+requests on failure. Restricted scheduler hooks cannot be unregistered, so the
+module remains resident, including on asynchronous initialization failure.
+
+`verify_walt.py WORKSPACE` tests actual staged helpers under AddressSanitizer
+and UndefinedBehaviorSanitizer: 4,097 task-storage cases, 11,023,650 capacity
+cases, 531,441 utilization-clamp cases, 1,000,006 counter updates and 42 sysctl
+registration/failure cases. The [recorded result](walt-validation-20261031.json)
+does not exercise the full scheduler, hardware counters, CPU hotplug or phone
+boot. Checkpatch and the 108-module build pass without warnings, with 4,957
+imported-symbol CRCs verified. WALT behavior and thermal coordination still
+require device testing before release.

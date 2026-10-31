@@ -618,7 +618,7 @@ ddk_module(
     kconfig = "Kconfig",
     defconfig = "platform_defconfig",
     kernel_build = "//common:kernel_aarch64",
-    deps = [":minidump", ":ufs_headers", ":storage_pmic_headers", ":platform_headers", ":scm_headers", ":clock_headers", ":phy_qcom_ufs", ":clk_qcom", ":qcom_ipc_logging", ":qcom_ice", ":ufshcd_crypto_qti"],
+    deps = [":walt_headers", ":sched_walt", ":minidump", ":ufs_headers", ":storage_pmic_headers", ":platform_headers", ":scm_headers", ":clock_headers", ":phy_qcom_ufs", ":clk_qcom", ":qcom_ipc_logging", ":qcom_ice", ":ufshcd_crypto_qti"],
 )
 
 ddk_headers(
@@ -1192,7 +1192,7 @@ ddk_module(
     kconfig = "Kconfig",
     defconfig = "platform_defconfig",
     kernel_build = "//common:kernel_aarch64",
-    deps = [":scm_headers", ":minidump_headers", ":debug_symbol", ":debug_symbol_headers", ":gunyah_headers", ":mem_buf_headers", ":gh_rm_drv", ":smem", ":qcom_dma_heaps"],
+    deps = [":sched_walt", ":scm_headers", ":minidump_headers", ":debug_symbol", ":debug_symbol_headers", ":gunyah_headers", ":mem_buf_headers", ":gh_rm_drv", ":smem", ":qcom_dma_heaps"],
 )
 
 ddk_module(
@@ -1399,6 +1399,23 @@ ddk_module(
     kernel_build = "//common:kernel_aarch64",
 )
 
+ddk_headers(
+    name = "walt_headers",
+    hdrs = ["kernel/sched/pelt.h", "kernel/sched/sched-pelt.h", "kernel/sched/walt/perf_trace_counters.h", "kernel/sched/walt/walt.h", "kernel/sched/walt/trace.h", "kernel/sched/walt/walt_debug.h", "kernel/sched/walt/preemptirq_long.h", "fs/proc/internal.h", "kernel/locking/mutex.h", "drivers/android/binder_internal.h", "drivers/android/binder_alloc.h", "drivers/android/binder_trace.h", "drivers/android/dbitmap.h", "include/linux/sched/walt.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "sched_walt",
+    srcs = ["kernel/sched/walt/walt.c", "kernel/sched/walt/boost.c", "kernel/sched/walt/sched_avg.c", "kernel/sched/walt/walt_halt.c", "kernel/sched/walt/core_ctl.c", "kernel/sched/walt/trace.c", "kernel/sched/walt/input-boost.c", "kernel/sched/walt/sysctl.c", "kernel/sched/walt/cpufreq_walt.c", "kernel/sched/walt/fixup.c", "kernel/sched/walt/walt_lb.c", "kernel/sched/walt/walt_rt.c", "kernel/sched/walt/walt_cfs.c", "kernel/sched/walt/walt_tp.c", "kernel/sched/walt/walt_config.c", "kernel/sched/walt/walt_cpufreq_cycle_cntr_driver.c", "kernel/sched/walt/walt_gclk_cycle_counter_driver.c", "kernel/sched/walt/walt_cycles.c", "kernel/sched/walt/debugfs.c", "kernel/sched/walt/pipeline.c", "kernel/sched/walt/smart_freq.c", "kernel/sched/walt/mvp_locking.c", "kernel/sched/walt/walt_storage_lb.c"],
+    includes = ["kernel/sched/walt"],
+    out = "sched-walt.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":walt_headers", ":minidump_headers", ":soc_headers", ":socinfo", ":qcom_cpufreq_hw", ":debug_symbol", ":debug_symbol_headers"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1493,6 +1510,7 @@ kernel_module_group(
         ":qcom_dload_mode",
         ":miev",
         ":boottime",
+        ":sched_walt",
         ":nvmem_qfprom",
         ":qcom_cpufreq_thermal",
         ":qcom_cpufreq_hw",
