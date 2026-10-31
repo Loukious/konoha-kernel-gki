@@ -1,0 +1,51 @@
+{
+  "modules": {
+    "main": {
+      "path": "/home/loukious/Android/custom-rom/kernel/xiaomi/sm8735-modules/qcom/opensource/wlan/qcacld-3.0/qca_cld3_wcn7750.ko",
+      "sha256": "03245100c14deff62bb370511bd7f85ffa67059b44e8aada4d48dd50f0dabee6",
+      "depends": "cfg80211,cnss_utils,cnss_nl,cnss_prealloc,qcom_iommu_util,sched-walt,qcom_va_minidump,hwid,rproc_qcom_common,qmi_helpers,icnss2",
+      "pci_pcie_mhi_imports": [
+        "0xdc645d78\tpci_read_config_word",
+        "0xdbea0dac\tpci_write_config_word",
+        "0xfc672d39\tpci_read_config_dword",
+        "0xa0628436\tpci_write_config_dword"
+      ]
+    },
+    "icnss2": {
+      "path": "/home/loukious/Android/custom-rom/out/target/product/onyx/vendor_dlkm/lib/modules/icnss2.ko",
+      "sha256": "0b059354548cd23089aa2b05ec2e8a6575fe37835b151f896ca3fba42fccc496",
+      "depends": "qcom_ipc_logging,qcom_ramdump,socinfo,pdr_interface,cnss_prealloc,rproc_qcom_common,qcom_iommu_util,pinctrl-msm,qcom_aoss,wlan_firmware_service,qmi_helpers",
+      "pci_pcie_mhi_imports": []
+    }
+  },
+  "selected_route": {
+    "qca-wifi-host-cmn/hif/src/ipcie/if_ipci.c": {
+      "sha256": "0a5070c214932041bafa5cf92d4d5034ffa3e79613a54c6822aed8738260498c",
+      "pci_pcie_mhi_calls": []
+    },
+    "qcacld-3.0/core/pld/src/pld_ipci.c": {
+      "sha256": "75eb421608b591d3eeedce4767e8728df1dba58a0aa19047688348fc466082de",
+      "pci_pcie_mhi_calls": []
+    },
+    "qcacld-3.0/core/pld/src/pld_ipci.h": {
+      "sha256": "e9c46baf161169a39a0cd56aceeb50deeb18c042cefa7be12b5079cb7eb6c98a",
+      "pci_pcie_mhi_calls": []
+    },
+    "platform/icnss2/main.c": {
+      "sha256": "1f3f328b8799bf2bbe508526635c71218fadf01aa8fc9ed347afa181b356f3bd",
+      "pci_pcie_mhi_calls": []
+    }
+  },
+  "shared_pci_helpers": {
+    "source": "qcacld-3.0/core/pld/src/pld_common.c",
+    "sha256": "5ccd073fc1b796585400524f4a8202832d6d3852c83f61fbf6befb8c22802426",
+    "lines": [
+      2006,
+      2033,
+      2059,
+      2085
+    ],
+    "behavior": "Each shared helper calls Linux PCI config APIs only for PLD_BUS_TYPE_PCIE. PLD_BUS_TYPE_IPCI explicitly breaks without calling them. pld_common.c is linked, so references remain in the native module."
+  },
+  "conclusion": "HIF_IPCI selects the integrated ICNSS2 platform route. Native main WLAN does require four generic PCI core symbols for this exact linked composition. These symbols and the IPCI name do not establish a runtime requirement for the standard PCIe root driver or Linux MHI controller; selected IPCI/ICNSS2 sources register platform callbacks and map firmware/DT MMIO."
+}

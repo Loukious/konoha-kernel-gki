@@ -1506,3 +1506,20 @@ ROM module build coverage is 242/466 (51.9%), leaving 224 names to
 assess or port, including alternative hardware. ICNSS2/main WLAN, remaining
 Bluetooth/audio, camera/video, device interfaces and image/installer work remain.
 No flashable 6.18 ZIP or phone validation exists yet.
+
+
+## Main WLAN source inventory
+
+The [native WLAN discovery](discovery/wlan-main-20261031/REPORT.md) records all
+813 linked objects, canonical source/header pins, per-object feature options and
+6.18 API changes. Monitor, frame injection and CFR remain selected from the
+custom source pin. This is preparation; the main WLAN driver has not yet been
+built for 6.18. Two current ROM direct-buffer RX files contain additional bounds
+checks absent from that pin and require a separately recorded port patch.
+
+The native module links four PCI core configuration helpers through shared PLD
+code. Its IPCI branches skip those calls; ICNSS2 itself imports no PCI/MHI
+helpers. Keep the distinction between those link-time PCI core references and a
+runtime requirement for a standard PCIe root or MHI host driver. The source
+inventory does not establish that runtime requirement or authorize removing
+other ROM-listed hardware support.
