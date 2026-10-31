@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 189 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 190 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 189 platform `.ko` files, their symbol tables and DDK configurations.
+- 190 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -1015,3 +1015,29 @@ unchanged. These tests mock kernel services; firmware, Type-C/DP electrical
 behavior and phone operation remain untested.
 
 The combined 189-module archive `artifacts/20261031T120312428524Z` passes 9,242 imported-symbol CRC checks with no compiler/modpost warnings. Device-tree checks pass with 1,084 existing vendor DTC warnings. ROM module build coverage is 188/466 (40.3%), leaving 278 names to assess or port. No flashable 6.18 ZIP exists.
+
+
+## Virtual-address minidump
+
+`qcom_va_minidump.ko` retains its coherent DMA pool until removal, publishes
+readiness after resources and panic hooks initialize, and balances subsystem
+kobject references. Panic collection rejects wrapped or overlapping ranges,
+checks ELF sizing before writes, accepts a fitting prefix, and uses nofault
+copies for direct-memory regions. Collection is restricted to its panic CPU
+and phase; a published dump is not rewritten. Unregister drains both panic
+phases. Failed firmware-region withdrawal retains the advertised buffer and
+rejects rebinding.
+
+[Integrated host validation](vamd-validation-20261031.json) passes 16,384 range
+cases, 24,576 decoded ELF geometries, seven panic-phase cases, eight probe
+failure stages and five registration failure stages under ASan/UBSan. Exact
+Git-blob replay preserves the existing public and private headers. These checks
+mock DMA, kobjects, notifiers, RCU and firmware; live panic capture and firmware
+dump extraction remain untested. KGSL now explicitly depends on this provider
+when the minidump configuration enables its VA callbacks.
+
+The combined 190-module archive `artifacts/20261031T122433629874Z` passes
+9,304 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
+checks pass with 1,084 existing vendor DTC warnings. ROM module build coverage
+is 189/466 (40.6%), leaving 277 names to assess or port. No flashable 6.18 ZIP
+exists.

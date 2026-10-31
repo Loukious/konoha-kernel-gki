@@ -2328,7 +2328,7 @@ ddk_module(
     kconfig = "Kconfig",
     defconfig = "platform_defconfig",
     kernel_build = "//common:kernel_aarch64",
-    deps = [":gpu_stack_headers", "//onyx:perf_headers", "//onyx:scm_headers", "//onyx:platform_headers", "//onyx:soc_headers", "//onyx:clock_headers", "//onyx:gunyah_headers", "//onyx:loader_headers", "//onyx:iommu_headers", "//onyx:smmu_headers", "//onyx:cache_irq_headers", "//onyx:mailbox_headers", "//onyx:mem_buf_headers", "//onyx:dcvs_headers", "//onyx:minidump_headers", "//onyx:remote_headers", "//onyx:msm_sysstats", "//onyx:msm_performance", "//onyx:mem_buf_dev", "//onyx:qcom_iommu_util", "//onyx:qcom_q6v5_pas", "//onyx:clk_qcom", "//onyx:qcom_dcvs", "//onyx:secure_buffer", "//onyx:qcom_scm", "//onyx:mdt_loader", "//onyx:minidump", ":synx_driver", "//onyx:socinfo", "//onyx:llcc_qcom", "//onyx:cmd_db", "//onyx:qcom_aoss"],
+    deps = [":qcom_va_minidump", ":gpu_stack_headers", "//onyx:perf_headers", "//onyx:scm_headers", "//onyx:platform_headers", "//onyx:soc_headers", "//onyx:clock_headers", "//onyx:gunyah_headers", "//onyx:loader_headers", "//onyx:iommu_headers", "//onyx:smmu_headers", "//onyx:cache_irq_headers", "//onyx:mailbox_headers", "//onyx:mem_buf_headers", "//onyx:dcvs_headers", "//onyx:minidump_headers", "//onyx:remote_headers", "//onyx:msm_sysstats", "//onyx:msm_performance", "//onyx:mem_buf_dev", "//onyx:qcom_iommu_util", "//onyx:qcom_q6v5_pas", "//onyx:clk_qcom", "//onyx:qcom_dcvs", "//onyx:secure_buffer", "//onyx:qcom_scm", "//onyx:mdt_loader", "//onyx:minidump", ":synx_driver", "//onyx:socinfo", "//onyx:llcc_qcom", "//onyx:cmd_db", "//onyx:qcom_aoss"],
 )
 
 
@@ -2385,6 +2385,17 @@ ddk_module(
     out = "fsa4480-i2c.ko", kconfig = "Kconfig", defconfig = "platform_defconfig",
     kernel_build = "//common:kernel_aarch64",
     deps = [":altmode_headers", ":platform_headers", ":soc_headers", ":ucsi_glink_headers", ":ucsi_qti_glink", ":qti_regmap_debugfs"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "qcom_va_minidump",
+    srcs = ["drivers/soc/qcom/qcom_va_minidump.c", "drivers/soc/qcom/elf.h"],
+    out = "qcom_va_minidump.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":minidump_headers", ":platform_headers", ":minidump"],
     visibility = ["//visibility:public"],
 )
 
@@ -2567,6 +2578,7 @@ kernel_module_group(
         ":f_fs_ipc_log",
         ":altmode_glink",
         ":fsa4480_i2c",
+        ":qcom_va_minidump",
     ],
 )
 
