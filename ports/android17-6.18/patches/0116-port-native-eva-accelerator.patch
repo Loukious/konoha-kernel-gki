@@ -1,0 +1,2908 @@
+diff --git a/qcom/opensource/eva-kernel/msm/eva/cvp.c b/qcom/opensource/eva-kernel/msm/eva/cvp.c
+--- a/qcom/opensource/eva-kernel/msm/eva/cvp.c
++++ b/qcom/opensource/eva-kernel/msm/eva/cvp.c
+@@ -8,6 +8,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/init.h>
+ #include <linux/ioctl.h>
++#include <linux/iommu.h>
+ #include <linux/list.h>
+ #include <linux/module.h>
+ #include <linux/of_platform.h>
+@@ -41,7 +42,7 @@
+ 
+ 	dprintk(CVP_SESS, "%s\n", __func__);
+ 
+-	inst = msm_cvp_open(MSM_CVP_USER, current);
++	inst = cvp_open_instance(MSM_CVP_USER, current, inode->i_cdev);
+ 	if (!inst) {
+ 		dprintk(CVP_ERR, "Failed to create cvp instance\n");
+ 		return -ENOMEM;
+@@ -104,7 +105,8 @@
+ 	if (pdev->dev.of_node) {
+ 		/* Target supports DT, parse from it */
+ 		rc = cvp_read_platform_resources_from_drv_data(core);
+-		rc = cvp_read_platform_resources_from_dt(core);
++		if (!rc)
++			rc = cvp_read_platform_resources_from_dt(core);
+ 	} else {
+ 		dprintk(CVP_ERR, "pdev node is NULL\n");
+ 		rc = -EINVAL;
+@@ -282,142 +284,152 @@
+ 	{}
+ };
+ 
++static void cvp_release_core(struct platform_device *pdev,
++			     struct msm_cvp_core *core)
++{
++	/* Withdraw new opens, then drain sessions while their hardware exists. */
++	mutex_lock(&cvp_driver->lock);
++	core->ready = false;
++	mutex_unlock(&cvp_driver->lock);
++	if (core->dsp_initialized)
++		cvp_dsp_device_exit();
++	cvp_put_core(core);
++	wait_for_completion(&core->users_zero);
++	if (core->dsp_initialized) {
++		cvp_dsp_device_deinit();
++		core->dsp_initialized = false;
++	}
++	debugfs_remove_recursive(cvp_driver->debugfs_root);
++	cvp_driver->debugfs_root = NULL;
++	cancel_work_sync(&core->ssr_work);
++	if (!IS_ERR_OR_NULL(core->dev_ops))
++		cvp_hfi_deinitialize(core->hfi_type, core->dev_ops);
++	of_platform_depopulate(&pdev->dev);
++	mutex_lock(&cvp_driver->lock);
++	cvp_driver->cvp_core = NULL;
++	mutex_unlock(&cvp_driver->lock);
++	msm_cvp_free_platform_resources(&core->resources);
++	kfree(core->capabilities);
++	idr_destroy(&core->sess_idr);
++	mutex_destroy(&core->idr_mtx);
++	mutex_destroy(&core->clk_lock);
++	mutex_destroy(&core->lock);
++	dev_set_drvdata(&pdev->dev, NULL);
++	kfree(core);
++}
++
++static int cvp_child_ready(struct device *dev, void *data)
++{
++	return device_is_bound(dev) ? 0 : -EPROBE_DEFER;
++}
++
+ static int msm_probe_cvp_device(struct platform_device *pdev)
+ {
+-	int rc = 0;
+ 	struct msm_cvp_core *core;
+-
+-	if (!cvp_driver) {
+-		dprintk(CVP_ERR, "Invalid cvp driver\n");
+-		return -EINVAL;
+-	}
+-
++	int rc;
++
++	mutex_lock(&cvp_driver->lock);
++	if (cvp_driver->cvp_core) {
++		mutex_unlock(&cvp_driver->lock);
++		return -EBUSY;
++	}
+ 	core = kzalloc(sizeof(*core), GFP_KERNEL);
+-	if (!core)
++	if (!core) {
++		mutex_unlock(&cvp_driver->lock);
+ 		return -ENOMEM;
+-
++	}
++	cvp_driver->cvp_core = core;
++	mutex_unlock(&cvp_driver->lock);
++	refcount_set(&core->users, 1);
++	init_completion(&core->users_zero);
+ 	core->platform_data = cvp_get_drv_data(&pdev->dev);
+ 	dev_set_drvdata(&pdev->dev, core);
+ 	rc = msm_cvp_initialize_core(pdev, core);
+-	if (rc) {
+-		dprintk(CVP_ERR, "Failed to init core\n");
+-		goto err_core_init;
+-	}
++	if (rc)
++		goto err_init;
++
++	rc = vm_manager.vm_ops->vm_start(core);
++	if (rc)
++		goto err_core;
++	core->dev_ops = cvp_hfi_initialize(core->hfi_type,
++					   &core->resources, &cvp_handle_cmd_response);
++	if (IS_ERR_OR_NULL(core->dev_ops)) {
++		rc = PTR_ERR(core->dev_ops) ?: -ENODEV;
++		goto err_core;
++	}
++	if (vm_manager.vm_id != VM_TRUSTED)
++		enable_irq(core->resources.irq_wd);
++	cvp_synx_ftbl_init(core);
++	rc = of_platform_populate(pdev->dev.of_node, msm_cvp_plat_match,
++				  NULL, &pdev->dev);
++	if (rc)
++		goto err_core;
++	rc = device_for_each_child(&pdev->dev, NULL, cvp_child_ready);
++	if (rc)
++		goto err_core;
++	atomic64_set(&core->kernel_trans_id, ARRAY_SIZE(cvp_hfi_defs));
++	if (core->resources.dsp_enabled) {
++		rc = cvp_dsp_device_init();
++		if (rc)
++			goto err_core;
++		core->dsp_initialized = true;
++	}
++	cvp_driver->sku_version = core->resources.sku_version;
++	cvp_driver->debugfs_root = msm_cvp_debugfs_init_drv();
++	if (!IS_ERR_OR_NULL(cvp_driver->debugfs_root))
++		core->debugfs_root = msm_cvp_debugfs_init_core(core,
++							       cvp_driver->debugfs_root);
+ 
+ 	rc = alloc_chrdev_region(&core->dev_num, 0, 1, DRIVER_NAME);
+-	if (rc < 0) {
+-		dprintk(CVP_ERR, "alloc_chrdev_region failed: %d\n",
+-				rc);
+-		goto err_alloc_chrdev;
+-	}
+-
++	if (rc)
++		goto err_core;
+ 	core->class = class_create(CLASS_NAME);
+ 	if (IS_ERR(core->class)) {
+ 		rc = PTR_ERR(core->class);
+-		dprintk(CVP_ERR, "class_create failed: %d\n",
+-				rc);
+-		goto err_class_create;
+-	}
+-
+-	core->dev = device_create(core->class, NULL,
+-		core->dev_num, NULL, DRIVER_NAME);
++		goto err_region;
++	}
++	core->cdev = cdev_alloc();
++	if (!core->cdev) {
++		rc = -ENOMEM;
++		goto err_class;
++	}
++	core->cdev->ops = &cvp_fops;
++	core->cdev->owner = THIS_MODULE;
++	rc = cdev_add(core->cdev, core->dev_num, 1);
++	if (rc) {
++		kobject_put(&core->cdev->kobj);
++		goto err_class;
++	}
++	core->dev = device_create(core->class, &pdev->dev,
++				  core->dev_num, core, DRIVER_NAME);
+ 	if (IS_ERR(core->dev)) {
+ 		rc = PTR_ERR(core->dev);
+-		dprintk(CVP_ERR, "device_create failed: %d\n",
+-				rc);
+-		goto err_device_create;
+-	}
+-	dev_set_drvdata(core->dev, core);
+-
+-	cdev_init(&core->cdev, &cvp_fops);
+-	rc = cdev_add(&core->cdev,
+-			MKDEV(MAJOR(core->dev_num), 0), 1);
+-	if (rc < 0) {
+-		dprintk(CVP_ERR, "cdev_add failed: %d\n",
+-				rc);
+-		goto error_cdev_add;
+-	}
+-
++		goto err_cdev;
++	}
+ 	rc = sysfs_create_group(&core->dev->kobj, &msm_cvp_core_attr_group);
+-	if (rc) {
+-		dprintk(CVP_ERR,
+-				"Failed to create attributes\n");
+-		goto err_cores_exceeded;
+-	}
+-
+-	/* VM manager shall be started before HFI init */
+-	vm_manager.vm_ops->vm_start(core);
+-
+-	core->dev_ops = cvp_hfi_initialize(core->hfi_type,
+-				&core->resources, &cvp_handle_cmd_response);
+-	if (IS_ERR_OR_NULL(core->dev_ops)) {
+-		mutex_lock(&cvp_driver->lock);
+-		mutex_unlock(&cvp_driver->lock);
+-
+-		rc = PTR_ERR(core->dev_ops) ?: -EBADHANDLE;
+-		if (rc != -EPROBE_DEFER)
+-			dprintk(CVP_ERR, "Failed to create HFI device\n");
+-		else
+-			dprintk(CVP_CORE, "msm_cvp: request probe defer\n");
+-		goto err_hfi_initialize;
+-	}
+-
+-	cvp_synx_ftbl_init(core);
+-
++	if (rc)
++		goto err_device;
+ 	mutex_lock(&cvp_driver->lock);
+-	cvp_driver->cvp_core = core;
++	core->ready = true;
+ 	mutex_unlock(&cvp_driver->lock);
+-
+-	cvp_driver->debugfs_root = msm_cvp_debugfs_init_drv();
+-	if (!cvp_driver->debugfs_root)
+-		dprintk(CVP_ERR, "Failed to create debugfs for msm_cvp\n");
+-
+-	core->debugfs_root = msm_cvp_debugfs_init_core(
+-		core, cvp_driver->debugfs_root);
+-
+-	cvp_driver->sku_version = core->resources.sku_version;
+-
+-	dprintk(CVP_CORE, "populating sub devices\n");
+-	/*
+-	 * Trigger probe for each sub-device i.e. qcom,msm-cvp,context-bank.
+-	 * When msm_cvp_probe is called for each sub-device, parse the
+-	 * context-bank details and store it in core->resources.context_banks
+-	 * list.
+-	 */
+-	rc = of_platform_populate(pdev->dev.of_node, msm_cvp_plat_match, NULL,
+-			&pdev->dev);
+-	if (rc) {
+-		dprintk(CVP_ERR, "Failed to trigger probe for sub-devices\n");
+-		goto err_fail_sub_device_probe;
+-	}
+-
+-	atomic64_set(&core->kernel_trans_id, ARRAY_SIZE(cvp_hfi_defs));
+-
+-	if (core->resources.dsp_enabled) {
+-		rc = cvp_dsp_device_init();
+-		if (rc)
+-			dprintk(CVP_WARN, "Failed to initialize DSP driver\n");
+-	} else {
+-		dprintk(CVP_DSP, "DSP interface not enabled\n");
+-	}
+-
+-	return rc;
+-
+-err_fail_sub_device_probe:
+-	cvp_hfi_deinitialize(core->hfi_type, core->dev_ops);
+-	debugfs_remove_recursive(cvp_driver->debugfs_root);
+-err_hfi_initialize:
+-err_cores_exceeded:
+-	cdev_del(&core->cdev);
+-error_cdev_add:
++	return 0;
++
++err_device:
+ 	device_destroy(core->class, core->dev_num);
+-err_device_create:
++err_cdev:
++	cdev_del(core->cdev);
++err_class:
+ 	class_destroy(core->class);
+-err_class_create:
++err_region:
+ 	unregister_chrdev_region(core->dev_num, 1);
+-err_alloc_chrdev:
+-	sysfs_remove_group(&pdev->dev.kobj, &msm_cvp_core_attr_group);
+-err_core_init:
++err_core:
++	cvp_release_core(pdev, core);
++	return rc;
++err_init:
++	msm_cvp_free_platform_resources(&core->resources);
++	mutex_lock(&cvp_driver->lock);
++	cvp_driver->cvp_core = NULL;
++	mutex_unlock(&cvp_driver->lock);
+ 	dev_set_drvdata(&pdev->dev, NULL);
+ 	kfree(core);
+ 	return rc;
+@@ -465,36 +477,37 @@
+ 	return -EINVAL;
+ }
+ 
+-static int msm_cvp_remove(struct platform_device *pdev)
+-{
+-	int rc = 0;
+-	struct msm_cvp_core *core;
+-
+-	if (!pdev) {
+-		dprintk(CVP_ERR, "%s invalid input %pK", __func__, pdev);
+-		return -EINVAL;
+-	}
+-
+-	if (of_device_is_compatible(pdev->dev.of_node, "qcom,msm-cvp"))
+-		core = dev_get_drvdata(&pdev->dev);
+-	else
++static void msm_cvp_remove(struct platform_device *pdev)
++{
++	struct msm_cvp_core *core = dev_get_drvdata(&pdev->dev);
++
++	/* Children share their parent's core and never own it. */
++	if (!of_device_is_compatible(pdev->dev.of_node, "qcom,msm-cvp")) {
++		struct context_bank_info *cb, *next;
++
+ 		core = dev_get_drvdata(pdev->dev.parent);
+-
+-	if (!core) {
+-		dprintk(CVP_ERR, "%s invalid core", __func__);
+-		return -EINVAL;
+-	}
+-
+-	cvp_hfi_deinitialize(core->hfi_type, core->dev_ops);
+-	msm_cvp_free_platform_resources(&core->resources);
+-	sysfs_remove_group(&pdev->dev.kobj, &msm_cvp_core_attr_group);
+-	dev_set_drvdata(&pdev->dev, NULL);
+-	idr_destroy(&core->sess_idr);
+-	mutex_destroy(&core->idr_mtx);
+-	mutex_destroy(&core->lock);
+-	mutex_destroy(&core->clk_lock);
+-	kfree(core);
+-	return rc;
++		if (!core)
++			return;
++		list_for_each_entry_safe(cb, next, &core->resources.context_banks, list) {
++			if (cb->dev != &pdev->dev)
++				continue;
++			if (cb->domain)
++				iommu_set_fault_handler(cb->domain, NULL, NULL);
++			list_del(&cb->list);
++		}
++		return;
++	}
++	if (!core)
++		return;
++	mutex_lock(&cvp_driver->lock);
++	core->ready = false;
++	mutex_unlock(&cvp_driver->lock);
++	sysfs_remove_group(&core->dev->kobj, &msm_cvp_core_attr_group);
++	cdev_del(core->cdev);
++	device_destroy(core->class, core->dev_num);
++	class_destroy(core->class);
++	unregister_chrdev_region(core->dev_num, 1);
++	cvp_release_core(pdev, core);
+ }
+ 
+ static int msm_cvp_pm_suspend(struct device *dev)
+@@ -545,54 +558,54 @@
+ 	.remove = msm_cvp_remove,
+ 	.driver = {
+ 		.name = "msm_cvp",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = msm_cvp_plat_match,
+ 		.pm = &msm_cvp_pm_ops,
+ 	},
+ };
+ 
++static void cvp_destroy_caches(void)
++{
++	kmem_cache_destroy(cvp_driver->smem_cache.cache);
++	kmem_cache_destroy(cvp_driver->buf_cache.cache);
++	kmem_cache_destroy(cvp_driver->frame_cache.cache);
++	kmem_cache_destroy(cvp_driver->msg_cache.cache);
++}
++
+ static int __init msm_cvp_init(void)
+ {
+-	int rc = 0;
++	int rc = -ENOMEM;
+ 
+ 	cvp_driver = kzalloc(sizeof(*cvp_driver), GFP_KERNEL);
+-	if (!cvp_driver) {
+-		dprintk(CVP_ERR,
+-			"Failed to allocate memroy for msm_cvp_drv\n");
++	if (!cvp_driver)
+ 		return -ENOMEM;
+-	}
+-
+ 	mutex_init(&cvp_driver->lock);
+-
+-	rc = platform_driver_register(&msm_cvp_driver);
+-	if (rc) {
+-		dprintk(CVP_ERR,
+-			"Failed to register platform driver\n");
+-		kfree(cvp_driver);
+-		cvp_driver = NULL;
+-		return rc;
+-	}
+-
++	mutex_init(&wncc_buf_pool.lock);
+ 	cvp_driver->msg_cache.cache = KMEM_CACHE(cvp_session_msg, 0);
+ 	cvp_driver->frame_cache.cache = KMEM_CACHE(msm_cvp_frame, 0);
+ 	cvp_driver->buf_cache.cache = KMEM_CACHE(cvp_internal_buf, 0);
+ 	cvp_driver->smem_cache.cache = KMEM_CACHE(msm_cvp_smem, 0);
+-	mutex_init(&wncc_buf_pool.lock);
+-
++	if (!cvp_driver->msg_cache.cache || !cvp_driver->frame_cache.cache ||
++	    !cvp_driver->buf_cache.cache || !cvp_driver->smem_cache.cache)
++		goto err_caches;
++	rc = platform_driver_register(&msm_cvp_driver);
++	if (!rc)
++		return 0;
++err_caches:
++	cvp_destroy_caches();
++	mutex_destroy(&wncc_buf_pool.lock);
++	mutex_destroy(&cvp_driver->lock);
++	kfree(cvp_driver);
++	cvp_driver = NULL;
+ 	return rc;
+ }
+ 
+ static void __exit msm_cvp_exit(void)
+ {
+-	cvp_dsp_device_exit();
+-	kmem_cache_destroy(cvp_driver->msg_cache.cache);
+-	kmem_cache_destroy(cvp_driver->frame_cache.cache);
+-	kmem_cache_destroy(cvp_driver->buf_cache.cache);
+-	kmem_cache_destroy(cvp_driver->smem_cache.cache);
+-
+ 	platform_driver_unregister(&msm_cvp_driver);
+-	debugfs_remove_recursive(cvp_driver->debugfs_root);
++	cvp_destroy_caches();
++	mutex_destroy(&wncc_buf_pool.lock);
+ 	mutex_destroy(&cvp_driver->lock);
+-	mutex_destroy(&wncc_buf_pool.lock);
+ 	kfree(cvp_driver);
+ 	cvp_driver = NULL;
+ }
+@@ -610,4 +623,5 @@
+ MODULE_SOFTDEP("pre: frpc-adsprpc");
+ #endif
+ MODULE_LICENSE("GPL v2");
+-MODULE_IMPORT_NS(DMA_BUF);
++MODULE_IMPORT_NS("DMA_BUF");
++MODULE_DESCRIPTION("Qualcomm native EVA accelerator");
+diff --git a/qcom/opensource/eva-kernel/msm/eva/cvp_core_hfi.h b/qcom/opensource/eva-kernel/msm/eva/cvp_core_hfi.h
+--- a/qcom/opensource/eva-kernel/msm/eva/cvp_core_hfi.h
++++ b/qcom/opensource/eva-kernel/msm/eva/cvp_core_hfi.h
+@@ -326,7 +326,7 @@
+ 			stream_id, pkt_id, t_id, ktid); \
+ 		dprintk(CVP_INFO, \
+ 			"tracing_eva_frame_from_sw: AON_TIMESTAMP: %llu %s session_id = 0x%x "\
+-			"stream_id = 0x%x packet_id = 0x%x transaction_id = 0x%x ktid = 0x%x\n",\
++			"stream_id = 0x%x packet_id = 0x%x transaction_id = 0x%x ktid = 0x%llx\n",\
+ 			aon_cycles, tag, sess_id, stream_id, pkt_id, t_id, ktid); \
+ 	} \
+ })
+@@ -351,7 +351,7 @@
+ 			stream_id, pkt_id, t_id, ktid); \
+ 		dprintk(CVP_INFO,\
+ 			"tracing_eva_frame_from_sw: AON_TIMESTAMP: %llu %s session_id = 0x%x "\
+-			"stream_id = 0x%x packet_id = 0x%x transaction_id = 0x%x ktid = 0x%x\n",\
++			"stream_id = 0x%x packet_id = 0x%x transaction_id = 0x%x ktid = 0x%llx\n",\
+ 			aon_cycles, tag, session_id, stream_id, pkt_id, t_id, ktid); \
+ 	} \
+ })
+diff --git a/qcom/opensource/eva-kernel/msm/eva/cvp_dump.c b/qcom/opensource/eva-kernel/msm/eva/cvp_dump.c
+--- a/qcom/opensource/eva-kernel/msm/eva/cvp_dump.c
++++ b/qcom/opensource/eva-kernel/msm/eva/cvp_dump.c
+@@ -75,7 +75,7 @@
+ 	if (msm_minidump_enabled()) {
+ 		dprintk(CVP_INFO, "Minidump is enabled!\n");
+ 
+-		strlcpy(md_entry.name, name, sizeof(md_entry.name));
++		strscpy(md_entry.name, name, sizeof(md_entry.name));
+ 		md_entry.virt_addr = (uintptr_t)virt;
+ 		md_entry.phys_addr = phys;
+ 		md_entry.size = size;
+@@ -160,7 +160,7 @@
+ 
+ 	temp_node->va_md_buff = buff_va;
+ 	temp_node->va_md_buff_size = buff_size;
+-	strlcpy(temp_node->region_name, region_name,
++	strscpy(temp_node->region_name, region_name,
+ 		sizeof(temp_node->region_name));
+ 	temp_node->copy = copy;
+ 
+@@ -257,7 +257,7 @@
+ 			}
+ 		}
+ 		entry.size = cursor->va_md_buff_size;
+-		strlcpy(entry.owner, cursor->region_name, sizeof(entry.owner));
++		strscpy(entry.owner, cursor->region_name, sizeof(entry.owner));
+ 		entry.cb = NULL;
+ 
+ 		if (msm_cvp_minidump_enable) {
+@@ -298,7 +298,7 @@
+ 			}
+ 		}
+ 		entry.size = cursor->va_md_buff_size;
+-		strlcpy(entry.owner, cursor->region_name, sizeof(entry.owner));
++		strscpy(entry.owner, cursor->region_name, sizeof(entry.owner));
+ 		entry.cb = NULL;
+ 
+ 		if (msm_cvp_minidump_enable) {
+diff --git a/qcom/opensource/eva-kernel/msm/eva/cvp_hfi.c b/qcom/opensource/eva-kernel/msm/eva/cvp_hfi.c
+--- a/qcom/opensource/eva-kernel/msm/eva/cvp_hfi.c
++++ b/qcom/opensource/eva-kernel/msm/eva/cvp_hfi.c
+@@ -2002,7 +2002,7 @@
+ 			dev->iface_q_table.align_virtual_addr;
+ 	q_tbl_hdr->qtbl_version = 0;
+ 	q_tbl_hdr->device_addr = (void *)dev;
+-	strlcpy(q_tbl_hdr->name, "msm_cvp", sizeof(q_tbl_hdr->name));
++	strscpy(q_tbl_hdr->name, "msm_cvp", sizeof(q_tbl_hdr->name));
+ 	q_tbl_hdr->qtbl_size = CVP_IFACEQ_TABLE_SIZE;
+ 	q_tbl_hdr->qtbl_qhdr0_offset =
+ 				sizeof(struct cvp_hfi_queue_table_header);
+@@ -2348,7 +2348,7 @@
+ 			device->res->reg_mappings.ipclite_size,
+ 			IOMMU_READ | IOMMU_WRITE);
+ 		if (rc) {
+-			dprintk(CVP_ERR, "map ipclite fail %d %#x %#x %#x\n",
++			dprintk(CVP_ERR, "map ipclite fail %d %#llx %#llx %#x\n",
+ 				rc, device->res->reg_mappings.ipclite_iova,
+ 				device->res->reg_mappings.ipclite_phyaddr,
+ 				device->res->reg_mappings.ipclite_size);
+@@ -2362,7 +2362,7 @@
+ 			device->res->reg_mappings.hwmutex_size,
+ 			IOMMU_MMIO | IOMMU_READ | IOMMU_WRITE);
+ 		if (rc) {
+-			dprintk(CVP_ERR, "map hwmutex fail %d %#x %#x %#x\n",
++			dprintk(CVP_ERR, "map hwmutex fail %d %#llx %#llx %#x\n",
+ 				rc, device->res->reg_mappings.hwmutex_iova,
+ 				device->res->reg_mappings.hwmutex_phyaddr,
+ 				device->res->reg_mappings.hwmutex_size);
+@@ -2376,7 +2376,7 @@
+ 			device->res->reg_mappings.aon_size,
+ 			IOMMU_MMIO | IOMMU_READ | IOMMU_WRITE);
+ 		if (rc) {
+-			dprintk(CVP_ERR, "map aon fail %d %#x %#x %#x\n",
++			dprintk(CVP_ERR, "map aon fail %d %#llx %#llx %#x\n",
+ 				rc, device->res->reg_mappings.aon_iova,
+ 				device->res->reg_mappings.aon_phyaddr,
+ 				device->res->reg_mappings.aon_size);
+@@ -2390,7 +2390,7 @@
+ 			device->res->reg_mappings.timer_size,
+ 			IOMMU_MMIO | IOMMU_READ | IOMMU_WRITE);
+ 		if (rc) {
+-			dprintk(CVP_ERR, "map timer fail %d %#x %#x %#x\n",
++			dprintk(CVP_ERR, "map timer fail %d %#llx %#llx %#x\n",
+ 				rc, device->res->reg_mappings.timer_iova,
+ 				device->res->reg_mappings.timer_phyaddr,
+ 				device->res->reg_mappings.timer_size);
+@@ -3926,8 +3926,8 @@
+ 			dprintk(CVP_ERR, "reset get exclusive fail %d\n", rc);
+ 			return rc;
+ 		}
+-		dprintk(CVP_PWR, "reset_clk: name %s get exclusive rst %llx\n",
+-				rst_set->reset_tbl[reset_index].name, rst);
++		dprintk(CVP_PWR, "reset_clk: name %s get exclusive rst %pK\n",
++			rst_set->reset_tbl[reset_index].name, rst);
+ 	} else if (rst_info->required_stage == CVP_ON_INIT) {
+ 		rst = devm_reset_control_get(&res->pdev->dev,
+ 				rst_set->reset_tbl[reset_index].name);
+@@ -3936,8 +3936,8 @@
+ 			dprintk(CVP_ERR, "reset get fail %d\n", rc);
+ 			return rc;
+ 		}
+-		dprintk(CVP_PWR, "reset_clk: name %s get rst %llx\n",
+-				rst_set->reset_tbl[reset_index].name, rst);
++		dprintk(CVP_PWR, "reset_clk: name %s get rst %pK\n",
++			rst_set->reset_tbl[reset_index].name, rst);
+ 	} else {
+ 		dprintk(CVP_ERR, "Invalid reset stage\n");
+ 		return -EINVAL;
+@@ -5266,7 +5266,7 @@
+ 	return rc;
+ }
+ 
+-void __init_cvp_ops(struct iris_hfi_device *device)
++static void __init_cvp_ops(struct iris_hfi_device *device)
+ {
+ 	device->hal_ops = &hal_ops;
+ }
+@@ -5302,10 +5302,6 @@
+ 		goto err_cleanup;
+ 	}
+ 
+-	rc = vm_manager.vm_ops->vm_init_reg_and_irq(hdevice, res);
+-	if (rc)
+-		goto err_cleanup;
+-
+ 	hdevice->res = res;
+ 	hdevice->callback = callback;
+ 
+@@ -5327,7 +5323,11 @@
+ 
+ 	mutex_init(&hdevice->lock);
+ 	INIT_LIST_HEAD(&hdevice->sess_head);
+-
++	rc = vm_manager.vm_ops->vm_init_reg_and_irq(hdevice, res);
++	if (rc) {
++		mutex_destroy(&hdevice->lock);
++		goto err_cleanup;
++	}
+ 	return hdevice;
+ 
+ err_cleanup:
+@@ -5355,30 +5355,32 @@
+ 
+ void cvp_iris_hfi_delete_device(void *device)
+ {
+-	struct msm_cvp_core *core;
+-	struct iris_hfi_device *dev = NULL;
+-
+-	if (!device)
+-		return;
+-
+-	core = cvp_driver->cvp_core;
+-	if (core)
+-		dev = core->dev_ops->hfi_device_data;
++	struct iris_hfi_device *dev = device;
+ 
+ 	if (!dev)
+ 		return;
+-
+-	mutex_destroy(&dev->lock);
+-	destroy_workqueue(dev->cvp_workq);
+-	destroy_workqueue(dev->iris_pm_workq);
+-
+ #ifndef USE_PRESIL42
+-	free_irq(dev->cvp_hal_data->irq, dev);
++	if (dev->cvp_hal_data) {
++		disable_irq(dev->cvp_hal_data->irq_wd);
++		disable_irq(dev->cvp_hal_data->irq);
++	}
+ #else
+ 	presil42_cvp_iris_hfi_delete_device(dev);
+ #endif
+-	iounmap(dev->cvp_hal_data->register_base);
+-	iounmap(dev->cvp_hal_data->gcc_reg_base);
++	cancel_delayed_work_sync(&iris_hfi_pm_work);
++	cancel_work_sync(&iris_hfi_wd_work);
++#ifndef USE_PRESIL42
++	if (dev->cvp_hal_data) {
++		free_irq(dev->cvp_hal_data->irq_wd, dev);
++		free_irq(dev->cvp_hal_data->irq, dev);
++	}
++#endif
++	destroy_workqueue(dev->cvp_workq);
++	destroy_workqueue(dev->iris_pm_workq);
++	if (cvp_driver->cvp_core)
++		cancel_work_sync(&cvp_driver->cvp_core->ssr_work);
++	mutex_destroy(&dev->lock);
++	/* Register mappings belong to the platform device's devres. */
+ 	kfree(dev->cvp_hal_data);
+ 	kfree(dev->response_pkt);
+ 	kfree(dev->raw_packet);
+diff --git a/qcom/opensource/eva-kernel/msm/eva/cvp_power.c b/qcom/opensource/eva-kernel/msm/eva/cvp_power.c
+--- a/qcom/opensource/eva-kernel/msm/eva/cvp_power.c
++++ b/qcom/opensource/eva-kernel/msm/eva/cvp_power.c
+@@ -152,12 +152,12 @@
+ 	cvp_max_rate = tbl[tbl_size - 1].clock_rate;
+ 
+ 	aggregate_power_update(core, &nrt_pwr, &rt_pwr, cvp_max_rate);
+-	dprintk(CVP_PWR, "PwrUpdate nrt %u %u rt %u %u\n",
++	dprintk(CVP_PWR, "PwrUpdate nrt %lu %lu rt %lu %lu\n",
+ 		nrt_pwr.core_sum, nrt_pwr.op_core_sum,
+ 		rt_pwr.core_sum, rt_pwr.op_core_sum);
+ 
+ 	if (rt_pwr.core_sum > cvp_max_rate) {
+-		dprintk(CVP_WARN, "%s clk vote out of range %lld\n",
++		dprintk(CVP_WARN, "%s clk vote out of range %lu\n",
+ 			__func__, rt_pwr.core_sum);
+ 		return -ENOTSUPP;
+ 	}
+@@ -185,7 +185,7 @@
+ 	bw_sum = (bw_sum > max_bw) ? max_bw : bw_sum;
+ 	bw_sum = (bw_sum < min_bw) ? min_bw : bw_sum;
+ 
+-	dprintk(CVP_PWR, "%s %lld %lld\n", __func__,
++	dprintk(CVP_PWR, "%s %lu %lu\n", __func__,
+ 		core_sum, bw_sum);
+ 
+ 	tmp = core->curr_freq;
+@@ -252,7 +252,7 @@
+ 	rc = msm_cvp_set_clocks(core);
+ 	if (rc) {
+ 		dprintk(CVP_ERR,
+-			"Failed to set clock rate %u %s: %d %s\n",
++			"Failed to set clock rate %lu %s: %d %s\n",
+ 			core->curr_freq, cl->name, rc, __func__);
+ 		core->curr_freq = core->orig_core_sum;
+ 		goto adjust_exit;
+diff --git a/qcom/opensource/eva-kernel/msm/eva/cvp_smem.c b/qcom/opensource/eva-kernel/msm/eva/cvp_smem.c
+--- a/qcom/opensource/eva-kernel/msm/eva/cvp_smem.c
++++ b/qcom/opensource/eva-kernel/msm/eva/cvp_smem.c
+@@ -22,10 +22,6 @@
+ #include "msm_cvp_dsp.h"
+ #include "msm_cvp_buf.h"
+ 
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0))
+-#define DMA_ATTR_IOMMU_USE_UPSTREAM_HINT 1;
+-#endif
+-
+ static struct sg_table* __cvp_dma_buf_map_attachment(struct dma_buf_attachment* attach, enum dma_data_direction direction)
+ {
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0))
+@@ -53,7 +49,7 @@
+ 	struct sg_table *table = NULL;
+ 	struct context_bank_info *cb = NULL;
+ 
+-	if (!dbuf || !iova || !mapping_info) {
++	if (!dbuf || !iova || !mapping_info || !res) {
+ 		dprintk(CVP_ERR, "Invalid params: %pK, %pK, %pK\n",
+ 			dbuf, iova, mapping_info);
+ 		return -EINVAL;
+@@ -90,27 +86,26 @@
+ 		attach->dma_map_attrs |= DMA_ATTR_SKIP_CPU_SYNC;
+ 		if (flags & SMEM_CAMERA)
+ 			attach->dma_map_attrs |= DMA_ATTR_QTI_SMMU_PROXY_MAP;
+-		if (res->sys_cache_present)
+-			attach->dma_map_attrs |=
+-				DMA_ATTR_IOMMU_USE_UPSTREAM_HINT;
+ 
+ 		table = __cvp_dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
+ 		if (IS_ERR_OR_NULL(table)) {
+-			dprintk(CVP_ERR, "Failed to map table %d\n", PTR_ERR(table));
++			dprintk(CVP_ERR, "Failed to map table %ld\n", PTR_ERR(table));
+ 			dprintk(CVP_ERR,
+-				"Mapping detail dma_buf 0x%llx, %s, size %#x\n",
++				"Mapping detail dma_buf %pK, %s, size %#zx\n",
+ 				dbuf, dbuf->name, dbuf->size);
+ 			rc = PTR_ERR(table) ?: -ENOMEM;
+ 			goto mem_map_table_failed;
+ 		}
+ 
+-		if (table->sgl) {
+-			*iova = table->sgl->dma_address;
+-		} else {
+-			dprintk(CVP_ERR, "sgl is NULL\n");
+-			rc = -ENOMEM;
++		/* EVA packets carry one contiguous 32-bit IOVA range. */
++		if (!table->sgl || table->nents != 1 || !dbuf->size ||
++		    dbuf->size > U32_MAX || sg_dma_len(table->sgl) < dbuf->size ||
++		    sg_dma_address(table->sgl) > U32_MAX ||
++		    dbuf->size - 1 > U32_MAX - sg_dma_address(table->sgl)) {
++			rc = -ERANGE;
+ 			goto mem_map_sg_failed;
+ 		}
++		*iova = sg_dma_address(table->sgl);
+ 
+ 		mapping_info->dev = cb->dev;
+ 		mapping_info->domain = cb->domain;
+@@ -119,7 +114,7 @@
+ 		mapping_info->buf = dbuf;
+ 		mapping_info->cb_info = (void *)cb;
+ 	} else {
+-		dprintk(CVP_MEM, "iommu not present, use phys mem addr\n");
++		return -ENODEV;
+ 	}
+ 
+ 	return 0;
+@@ -241,7 +236,8 @@
+ 	temp = (u32)iova;
+ 	if ((dma_addr_t)temp != iova) {
+ 		dprintk(CVP_ERR, "iova(%pa) truncated to %#x", &iova, temp);
+-		rc = -EINVAL;
++		rc = -ERANGE;
++		msm_dma_put_device_address(smem->flags, &smem->mapping_info);
+ 		goto exit;
+ 	}
+ 
+@@ -255,23 +251,24 @@
+ 		is_config_pkt = cvp_hfi_defs[i].is_config_pkt;
+ 
+ 	if (i > 0 && cvp_hfi_defs[i].checksum_enabled) {
+-		dma_buf_begin_cpu_access(dma_buf, DMA_BIDIRECTIONAL);
+-		msm_cvp_dma_buf_vmap(dma_buf, &vmap);
++		rc = dma_buf_begin_cpu_access(dma_buf, DMA_BIDIRECTIONAL);
++		if (rc)
++			goto unmap;
++		rc = msm_cvp_dma_buf_vmap(dma_buf, &vmap);
++		if (rc) {
++			dma_buf_end_cpu_access(dma_buf, DMA_BIDIRECTIONAL);
++			goto unmap;
++		}
+ 		smem->kvaddr = vmap.vaddr;
+-		if (!smem->kvaddr) {
+-			dprintk(CVP_WARN, "%s Fail map into kernel\n",
+-					__func__);
+-			dma_buf_end_cpu_access(dma_buf, DMA_BIDIRECTIONAL);
+-		} else {
+-			for (i = 0; i < 256; i++)
+-				checksum += *(u32 *)(smem->kvaddr + i*sizeof(u32));
+-			dprintk(CVP_MEM, "Map checksum %#x fd=%d\n",
+-				checksum, smem->fd);
+-		}
++		for (i = 0; i < min_t(size_t, 256, dma_buf->size / sizeof(u32)); i++)
++			checksum += ((u32 *)smem->kvaddr)[i];
++		dprintk(CVP_MEM, "Map checksum %#x fd=%d\n", checksum, smem->fd);
+ 	}
+ 	print_smem(CVP_MEM, str, inst, smem);
+ 	atomic_inc(&inst->smem_count);
+ 	goto success;
++unmap:
++	msm_dma_put_device_address(smem->flags, &smem->mapping_info);
+ exit:
+ 	smem->device_addr = 0x0;
+ success:
+@@ -297,22 +294,14 @@
+ 
+ 	print_smem(CVP_MEM, str, inst, smem);
+ 	dma_buf = smem->dma_buf;
+-	i = get_pkt_index_from_type(smem->pkt_type);
+-	if (i > 0 && cvp_hfi_defs[i].checksum_enabled) {
+-		if (!smem->kvaddr) {
+-			dprintk(CVP_WARN, "%s DS buf Fail map into kernel\n",
+-					__func__);
+-			dma_buf_end_cpu_access(dma_buf, DMA_BIDIRECTIONAL);
+-		} else {
+-			for (i = 0; i < 256; i++)
+-				checksum += *(u32 *)(smem->kvaddr + i*sizeof(u32));
+-			dprintk(CVP_MEM, "Unmap checksum %#x fd=%d\n",
+-				checksum, smem->fd);
+-			vmap.vaddr = smem->kvaddr;
+-			msm_cvp_dma_buf_vunmap(dma_buf, &vmap);
+-			smem->kvaddr = 0;
+-			dma_buf_end_cpu_access(dma_buf, DMA_BIDIRECTIONAL);
+-		}
++	if (smem->kvaddr) {
++		for (i = 0; i < min_t(size_t, 256, dma_buf->size / sizeof(u32)); i++)
++			checksum += ((u32 *)smem->kvaddr)[i];
++		dprintk(CVP_MEM, "Unmap checksum %#x fd=%d\n", checksum, smem->fd);
++		vmap.vaddr = smem->kvaddr;
++		msm_cvp_dma_buf_vunmap(dma_buf, &vmap);
++		smem->kvaddr = NULL;
++		dma_buf_end_cpu_access(dma_buf, DMA_BIDIRECTIONAL);
+ 	}
+ 	rc = msm_dma_put_device_address(smem->flags, &smem->mapping_info);
+ 	if (rc) {
+@@ -339,7 +328,7 @@
+ 	int perms[1];
+ 	struct cvp_dma_buf_vmap vmap = {0};
+ 
+-	if (!res) {
++	if (!res || !mem || !size || size > U32_MAX - (SZ_4K - 1)) {
+ 		dprintk(CVP_ERR, "%s: NULL res\n", __func__);
+ 		return -EINVAL;
+ 	}
+@@ -357,10 +346,13 @@
+ 		size, align);
+ 	}
+ 
++	if (!heap)
++		return -ENODEV;
+ 	dbuf = dma_heap_buffer_alloc(heap, size, 0, 0);
++	dma_heap_put(heap);
+ 	if (IS_ERR_OR_NULL(dbuf)) {
+ 		dprintk(CVP_ERR,
+-			"Failed to allocate shared memory = %x bytes, %x %x\n",
++			"Failed to allocate shared memory = %zx bytes, %x %lx\n",
+ 			size, mem->flags, PTR_ERR(dbuf));
+ 		rc = -ENOMEM;
+ 		goto fail_shared_mem_alloc;
+@@ -403,14 +395,17 @@
+ 	if ((dma_addr_t)mem->device_addr != iova) {
+ 		dprintk(CVP_ERR, "iova(%pa) truncated to %#x",
+ 			&iova, mem->device_addr);
+-		goto fail_device_address;
++		rc = -ERANGE;
++		goto fail_mapping;
+ 	}
+ 
+ 	if (map_kernel) {
+-		dma_buf_begin_cpu_access(dbuf, DMA_BIDIRECTIONAL);
+-		msm_cvp_dma_buf_vmap(dbuf, &vmap);
++		rc = dma_buf_begin_cpu_access(dbuf, DMA_BIDIRECTIONAL);
++		if (rc)
++			goto fail_mapping;
++		rc = msm_cvp_dma_buf_vmap(dbuf, &vmap);
+ 		mem->kvaddr = vmap.vaddr;
+-		if (!mem->kvaddr) {
++		if (rc || !mem->kvaddr) {
+ 			dprintk(CVP_ERR,
+ 				"Failed to map shared mem in kernel\n");
+ 			rc = -EIO;
+@@ -419,7 +414,7 @@
+ 	}
+ 
+ 	dprintk(CVP_MEM,
+-		"%s: dma_buf=%pK,iova=%x,size=%d,kvaddr=%pK,flags=%#lx\n",
++		"%s: dma_buf=%pK,iova=%x,size=%d,kvaddr=%pK,flags=%#x\n",
+ 		__func__, mem->dma_buf, mem->device_addr, mem->size,
+ 		mem->kvaddr, mem->flags);
+ 	return rc;
+@@ -427,7 +422,11 @@
+ fail_map:
+ 	if (map_kernel)
+ 		dma_buf_end_cpu_access(dbuf, DMA_BIDIRECTIONAL);
++fail_mapping:
++	msm_dma_put_device_address(mem->flags, &mem->mapping_info);
+ fail_device_address:
++	mem->device_addr = 0;
++	mem->dma_buf = NULL;
+ 	dma_heap_buffer_free(dbuf);
+ fail_shared_mem_alloc:
+ 	return rc;
+@@ -440,7 +439,7 @@
+ 		"%s: dma_buf = %pK, device_addr = %x, size = %d, kvaddr = %pK\n",
+ 		__func__, mem->dma_buf, mem->device_addr, mem->size, mem->kvaddr);
+ 
+-	if (mem->device_addr) {
++	if (mem->mapping_info.attach) {
+ 		msm_dma_put_device_address(mem->flags, &mem->mapping_info);
+ 		mem->device_addr = 0x0;
+ 	}
+@@ -495,7 +494,7 @@
+ {
+ 	int rc = 0;
+ 
+-	if (!dbuf) {
++	if (!dbuf || offset > dbuf->size || size > dbuf->size - offset) {
+ 		dprintk(CVP_ERR, "%s: Invalid params\n", __func__);
+ 		return -EINVAL;
+ 	}
+diff --git a/qcom/opensource/eva-kernel/msm/eva/hfi_packetization.c b/qcom/opensource/eva-kernel/msm/eva/hfi_packetization.c
+--- a/qcom/opensource/eva-kernel/msm/eva/hfi_packetization.c
++++ b/qcom/opensource/eva-kernel/msm/eva/hfi_packetization.c
+@@ -17,8 +17,8 @@
+  * sensible index.
+  */
+ 
+-int cvp_create_pkt_cmd_sys_init(struct cvp_hfi_cmd_sys_init_packet *pkt,
+-			   u32 arch_type)
++static int cvp_create_pkt_cmd_sys_init(struct cvp_hfi_cmd_sys_init_packet *pkt,
++				       u32 arch_type)
+ {
+ 	int rc = 0;
+ 
+@@ -31,7 +31,7 @@
+ 	return rc;
+ }
+ 
+-int cvp_create_pkt_cmd_sys_pc_prep(struct cvp_hfi_cmd_sys_pc_prep_packet *pkt)
++static int cvp_create_pkt_cmd_sys_pc_prep(struct cvp_hfi_cmd_sys_pc_prep_packet *pkt)
+ {
+ 	int rc = 0;
+ 
+@@ -43,9 +43,8 @@
+ 	return rc;
+ }
+ 
+-int cvp_create_pkt_cmd_sys_debug_config(
+-	struct cvp_hfi_cmd_sys_set_property_packet *pkt,
+-	u32 mode)
++static int cvp_create_pkt_cmd_sys_debug_config(struct cvp_hfi_cmd_sys_set_property_packet *pkt,
++					       u32 mode)
+ {
+ 	struct cvp_hfi_debug_config *hfi;
+ 
+@@ -67,9 +66,8 @@
+ 	return 0;
+ }
+ 
+-int cvp_create_pkt_cmd_sys_coverage_config(
+-	struct cvp_hfi_cmd_sys_set_property_packet *pkt,
+-	u32 mode)
++static int cvp_create_pkt_cmd_sys_coverage_config(struct cvp_hfi_cmd_sys_set_property_packet *pkt,
++						  u32 mode)
+ {
+ 	if (!pkt) {
+ 		dprintk(CVP_ERR, "In %s(), No input packet\n", __func__);
+@@ -88,9 +86,9 @@
+ 	return 0;
+ }
+ 
+-int cvp_create_pkt_cmd_sys_set_idle_indicator(
+-	struct cvp_hfi_cmd_sys_set_property_packet *pkt,
+-	u32 mode)
++static int
++cvp_create_pkt_cmd_sys_set_idle_indicator(struct cvp_hfi_cmd_sys_set_property_packet *pkt,
++					  u32 mode)
+ {
+ 	if (!pkt) {
+ 		dprintk(CVP_ERR, "In %s(), No input packet\n", __func__);
+@@ -109,10 +107,9 @@
+ 	return 0;
+ }
+ 
+-int cvp_create_pkt_cmd_sys_set_resource(
+-		struct cvp_hfi_cmd_sys_set_resource_packet *pkt,
+-		struct cvp_resource_hdr *res_hdr,
+-		void *res_value)
++static int cvp_create_pkt_cmd_sys_set_resource(struct cvp_hfi_cmd_sys_set_resource_packet *pkt,
++					       struct cvp_resource_hdr *res_hdr,
++					       void *res_value)
+ {
+ 	int rc = 0;
+ 	u32 i = 0;
+@@ -168,9 +165,9 @@
+ 	return rc;
+ }
+ 
+-int cvp_create_pkt_cmd_sys_release_resource(
+-		struct cvp_hfi_cmd_sys_release_resource_packet *pkt,
+-		struct cvp_resource_hdr *res_hdr)
++static int
++cvp_create_pkt_cmd_sys_release_resource(struct cvp_hfi_cmd_sys_release_resource_packet *pkt,
++					struct cvp_resource_hdr *res_hdr)
+ {
+ 	int rc = 0;
+ 
+@@ -268,8 +265,8 @@
+ 	return rc;
+ }
+ 
+-int cvp_create_pkt_cmd_session_cmd(struct cvp_hal_session_cmd_pkt *pkt,
+-			int pkt_type, struct cvp_hal_session *session)
++static int cvp_create_pkt_cmd_session_cmd(struct cvp_hal_session_cmd_pkt *pkt,
++					  int pkt_type, struct cvp_hal_session *session)
+ {
+ 	int rc = 0;
+ 	struct msm_cvp_inst *inst = session->session_id;
+@@ -284,9 +281,9 @@
+ 	return rc;
+ }
+ 
+-int cvp_session_cmd_ktid(struct cvp_hfi_cmd_session_hdr *pkt,
+-			int pkt_type, struct cvp_hal_session *session,
+-			u64 ktid)
++static int cvp_session_cmd_ktid(struct cvp_hfi_cmd_session_hdr *pkt,
++				int pkt_type, struct cvp_hal_session *session,
++				u64 ktid)
+ {
+ 	int rc = 0;
+ 	struct msm_cvp_inst *inst = session->session_id;
+@@ -302,8 +299,8 @@
+ 	return rc;
+ }
+ 
+-int cvp_create_pkt_cmd_sys_power_control(
+-	struct cvp_hfi_cmd_sys_set_property_packet *pkt, u32 enable)
++static int
++cvp_create_pkt_cmd_sys_power_control(struct cvp_hfi_cmd_sys_set_property_packet *pkt, u32 enable)
+ {
+ 	struct cvp_hfi_enable *hfi;
+ 
+@@ -353,9 +350,8 @@
+ 	return rc;
+ }
+ 
+-int cvp_create_pkt_cmd_session_release_buffers(
+-		void *cmd,
+-		struct cvp_hal_session *session)
++static int cvp_create_pkt_cmd_session_release_buffers(void *cmd,
++						      struct cvp_hal_session *session)
+ {
+ 	struct cvp_session_release_buffers_packet *pkt;
+ 	struct msm_cvp_inst *inst = session->session_id;
+@@ -374,10 +370,9 @@
+ 	return 0;
+ }
+ 
+-int cvp_create_pkt_cmd_session_send(
+-		struct eva_kmd_hfi_packet *out_pkt,
+-		struct cvp_hal_session *session,
+-		struct eva_kmd_hfi_packet *in_pkt)
++static int cvp_create_pkt_cmd_session_send(struct eva_kmd_hfi_packet *out_pkt,
++					   struct cvp_hal_session *session,
++					   struct eva_kmd_hfi_packet *in_pkt)
+ {
+ 	int def_idx;
+ 	struct cvp_hal_session_cmd_pkt *ptr =
+@@ -443,8 +438,8 @@
+ 	return rc;
+ }
+ 
+-int cvp_create_pkt_ssr_cmd(enum hal_ssr_trigger_type type,
+-		struct cvp_hfi_cmd_sys_test_ssr_packet *pkt)
++static int cvp_create_pkt_ssr_cmd(enum hal_ssr_trigger_type type,
++				  struct cvp_hfi_cmd_sys_test_ssr_packet *pkt)
+ {
+ 	if (!pkt) {
+ 		dprintk(CVP_ERR, "Invalid params, device: %pK\n", pkt);
+@@ -456,8 +451,7 @@
+ 	return 0;
+ }
+ 
+-int cvp_create_pkt_cmd_sys_image_version(
+-		struct cvp_hfi_cmd_sys_get_property_packet *pkt)
++static int cvp_create_pkt_cmd_sys_image_version(struct cvp_hfi_cmd_sys_get_property_packet *pkt)
+ {
+ 	if (!pkt) {
+ 		dprintk(CVP_ERR, "%s invalid param :%pK\n", __func__, pkt);
+diff --git a/qcom/opensource/eva-kernel/msm/eva/hfi_packetization.h b/qcom/opensource/eva-kernel/msm/eva/hfi_packetization.h
+--- a/qcom/opensource/eva-kernel/msm/eva/hfi_packetization.h
++++ b/qcom/opensource/eva-kernel/msm/eva/hfi_packetization.h
+@@ -77,4 +77,9 @@
+ 
+ struct cvp_hfi_packetization_ops *cvp_hfi_get_pkt_ops_handle(
+ 		enum hfi_packetization_type);
++int cvp_create_pkt_cmd_session_set_buffers(void *cmd,
++					   struct cvp_hal_session *session,
++					   u32 iova,
++					   u32 size);
++
+ #endif
+diff --git a/qcom/opensource/eva-kernel/msm/eva/hfi_response_handler.c b/qcom/opensource/eva-kernel/msm/eva/hfi_response_handler.c
+--- a/qcom/opensource/eva-kernel/msm/eva/hfi_response_handler.c
++++ b/qcom/opensource/eva-kernel/msm/eva/hfi_response_handler.c
+@@ -519,7 +519,7 @@
+ 		dprintk(CVP_ERR, "%s: invalid param\n", __func__);
+ 		return -EINVAL;
+ 	} else if (pkt->size != sizeof(struct cvp_hfi_dumpmsg_session_hdr)) {
+-		dprintk(CVP_ERR, "%s: bad_pkt_size %d, expected pkt_size %d\n",
++		dprintk(CVP_ERR, "%s: bad_pkt_size %d, expected pkt_size %zu\n",
+ 			__func__, pkt->size, sizeof(struct cvp_hfi_dumpmsg_session_hdr));
+ 		if (pkt->size > sizeof(struct cvp_hfi_dumpmsg_session_hdr))
+ 			return -E2BIG;
+diff --git a/qcom/opensource/eva-kernel/msm/eva/msm_cvp.c b/qcom/opensource/eva-kernel/msm/eva/msm_cvp.c
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp.c
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include "msm_cvp.h"
+ #include "cvp_hfi.h"
+ #include "cvp_core_hfi.h"
+@@ -427,7 +428,7 @@
+ 			current->comm, __func__, rc,
+ 			pkt->session_id, pkt->client_data.data1);
+ 
+-		dprintk(CVP_ERR, "pkt_type: 0x%x, frame_id: %llu, ktid: %llu\n",
++		dprintk(CVP_ERR, "pkt_type: 0x%x, frame_id: %u, ktid: %llu\n",
+ 			pkt->packet_type, pkt->client_data.transaction_id, ktid);
+ 
+ 		synx_state = SYNX_STATE_SIGNALED_CANCEL;
+@@ -1219,8 +1220,8 @@
+ 		goto stop_thread;
+ 	}
+ 
+-	pr_info_ratelimited(CVP_PID_TAG "session %llx (%#x) started\n",
+-		current->pid, current->tgid, "sess", inst, inst->sess_id);
++	pr_info_ratelimited(CVP_PID_TAG "session %pK (%#x) started\n",
++			    current->pid, current->tgid, "sess", inst, inst->sess_id);
+ 	CVPKERNEL_ATRACE_END("msm_cvp_session_start");
+ 
+ 	return 0;
+@@ -1257,7 +1258,7 @@
+ 	spin_lock(&sq->lock);
+ 
+ 	if (sq->state == QUEUE_STOP) {
+-		dprintk(CVP_WARN, "Session %llx (%#x) already stopped\n",
++		dprintk(CVP_WARN, "Session %pK (%#x) already stopped\n",
+ 			inst, inst->sess_id);
+ 		spin_unlock(&sq->lock);
+ 		rc = 0;
+@@ -1275,7 +1276,7 @@
+ 	rc = cvp_session_flush_all(inst);
+ 	if (rc) {
+ 		dprintk(CVP_ERR,
+-			"%s: cannot flush session %llx (%#x) rc %d\n",
++			"%s: cannot flush session %pK (%#x) rc %d\n",
+ 			__func__, inst, inst->sess_id, rc);
+ 		goto stop_thread;
+ 	}
+@@ -1344,7 +1345,7 @@
+ 
+ 	spin_lock(&sq->lock);
+ 	if (sq->state == QUEUE_STOP) {
+-		dprintk(CVP_WARN, "Session %llx (%#x) already stopped\n",
++		dprintk(CVP_WARN, "Session %pK (%#x) already stopped\n",
+ 			inst, inst->sess_id);
+ 		spin_unlock(&sq->lock);
+ 		rc = 0;
+@@ -1805,8 +1806,8 @@
+ 	wait_time = count * 1000;
+ 	wait_time *= inst->core->resources.msm_cvp_hw_rsp_timeout;
+ 
+-	dprintk(CVP_SYNX, "%s: wait %d us for %d fence command\n",
+-			__func__, wait_time, count);
++	dprintk(CVP_SYNX, "%s: wait %lu us for %d fence command\n",
++		__func__, wait_time, count);
+ 
+ 	count = 0;
+ 	max_count = wait_time / 100;
+@@ -1932,8 +1933,8 @@
+ 	if (!s)
+ 		return -ECONNRESET;
+ 
+-	dprintk(CVP_SESS, "session %llx (%#x)flush all starts\n",
+-			inst, inst->sess_id);
++	dprintk(CVP_SESS, "session %pK (%#x)flush all starts\n",
++		inst, inst->sess_id);
+ 	q = &inst->fence_cmd_queue;
+ 	ops_tbl = inst->core->dev_ops;
+ 
+diff --git a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_buf.c b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_buf.c
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_buf.c
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_buf.c
+@@ -6,6 +6,7 @@
+ 
+ #include <linux/pid.h>
+ #include <linux/fdtable.h>
++#include <linux/file.h>
+ #include <linux/rcupdate.h>
+ #include <linux/fs.h>
+ #include <linux/dma-buf.h>
+@@ -33,7 +34,7 @@
+ #define CLEAR_USE_BITMAP(idx, inst) \
+ 	do { \
+ 		clear_bit(idx, &inst->dma_cache.usage_bitmap); \
+-		dprintk(CVP_MEM, "clear %x bit %d dma_cache bitmap 0x%llx\n", \
++		dprintk(CVP_MEM, "clear %x bit %d dma_cache bitmap 0x%lx\n", \
+ 			inst->sess_id, smem->bitmap_index, \
+ 			inst->dma_cache.usage_bitmap); \
+ 	} while (0)
+@@ -41,7 +42,7 @@
+ #define SET_USE_BITMAP(idx, inst) \
+ 	do { \
+ 		set_bit(idx, &inst->dma_cache.usage_bitmap); \
+-		dprintk(CVP_MEM, "Set %x bit %d dma_cache bitmap 0x%llx\n", \
++		dprintk(CVP_MEM, "Set %x bit %d dma_cache bitmap 0x%lx\n", \
+ 			inst->sess_id, idx, \
+ 			inst->dma_cache.usage_bitmap); \
+ 	} while (0)
+@@ -66,24 +67,24 @@
+ 		return 0;
+ 
+ 	if (!inst || !smem) {
+-		dprintk(CVP_ERR, "Invalid inst 0x%llx or smem 0x%llx\n",
+-				inst, smem);
++		dprintk(CVP_ERR, "Invalid inst %pK or smem %pK\n",
++			inst, smem);
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (smem->dma_buf) {
+ 		i = get_pkt_index_from_type(smem->pkt_type);
+ 		if (i > 0)
+-			strlcpy(name, cvp_hfi_defs[i].name, PKT_NAME_LEN);
++			strscpy(name, cvp_hfi_defs[i].name, PKT_NAME_LEN);
+ 
+ 		if (!atomic_read(&smem->refcount))
+ 			dprintk(tag,
+-				" UNUSED mapping %s: 0x%llx size %d iova %#x idx %d pkt_type %s buf_idx %#x fd %d\n",
++				" UNUSED mapping %s: %pK size %d iova %#x idx %d pkt_type %s buf_idx %#x fd %d\n",
+ 				str, smem->dma_buf,
+ 				smem->size, smem->device_addr, smem->bitmap_index, name, smem->buf_idx, smem->fd);
+ 		else
+ 			dprintk(tag,
+-				"%s: %x : 0x%llx size %d flags %#x iova %#x idx %d ref %d pkt_type %s buf_idx %#x fd %d\n",
++				"%s: %x : %pK size %d flags %#x iova %#x idx %d ref %d pkt_type %s buf_idx %#x fd %d\n",
+ 				str, inst->sess_id, smem->dma_buf,
+ 				smem->size, smem->flags, smem->device_addr,
+ 				smem->bitmap_index, atomic_read(&smem->refcount),
+@@ -100,7 +101,7 @@
+ 
+ 	if (cbuf->smem->dma_buf) {
+ 		dprintk(tag,
+-		"%s: %x : fd %d off %d 0x%llx %s size %d iova %#x\n",
++		"%s: %x : fd %d off %d %pK %s size %d iova %#x\n",
+ 		str, inst->sess_id, cbuf->fd,
+ 		cbuf->offset, cbuf->smem->dma_buf, cbuf->smem->dma_buf->name,
+ 		cbuf->size, cbuf->smem->device_addr);
+@@ -241,31 +242,19 @@
+ static struct file *msm_cvp_fget(unsigned int fd, struct task_struct *task,
+ 			fmode_t mask, unsigned int refs)
+ {
+-	struct files_struct *files = task->files;
++	unsigned int found = fd;
+ 	struct file *file;
+ 
+-	if (!files)
++	if (!task)
+ 		return NULL;
+-
+ 	rcu_read_lock();
+-loop:
+-#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 13, 0))
+-	file = fcheck_files(files, fd);
+-#else
+-	file = files_lookup_fd_rcu(files, fd);
+-#endif
+-	if (file) {
+-		/* File object ref couldn't be taken.
+-		 * dup2() atomicity guarantee is the reason
+-		 * we loop to catch the new file (or NULL pointer)
+-		 */
+-		if (file->f_mode & mask)
+-			file = NULL;
+-		else if (!get_file_rcu(file))
+-			goto loop;
+-	}
++	file = fget_task_next(task, &found);
+ 	rcu_read_unlock();
+ 
++	if (file && (found != fd || (file->f_mode & mask))) {
++		fput(file);
++		return NULL;
++	}
+ 	return file;
+ }
+ 
+@@ -311,13 +300,13 @@
+ 	}
+ 
+ 	if (dma_buf->size < buf->size) {
+-		dprintk(CVP_ERR, "%s DSP client buffer too large %d > %d\n",
++		dprintk(CVP_ERR, "%s DSP client buffer too large %d > %zu\n",
+ 			__func__, buf->size, dma_buf->size);
+ 		rc =  -EINVAL;
+ 		goto exit;
+ 	}
+ 
+-	dprintk(CVP_MEM, "dma_buf from internal %llu\n", dma_buf);
++	dprintk(CVP_MEM, "dma_buf from internal %pK\n", dma_buf);
+ 
+ 	cbuf = cvp_kmem_cache_zalloc(&cvp_driver->buf_cache, GFP_KERNEL);
+ 	if (!cbuf) {
+@@ -336,7 +325,7 @@
+ 	smem->pkt_type = 0;
+ 	smem->buf_idx = 0;
+ 	smem->fd = buf->fd;
+-	dprintk(CVP_MEM, "%s: dma_buf = %llx\n", __func__, dma_buf);
++	dprintk(CVP_MEM, "%s: dma_buf = %pK\n", __func__, dma_buf);
+ 	rc = msm_cvp_map_smem(inst, smem, "map dsp");
+ 	if (rc) {
+ 		print_client_buffer(CVP_ERR, "map failed", inst, buf);
+@@ -503,7 +492,7 @@
+ 	smem->pkt_type = 0;
+ 	smem->buf_idx = 0;
+ 	smem->fd = buf->fd;
+-	dprintk(CVP_MEM, "%s: dma_buf = %llx", __func__, dma_buf);
++	dprintk(CVP_MEM, "%s: dma_buf = %pK", __func__, dma_buf);
+ 	rc = msm_cvp_map_smem(inst, smem, "map wncc");
+ 	if (rc) {
+ 		dprintk(CVP_ERR, "%s: map failed", __func__);
+@@ -1231,7 +1220,7 @@
+ 		}
+ 		if (dmabuf->size < wncc_metadata_bufs[i].size) {
+ 			dprintk(CVP_ERR,
+-				"%s: wncc_metadata_bufs[%d] size %d is more than dma buf size %d",
++				"%s: wncc_metadata_bufs[%d] size %d is more than dma buf size %zu",
+ 				__func__, i, wncc_metadata_bufs[i].size, dmabuf->size);
+ 			dma_buf_put(dmabuf);
+ 			rc = -EINVAL;
+@@ -1311,7 +1300,7 @@
+ 	}
+ 
+ 	dprintk(CVP_MEM,
+-		"%s: cache operation enabled for dma_buf: %llx, cache_op: %d, offset: %d, size: %d\n",
++		"%s: cache operation enabled for dma_buf: %pK, cache_op: %d, offset: %d, size: %d\n",
+ 		__func__, smem->dma_buf, cache_op, offset, size);
+ 	msm_cvp_smem_cache_operations(smem->dma_buf, cache_op, offset, size);
+ }
+@@ -1414,7 +1403,7 @@
+ 				"%s: reached limit, fallback to buf mapping list\n"
+ 				, __func__);
+ 			dprintk(CVP_WARN,
+-				"%s: fd %d, dma_buf %#llx, smem->refcount %d\n"
++				"%s: fd %d, dma_buf %pK, smem->refcount %d\n"
+ 				, __func__, smem->fd, smem->dma_buf, atomic_read(&smem->refcount));
+ 			mutex_unlock(&inst->dma_cache.lock);
+ 			return -ENOMEM;
+@@ -1424,7 +1413,7 @@
+ 	atomic_inc(&smem->refcount);
+ 	mutex_unlock(&inst->dma_cache.lock);
+ 	dprintk(CVP_MEM, "%s: Added entry %d into cache\n", __func__, i);
+-	dprintk(CVP_MEM, "%s: fd %d, dma_buf %#llx, smem->refcount %d\n",
++	dprintk(CVP_MEM, "%s: fd %d, dma_buf %pK, smem->refcount %d\n",
+ 		__func__, smem->fd, smem->dma_buf, atomic_read(&smem->refcount));
+ 
+ 	return 0;
+@@ -1491,7 +1480,7 @@
+ 			goto exit;
+ 		if (!IS_CVP_BUF_VALID(buf, smem)) {
+ 			dprintk(CVP_ERR,
+-				"%s: invalid buf %d %d fd %d dma 0x%llx %s %d type %#x\n",
++				"%s: invalid buf %d %d fd %d dma %pK %s %zu type %#x\n",
+ 				__func__, buf->offset, buf->size, buf->fd,
+ 				dma_buf, dma_buf->name, dma_buf->size, pkt_type);
+ 			goto exit2;
+@@ -1553,7 +1542,7 @@
+ 			if (atomic_dec_and_test(&smem->refcount)) {
+ 				*iova = smem->device_addr;
+ 				dprintk(CVP_MEM,
+-					"Unmap persist fd %d, dma_buf %#llx iova %#x\n",
++					"Unmap persist fd %d, dma_buf %pK iova %#x\n",
+ 					pbuf->fd, smem->dma_buf, *iova);
+ 				list_del(&pbuf->list);
+ 
+@@ -1580,7 +1569,7 @@
+ 				return 0;
+ 			}
+ 			dprintk(CVP_INFO, "%s - pbuf in use, smem refcount: %d",
+-					__func__, pbuf->smem->refcount);
++					__func__, atomic_read(&pbuf->smem->refcount));
+ 			mutex_unlock(&inst->dma_cache.lock);
+ 			mutex_unlock(&inst->persistbufs.lock);
+ 			dma_buf_put(dma_buf);
+@@ -1632,7 +1621,7 @@
+ 			atomic_inc(&pbuf->smem->refcount);
+ 			dma_buf_put(dma_buf);
+ 			dprintk(CVP_MEM,
+-				"map persist Reuse fd %d, dma_buf %#llx\n",
++				"map persist Reuse fd %d, dma_buf %pK\n",
+ 				pbuf->fd, pbuf->smem->dma_buf);
+ 			return 0;
+ 		}
+@@ -2174,10 +2163,10 @@
+ 	return rc;
+ }
+ 
+-void msm_cvp_populate_dsp_buf_info(struct cvp_internal_buf *buf,
+-								struct cvp_hal_session *session,
+-								u32 session_id,
+-								struct msm_cvp_core *core)
++static void msm_cvp_populate_dsp_buf_info(struct cvp_internal_buf *buf,
++					  struct cvp_hal_session *session,
++					  u32 session_id,
++					  struct msm_cvp_core *core)
+ {
+ 	struct cvp_hfi_ops *dev_ops = (struct cvp_hfi_ops *) core->dev_ops;
+ 	struct iris_hfi_device *cvp_device = (struct iris_hfi_device *) dev_ops->hfi_device_data;
+@@ -2614,31 +2603,23 @@
+ 
+ int msm_cvp_dma_buf_vmap(struct dma_buf *dmabuf, struct cvp_dma_buf_vmap *vmap)
+ {
+-	int ret = 0;
+-
+-	#if (KERNEL_VERSION(6, 2, 0) <= LINUX_VERSION_CODE)
+-		ret = dma_buf_vmap_unlocked(dmabuf, &vmap->map);
+-		vmap->vaddr = vmap->map.vaddr;
+-	#elif (KERNEL_VERSION(5, 11, 0) <= LINUX_VERSION_CODE)
+-		ret = dma_buf_vmap(dmabuf, &vmap->map);
+-		vmap->vaddr = vmap->map.vaddr;
+-	#else
+-		vmap->vaddr = dma_buf_vmap(dmabuf);
+-		if (!vmap->vaddr)
+-			ret = -EINVAL;
+-	#endif
+-
+-	return ret;
++	int rc;
++
++	rc = dma_buf_vmap_unlocked(dmabuf, &vmap->map);
++	if (rc)
++		return rc;
++	if (vmap->map.is_iomem) {
++		dma_buf_vunmap_unlocked(dmabuf, &vmap->map);
++		return -EOPNOTSUPP;
++	}
++	vmap->vaddr = vmap->map.vaddr;
++	return 0;
+ }
+ 
+ void msm_cvp_dma_buf_vunmap(struct dma_buf *dmabuf, struct cvp_dma_buf_vmap *vmap)
+ {
+-	#if (KERNEL_VERSION(6, 2, 0) <= LINUX_VERSION_CODE)
+-		dma_buf_vunmap_unlocked(dmabuf, &vmap->map);
+-	#elif (KERNEL_VERSION(5, 11, 0) <= LINUX_VERSION_CODE)
+-		dma_buf_vunmap(dmabuf, &vmap->map);
+-	#else
+-		dma_buf_vunmap(dmabuf, vmap->vaddr);
+-	#endif
+-}
+-
++	/* Callers retain the normal-memory address across the mapping lifetime. */
++	iosys_map_set_vaddr(&vmap->map, vmap->vaddr);
++	dma_buf_vunmap_unlocked(dmabuf, &vmap->map);
++	vmap->vaddr = NULL;
++}
+diff --git a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_buf.h b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_buf.h
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_buf.h
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_buf.h
+@@ -19,7 +19,7 @@
+ #define MAX_FRAME_BUFFER_NUMS 40
+ #define MAX_DMABUF_NUMS 64
+ #define IS_CVP_BUF_VALID(buf, smem) \
+-	((buf->size <= smem->size) && \
++	((buf->offset <= smem->size) && \
+ 	(buf->size <= smem->size - buf->offset))
+ 
+ struct msm_cvp_inst;
+diff --git a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_clocks.c b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_clocks.c
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_clocks.c
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_clocks.c
+@@ -51,8 +51,7 @@
+ #endif
+ }
+ 
+-int msm_cvp_mmrm_notifier_cb(
+-	struct mmrm_client_notifier_data *notifier_data)
++static int msm_cvp_mmrm_notifier_cb(struct mmrm_client_notifier_data *notifier_data)
+ {
+ 	if (!notifier_data) {
+ 		dprintk(CVP_WARN, "%s Invalid notifier data: %pK\n",
+@@ -119,8 +118,8 @@
+ 		if (cl->has_scaling) {	/* only clk source enabled in dtsi */
+ 			device->mmrm_desc.client_info.desc.clk=cl->clk;
+ 			device->mmrm_desc.client_info.desc.client_id=cl->clk_id;
+-			strlcpy(name, cl->name,
+-			sizeof(device->mmrm_desc.client_info.desc.name));
++			strscpy(name, cl->name,
++				sizeof(device->mmrm_desc.client_info.desc.name));
+ 		}
+ 	}
+ 
+@@ -145,7 +144,7 @@
+ 		rc = -ENOENT;
+ 	} else {
+ 		dprintk(CVP_PWR,
+-			"%s: mmrm_client_register done: %pK, type:%d, uid:%ld\n",
++			"%s: mmrm_client_register done: %pK, type:%d, uid:%u\n",
+ 			__func__, device->mmrm_cvp,
+ 			device->mmrm_cvp->client_type,
+ 			device->mmrm_cvp->client_uid);
+@@ -212,7 +211,7 @@
+ 	}
+ 
+ 	dprintk(CVP_PWR,
+-		"%s: set clock rate for mmrm_cvp: %pK, type :%d, uid: %ld\n",
++		"%s: set clock rate for mmrm_cvp: %pK, type :%d, uid: %u\n",
+ 		__func__, device->mmrm_cvp,
+ 		device->mmrm_cvp->client_type, device->mmrm_cvp->client_uid);
+ 
+@@ -222,13 +221,13 @@
+ 	data.flags = 0;		/* Not MMRM_CLIENT_DATA_FLAG_RESERVE_ONLY */
+ 
+ 	dprintk(CVP_PWR,
+-		"%s: set clock rate to min %u cur %u: %d\n",
++		"%s: set clock rate to min %lu cur %lu: %d\n",
+ 		__func__, val.min, val.cur, rc);
+ 
+ 	rc = __mmrm_client_set_value_in_range(device->mmrm_cvp, &data, &val);
+ 	if (rc) {
+ 		dprintk(CVP_ERR,
+-			"%s: Failed to set clock rate to min %u cur %u: %d\n",
++			"%s: Failed to set clock rate to min %lu cur %lu: %d\n",
+ 			__func__, val.min, val.cur, rc);
+ 	}
+ 	return rc;
+@@ -242,7 +241,7 @@
+ 	// ratio factor for clock source : clk
+ 	u32 freq_min = device->res->allowed_clks_tbl[0].clock_rate * fsrc2clk;
+ 
+-	dprintk(CVP_PWR, "%s: entering with freq : %ld\n", __func__, freq);
++	dprintk(CVP_PWR, "%s: entering with freq : %u\n", __func__, freq);
+ 
+ 	iris_hfi_for_each_clock(device, cl) {
+ 		if (cl->has_scaling) {/* has_scaling */
+@@ -252,7 +251,7 @@
+ 
+ 			freq = freq * fsrc2clk;
+ 			dprintk(CVP_PWR,
+-				"%s: clock source rate set to: %ld\n",
++				"%s: clock source rate set to: %u\n",
+ 				__func__, freq);
+ 
+ 			if (device->mmrm_cvp != NULL) {
+@@ -481,12 +480,12 @@
+ 
+ 	if (!bus->client)
+ 		return -EINVAL;
+-	dprintk(CVP_PWR, "bus->name = %s to bw = %u\n",
+-			bus->name, bw);
++	dprintk(CVP_PWR, "bus->name = %s to bw = %lu\n",
++		bus->name, bw);
+ 
+ 	rc = icc_set_bw(bus->client, bw, 0);
+ 	if (rc)
+-		dprintk(CVP_ERR, "Failed voting bus %s to ab %u\n",
++		dprintk(CVP_ERR, "Failed voting bus %s to ab %lu\n",
+ 			bus->name, bw);
+ 
+ 	return rc;
+diff --git a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_common.c b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_common.c
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_common.c
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_common.c
+@@ -142,7 +142,7 @@
+ void cvp_put_inst(struct msm_cvp_inst *inst)
+ {
+ 	if (!inst || (kref_read(&inst->kref) < 1)) {
+-		dprintk(CVP_ERR, "Invalid session %llx\n", inst);
++		dprintk(CVP_ERR, "Invalid session %pK\n", inst);
+ 		WARN_ON(true);
+ 		return;
+ 	}
+@@ -321,7 +321,7 @@
+ 			SYS_MSG_INDEX(HAL_SYS_RELEASE_RESOURCE_DONE)]);
+ }
+ 
+-void change_cvp_inst_state(struct msm_cvp_inst *inst, enum instance_state state)
++static void change_cvp_inst_state(struct msm_cvp_inst *inst, enum instance_state state)
+ {
+ 	if (!inst) {
+ 		dprintk(CVP_ERR, "Invalid parameter %s\n", __func__);
+@@ -431,8 +431,8 @@
+ 	core = cvp_driver->cvp_core;
+ 	inst = cvp_get_inst(cvp_driver->cvp_core, response->session_id);
+ 	if (!inst) {
+-		dprintk(CVP_WARN, "%s:Got a response for an inactive session %#x\n",
+-				__func__, response->session_id);
++		dprintk(CVP_WARN, "%s:Got a response for an inactive session %pK\n",
++			__func__, response->session_id);
+ 		list_for_each_entry(inst, &core->instances, list) {
+ 			if (kref_get_unless_zero(&inst->kref)) {
+ 				cvp_print_inst(CVP_WARN, inst);
+@@ -772,8 +772,8 @@
+ 	core = cvp_driver->cvp_core;
+ 	inst = cvp_get_inst(cvp_driver->cvp_core, response->session_id);
+ 	if (!inst) {
+-		dprintk(CVP_WARN, "%s: response for an inactive session %#x\n",
+-				__func__, response->session_id);
++		dprintk(CVP_WARN, "%s: response for an inactive session %pK\n",
++			__func__, response->session_id);
+ 
+ 		list_for_each_entry_safe(inst, temp, &core->instances, list)
+ 			cvp_print_inst(CVP_WARN, inst);
+@@ -1167,7 +1167,7 @@
+ 	"CORE_INVALID"
+ };
+ 
+-int msm_cvp_state_result_check(struct msm_cvp_inst *inst, int input, int state)
++static int msm_cvp_state_result_check(struct msm_cvp_inst *inst, int input, int state)
+ {
+ 	if (input == -ETIMEDOUT) {
+ 		dprintk(CVP_ERR,
+@@ -1343,7 +1343,7 @@
+ 		mutex_lock(&core->lock);
+ 		list_for_each_entry_safe(inst, inst_temp, &core->instances, list) {
+ 			dprintk(CVP_WARN,
+-				"Session to abort: inst %#x ref %x\n",
++				"Session to abort: inst %pK ref %x\n",
+ 				inst, kref_read(&inst->kref));
+ 			if (inst != NULL) {
+ 				s = cvp_get_inst_validate(inst->core, inst);
+@@ -1370,7 +1370,7 @@
+ 		mutex_lock(&core->lock);
+ 		list_for_each_entry_safe(inst, inst_t, &core->instances, list) {
+ 			if (inst != NULL) {
+-				dprintk(CVP_INFO, "Session to be taken for session error 0x%x\n",
++				dprintk(CVP_INFO, "Session to be taken for session error %pK\n",
+ 					inst);
+ 				response.session_id = inst;
+ 				break;
+@@ -1395,7 +1395,7 @@
+ 		mutex_lock(&core->lock);
+ 		list_for_each_entry_safe(inst, inst_t,  &core->instances, list) {
+ 			if (inst != NULL) {
+-				dprintk(CVP_INFO, "Session to be taken for session timeout 0x%x\n",
++				dprintk(CVP_INFO, "Session to be taken for session timeout %pK\n",
+ 					inst);
+ 				handle_session_timeout(inst, false);
+ 				break;
+diff --git a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_core.c b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_core.c
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_core.c
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_core.c
+@@ -151,7 +151,27 @@
+ 	wake_up_all(&inst->session_queue.wq);
+ }
+ 
+-struct msm_cvp_inst *msm_cvp_open(int session_type, struct task_struct *task)
++bool cvp_get_core(struct msm_cvp_core *core)
++{
++	bool acquired = false;
++
++	mutex_lock(&cvp_driver->lock);
++	if (core && cvp_driver->cvp_core == core && core->ready) {
++		refcount_inc(&core->users);
++		acquired = true;
++	}
++	mutex_unlock(&cvp_driver->lock);
++	return acquired;
++}
++
++void cvp_put_core(struct msm_cvp_core *core)
++{
++	if (refcount_dec_and_test(&core->users))
++		complete(&core->users_zero);
++}
++
++struct msm_cvp_inst *cvp_open_instance(int session_type,
++				       struct task_struct *task, struct cdev *cdev)
+ {
+ 	struct msm_cvp_inst *inst = NULL;
+ 	struct msm_cvp_core *core = NULL;
+@@ -159,11 +179,14 @@
+ 	int i = 0;
+ 	u32 instance_count;
+ 
++	mutex_lock(&cvp_driver->lock);
+ 	core = cvp_driver->cvp_core;
+-	if (!core) {
+-		dprintk(CVP_ERR, "%s CVP core not initialized\n", __func__);
+-		goto err_invalid_core;
+-	}
++	if (!core || !core->ready || !task || (cdev && core->cdev != cdev)) {
++		mutex_unlock(&cvp_driver->lock);
++		return NULL;
++	}
++	refcount_inc(&core->users);
++	mutex_unlock(&cvp_driver->lock);
+ 
+ 	if (!msm_cvp_auto_pil && session_type == MSM_CVP_BOOT) {
+ 		dprintk(CVP_SESS, "Auto PIL disabled, bypass CVP init at boot");
+@@ -177,8 +200,8 @@
+ 		list_for_each_entry(inst, &core->instances, list)
+ 			cvp_print_inst(CVP_ERR, inst);
+ 		mutex_unlock(&core->lock);
+-
+-		return NULL;
++		inst = NULL;
++		goto err_invalid_core;
+ 	}
+ 
+ 	inst = kzalloc(sizeof(*inst), GFP_KERNEL);
+@@ -244,7 +267,7 @@
+ 
+ 	inst->debugfs_root =
+ 		msm_cvp_debugfs_init_inst(inst, core->debugfs_root);
+-	strlcpy(inst->proc_name, task->comm, TASK_COMM_LEN);
++	strscpy(inst->proc_name, task->comm, TASK_COMM_LEN);
+ 
+ 	return inst;
+ fail_init:
+@@ -252,6 +275,7 @@
+ 	__deinit_fence_queue(inst);
+ 	mutex_lock(&core->lock);
+ 	list_del(&inst->list);
++	atomic_dec(&nr_insts);
+ 	mutex_unlock(&core->lock);
+ 	mutex_destroy(&inst->sync_lock);
+ 	mutex_destroy(&inst->lock);
+@@ -265,7 +289,13 @@
+ 	kfree(inst);
+ 	inst = NULL;
+ err_invalid_core:
++	cvp_put_core(core);
+ 	return inst;
++}
++
++struct msm_cvp_inst *msm_cvp_open(int session_type, struct task_struct *task)
++{
++	return cvp_open_instance(session_type, task, NULL);
+ }
+ EXPORT_SYMBOL(msm_cvp_open);
+ 
+@@ -367,7 +397,7 @@
+ stop_session:
+ 	tmp = cvp_get_inst_validate(inst->core, inst);
+ 	if (!tmp) {
+-		dprintk(CVP_ERR, "%s has a invalid session %llx\n",
++		dprintk(CVP_ERR, "%s has a invalid session %pK\n",
+ 			__func__, inst);
+ 		goto exit;
+ 	}
+@@ -465,6 +495,7 @@
+ 		atomic_read(&cvp_driver->frame_cache.nr_objs),
+ 		atomic_read(&cvp_driver->buf_cache.nr_objs),
+ 		atomic_read(&cvp_driver->smem_cache.nr_objs));
++	cvp_put_core(core);
+ 	return 0;
+ }
+ 
+@@ -509,7 +540,7 @@
+ 		rc = msm_cvp_cleanup_instance(inst);
+ 		if (rc) {
+ 			dprintk(CVP_ERR,
+-				"%s: cleanup instance failed for session %llx (%#x) rc %d\n",
++				"%s: cleanup instance failed for session %pK (%#x) rc %d\n",
+ 				__func__, inst, inst->sess_id, rc);
+ 			return -EINVAL;
+ 		}
+diff --git a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_debug.c b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_debug.c
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_debug.c
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_debug.c
+@@ -494,17 +494,6 @@
+ 	return 0;
+ }
+ 
+-static void put_inst_helper(struct kref *kref)
+-{
+-	struct msm_cvp_inst *inst;
+-
+-	if (!kref)
+-		return;
+-	inst = container_of(kref, struct msm_cvp_inst, kref);
+-
+-	msm_cvp_destroy(inst);
+-}
+-
+ static ssize_t inst_info_read(struct file *file, char __user *buf,
+ 		size_t count, loff_t *ppos)
+ {
+@@ -528,11 +517,10 @@
+ 		if (temp == inst)
+ 			break;
+ 	}
+-	inst = ((temp == inst) && kref_get_unless_zero(&inst->kref)) ?
+-		inst : NULL;
+-	mutex_unlock(&core->lock);
++	inst = (temp == inst) ? inst : NULL;
+ 
+ 	if (!inst) {
++		mutex_unlock(&core->lock);
+ 		dprintk(CVP_ERR, "%s: Instance has become obsolete", __func__);
+ 		return 0;
+ 	}
+@@ -566,7 +554,7 @@
+ 
+ 	kfree(dbuf);
+ failed_alloc:
+-	kref_put(&inst->kref, put_inst_helper);
++	mutex_unlock(&core->lock);
+ 	return len;
+ }
+ 
+@@ -590,7 +578,7 @@
+ 	char debugfs_name[MAX_DEBUGFS_NAME];
+ 	struct cvp_core_inst_pair *idata = NULL;
+ 
+-	if (!inst) {
++	if (!inst || IS_ERR_OR_NULL(parent)) {
+ 		dprintk(CVP_ERR, "Invalid params, inst: %pK\n", inst);
+ 		goto exit;
+ 	}
+@@ -614,7 +602,7 @@
+ 
+ 	info = debugfs_create_file("info", 0444, dir,
+ 			idata, &inst_info_fops);
+-	if (!info) {
++	if (IS_ERR_OR_NULL(info)) {
+ 		dprintk(CVP_ERR, "debugfs_create_file: info fail\n");
+ 		goto failed_create_file;
+ 	}
+@@ -634,17 +622,14 @@
+ 
+ void msm_cvp_debugfs_deinit_inst(struct msm_cvp_inst *inst)
+ {
+-	struct dentry *dentry = NULL;
+-
+-	if (!inst || !inst->debugfs_root)
++	struct cvp_core_inst_pair *idata;
++	struct dentry *dentry;
++
++	if (!inst || IS_ERR_OR_NULL(inst->debugfs_root))
+ 		return;
+-
+ 	dentry = inst->debugfs_root;
+-	if (dentry->d_inode) {
+-		dprintk(CVP_INFO, "Destroy %pK\n", dentry->d_inode->i_private);
+-		kfree(dentry->d_inode->i_private);
+-		dentry->d_inode->i_private = NULL;
+-	}
++	idata = dentry->d_inode->i_private;
+ 	debugfs_remove_recursive(dentry);
++	kfree(idata);
+ 	inst->debugfs_root = NULL;
+ }
+diff --git a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_dsp.c b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_dsp.c
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_dsp.c
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_dsp.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2023-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ #include <linux/module.h>
++#include <linux/workqueue.h>
+ #include <linux/rpmsg.h>
+ #include <linux/of_platform.h>
+ #include <linux/of_fdt.h>
+@@ -25,6 +26,8 @@
+ static int cvp_reinit_dsp(void);
+ 
+ static void cvp_remove_dsp_sessions(void);
++static void cvp_fastrpc_cleanup_worker(struct work_struct *work);
++static DECLARE_WORK(cvp_fastrpc_cleanup_work, cvp_fastrpc_cleanup_worker);
+ 
+ static int __fastrpc_driver_register(struct fastrpc_driver *driver)
+ {
+@@ -340,87 +343,43 @@
+ static bool dequeue_frpc_node(struct cvp_dsp_fastrpc_driver_entry *node)
+ {
+ 	struct cvp_dsp_apps *me = &gfa_cv;
+-	struct cvp_dsp_fastrpc_driver_entry *frpc_node = NULL;
+-	struct list_head *ptr = NULL, *next = NULL;
+-	u32 refcount, max_count = 10;
+-	bool rc = false;
+-
+-	if (!node)
+-		return rc;
+-
+-search_again:
+-	ptr = &me->fastrpc_driver_list.list;
++	struct cvp_dsp_fastrpc_driver_entry *entry;
++	bool found = false;
++
+ 	mutex_lock(&me->fastrpc_driver_list.lock);
+-	list_for_each_safe(ptr, next, &me->fastrpc_driver_list.list) {
+-		frpc_node = list_entry(ptr,
+-			struct cvp_dsp_fastrpc_driver_entry, list);
+-
+-		if (frpc_node == node) {
+-			refcount = atomic_read(&frpc_node->refcount);
+-			if (refcount > 0) {
+-				mutex_unlock(&me->fastrpc_driver_list.lock);
+-				usleep_range(5000, 10000);
+-				if (max_count-- == 0) {
+-					dprintk(CVP_ERR, "%s timeout %d\n",
+-						__func__, refcount);
+-					WARN_ON(true);
+-					goto exit;
+-				}
+-				goto search_again;
+-			}
+-			list_del(&frpc_node->list);
+-			rc = true;
++	list_for_each_entry(entry, &me->fastrpc_driver_list.list, list) {
++		if (entry == node) {
++			list_del(&entry->list);
++			found = true;
+ 			break;
+ 		}
+ 	}
+ 	mutex_unlock(&me->fastrpc_driver_list.lock);
+-exit:
+-	return rc;
+-}
+-
+-/* The function may not return for up to 50ms */
++	/* Release the caller's lookup reference after deciding who removes it. */
++	atomic_dec(&node->refcount);
++	/* Withdrawal prevents new lookups; the removing task now owns the node. */
++	if (found)
++		while (atomic_read(&node->refcount))
++			usleep_range(5000, 10000);
++	return found;
++}
++
+ static struct cvp_dsp_fastrpc_driver_entry *pop_frpc_node(void)
+ {
+ 	struct cvp_dsp_apps *me = &gfa_cv;
+-	struct cvp_dsp_fastrpc_driver_entry *frpc_node = NULL;
+-	struct list_head *ptr = NULL, *next = NULL;
+-	u32 refcount, max_count = 10;
+-
+-search_again:
+-	ptr = &me->fastrpc_driver_list.list;
+-	if (!ptr) {
+-		frpc_node = NULL;
+-		goto exit;
+-	}
++	struct cvp_dsp_fastrpc_driver_entry *node = NULL;
+ 
+ 	mutex_lock(&me->fastrpc_driver_list.lock);
+-	list_for_each_safe(ptr, next, &me->fastrpc_driver_list.list) {
+-		if (!ptr)
+-			break;
+-		frpc_node = list_entry(ptr,
+-			struct cvp_dsp_fastrpc_driver_entry, list);
+-
+-		if (frpc_node) {
+-			refcount = atomic_read(&frpc_node->refcount);
+-			if (refcount > 0) {
+-				mutex_unlock(&me->fastrpc_driver_list.lock);
+-				usleep_range(5000, 10000);
+-				if (max_count-- == 0) {
+-					dprintk(CVP_ERR, "%s timeout\n",
+-							__func__);
+-					frpc_node = NULL;
+-					goto exit;
+-				}
+-				goto search_again;
+-			}
+-			list_del(&frpc_node->list);
+-			break;
+-		}
+-	}
+-
++	if (!list_empty(&me->fastrpc_driver_list.list)) {
++		node = list_first_entry(&me->fastrpc_driver_list.list,
++					struct cvp_dsp_fastrpc_driver_entry, list);
++		list_del(&node->list);
++	}
+ 	mutex_unlock(&me->fastrpc_driver_list.lock);
+-exit:
+-	return frpc_node;
++	if (node)
++		while (atomic_read(&node->refcount))
++			usleep_range(5000, 10000);
++	return node;
+ }
+ 
+ static void cvp_dsp_rpmsg_remove(struct rpmsg_device *rpdev)
+@@ -465,8 +424,16 @@
+ static int cvp_dsp_rpmsg_callback(struct rpmsg_device *rpdev,
+ 	void *data, int len, void *priv, u32 addr)
+ {
+-	struct cvp_dsp_rsp_msg *rsp = (struct cvp_dsp_rsp_msg *)data;
+-	struct cvp_dsp_apps *me = &gfa_cv;
++	union {
++		struct cvp_dsp_rsp_msg rsp;
++		struct cvp_dsp2cpu_cmd cmd;
++	} packet;
++	struct cvp_dsp_rsp_msg *rsp = &packet.rsp;
++	struct cvp_dsp_apps *me = &gfa_cv;
++
++	if (!data || (len != sizeof(packet.rsp) && len != sizeof(packet.cmd)))
++		return -EINVAL;
++	memcpy(&packet, data, len);
+ 
+ 	dprintk(CVP_DSP, "%s: type = 0x%x ret = 0x%x len = 0x%x\n",
+ 		__func__, rsp->type, rsp->ret, len);
+@@ -482,12 +449,12 @@
+ 					me->pending_dsp2cpu_rsp.type);
+ 			goto exit;
+ 		}
+-	} else if (rsp->type < CVP_DSP_MAX_CMD
++	} else if (rsp->type >= DSP2CPU_POWERON && rsp->type < CVP_DSP_MAX_CMD
+ 			&& len == sizeof(struct cvp_dsp2cpu_cmd)
+ 			) {
+ 		if (me->pending_dsp2cpu_cmd.type != CVP_INVALID_RPMSG_TYPE) {
+ 			dprintk(CVP_ERR,
+-				"%s: DSP2CPU cmd:%d pending %d %d expect %d\n",
++				"%s: DSP2CPU cmd:%d pending %d %d expect %zu\n",
+ 					__func__, rsp->type,
+ 				me->pending_dsp2cpu_cmd.type, len,
+ 				sizeof(struct cvp_dsp2cpu_cmd));
+@@ -613,50 +580,39 @@
+ 	return rc;
+ }
+ 
++static void cvp_destroy_dsp_node(struct cvp_dsp_fastrpc_driver_entry *node)
++{
++	struct cvp_dsp_apps *me = &gfa_cv;
++	struct msm_cvp_inst *inst;
++
++	/* The node has been withdrawn and all lookup references have drained. */
++	for (;;) {
++		mutex_lock(&node->dsp_sessions.lock);
++		if (list_empty(&node->dsp_sessions.list)) {
++			mutex_unlock(&node->dsp_sessions.lock);
++			break;
++		}
++		inst = list_first_entry(&node->dsp_sessions.list,
++					struct msm_cvp_inst, dsp_list);
++		list_del(&inst->dsp_list);
++		node->session_cnt--;
++		mutex_unlock(&node->dsp_sessions.lock);
++		delete_dsp_session(inst, node);
++	}
++	__fastrpc_driver_unregister(&node->cvp_fastrpc_driver);
++	DEINIT_MSM_CVP_LIST(&node->dsp_sessions);
++	mutex_lock(&me->driver_name_lock);
++	eva_fastrpc_driver_release_name(node);
++	mutex_unlock(&me->driver_name_lock);
++	kfree(node);
++}
++
+ static void cvp_remove_dsp_sessions(void)
+ {
+-	struct cvp_dsp_apps *me = &gfa_cv;
+-	struct cvp_dsp_fastrpc_driver_entry *frpc_node = NULL;
+-	struct msm_cvp_inst *inst = NULL;
+-	struct list_head *s = NULL, *next_s = NULL;
+-
+-	while ((frpc_node = pop_frpc_node())) {
+-		s = &frpc_node->dsp_sessions.list;
+-		if (!s || !(s->next))
+-			return;
+-		list_for_each_safe(s, next_s,
+-				&frpc_node->dsp_sessions.list) {
+-			if (!s || !next_s)
+-				return;
+-			inst = list_entry(s, struct msm_cvp_inst,
+-					dsp_list);
+-			if (inst) {
+-				mutex_lock(&frpc_node->dsp_sessions.lock);
+-				list_del(&inst->dsp_list);
+-				frpc_node->session_cnt--;
+-				mutex_unlock(&frpc_node->dsp_sessions.lock);
+-				delete_dsp_session(inst, frpc_node);
+-			}
+-		}
+-
+-		dprintk(CVP_DSP, "%s DEINIT_MSM_CVP_LIST 0x%x\n",
+-				__func__, frpc_node->dsp_sessions);
+-		DEINIT_MSM_CVP_LIST(&frpc_node->dsp_sessions);
+-		dprintk(CVP_DSP, "%s list_del fastrpc node 0x%x\n",
+-				__func__, frpc_node);
+-		__fastrpc_driver_unregister(
+-				&frpc_node->cvp_fastrpc_driver);
+-		dprintk(CVP_DSP,
+-				"%s Unregistered fastrpc handle 0x%x\n",
+-				__func__, frpc_node->handle);
+-		mutex_lock(&me->driver_name_lock);
+-		eva_fastrpc_driver_release_name(frpc_node);
+-		mutex_unlock(&me->driver_name_lock);
+-		kfree(frpc_node);
+-		frpc_node = NULL;
+-	}
+-
+-	dprintk(CVP_WARN, "%s: EVA SSR handled for CDSP\n", __func__);
++	struct cvp_dsp_fastrpc_driver_entry *node;
++
++	while ((node = pop_frpc_node()))
++		cvp_destroy_dsp_node(node);
+ }
+ 
+ int cvp_dsp_shutdown(void)
+@@ -669,7 +625,7 @@
+ 	cmd.type = CPU2DSP_SHUTDOWN;
+ 
+ 	mutex_lock(&me->tx_lock);
+-	if (me->state == DSP_INVALID)
++	if (kthread_should_stop() || READ_ONCE(me->state) == DSP_INVALID)
+ 		goto exit;
+ 
+ 	me->state = DSP_INACTIVE;
+@@ -753,7 +709,7 @@
+ 			device->dsp_iface_q_table.align_virtual_addr;
+ 	q_tbl_hdr->qtbl_version = 0;
+ 	q_tbl_hdr->device_addr = (void *)device;
+-	strlcpy(q_tbl_hdr->name, "msm_cvp", sizeof(q_tbl_hdr->name));
++	strscpy(q_tbl_hdr->name, "msm_cvp", sizeof(q_tbl_hdr->name));
+ 	q_tbl_hdr->qtbl_size = CVP_IFACEQ_TABLE_SIZE;
+ 	q_tbl_hdr->qtbl_qhdr0_offset =
+ 				sizeof(struct cvp_hfi_queue_table_header);
+@@ -925,20 +881,19 @@
+ }
+ 
+ static int cvp_fastrpc_callback(struct fastrpc_device *rpc_dev,
+-			enum fastrpc_driver_status fastrpc_proc_num)
+-{
+-	dprintk(CVP_DSP, "%s handle 0x%x, proc %d\n", __func__,
+-			rpc_dev->handle, fastrpc_proc_num);
+-
+-	/* fastrpc drive down when process gone
+-	 * any handling can happen here, such as
+-	 * eva_fastrpc_driver_unregister(rpc_dev->handle, true);
+-	 */
+-	eva_fastrpc_driver_unregister(rpc_dev->handle, true);
+-
++				enum fastrpc_driver_status status)
++{
++	struct cvp_dsp_fastrpc_driver_entry *node;
++
++	/* FastRPC unregister can wait for this callback: never wait on rx_lock. */
++	node = cvp_get_fastrpc_node_with_handle(rpc_dev->handle);
++	if (node) {
++		WRITE_ONCE(node->cleanup_pending, true);
++		cvp_put_fastrpc_node(node);
++		schedule_work(&cvp_fastrpc_cleanup_work);
++	}
+ 	return 0;
+ }
+-
+ 
+ static struct fastrpc_driver cvp_fastrpc_client = {
+ 	.probe = cvp_fastrpc_probe,
+@@ -961,7 +916,7 @@
+ 		frpc_map_buf.attrs = 0;
+ 
+ 		dprintk(CVP_DSP,
+-			"%s frpc_map_buf size %d, dma_buf %pK, map %pK, 0x%x\n",
++			"%s frpc_map_buf size %zu, dma_buf %pK, map %pK, 0x%lx\n",
+ 			__func__, frpc_map_buf.size, frpc_map_buf.buf,
+ 			&frpc_map_buf, (unsigned long)&frpc_map_buf);
+ 		rc = __fastrpc_driver_invoke(frpc_device, FASTRPC_DEV_MAP_DMA,
+@@ -1143,14 +1098,15 @@
+ 			goto fail_fastrpc_driver_get_name;
+ 		}
+ 
+-		/* Init completion */
++		/* Registration retains the node until probe/wait handling finishes. */
++		atomic_set(&frpc_node->refcount, 1);
+ 		init_completion(&frpc_node->fastrpc_probe_completion);
+ 
+ 		mutex_lock(&me->fastrpc_driver_list.lock);
+ 		list_add_tail(&frpc_node->list, &me->fastrpc_driver_list.list);
+ 		INIT_MSM_CVP_LIST(&frpc_node->dsp_sessions);
+ 		mutex_unlock(&me->fastrpc_driver_list.lock);
+-		dprintk(CVP_DSP, "Add frpc node 0x%x to list\n", frpc_node);
++		dprintk(CVP_DSP, "Add frpc node %pK to list\n", frpc_node);
+ 
+ 		/* register fastrpc device to this session */
+ 		rc = __fastrpc_driver_register(&frpc_node->cvp_fastrpc_driver);
+@@ -1170,6 +1126,7 @@
+ 			skip_deregister = false;
+ 			goto fail_fastrpc_driver_register;
+ 		}
++		cvp_put_fastrpc_node(frpc_node);
+ 	} else {
+ 		dprintk(CVP_DSP, "%s fastrpc probe frpc_node %pK hdl 0x%x\n",
+ 			__func__, frpc_node, handle);
+@@ -1179,13 +1136,15 @@
+ 	return rc;
+ 
+ fail_fastrpc_driver_register:
+-	dequeue_frpc_node(frpc_node);
++	if (!dequeue_frpc_node(frpc_node))
++		return -EINVAL;
+ 	if (!skip_deregister)
+ 		__fastrpc_driver_unregister(&frpc_node->cvp_fastrpc_driver);
+ 
+ 	mutex_lock(&me->driver_name_lock);
+ 	eva_fastrpc_driver_release_name(frpc_node);
+ 	mutex_unlock(&me->driver_name_lock);
++	DEINIT_MSM_CVP_LIST(&frpc_node->dsp_sessions);
+ fail_fastrpc_driver_get_name:
+ 	kfree(frpc_node);
+ 	return -EINVAL;
+@@ -1193,44 +1152,48 @@
+ 
+ static void eva_fastrpc_driver_unregister(uint32_t handle, bool force_exit)
+ {
+-	struct cvp_dsp_apps *me = &gfa_cv;
+-	struct cvp_dsp_fastrpc_driver_entry *frpc_node = NULL;
+-	struct cvp_dsp2cpu_cmd *dsp2cpu_cmd = &me->pending_dsp2cpu_cmd;
+-
+-	dprintk(CVP_DSP, "%s Unregister fastrpc driver hdl %#x hdl %#x, f %d\n",
+-		__func__, handle, dsp2cpu_cmd->pid, (uint32_t)force_exit);
+-
+-	if (handle != dsp2cpu_cmd->pid)
+-		dprintk(CVP_ERR, "Unregister pid != hndl %#x %#x\n",
+-				handle, dsp2cpu_cmd->pid);
+-
+-	/* Foundd fastrpc node */
+-	frpc_node = cvp_get_fastrpc_node_with_handle(handle);
+-
+-	if (frpc_node == NULL) {
+-		dprintk(CVP_DSP, "%s fastrpc handle 0x%x unregistered\n",
+-			__func__, handle);
++	struct cvp_dsp_fastrpc_driver_entry *node;
++	bool remove;
++
++	node = cvp_get_fastrpc_node_with_handle(handle);
++	if (!node)
+ 		return;
+-	}
+-
+-	if ((frpc_node->session_cnt == 0) || force_exit) {
+-		dprintk(CVP_DSP, "%s session cnt %d, force %d\n",
+-		__func__, frpc_node->session_cnt, (uint32_t)force_exit);
+-
+-		DEINIT_MSM_CVP_LIST(&frpc_node->dsp_sessions);
+-
+-		cvp_put_fastrpc_node(frpc_node);
+-		if (!dequeue_frpc_node(frpc_node))
+-			/* Don't find the node */
++	mutex_lock(&node->dsp_sessions.lock);
++	remove = !node->session_cnt || force_exit;
++	mutex_unlock(&node->dsp_sessions.lock);
++	if (remove) {
++		if (dequeue_frpc_node(node))
++			cvp_destroy_dsp_node(node);
++	} else {
++		cvp_put_fastrpc_node(node);
++	}
++}
++
++static void cvp_fastrpc_cleanup_worker(struct work_struct *work)
++{
++	struct cvp_dsp_apps *me = &gfa_cv;
++	struct cvp_dsp_fastrpc_driver_entry *node;
++	u32 handle = 0;
++	bool found;
++
++	for (;;) {
++		/* Serialize session destruction with the DSP command worker. */
++		mutex_lock(&me->rx_lock);
++		found = false;
++		mutex_lock(&me->fastrpc_driver_list.lock);
++		list_for_each_entry(node, &me->fastrpc_driver_list.list, list) {
++			if (READ_ONCE(node->cleanup_pending)) {
++				handle = node->handle;
++				found = true;
++				break;
++			}
++		}
++		mutex_unlock(&me->fastrpc_driver_list.lock);
++		if (found)
++			eva_fastrpc_driver_unregister(handle, true);
++		mutex_unlock(&me->rx_lock);
++		if (!found)
+ 			return;
+-
+-		__fastrpc_driver_unregister(&frpc_node->cvp_fastrpc_driver);
+-		mutex_lock(&me->driver_name_lock);
+-		eva_fastrpc_driver_release_name(frpc_node);
+-		mutex_unlock(&me->driver_name_lock);
+-		kfree(frpc_node);
+-	} else {
+-		cvp_put_fastrpc_node(frpc_node);
+ 	}
+ }
+ 
+@@ -1413,7 +1376,7 @@
+ 	}
+ }
+ 
+-void __dsp_cvp_sess_create(struct cvp_dsp_cmd_msg *cmd)
++static void __dsp_cvp_sess_create(struct cvp_dsp_cmd_msg *cmd)
+ {
+ 	struct cvp_dsp_apps *me = &gfa_cv;
+ 	struct msm_cvp_inst *inst = NULL;
+@@ -1468,8 +1431,8 @@
+ 		dprintk(CVP_WARN, "%s incorrect pid %x\n", __func__, pid);
+ 		goto fail_pid;
+ 	}
+-	dprintk(CVP_DSP, "%s get pid_s 0x%x from hdl 0x%x\n", __func__,
+-			pid_s, dsp2cpu_cmd->pid);
++	dprintk(CVP_DSP, "%s get pid_s %pK from hdl 0x%x\n", __func__,
++		pid_s, dsp2cpu_cmd->pid);
+ 
+ 	task = get_pid_task(pid_s, PIDTYPE_TGID);
+ 	if (!task) {
+@@ -1538,7 +1501,7 @@
+ 	cmd->ret = -1;
+ }
+ 
+-void __dsp_cvp_sess_delete(struct cvp_dsp_cmd_msg *cmd)
++static void __dsp_cvp_sess_delete(struct cvp_dsp_cmd_msg *cmd)
+ {
+ 	struct cvp_dsp_apps *me = &gfa_cv;
+ 	struct msm_cvp_inst *inst;
+@@ -1612,7 +1575,7 @@
+ 	return;
+ }
+ 
+-void __dsp_cvp_power_req(struct cvp_dsp_cmd_msg *cmd)
++static void __dsp_cvp_power_req(struct cvp_dsp_cmd_msg *cmd)
+ {
+ 	struct cvp_dsp_apps *me = &gfa_cv;
+ 	struct msm_cvp_inst *inst;
+@@ -1668,7 +1631,7 @@
+ 	return;
+ }
+ 
+-void __dsp_cvp_buf_register(struct cvp_dsp_cmd_msg *cmd)
++static void __dsp_cvp_buf_register(struct cvp_dsp_cmd_msg *cmd)
+ {
+ 	struct cvp_dsp_apps *me = &gfa_cv;
+ 	struct msm_cvp_inst *inst;
+@@ -1731,7 +1694,7 @@
+ 	kfree(kmd);
+ }
+ 
+-void __dsp_cvp_buf_deregister(struct cvp_dsp_cmd_msg *cmd)
++static void __dsp_cvp_buf_deregister(struct cvp_dsp_cmd_msg *cmd)
+ {
+ 	struct cvp_dsp_apps *me = &gfa_cv;
+ 	struct msm_cvp_inst *inst;
+@@ -1789,7 +1752,7 @@
+ 	kfree(kmd);
+ }
+ 
+-void __dsp_cvp_mem_alloc(struct cvp_dsp_cmd_msg *cmd)
++static void __dsp_cvp_mem_alloc(struct cvp_dsp_cmd_msg *cmd)
+ {
+ 	struct cvp_dsp_apps *me = &gfa_cv;
+ 	struct msm_cvp_inst *inst;
+@@ -1860,7 +1823,8 @@
+ 	cmd->sbuf.v_dsp_addr = v_dsp_addr;
+ 	dprintk(CVP_DSP, "%s: size %d, iova 0x%x, v_dsp_addr 0x%llx id %#x, fd %#x, refcount %d\n",
+ 		__func__, cmd->sbuf.size, cmd->sbuf.iova,
+-		cmd->sbuf.v_dsp_addr, dsp2cpu_cmd->session_id, buf->smem->fd, buf->smem->refcount);
++		cmd->sbuf.v_dsp_addr, dsp2cpu_cmd->session_id, buf->smem->fd,
++		atomic_read(&buf->smem->refcount));
+ 
+ 	cvp_put_fastrpc_node(frpc_node);
+ 	return;
+@@ -1877,7 +1841,7 @@
+ 
+ }
+ 
+-void __dsp_cvp_mem_free(struct cvp_dsp_cmd_msg *cmd)
++static void __dsp_cvp_mem_free(struct cvp_dsp_cmd_msg *cmd)
+ {
+ 	struct cvp_dsp_apps *me = &gfa_cv;
+ 	struct msm_cvp_inst *inst;
+@@ -1966,7 +1930,7 @@
+ 	cvp_put_fastrpc_node(frpc_node);
+ }
+ 
+-void __dsp_cvp_sess_start(struct cvp_dsp_cmd_msg *cmd)
++static void __dsp_cvp_sess_start(struct cvp_dsp_cmd_msg *cmd)
+ {
+ 	struct cvp_dsp_apps *me = &gfa_cv;
+ 	struct msm_cvp_inst *inst;
+@@ -1988,7 +1952,7 @@
+ 			dsp2cpu_cmd->session_cpu_low);
+ 
+ 	if (!inst || !is_cvp_inst_valid(inst)) {
+-		dprintk(CVP_ERR, "%s incorrect session ID %llx\n", __func__, inst);
++		dprintk(CVP_ERR, "%s incorrect session ID %pK\n", __func__, inst);
+ 		cmd->ret = -1;
+ 		return;
+ 	}
+@@ -1997,21 +1961,21 @@
+ 	spin_lock(&sq->lock);
+ 	if (sq->state == QUEUE_START) {
+ 		spin_unlock(&sq->lock);
+-		dprintk(CVP_WARN, "DSP double started session %llx\n", inst);
++		dprintk(CVP_WARN, "DSP double started session %pK\n", inst);
+ 		return;
+ 	}
+ 	spin_unlock(&sq->lock);
+ 
+ 	rc = msm_cvp_session_start(inst, (struct eva_kmd_arg *)NULL);
+ 	if (rc) {
+-		dprintk(CVP_ERR, "%s Failed to start session %llx\n", __func__, inst);
++		dprintk(CVP_ERR, "%s Failed to start session %pK\n", __func__, inst);
+ 		cmd->ret = -1;
+ 		return;
+ 	}
+ 	dprintk(CVP_DSP, "%s session started\n", __func__);
+ }
+ 
+-void __dsp_cvp_sess_stop(struct cvp_dsp_cmd_msg *cmd)
++static void __dsp_cvp_sess_stop(struct cvp_dsp_cmd_msg *cmd)
+ {
+ 	struct cvp_dsp_apps *me = &gfa_cv;
+ 	struct msm_cvp_inst *inst;
+@@ -2033,7 +1997,7 @@
+ 			dsp2cpu_cmd->session_cpu_low);
+ 
+ 	if (!inst || !is_cvp_inst_valid(inst)) {
+-		dprintk(CVP_ERR, "%s incorrect session ID %llx\n", __func__, inst);
++		dprintk(CVP_ERR, "%s incorrect session ID %pK\n", __func__, inst);
+ 		cmd->ret = -1;
+ 		return;
+ 	}
+@@ -2042,7 +2006,7 @@
+ 	spin_lock(&sq->lock);
+ 	if (sq->state == QUEUE_STOP) {
+ 		spin_unlock(&sq->lock);
+-		dprintk(CVP_WARN, "DSP double stopped session %llx\n", inst);
++		dprintk(CVP_WARN, "DSP double stopped session %pK\n", inst);
+ 		return;
+ 	}
+ 	spin_unlock(&sq->lock);
+@@ -2056,7 +2020,7 @@
+ 	dprintk(CVP_DSP, "%s session stoppd\n", __func__);
+ }
+ 
+-void __dsp_cvp_set_session_name(struct cvp_dsp_cmd_msg *cmd)
++static void __dsp_cvp_set_session_name(struct cvp_dsp_cmd_msg *cmd)
+ {
+ 	struct cvp_dsp_apps *me = &gfa_cv;
+ 	struct msm_cvp_inst *inst;
+@@ -2077,7 +2041,7 @@
+ 			dsp2cpu_cmd->session_cpu_low);
+ 
+ 	if (!inst || !is_cvp_inst_valid(inst)) {
+-		dprintk(CVP_ERR, "%s incorrect session ID %llx\n", __func__, inst);
++		dprintk(CVP_ERR, "%s incorrect session ID %pK\n", __func__, inst);
+ 		cmd->ret = -1;
+ 		return;
+ 	}
+@@ -2275,7 +2239,7 @@
+ 	mutex_init(&me->driver_name_lock);
+ 	for (i = 0; i < MAX_FASTRPC_DRIVER_NUM; i++) {
+ 		me->cvp_fastrpc_name[i].status = DRIVER_NAME_AVAILABLE;
+-		snprintf(me->cvp_fastrpc_name[i].name, sizeof(name), name);
++		snprintf(me->cvp_fastrpc_name[i].name, sizeof(name), "%s", name);
+ 		name[11]++;
+ 	}
+ 
+@@ -2294,15 +2258,17 @@
+ 	mutex_unlock(&me->tx_lock);
+ 
+ 	me->dsp_thread = kthread_run(cvp_dsp_thread, me, tname);
+-	if (!me->dsp_thread) {
+-		dprintk(CVP_ERR, "%s create %s fail", __func__, tname);
+-		rc = -ECHILD;
++	if (IS_ERR(me->dsp_thread)) {
++		rc = PTR_ERR(me->dsp_thread);
++		me->dsp_thread = NULL;
++		cvp_unregister_rpmsg_driver(&cvp_dsp_rpmsg_client);
+ 		me->state = DSP_INVALID;
+ 		goto register_bail;
+ 	}
+ 	return 0;
+ 
+ register_bail:
++	cvp_dsp_device_deinit();
+ 	return rc;
+ }
+ 
+@@ -2311,17 +2277,29 @@
+ 	struct cvp_dsp_apps *me = &gfa_cv;
+ 	int i;
+ 
++	/* Unregister drains callbacks while the command worker is still alive. */
++	cvp_unregister_rpmsg_driver(&cvp_dsp_rpmsg_client);
+ 	mutex_lock(&me->tx_lock);
+ 	me->state = DSP_INVALID;
+ 	mutex_unlock(&me->tx_lock);
+-
+-	DEINIT_MSM_CVP_LIST(&me->fastrpc_driver_list);
+-
+ 	for (i = 0; i <= CPU2DSP_MAX_CMD; i++)
+ 		complete_all(&me->completions[i]);
+-
++	if (me->dsp_thread) {
++		kthread_stop(me->dsp_thread);
++		me->dsp_thread = NULL;
++	}
++	cvp_remove_dsp_sessions();
++	/* All FastRPC callbacks are withdrawn before the last worker drain. */
++	cancel_work_sync(&cvp_fastrpc_cleanup_work);
++}
++
++void cvp_dsp_device_deinit(void)
++{
++	struct cvp_dsp_apps *me = &gfa_cv;
++
++	/* All remaining user sessions are gone before their locks are destroyed. */
++	DEINIT_MSM_CVP_LIST(&me->fastrpc_driver_list);
+ 	mutex_destroy(&me->tx_lock);
+ 	mutex_destroy(&me->rx_lock);
+ 	mutex_destroy(&me->driver_name_lock);
+-	cvp_unregister_rpmsg_driver(&cvp_dsp_rpmsg_client);
+-}
++}
+diff --git a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_dsp.h b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_dsp.h
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_dsp.h
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_dsp.h
+@@ -215,6 +215,7 @@
+ };
+ 
+ struct cvp_dsp_fastrpc_driver_entry {
++	bool cleanup_pending;
+ 	struct list_head list;
+ 	uint32_t handle;	/*handle is not PID*/
+ 	uint32_t session_cnt;
+@@ -315,5 +316,7 @@
+ 
+ void cvp_dsp_send_debug_mask(void);
+ 
++void cvp_dsp_device_deinit(void);
++
+ #endif // MSM_CVP_DSP_H
+ 
+diff --git a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_events.h b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_events.h
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_events.h
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_events.h
+@@ -30,7 +30,7 @@
+ 	),
+ 	TP_fast_assign(
+ 		__entry->pid = pid;
+-		__assign_str(trace_name, name);
++		__assign_str(trace_name);
+ 		__entry->trace_begin = trace_begin;
+ 		),
+ 	TP_printk("%s|%d|%s", __entry->trace_begin ? "B" : "E",
+@@ -57,7 +57,7 @@
+ 	),
+ 	TP_fast_assign(
+ 		__entry->aon_cycles = aon_cycles;
+-		__assign_str(trace_name, name);
++		__assign_str(trace_name);
+ 		__entry->session_id = session_id;
+ 		__entry->stream_id  = stream_id;
+ 		__entry->packet_id  = packet_id;
+@@ -81,7 +81,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(trace_name, trace);
++		__assign_str(trace_name);
+ 	),
+ 
+ 	TP_printk("%s", __get_str(trace_name))
+diff --git a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_internal.h b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_internal.h
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_internal.h
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_internal.h
+@@ -340,7 +340,11 @@
+ 	struct mutex lock;
+ 	struct mutex clk_lock;
+ 	dev_t dev_num;
+-	struct cdev cdev;
++	struct cdev *cdev;
++	bool ready;
++	bool dsp_initialized;
++	refcount_t users;
++	struct completion users_zero;
+ 	struct class *class;
+ 	struct device *dev;
+ 	struct cvp_hfi_ops *dev_ops;
+@@ -434,4 +438,10 @@
+ void *cvp_kmem_cache_zalloc(struct cvp_kmem_cache *k, gfp_t flags);
+ void cvp_kmem_cache_free(struct cvp_kmem_cache *k, void *obj);
+ bool msm_cvp_check_for_inst_overload(struct msm_cvp_core *core, u32 *instance_count);
++
++struct msm_cvp_inst *cvp_open_instance(int session_type,
++				       struct task_struct *task, struct cdev *cdev);
++void cvp_put_core(struct msm_cvp_core *core);
++bool cvp_get_core(struct msm_cvp_core *core);
++
+ #endif
+diff --git a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_ioctl.c b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_ioctl.c
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_ioctl.c
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_ioctl.c
+@@ -24,6 +24,10 @@
+ 	if (get_user(pkt_hdr->packet_type, &u->pkt_data[1]))
+ 		return -EFAULT;
+ 
++	if (pkt_hdr->size < sizeof(*pkt_hdr) || pkt_hdr->size % sizeof(u32) ||
++	    pkt_hdr->size > MAX_HFI_PKT_SIZE * sizeof(u32))
++		return -EINVAL;
++
+ 	if (get_pkt_index(pkt_hdr) < 0) {
+ 		dprintk(CVP_ERR, "user mode provides incorrect hfi\n");
+ 		goto set_default_pkt_hdr;
+@@ -55,7 +59,8 @@
+ 	if (get_user(pkt_hdr->packet_type, &u->pkt_data[1]))
+ 		return -EFAULT;
+ 
+-	if (pkt_hdr->size > (MAX_HFI_PKT_SIZE*sizeof(unsigned int)))
++	if (pkt_hdr->size < sizeof(*pkt_hdr) || pkt_hdr->size % sizeof(u32) ||
++	    pkt_hdr->size > MAX_HFI_PKT_SIZE * sizeof(u32))
+ 		return -EINVAL;
+ 
+ 	return 0;
+@@ -69,6 +74,8 @@
+ 	struct eva_kmd_hfi_packet *k, *u;
+ 	int i;
+ 
++	if (start > MAX_HFI_PKT_SIZE || size > MAX_HFI_PKT_SIZE - start)
++		return -EINVAL;
+ 	k = &kp->data.hfi_pkt;
+ 	u = &up->data.hfi_pkt;
+ 	for (i = start; i < size + start; i++)
+@@ -143,6 +150,25 @@
+ 				(struct eva_kmd_hfi_fence_packet *)k, u1);
+ }
+ 
++static int _copy_checked_pkt_from_user(struct eva_kmd_arg *kp,
++				       struct eva_kmd_arg __user *up,
++				       const struct cvp_hal_session_cmd_pkt *hdr,
++				       bool fence)
++{
++	int rc;
++
++	if (fence)
++		rc = _copy_fence_pkt_from_user(kp, up);
++	else
++		rc = _copy_pkt_from_user(kp, up, 0, hdr->size / sizeof(u32));
++	if (rc)
++		return rc;
++	/* Keep the validated header if userspace changes it during the copy. */
++	kp->data.hfi_pkt.pkt_data[0] = hdr->size;
++	kp->data.hfi_pkt.pkt_data[1] = hdr->packet_type;
++	return 0;
++}
++
+ static int _copy_frameid_from_user(struct eva_kmd_arg *kp,
+ 		struct eva_kmd_arg __user *up)
+ {
+@@ -181,6 +207,8 @@
+ 	struct eva_kmd_hfi_packet *k, *u;
+ 	int i;
+ 
++	if (size > MAX_HFI_PKT_SIZE)
++		return -EINVAL;
+ 	k = &kp->data.hfi_pkt;
+ 	u = &up->data.hfi_pkt;
+ 	for (i = 0; i < size; i++)
+@@ -377,7 +405,7 @@
+ 			return -EFAULT;
+ 		}
+ 
+-		rc = _copy_pkt_from_user(kp, up, 0, (pkt_hdr.size >> 2));
++		rc = _copy_checked_pkt_from_user(kp, up, &pkt_hdr, false);
+ 		break;
+ 	}
+ 	case EVA_KMD_SEND_FENCE_CMD_PKT:
+@@ -399,7 +427,7 @@
+ 			return -EFAULT;
+ 		}
+ 
+-		rc = _copy_fence_pkt_from_user(kp, up);
++		rc = _copy_checked_pkt_from_user(kp, up, &pkt_hdr, true);
+ 		break;
+ 	}
+ 	case EVA_KMD_RECEIVE_MSG_PKT:
+diff --git a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_res_parse.c b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_res_parse.c
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_res_parse.c
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_res_parse.c
+@@ -134,7 +134,7 @@
+ 	res->ipcc_reg_size = reg_config[1];
+ 
+ 	dprintk(CVP_CORE,
+-		"ipcc reg_base = %x, reg_size = %x\n",
++		"ipcc reg_base = %llx, reg_size = %x\n",
+ 		res->ipcc_reg_base,
+ 		res->ipcc_reg_size
+ 	);
+@@ -192,7 +192,7 @@
+ 	res->reg_mappings.timer_phyaddr = timer_config[2];
+ 
+ 	dprintk(CVP_CORE,
+-	"reg mappings %#x %#x %#x %#x %#x %#X %#x %#x %#x %#x %#x %#x\n",
++	"reg mappings %#llx %#x %#llx %#llx %#x %#llX %#llx %#x %#llx %#llx %#x %#llx\n",
+ 	res->reg_mappings.ipclite_iova, res->reg_mappings.ipclite_size,
+ 	res->reg_mappings.ipclite_phyaddr, res->reg_mappings.hwmutex_iova,
+ 	res->reg_mappings.hwmutex_size, res->reg_mappings.hwmutex_phyaddr,
+@@ -618,7 +618,7 @@
+ 					"Failed to alloc memory for regulator name\n");
+ 			goto err_reg_name_alloc;
+ 		}
+-		strlcpy(rinfo->name, domains_property->name,
++		strscpy(rinfo->name, domains_property->name,
+ 			(supply - domains_property->name) + 1);
+ 
+ 		rinfo->has_hw_power_collapse = of_property_read_bool(
+@@ -889,16 +889,22 @@
+ 	res->firmware_base = (phys_addr_t)firmware_base;
+ 
+ 	kres = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	res->register_base = kres ? kres->start : -1;
+-	res->register_size = kres ? (kres->end + 1 - kres->start) : -1;
++	if (!kres)
++		return -EINVAL;
++	res->register_base = kres->start;
++	res->register_size = resource_size(kres);
+ 
+ 	res->irq = platform_get_irq(pdev, 0);
++	if ((int)res->irq < 0)
++		return (int)res->irq;
+ 
+ 	dprintk(CVP_CORE, "%s: res->irq:%d \n",
+ 		__func__, res->irq);
+ 
+ 	//Parsing for WD interrupt
+ 	res->irq_wd = platform_get_irq(pdev, 1);
++	if ((int)res->irq_wd < 0)
++		return (int)res->irq_wd;
+ 
+ 	dprintk(CVP_CORE, "%s: res->irq_wd:%d \n",
+ 		__func__, res->irq_wd);
+@@ -1014,6 +1020,8 @@
+ 	if (!dev->dma_parms)
+ 		dev->dma_parms =
+ 			devm_kzalloc(dev, sizeof(*dev->dma_parms), GFP_KERNEL);
++	if (!dev->dma_parms)
++		return -ENOMEM;
+ 	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
+ 	dma_set_seg_boundary(dev, DMA_BIT_MASK(64));
+ 
+@@ -1029,15 +1037,16 @@
+ 	return rc;
+ }
+ 
+-int msm_cvp_smmu_fault_handler(struct iommu_domain *domain,
+-		struct device *dev, unsigned long iova, int flags, void *token)
++static int msm_cvp_smmu_fault_handler(struct iommu_domain *domain,
++				      struct device *dev, unsigned long iova,
++				      int flags, void *token)
+ {
+ 	struct msm_cvp_core *core = token;
+ 	struct iris_hfi_device *hdev;
+ 	struct msm_cvp_inst *inst;
+ 	bool log = false;
+ 
+-	if (!domain || !core) {
++	if (!domain || !cvp_get_core(core)) {
+ 		dprintk(CVP_ERR, "%s - invalid param %pK %pK\n",
+ 			__func__, domain, core);
+ 		return -EINVAL;
+@@ -1058,6 +1067,7 @@
+ 
+ 	if (core->smmu_fault_count > 0) {
+ 		core->smmu_fault_count++;
++		cvp_put_core(core);
+ 		return -ENOSYS;
+ 	}
+ 	mutex_lock(&core->lock);
+@@ -1077,6 +1087,7 @@
+ 	 * is not installed and prints a list of useful debug information like
+ 	 * FAR, SID etc. This information is not printed if we return 0.
+ 	 */
++	cvp_put_core(core);
+ 	return -ENOSYS;
+ }
+ 
+@@ -1110,7 +1121,7 @@
+ 	list_add_tail(&cb->list, &core->resources.context_banks);
+ 
+ 	dprintk(CVP_CORE, "%s: context bank has name %s\n", __func__, cb->name);
+-	if (!strcmp(cb->name, "cvp_camera")) {
++	if (cb->name && !strcmp(cb->name, "cvp_camera")) {
+ 		cb->is_secure = true;
+ 		rc = msm_cvp_setup_context_bank(&core->resources, cb, dev);
+ 		if (rc) {
+diff --git a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_synx.c b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_synx.c
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_synx.c
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_synx.c
+@@ -161,8 +161,8 @@
+ 		h_synx = fc->synx[i];
+ 		if (h_synx) {
+ 			rc = synx_signal(ssid, h_synx, synx_state);
+-			dprintk(CVP_SYNX, "Cancel synx %d session %llx\n",
+-					h_synx, inst);
++			dprintk(CVP_SYNX, "Cancel synx %d session %pK\n",
++				h_synx, inst);
+ 			if (rc)
+ 				dprintk(CVP_ERR,
+ 					"%s: synx_signal %d %d %d failed\n",
+diff --git a/qcom/opensource/eva-kernel/msm/eva/vm/cvp_vm_main.c b/qcom/opensource/eva-kernel/msm/eva/vm/cvp_vm_main.c
+--- a/qcom/opensource/eva-kernel/msm/eva/vm/cvp_vm_main.c
++++ b/qcom/opensource/eva-kernel/msm/eva/vm/cvp_vm_main.c
+@@ -145,6 +145,7 @@
+ 		dprintk(CVP_ERR,
+ 			"could not map reg addr %pa of size %d\n",
+ 			&res->register_base, res->register_size);
++		rc = -ENOMEM;
+ 		goto error_irq_fail;
+ 	}
+ 
+@@ -165,26 +166,28 @@
+ #endif
+ 
+ 	rc = request_threaded_irq(res->irq, cvp_hfi_isr, iris_hfi_core_work_handler,
+-			IRQF_TRIGGER_HIGH, "msm_cvp", device);
++			IRQF_TRIGGER_HIGH | IRQF_NO_AUTOEN, "msm_cvp", device);
+ 	if (unlikely(rc)) {
+ 		dprintk(CVP_ERR, "%s: request_irq failed rc: %d\n", __func__, rc);
+ 		goto error_irq_fail;
+ 	}
+ 
+-	rc = request_irq(res->irq_wd, iris_hfi_isr_wd, IRQF_TRIGGER_HIGH,
+-			"msm_cvp", device);
++	rc = request_irq(res->irq_wd, iris_hfi_isr_wd,
++			 IRQF_TRIGGER_HIGH | IRQF_NO_AUTOEN,
++			 "msm_cvp", device);
+ 	if (unlikely(rc)) {
+ 		dprintk(CVP_ERR, "() :request_irq for WD failed\n");
++		free_irq(res->irq, device);
+ 		goto error_irq_fail;
+ 	}
+ 
+-	disable_irq_nosync(res->irq);
+ 	dprintk(CVP_INFO,
+ 		"firmware_base = %pa, register_base = %pa, register_size = %d\n",
+ 		&res->firmware_base, &res->register_base,
+ 		res->register_size);
+ 	return rc;
+ error_irq_fail:
++	device->cvp_hal_data = NULL;
+ 	kfree(hal);
+ err_core_init:
+ 	return rc;
+diff --git a/qcom/opensource/eva-kernel/msm/eva/vm/cvp_vm_msgq.c b/qcom/opensource/eva-kernel/msm/eva/vm/cvp_vm_msgq.c
+--- a/qcom/opensource/eva-kernel/msm/eva/vm/cvp_vm_msgq.c
++++ b/qcom/opensource/eva-kernel/msm/eva/vm/cvp_vm_msgq.c
+@@ -42,7 +42,7 @@
+ 
+ 		if (rc != 0 ) {
+ 			dprintk(CVP_ERR,
+-			"%s: gh_msgq_recv fail rc=%d handle=%#x msg_ptr=%#x\n",
++			"%s: gh_msgq_recv fail rc=%d handle=%pK msg_ptr=%pK\n",
+ 			__func__, rc, msgq_drv->config.handle, msg_ptr);
+ 
+ 			if (rc != -EAGAIN) {
+@@ -81,7 +81,7 @@
+ 				/* sanity check on size information */
+ 				if (size > sizeof(*msg_ptr)) {
+ 					dprintk(CVP_ERR,
+-						"%s: msg size %d exceed max size supported %d \n",
++						"%s: msg size %zu exceed max size supported %zu\n",
+ 						__func__, size, sizeof(*msg_ptr));
+ 					rc = -E2BIG;
+ 					msgq_drv->pending_local_cmd.type = 0;
+@@ -209,8 +209,8 @@
+ 		dprintk(CVP_ERR, "PVM failed to register msgq %d\n", rc);
+ 		return rc;
+ 	}
+-	dprintk(CVP_VM, "%s: gh_msgq_register handle: %x\n",
+-			__func__, msgq_config->handle);
++	dprintk(CVP_VM, "%s: gh_msgq_register handle: %pK\n",
++		__func__, msgq_config->handle);
+ 
+ 	rc = cvp_complete_msgq_init(msgq_drv);
+ 
+@@ -271,7 +271,7 @@
+ 
+ 	if (msg_size > GH_MSGQ_MAX_MSG_SIZE_BYTES) {
+ 		dprintk(CVP_ERR,
+-			"%s: msg size %d exceed max size supported %d \n",
++			"%s: msg size %zu exceed max size supported %d\n",
+ 			__func__, msg_size, GH_MSGQ_MAX_MSG_SIZE_BYTES);
+ 		rc = -E2BIG;
+ 		goto err_param_check;

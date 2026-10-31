@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 268 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 269 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 268 platform `.ko` files, their symbol tables and DDK configurations.
+- 269 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 16,595
-imported symbol CRCs across all 268 modules.
+used. The current [validation report](validation-20261031.json) checks 16,865
+imported symbol CRCs across all 269 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1799,5 +1799,23 @@ Archive `artifacts/20261031T194558036771Z` contains 268 modules and passes 16,59
 imported-symbol CRC checks without compiler/modpost warnings. Device-tree and
 overlay checks pass with existing vendor warnings. ROM module-name coverage
 is 265/466 (56.9%). Main camera, EVA, remaining audio/peripherals, KernelSU and
+NetHunter integration and boot/DLKM/ZIP packaging remain. No flashable ZIP or
+phone/hardware validation is claimed.
+
+
+## Native EVA accelerator
+
+The EVA module preserves 24 native compilation units, eight exports, twenty
+device aliases, nine provider dependencies and the public ioctl ABI. Its
+port checks packet and DMA bounds, ties files and callbacks to their owning
+core, and drains IRQ, work, DSP and FastRPC activity before releasing storage.
+Seven sanitizer groups pass and reject twenty deliberate regressions. The
+[EVA record](eva-port.md) documents the tested functions, mocked services,
+indefinite client-drain contract and retained firmware failure policies.
+
+Archive `artifacts/20261031T200031808490Z` contains 269 modules and passes 16,865
+imported-symbol CRC checks without compiler/modpost warnings. Device-tree and
+overlay checks pass with existing vendor warnings. ROM module-name coverage
+is 266/466 (57.1%). Main camera, remaining audio/peripherals, KernelSU and
 NetHunter integration and boot/DLKM/ZIP packaging remain. No flashable ZIP or
 phone/hardware validation is claimed.

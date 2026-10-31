@@ -3570,6 +3570,25 @@ ddk_module(
 )
 
 
+ddk_headers(
+    name = "eva_headers",
+    hdrs = ["qcom/opensource/eva-kernel/include/uapi/eva/media/msm_eva_private.h", "qcom/opensource/eva-kernel/msm/eva/cvp_comm_def.h", "qcom/opensource/eva-kernel/msm/eva/cvp_core_hfi.h", "qcom/opensource/eva-kernel/msm/eva/cvp_dump.h", "qcom/opensource/eva-kernel/msm/eva/cvp_hfi.h", "qcom/opensource/eva-kernel/msm/eva/cvp_hfi_api.h", "qcom/opensource/eva-kernel/msm/eva/cvp_hfi_helper.h", "qcom/opensource/eva-kernel/msm/eva/cvp_hfi_io.h", "qcom/opensource/eva-kernel/msm/eva/cvp_pakala_io.h", "qcom/opensource/eva-kernel/msm/eva/cvp_power.h", "qcom/opensource/eva-kernel/msm/eva/cvp_presil.h", "qcom/opensource/eva-kernel/msm/eva/cvp_private.h", "qcom/opensource/eva-kernel/msm/eva/eva_shared_def.h", "qcom/opensource/eva-kernel/msm/eva/hfi_packetization.h", "qcom/opensource/eva-kernel/msm/eva/msm_cvp.h", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_buf.h", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_clocks.h", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_common.h", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_core.h", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_debug.h", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_dsp.h", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_events.h", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_internal.h", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_res_parse.h", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_resources.h", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_synx.h", "qcom/opensource/eva-kernel/msm/eva/vm/cvp_vm.h", "qcom/opensource/eva-kernel/msm/eva/vm/cvp_vm_msgq.h", "qcom/opensource/eva-kernel/msm/eva/vm/cvp_vm_resource.h"],
+    includes = ["qcom/opensource/eva-kernel/include", "qcom/opensource/eva-kernel/include/uapi", "qcom/opensource/eva-kernel/include/uapi/eva", "qcom/opensource/eva-kernel/msm/eva", "qcom/opensource/eva-kernel/msm/eva/vm"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "msm_eva",
+    srcs = ["qcom/opensource/eva-kernel/msm/eva/cvp.c", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_ioctl.c", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_platform.c", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_common.c", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_core.c", "qcom/opensource/eva-kernel/msm/eva/msm_cvp.c", "qcom/opensource/eva-kernel/msm/eva/cvp_smem.c", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_debug.c", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_res_parse.c", "qcom/opensource/eva-kernel/msm/eva/cvp_dump.c", "qcom/opensource/eva-kernel/msm/eva/cvp_hfi.c", "qcom/opensource/eva-kernel/msm/eva/hfi_response_handler.c", "qcom/opensource/eva-kernel/msm/eva/hfi_packetization.c", "qcom/opensource/eva-kernel/msm/eva/cvp_core_hfi.c", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_clocks.c", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_dsp.c", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_buf.c", "qcom/opensource/eva-kernel/msm/eva/msm_cvp_synx.c", "qcom/opensource/eva-kernel/msm/eva/cvp_fw_load.c", "qcom/opensource/eva-kernel/msm/eva/cvp_power.c", "qcom/opensource/eva-kernel/msm/eva/cvp_presil.c", "qcom/opensource/eva-kernel/msm/eva/vm/cvp_vm_main.c", "qcom/opensource/eva-kernel/msm/eva/vm/cvp_vm_msgq.c", "qcom/opensource/eva-kernel/msm/eva/vm/cvp_vm_resource.c"],
+    out = "msm-eva.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    local_defines = ["CONFIG_EVA_SUN=1", "CONFIG_MSM_MMRM=1"],
+    deps = [":eva_headers", ":fastrpc_headers", ":frpc_adsprpc", ":scm_headers", ":mem_buf_headers", ":iommu_headers", ":gunyah_headers", ":platform_headers", ":clock_headers", ":loader_headers", ":gpu_stack_headers", ":display_support_headers", ":mem_buf_dev", ":qcom_scm", ":llcc_qcom", ":synx_driver", ":msm_mmrm", ":mdt_loader", ":gh_rm_drv", ":gh_msgq"],
+    visibility = ["//visibility:public"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3828,6 +3847,7 @@ kernel_module_group(
         ":lpass_cdc_va_macro_dlkm",
         ":qcom_rng",
         ":qrng_dlkm",
+        ":msm_eva",
     ],
 )
 
