@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 140 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 157 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 140 platform `.ko` files, their symbol tables and DDK configurations.
+- 157 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 6542
-imported symbol CRCs across all 140 modules.
+used. The current [validation report](validation-20261031.json) checks 7200
+imported symbol CRCs across all 157 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -760,11 +760,47 @@ Register errors propagate while successful vendor register sequences are retaine
 `verify_wcd.py` passes 20,163 transport, 72 short-transfer, 32,768 differential
 register-trace, 637 failure, 13 PM and 256 cleanup cases with ASan/UBSan.
 
-All 140 modules build together with 6,542 matching imported-symbol CRCs and
-no kernel compiler/modpost warnings. Device-tree checks pass with the same 1,084
+The 140-module checkpoint passed 6,542 imported-symbol CRCs. A later log audit
+found a missing SPI module-description warning, fixed in the 157-module checkpoint. Device-tree checks pass with the same 1,084
 recorded vendor DTC warnings. The checkpoint covers 139 of 466 distinct vendor
 load-list names (29.8%); the additional module is a heap helper. This count includes
 shared-list alternative hardware and is not an overall completion percentage.
 Host tests simulate kernel services and do not validate live IRQ/DMA/SRCU,
 firmware, charging, USB operation or device boot. Image assembly and the remaining
 driver stack are still required before a flashable ZIP exists.
+
+
+Five remote-processor modules add PIL information, ramdump, sysmon, Q6 and PAS.
+Tuna ADSP/CDSP/modem/WPSS descriptors remain unchanged. IRQ/work cleanup, firmware
+address arithmetic, regulator rollback, PIL records and ELF dump bounds are
+checked. PAS owns and drains its recovery-policy hook. Sysmon preserves the ROM's
+20,000/10,000 ms notification/shutdown policy. `verify_rproc.py` passes 1,877,291
+ASan/UBSan helper cases, fourteen lifetime contracts and descriptor/config checks.
+
+Nine charging platform/IC modules add the FG, buck, charge-pump, load-switch,
+wireless and strategy registries, I2C base, BQ27Z561 fuel gauge and SC8581 charge
+pump. Onyx selects BQ27Z561 at 0x55 and SC8581 at 0x6f. SRCU-protected callback
+registries and the MCA logging follow-up drain callbacks before unregister
+returns. Short I2C transfers, gauge packet length/checksum errors, class-creation
+rollback and protection-register failures propagate. `verify_chargehw.py` runs
+actual extracted helpers with ASan/UBSan and a modeled sleeping-reader/unregister
+concurrency test. Actual battery/USB power-supply integration and charge policies
+still require further modules and hardware validation.
+
+USB auxiliary support adds EUD, the redriver framework and QMP/DP PHY. EUD uses
+current serial-core FIFOs and bounded hardware packets; interrupt masks, pending
+events, retry accounting and teardown are checked. QMP keeps the exact vendor
+register operations with resource failure rollback and DT bounds checks. Redriver
+binding is exclusive and callbacks drain before removal. The final Onyx DT enables
+EUD, sets DWC to high speed, selects eUSB2 plus NOP PHY, and disables QMP; QMP is
+optional support retained from the shared ROM module configuration. No Onyx
+external-redriver phandle was found. `verify_usbaux.py` verifies the 330-cell QMP
+sequence, extracted I/O/resource helpers and callback-removal behavior under
+ASan/UBSan with simulated kernel services.
+
+The 157-module combined build passes 7,200 imported-symbol CRC checks with no
+compiler or modpost warnings, including the corrected GENI SPI description.
+Device-tree checks retain the 1,084 existing vendor DTC warnings. Coverage is
+156/466 distinct vendor load-list names (33.5%); 310 remain to assess or port.
+This raw count includes alternative hardware and does not measure overall ZIP
+readiness. All runtime and device-testing limitations above still apply.

@@ -1,0 +1,1486 @@
+--- a/drivers/remoteproc/qcom_pil_info.c
++++ b/drivers/remoteproc/qcom_pil_info.c
+@@ -64,25 +64,27 @@
+ bool qcom_pil_timeouts_disabled(void)
+ {
+ 	const char *compatible = "qcom,msm-imem-pil-disable-timeout";
+-	bool timeouts_disabled;
+ 	struct resource imem;
++	bool disabled = false;
+ 	void __iomem *base;
+ 
++	mutex_lock(&pil_reloc_lock);
+ 	if (!pil_timeout_base) {
+ 		base = qcom_map_pil_imem_resource(compatible, &imem);
+ 		if (IS_ERR(base))
+-			return false;
+-
++			goto unlock;
++		if (resource_size(&imem) < sizeof(u32)) {
++			iounmap(base);
++			goto unlock;
++		}
+ 		pil_timeout_base = base;
+ 	}
+-
+-	if (__raw_readl(pil_timeout_base) == 0x53444247) {
++	disabled = __raw_readl(pil_timeout_base) == 0x53444247;
++	if (disabled)
+ 		pr_info("pil-imem set to disable pil timeouts\n");
+-		timeouts_disabled = true;
+-	} else
+-		timeouts_disabled = false;
+-
+-	return timeouts_disabled;
++unlock:
++	mutex_unlock(&pil_reloc_lock);
++	return disabled;
+ }
+ EXPORT_SYMBOL_GPL(qcom_pil_timeouts_disabled);
+ 
+@@ -99,10 +101,14 @@
+ 	if (IS_ERR(base))
+ 		return PTR_ERR(base);
+ 
++	if (resource_size(&imem) < PIL_RELOC_ENTRY_SIZE) {
++		iounmap(base);
++		return -EINVAL;
++	}
+ 	memset_io(base, 0, resource_size(&imem));
+ 
+ 	_reloc.base = base;
+-	_reloc.num_entries = (u32)resource_size(&imem) / PIL_RELOC_ENTRY_SIZE;
++	_reloc.num_entries = resource_size(&imem) / PIL_RELOC_ENTRY_SIZE;
+ 
+ 	return 0;
+ }
+@@ -119,10 +125,13 @@
+ {
+ 	char buf[PIL_RELOC_NAME_LEN];
+ 	void __iomem *entry;
+-	size_t entry_size;
++	char name[PIL_RELOC_NAME_LEN] = {};
+ 	int ret;
+-	int i;
++	size_t i;
+ 
++	if (!image || !*image || size > U32_MAX)
++		return -EINVAL;
++	memcpy(name, image, min(strlen(image), sizeof(name)));
+ 	mutex_lock(&pil_reloc_lock);
+ 	ret = qcom_pil_info_init("qcom,pil-reloc-info");
+ 	if (ret < 0) {
+@@ -142,7 +151,7 @@
+ 		if (!buf[0])
+ 			goto found_unused;
+ 
+-		if (!strncmp(buf, image, PIL_RELOC_NAME_LEN))
++		if (!memcmp(buf, name, PIL_RELOC_NAME_LEN))
+ 			goto found_existing;
+ 	}
+ 
+@@ -151,8 +160,7 @@
+ 	return -ENOMEM;
+ 
+ found_unused:
+-	entry_size = min(strlen(image), PIL_RELOC_ENTRY_SIZE - 1);
+-	memcpy_toio(entry, image, entry_size);
++	memcpy_toio(entry, name, sizeof(name));
+ found_existing:
+ 	/* Use two writel() as base is only aligned to 4 bytes on odd entries */
+ 	writel(base, entry + PIL_RELOC_NAME_LEN);
+@@ -169,9 +177,9 @@
+ 	mutex_lock(&pil_reloc_lock);
+ 	iounmap(_reloc.base);
+ 	_reloc.base = NULL;
+-	mutex_unlock(&pil_reloc_lock);
+ 	iounmap(pil_timeout_base);
+ 	pil_timeout_base = NULL;
++	mutex_unlock(&pil_reloc_lock);
+ }
+ module_exit(pil_reloc_exit);
+ 
+--- a/drivers/remoteproc/qcom_q6v5.c
++++ b/drivers/remoteproc/qcom_q6v5.c
+@@ -17,6 +17,7 @@
+ #include <linux/soc/qcom/smem_state.h>
+ #include <linux/remoteproc.h>
+ #include <linux/delay.h>
++#include <linux/slab.h>
+ #include <asm/timex.h>
+ 
+ #include "qcom_common.h"
+@@ -138,11 +139,36 @@
+ 	mutex_unlock(&rproc->lock);
+ }
+ 
++static char *q6v5_copy_crash_message(unsigned int host, unsigned int id)
++{
++	const char *message;
++	size_t length;
++
++	message = qcom_smem_get(host, id, &length);
++	if (IS_ERR(message) || !length || !message[0])
++		return NULL;
++	return kstrndup(message, length, GFP_KERNEL);
++}
++
++static void q6v5_log_crash(struct qcom_q6v5 *q6v5, const char *event)
++{
++	char *message, *stack;
++
++	message = q6v5_copy_crash_message(QCOM_SMEM_HOST_ANY, q6v5->crash_reason);
++	dev_err(q6v5->dev, "%s: %s\n", event, message ?: "no crash message");
++	trace_rproc_qcom_event(dev_name(q6v5->dev), event, message ?: "no crash message");
++	kfree(message);
++	if (q6v5->crash_stack) {
++		stack = q6v5_copy_crash_message(q6v5->smem_host_id, q6v5->crash_stack);
++		if (stack)
++			dev_err(q6v5->dev, "%s\n", stack);
++		kfree(stack);
++	}
++}
++
+ static irqreturn_t q6v5_wdog_interrupt(int irq, void *data)
+ {
+ 	struct qcom_q6v5 *q6v5 = data;
+-	size_t len;
+-	char *msg;
+ 
+ 	/* Sometimes the stop triggers a watchdog rather than a stop-ack */
+ 	if (!q6v5->running) {
+@@ -156,21 +182,10 @@
+ 		"enabled and kick recovery process");
+ 
+ 	q6v5->crash_seq = q6v5->seq;
+-	msg = qcom_smem_get(QCOM_SMEM_HOST_ANY, q6v5->crash_reason, &len);
+-	if (!IS_ERR(msg) && len > 0 && msg[0])
+-		dev_err(q6v5->dev, "watchdog received: %s\n", msg);
+-	else
+-		dev_err(q6v5->dev, "watchdog without message\n");
+-
+-	if (q6v5->crash_stack) {
+-		msg = qcom_smem_get(q6v5->smem_host_id, q6v5->crash_stack, &len);
+-		if (!IS_ERR(msg) && len > 0 && msg[0])
+-			dev_err(q6v5->dev, "%s\n", msg);
+-	}
++	q6v5_log_crash(q6v5, "q6v5_wdog");
+ 
+ 	q6v5->running = false;
+ 
+-	trace_rproc_qcom_event(dev_name(q6v5->dev), "q6v5_wdog", msg);
+ 	if (q6v5->ssr_subdev)
+ 		qcom_notify_early_ssr_clients(q6v5->ssr_subdev);
+ 
+@@ -185,8 +200,6 @@
+ static irqreturn_t q6v5_fatal_interrupt(int irq, void *data)
+ {
+ 	struct qcom_q6v5 *q6v5 = data;
+-	size_t len;
+-	char *msg;
+ 
+ 	if (!q6v5->running)
+ 		return IRQ_HANDLED;
+@@ -197,21 +210,10 @@
+ 		"enabled and kick recovery process");
+ 
+ 	q6v5->crash_seq = q6v5->seq;
+-	msg = qcom_smem_get(QCOM_SMEM_HOST_ANY, q6v5->crash_reason, &len);
+-	if (!IS_ERR(msg) && len > 0 && msg[0])
+-		dev_err(q6v5->dev, "fatal error received: %s\n", msg);
+-	else
+-		dev_err(q6v5->dev, "fatal error without message\n");
+-
+-	if (q6v5->crash_stack) {
+-		msg = qcom_smem_get(q6v5->smem_host_id, q6v5->crash_stack, &len);
+-		if (!IS_ERR(msg) && len > 0 && msg[0])
+-			dev_err(q6v5->dev, "%s\n", msg);
+-	}
++	q6v5_log_crash(q6v5, "q6v5_fatal");
+ 
+ 	q6v5->running = false;
+ 
+-	trace_rproc_qcom_event(dev_name(q6v5->dev), "q6v5_fatal", msg);
+ 
+ 	if (q6v5->ssr_subdev)
+ 		qcom_notify_early_ssr_clients(q6v5->ssr_subdev);
+@@ -324,6 +326,22 @@
+ 	return Q6V5_PANIC_DELAY_MS;
+ }
+ EXPORT_SYMBOL_GPL(qcom_q6v5_panic);
++
++static void q6v5_release_resources(struct qcom_q6v5 *q6v5)
++{
++	int irqs[] = { q6v5->wdog_irq, q6v5->fatal_irq, q6v5->ready_irq,
++		       q6v5->handover_irq, q6v5->stop_irq };
++	int i;
++
++	for (i = ARRAY_SIZE(irqs) - 1; i >= 0; i--)
++		if (q6v5->requested_irqs & BIT(i))
++			devm_free_irq(q6v5->dev, irqs[i], q6v5);
++	q6v5->requested_irqs = 0;
++	cancel_work_sync(&q6v5->crash_handler);
++	if (!IS_ERR_OR_NULL(q6v5->qmp))
++		qmp_put(q6v5->qmp);
++	q6v5->qmp = NULL;
++}
+ 
+ /**
+  * qcom_q6v5_init() - initializer of the q6v5 common struct
+@@ -350,13 +368,17 @@
+ 	q6v5->smem_host_id = smem_host_id;
+ 	q6v5->handover = handover;
+ 	q6v5->ssr_subdev = NULL;
++	q6v5->requested_irqs = 0;
++	INIT_WORK(&q6v5->crash_handler, qcom_q6v5_crash_handler_work);
+ 
+ 	init_completion(&q6v5->start_done);
+ 	init_completion(&q6v5->stop_done);
+ 
+ 	q6v5->wdog_irq = platform_get_irq_byname(pdev, "wdog");
+-	if (q6v5->wdog_irq < 0)
+-		return q6v5->wdog_irq;
++	if (q6v5->wdog_irq < 0) {
++		ret = q6v5->wdog_irq;
++		goto release;
++	}
+ 
+ 	ret = devm_request_threaded_irq(&pdev->dev, q6v5->wdog_irq,
+ 					NULL, q6v5_wdog_interrupt,
+@@ -364,12 +386,15 @@
+ 					"q6v5 wdog", q6v5);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "failed to acquire wdog IRQ\n");
+-		return ret;
+-	}
++		goto release;
++	}
++	q6v5->requested_irqs |= BIT(0);
+ 
+ 	q6v5->fatal_irq = platform_get_irq_byname(pdev, "fatal");
+-	if (q6v5->fatal_irq < 0)
+-		return q6v5->fatal_irq;
++	if (q6v5->fatal_irq < 0) {
++		ret = q6v5->fatal_irq;
++		goto release;
++	}
+ 
+ 	ret = devm_request_threaded_irq(&pdev->dev, q6v5->fatal_irq,
+ 					NULL, q6v5_fatal_interrupt,
+@@ -377,12 +402,15 @@
+ 					"q6v5 fatal", q6v5);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "failed to acquire fatal IRQ\n");
+-		return ret;
+-	}
++		goto release;
++	}
++	q6v5->requested_irqs |= BIT(1);
+ 
+ 	q6v5->ready_irq = platform_get_irq_byname(pdev, "ready");
+-	if (q6v5->ready_irq < 0)
+-		return q6v5->ready_irq;
++	if (q6v5->ready_irq < 0) {
++		ret = q6v5->ready_irq;
++		goto release;
++	}
+ 
+ 	ret = devm_request_threaded_irq(&pdev->dev, q6v5->ready_irq,
+ 					NULL, q6v5_ready_interrupt,
+@@ -390,26 +418,31 @@
+ 					"q6v5 ready", q6v5);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "failed to acquire ready IRQ\n");
+-		return ret;
+-	}
++		goto release;
++	}
++	q6v5->requested_irqs |= BIT(2);
+ 
+ 	q6v5->handover_irq = platform_get_irq_byname(pdev, "handover");
+-	if (q6v5->handover_irq < 0)
+-		return q6v5->handover_irq;
++	if (q6v5->handover_irq < 0) {
++		ret = q6v5->handover_irq;
++		goto release;
++	}
+ 
+ 	ret = devm_request_threaded_irq(&pdev->dev, q6v5->handover_irq,
+ 					NULL, q6v5_handover_interrupt,
+-					IRQF_TRIGGER_RISING | IRQF_ONESHOT,
++					IRQF_TRIGGER_RISING | IRQF_ONESHOT | IRQF_NO_AUTOEN,
+ 					"q6v5 handover", q6v5);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "failed to acquire handover IRQ\n");
+-		return ret;
+-	}
+-	disable_irq(q6v5->handover_irq);
++		goto release;
++	}
++	q6v5->requested_irqs |= BIT(3);
+ 
+ 	q6v5->stop_irq = platform_get_irq_byname(pdev, "stop-ack");
+-	if (q6v5->stop_irq < 0)
+-		return q6v5->stop_irq;
++	if (q6v5->stop_irq < 0) {
++		ret = q6v5->stop_irq;
++		goto release;
++	}
+ 
+ 	ret = devm_request_threaded_irq(&pdev->dev, q6v5->stop_irq,
+ 					NULL, q6v5_stop_interrupt,
+@@ -417,35 +450,45 @@
+ 					"q6v5 stop", q6v5);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "failed to acquire stop-ack IRQ\n");
+-		return ret;
+-	}
++		goto release;
++	}
++	q6v5->requested_irqs |= BIT(4);
+ 
+ 	q6v5->state = devm_qcom_smem_state_get(&pdev->dev, "stop", &q6v5->stop_bit);
+ 	if (IS_ERR(q6v5->state)) {
+ 		dev_err(&pdev->dev, "failed to acquire stop state\n");
+-		return PTR_ERR(q6v5->state);
++		ret = PTR_ERR(q6v5->state);
++		goto release;
++	}
++
++	if (q6v5->stop_bit >= 32) {
++		ret = -EINVAL;
++		goto release;
+ 	}
+ 
+ 	q6v5->load_state = devm_kstrdup_const(&pdev->dev, load_state, GFP_KERNEL);
+ 	q6v5->qmp = qmp_get(&pdev->dev);
+ 	if (IS_ERR(q6v5->qmp)) {
+-		if (PTR_ERR(q6v5->qmp) != -ENODEV)
+-			return dev_err_probe(&pdev->dev, PTR_ERR(q6v5->qmp),
+-					     "failed to acquire load state\n");
++		if (PTR_ERR(q6v5->qmp) != -ENODEV) {
++			ret = dev_err_probe(&pdev->dev, PTR_ERR(q6v5->qmp),
++					    "failed to acquire load state\n");
++			goto release;
++		}
+ 		q6v5->qmp = NULL;
+ 	} else if (!q6v5->load_state) {
+ 		if (!load_state)
+ 			dev_err(&pdev->dev, "load state resource string empty\n");
+ 
+-		qmp_put(q6v5->qmp);
+-		return load_state ? -ENOMEM : -EINVAL;
++		ret = load_state ? -ENOMEM : -EINVAL;
++		goto release;
+ 	}
+ 
+ 	q6v5->path = devm_of_icc_get(&pdev->dev, "rproc_ddr");
+ 	if (IS_ERR(q6v5->path)) {
+ 		if (PTR_ERR(q6v5->path) != -ENODATA) {
+-			return dev_err_probe(&pdev->dev, PTR_ERR(q6v5->path),
++			ret = dev_err_probe(&pdev->dev, PTR_ERR(q6v5->path),
+ 				     "failed to acquire rproc_ddr interconnect path\n");
++			goto release;
+ 		}
+ 		q6v5->path = NULL;
+ 	}
+@@ -453,15 +496,17 @@
+ 	q6v5->crypto_path = devm_of_icc_get(&pdev->dev, "crypto_ddr");
+ 	if (IS_ERR(q6v5->crypto_path)) {
+ 		if (PTR_ERR(q6v5->crypto_path) != -ENODATA) {
+-			return dev_err_probe(&pdev->dev, PTR_ERR(q6v5->crypto_path),
++			ret = dev_err_probe(&pdev->dev, PTR_ERR(q6v5->crypto_path),
+ 				     "failed to acquire crypto_ddr interconnect path\n");
++			goto release;
+ 		}
+ 		q6v5->crypto_path = NULL;
+ 	}
+ 
+-	INIT_WORK(&q6v5->crash_handler, qcom_q6v5_crash_handler_work);
+-
+ 	return 0;
++release:
++	q6v5_release_resources(q6v5);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(qcom_q6v5_init);
+ 
+@@ -471,7 +516,7 @@
+  */
+ void qcom_q6v5_deinit(struct qcom_q6v5 *q6v5)
+ {
+-	qmp_put(q6v5->qmp);
++	q6v5_release_resources(q6v5);
+ }
+ EXPORT_SYMBOL_GPL(qcom_q6v5_deinit);
+ 
+--- a/drivers/remoteproc/qcom_q6v5.h
++++ b/drivers/remoteproc/qcom_q6v5.h
+@@ -29,6 +29,7 @@
+ 	int ready_irq;
+ 	int handover_irq;
+ 	int stop_irq;
++	u32 requested_irqs;
+ 
+ 	struct rproc_subdev *ssr_subdev;
+ 	struct rproc_subdev *glink_subdev;
+--- a/drivers/remoteproc/qcom_sysmon.c
++++ b/drivers/remoteproc/qcom_sysmon.c
+@@ -45,6 +45,7 @@
+ 	const char *name;
+ 
+ 	int shutdown_irq;
++	bool shutdown_irq_requested;
+ 	int ssctl_version;
+ 	int ssctl_instance;
+ 
+@@ -89,12 +90,14 @@
+ 	int len;
+ 	int ret;
+ 
+-	len = scnprintf(req, sizeof(req), "ssr:%s:%s", source->name,
++	len = snprintf(req, sizeof(req), "ssr:%s:%s", source->name,
+ 		       subdevice_state_string[source->state]);
+ 	if (len >= sizeof(req))
+ 		return;
+ 
+ 	mutex_lock(&sysmon->lock);
++	if (!sysmon->ept)
++		goto out_unlock;
+ 	reinit_completion(&sysmon->comp);
+ 	sysmon->ssr_ack = false;
+ 
+@@ -131,6 +134,8 @@
+ 	int ret;
+ 
+ 	mutex_lock(&sysmon->lock);
++	if (!sysmon->ept)
++		goto out_unlock;
+ 	reinit_completion(&sysmon->comp);
+ 	sysmon->ssr_ack = false;
+ 
+@@ -621,7 +626,7 @@
+ 
+ static void sysmon_notif_timeout_handler(struct timer_list *t)
+ {
+-	struct notif_timeout_data *td = from_timer(td, t, timer);
++	struct notif_timeout_data *td = timer_container_of(td, t, timer);
+ 	struct qcom_sysmon *sysmon = container_of(td, struct qcom_sysmon, timeout_data);
+ 
+ 	if (IS_ENABLED(CONFIG_QCOM_PANIC_ON_NOTIF_TIMEOUT) &&
+@@ -638,7 +643,7 @@
+ 
+ static void sysmon_shutdown_notif_timeout_handler(struct timer_list *t)
+ {
+-	struct notif_timeout_data *td = from_timer(td, t, timer);
++	struct notif_timeout_data *td = timer_container_of(td, t, timer);
+ 	struct qcom_sysmon *sysmon = container_of(td, struct qcom_sysmon, timeout_data);
+ 
+ 	WARN(1, shutdown_timeout_msg, sysmon->name);
+@@ -668,7 +673,7 @@
+ 	} else if (sysmon->ept)
+ 		sysmon_send_event(sysmon, source);
+ 
+-	del_timer_sync(&source->timeout_data.timer);
++	timer_delete_sync(&source->timeout_data.timer);
+ }
+ 
+ static int sysmon_prepare(struct rproc_subdev *subdev)
+@@ -760,7 +765,7 @@
+ 	else if (sysmon->ept)
+ 		sysmon->shutdown_acked = sysmon_request_shutdown(sysmon);
+ 
+-	del_timer_sync(&sysmon->timeout_data.timer);
++	timer_delete_sync(&sysmon->timeout_data.timer);
+ }
+ 
+ static void sysmon_unprepare(struct rproc_subdev *subdev)
+@@ -853,8 +858,7 @@
+ 			dev_err(sysmon->dev,
+ 				"failed to retrieve shutdown-ack IRQ\n");
+ 			ret = sysmon->shutdown_irq;
+-			kfree(sysmon);
+-			return ERR_PTR(ret);
++			goto free_sysmon;
+ 		}
+ 	} else {
+ 		ret = devm_request_threaded_irq(sysmon->dev,
+@@ -865,20 +869,21 @@
+ 		if (ret) {
+ 			dev_err(sysmon->dev,
+ 				"failed to acquire shutdown-ack IRQ\n");
+-			kfree(sysmon);
+-			return ERR_PTR(ret);
++			goto free_sysmon;
+ 		}
++		sysmon->shutdown_irq_requested = true;
+ 	}
+ 
+ 	ret = qmi_handle_init(&sysmon->qmi, SSCTL_MAX_MSG_LEN, &ssctl_ops,
+ 			      qmi_indication_handler);
+ 	if (ret < 0) {
+ 		dev_err(sysmon->dev, "failed to initialize qmi handle\n");
+-		kfree(sysmon);
+-		return ERR_PTR(ret);
+-	}
+-
+-	qmi_add_lookup(&sysmon->qmi, 43, 0, 0);
++		goto free_irq;
++	}
++
++	ret = qmi_add_lookup(&sysmon->qmi, 43, 0, 0);
++	if (ret)
++		goto release_qmi;
+ 
+ add_subdev_callbacks:
+ 	sysmon->subdev.prepare = sysmon_prepare;
+@@ -896,6 +901,15 @@
+ 	mutex_unlock(&sysmon_lock);
+ 
+ 	return sysmon;
++release_qmi:
++	qmi_handle_release(&sysmon->qmi);
++free_irq:
++	if (sysmon->shutdown_irq_requested)
++		devm_free_irq(sysmon->dev, sysmon->shutdown_irq, sysmon);
++free_sysmon:
++	timer_shutdown_sync(&sysmon->timeout_data.timer);
++	kfree(sysmon);
++	return ERR_PTR(ret);
+ }
+ EXPORT_SYMBOL_GPL(qcom_add_sysmon_subdev);
+ 
+@@ -905,7 +919,7 @@
+  */
+ void qcom_remove_sysmon_subdev(struct qcom_sysmon *sysmon)
+ {
+-	if (!sysmon)
++	if (IS_ERR_OR_NULL(sysmon))
+ 		return;
+ 
+ 	mutex_lock(&sysmon_lock);
+@@ -919,6 +933,9 @@
+ 	if (sysmon->ssctl_instance != -EINVAL)
+ 		qmi_handle_release(&sysmon->qmi);
+ 
++	if (sysmon->shutdown_irq_requested)
++		devm_free_irq(sysmon->dev, sysmon->shutdown_irq, sysmon);
++	timer_shutdown_sync(&sysmon->timeout_data.timer);
+ 	kfree(sysmon);
+ }
+ EXPORT_SYMBOL_GPL(qcom_remove_sysmon_subdev);
+@@ -971,10 +988,11 @@
+ 	return -EINVAL;
+ 
+ found:
+-	mutex_unlock(&sysmon_lock);
+-
++	mutex_lock(&sysmon->lock);
+ 	rpdev->ept->priv = sysmon;
+ 	sysmon->ept = rpdev->ept;
++	mutex_unlock(&sysmon->lock);
++	mutex_unlock(&sysmon_lock);
+ 
+ 	return 0;
+ }
+@@ -989,7 +1007,9 @@
+ {
+ 	struct qcom_sysmon *sysmon = rpdev->ept->priv;
+ 
++	mutex_lock(&sysmon->lock);
+ 	sysmon->ept = NULL;
++	mutex_unlock(&sysmon->lock);
+ }
+ 
+ static const struct rpmsg_device_id sysmon_match[] = {
+--- a/drivers/remoteproc/qcom_q6v5_pas.c
++++ b/drivers/remoteproc/qcom_q6v5_pas.c
+@@ -34,6 +34,7 @@
+ #include <trace/hooks/remoteproc.h>
+ #include <linux/iopoll.h>
+ #include <linux/refcount.h>
++#include <linux/overflow.h>
+ #include <trace/events/rproc_qcom.h>
+ #include <linux/interconnect.h>
+ 
+@@ -100,6 +101,7 @@
+ 	struct regulator *px_supply;
+ 	struct reg_info *regs;
+ 	int reg_cnt;
++	int enabled_regs;
+ 
+ 	struct device *proxy_pds[3];
+ 
+@@ -143,6 +145,7 @@
+ 	bool dma_phys_below_32b;
+ 	bool subsys_recovery_disabled;
+ 	bool region_assigned;
++	unsigned int assigned_regions;
+ 
+ 	struct qcom_rproc_glink glink_subdev;
+ 	struct qcom_rproc_subdev smd_subdev;
+@@ -175,67 +178,73 @@
+ }
+ static DEVICE_ATTR_RO(txn_id);
+ 
++static bool adsp_range_offset(u64 address, size_t size, u64 base,
++			      size_t region_size, size_t *offset)
++{
++	u64 delta;
++
++	if (address < base)
++		return false;
++	delta = address - base;
++	if (delta > region_size || size > region_size - delta)
++		return false;
++	*offset = delta;
++	return true;
++}
++
++static bool adsp_dump_address(struct rproc_dump_segment *segment, size_t offset,
++			      size_t size, u64 *address)
++{
++	if (segment->offset < 0 || offset > segment->size || size > segment->size - offset ||
++	    check_add_overflow(segment->da, (u64)segment->offset, address) ||
++	    check_add_overflow(*address, (u64)offset, address) || size > U64_MAX - *address)
++		return false;
++	return true;
++}
++
+ static int adsp_custom_segment_dump(struct qcom_adsp *adsp,
+ 				    struct rproc_dump_segment *segment,
+ 				    void *dest, size_t offset, size_t size)
+ {
+-	int len = strlen("md_dbg_buf");
+ 	void __iomem *base;
+-	int total_offset;
++	size_t region_offset;
++	u64 address;
+ 	bool valid = false;
+ 	int i;
+ 
+-	if (segment->priv && strnlen(segment->priv, len + 1) == len &&
+-		    !strcmp(segment->priv, "md_dbg_buf"))
+-		goto custom_segment_dump;
+-
+-	/*
+-	 * Also, do second level of check for custom segments in
+-	 * adsp_custom_segment_dump(), which checks if the segment
+-	 * lies outside the subsystem region range.
+-	 */
+-	for (i = 0; i < adsp->region_assign_count; i++) {
+-		total_offset = segment->da + segment->offset +
+-				offset - adsp->region_assign_phys[i];
+-		if (!(total_offset < 0 ||
+-				total_offset + size > adsp->region_assign_size[i])) {
+-			valid = true;
+-			break;
+-		}
+-	}
+-
++	if (!adsp_dump_address(segment, offset, size, &address))
++		return -EINVAL;
++	/* Firmware exposes its diagnostic header separately from assigned regions. */
++	if (segment->priv && !strcmp(segment->priv, "md_dbg_buf"))
++		valid = true;
++	for (i = 0; !valid && i < adsp->region_assign_count; i++)
++		valid = adsp_range_offset(address, size, adsp->region_assign_phys[i],
++					  adsp->region_assign_size[i], &region_offset);
+ 	if (!valid)
+ 		return -EINVAL;
+-
+-custom_segment_dump:
+-	base = ioremap((unsigned long)le64_to_cpu(segment->da) + offset, size);
+-	if (!base) {
+-		dev_err(adsp->dev, "failed to map custom_segment region\n");
+-		return -EINVAL;
+-	}
+-
++	base = ioremap(address, size);
++	if (!base)
++		return -ENOMEM;
+ 	memcpy_fromio(dest, base, size);
+ 	iounmap(base);
+-
+ 	return 0;
+ }
+ 
+-void adsp_segment_dump(struct rproc *rproc, struct rproc_dump_segment *segment,
+-		     void *dest, size_t offset, size_t size)
++static void adsp_segment_dump(struct rproc *rproc, struct rproc_dump_segment *segment,
++			      void *dest, size_t offset, size_t size)
+ {
+ 	struct qcom_adsp *adsp = rproc->priv;
+-	int total_offset;
+-
+-	total_offset = segment->da + segment->offset + offset - adsp->mem_phys;
+-	if (!(total_offset < 0 || total_offset + size > adsp->mem_size)) {
+-		memcpy_fromio(dest, adsp->mem_region + total_offset, size);
++	size_t region_offset;
++	u64 address;
++
++	if (adsp_dump_address(segment, offset, size, &address) &&
++	    adsp_range_offset(address, size, adsp->mem_phys, adsp->mem_size, &region_offset)) {
++		memcpy_fromio(dest, adsp->mem_region + region_offset, size);
+ 		return;
+-	} else if (!adsp_custom_segment_dump(adsp, segment, dest, offset, size)) {
++	}
++	if (!adsp_custom_segment_dump(adsp, segment, dest, offset, size))
+ 		return;
+-	}
+-
+-	dev_err(adsp->dev,
+-		"invalid copy request for segment %pad with offset %zu and size %zu)\n",
++	dev_err(adsp->dev, "invalid dump segment %pad offset %zu size %zu\n",
+ 		&segment->da, offset, size);
+ 	memset(dest, 0xff, size);
+ }
+@@ -258,34 +267,43 @@
+ 
+ static void disable_regulators(struct qcom_adsp *adsp)
+ {
+-	int i;
+-
+-	for (i = (adsp->reg_cnt - 1); i >= 0; i--) {
+-		regulator_set_voltage(adsp->regs[i].reg, 0, INT_MAX);
+-		regulator_set_load(adsp->regs[i].reg, 0);
+-		regulator_disable(adsp->regs[i].reg);
+-	}
+-}
++	while (adsp->enabled_regs) {
++		struct reg_info *reg = &adsp->regs[--adsp->enabled_regs];
++
++		regulator_set_voltage(reg->reg, 0, INT_MAX);
++		regulator_set_load(reg->reg, 0);
++		regulator_disable(reg->reg);
++	}
++}
++
+ static int enable_regulators(struct qcom_adsp *adsp)
+ {
+-	int i, rc = 0;
+-
+-	for (i = 0; i < adsp->reg_cnt; i++) {
+-		regulator_set_voltage(adsp->regs[i].reg, adsp->regs[i].uV, INT_MAX);
+-		regulator_set_load(adsp->regs[i].reg, adsp->regs[i].uA);
+-		rc = regulator_enable(adsp->regs[i].reg);
+-		if (rc) {
+-			dev_err(adsp->dev, "Regulator enable failed(rc:%d)\n",
+-				rc);
+-			goto err_enable;
+-		}
+-	}
+-	return rc;
+-
+-err_enable:
++	struct reg_info *reg;
++	int ret;
++
++	while (adsp->enabled_regs < adsp->reg_cnt) {
++		reg = &adsp->regs[adsp->enabled_regs];
++		ret = regulator_set_voltage(reg->reg, reg->uV, INT_MAX);
++		if (ret)
++			goto rollback;
++		ret = regulator_set_load(reg->reg, reg->uA);
++		if (ret < 0)
++			goto reset_voltage;
++		ret = regulator_enable(reg->reg);
++		if (ret)
++			goto reset_load;
++		adsp->enabled_regs++;
++	}
++	return 0;
++reset_load:
++	regulator_set_load(reg->reg, 0);
++reset_voltage:
++	regulator_set_voltage(reg->reg, 0, INT_MAX);
++rollback:
+ 	disable_regulators(adsp);
+-	return rc;
+-}
++	return ret;
++}
++
+ static int adsp_pds_enable(struct qcom_adsp *adsp, struct device **pds,
+ 			   size_t pd_count)
+ {
+@@ -293,7 +311,9 @@
+ 	int i;
+ 
+ 	for (i = 0; i < pd_count; i++) {
+-		dev_pm_genpd_set_performance_state(pds[i], INT_MAX);
++		ret = dev_pm_genpd_set_performance_state(pds[i], INT_MAX);
++		if (ret)
++			goto unroll_pd_votes;
+ 		ret = pm_runtime_get_sync(pds[i]);
+ 		if (ret < 0) {
+ 			pm_runtime_put_noidle(pds[i]);
+@@ -468,7 +488,7 @@
+ 	 * Modem physical address range has to be in the low 4G (32 bits only) and low 2
+ 	 * bytes will be zeros, so, left shift by 16 to get proper address & size.
+ 	 */
+-	for (i = 0; i < resource_size(&imem); i = i + 4) {
++	for (i = 0; i + 4 <= resource_size(&imem); i += 4) {
+ 		da = (u32)(__raw_readw(base + i) << 16);
+ 		size = (u32)(__raw_readw(base + (i + 2)) << 16);
+ 		if (da && size)
+@@ -489,7 +509,7 @@
+ 	if (!adsp->region_assign_idx)
+ 		return 0;
+ 
+-	for (offset = 0; offset < adsp->region_assign_count; ++offset) {
++	for (offset = adsp->assigned_regions; offset < adsp->region_assign_count; ++offset) {
+ 		node = of_parse_phandle(adsp->dev->of_node, "memory-region",
+ 					adsp->region_assign_idx + offset);
+ 		if (!node) {
+@@ -498,6 +518,7 @@
+ 		}
+ 
+ 		ret = of_address_to_resource(node, 0, &r);
++		of_node_put(node);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -526,6 +547,7 @@
+ 			dev_err(adsp->dev, "assign memory %d failed\n", offset);
+ 			return ret;
+ 		}
++		adsp->assigned_regions++;
+ 	}
+ 
+ 	return 0;
+@@ -539,7 +561,7 @@
+ 	if (!adsp->region_assign_idx || adsp->region_assign_shared)
+ 		return;
+ 
+-	for (offset = 0; offset < adsp->region_assign_count; ++offset) {
++	for (offset = (int)adsp->assigned_regions - 1; offset >= 0; offset--) {
+ 		perm.vmid = QCOM_SCM_VMID_HLOS;
+ 		perm.perm = QCOM_SCM_PERM_RW;
+ 
+@@ -547,8 +569,11 @@
+ 					  adsp->region_assign_size[offset],
+ 					  &adsp->region_assign_perms[offset],
+ 					  &perm, 1);
+-		if (ret < 0)
++		if (ret < 0) {
+ 			dev_err(adsp->dev, "unassign memory failed\n");
++			break;
++		}
++		adsp->assigned_regions--;
+ 	}
+ }
+ 
+@@ -575,7 +600,7 @@
+ 			(adsp->region_assign_shared && !adsp->region_assigned)) {
+ 		ret = adsp_assign_memory_region(adsp);
+ 		if (ret)
+-			goto disable_irqs;
++			goto unassign_memory;
+ 	}
+ 	adsp->region_assigned = true;
+ 
+@@ -694,7 +719,6 @@
+ unassign_memory:
+ 	adsp->region_assigned = false;
+ 	adsp_unassign_memory_region(adsp);
+-disable_irqs:
+ 	qcom_q6v5_unprepare(&adsp->q6v5);
+ exit_start:
+ 	if (adsp->dtb_pas_id && adsp->dma_phys_below_32b && !auth_reset_ret)
+@@ -1101,15 +1125,12 @@
+ static void *adsp_da_to_va(struct rproc *rproc, u64 da, size_t len, bool *is_iomem)
+ {
+ 	struct qcom_adsp *adsp = rproc->priv;
+-	int offset;
+-
+-	offset = da - adsp->mem_phys;
+-	if (offset < 0 || offset + len > adsp->mem_size)
++	size_t offset;
++
++	if (!adsp_range_offset(da, len, adsp->mem_phys, adsp->mem_size, &offset))
+ 		return NULL;
+-
+ 	if (is_iomem)
+ 		*is_iomem = true;
+-
+ 	return adsp->mem_region + offset;
+ }
+ 
+@@ -1179,15 +1200,15 @@
+ 		return 0;
+ 	}
+ 
+-	adsp->regs = devm_kzalloc(adsp->dev,
+-				  sizeof(struct reg_info) * adsp->reg_cnt,
+-				  GFP_KERNEL);
++	adsp->regs = devm_kcalloc(adsp->dev, adsp->reg_cnt,
++				   sizeof(*adsp->regs), GFP_KERNEL);
+ 	if (!adsp->regs)
+ 		return -ENOMEM;
+ 
+ 	for (i = 0; i < adsp->reg_cnt; i++) {
+-		of_property_read_string_index(adsp->dev->of_node, "reg-names",
+-					      i, &reg_name);
++		rc = of_property_read_string_index(adsp->dev->of_node, "reg-names", i, &reg_name);
++		if (rc)
++			return rc;
+ 
+ 		adsp->regs[i].reg = devm_regulator_get(adsp->dev, reg_name);
+ 		if (IS_ERR(adsp->regs[i].reg)) {
+@@ -1227,8 +1248,11 @@
+ 	if (!pd_names)
+ 		return 0;
+ 
+-	while (pd_names[num_pds])
++	while (pd_names[num_pds]) {
++		if (num_pds == 3)
++			return -E2BIG;
+ 		num_pds++;
++	}
+ 
+ 	/* Handle single power domain */
+ 	if (num_pds == 1 && dev->pm_domain) {
+@@ -1325,6 +1349,11 @@
+ 	return 0;
+ }
+ 
++static void adsp_release_dma_region(void *data)
++{
++	of_reserved_mem_device_release(data);
++}
++
+ static int adsp_setup_32b_dma_allocs(struct qcom_adsp *adsp)
+ {
+ 	int ret;
+@@ -1340,6 +1369,9 @@
+ 		goto out;
+ 	}
+ 
++	ret = devm_add_action_or_reset(adsp->dev, adsp_release_dma_region, adsp->dev);
++	if (ret)
++		return ret;
+ 	ret = dma_set_mask_and_coherent(adsp->dev, DMA_BIT_MASK(32));
+ 	if (ret)
+ 		dev_err(adsp->dev, "Unable to set the coherent mask to 32-bits!\n");
+@@ -1348,10 +1380,13 @@
+ 	return ret;
+ }
+ 
+-static void rproc_recovery_set(struct rproc *rproc)
+-{
+-	struct qcom_adsp *adsp = (struct qcom_adsp *)rproc->priv;
+-
++static void rproc_recovery_set(void *unused, struct rproc *rproc)
++{
++	struct qcom_adsp *adsp;
++
++	if (rproc->ops->start != adsp_start)
++		return;
++	adsp = rproc->priv;
+ 	adsp->subsys_recovery_disabled = rproc->recovery_disabled;
+ }
+ 
+@@ -1488,20 +1523,21 @@
+ 		goto detach_proxy_pds;
+ 
+ 	if (adsp->check_status) {
+-		if (rproc_find_status_register(adsp))
+-			goto detach_proxy_pds;
++		ret = rproc_find_status_register(adsp);
++		if (ret)
++			goto deinit_q6;
+ 		adsp->wake_state = devm_qcom_smem_state_get(&pdev->dev, "wakeup", &adsp->wake_bit);
+ 
+ 		if (IS_ERR(adsp->wake_state)) {
+-			dev_err(&pdev->dev, "failed to acquire wake state\n");
+-			goto detach_proxy_pds;
++			ret = PTR_ERR(adsp->wake_state);
++			goto deinit_q6;
+ 		}
+ 
+ 		adsp->sleep_state = devm_qcom_smem_state_get(&pdev->dev, "sleep", &adsp->sleep_bit);
+ 
+ 		if (IS_ERR(adsp->sleep_state)) {
+-			dev_err(&pdev->dev, "failed to acquire sleep state\n");
+-			goto detach_proxy_pds;
++			ret = PTR_ERR(adsp->sleep_state);
++			goto deinit_q6;
+ 		}
+ 
+ 		mutex_init(&adsp->adsp_lock);
+@@ -1519,30 +1555,28 @@
+ 					      desc->ssctl_id);
+ 	if (IS_ERR(adsp->sysmon)) {
+ 		ret = PTR_ERR(adsp->sysmon);
+-		goto detach_proxy_pds;
++		goto remove_smd;
+ 	}
+ 
+ 	ret = device_create_file(adsp->dev, &dev_attr_txn_id);
+ 	if (ret)
+-		goto remove_subdevs;
++		goto remove_sysmon;
+ 
+ 	snprintf(md_dev_name, ARRAY_SIZE(md_dev_name), "%s-md", pdev->dev.of_node->name);
+ 	adsp->minidump_dev = qcom_create_ramdump_device(md_dev_name, NULL);
+-	if (!adsp->minidump_dev)
+-		dev_err(&pdev->dev, "Unable to create %s minidump device.\n", md_dev_name);
++	if (IS_ERR_OR_NULL(adsp->minidump_dev)) {
++		ret = adsp->minidump_dev ? PTR_ERR(adsp->minidump_dev) : -ENOMEM;
++		goto remove_attribute;
++	}
+ 
+ 	qcom_add_ssr_subdev(rproc, &adsp->ssr_subdev, desc->ssr_name);
++	if (!adsp->ssr_subdev.info) {
++		ret = -ENOMEM;
++		goto destroy_minidump_dev;
++	}
+ 	ret = rproc_add(rproc);
+ 	if (ret)
+-		goto destroy_minidump_dev;
+-
+-	/*
+-	 * Concurrent stores can happen on the same global variable with
+-	 * different subsystem probe, however, as it is happening with
+-	 * same value at max, compiler can do is to optimize it away with
+-	 * single store compared to multiple store on worst case, so be it.
+-	 */
+-	rproc_recovery_set_fn = rproc_recovery_set;
++		goto remove_ssr;
+ 
+ 	if (adsp->check_status) {
+ 		adsp->panic_blk.priority = INT_MAX - 2;
+@@ -1552,13 +1586,19 @@
+ 
+ 	return 0;
+ 
++remove_ssr:
++	qcom_remove_ssr_subdev(rproc, &adsp->ssr_subdev);
+ destroy_minidump_dev:
+-	if (adsp->minidump_dev)
+-		qcom_destroy_ramdump_device(adsp->minidump_dev);
+-
++	qcom_destroy_ramdump_device(adsp->minidump_dev);
++remove_attribute:
+ 	device_remove_file(adsp->dev, &dev_attr_txn_id);
+-remove_subdevs:
++remove_sysmon:
+ 	qcom_remove_sysmon_subdev(adsp->sysmon);
++remove_smd:
++	qcom_remove_smd_subdev(rproc, &adsp->smd_subdev);
++	qcom_remove_glink_subdev(rproc, &adsp->glink_subdev);
++deinit_q6:
++	qcom_q6v5_deinit(&adsp->q6v5);
+ detach_proxy_pds:
+ 	adsp_pds_detach(adsp, adsp->proxy_pds, adsp->proxy_pd_count);
+ free_rproc:
+@@ -2581,13 +2621,35 @@
+ 
+ static struct platform_driver adsp_driver = {
+ 	.probe = adsp_probe,
+-	.remove_new = adsp_remove,
++	.remove = adsp_remove,
+ 	.driver = {
+ 		.name = "qcom_q6v5_pas",
+ 		.of_match_table = adsp_of_match,
+ 	},
+ };
+ 
+-module_platform_driver(adsp_driver);
++static int __init adsp_driver_init(void)
++{
++	int ret;
++
++	ret = register_trace_android_vh_rproc_recovery_set(rproc_recovery_set, NULL);
++	if (ret)
++		return ret;
++	ret = platform_driver_register(&adsp_driver);
++	if (ret) {
++		unregister_trace_android_vh_rproc_recovery_set(rproc_recovery_set, NULL);
++		tracepoint_synchronize_unregister();
++	}
++	return ret;
++}
++module_init(adsp_driver_init);
++
++static void __exit adsp_driver_exit(void)
++{
++	unregister_trace_android_vh_rproc_recovery_set(rproc_recovery_set, NULL);
++	tracepoint_synchronize_unregister();
++	platform_driver_unregister(&adsp_driver);
++}
++module_exit(adsp_driver_exit);
+ MODULE_DESCRIPTION("Qualcomm Hexagon v5 Peripheral Authentication Service driver");
+ MODULE_LICENSE("GPL v2");
+--- a/drivers/soc/qcom/qcom_ramdump.c
++++ b/drivers/soc/qcom/qcom_ramdump.c
+@@ -10,6 +10,8 @@
+ #include <linux/wait.h>
+ #include <linux/cdev.h>
+ #include <linux/atomic.h>
++#include <linux/fs.h>
++#include <linux/overflow.h>
+ #include <soc/qcom/qcom_ramdump.h>
+ #include <linux/devcoredump.h>
+ #include <linux/of.h>
+@@ -54,9 +56,8 @@
+ static bool ramdump_devnode_inited;
+ 
+ struct ramdump_device {
+-	char name[256];
+ 	struct cdev cdev;
+-	struct device *dev;
++	struct device dev;
+ };
+ 
+ struct qcom_ramdump_desc {
+@@ -96,7 +97,7 @@
+ 	desc.data = data;
+ 	init_completion(&desc.dump_done);
+ 
+-	dev_coredumpm(dev, NULL, &desc, datalen, gfp, qcom_devcd_readv, qcom_devcd_freev);
++	dev_coredumpm(dev, THIS_MODULE, &desc, datalen, gfp, qcom_devcd_readv, qcom_devcd_freev);
+ 
+ 	wait_for_completion(&desc.dump_done);
+ 
+@@ -116,7 +117,8 @@
+ 
+ 	list_for_each_entry(segment, segs, node) {
+ 		pr_info("Got segment size %zd\n", segment->size);
+-		data_size += segment->size;
++		if (check_add_overflow(data_size, segment->size, &data_size))
++			return -EOVERFLOW;
+ 	}
+ 
+ 	data = vmalloc(data_size);
+@@ -127,15 +129,16 @@
+ 		if (segment->va)
+ 			memcpy(data + offset, segment->va, segment->size);
+ 		else {
+-			ptr = devm_ioremap(dev, segment->da, segment->size);
++			ptr = ioremap(segment->da, segment->size);
+ 			if (!ptr) {
+ 				dev_err(dev,
+ 					"invalid coredump segment (%pad, %zu)\n",
+ 					&segment->da, segment->size);
+ 				memset(data + offset, 0xff, segment->size);
+-			} else
+-				memcpy_fromio(data + offset, ptr,
+-					      segment->size);
++			} else {
++				memcpy_fromio(data + offset, ptr, segment->size);
++				iounmap(ptr);
++			}
+ 		}
+ 		offset += segment->size;
+ 	}
+@@ -168,13 +171,18 @@
+ 	void __iomem *ptr;
+ 
+ 
+-	if (!segs || list_empty(segs))
++	if (!segs || list_empty(segs) ||
++	    (class != ELFCLASS32 && class != ELFCLASS64))
+ 		return -EINVAL;
+ 
+ 	data_size = sizeof_elf_hdr(class);
+ 	list_for_each_entry(segment, segs, node) {
+-		data_size += sizeof_elf_phdr(class) + segment->size;
+-		phnum++;
++		if (++phnum >= PN_XNUM ||
++		    check_add_overflow(data_size, sizeof_elf_phdr(class), &data_size) ||
++		    check_add_overflow(data_size, segment->size, &data_size) ||
++		    (class == ELFCLASS32 &&
++		     (segment->da > U32_MAX || segment->size > U32_MAX || data_size > U32_MAX)))
++			return -EOVERFLOW;
+ 	}
+ 
+ 	data = vmalloc(data_size);
+@@ -210,15 +218,16 @@
+ 		if (segment->va)
+ 			memcpy(data + offset, segment->va, segment->size);
+ 		else {
+-			ptr = devm_ioremap(dev, segment->da, segment->size);
++			ptr = ioremap(segment->da, segment->size);
+ 			if (!ptr) {
+ 				dev_err(dev,
+ 					"invalid coredump segment (%pad, %zu)\n",
+ 					&segment->da, segment->size);
+ 				memset(data + offset, 0xff, segment->size);
+-			} else
+-				memcpy_fromio(data + offset, ptr,
+-					      segment->size);
++			} else {
++				memcpy_fromio(data + offset, ptr, segment->size);
++				iounmap(ptr);
++			}
+ 		}
+ 
+ 		offset += segment->size;
+@@ -229,144 +238,153 @@
+ }
+ EXPORT_SYMBOL(qcom_elf_dump);
+ 
++static bool qcom_ramdump_elf32_valid(const struct firmware *fw)
++{
++	const struct elf32_hdr *ehdr;
++
++	if (!fw || !fw->data || fw->size < sizeof(*ehdr))
++		return false;
++	ehdr = (const struct elf32_hdr *)fw->data;
++	return !memcmp(ehdr->e_ident, ELFMAG, SELFMAG) &&
++		ehdr->e_ident[EI_CLASS] == ELFCLASS32 &&
++		ehdr->e_ident[EI_DATA] == ELFDATA2LSB &&
++		ehdr->e_phentsize == sizeof(struct elf32_phdr) &&
++		ehdr->e_phoff >= sizeof(*ehdr) && ehdr->e_phoff <= fw->size &&
++		IS_ALIGNED(ehdr->e_phoff, __alignof__(struct elf32_phdr)) &&
++		ehdr->e_phnum < PN_XNUM &&
++		ehdr->e_phnum <= (fw->size - ehdr->e_phoff) / sizeof(struct elf32_phdr);
++}
++
+ int qcom_fw_elf_dump(struct firmware *fw, struct device *dev)
+ {
++	const struct elf32_hdr *ehdr;
+ 	const struct elf32_phdr *phdrs, *phdr;
+-	const struct elf32_hdr *ehdr;
+-	struct qcom_dump_segment *segment;
+-	struct list_head head;
+-	int i;
+-
+-	ehdr = (struct elf32_hdr *)fw->data;
+-	phdrs = (struct elf32_phdr *)(ehdr + 1);
+-	INIT_LIST_HEAD(&head);
+-
++	struct qcom_dump_segment *segment, *tmp;
++	LIST_HEAD(head);
++	int i, ret;
++
++	if (!qcom_ramdump_elf32_valid(fw))
++		return -EINVAL;
++	ehdr = (const struct elf32_hdr *)fw->data;
++	phdrs = (const struct elf32_phdr *)(fw->data + ehdr->e_phoff);
+ 	for (i = 0; i < ehdr->e_phnum; i++) {
+ 		phdr = &phdrs[i];
+-
+-		if (phdr->p_type != PT_LOAD)
++		if (phdr->p_type != PT_LOAD || !phdr->p_memsz ||
++		    (phdr->p_flags & QCOM_MDT_TYPE_MASK) == QCOM_MDT_TYPE_HASH)
+ 			continue;
+-
+-		if ((phdr->p_flags & QCOM_MDT_TYPE_MASK) == QCOM_MDT_TYPE_HASH)
+-			continue;
+-
+-		if (!phdr->p_memsz)
+-			continue;
+-
+-
+ 		segment = kzalloc(sizeof(*segment), GFP_KERNEL);
+-		if (!segment)
+-			return -ENOMEM;
+-
++		if (!segment) {
++			ret = -ENOMEM;
++			goto free_segments;
++		}
+ 		segment->da = phdr->p_paddr;
+ 		segment->size = phdr->p_memsz;
+-
+ 		list_add_tail(&segment->node, &head);
+ 	}
+-	qcom_elf_dump(&head, dev, ELFCLASS32);
++	ret = qcom_elf_dump(&head, dev, ELFCLASS32);
++free_segments:
++	list_for_each_entry_safe(segment, tmp, &head, node) {
++		list_del(&segment->node);
++		kfree(segment);
++	}
++	return ret;
++}
++EXPORT_SYMBOL(qcom_fw_elf_dump);
++
++static int ramdump_devnode_init(void)
++{
++	int ret;
++
++	ret = alloc_chrdev_region(&ramdump_dev, 0, RAMDUMP_NUM_DEVICES, RAMDUMP_NAME);
++	if (ret)
++		return ret;
++	ramdump_class = class_create(RAMDUMP_NAME);
++	if (IS_ERR(ramdump_class)) {
++		ret = PTR_ERR(ramdump_class);
++		unregister_chrdev_region(ramdump_dev, RAMDUMP_NUM_DEVICES);
++		return ret;
++	}
++	ramdump_devnode_inited = true;
+ 	return 0;
+ }
+-EXPORT_SYMBOL(qcom_fw_elf_dump);
+-
+-static int ramdump_devnode_init(void)
+-{
+-	int ret;
+-
+-	ramdump_class = class_create(RAMDUMP_NAME);
+-	ret = alloc_chrdev_region(&ramdump_dev, 0, RAMDUMP_NUM_DEVICES,
+-				  RAMDUMP_NAME);
+-	if (ret) {
+-		pr_err("%s: unable to allocate major\n", __func__);
+-		return ret;
+-	}
+-
+-	ramdump_devnode_inited = true;
+-
+-	return 0;
+-}
+-
+-void *qcom_create_ramdump_device(const char *dev_name, struct device *parent)
+-{
+-	int ret, minor;
+-	struct ramdump_device *rd_dev;
+-
+-	if (!dev_name) {
+-		pr_err("%s: Invalid device name.\n", __func__);
+-		return NULL;
+-	}
++
++/* Dump data is provided by devcoredump; these nodes identify the dump source. */
++static const struct file_operations ramdump_fops = {
++	.owner = THIS_MODULE,
++};
++
++static void ramdump_device_release(struct device *dev)
++{
++	struct ramdump_device *rd = container_of(dev, struct ramdump_device, dev);
++
++	ida_free(&rd_minor_id, MINOR(dev->devt));
++	kfree(rd);
++	module_put(THIS_MODULE);
++}
++
++void *qcom_create_ramdump_device(const char *name, struct device *parent)
++{
++	struct ramdump_device *rd;
++	int minor, ret;
+ 
+ 	mutex_lock(&rd_minor_mutex);
+-	if (!ramdump_devnode_inited) {
+-		ret = ramdump_devnode_init();
+-		if (ret) {
+-			mutex_unlock(&rd_minor_mutex);
+-			return ERR_PTR(ret);
+-		}
+-	}
++	ret = ramdump_devnode_inited ? 0 : ramdump_devnode_init();
+ 	mutex_unlock(&rd_minor_mutex);
+-
+-	rd_dev = kzalloc(sizeof(struct ramdump_device), GFP_KERNEL);
+-
+-	if (!rd_dev)
+-		return NULL;
+-
+-	/* get a minor number */
+-	minor = ida_simple_get(&rd_minor_id, 0, RAMDUMP_NUM_DEVICES,
+-			GFP_KERNEL);
++	if (ret)
++		return ERR_PTR(ret);
++
++	rd = kzalloc(sizeof(*rd), GFP_KERNEL);
++	if (!rd)
++		return ERR_PTR(-ENOMEM);
++	minor = ida_alloc_range(&rd_minor_id, 0, RAMDUMP_NUM_DEVICES - 1, GFP_KERNEL);
+ 	if (minor < 0) {
+-		pr_err("%s: No more minor numbers left! rc:%d\n", __func__,
+-			minor);
+-		ret = -ENODEV;
+-		goto fail_out_of_minors;
+-	}
+-
+-	snprintf(rd_dev->name, ARRAY_SIZE(rd_dev->name), "%s",
+-		 dev_name);
+-
+-	rd_dev->dev = device_create(ramdump_class, parent,
+-				    MKDEV(MAJOR(ramdump_dev), minor),
+-				   rd_dev, rd_dev->name);
+-	if (IS_ERR(rd_dev->dev)) {
+-		ret = PTR_ERR(rd_dev->dev);
+-		pr_err("%s: device_create failed for %s (%d)\n", __func__,
+-				dev_name, ret);
+-		goto fail_return_minor;
+-	}
+-
+-	cdev_init(&rd_dev->cdev, NULL);
+-	ret = cdev_add(&rd_dev->cdev, MKDEV(MAJOR(ramdump_dev), minor), 1);
+-	if (ret) {
+-		pr_err("%s: cdev_add failed for %s (%d)\n", __func__,
+-				dev_name, ret);
+-		goto fail_cdev_add;
+-	}
+-
+-	return (void *)rd_dev->dev;
+-
+-fail_cdev_add:
+-	device_unregister(rd_dev->dev);
+-fail_return_minor:
+-	ida_simple_remove(&rd_minor_id, minor);
+-fail_out_of_minors:
+-	kfree(rd_dev);
++		kfree(rd);
++		return ERR_PTR(minor);
++	}
++	/* A devcoredump child may retain this device after its creator detaches. */
++	__module_get(THIS_MODULE);
++	device_initialize(&rd->dev);
++	rd->dev.class = ramdump_class;
++	rd->dev.parent = parent;
++	rd->dev.devt = MKDEV(MAJOR(ramdump_dev), minor);
++	rd->dev.release = ramdump_device_release;
++	dev_set_drvdata(&rd->dev, rd);
++	ret = dev_set_name(&rd->dev, "%s", name);
++	if (ret)
++		goto put_device;
++	cdev_init(&rd->cdev, &ramdump_fops);
++	rd->cdev.owner = THIS_MODULE;
++	ret = cdev_device_add(&rd->cdev, &rd->dev);
++	if (ret)
++		goto put_device;
++	return &rd->dev;
++put_device:
++	put_device(&rd->dev);
+ 	return ERR_PTR(ret);
+ }
+ EXPORT_SYMBOL(qcom_create_ramdump_device);
+ 
+ void qcom_destroy_ramdump_device(void *dev)
+ {
+-	struct ramdump_device *rd_dev = dev_get_drvdata(dev);
+-	int minor = MINOR(rd_dev->cdev.dev);
+-
+-	if (IS_ERR_OR_NULL(rd_dev))
++	struct ramdump_device *rd;
++
++	if (IS_ERR_OR_NULL(dev))
+ 		return;
+-
+-	cdev_del(&rd_dev->cdev);
+-	device_unregister(rd_dev->dev);
+-	ida_simple_remove(&rd_minor_id, minor);
+-	kfree(rd_dev);
++	rd = dev_get_drvdata(dev);
++	cdev_device_del(&rd->cdev, &rd->dev);
++	put_device(&rd->dev);
+ }
+ EXPORT_SYMBOL(qcom_destroy_ramdump_device);
++
++static void __exit qcom_ramdump_exit(void)
++{
++	if (ramdump_devnode_inited) {
++		class_destroy(ramdump_class);
++		unregister_chrdev_region(ramdump_dev, RAMDUMP_NUM_DEVICES);
++	}
++	ida_destroy(&rd_minor_id);
++}
++module_exit(qcom_ramdump_exit);
+ 
+ MODULE_DESCRIPTION("Qualcomm Technologies, Inc. Ramdump driver");
+ MODULE_LICENSE("GPL");

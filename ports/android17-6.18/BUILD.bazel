@@ -1809,9 +1809,229 @@ ddk_module(
     visibility = ["//visibility:public"],
 )
 
+ddk_headers(
+    name = "rproc_headers",
+    hdrs = ["drivers/remoteproc/qcom_q6v5.h", "drivers/remoteproc/qcom_pil_info.h", "include/soc/qcom/qcom_ramdump.h"],
+    linux_includes = ["include"],
+    includes = ["drivers/remoteproc"],
+)
+
+ddk_module(
+    name = "qcom_pil_info",
+    srcs = ["drivers/remoteproc/qcom_pil_info.c"],
+    out = "qcom_pil_info.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":rproc_headers", ":remote_headers", ":scm_headers", ":platform_headers", ":loader_headers", ":mailbox_headers"],
+)
+
+ddk_module(
+    name = "qcom_ramdump",
+    srcs = ["drivers/soc/qcom/qcom_ramdump.c"],
+    out = "qcom_ramdump.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":rproc_headers", ":remote_headers", ":scm_headers", ":platform_headers", ":loader_headers", ":mailbox_headers"],
+)
+
+ddk_module(
+    name = "qcom_sysmon",
+    srcs = ["drivers/remoteproc/qcom_sysmon.c"],
+    out = "qcom_sysmon.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":rproc_headers", ":remote_headers", ":scm_headers", ":platform_headers", ":loader_headers", ":mailbox_headers", ":qmi_helpers", ":rproc_qcom_common"],
+)
+
+ddk_module(
+    name = "qcom_q6v5",
+    srcs = ["drivers/remoteproc/qcom_q6v5.c"],
+    out = "qcom_q6v5.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":rproc_headers", ":remote_headers", ":scm_headers", ":platform_headers", ":loader_headers", ":mailbox_headers", ":qcom_sysmon", ":rproc_qcom_common", ":smp2p", ":qcom_aoss", ":smem"],
+)
+
+ddk_module(
+    name = "qcom_q6v5_pas",
+    srcs = ["drivers/remoteproc/qcom_q6v5_pas.c"],
+    out = "qcom_q6v5_pas.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":rproc_headers", ":remote_headers", ":scm_headers", ":platform_headers", ":loader_headers", ":mailbox_headers", ":qcom_q6v5", ":qcom_pil_info", ":qcom_sysmon", ":qcom_ramdump", ":rproc_qcom_common", ":qcom_scm", ":mdt_loader", ":qcom_aoss", ":smem"],
+)
+
+ddk_headers(
+    name = "chargehw_headers",
+    hdrs = glob(["drivers/power/supply/mca/include/**/*.h", "drivers/power/supply/mca/mca_hardware_ic/**/*.h"]),
+    includes = ["drivers/power/supply/mca/include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_platform_base",
+    srcs = ["drivers/power/supply/mca/mca_platform/mca_platform_base.c"],
+    out = "mca_platform_base.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_parse_dts", ":mca_hwid", ":mca_common"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_platform_fg_ic_ops",
+    srcs = ["drivers/power/supply/mca/mca_platform/mca_platform_fg_ic_ops.c"],
+    out = "mca_platform_fg_ic_ops.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_parse_dts", ":mca_hwid", ":mca_common"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_platform_buckchg_class",
+    srcs = ["drivers/power/supply/mca/mca_platform/mca_platform_buckchg_class.c"],
+    out = "mca_platform_buckchg_class.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_parse_dts", ":mca_hwid", ":mca_common"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_platform_cp_class",
+    srcs = ["drivers/power/supply/mca/mca_platform/mca_platform_cp_class.c"],
+    out = "mca_platform_cp_class.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_parse_dts", ":mca_hwid", ":mca_common"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_platform_loadsw_class",
+    srcs = ["drivers/power/supply/mca/mca_platform/mca_platform_loadsw_class.c"],
+    out = "mca_platform_loadsw_class.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_parse_dts", ":mca_hwid", ":mca_common"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_platform_wireless_class",
+    srcs = ["drivers/power/supply/mca/mca_platform/mca_platform_wireless_class.c"],
+    out = "mca_platform_wireless_class.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_parse_dts", ":mca_hwid", ":mca_common"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_strategy_class",
+    srcs = ["drivers/power/supply/mca/mca_strategy/mca_strategy_class.c"],
+    out = "mca_strategy_class.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_parse_dts", ":mca_hwid", ":mca_common"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "sc8581",
+    srcs = ["drivers/power/supply/mca/mca_hardware_ic/charge_pump_ic/sc8581/sc8581.c"],
+    out = "sc8581.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_parse_dts", ":mca_hwid", ":mca_common", ":mca_platform_cp_class"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "bq27z561",
+    srcs = ["drivers/power/supply/mca/mca_hardware_ic/fuelgauge_ic/bq27z561/bq27z561.c"],
+    out = "bq27z561.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_parse_dts", ":mca_hwid", ":mca_common", ":mca_platform_fg_ic_ops", ":mca_strategy_class"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_headers(
+    name = "redriver_headers",
+    hdrs = ["include/linux/usb/redriver.h"],
+    linux_includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "phy_msm_ssusb_qmp",
+    srcs = ["drivers/usb/phy/phy-msm-ssusb-qmp.c"],
+    out = "phy-msm-ssusb-qmp.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":usb_phy_headers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "eud",
+    srcs = ["drivers/soc/qcom/eud.c"],
+    out = "eud.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":platform_headers", ":qcom_scm"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "redriver",
+    srcs = ["drivers/usb/redriver/redriver.c"],
+    out = "redriver.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":redriver_headers"],
+    visibility = ["//visibility:public"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
+        ":qcom_pil_info",
+        ":qcom_ramdump",
+        ":qcom_sysmon",
+        ":qcom_q6v5",
+        ":qcom_q6v5_pas",
+        ":mca_platform_base",
+        ":mca_platform_fg_ic_ops",
+        ":mca_platform_buckchg_class",
+        ":mca_platform_cp_class",
+        ":mca_platform_loadsw_class",
+        ":mca_platform_wireless_class",
+        ":mca_strategy_class",
+        ":sc8581",
+        ":bq27z561",
+        ":phy_msm_ssusb_qmp",
+        ":eud",
+        ":redriver",
         ":qmi_helpers",
         ":pdr_interface",
         ":smp2p",

@@ -1,0 +1,2227 @@
+--- a/drivers/usb/phy/phy-msm-ssusb-qmp.c
++++ b/drivers/usb/phy/phy-msm-ssusb-qmp.c
+@@ -18,6 +18,7 @@
+ #include <linux/clk.h>
+ #include <linux/extcon.h>
+ #include <linux/reset.h>
++#include <linux/mutex.h>
+ 
+ enum core_ldo_levels {
+ 	CORE_LEVEL_NONE = 0,
+@@ -142,6 +143,13 @@
+ 	struct reset_control	*phy_reset;
+ 	struct reset_control	*phy_phy_reset;
+ 	struct reset_control	*global_phy_reset;
++	struct mutex		lock;
++	resource_size_t		base_size;
++	unsigned int		supply_votes[3];
++	unsigned long		clock_votes;
++	bool			gdsc_enabled;
++	bool			removing;
++	bool			transition_failed;
+ 	bool			power_enabled;
+ 	bool			clk_enabled;
+ 	bool			cable_connected;
+@@ -174,7 +182,7 @@
+ MODULE_DEVICE_TABLE(of, msm_usb_id_table);
+ 
+ static void usb_qmp_powerup_phy(struct msm_ssphy_qmp *phy);
+-static void msm_ssphy_qmp_enable_clks(struct msm_ssphy_qmp *phy, bool on);
++static int msm_ssphy_qmp_enable_clks(struct msm_ssphy_qmp *phy, bool on);
+ static int msm_ssphy_qmp_reset(struct usb_phy *uphy);
+ static int msm_ssphy_qmp_dp_combo_reset(struct usb_phy *uphy);
+ 
+@@ -246,166 +254,141 @@
+ {
+ 	int ret;
+ 
+-	if (IS_ERR_OR_NULL(phy->usb3_dp_phy_gdsc))
++	if (!phy->usb3_dp_phy_gdsc || phy->gdsc_enabled == on)
+ 		return 0;
+-
+-	if (on)
+-		ret = regulator_enable(phy->usb3_dp_phy_gdsc);
+-	else
+-		ret = regulator_disable(phy->usb3_dp_phy_gdsc);
+-
+-	if (ret)
+-		dev_err(phy->phy.dev, "err:%d fail to %s usb3_dp_phy_gdsc\n",
+-				ret, on ? "enable" : "disable");
++	ret = on ? regulator_enable(phy->usb3_dp_phy_gdsc) :
++		   regulator_disable(phy->usb3_dp_phy_gdsc);
++	if (!ret)
++		phy->gdsc_enabled = on;
+ 	return ret;
+ }
+ 
++/* Keep each vote until its provider confirms release. */
++static int qmp_supply_disable(struct regulator *reg, const int levels[3], unsigned int *votes)
++{
++	int ret;
++
++	if (*votes & BIT(2)) {
++		ret = regulator_disable(reg);
++		if (ret)
++			return ret;
++		*votes &= ~BIT(2);
++	}
++	if (*votes & BIT(1)) {
++		ret = regulator_set_voltage(reg, levels[0], levels[2]);
++		if (ret)
++			return ret;
++		*votes &= ~BIT(1);
++	}
++	if (*votes & BIT(0)) {
++		ret = regulator_set_load(reg, 0);
++		if (ret < 0)
++			return ret;
++		*votes &= ~BIT(0);
++	}
++	return 0;
++}
++
++static int qmp_supply_enable(struct regulator *reg, const int levels[3], int load,
++			     unsigned int *votes)
++{
++	int ret;
++
++	ret = regulator_set_load(reg, load);
++	if (ret < 0)
++		return ret;
++	*votes |= BIT(0);
++	ret = regulator_set_voltage(reg, levels[1], levels[2]);
++	if (ret)
++		return ret;
++	*votes |= BIT(1);
++	ret = regulator_enable(reg);
++	if (!ret)
++		*votes |= BIT(2);
++	return ret;
++}
++
++static int qmp_power_off(struct msm_ssphy_qmp *phy)
++{
++	int ret;
++
++	phy->power_enabled = false;
++	ret = qmp_supply_disable(phy->refgen, phy->refgen_levels, &phy->supply_votes[2]);
++	if (ret)
++		return ret;
++	ret = qmp_supply_disable(phy->core_ldo, phy->core_voltage_levels, &phy->supply_votes[1]);
++	if (ret)
++		return ret;
++	ret = qmp_supply_disable(phy->vdd, phy->vdd_levels, &phy->supply_votes[0]);
++	if (ret)
++		return ret;
++	return msm_ssusb_qmp_gdsc(phy, false);
++}
++
+ static int msm_ssusb_qmp_ldo_enable(struct msm_ssphy_qmp *phy, int on)
+ {
+-	int min, rc = 0;
+-
+-	dev_dbg(phy->phy.dev, "reg (%s)\n", on ? "HPM" : "LPM");
+-
+-	if (phy->power_enabled == on) {
+-		dev_dbg(phy->phy.dev, "PHYs' regulators status %d\n",
+-			phy->power_enabled);
++	int ret, cleanup;
++
++	if (!on)
++		return qmp_power_off(phy);
++	if (phy->power_enabled)
+ 		return 0;
+-	}
+-
+-	phy->power_enabled = on;
+-
+-	min = on ? 1 : 0; /* low or none? */
+-
+-	if (!on) {
+-		if (phy->refgen)
+-			goto disable_refgen;
+-		else
+-			goto disable_regulators;
+-	}
+-
+-	rc = msm_ssusb_qmp_gdsc(phy, true);
+-	if (rc < 0)
+-		return rc;
+-
+-	rc = regulator_set_load(phy->vdd, phy->vdd_max_uA);
+-	if (rc < 0) {
+-		dev_err(phy->phy.dev, "Unable to set HPM of %s\n", "vdd");
+-		goto put_gdsc;
+-	}
+-
+-	rc = regulator_set_voltage(phy->vdd, phy->vdd_levels[min],
+-				    phy->vdd_levels[2]);
+-	if (rc) {
+-		dev_err(phy->phy.dev, "Unable to set voltage for %s\n", "vdd");
+-		goto put_vdd_lpm;
+-	}
+-
+-	dev_dbg(phy->phy.dev, "min_vol:%d max_vol:%d\n",
+-		phy->vdd_levels[min], phy->vdd_levels[2]);
+-
+-	rc = regulator_enable(phy->vdd);
+-	if (rc) {
+-		dev_err(phy->phy.dev, "Unable to enable %s\n", "vdd");
+-		goto unconfig_vdd;
+-	}
+-
+-	rc = regulator_set_load(phy->core_ldo, phy->core_max_uA);
+-	if (rc < 0) {
+-		dev_err(phy->phy.dev, "Unable to set HPM of %s\n", "core_ldo");
+-		goto disable_vdd;
+-	}
+-
+-	rc = regulator_set_voltage(phy->core_ldo,
+-			phy->core_voltage_levels[CORE_LEVEL_MIN],
+-			phy->core_voltage_levels[CORE_LEVEL_MAX]);
+-	if (rc) {
+-		dev_err(phy->phy.dev, "Unable to set voltage for %s\n",
+-				"core_ldo");
+-		goto put_core_ldo_lpm;
+-	}
+-
+-	rc = regulator_enable(phy->core_ldo);
+-	if (rc) {
+-		dev_err(phy->phy.dev, "Unable to enable %s\n", "core_ldo");
+-		goto unset_core_ldo;
+-	}
++	/* Finish any failed unwind before acquiring fresh votes. */
++	ret = qmp_power_off(phy);
++	if (ret)
++		return ret;
++	ret = msm_ssusb_qmp_gdsc(phy, true);
++	if (ret)
++		return ret;
++	ret = qmp_supply_enable(phy->vdd, phy->vdd_levels, phy->vdd_max_uA,
++				&phy->supply_votes[0]);
++	if (ret)
++		goto unwind;
++	ret = qmp_supply_enable(phy->core_ldo, phy->core_voltage_levels, phy->core_max_uA,
++				&phy->supply_votes[1]);
++	if (ret)
++		goto unwind;
+ 	if (phy->refgen) {
+-		rc = regulator_set_load(phy->refgen, USB3PHY_REFGEN_HPM_LOAD);
+-		if (rc < 0) {
+-			dev_err(phy->phy.dev, "Unable to set HPM of refgen:%d\n", rc);
+-			goto disable_regulators;
+-		}
+-
+-		rc = regulator_set_voltage(phy->refgen, phy->refgen_levels[1],
+-						phy->refgen_levels[2]);
+-		if (rc) {
+-			dev_err(phy->phy.dev,
+-					"Unable to set voltage for refgen:%d\n", rc);
+-			goto put_refgen_lpm;
+-		}
+-
+-		rc = regulator_enable(phy->refgen);
+-		if (rc) {
+-			dev_err(phy->phy.dev, "Unable to enable refgen:%d\n", rc);
+-			goto unset_refgen;
+-		}
+-	}
+-
++		ret = qmp_supply_enable(phy->refgen, phy->refgen_levels, USB3PHY_REFGEN_HPM_LOAD,
++					&phy->supply_votes[2]);
++		if (ret)
++			goto unwind;
++	}
++	phy->power_enabled = true;
+ 	return 0;
+-
+-disable_refgen:
+-	rc = regulator_disable(phy->refgen);
+-	if (rc)
+-		dev_err(phy->phy.dev, "Unable to disable refgen\n");
+-
+-unset_refgen:
+-	rc = regulator_set_voltage(phy->refgen, phy->refgen_levels[0], phy->refgen_levels[2]);
+-	if (rc)
+-		dev_err(phy->phy.dev,
+-				"Unable to set (0) voltage for refgen:refgen\n");
+-
+-put_refgen_lpm:
+-	rc = regulator_set_load(phy->refgen, 0);
+-	if (rc < 0)
+-		dev_err(phy->phy.dev, "Unable to set (0) HPM of refgen\n");
+-
+-disable_regulators:
+-	rc = regulator_disable(phy->core_ldo);
+-	if (rc)
+-		dev_err(phy->phy.dev, "Unable to disable %s\n", "core_ldo");
+-
+-unset_core_ldo:
+-	rc = regulator_set_voltage(phy->core_ldo,
+-			phy->core_voltage_levels[CORE_LEVEL_NONE],
+-			phy->core_voltage_levels[CORE_LEVEL_MAX]);
+-	if (rc)
+-		dev_err(phy->phy.dev, "Unable to set voltage for %s\n",
+-				"core_ldo");
+-
+-put_core_ldo_lpm:
+-	rc = regulator_set_load(phy->core_ldo, 0);
+-	if (rc < 0)
+-		dev_err(phy->phy.dev, "Unable to set LPM of %s\n", "core_ldo");
+-
+-disable_vdd:
+-	rc = regulator_disable(phy->vdd);
+-	if (rc)
+-		dev_err(phy->phy.dev, "Unable to disable %s\n", "vdd");
+-
+-unconfig_vdd:
+-	rc = regulator_set_voltage(phy->vdd, phy->vdd_levels[min],
+-				    phy->vdd_levels[2]);
+-	if (rc)
+-		dev_err(phy->phy.dev, "Unable to set voltage for %s\n", "vdd");
+-
+-put_vdd_lpm:
+-	rc = regulator_set_load(phy->vdd, 0);
+-	if (rc < 0)
+-		dev_err(phy->phy.dev, "Unable to set LPM of %s\n", "vdd");
+-
+-put_gdsc:
+-	rc = msm_ssusb_qmp_gdsc(phy, false);
+-	return rc < 0 ? rc : 0;
++unwind:
++	cleanup = qmp_power_off(phy);
++	if (cleanup)
++		dev_err(phy->phy.dev, "Supply unwind failed: %d (original %d)\n", cleanup, ret);
++	return ret;
++}
++
++static bool qmp_offset_valid(resource_size_t size, u32 offset)
++{
++	return size >= sizeof(u32) && !(offset & 3) && offset <= size - sizeof(u32);
++}
++
++static int qmp_validate_tables(struct msm_ssphy_qmp *phy)
++{
++	int i, required = USB3_PHY_START + 1;
++
++	if (phy->phy_type == USB3_AND_DP)
++		required = USB3_PCS_MISC_CLAMP_ENABLE + 1;
++	else if (phy->phy_type == USB3_OR_DP)
++		required = USB3_PHY_PCS_MISC_TYPEC_CTRL + 1;
++	if (phy->reg_offset_cnt < required || phy->reg_offset_cnt > USB3_PHY_REG_MAX ||
++	    phy->init_seq_len <= 0 || (phy->init_seq_len & 1))
++		return -EINVAL;
++	for (i = 0; i < phy->reg_offset_cnt; i++) {
++		if (i == USB3_PHY_PCS_MISC_TYPEC_CTRL && phy->phy_type != USB3_OR_DP)
++			continue;
++		if (!qmp_offset_valid(phy->base_size, phy->phy_reg[i]))
++			return -EINVAL;
++	}
++	for (i = 0; i < phy->init_seq_len; i += 2)
++		if (!qmp_offset_valid(phy->base_size, phy->qmp_phy_init_seq[i]))
++			return -EINVAL;
++	return 0;
+ }
+ 
+ static int configure_phy_regs(struct usb_phy *uphy,
+@@ -548,7 +531,7 @@
+ }
+ 
+ /* SSPHY Initialization */
+-static int msm_ssphy_qmp_init(struct usb_phy *uphy)
++static int msm_ssphy_qmp_init_locked(struct usb_phy *uphy)
+ {
+ 	struct msm_ssphy_qmp *phy = container_of(uphy, struct msm_ssphy_qmp,
+ 					phy);
+@@ -571,12 +554,16 @@
+ 		return ret;
+ 	}
+ 
+-	msm_ssphy_qmp_enable_clks(phy, true);
++	ret = msm_ssphy_qmp_enable_clks(phy, true);
++	if (ret)
++		goto disable_power;
+ 
+ 	if (phy->phy_type == USB3_AND_DP)
+ 		ret = msm_ssphy_qmp_dp_combo_reset(&phy->phy);
+ 	else
+ 		ret = msm_ssphy_qmp_reset(&phy->phy);
++	if (ret)
++		goto disable_clocks;
+ 
+ 	/* select appropriate port select and PHY mode if applicable */
+ 	usb_qmp_update_portselect_phymode(phy);
+@@ -619,14 +606,19 @@
+ 		goto fail;
+ 	}
+ 
+-	return ret;
++	phy->in_suspend = false;
++	return 0;
+ fail:
+ 	phy->in_suspend = true;
+ 	writel_relaxed(0x00,
+ 		phy->base + phy->phy_reg[USB3_PHY_POWER_DOWN_CONTROL]);
+-	msm_ssphy_qmp_enable_clks(phy, false);
+-	msm_ssusb_qmp_ldo_enable(phy, 0);
+-
++disable_clocks:
++	if (msm_ssphy_qmp_enable_clks(phy, false))
++		dev_err(uphy->dev, "Clock unwind failed\n");
++disable_power:
++	if (!phy->clock_votes && msm_ssusb_qmp_ldo_enable(phy, 0))
++		dev_err(uphy->dev, "Power unwind failed\n");
++	phy->in_suspend = true;
+ 	return ret;
+ }
+ 
+@@ -634,7 +626,7 @@
+ {
+ 	struct msm_ssphy_qmp *phy = container_of(uphy, struct msm_ssphy_qmp,
+ 					phy);
+-	int ret = 0;
++	int ret = 0, cleanup;
+ 
+ 	if (phy->phy.flags & PHY_USB_DP_CONCURRENT_MODE) {
+ 		dev_dbg(uphy->dev, "Resetting USB part of QMP phy\n");
+@@ -667,7 +659,7 @@
+ 	ret = reset_control_assert(phy->phy_reset);
+ 	if (ret) {
+ 		dev_err(uphy->dev, "phy_reset assert failed\n");
+-		goto exit;
++		goto deassert_global;
+ 	}
+ 
+ 	/* De-Assert QMP USB PHY reset */
+@@ -675,10 +667,14 @@
+ 	if (ret)
+ 		dev_err(uphy->dev, "phy_reset deassert failed\n");
+ 
+-	/* De-Assert global PHY reset */
+-	ret = reset_control_deassert(phy->global_phy_reset);
+-	if (ret)
++deassert_global:
++	/* Preserve the first error while releasing the outer reset. */
++	cleanup = reset_control_deassert(phy->global_phy_reset);
++	if (cleanup) {
+ 		dev_err(uphy->dev, "global_phy_reset deassert failed\n");
++		if (!ret)
++			ret = cleanup;
++	}
+ 
+ exit:
+ 	return ret;
+@@ -688,7 +684,7 @@
+ {
+ 	struct msm_ssphy_qmp *phy = container_of(uphy, struct msm_ssphy_qmp,
+ 					phy);
+-	int ret;
++	int ret, cleanup;
+ 
+ 	dev_dbg(uphy->dev, "Resetting QMP phy\n");
+ 
+@@ -727,11 +723,10 @@
+ 	return 0;
+ 
+ deassert_phy_phy_reset:
+-	ret = reset_control_deassert(phy->phy_phy_reset);
+-	if (ret)
++	cleanup = reset_control_deassert(phy->phy_phy_reset);
++	if (cleanup)
+ 		dev_err(uphy->dev, "phy_phy_reset deassert failed\n");
+ exit:
+-	phy->in_suspend = false;
+ 
+ 	return ret;
+ }
+@@ -771,22 +766,25 @@
+  * @suspend - to enable suspend or not. 1 - suspend, 0 - resume
+  *
+  */
+-static int msm_ssphy_qmp_set_suspend(struct usb_phy *uphy, int suspend)
++static int msm_ssphy_qmp_set_suspend_locked(struct usb_phy *uphy, int suspend)
+ {
+ 	struct msm_ssphy_qmp *phy = container_of(uphy, struct msm_ssphy_qmp,
+ 					phy);
++	int ret;
+ 
+ 	dev_dbg(uphy->dev, "QMP PHY set_suspend for %s called with cable %s\n",
+ 			(suspend ? "suspend" : "resume"),
+ 			get_cable_status_str(phy));
+ 
+-	if (phy->in_suspend == suspend) {
++	if (phy->in_suspend == suspend && !phy->transition_failed) {
+ 		dev_dbg(uphy->dev, "%s: USB PHY is already %s.\n",
+ 			__func__, (suspend ? "suspended" : "resumed"));
+ 		return 0;
+ 	}
+ 
+ 	if (suspend) {
++		if (!phy->clk_enabled)
++			goto disable_resources;
+ 		if (phy->cable_connected) {
+ 			msm_ssusb_qmp_enable_autonomous(phy, 1);
+ 		} else {
+@@ -802,9 +800,14 @@
+ 		/* Make sure above write completed with PHY */
+ 		wmb();
+ 
+-		msm_ssphy_qmp_enable_clks(phy, false);
++disable_resources:
++		ret = msm_ssphy_qmp_enable_clks(phy, false);
++		if (ret)
++			return ret;
++		ret = msm_ssphy_power_enable(phy, 0);
++		if (ret)
++			return ret;
+ 		phy->in_suspend = true;
+-		msm_ssphy_power_enable(phy, 0);
+ 		dev_dbg(uphy->dev, "QMP PHY is suspend\n");
+ 	} else {
+ 		if (uphy->flags & PHY_DP_MODE) {
+@@ -812,8 +815,12 @@
+ 			return -EBUSY;
+ 		}
+ 
+-		msm_ssphy_power_enable(phy, 1);
+-		msm_ssphy_qmp_enable_clks(phy, true);
++		ret = msm_ssphy_power_enable(phy, 1);
++		if (ret)
++			return ret;
++		ret = msm_ssphy_qmp_enable_clks(phy, true);
++		if (ret)
++			return ret;
+ 		if (!phy->cable_connected) {
+ 			writel_relaxed(0x01,
+ 			phy->base + phy->phy_reg[USB3_PHY_POWER_DOWN_CONTROL]);
+@@ -831,6 +838,30 @@
+ 	return 0;
+ }
+ 
++static int msm_ssphy_qmp_init(struct usb_phy *uphy)
++{
++	struct msm_ssphy_qmp *phy = container_of(uphy, struct msm_ssphy_qmp, phy);
++	int ret;
++
++	mutex_lock(&phy->lock);
++	ret = phy->removing ? -ENODEV : msm_ssphy_qmp_init_locked(uphy);
++	phy->transition_failed = ret != 0;
++	mutex_unlock(&phy->lock);
++	return ret;
++}
++
++static int msm_ssphy_qmp_set_suspend(struct usb_phy *uphy, int suspend)
++{
++	struct msm_ssphy_qmp *phy = container_of(uphy, struct msm_ssphy_qmp, phy);
++	int ret;
++
++	mutex_lock(&phy->lock);
++	ret = phy->removing ? -ENODEV : msm_ssphy_qmp_set_suspend_locked(uphy, suspend);
++	phy->transition_failed = ret != 0;
++	mutex_unlock(&phy->lock);
++	return ret;
++}
++
+ static int msm_ssphy_qmp_notify_connect(struct usb_phy *uphy,
+ 				       enum usb_device_speed speed)
+ {
+@@ -838,7 +869,7 @@
+ 					phy);
+ 
+ 	dev_dbg(uphy->dev, "QMP phy connect notification\n");
+-	phy->cable_connected = true;
++	WRITE_ONCE(phy->cable_connected, true);
+ 	atomic_notifier_call_chain(&uphy->notifier, 1, uphy);
+ 
+ 	return 0;
+@@ -851,7 +882,7 @@
+ 					phy);
+ 
+ 	atomic_notifier_call_chain(&uphy->notifier, 0, uphy);
+-	if (phy->phy.flags & PHY_HOST_MODE) {
++	if ((phy->phy.flags & PHY_HOST_MODE) && READ_ONCE(phy->clk_enabled)) {
+ 		writel_relaxed(0x00,
+ 			phy->base + phy->phy_reg[USB3_PHY_POWER_DOWN_CONTROL]);
+ 		readl_relaxed(phy->base + phy->phy_reg[USB3_PHY_POWER_DOWN_CONTROL]);
+@@ -859,124 +890,89 @@
+ 
+ 	dev_dbg(uphy->dev, "QMP phy disconnect notification\n");
+ 	dev_dbg(uphy->dev, " cable_connected=%d\n", phy->cable_connected);
+-	phy->cable_connected = false;
++	WRITE_ONCE(phy->cable_connected, false);
+ 
+ 	return 0;
+ }
+ 
+ static int msm_ssphy_qmp_get_clks(struct msm_ssphy_qmp *phy, struct device *dev)
+ {
+-	int ret = 0;
++	struct clk **optional[] = { &phy->cfg_ahb_clk, &phy->pipe_clk_mux,
++		&phy->pipe_clk_ext_src, &phy->ref_clk_src, &phy->ref_clk, &phy->com_aux_clk };
++	const char * const names[] = { "cfg_ahb_clk", "pipe_clk_mux", "pipe_clk_ext_src",
++		"ref_clk_src", "ref_clk", "com_aux_clk" };
++	long rate;
++	int ret, i;
+ 
+ 	phy->aux_clk = devm_clk_get(dev, "aux_clk");
+-	if (IS_ERR(phy->aux_clk)) {
+-		ret = PTR_ERR(phy->aux_clk);
+-		phy->aux_clk = NULL;
+-		if (ret != -EPROBE_DEFER)
+-			dev_err(dev, "failed to get aux_clk\n");
+-		goto err;
+-	}
+-	clk_set_rate(phy->aux_clk, clk_round_rate(phy->aux_clk, ULONG_MAX));
+-
+-	if (of_property_match_string(dev->of_node,
+-			"clock-names", "cfg_ahb_clk") >= 0) {
+-		phy->cfg_ahb_clk = devm_clk_get(dev, "cfg_ahb_clk");
+-		if (IS_ERR(phy->cfg_ahb_clk)) {
+-			ret = PTR_ERR(phy->cfg_ahb_clk);
+-			if (ret != -EPROBE_DEFER)
+-				dev_err(dev,
+-				"failed to get cfg_ahb_clk ret %d\n", ret);
+-			goto err;
+-		}
+-	}
+-
++	if (IS_ERR(phy->aux_clk))
++		return PTR_ERR(phy->aux_clk);
++	rate = clk_round_rate(phy->aux_clk, ULONG_MAX);
++	if (rate < 0)
++		return rate;
++	ret = clk_set_rate(phy->aux_clk, rate);
++	if (ret)
++		return ret;
+ 	phy->pipe_clk = devm_clk_get(dev, "pipe_clk");
+-	if (IS_ERR(phy->pipe_clk)) {
+-		ret = PTR_ERR(phy->pipe_clk);
+-		phy->pipe_clk = NULL;
+-		if (ret != -EPROBE_DEFER)
+-			dev_err(dev, "failed to get pipe_clk\n");
+-		goto err;
+-	}
+-
+-	phy->pipe_clk_mux = devm_clk_get(dev, "pipe_clk_mux");
+-	if (IS_ERR(phy->pipe_clk_mux))
+-		phy->pipe_clk_mux = NULL;
+-
+-	phy->pipe_clk_ext_src = devm_clk_get(dev, "pipe_clk_ext_src");
+-	if (IS_ERR(phy->pipe_clk_ext_src))
+-		phy->pipe_clk_ext_src = NULL;
+-
+-	phy->ref_clk_src = devm_clk_get(dev, "ref_clk_src");
+-	if (IS_ERR(phy->ref_clk_src))
+-		phy->ref_clk_src = NULL;
+-
+-	phy->ref_clk = devm_clk_get(dev, "ref_clk");
+-	if (IS_ERR(phy->ref_clk))
+-		phy->ref_clk = NULL;
+-
+-	if (of_property_match_string(dev->of_node,
+-			"clock-names", "com_aux_clk") >= 0) {
+-		phy->com_aux_clk = devm_clk_get(dev, "com_aux_clk");
+-		if (IS_ERR(phy->com_aux_clk)) {
+-			ret = PTR_ERR(phy->com_aux_clk);
+-			if (ret != -EPROBE_DEFER)
+-				dev_err(dev,
+-				"failed to get com_aux_clk ret %d\n", ret);
+-			goto err;
+-		}
+-	}
+-
+-err:
++	if (IS_ERR(phy->pipe_clk))
++		return PTR_ERR(phy->pipe_clk);
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		*optional[i] = devm_clk_get_optional(dev, names[i]);
++		if (IS_ERR(*optional[i]))
++			return PTR_ERR(*optional[i]);
++	}
++	if (phy->pipe_clk_mux && (!phy->pipe_clk_ext_src || !phy->ref_clk_src))
++		return -EINVAL;
++	return 0;
++}
++
++static int msm_ssphy_qmp_enable_clks(struct msm_ssphy_qmp *phy, bool on)
++{
++	struct clk *clocks[] = { phy->ref_clk_src, phy->ref_clk, phy->com_aux_clk,
++		phy->aux_clk, phy->cfg_ahb_clk, phy->pipe_clk };
++	int ret = 0, cleanup, i;
++
++	if (on && phy->clk_enabled)
++		return 0;
++	if (on) {
++		for (i = 0; i < ARRAY_SIZE(clocks) - 1; i++) {
++			if (!clocks[i] || (phy->clock_votes & BIT(i)))
++				continue;
++			ret = clk_prepare_enable(clocks[i]);
++			if (ret)
++				goto unwind;
++			phy->clock_votes |= BIT(i);
++		}
++		ret = clk_set_parent(phy->pipe_clk_mux, phy->pipe_clk_ext_src);
++		if (ret)
++			goto unwind;
++		ret = clk_prepare_enable(phy->pipe_clk);
++		if (ret)
++			goto restore_parent;
++		phy->clock_votes |= BIT(5);
++		phy->clk_enabled = true;
++		return 0;
++	}
++	phy->clk_enabled = false;
++	if (phy->clock_votes & BIT(5)) {
++		clk_disable_unprepare(phy->pipe_clk);
++		phy->clock_votes &= ~BIT(5);
++restore_parent:
++		cleanup = clk_set_parent(phy->pipe_clk_mux, phy->ref_clk_src);
++		if (cleanup) {
++			dev_err(phy->phy.dev, "Could not restore pipe parent: %d\n", cleanup);
++			if (!ret)
++				ret = cleanup;
++		}
++	}
++unwind:
++	for (i = ARRAY_SIZE(clocks) - 2; i >= 0; i--) {
++		if (phy->clock_votes & BIT(i)) {
++			clk_disable_unprepare(clocks[i]);
++			phy->clock_votes &= ~BIT(i);
++		}
++	}
+ 	return ret;
+-}
+-
+-static void msm_ssphy_qmp_enable_clks(struct msm_ssphy_qmp *phy, bool on)
+-{
+-	dev_dbg(phy->phy.dev, "%s(): clk_enabled:%d on:%d\n", __func__,
+-					phy->clk_enabled, on);
+-
+-	if (!phy->clk_enabled && on) {
+-		if (phy->ref_clk_src)
+-			clk_prepare_enable(phy->ref_clk_src);
+-
+-		if (phy->ref_clk)
+-			clk_prepare_enable(phy->ref_clk);
+-
+-		if (phy->com_aux_clk)
+-			clk_prepare_enable(phy->com_aux_clk);
+-
+-		clk_prepare_enable(phy->aux_clk);
+-		if (phy->cfg_ahb_clk)
+-			clk_prepare_enable(phy->cfg_ahb_clk);
+-
+-		//select PHY pipe clock
+-		clk_set_parent(phy->pipe_clk_mux, phy->pipe_clk_ext_src);
+-		clk_prepare_enable(phy->pipe_clk);
+-		phy->clk_enabled = true;
+-	}
+-
+-	if (phy->clk_enabled && !on) {
+-		clk_disable_unprepare(phy->pipe_clk);
+-
+-		//select XO instead of PHY pipe clock
+-		clk_set_parent(phy->pipe_clk_mux, phy->ref_clk_src);
+-
+-		if (phy->cfg_ahb_clk)
+-			clk_disable_unprepare(phy->cfg_ahb_clk);
+-
+-		clk_disable_unprepare(phy->aux_clk);
+-		if (phy->com_aux_clk)
+-			clk_disable_unprepare(phy->com_aux_clk);
+-
+-		if (phy->ref_clk)
+-			clk_disable_unprepare(phy->ref_clk);
+-
+-		if (phy->ref_clk_src)
+-			clk_disable_unprepare(phy->ref_clk_src);
+-
+-		phy->clk_enabled = false;
+-	}
+ }
+ 
+ static int usb3_get_regulators(struct msm_ssphy_qmp  *phy)
+@@ -1002,20 +998,20 @@
+ 		return ret;
+ 	}
+ 
+-	phy->usb3_dp_phy_gdsc = devm_regulator_get(dev, "usb3_dp_phy_gdsc");
++	phy->usb3_dp_phy_gdsc = devm_regulator_get_optional(dev, "usb3_dp_phy_gdsc");
+ 	if (IS_ERR(phy->usb3_dp_phy_gdsc)) {
+ 		ret = PTR_ERR(phy->usb3_dp_phy_gdsc);
+ 		if (ret != -ENODEV) {
+ 			dev_err(dev, "fail to get usb3_dp_phy_gdsc(%d)\n", ret);
+ 			return ret;
+ 		}
+-		dev_dbg(dev, "usb3_dp_phy_gdsc optional regulator missing\n");
++		phy->usb3_dp_phy_gdsc = NULL;
+ 	}
+ 
+ 	if (of_property_read_bool(dev->of_node, "refgen-supply")) {
+ 		phy->refgen = devm_regulator_get_optional(dev, "refgen");
+ 		if (IS_ERR(phy->refgen))
+-			dev_err(dev, "fail to get refgen supply\n");
++			return PTR_ERR(phy->refgen);
+ 	}
+ 
+ 	return 0;
+@@ -1070,7 +1066,7 @@
+ 	}
+ 
+ 	of_get_property(dev->of_node, "qcom,qmp-phy-reg-offset", &size);
+-	if (size) {
++	if (size > 0 && !(size % sizeof(u32))) {
+ 		phy->phy_reg = devm_kzalloc(dev, PHY_REG_SIZE, GFP_KERNEL);
+ 		if (phy->phy_reg) {
+ 			phy->reg_offset_cnt = (size / sizeof(*phy->phy_reg));
+@@ -1079,9 +1075,11 @@
+ 				return -EINVAL;
+ 			}
+ 
+-			of_property_read_u32_array(dev->of_node,
++			ret = of_property_read_u32_array(dev->of_node,
+ 				"qcom,qmp-phy-reg-offset",
+ 				phy->phy_reg, phy->reg_offset_cnt);
++			if (ret)
++				return ret;
+ 		} else {
+ 			dev_err(dev, "err mem alloc for qmp_phy_reg_offset\n");
+ 			return -ENOMEM;
+@@ -1102,9 +1100,10 @@
+ 	 * For USB QMP DP combo PHY, common set of registers shall be accessed
+ 	 * by DP driver as well.
+ 	 */
+-	phy->base = devm_ioremap(dev, res->start, resource_size(res));
+-	if (IS_ERR_OR_NULL(phy->base)) {
+-		ret = PTR_ERR(phy->base);
++	phy->base_size = resource_size(res);
++	phy->base = devm_ioremap(dev, res->start, phy->base_size);
++	if (!phy->base) {
++		ret = -ENOMEM;
+ 		goto err;
+ 	}
+ 
+@@ -1140,7 +1139,7 @@
+ 
+ 	of_get_property(dev->of_node, "qcom,qmp-phy-init-seq", &size);
+ 	if (size) {
+-		if (size % sizeof(*phy->qmp_phy_init_seq)) {
++		if (size % (2 * sizeof(*phy->qmp_phy_init_seq))) {
+ 			dev_err(dev, "invalid init_seq_len\n");
+ 			return -EINVAL;
+ 		}
+@@ -1150,22 +1149,29 @@
+ 			return -ENOMEM;
+ 
+ 		phy->init_seq_len = (size / sizeof(*phy->qmp_phy_init_seq));
+-		of_property_read_u32_array(dev->of_node,
++		ret = of_property_read_u32_array(dev->of_node,
+ 				"qcom,qmp-phy-init-seq",
+ 				phy->qmp_phy_init_seq,
+ 				phy->init_seq_len);
++		if (ret)
++			return ret;
+ 	} else {
+ 		dev_err(dev, "error need qmp-phy-init-seq\n");
+ 		return -EINVAL;
+ 	}
++
++	ret = qmp_validate_tables(phy);
++	if (ret)
++		return ret;
+ 
+ 	/* Set default core voltage values */
+ 	phy->core_voltage_levels[CORE_LEVEL_NONE] = 0;
+ 	phy->core_voltage_levels[CORE_LEVEL_MIN] = USB_SSPHY_1P2_VOL_MIN;
+ 	phy->core_voltage_levels[CORE_LEVEL_MAX] = USB_SSPHY_1P2_VOL_MAX;
+ 
+-	if (of_get_property(dev->of_node, "qcom,core-voltage-level", &len) &&
+-		len == sizeof(phy->core_voltage_levels)) {
++	if (of_get_property(dev->of_node, "qcom,core-voltage-level", &len)) {
++		if (len != sizeof(phy->core_voltage_levels))
++			return -EINVAL;
+ 		ret = of_property_read_u32_array(dev->of_node,
+ 				"qcom,core-voltage-level",
+ 				(u32 *)phy->core_voltage_levels,
+@@ -1196,20 +1202,22 @@
+ 		goto err;
+ 	}
+ 
+-	if (of_get_property(dev->of_node, "qcom,refgen-voltage-level", &len) &&
+-			len == sizeof(phy->refgen_levels)) {
++	if (of_get_property(dev->of_node, "qcom,refgen-voltage-level", &len)) {
++		if (len != sizeof(phy->refgen_levels))
++			return -EINVAL;
+ 		ret = of_property_read_u32_array(dev->of_node,
+ 				"qcom,refgen-voltage-level",
+ 				(u32 *) phy->refgen_levels,
+ 				len / sizeof(u32));
+ 		if (ret)
+-			dev_err(dev, "err qcom,refgen-voltage-level property\n");
++			return ret;
+ 	}
+ 
+ 	if (of_property_read_s32(dev->of_node, "qcom,vdd-max-load-uA",
+ 				&phy->vdd_max_uA) || !phy->vdd_max_uA)
+ 		phy->vdd_max_uA = USB_SSPHY_HPM_LOAD;
+ 
++	mutex_init(&phy->lock);
+ 	platform_set_drvdata(pdev, phy);
+ 
+ 	phy->phy.dev			= dev;
+@@ -1222,6 +1230,15 @@
+ 	if (ret)
+ 		goto err;
+ 
++	if (phy->vdd_max_uA < 0 || phy->core_max_uA < 0 ||
++	    phy->vdd_levels[0] < 0 || phy->vdd_levels[1] <= 0 ||
++	    phy->vdd_levels[2] < phy->vdd_levels[1] ||
++	    phy->core_voltage_levels[0] < 0 || phy->core_voltage_levels[1] <= 0 ||
++	    phy->core_voltage_levels[2] < phy->core_voltage_levels[1] ||
++	    (phy->refgen && (phy->refgen_levels[0] < 0 || phy->refgen_levels[1] <= 0 ||
++			     phy->refgen_levels[2] < phy->refgen_levels[1])))
++		return -EINVAL;
++
+ 	/* Placed at the end to ensure the probe is complete */
+ 	ret = usb_add_phy_dev(&phy->phy);
+ 
+@@ -1229,17 +1246,21 @@
+ 	return ret;
+ }
+ 
+-static int msm_ssphy_qmp_remove(struct platform_device *pdev)
++static void msm_ssphy_qmp_remove(struct platform_device *pdev)
+ {
+ 	struct msm_ssphy_qmp *phy = platform_get_drvdata(pdev);
+-
+-	if (!phy)
+-		return 0;
++	int ret;
+ 
+ 	usb_remove_phy(&phy->phy);
+-	msm_ssphy_qmp_enable_clks(phy, false);
+-	msm_ssusb_qmp_ldo_enable(phy, 0);
+-	return 0;
++	mutex_lock(&phy->lock);
++	phy->removing = true;
++	ret = msm_ssphy_qmp_enable_clks(phy, false);
++	if (ret)
++		dev_err(phy->phy.dev, "Clock release failed: %d\n", ret);
++	ret = msm_ssusb_qmp_ldo_enable(phy, 0);
++	if (ret)
++		dev_err(phy->phy.dev, "Supply release failed: %d\n", ret);
++	mutex_unlock(&phy->lock);
+ }
+ 
+ static struct platform_driver msm_ssphy_qmp_driver = {
+--- a/drivers/soc/qcom/eud.c
++++ b/drivers/soc/qcom/eud.c
+@@ -24,6 +24,7 @@
+ #include <linux/serial.h>
+ #include <linux/clk.h>
+ #include <linux/workqueue.h>
++#include <linux/mutex.h>
+ #include <linux/power_supply.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
+ #include <linux/delay.h>
+@@ -72,8 +73,7 @@
+ struct eud_chip {
+ 	struct device			*dev;
+ 	int				eud_irq;
+-	unsigned int			extcon_id;
+-	unsigned int			int_status;
++	unsigned int			pending_events;
+ 	bool				usb_attach;
+ 	bool				chgr_enable;
+ 	void __iomem			*eud_reg_base;
+@@ -88,6 +88,15 @@
+ 	struct clk			*eud_clkref_clk;
+ 	bool				eud_clkref_enabled;
+ 	bool				eud_enabled;
++	bool				ahb_enabled;
++	bool				irq_registered;
++	bool				irq_wake_enabled;
++	bool				uart_registered;
++	bool				uart_active;
++	bool				removing;
++	bool				suspended;
++	bool				stopped;
++	bool				maybe_enabled;
+ 	u16				utmi_switch_delay;
+ };
+ 
+@@ -99,7 +108,8 @@
+ };
+ 
+ static int enable = EUD_DISABLE_CMD;
+-static bool eud_ready;
++static DEFINE_MUTEX(eud_lock);
++static bool eud_claimed;
+ static struct platform_device *eud_private;
+ 
+ static int msm_eud_clkref_en(struct eud_chip *chip, bool enable)
+@@ -128,17 +138,22 @@
+ 
+ static void msm_eud_enable_irqs(struct eud_chip *chip)
+ {
+-	/* Enable vbus, chgr & safe mode warning interrupts */
+-	writel_relaxed(EUD_INT_VBUS | EUD_INT_CHGR | EUD_INT_SAFE_MODE,
+-			chip->eud_reg_base + EUD_REG_INT1_EN_MASK);
+-	/* Ensure Register Writes Complete */
+-	wmb();
++	unsigned long flags;
++	u32 mask;
++
++	uart_port_lock_irqsave(&chip->port, &flags);
++	mask = readl_relaxed(chip->eud_reg_base + EUD_REG_INT1_EN_MASK);
++	mask |= EUD_INT_VBUS | EUD_INT_CHGR | EUD_INT_SAFE_MODE;
++	writel_relaxed(mask, chip->eud_reg_base + EUD_REG_INT1_EN_MASK);
++	/* Complete MMIO writes before the next hardware or notification step. */
++	wmb();
++	uart_port_unlock_irqrestore(&chip->port, flags);
+ }
+ 
+ static int msm_eud_hw_is_enabled(struct platform_device *pdev)
+ {
+ 	struct eud_chip *chip = platform_get_drvdata(pdev);
+-	int sec_eud_enabled = 0;
++	u32 sec_eud_enabled = 0;
+ 
+ 	if (chip->secure_eud_en) {
+ 		int ret = qcom_scm_io_readl(
+@@ -147,10 +162,10 @@
+ 		if (ret) {
+ 			dev_err(&pdev->dev,
+ 				"qcom_scm_io_readl failed with rc: %d\n", ret);
+-			return 0;
++			return ret;
+ 		}
+ 
+-		return sec_eud_enabled;
++		return !!(sec_eud_enabled & BIT(0));
+ 	}
+ 
+ 	return readl_relaxed(chip->eud_reg_base + EUD_REG_CSR_EUD_EN) & BIT(0);
+@@ -173,117 +188,113 @@
+ static int check_eud_mode_mgr2(struct eud_chip *chip)
+ {
+ 	u32 val;
+-
+-	qcom_scm_io_readl(chip->eud_mode_mgr2_phys_base, &val);
+-	return val & BIT(0);
+-}
+-
+-static void enable_eud(struct platform_device *pdev)
++	int ret;
++
++	ret = qcom_scm_io_readl(chip->eud_mode_mgr2_phys_base, &val);
++	return ret ? ret : !!(val & BIT(0));
++}
++
++static int enable_eud(struct platform_device *pdev)
++{
++	struct eud_chip *priv = platform_get_drvdata(pdev);
++	int ret, secure_enabled = 0;
++
++	if (priv->eud_enabled)
++		return 0;
++	if (priv->secure_eud_en) {
++		secure_enabled = check_eud_mode_mgr2(priv);
++		if (secure_enabled < 0)
++			return secure_enabled;
++	}
++	ret = msm_eud_clkref_en(priv, true);
++	if (ret)
++		return ret;
++	/* Preserve the vendor spoof-disconnect/connect sequence. */
++	ret = extcon_set_state_sync(priv->extcon, EXTCON_USB, true);
++	if (ret)
++		goto release_clock;
++	extcon_set_state(priv->extcon, EXTCON_JIG, false);
++	ret = extcon_set_state_sync(priv->extcon, EXTCON_USB, false);
++	if (ret)
++		goto release_clock;
++	set_eud_utmi_switch_delay(priv);
++	writel_relaxed(BIT(0), priv->eud_reg_base + EUD_REG_CSR_EUD_EN);
++	priv->maybe_enabled = true;
++	msm_eud_enable_irqs(priv);
++	if (priv->secure_eud_en && !secure_enabled) {
++		ret = qcom_scm_io_writel(priv->eud_mode_mgr2_phys_base + EUD_REG_EUD_EN2,
++					EUD_ENABLE_CMD);
++		if (ret)
++			return ret;
++	}
++	/* Complete MMIO writes before the next hardware or notification step. */
++	wmb();
++	usleep_range(50, 100);
++	ret = extcon_set_state_sync(priv->extcon, EXTCON_USB, true);
++	if (ret)
++		return ret;
++	ret = extcon_set_state_sync(priv->extcon, EXTCON_CHG_USB_SDP, true);
++	if (ret)
++		return ret;
++	priv->eud_enabled = true;
++	return 0;
++release_clock:
++	if (!priv->maybe_enabled)
++		msm_eud_clkref_en(priv, false);
++	return ret;
++}
++
++static int disable_eud(struct platform_device *pdev)
+ {
+ 	struct eud_chip *priv = platform_get_drvdata(pdev);
+ 	int ret;
+ 
+-	/* No need to notify USB and modify EUD CSR if already enabled */
+-	if (priv->eud_enabled)
+-		return;
+-
+-	/*
+-	 * Set the default cable state to usb connect and charger
+-	 * enable
+-	 */
+-	extcon_set_state_sync(priv->extcon, EXTCON_USB, true);
+-	/* indicate that the eud enable is due to the module param */
++	if (!priv->eud_enabled && !priv->maybe_enabled)
++		return 0;
+ 	extcon_set_state(priv->extcon, EXTCON_JIG, false);
+-	/* perform spoof disconnect as recommended */
+-	extcon_set_state_sync(priv->extcon, EXTCON_USB, false);
+-
+-	msm_eud_clkref_en(priv, true);
+-	set_eud_utmi_switch_delay(priv);
+-	/* write into CSR to enable EUD */
+-	writel_relaxed(BIT(0), priv->eud_reg_base + EUD_REG_CSR_EUD_EN);
+-
+-	msm_eud_enable_irqs(priv);
+-
+-	/* Enable secure eud if supported */
+-	if (priv->secure_eud_en && !check_eud_mode_mgr2(priv)) {
+-		ret = qcom_scm_io_writel(priv->eud_mode_mgr2_phys_base +
+-				   EUD_REG_EUD_EN2, EUD_ENABLE_CMD);
++	ret = extcon_set_state_sync(priv->extcon, EXTCON_USB, false);
++	if (ret && !priv->removing)
++		return ret;
++	writel_relaxed(0, priv->eud_reg_base + EUD_REG_CSR_EUD_EN);
++	priv->eud_enabled = false;
++	/* Complete MMIO writes before the next hardware or notification step. */
++	wmb();
++	if (priv->secure_eud_en) {
++		ret = qcom_scm_io_writel(priv->eud_mode_mgr2_phys_base + EUD_REG_EUD_EN2,
++					EUD_DISABLE_CMD);
+ 		if (ret)
+-			dev_err(&pdev->dev,
+-			"qcom_scm_io_writel failed with rc:%d\n", ret);
+-	}
+-
+-	/* Ensure Register Writes Complete */
+-	wmb();
+-
++			return ret;
++	}
++	priv->eud_enabled = false;
++	priv->maybe_enabled = false;
++	msm_eud_clkref_en(priv, false);
+ 	usleep_range(50, 100);
+-	/* perform spoof connect as recommended */
+-	extcon_set_state_sync(priv->extcon, EXTCON_USB, true);
+-	extcon_set_state_sync(priv->extcon, EXTCON_CHG_USB_SDP, true);
+-	priv->eud_enabled = true;
+-
+-	dev_dbg(&pdev->dev, "%s: EUD is Enabled\n", __func__);
+-}
+-
+-static void disable_eud(struct platform_device *pdev)
+-{
+-	struct eud_chip *priv = platform_get_drvdata(pdev);
+-	int ret;
+-
+-	if (!priv->eud_enabled)
+-		return;
+-
+-	/* indicate that the eud enable is due to the module param */
+-	extcon_set_state(priv->extcon, EXTCON_JIG, false);
+-
+-	/* perform spoof disconnect as recommended */
+-	extcon_set_state_sync(priv->extcon, EXTCON_USB, false);
+-
+-	/* write into CSR to disable EUD */
+-	writel_relaxed(0, priv->eud_reg_base + EUD_REG_CSR_EUD_EN);
+-
+-	/* Disable secure eud if supported */
+-	if (priv->secure_eud_en) {
+-		ret = qcom_scm_io_writel(priv->eud_mode_mgr2_phys_base +
+-				   EUD_REG_EUD_EN2, EUD_DISABLE_CMD);
+-		if (ret)
+-			dev_err(&pdev->dev,
+-			"qcom_scm_io_write failed with rc:%d\n", ret);
+-	}
+-
+-	msm_eud_clkref_en(priv, false);
+-
+-	usleep_range(50, 100);
+-	/* perform spoof connect as recommended */
+-	extcon_set_state_sync(priv->extcon, EXTCON_USB, true);
+-	priv->eud_enabled = false;
+-
+-	dev_dbg(&pdev->dev, "%s: EUD Disabled!\n", __func__);
++	if (priv->removing)
++		return 0;
++	return extcon_set_state_sync(priv->extcon, EXTCON_USB, true);
+ }
+ 
+ static int param_eud_set(const char *val, const struct kernel_param *kp)
+ {
+-	int enable = 0;
+-
+-	if (sscanf(val, "%du", &enable) != 1)
++	struct eud_chip *chip;
++	int requested, ret;
++
++	ret = kstrtoint(val, 0, &requested);
++	if (ret || (requested != EUD_ENABLE_CMD && requested != EUD_DISABLE_CMD))
+ 		return -EINVAL;
+-
+-	if (enable != EUD_ENABLE_CMD && enable != EUD_DISABLE_CMD)
+-		return -EINVAL;
+-
+-	*((uint *)kp->arg) = enable;
+-	if (!eud_ready)
+-		return 0;
+-
+-	if (enable == EUD_ENABLE_CMD) {
+-		pr_debug("%s: Enbling EUD\n", __func__);
+-		enable_eud(eud_private);
+-	} else if (enable == EUD_DISABLE_CMD) {
+-		pr_debug("%s: Disabling EUD\n", __func__);
+-		disable_eud(eud_private);
+-	}
+-
+-	return 0;
++	mutex_lock(&eud_lock);
++	ret = 0;
++	if (eud_private) {
++		chip = platform_get_drvdata(eud_private);
++		if (chip->suspended)
++			ret = -EBUSY;
++		else
++			ret = requested ? enable_eud(eud_private) : disable_eud(eud_private);
++	}
++	if (!ret)
++		*(int *)kp->arg = requested;
++	mutex_unlock(&eud_lock);
++	return ret;
+ }
+ 
+ static const struct kernel_param_ops eud_param_ops = {
+@@ -304,70 +315,70 @@
+ 	return true;
+ }
+ 
+-static void eud_event_notifier(struct work_struct *eud_work)
+-{
+-	struct eud_chip *chip = container_of(eud_work, struct eud_chip,
+-					eud_work);
++static void eud_event_notifier(struct work_struct *work)
++{
++	struct eud_chip *chip = container_of(work, struct eud_chip, eud_work);
+ 	union power_supply_propval pval;
+-
+-	if (chip->int_status == EUD_INT_VBUS) {
+-		extcon_set_state(chip->extcon, EXTCON_JIG, true);
+-		extcon_set_state_sync(chip->extcon, chip->extcon_id,
+-					chip->usb_attach);
+-	} else if (chip->int_status == EUD_INT_CHGR) {
+-		if (is_usb_psy_available(chip)) {
+-			int ret;
+-
+-			pval.intval = chip->chgr_enable ? -EINVAL :
+-				chip->chgr_enable;
+-			ret = power_supply_set_property(chip->usb_psy,
+-				POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT, &pval);
+-			if (ret < 0)
+-				dev_err(chip->dev,
+-				"Failed to set the powersupply property: %d\n",
+-				ret);
++	unsigned long flags;
++	unsigned int pending;
++	bool attached, charging;
++	int ret;
++
++	for (;;) {
++		uart_port_lock_irqsave(&chip->port, &flags);
++		pending = chip->pending_events;
++		chip->pending_events = 0;
++		attached = chip->usb_attach;
++		charging = chip->chgr_enable;
++		uart_port_unlock_irqrestore(&chip->port, flags);
++		if (!pending || READ_ONCE(chip->removing))
++			return;
++		mutex_lock(&eud_lock);
++		if (!chip->removing) {
++			if (pending & EUD_INT_VBUS) {
++				extcon_set_state(chip->extcon, EXTCON_JIG, true);
++				extcon_set_state_sync(chip->extcon, EXTCON_USB, attached);
++			}
++			if ((pending & EUD_INT_CHGR) && is_usb_psy_available(chip)) {
++				pval.intval = charging ? -EINVAL : 0;
++				ret = power_supply_set_property(chip->usb_psy,
++						POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT, &pval);
++				if (ret)
++					dev_err(chip->dev, "Power-supply update failed: %d\n", ret);
++			}
+ 		}
++		mutex_unlock(&eud_lock);
+ 	}
+ }
+ 
+ static void usb_attach_detach(struct eud_chip *chip)
+ {
+-	u32 reg;
+-
+-	chip->extcon_id = EXTCON_USB;
+-	/* read ctl_out_1[4] to find USB attach or detach event */
+-	reg = readl_relaxed(chip->eud_reg_base + EUD_REG_CTL_OUT_1);
+-	if (reg & BIT(4))
+-		chip->usb_attach = true;
+-	else
+-		chip->usb_attach = false;
+-
+-	schedule_work(&chip->eud_work);
+-
+-	/* set and clear vbus_int_clr[0] to clear interrupt */
++	unsigned long flags;
++	u32 reg = readl_relaxed(chip->eud_reg_base + EUD_REG_CTL_OUT_1);
++
++	uart_port_lock_irqsave(&chip->port, &flags);
++	chip->usb_attach = !!(reg & BIT(4));
++	chip->pending_events |= EUD_INT_VBUS;
++	uart_port_unlock_irqrestore(&chip->port, flags);
++	queue_work(system_freezable_wq, &chip->eud_work);
+ 	writel_relaxed(BIT(0), chip->eud_reg_base + EUD_REG_VBUS_INT_CLR);
+-	/* Ensure Register Writes Complete */
++	/* Complete MMIO writes before the next hardware or notification step. */
+ 	wmb();
+ 	writel_relaxed(0, chip->eud_reg_base + EUD_REG_VBUS_INT_CLR);
+ }
+ 
+ static void chgr_enable_disable(struct eud_chip *chip)
+ {
+-	u32 reg;
+-
+-	chip->extcon_id = EXTCON_CHG_USB_SDP;
+-	/* read ctl_out_1[6] to find charger enable or disable event */
+-	reg = readl_relaxed(chip->eud_reg_base + EUD_REG_CTL_OUT_1);
+-	if (reg & BIT(6))
+-		chip->chgr_enable = true;
+-	else
+-		chip->chgr_enable = false;
+-
+-	schedule_work(&chip->eud_work);
+-
+-	/* set and clear chgr_int_clr[0] to clear interrupt */
++	unsigned long flags;
++	u32 reg = readl_relaxed(chip->eud_reg_base + EUD_REG_CTL_OUT_1);
++
++	uart_port_lock_irqsave(&chip->port, &flags);
++	chip->chgr_enable = !!(reg & BIT(6));
++	chip->pending_events |= EUD_INT_CHGR;
++	uart_port_unlock_irqrestore(&chip->port, flags);
++	queue_work(system_freezable_wq, &chip->eud_work);
+ 	writel_relaxed(BIT(0), chip->eud_reg_base + EUD_REG_CHGR_INT_CLR);
+-	/* Ensure Register Writes Complete */
++	/* Complete MMIO writes before the next hardware or notification step. */
+ 	wmb();
+ 	writel_relaxed(0, chip->eud_reg_base + EUD_REG_CHGR_INT_CLR);
+ }
+@@ -382,19 +393,22 @@
+ 		/* Detach & Attach pet for EUD */
+ 		writel_relaxed(0, chip->eud_reg_base + EUD_REG_SW_ATTACH_DET);
+ 		/* Ensure Register Writes Complete */
+-		wmb();
++		/* Complete MMIO writes before the next hardware or notification step. */
++	wmb();
+ 		/* Delay to make sure detach pet is done before attach pet */
+ 		udelay(100);
+ 		writel_relaxed(BIT(0), chip->eud_reg_base +
+ 					EUD_REG_SW_ATTACH_DET);
+ 		/* Ensure Register Writes Complete */
+-		wmb();
++		/* Complete MMIO writes before the next hardware or notification step. */
++	wmb();
+ 	} else {
+ 		/* Attach pet for EUD */
+ 		writel_relaxed(BIT(0), chip->eud_reg_base +
+ 					EUD_REG_SW_ATTACH_DET);
+ 		/* Ensure Register Writes Complete */
+-		wmb();
++		/* Complete MMIO writes before the next hardware or notification step. */
++	wmb();
+ 	}
+ }
+ 
+@@ -426,46 +440,61 @@
+ 	/* Nothing to do here, but to satisfy the serial core */
+ }
+ 
++static void eud_serial_irqs(struct uart_port *port, u32 set, u32 clear)
++{
++	struct eud_chip *chip = container_of(port, struct eud_chip, port);
++	u32 mask = readl_relaxed(port->membase + EUD_REG_INT1_EN_MASK);
++
++	if (READ_ONCE(chip->removing)) {
++		set = 0;
++		clear = EUD_INT_ALL;
++	}
++	mask = (mask & ~clear) | set;
++	writel_relaxed(mask, port->membase + EUD_REG_INT1_EN_MASK);
++	/* Complete MMIO writes before the next hardware or notification step. */
++	wmb();
++}
++
+ static void eud_stop_tx(struct uart_port *port)
+ {
+-	/* Disable Tx interrupt */
+-	writel_relaxed((__force u32)~EUD_INT_TX, port->membase + EUD_REG_INT_STATUS_1);
+-	/* Ensure Register Writes Complete */
+-	wmb();
++	eud_serial_irqs(port, 0, EUD_INT_TX);
+ }
+ 
+ static void eud_start_tx(struct uart_port *port)
+ {
+-	/* Enable Tx interrupt */
+-	writel_relaxed(EUD_INT_TX, port->membase + EUD_REG_INT_STATUS_1);
+-	/* Ensure Register Writes Complete */
+-	wmb();
++	eud_serial_irqs(port, EUD_INT_TX, 0);
+ }
+ 
+ static void eud_stop_rx(struct uart_port *port)
+ {
+-	/* Disable Rx interrupt */
+-	writel_relaxed((__force u32)~EUD_INT_RX, port->membase + EUD_REG_INT_STATUS_1);
+-	/* Ensure Register Writes Complete */
+-	wmb();
++	eud_serial_irqs(port, 0, EUD_INT_RX);
+ }
+ 
+ static int eud_startup(struct uart_port *port)
+ {
+-	/* Enable Rx interrupt */
+-	writel_relaxed(EUD_INT_RX, port->membase + EUD_REG_INT_STATUS_1);
+-	/* Ensure Register Writes Complete */
+-	wmb();
++	struct eud_chip *chip = container_of(port, struct eud_chip, port);
++	unsigned long flags;
++
++	uart_port_lock_irqsave(port, &flags);
++	if (READ_ONCE(chip->removing)) {
++		uart_port_unlock_irqrestore(port, flags);
++		return -ENODEV;
++	}
++	chip->uart_active = true;
++	eud_serial_irqs(port, EUD_INT_RX, 0);
++	uart_port_unlock_irqrestore(port, flags);
+ 	return 0;
+ }
+ 
+ static void eud_shutdown(struct uart_port *port)
+ {
+-	/* Disable both Tx & Rx interrupts */
+-	writel_relaxed((__force u32)(~EUD_INT_TX | ~EUD_INT_RX),
+-			port->membase + EUD_REG_INT_STATUS_1);
+-	/* Ensure Register Writes Complete */
+-	wmb();
++	struct eud_chip *chip = container_of(port, struct eud_chip, port);
++	unsigned long flags;
++
++	uart_port_lock_irqsave(port, &flags);
++	chip->uart_active = false;
++	eud_serial_irqs(port, 0, EUD_INT_TX | EUD_INT_RX);
++	uart_port_unlock_irqrestore(port, flags);
+ }
+ 
+ static const char *eud_type(struct uart_port *port)
+@@ -486,12 +515,8 @@
+ 
+ static void eud_config_port(struct uart_port *port, int flags)
+ {
+-	/* set port type, clear Tx and Rx interrupts */
+ 	port->type = PORT_EUD_UART;
+-	writel_relaxed((__force u32)(~EUD_INT_TX | ~EUD_INT_RX),
+-			port->membase + EUD_REG_INT_STATUS_1);
+-	/* Ensure Register Writes Complete */
+-	wmb();
++	eud_serial_irqs(port, 0, EUD_INT_TX | EUD_INT_RX);
+ }
+ 
+ static int eud_verify_port(struct uart_port *port,
+@@ -531,71 +556,76 @@
+ static void eud_uart_rx(struct eud_chip *chip)
+ {
+ 	struct uart_port *port = &chip->port;
+-	u32 reg;
+-	unsigned int len;
+-	unsigned char ch, flag;
+-	int i;
+-
+-	reg = readl_relaxed(chip->eud_reg_base + EUD_REG_COM_RX_ID);
+-	if (reg != UART_ID) {
+-		dev_dbg(chip->dev, "Rx interrupt isn't for us\n");
++	unsigned long flags;
++	unsigned int len, i;
++	unsigned char ch;
++	bool active;
++
++	if (readl_relaxed(chip->eud_reg_base + EUD_REG_COM_RX_ID) != UART_ID)
+ 		return;
+-	}
+-	/* Read Rx Len & Data registers */
+-	spin_lock(&port->lock);
++	uart_port_lock_irqsave(port, &flags);
++	active = chip->uart_active && port->state;
+ 	len = readl_relaxed(chip->eud_reg_base + EUD_REG_COM_RX_LEN);
++	if (len > MAX_FIFO_SIZE) {
++		port->icount.overrun++;
++		len = MAX_FIFO_SIZE;
++	}
+ 	for (i = 0; i < len; i++) {
+ 		ch = readl_relaxed(chip->eud_reg_base + EUD_REG_COM_RX_DAT);
+-		flag = TTY_NORMAL;
++		if (!active)
++			continue;
+ 		port->icount.rx++;
+-
+-		if (uart_handle_sysrq_char(port, ch))
+-			continue;
+-		uart_insert_char(port, 0, 0, ch, flag);
+-	}
+-
+-	spin_unlock(&port->lock);
+-	tty_flip_buffer_push(&port->state->port);
++		if (!uart_handle_sysrq_char(port, ch))
++			uart_insert_char(port, 0, 0, ch, TTY_NORMAL);
++	}
++	if (active)
++		tty_flip_buffer_push(&port->state->port);
++	uart_port_unlock_irqrestore(port, flags);
+ }
+ 
+ static void eud_uart_tx(struct eud_chip *chip)
+ {
+ 	struct uart_port *port = &chip->port;
+-	struct circ_buf *xmit = &port->state->xmit;
+-	unsigned int len;
+-	u32 reg;
+-
++	unsigned long flags;
++	unsigned int count = MAX_FIFO_SIZE;
++	unsigned char ch;
++
++	uart_port_lock_irqsave(port, &flags);
++	if (!chip->uart_active || !port->state)
++		goto out;
+ 	writel_relaxed(UART_ID, chip->eud_reg_base + EUD_REG_COM_TX_ID);
+-	reg = readl_relaxed(chip->eud_reg_base + EUD_REG_COM_TX_ID);
+-	if (reg != UART_ID) {
+-		dev_dbg(chip->dev, "Tx interrupt isn't for us\n");
+-		return;
+-	}
+-	/* Write to Tx Len & Data registers */
+-	spin_lock(&port->lock);
+-	len = uart_circ_chars_pending(xmit);
+-	if (len > 0) {
+-		if (len > port->fifosize)
+-			len = port->fifosize;
+-		while (len--) {
+-			writel_relaxed(xmit->buf[xmit->tail],
+-			       port->membase + EUD_REG_COM_TX_DAT);
+-			xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
+-			port->icount.tx++;
+-		}
+-	}
+-	spin_unlock(&port->lock);
++	if (readl_relaxed(chip->eud_reg_base + EUD_REG_COM_TX_ID) != UART_ID)
++		goto out;
++	if (port->x_char) {
++		writel_relaxed(port->x_char, port->membase + EUD_REG_COM_TX_DAT);
++		port->x_char = 0;
++		port->icount.tx++;
++		count--;
++	}
++	if (!uart_tx_stopped(port))
++		while (count-- && uart_fifo_get(port, &ch))
++			writel_relaxed(ch, port->membase + EUD_REG_COM_TX_DAT);
++	if (kfifo_len(&port->state->port.xmit_fifo) < WAKEUP_CHARS)
++		uart_write_wakeup(port);
++	if (uart_tx_stopped(port) || kfifo_is_empty(&port->state->port.xmit_fifo))
++		eud_stop_tx(port);
++out:
++	uart_port_unlock_irqrestore(port, flags);
+ }
+ 
+ static irqreturn_t handle_eud_irq(int irq, void *data)
+ {
+ 	struct eud_chip *chip = data;
+-	u8 reg;
++	u8 reg, handled;
+ 	u32 int_mask_en1 = readl_relaxed(chip->eud_reg_base +
+ 					EUD_REG_INT1_EN_MASK);
+ 
+ 	/* read status register and find out which interrupt triggered */
+ 	reg = readb_relaxed(chip->eud_reg_base + EUD_REG_INT_STATUS_1);
++	reg &= int_mask_en1 & EUD_INT_ALL;
++	handled = reg;
++	if (!reg || READ_ONCE(chip->removing))
++		return IRQ_NONE;
+ 	dev_dbg(chip->dev, "EUD Interrupt is received status:%x\n", reg);
+ 
+ 	if (reg & EUD_INT_RX) {
+@@ -614,14 +644,12 @@
+ 
+ 	if (reg & EUD_INT_VBUS) {
+ 		dev_dbg(chip->dev, "EUD VBUS Interrupt is received\n");
+-		chip->int_status = EUD_INT_VBUS;
+ 		usb_attach_detach(chip);
+ 		reg &= ~EUD_INT_VBUS;
+ 	}
+ 
+ 	if (reg & EUD_INT_CHGR) {
+ 		dev_dbg(chip->dev, "EUD CHGR Interrupt is received\n");
+-		chip->int_status = EUD_INT_CHGR;
+ 		chgr_enable_disable(chip);
+ 		reg &= ~EUD_INT_CHGR;
+ 	}
+@@ -637,32 +665,106 @@
+ 		return IRQ_NONE;
+ 	}
+ 
+-	return IRQ_HANDLED;
++	return handled ? IRQ_HANDLED : IRQ_NONE;
+ }
+ 
+ static int msm_eud_suspend(struct device *dev)
+ {
+ 	struct eud_chip *chip = dev_get_drvdata(dev);
+ 
+-	if (chip->need_phy_clk_vote && chip->eud_ahb2phy_clk)
++	mutex_lock(&eud_lock);
++	chip->suspended = true;
++	mutex_unlock(&eud_lock);
++	return 0;
++}
++
++static int msm_eud_resume(struct device *dev)
++{
++	struct eud_chip *chip = dev_get_drvdata(dev);
++
++	mutex_lock(&eud_lock);
++	chip->suspended = false;
++	mutex_unlock(&eud_lock);
++	return 0;
++}
++
++static int msm_eud_suspend_noirq(struct device *dev)
++{
++	struct eud_chip *chip = dev_get_drvdata(dev);
++
++	if (chip->ahb_enabled) {
+ 		clk_disable_unprepare(chip->eud_ahb2phy_clk);
+-
+-	return 0;
+-}
+-
+-static int msm_eud_resume(struct device *dev)
++		chip->ahb_enabled = false;
++	}
++	return 0;
++}
++
++static int msm_eud_resume_noirq(struct device *dev)
+ {
+ 	struct eud_chip *chip = dev_get_drvdata(dev);
+-	int ret = 0;
+-
+-	if (chip->need_phy_clk_vote && chip->eud_ahb2phy_clk) {
+-		ret = clk_prepare_enable(chip->eud_ahb2phy_clk);
+-		if (ret)
+-			dev_err(chip->dev, "%s failed to vote ahb2phy clk %d\n",
+-					__func__, ret);
+-	}
+-
++	int ret;
++
++	if (!chip->need_phy_clk_vote || chip->ahb_enabled)
++		return 0;
++	ret = clk_prepare_enable(chip->eud_ahb2phy_clk);
++	if (!ret)
++		chip->ahb_enabled = true;
+ 	return ret;
++}
++
++static void msm_eud_release_claim(void *data)
++{
++	mutex_lock(&eud_lock);
++	eud_claimed = false;
++	mutex_unlock(&eud_lock);
++}
++
++static void msm_eud_cleanup(void *data)
++{
++	struct platform_device *pdev = data;
++	struct eud_chip *chip = platform_get_drvdata(pdev);
++	int ret;
++
++	mutex_lock(&eud_lock);
++	if (chip->stopped) {
++		mutex_unlock(&eud_lock);
++		return;
++	}
++	chip->stopped = true;
++	WRITE_ONCE(chip->removing, true);
++	if (eud_private == pdev)
++		eud_private = NULL;
++	mutex_unlock(&eud_lock);
++	writel_relaxed(0, chip->eud_reg_base + EUD_REG_INT1_EN_MASK);
++	/* Disable the source before synchronizing and releasing its handler. */
++	wmb();
++	if (chip->irq_registered) {
++		if (chip->irq_wake_enabled)
++			disable_irq_wake(chip->eud_irq);
++		devm_free_irq(chip->dev, chip->eud_irq, chip);
++		chip->irq_registered = false;
++	}
++	cancel_work_sync(&chip->eud_work);
++	if (chip->uart_registered) {
++		uart_remove_one_port(&eud_uart_driver, &chip->port);
++		chip->uart_registered = false;
++	}
++	writel_relaxed(0, chip->eud_reg_base + EUD_REG_INT1_EN_MASK);
++	/* Serial teardown must leave every EUD interrupt masked. */
++	wmb();
++	ret = disable_eud(pdev);
++	if (ret)
++		dev_err(chip->dev, "EUD disable failed during cleanup: %d\n", ret);
++	msm_eud_clkref_en(chip, false);
++	if (chip->ahb_enabled) {
++		clk_disable_unprepare(chip->eud_ahb2phy_clk);
++		chip->ahb_enabled = false;
++	}
++	if (chip->usb_psy) {
++		power_supply_put(chip->usb_psy);
++		chip->usb_psy = NULL;
++	}
++	device_init_wakeup(chip->dev, false);
+ }
+ 
+ static int msm_eud_probe(struct platform_device *pdev)
+@@ -670,213 +772,156 @@
+ 	struct eud_chip *chip;
+ 	struct uart_port *port;
+ 	struct resource *res;
+-	int ret;
+-	bool eud_tcsr_check_state;
+-	phys_addr_t eud_tcsr_check;
+-
++	int ret, hw_enabled;
++
++	mutex_lock(&eud_lock);
++	if (eud_claimed) {
++		mutex_unlock(&eud_lock);
++		return -EBUSY;
++	}
++	eud_claimed = true;
++	mutex_unlock(&eud_lock);
++	ret = devm_add_action_or_reset(&pdev->dev, msm_eud_release_claim, NULL);
++	if (ret)
++		return ret;
+ 	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
+ 	if (!chip)
+ 		return -ENOMEM;
+-
++	chip->dev = &pdev->dev;
++	if ((of_property_read_bool(chip->dev->of_node, "qcom,secure-eud-en") ||
++	     of_property_read_bool(chip->dev->of_node, "qcom,eud-tcsr-check-enable")) &&
++	    !qcom_scm_is_available())
++		return -EPROBE_DEFER;
+ 	platform_set_drvdata(pdev, chip);
+-
+-	chip->dev = &pdev->dev;
+-	chip->extcon = devm_extcon_dev_allocate(&pdev->dev, eud_extcon_cable);
+-	if (IS_ERR(chip->extcon)) {
+-		dev_err(chip->dev, "%s: failed to allocate extcon device\n",
+-					__func__);
+-		return PTR_ERR(chip->extcon);
+-	}
+-
+-	ret = devm_extcon_dev_register(&pdev->dev, chip->extcon);
+-	if (ret) {
+-		dev_err(chip->dev, "%s: failed to register extcon device\n",
+-					__func__);
+-		return ret;
+-	}
+-
+-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "eud_base");
+-	if (!res) {
+-		dev_err(chip->dev, "%s: failed to get resource eud_base\n",
+-					__func__);
+-		return -ENOMEM;
+-	}
+-
+-	chip->eud_reg_base = devm_ioremap_resource(&pdev->dev, res);
+-	if (IS_ERR(chip->eud_reg_base))
+-		return PTR_ERR(chip->eud_reg_base);
+-
+-	chip->eud_irq = platform_get_irq_byname(pdev, "eud_irq");
+-
+-	chip->secure_eud_en = of_property_read_bool(pdev->dev.of_node,
+-			      "qcom,secure-eud-en");
+-	if (chip->secure_eud_en) {
+-		res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+-						   "eud_mode_mgr2");
+-		if (!res) {
+-			dev_err(chip->dev,
+-			"%s: failed to get resource eud_mode_mgr2\n",
+-			__func__);
+-			return -ENOMEM;
+-		}
+-
+-		chip->eud_mode_mgr2_phys_base = res->start;
+-	}
+-
+-	chip->need_phy_clk_vote = of_property_read_bool(pdev->dev.of_node,
+-			      "qcom,eud-clock-vote-req");
+-	if (chip->need_phy_clk_vote) {
+-		chip->eud_ahb2phy_clk = devm_clk_get(&pdev->dev,
+-						     "eud_ahb2phy_clk");
+-		if (IS_ERR(chip->eud_ahb2phy_clk)) {
+-			ret = PTR_ERR(chip->eud_ahb2phy_clk);
+-			return ret;
+-		}
+-
+-		ret = clk_prepare_enable(chip->eud_ahb2phy_clk);
+-		if (ret)
+-			return ret;
+-	}
+-
+-	chip->eud_clkref_clk = devm_clk_get(&pdev->dev, "eud_clkref_clk");
+-	if (IS_ERR(chip->eud_clkref_clk))
+-		chip->eud_clkref_clk = NULL;
+-
+-	ret = devm_request_irq(&pdev->dev, chip->eud_irq, handle_eud_irq,
+-				IRQF_TRIGGER_HIGH, "eud_irq", chip);
+-	if (ret) {
+-		dev_err(chip->dev, "request failed for eud irq\n");
+-		goto error;
+-	}
+-
+-	ret = of_property_read_u16(pdev->dev.of_node, "qcom,eud-utmi-delay",
+-					&chip->utmi_switch_delay);
+-	if (ret || (chip->utmi_switch_delay < EUD_UTMI_DELAY_MIN))
+-		/*
+-		 * Leave default POR value if not defined.  According to
+-		 * EUD team, a zero value written to the UTMI SWITCH delay
+-		 * register is not valid.  Requires a minimum value of 28.
+-		 */
+-		chip->utmi_switch_delay = 0;
+-
+-	device_init_wakeup(&pdev->dev, true);
+-	enable_irq_wake(chip->eud_irq);
+-
+ 	INIT_WORK(&chip->eud_work, eud_event_notifier);
+-
+-	pdev->id = 0;
+ 	port = &chip->port;
+-	port->line = pdev->id;
++	spin_lock_init(&port->lock);
++	port->line = 0;
+ 	port->type = PORT_EUD_UART;
+ 	port->dev = chip->dev;
+ 	port->fifosize = MAX_FIFO_SIZE;
+ 	port->iotype = SERIAL_IO_MEM;
+ 	port->flags = UPF_BOOT_AUTOCONF;
++	port->ops = &eud_uart_ops;
++	chip->extcon = devm_extcon_dev_allocate(chip->dev, eud_extcon_cable);
++	if (IS_ERR(chip->extcon))
++		return PTR_ERR(chip->extcon);
++	ret = devm_extcon_dev_register(chip->dev, chip->extcon);
++	if (ret)
++		return ret;
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "eud_base");
++	if (!res || resource_size(res) < EUD_CHIKNBIT_EN_DEL_CNTR + sizeof(u32))
++		return -EINVAL;
++	chip->eud_reg_base = devm_ioremap_resource(chip->dev, res);
++	if (IS_ERR(chip->eud_reg_base))
++		return PTR_ERR(chip->eud_reg_base);
+ 	port->membase = chip->eud_reg_base;
++	chip->eud_irq = platform_get_irq_byname(pdev, "eud_irq");
++	if (chip->eud_irq < 0)
++		return chip->eud_irq;
+ 	port->irq = chip->eud_irq;
+-	port->ops = &eud_uart_ops;
+-
+-	/*
+-	 * Before enabling EUD, check for TCSR register
+-	 * and if present, enable it.
+-	 */
+-	eud_tcsr_check_state = of_property_read_bool(
+-		pdev->dev.of_node, "qcom,eud-tcsr-check-enable");
+-
+-	if (eud_tcsr_check_state) {
+-		res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+-					"eud_tcsr_check_reg");
+-		if (res) {
+-			eud_tcsr_check = res->start;
+-			ret = qcom_scm_io_writel(eud_tcsr_check,
+-					EUD_TCSR_ENABLE_BIT);
+-			if (ret) {
+-				dev_err(&pdev->dev,
+-				"TCSR qcom_scm_io_writel failed with rc:%d\n",
+-				ret);
+-			}
+-		} else {
+-			dev_err(chip->dev,
+-				"Failed to get resource for tcsr check!\n");
++	chip->secure_eud_en = of_property_read_bool(chip->dev->of_node, "qcom,secure-eud-en");
++	if (chip->secure_eud_en) {
++		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "eud_mode_mgr2");
++		if (!res || resource_size(res) < sizeof(u32))
++			return -EINVAL;
++		chip->eud_mode_mgr2_phys_base = res->start;
++	}
++	chip->need_phy_clk_vote = of_property_read_bool(chip->dev->of_node,
++						      "qcom,eud-clock-vote-req");
++	if (chip->need_phy_clk_vote) {
++		chip->eud_ahb2phy_clk = devm_clk_get(chip->dev, "eud_ahb2phy_clk");
++		if (IS_ERR(chip->eud_ahb2phy_clk))
++			return PTR_ERR(chip->eud_ahb2phy_clk);
++	}
++	chip->eud_clkref_clk = devm_clk_get_optional(chip->dev, "eud_clkref_clk");
++	if (IS_ERR(chip->eud_clkref_clk))
++		return PTR_ERR(chip->eud_clkref_clk);
++	if (chip->need_phy_clk_vote) {
++		ret = clk_prepare_enable(chip->eud_ahb2phy_clk);
++		if (ret)
++			return ret;
++		chip->ahb_enabled = true;
++	}
++	ret = of_property_read_u16(chip->dev->of_node, "qcom,eud-utmi-delay",
++					&chip->utmi_switch_delay);
++	if (ret || chip->utmi_switch_delay < EUD_UTMI_DELAY_MIN)
++		chip->utmi_switch_delay = 0;
++	if (of_property_read_bool(chip->dev->of_node, "qcom,eud-tcsr-check-enable")) {
++		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "eud_tcsr_check_reg");
++		if (!res) {
++			ret = -EINVAL;
+ 			goto error;
+ 		}
+-	}
+-
+-	if (chip->secure_eud_en && check_eud_mode_mgr2(chip))
+-		enable = 1;
+-
++		ret = qcom_scm_io_writel(res->start, EUD_TCSR_ENABLE_BIT);
++		if (ret)
++			goto error;
++	}
++	hw_enabled = msm_eud_hw_is_enabled(pdev);
++	if (hw_enabled < 0) {
++		ret = hw_enabled;
++		goto error;
++	}
++	/* No interrupt can observe uninitialized work or serial state. */
++	writel_relaxed(0, chip->eud_reg_base + EUD_REG_INT1_EN_MASK);
++	/* Complete MMIO writes before the next hardware or notification step. */
++	wmb();
+ 	ret = uart_add_one_port(&eud_uart_driver, port);
+-	if (ret) {
+-		dev_err(chip->dev, "failed to add uart port!\n");
++	if (ret)
+ 		goto error;
+-	}
+-
+-	eud_private = pdev;
+-	eud_ready = true;
+-
+-	/*
+-	 * Set the chicken bit register to delay EUD enablement.
+-	 * REVISIT: Need more understanding about this register.
+-	 */
++	chip->uart_registered = true;
++	ret = devm_request_irq(chip->dev, chip->eud_irq, handle_eud_irq,
++			      IRQF_TRIGGER_HIGH, "eud_irq", chip);
++	if (ret)
++		goto error;
++	chip->irq_registered = true;
++	ret = device_init_wakeup(chip->dev, true);
++	if (ret)
++		goto error;
++	ret = enable_irq_wake(chip->eud_irq);
++	if (ret)
++		goto error;
++	chip->irq_wake_enabled = true;
+ 	writel_relaxed(1, chip->eud_reg_base + EUD_CHIKNBIT_EN_DEL_CNTR);
+-	/* Ensure Register Writes Complete */
+-	wmb();
+-
+-	/* Proceed enable other EUD elements if bootloader has enabled it */
+-	if (msm_eud_hw_is_enabled(pdev)) {
+-		/*
+-		 * UEFI USB driver should have already enabled this clock, but
+-		 * enable it here as well, so the clk driver can track the use
+-		 * count if we disable EUD from the module param.
+-		 */
+-		msm_eud_clkref_en(chip, true);
+-
++	/* Complete MMIO writes before the next hardware or notification step. */
++	wmb();
++	if (hw_enabled) {
++		chip->maybe_enabled = true;
++		ret = msm_eud_clkref_en(chip, true);
++		if (ret)
++			goto error;
+ 		set_eud_utmi_switch_delay(chip);
+-
+ 		msm_eud_enable_irqs(chip);
+-
+-		/*
+-		 * Set the default cable state to usb connect and charger
+-		 * enable
+-		 */
+ 		ret = extcon_set_state_sync(chip->extcon, EXTCON_USB, true);
+ 		if (ret)
+-			dev_warn(&pdev->dev, "Failed to set EXTCON_USB (%d)\n",
+-				ret);
+-
+-		ret = extcon_set_state_sync(chip->extcon,
+-						EXTCON_CHG_USB_SDP, true);
++			goto error;
++		ret = extcon_set_state_sync(chip->extcon, EXTCON_CHG_USB_SDP, true);
+ 		if (ret)
+-			dev_warn(&pdev->dev,
+-				"Failed to set EXTCON_CHG_USB_SDP (%d)\n", ret);
+-
+-		enable = EUD_ENABLE_CMD;
++			goto error;
+ 		chip->eud_enabled = true;
+ 	}
+-
+-	return 0;
+-
++	mutex_lock(&eud_lock);
++	if (!hw_enabled && enable)
++		ret = enable_eud(pdev);
++	else
++		ret = 0;
++	if (!ret) {
++		if (hw_enabled)
++			enable = EUD_ENABLE_CMD;
++		eud_private = pdev;
++	}
++	mutex_unlock(&eud_lock);
++	if (ret)
++		goto error;
++	return devm_add_action_or_reset(chip->dev, msm_eud_cleanup, pdev);
+ error:
+-	if (chip->need_phy_clk_vote && chip->eud_ahb2phy_clk)
+-		clk_disable_unprepare(chip->eud_ahb2phy_clk);
+-
++	msm_eud_cleanup(pdev);
+ 	return ret;
+ }
+ 
+-static int msm_eud_remove(struct platform_device *pdev)
+-{
+-	struct eud_chip *chip = platform_get_drvdata(pdev);
+-	struct uart_port *port = &chip->port;
+-
+-	if (chip->usb_psy)
+-		power_supply_put(chip->usb_psy);
+-
+-	uart_remove_one_port(&eud_uart_driver, port);
+-	device_init_wakeup(chip->dev, false);
+-	if (chip->need_phy_clk_vote)
+-		clk_disable_unprepare(chip->eud_ahb2phy_clk);
+-
+-	return 0;
++static void msm_eud_remove(struct platform_device *pdev)
++{
++	msm_eud_cleanup(pdev);
+ }
+ 
+ static const struct of_device_id msm_eud_dt_match[] = {
+@@ -886,7 +931,8 @@
+ MODULE_DEVICE_TABLE(of, msm_eud_dt_match);
+ 
+ static const struct dev_pm_ops msm_eud_dev_pm_ops = {
+-	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(msm_eud_suspend, msm_eud_resume)
++	SET_SYSTEM_SLEEP_PM_OPS(msm_eud_suspend, msm_eud_resume)
++	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(msm_eud_suspend_noirq, msm_eud_resume_noirq)
+ };
+ 
+ static struct platform_driver msm_eud_driver = {
+--- a/drivers/usb/redriver/redriver.c
++++ b/drivers/usb/redriver/redriver.c
+@@ -7,10 +7,12 @@
+ #define pr_fmt(fmt) "redriver-core: " fmt
+ 
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/usb/redriver.h>
+ 
+ static LIST_HEAD(usb_redriver_list);
+-static DEFINE_SPINLOCK(usb_rediver_lock);
++static DEFINE_SPINLOCK(usb_redriver_lock);
++static DEFINE_MUTEX(usb_redriver_unbind_lock);
+ 
+ /**
+  * usb_add_redriver() - register a redriver from a specific chip driver.
+@@ -24,21 +26,22 @@
+ {
+ 	struct usb_redriver *iter;
+ 
+-	if (!redriver->of_node ||  redriver->bounded)
++	if (!redriver || !redriver->of_node)
+ 		return -EINVAL;
+ 
+-	spin_lock(&usb_rediver_lock);
++	spin_lock(&usb_redriver_lock);
+ 
+ 	list_for_each_entry(iter, &usb_redriver_list, list) {
+-		if (iter == redriver) {
+-			spin_unlock(&usb_rediver_lock);
++		if (iter == redriver || iter->of_node == redriver->of_node) {
++			spin_unlock(&usb_redriver_lock);
+ 			return -EEXIST;
+ 		}
+ 	}
+ 
++	redriver->bounded = false;
+ 	pr_debug("add redriver %s\n", of_node_full_name(redriver->of_node));
+ 	list_add_tail(&redriver->list, &usb_redriver_list);
+-	spin_unlock(&usb_rediver_lock);
++	spin_unlock(&usb_redriver_lock);
+ 
+ 	return 0;
+ }
+@@ -53,24 +56,33 @@
+  * no unbind operation here.
+  *
+  * Return:
+- *  -EINVAL - redriver still used by uppper layer.
++ *  -EBUSY - redriver still used by upper layer.
++ *  -ENOENT - redriver is not registered.
+  *  0 - redriver removed.
+  */
+ int usb_remove_redriver(struct usb_redriver *redriver)
+ {
+-	spin_lock(&usb_rediver_lock);
+-
+-	if (redriver->bounded) {
+-		spin_unlock(&usb_rediver_lock);
++	struct usb_redriver *iter;
++	int ret = -ENOENT;
++
++	if (!redriver)
+ 		return -EINVAL;
+-	}
+-
+-	pr_debug("remove redriver %s\n", of_node_full_name(redriver->of_node));
+-	list_del(&redriver->list);
+-
+-	spin_unlock(&usb_rediver_lock);
+-
+-	return 0;
++	mutex_lock(&usb_redriver_unbind_lock);
++	spin_lock(&usb_redriver_lock);
++	list_for_each_entry(iter, &usb_redriver_list, list) {
++		if (iter != redriver)
++			continue;
++		if (redriver->bounded) {
++			ret = -EBUSY;
++			break;
++		}
++		list_del_init(&redriver->list);
++		ret = 0;
++		break;
++	}
++	spin_unlock(&usb_redriver_lock);
++	mutex_unlock(&usb_redriver_unbind_lock);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(usb_remove_redriver);
+ 
+@@ -98,7 +110,7 @@
+ 		return NULL;
+ 	}
+ 
+-	spin_lock(&usb_rediver_lock);
++	spin_lock(&usb_redriver_lock);
+ 	list_for_each_entry(redriver, &usb_redriver_list, list) {
+ 		if (redriver->of_node == node) {
+ 			found = true;
+@@ -108,14 +120,19 @@
+ 
+ 	if (!found) {
+ 		of_node_put(node);
+-		spin_unlock(&usb_rediver_lock);
++		spin_unlock(&usb_redriver_lock);
+ 		return ERR_PTR(-EPROBE_DEFER);
+ 	}
+ 
++	if (redriver->bounded) {
++		of_node_put(node);
++		spin_unlock(&usb_redriver_lock);
++		return ERR_PTR(-EBUSY);
++	}
+ 	pr_debug("get redriver %s\n", of_node_full_name(redriver->of_node));
+ 	redriver->bounded = true;
+ 
+-	spin_unlock(&usb_rediver_lock);
++	spin_unlock(&usb_redriver_lock);
+ 
+ 	return redriver;
+ }
+@@ -129,17 +146,31 @@
+  */
+ void usb_put_redriver(struct usb_redriver *redriver)
+ {
++	struct usb_redriver *iter;
++	struct device_node *node = NULL;
++
+ 	if (!redriver)
+ 		return;
+-
+-	spin_lock(&usb_rediver_lock);
+-	of_node_put(redriver->of_node);
+-	pr_debug("put redriver %s\n", of_node_full_name(redriver->of_node));
+-	redriver->bounded = false;
+-	spin_unlock(&usb_rediver_lock);
+-
+-	if (redriver->unbind)
+-		redriver->unbind(redriver);
++	/* Serialize final callbacks and provider removal, including repeated puts. */
++	mutex_lock(&usb_redriver_unbind_lock);
++	spin_lock(&usb_redriver_lock);
++	list_for_each_entry(iter, &usb_redriver_list, list) {
++		if (iter == redriver && iter->bounded) {
++			node = iter->of_node;
++			break;
++		}
++	}
++	spin_unlock(&usb_redriver_lock);
++	if (node) {
++		/* The binding stays live until its final callback has returned. */
++		if (redriver->unbind)
++			redriver->unbind(redriver);
++		spin_lock(&usb_redriver_lock);
++		redriver->bounded = false;
++		spin_unlock(&usb_redriver_lock);
++		of_node_put(node);
++	}
++	mutex_unlock(&usb_redriver_unbind_lock);
+ }
+ EXPORT_SYMBOL_GPL(usb_put_redriver);
+ 

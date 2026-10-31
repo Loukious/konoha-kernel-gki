@@ -1,0 +1,181 @@
+--- a/drivers/power/supply/mca/mca_common/mca_log.c
++++ b/drivers/power/supply/mca/mca_common/mca_log.c
+@@ -17,6 +17,7 @@
+  *
+  */
+ #include <linux/module.h>
++#include <linux/srcu.h>
+ #include <linux/stat.h>
+ #include <linux/init.h>
+ #include <linux/ctype.h>
+@@ -95,8 +96,10 @@
+ static struct mca_log_buf_info g_mca_log_info;
+ static DEFINE_SPINLOCK(g_mca_log_lock);
+ 
+-static struct mca_charge_log_ops_data
++static struct mca_charge_log_ops_data __rcu *
+ 	g_mca_charge_log_data[MCA_CHARGE_LOG_ID_MAX];
++static DEFINE_MUTEX(mca_charge_log_lock);
++DEFINE_STATIC_SRCU(mca_charge_log_srcu);
+ 
+ static void mca_log_get_cur_time(struct mca_cur_time *tm)
+ {
+@@ -277,13 +280,46 @@
+ void mca_log_charge_log_register(enum mca_charge_log_id_ele type,
+ 				 struct mca_log_charge_log_ops *ops, void *data)
+ {
+-	if (type >= MCA_CHARGE_LOG_ID_MAX)
+-		return;
+-
+-	g_mca_charge_log_data[type].ops = ops;
+-	g_mca_charge_log_data[type].data = data;
++	struct mca_charge_log_ops_data *entry, *old;
++
++	if ((unsigned int)type >= MCA_CHARGE_LOG_ID_MAX || !ops || !data)
++		return;
++	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return;
++	entry->ops = ops;
++	entry->data = data;
++	mutex_lock(&mca_charge_log_lock);
++	old = rcu_replace_pointer(g_mca_charge_log_data[type], entry,
++				  lockdep_is_held(&mca_charge_log_lock));
++	mutex_unlock(&mca_charge_log_lock);
++	if (old) {
++		synchronize_srcu(&mca_charge_log_srcu);
++		kfree(old);
++	}
+ }
+ EXPORT_SYMBOL(mca_log_charge_log_register);
++
++void mca_log_charge_log_unregister(enum mca_charge_log_id_ele type, void *data)
++{
++	struct mca_charge_log_ops_data *entry;
++
++	if ((unsigned int)type >= MCA_CHARGE_LOG_ID_MAX)
++		return;
++	mutex_lock(&mca_charge_log_lock);
++	entry = rcu_dereference_protected(g_mca_charge_log_data[type],
++					  lockdep_is_held(&mca_charge_log_lock));
++	if (!entry || entry->data != data) {
++		mutex_unlock(&mca_charge_log_lock);
++		return;
++	}
++	rcu_assign_pointer(g_mca_charge_log_data[type], NULL);
++	mutex_unlock(&mca_charge_log_lock);
++	synchronize_srcu(&mca_charge_log_srcu);
++	kfree(entry);
++}
++EXPORT_SYMBOL(mca_log_charge_log_unregister);
++
+ 
+ #ifdef CONFIG_SYSFS
+ static ssize_t mca_log_sysfs_show(struct device *dev,
+@@ -326,52 +362,52 @@
+ static inline struct mca_charge_log_ops_data *
+ mca_log_get_charge_log_ops(unsigned int type)
+ {
+-	return &g_mca_charge_log_data[type];
++	return srcu_dereference(g_mca_charge_log_data[type], &mca_charge_log_srcu);
+ }
+ 
+ static int mca_log_charge_log_dump_log_head(char *buf)
+ {
+-	int i;
+-	int len = 0;
+-	struct mca_charge_log_ops_data *ops_data;
+-
+-	for (i = 0; i < MCA_CHARGE_LOG_ID_MAX; i++) {
+-		ops_data = mca_log_get_charge_log_ops(i);
+-		if (!ops_data->ops || !ops_data->ops->dump_log_head)
++	struct mca_charge_log_ops_data *entry;
++	int i, ret, len = 0;
++
++	guard(srcu)(&mca_charge_log_srcu);
++	for (i = 0; i < MCA_CHARGE_LOG_ID_MAX && len < PAGE_SIZE - 1; i++) {
++		entry = mca_log_get_charge_log_ops(i);
++		if (!entry || !entry->ops->dump_log_head)
+ 			continue;
+-
+-		len += ops_data->ops->dump_log_head(ops_data->data, buf + len,
+-						    PAGE_SIZE - len);
+-	}
+-
+-	if (len < PAGE_SIZE - 1)
+-		buf[len] = '\n';
+-	else
+-		buf[PAGE_SIZE - 1] = '\n';
+-
++		ret = entry->ops->dump_log_head(entry->data, buf + len, PAGE_SIZE - len);
++		if (ret < 0)
++			return ret;
++		/* Callbacks may use snprintf, whose result can exceed the buffer. */
++		len += min(ret, PAGE_SIZE - len - 1);
++	}
++	if (len < PAGE_SIZE - 1) {
++		buf[len++] = '\n';
++		buf[len] = '\0';
++	}
+ 	return len;
+ }
+ 
+ static int mca_log_charge_log_dump_log_context(char *buf)
+ {
+-	int i;
+-	int len = 0;
+-	struct mca_charge_log_ops_data *ops_data;
+-
+-	for (i = 0; i < MCA_CHARGE_LOG_ID_MAX; i++) {
+-		ops_data = mca_log_get_charge_log_ops(i);
+-		if (!ops_data->ops || !ops_data->ops->dump_log_head)
++	struct mca_charge_log_ops_data *entry;
++	int i, ret, len = 0;
++
++	guard(srcu)(&mca_charge_log_srcu);
++	for (i = 0; i < MCA_CHARGE_LOG_ID_MAX && len < PAGE_SIZE - 1; i++) {
++		entry = mca_log_get_charge_log_ops(i);
++		if (!entry || !entry->ops->dump_log_context)
+ 			continue;
+-
+-		len += ops_data->ops->dump_log_context(
+-			ops_data->data, buf + len, PAGE_SIZE - len);
+-	}
+-
+-	if (len < PAGE_SIZE - 1)
+-		buf[len] = '\n';
+-	else
+-		buf[PAGE_SIZE - 1] = '\n';
+-
++		ret = entry->ops->dump_log_context(entry->data, buf + len, PAGE_SIZE - len);
++		if (ret < 0)
++			return ret;
++		/* Callbacks may use snprintf, whose result can exceed the buffer. */
++		len += min(ret, PAGE_SIZE - len - 1);
++	}
++	if (len < PAGE_SIZE - 1) {
++		buf[len++] = '\n';
++		buf[len] = '\0';
++	}
+ 	return len;
+ }
+ 
+@@ -549,6 +585,8 @@
+ 	int i;
+ 
+ 	mca_log_sysfs_remove_group(&g_mca_log_info);
++	for (i = 0; i < MCA_CHARGE_LOG_ID_MAX; i++)
++		kfree(rcu_access_pointer(g_mca_charge_log_data[i]));
+ 	info->init_flag = 0;
+ 	for (i = 0; i < MCA_LOG_BUFF_COUNT; i++) {
+ 		if (info->log_buff_cache[i]) {
+--- a/drivers/power/supply/mca/include/mca/common/mca_log.h
++++ b/drivers/power/supply/mca/include/mca/common/mca_log.h
+@@ -64,4 +64,7 @@
+ 		     "%s:%d " fmt,                        \
+ 		     __func__, __LINE__, ##__VA_ARGS__)
+ 
++/* Drain dump callbacks before freeing data; do not call from a dump callback. */
++void mca_log_charge_log_unregister(enum mca_charge_log_id_ele type, void *data);
++
+ #endif /* _MCA_COMMON_MCA_LOG_H_ */

@@ -1,0 +1,5187 @@
+--- a/drivers/power/supply/mca/mca_platform/mca_platform_base.c
++++ b/drivers/power/supply/mca/mca_platform/mca_platform_base.c
+@@ -28,7 +28,6 @@
+ #include <linux/atomic.h>
+ #include <linux/of.h>
+ #include <linux/gpio.h>
+-#include <linux/version.h>
+ #include <mca/common/mca_log.h>
+ 
+ #ifndef MCA_LOG_TAG
+@@ -59,6 +58,8 @@
+ 	struct i2c_client *i2c;
+ 	const u8 *_data = data;
+ 
++	if (!data || count < 3 || count > I2C_SMBUS_BLOCK_MAX + 2)
++		return -EINVAL;
+ 	i2c = bank_to_i2c(dev, _data[0]);
+ 	if (!i2c)
+ 		return -EINVAL;
+@@ -76,6 +77,9 @@
+ 	struct i2c_client *i2c;
+ 	const u8 *_reg_buf = reg_buf;
+ 
++	if (!reg_buf || reg_size != 2 || !val_buf || !val_size ||
++	    val_size > I2C_SMBUS_BLOCK_MAX)
++		return -EINVAL;
+ 	i2c = bank_to_i2c(dev, _reg_buf[0]);
+ 	if (!i2c)
+ 		return -EINVAL;
+@@ -102,33 +106,27 @@
+ static int mca_platform_base_parse_dt(struct mca_platform_base_device *dev)
+ {
+ 	struct device_node *node = dev->dev->of_node;
+-	int i, rc = 0, byte_len;
+-
+-	if (of_find_property(node, "platform_slave_addrs", &byte_len)) {
+-		dev->slave_addrs = devm_kzalloc(dev->dev, byte_len, GFP_KERNEL);
+-		if (dev->slave_addrs == NULL)
+-			return -ENOMEM;
+-
+-		dev->slave_addr_num = byte_len / sizeof(u8);
+-		rc = of_property_read_u8_array(node, "platform_slave_addrs",
+-					       dev->slave_addrs,
+-					       dev->slave_addr_num);
+-		if (rc < 0) {
+-			mca_log_err(
+-				"couldn't read platform_slave_addrs rc = %d\n",
+-				rc);
+-			return rc;
+-		}
+-
+-		for (i = 0; i < dev->slave_addr_num; i++) {
+-			dev->plat_i2c[i] = devm_kzalloc(
+-				dev->dev, sizeof(**dev->plat_i2c), GFP_KERNEL);
+-			if (dev->plat_i2c == NULL)
+-				return -ENOMEM;
+-		}
++	int i, j, count, ret;
++
++	count = of_property_count_u8_elems(node, "platform_slave_addrs");
++	if (count <= 0 || count > 128)
++		return -EINVAL;
++	dev->slave_addrs = devm_kmalloc(dev->dev, count, GFP_KERNEL);
++	dev->plat_i2c = devm_kcalloc(dev->dev, count, sizeof(*dev->plat_i2c), GFP_KERNEL);
++	if (!dev->slave_addrs || !dev->plat_i2c)
++		return -ENOMEM;
++	ret = of_property_read_u8_array(node, "platform_slave_addrs", dev->slave_addrs, count);
++	if (ret)
++		return ret;
++	for (i = 0; i < count; i++) {
++		if (dev->slave_addrs[i] < 0x08 || dev->slave_addrs[i] > 0x77)
++			return -EINVAL;
++		for (j = 0; j < i; j++)
++			if (dev->slave_addrs[i] == dev->slave_addrs[j])
++				return -EINVAL;
+ 	}
+-
+-	return rc;
++	dev->slave_addr_num = count;
++	return 0;
+ }
+ 
+ static int mca_platform_base_probe(struct i2c_client *client)
+@@ -144,9 +142,15 @@
+ 	dev->dev = &client->dev;
+ 	i2c_set_clientdata(client, dev);
+ 
+-	mca_platform_base_parse_dt(dev);
++	ret = mca_platform_base_parse_dt(dev);
++	if (ret)
++		return ret;
+ 
+ 	for (i = 0; i < dev->slave_addr_num; i++) {
++		if (dev->slave_addrs[i] == client->addr) {
++			dev->plat_i2c[i] = client;
++			continue;
++		}
+ 		dev->plat_i2c[i] = devm_i2c_new_dummy_device(
+ 			dev->dev, client->adapter, dev->slave_addrs[i]);
+ 		if (IS_ERR(dev->plat_i2c[i])) {
+@@ -180,12 +184,9 @@
+ 	{},
+ };
+ 
++MODULE_DEVICE_TABLE(of, mca_platform_base_of_match);
++
+ static struct i2c_driver mca_platform_base_driver = {
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 9))
+-	.probe = mca_platform_base_probe,
+-#else
+-	.probe_new = mca_platform_base_probe,
+-#endif
+ 	.probe = mca_platform_base_probe,
+ 	.driver = {
+ 		.name = "mca_platform_base",
+--- a/drivers/power/supply/mca/mca_platform/mca_platform_fg_ic_ops.c
++++ b/drivers/power/supply/mca/mca_platform/mca_platform_fg_ic_ops.c
+@@ -20,6 +20,8 @@
+ #include <linux/string.h>
+ #include <linux/device.h>
+ #include <linux/module.h>
++#include <linux/srcu.h>
++#include <linux/slab.h>
+ #include <linux/platform_device.h>
+ #include <mca/platform/platform_fg_ic_ops.h>
+ #include <mca/common/mca_log.h>
+@@ -31,32 +33,65 @@
+ 	void *data;
+ 	struct fuelguage_ic_ops *ops;
+ };
+-static struct fuelguage_info g_fg_ic_ops[FG_IC_MAX];
+-
+-static inline struct fuelguage_info *
+-platform_get_fg_ic_ops(unsigned int ic_role)
+-{
+-	if (ic_role >= FG_IC_MAX || g_fg_ic_ops[ic_role].ops == NULL)
++static struct fuelguage_info __rcu *g_fg_ic_ops[FG_IC_MAX];
++static DEFINE_MUTEX(mca_ops_lock);
++DEFINE_STATIC_SRCU(mca_ops_srcu);
++
++static struct fuelguage_info *platform_get_fg_ic_ops(unsigned int ic_role)
++{
++	if (ic_role >= FG_IC_MAX)
+ 		return NULL;
+-
+-	return &g_fg_ic_ops[ic_role];
++	return srcu_dereference(g_fg_ic_ops[ic_role], &mca_ops_srcu);
+ }
+ 
+ int platform_fg_ic_ops_register(unsigned int ic_role, void *data,
+ 				struct fuelguage_ic_ops *platform_fg_ops)
+ {
+-	if (ic_role >= FG_IC_MAX || data == NULL || platform_fg_ops == NULL)
+-		return -EOPNOTSUPP;
+-
+-	g_fg_ic_ops[ic_role].data = data;
+-	g_fg_ic_ops[ic_role].ops = platform_fg_ops;
+-
++	struct fuelguage_info *entry;
++
++	if (ic_role >= FG_IC_MAX || !data || !platform_fg_ops)
++		return -EINVAL;
++	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++	entry->data = data;
++	entry->ops = platform_fg_ops;
++	mutex_lock(&mca_ops_lock);
++	if (rcu_access_pointer(g_fg_ic_ops[ic_role])) {
++		mutex_unlock(&mca_ops_lock);
++		kfree(entry);
++		return -EEXIST;
++	}
++	rcu_assign_pointer(g_fg_ic_ops[ic_role], entry);
++	mutex_unlock(&mca_ops_lock);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(platform_fg_ic_ops_register);
+ 
++void platform_fg_ic_ops_unregister(unsigned int ic_role, void *data)
++{
++	struct fuelguage_info *entry;
++
++	if (ic_role >= FG_IC_MAX)
++		return;
++	mutex_lock(&mca_ops_lock);
++	entry = rcu_dereference_protected(g_fg_ic_ops[ic_role], lockdep_is_held(&mca_ops_lock));
++	if (!entry || entry->data != data) {
++		mutex_unlock(&mca_ops_lock);
++		return;
++	}
++	rcu_assign_pointer(g_fg_ic_ops[ic_role], NULL);
++	mutex_unlock(&mca_ops_lock);
++	synchronize_srcu(&mca_ops_srcu);
++	kfree(entry);
++}
++EXPORT_SYMBOL(platform_fg_ic_ops_unregister);
++
++
+ int platform_fg_ops_probe_ok(unsigned int ic_role, bool *ok)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_probe_ok))
+@@ -68,6 +103,8 @@
+ 
+ int platform_fg_ops_get_batt_info(unsigned int ic_role, void *info)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_batt_info))
+@@ -79,6 +116,8 @@
+ 
+ int platform_fg_ops_get_soc(unsigned int ic_role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_soc))
+@@ -90,6 +129,8 @@
+ 
+ int platform_fg_ops_get_rsoc(unsigned int ic_role, int *rsoc)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_rsoc))
+@@ -101,6 +142,8 @@
+ 
+ int platform_fg_ops_get_curr(unsigned int ic_role, int *curr)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_curr))
+@@ -112,6 +155,8 @@
+ 
+ int platform_fg_ops_set_verify_digest(unsigned int ic_role, char *buf)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_set_verify_digest))
+@@ -123,6 +168,8 @@
+ 
+ int platform_fg_ops_get_verify_digest(unsigned int ic_role, char *buf)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_verify_digest))
+@@ -134,6 +181,8 @@
+ 
+ int platform_fg_ops_set_authentic(unsigned int ic_role, int value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_set_authentic))
+@@ -145,6 +194,8 @@
+ 
+ int platform_fg_ops_get_authentic(unsigned int ic_role, int *value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_authentic))
+@@ -156,6 +207,8 @@
+ 
+ int platform_fg_ops_get_error_state(unsigned int ic_role, bool *error)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_error_state))
+@@ -167,6 +220,8 @@
+ 
+ int platform_fg_ops_get_volt(unsigned int ic_role, int *volt)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_volt))
+@@ -178,6 +233,8 @@
+ 
+ int platform_fg_ops_set_temp(unsigned int ic_role, int temp)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_set_temp))
+@@ -189,6 +246,8 @@
+ 
+ int platform_fg_ops_get_temp(unsigned int ic_role, int *temp)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_temp))
+@@ -200,6 +259,8 @@
+ 
+ int platform_fg_ops_set_iterm(unsigned int ic_role, int curr)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_set_iterm))
+@@ -211,6 +272,8 @@
+ 
+ int platform_fg_ops_get_charge_status(unsigned int ic_role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_charge_status))
+@@ -222,6 +285,8 @@
+ 
+ int platform_fg_ops_get_rm(unsigned int ic_role, int *rm)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_rm))
+@@ -233,6 +298,8 @@
+ 
+ int platform_fg_ops_get_isc_alert_level(unsigned int ic_role, int *level)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_isc_alert_level))
+@@ -245,6 +312,8 @@
+ 
+ int platform_fg_ops_get_soa_alert_level(unsigned int ic_role, int *level)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_soa_alert_level))
+@@ -257,6 +326,8 @@
+ 
+ int platform_fg_ops_get_fastcharge(unsigned int ic_role, int *ffc)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_fastcharge))
+@@ -268,6 +339,8 @@
+ 
+ int platform_fg_ops_set_fastcharge(unsigned int ic_role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_set_fastcharge))
+@@ -279,6 +352,8 @@
+ 
+ int platform_fg_ops_get_chg_vol(unsigned int ic_role, int *volt)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_chg_vol))
+@@ -290,6 +365,8 @@
+ 
+ int platform_fg_ops_get_chip_ok(unsigned int ic_role, int *ok)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_chip_ok))
+@@ -301,6 +378,8 @@
+ 
+ int platform_fg_ops_get_cyclecount(unsigned int ic_role, int *cc)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_cyclecount))
+@@ -312,6 +391,8 @@
+ 
+ int platform_fg_ops_get_tte(unsigned int ic_role, int *tte)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_tte))
+@@ -323,6 +404,8 @@
+ 
+ int platform_fg_ops_get_ttf(unsigned int ic_role, int *ttf)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_ttf))
+@@ -334,6 +417,8 @@
+ 
+ int platform_fg_ops_get_fcc(unsigned int ic_role, int *fcc)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_fcc))
+@@ -345,6 +430,8 @@
+ 
+ int platform_fg_ops_get_full_design(unsigned int ic_role, int *dc)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_full_design))
+@@ -356,6 +443,8 @@
+ 
+ int platform_fg_ops_get_decimal_rate(unsigned int ic_role, int *rate)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_decimal_rate))
+@@ -367,6 +456,8 @@
+ 
+ int platform_fg_ops_get_decimal(unsigned int ic_role, int *decimal)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_decimal))
+@@ -378,6 +469,8 @@
+ 
+ int platform_fg_ops_get_soh(unsigned int ic_role, int *soh)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_soh))
+@@ -389,6 +482,8 @@
+ 
+ int platform_fg_ops_get_temp_max(unsigned int ic_role, int *temp_max)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_temp_max))
+@@ -400,6 +495,8 @@
+ 
+ int platform_fg_ops_get_time_ot(unsigned int ic_role, int *time_ot)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_time_ot))
+@@ -411,6 +508,8 @@
+ 
+ int platform_fg_ops_get_batt_cell_info(unsigned int ic_role, const char **name)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_batt_cell_info))
+@@ -422,6 +521,8 @@
+ 
+ int platform_fg_ops_get_cutoff_voltage(unsigned int ic_role, int *volt)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_cutoff_voltage))
+@@ -433,6 +534,8 @@
+ 
+ int platform_fg_ops_set_cutoff_voltage(unsigned int ic_role, int value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_set_cutoff_voltage))
+@@ -444,6 +547,8 @@
+ 
+ int platform_fg_ops_get_dod_count(unsigned int ic_role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_dod_count))
+@@ -455,6 +560,8 @@
+ 
+ int platform_fg_ops_get_count_level1(unsigned int ic_role, int *count)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_count_level1))
+@@ -466,6 +573,8 @@
+ 
+ int platform_fg_ops_get_count_level2(unsigned int ic_role, int *count)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_count_level1))
+@@ -477,6 +586,8 @@
+ 
+ int platform_fg_ops_get_count_level3(unsigned int ic_role, int *count)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_count_level3))
+@@ -488,6 +599,8 @@
+ 
+ int platform_fg_ops_get_count_lowtemp(unsigned int ic_role, int *count)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_count_lowtemp))
+@@ -499,6 +612,8 @@
+ 
+ int platform_fg_ops_set_clear_count_data(unsigned int ic_role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_set_clear_count_data))
+@@ -510,6 +625,8 @@
+ 
+ int platform_fg_ops_get_adapt_power(unsigned int ic_role, int *adapt_power)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_adapt_power))
+@@ -522,6 +639,8 @@
+ 
+ int platform_fg_ops_get_aged_flag(unsigned int ic_role, int *flag)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_aged_flag))
+@@ -533,6 +652,8 @@
+ 
+ int platform_fg_ops_get_raw_soc(unsigned int ic_role, int *raw_soc)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_raw_soc))
+@@ -545,6 +666,8 @@
+ int platform_fg_ops_get_real_supplement_energy(unsigned int ic_role,
+ 					       int *supplement_energy)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info,
+@@ -558,6 +681,8 @@
+ 
+ int platform_fg_ops_get_calibration_ffc_iterm(unsigned int ic_role, int *iterm)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_calibration_ffc_iterm))
+@@ -571,6 +696,8 @@
+ int platform_fg_ops_get_calibration_charge_energy(unsigned int ic_role,
+ 						  int *charge_energy)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info,
+@@ -584,6 +711,8 @@
+ 
+ void platform_fg_ops_fl4p0_enable_check(unsigned int ic_role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_fl4p0_enable_check))
+@@ -595,6 +724,8 @@
+ 
+ void platform_fg_ops_update_fw(unsigned int ic_role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_update_fw))
+@@ -606,6 +737,8 @@
+ 
+ int platform_fg_ops_get_device_name(unsigned int ic_role, const char **name)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_device_name))
+@@ -617,6 +750,8 @@
+ 
+ int platform_fg_ops_get_temp_min(unsigned int ic_role, int *temp_min)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_temp_min))
+@@ -628,6 +763,8 @@
+ 
+ void platform_fg_ops_set_force_report_full(unsigned int ic_role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_set_force_report_full))
+@@ -639,6 +776,8 @@
+ 
+ int platform_fg_ops_get_fc(unsigned int ic_role, bool *fc)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_fc))
+@@ -650,6 +789,8 @@
+ 
+ int platform_fg_ops_set_co(unsigned int ic_role, bool value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_set_co))
+@@ -661,6 +802,8 @@
+ 
+ void platform_fg_ops_get_ui_soh(unsigned int ic_role, int *ui_soh)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_ui_soh))
+@@ -672,6 +815,8 @@
+ 
+ unsigned long platform_fg_ops_get_calc_rvalue(unsigned int ic_role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_calc_rvalue))
+@@ -683,6 +828,8 @@
+ 
+ int platform_fg_ops_get_pack_vendor(unsigned int ic_role, int *vendor)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_pack_vendor))
+@@ -694,6 +841,8 @@
+ 
+ int platform_fg_ops_get_original_temp(unsigned int ic_role, int *temp)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_original_temp))
+@@ -705,6 +854,8 @@
+ 
+ int platform_fg_ops_get_average_current(unsigned int ic_role, int *curr)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_average_current))
+@@ -716,6 +867,8 @@
+ 
+ int platform_fg_ops_get_ota_update_flag(unsigned int ic_role, int *flag)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_ota_update_flag))
+@@ -727,6 +880,8 @@
+ 
+ int platform_fg_ops_ota_update_check(unsigned int ic_role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_ota_update_check))
+@@ -738,6 +893,8 @@
+ 
+ void platform_fg_ops_get_batt_abnormal_info(unsigned int ic_role, int *info)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_batt_abnormal_info))
+@@ -749,6 +906,8 @@
+ 
+ int platform_fg_ops_get_first_usage_date(unsigned int ic_role, u8 *buf)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_first_usage_date))
+@@ -760,6 +919,8 @@
+ 
+ int platform_fg_ops_get_manufacturing_date(unsigned int ic_role, u8 *buf)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_get_manufacturing_date))
+@@ -773,6 +934,8 @@
+ void platform_fg_ops_set_first_usage_date(unsigned int ic_role,
+ 					  const char *date)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_set_first_usage_date))
+@@ -784,6 +947,8 @@
+ 
+ void platform_fg_ops_qbg_send_chg_data(unsigned int ic_role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct fuelguage_info *temp_info = platform_get_fg_ic_ops(ic_role);
+ 
+ 	if (platform_fg_ops_invalid(temp_info, fg_ic_qbg_send_chg_data))
+--- a/drivers/power/supply/mca/mca_platform/mca_platform_buckchg_class.c
++++ b/drivers/power/supply/mca/mca_platform/mca_platform_buckchg_class.c
+@@ -17,6 +17,8 @@
+  *
+  */
+ #include <linux/module.h>
++#include <linux/srcu.h>
++#include <linux/slab.h>
+ #include <linux/platform_device.h>
+ #include <mca/platform/platform_buckchg_class.h>
+ 
+@@ -28,33 +30,66 @@
+ #define platform_class_buckchg_invalid_ops(data, name) \
+ 	(!data || !(data->ops) || !(data->ops->name))
+ 
+-static struct platform_class_buckchg_data
+-	platform_buckchg_ops_data[MAX_BUCK_CHARGER];
+-
+-static struct platform_class_buckchg_data *
+-platform_class_buckchg_get_ops_data(unsigned int role)
++static struct platform_class_buckchg_data __rcu *platform_buckchg_ops_data[MAX_BUCK_CHARGER];
++static DEFINE_MUTEX(mca_ops_lock);
++DEFINE_STATIC_SRCU(mca_ops_srcu);
++
++static struct platform_class_buckchg_data *platform_class_buckchg_get_ops_data(unsigned int role)
+ {
+ 	if (role >= MAX_BUCK_CHARGER)
+ 		return NULL;
+-
+-	return &platform_buckchg_ops_data[role];
++	return srcu_dereference(platform_buckchg_ops_data[role], &mca_ops_srcu);
+ }
+ 
+ int platform_class_buckchg_ops_register(unsigned int role, void *data,
+ 					struct platform_class_buckchg_ops *ops)
+ {
++	struct platform_class_buckchg_data *entry;
++
++	if (role >= MAX_BUCK_CHARGER || !data || !ops)
++		return -EINVAL;
++	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++	entry->data = data;
++	entry->ops = ops;
++	mutex_lock(&mca_ops_lock);
++	if (rcu_access_pointer(platform_buckchg_ops_data[role])) {
++		mutex_unlock(&mca_ops_lock);
++		kfree(entry);
++		return -EEXIST;
++	}
++	rcu_assign_pointer(platform_buckchg_ops_data[role], entry);
++	mutex_unlock(&mca_ops_lock);
++	return 0;
++}
++EXPORT_SYMBOL(platform_class_buckchg_ops_register);
++
++void platform_class_buckchg_ops_unregister(unsigned int role, void *data)
++{
++	struct platform_class_buckchg_data *entry;
++
+ 	if (role >= MAX_BUCK_CHARGER)
+-		return -1;
+-
+-	platform_buckchg_ops_data[role].data = data;
+-	platform_buckchg_ops_data[role].ops = ops;
+-
+-	return 0;
+-}
+-EXPORT_SYMBOL(platform_class_buckchg_ops_register);
++		return;
++	mutex_lock(&mca_ops_lock);
++	entry = rcu_dereference_protected(platform_buckchg_ops_data[role],
++					  lockdep_is_held(&mca_ops_lock));
++	if (!entry || entry->data != data) {
++		mutex_unlock(&mca_ops_lock);
++		return;
++	}
++	rcu_assign_pointer(platform_buckchg_ops_data[role], NULL);
++	mutex_unlock(&mca_ops_lock);
++	synchronize_srcu(&mca_ops_srcu);
++	kfree(entry);
++}
++EXPORT_SYMBOL(platform_class_buckchg_ops_unregister);
++
+ 
+ int platform_class_buckchg_ops_enable_hvdcp(unsigned int role, int en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -67,6 +102,8 @@
+ 
+ int platform_class_buckchg_ops_get_online(unsigned int role, int *online)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -80,6 +117,8 @@
+ int platform_class_buckchg_ops_is_charge_done(unsigned int role,
+ 					      bool *charge_done)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -92,6 +131,8 @@
+ 
+ int platform_class_buckchg_ops_get_hiz_status(unsigned int role, int *hz)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -104,6 +145,8 @@
+ 
+ int platform_class_buckchg_ops_get_input_volt_lmt(unsigned int role, int *mV)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -116,6 +159,8 @@
+ 
+ int platform_class_buckchg_ops_get_input_curr_lmt(unsigned int role, int *mA)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -128,6 +173,8 @@
+ 
+ int platform_class_buckchg_ops_get_bus_curr(unsigned int role, int *bus_curr)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -140,6 +187,8 @@
+ 
+ int platform_class_buckchg_ops_get_bus_volt(unsigned int role, int *bus_volt)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -153,6 +202,8 @@
+ int platform_class_buckchg_ops_get_usb_sns_volt(unsigned int role,
+ 						int *bus_volt)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -165,6 +216,8 @@
+ 
+ int platform_class_buckchg_ops_get_ac_volt(unsigned int role, int *mV)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -177,6 +230,8 @@
+ 
+ int platform_class_buckchg_ops_get_batt_volt_sns(unsigned int role, int *sns)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -189,6 +244,8 @@
+ 
+ int platform_class_buckchg_ops_get_batt_volt(unsigned int role, int *mV)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -201,6 +258,8 @@
+ 
+ int platform_class_buckchg_ops_get_batt_curr(unsigned int role, int *mA)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -213,6 +272,8 @@
+ 
+ int platform_class_buckchg_ops_get_sys_volt(unsigned int role, int *vsys_min)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -225,6 +286,8 @@
+ 
+ int platform_class_buckchg_ops_get_bus_tsns(unsigned int role, int *sns)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -237,6 +300,8 @@
+ 
+ int platform_class_buckchg_ops_get_batt_tsns(unsigned int role, int *sns)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -249,6 +314,8 @@
+ 
+ int platform_class_buckchg_ops_get_die_temp(unsigned int role, int *temp)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -261,6 +328,8 @@
+ 
+ int platform_class_buckchg_ops_get_batt_id(unsigned int role, int *id)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -274,6 +343,8 @@
+ int platform_class_buckchg_ops_get_chg_status(unsigned int role,
+ 					      int *chg_status)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -286,6 +357,8 @@
+ 
+ int platform_class_buckchg_ops_get_chg_type(unsigned int role, int *chg_type)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -298,6 +371,8 @@
+ 
+ int platform_class_buckchg_ops_get_term_curr(unsigned int role, int *term_curr)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -310,6 +385,8 @@
+ 
+ int platform_class_buckchg_ops_get_term_volt(unsigned int role, int *term_volt)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -322,6 +399,8 @@
+ 
+ int platform_class_buckchg_ops_get_wls_curr(unsigned int role, int *wls_curr)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -334,6 +413,8 @@
+ 
+ int platform_class_buckchg_ops_set_hiz(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -346,6 +427,8 @@
+ 
+ int platform_class_buckchg_ops_set_wls_hiz(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -358,6 +441,8 @@
+ 
+ int platform_class_buckchg_ops_set_input_curr_lmt(unsigned int role, int ma)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -370,6 +455,8 @@
+ 
+ int platform_class_buckchg_ops_set_wls_input_curr_lmt(unsigned int role, int ma)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -383,6 +470,8 @@
+ 
+ int platform_class_buckchg_ops_set_input_volt_lmt(unsigned int role, int mv)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -395,6 +484,8 @@
+ 
+ int platform_class_buckchg_ops_set_ichg(unsigned int role, int ma)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -407,6 +498,8 @@
+ 
+ int platform_class_buckchg_ops_set_chg(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -419,6 +512,8 @@
+ 
+ int platform_class_buckchg_ops_set_buck_fsw(unsigned int role, int mv)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -431,6 +526,8 @@
+ 
+ int platform_class_buckchg_ops_set_otg_curr(unsigned int role, int ma)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -443,6 +540,8 @@
+ 
+ int platform_class_buckchg_ops_set_otg_volt(unsigned int role, int mv)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -455,6 +554,8 @@
+ 
+ int platform_class_buckchg_ops_set_term(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -467,6 +568,8 @@
+ 
+ int platform_class_buckchg_ops_set_term_curr(unsigned int role, int ma)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -479,6 +582,8 @@
+ 
+ int platform_class_buckchg_ops_set_term_volt(unsigned int role, int mv)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -491,6 +596,8 @@
+ 
+ int platform_class_buckchg_ops_adc_enable(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -503,6 +610,8 @@
+ 
+ int platform_class_buckchg_ops_set_prechg_volt(unsigned int role, int mv)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -515,6 +624,8 @@
+ 
+ int platform_class_buckchg_ops_set_prechg_curr(unsigned int role, int ma)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -527,6 +638,8 @@
+ 
+ int platform_class_buckchg_ops_force_dpdm(unsigned int role, int en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -539,6 +652,8 @@
+ 
+ int platform_class_buckchg_ops_request_dpdm(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -551,6 +666,8 @@
+ 
+ int platform_class_buckchg_ops_set_wd_timeout(unsigned int role, int ms)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -563,6 +680,8 @@
+ 
+ int platform_class_buckchg_ops_kick_wd(unsigned int role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -575,6 +694,8 @@
+ 
+ int platform_class_buckchg_ops_set_qc_volt(unsigned int role, int mv)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -587,6 +708,8 @@
+ 
+ int platform_class_buckchg_ops_set_usb_aicl_cont_thd(unsigned int role, int mv)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -600,6 +723,8 @@
+ 
+ int platform_class_buckchg_ops_get_usb_aicl_cont_thd(unsigned int role, int *mv)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -613,6 +738,8 @@
+ 
+ int platform_class_buckchg_ops_set_opt_fws(unsigned int role, int mv)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -626,6 +753,8 @@
+ int platform_class_buckchg_ops_usb_adapter_allow_override(unsigned int role,
+ 							  bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -639,6 +768,8 @@
+ 
+ int platform_class_buckchg_ops_set_qc3_volt(unsigned int role, int mv)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -652,6 +783,8 @@
+ int platform_class_buckchg_ops_get_otg_boost_src(unsigned int role,
+ 						 int *otg_boost_src)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -666,6 +799,8 @@
+ int platform_class_buckchg_ops_get_otg_boost_enable_status(
+ 	unsigned int role, int *otg_boost_enable_sts)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -681,6 +816,8 @@
+ int platform_class_buckchg_ops_get_otg_gate_enable_status(
+ 	unsigned int role, int *otg_gate_enable_sts)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -695,6 +832,8 @@
+ 
+ int platform_class_buckchg_ops_set_otg(unsigned int role, int en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -709,6 +848,8 @@
+ int platform_class_buckchg_ops_set_boost_enable(unsigned int role,
+ 						int src_enable)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -722,6 +863,8 @@
+ int platform_class_buckchg_ops_set_boost_voltage(unsigned int role,
+ 						 int src_value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -734,6 +877,8 @@
+ 
+ int platform_class_buckchg_ops_set_aicl_enable(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -746,6 +891,8 @@
+ 
+ int platform_class_buckchg_ops_set_rerun_aicl(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -758,6 +905,8 @@
+ 
+ int platform_class_buckchg_ops_is_support_cid(unsigned int role, bool *en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -770,6 +919,8 @@
+ 
+ int platform_class_buckchg_ops_set_ship_mode(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -782,6 +933,8 @@
+ 
+ int platform_class_buckchg_ops_get_ship_mode(unsigned int role, bool *en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -794,6 +947,8 @@
+ 
+ int platform_class_buckchg_ops_set_wls_vdd_flag(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -805,6 +960,8 @@
+ EXPORT_SYMBOL(platform_class_buckchg_ops_set_wls_vdd_flag);
+ int platform_class_buckchg_ops_get_lpd_enable(unsigned int role, int *lpd_en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -818,6 +975,8 @@
+ int platform_class_buckchg_ops_get_lpd_status(unsigned int role,
+ 					      int *lpd_status)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -830,6 +989,8 @@
+ 
+ int platform_class_buckchg_ops_get_lpd_sbu1(unsigned int role, int *lpd_sbu1)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -842,6 +1003,8 @@
+ 
+ int platform_class_buckchg_ops_get_lpd_sbu2(unsigned int role, int *lpd_sbu2)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -854,6 +1017,8 @@
+ 
+ int platform_class_buckchg_ops_get_lpd_cc1(unsigned int role, int *lpd_cc1)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -866,6 +1031,8 @@
+ 
+ int platform_class_buckchg_ops_get_lpd_cc2(unsigned int role, int *lpd_cc2)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -878,6 +1045,8 @@
+ 
+ int platform_class_buckchg_ops_get_lpd_dp(unsigned int role, int *lpd_dp)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -890,6 +1059,8 @@
+ 
+ int platform_class_buckchg_ops_get_lpd_dm(unsigned int role, int *lpd_dm)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -902,6 +1073,8 @@
+ 
+ int platform_class_buckchg_ops_set_lpd_sbu1(unsigned int role, int lpd_sbu1)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -915,6 +1088,8 @@
+ int platform_class_buckchg_ops_set_lpd_control(unsigned int role,
+ 					       int lpd_control)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -928,6 +1103,8 @@
+ int platform_class_buckchg_ops_get_lpd_control(unsigned int role,
+ 					       int *lpd_control)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -941,6 +1118,8 @@
+ int platform_class_buckchg_ops_set_lpd_uart_control(unsigned int role,
+ 						    int lpd_uart_control)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -955,6 +1134,8 @@
+ int platform_class_buckchg_ops_get_lpd_uart_control(unsigned int role,
+ 						    int *lpd_uart_control)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -968,6 +1149,8 @@
+ 
+ int platform_class_buckchg_ops_get_pack_vbat(unsigned int role, int *pvbat)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -980,6 +1163,8 @@
+ 
+ int platform_class_buckchg_ops_set_eu_model(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -992,6 +1177,8 @@
+ 
+ int platform_class_buckchg_ops_is_init_ok(unsigned int role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -1004,6 +1191,8 @@
+ 
+ int platform_class_buckchg_ops_set_restart_aicl(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -1016,6 +1205,8 @@
+ 
+ int platform_class_buckchg_ops_get_pack_ibat(unsigned int role, int *ibat)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -1028,6 +1219,8 @@
+ 
+ int platform_class_buckchg_ops_get_pack_tbat(unsigned int role, int *tbat)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -1040,6 +1233,8 @@
+ 
+ int platform_class_buckchg_ops_get_aicl_status(unsigned int role, int *status)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+@@ -1052,6 +1247,8 @@
+ 
+ int platform_class_buckchg_ops_set_too_hot_limit(unsigned int role, int limit)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_buckchg_data *temp_data =
+ 		platform_class_buckchg_get_ops_data(role);
+ 
+--- a/drivers/power/supply/mca/mca_platform/mca_platform_cp_class.c
++++ b/drivers/power/supply/mca/mca_platform/mca_platform_cp_class.c
+@@ -20,6 +20,8 @@
+ #include <linux/string.h>
+ #include <linux/device.h>
+ #include <linux/module.h>
++#include <linux/srcu.h>
++#include <linux/slab.h>
+ #include <linux/platform_device.h>
+ #include <mca/platform/platform_cp_class.h>
+ #include <mca/common/mca_log.h>
+@@ -51,6 +53,7 @@
+ };
+ 
+ static struct platform_cp_dev *g_platform_cp_dev;
++static DEFINE_MUTEX(cp_state_lock);
+ 
+ union platform_cp_propval {
+ 	unsigned int uintval;
+@@ -78,33 +81,66 @@
+ 	CP_PROP_WORK_MODE,
+ };
+ 
+-static struct platform_cp_class_ops_data g_platform_cp_data[CP_ROLE_MAX];
+-
+-static inline struct platform_cp_class_ops_data *
+-platform_cp_class_get_ic_ops(unsigned int role)
+-{
+-	if (role >= CP_ROLE_MAX || g_platform_cp_data[role].ops == NULL)
++static struct platform_cp_class_ops_data __rcu *g_platform_cp_data[CP_ROLE_MAX];
++static DEFINE_MUTEX(mca_ops_lock);
++DEFINE_STATIC_SRCU(mca_ops_srcu);
++
++static struct platform_cp_class_ops_data *platform_cp_class_get_ic_ops(unsigned int role)
++{
++	if (role >= CP_ROLE_MAX)
+ 		return NULL;
+-
+-	return &g_platform_cp_data[role];
++	return srcu_dereference(g_platform_cp_data[role], &mca_ops_srcu);
+ }
+ 
+ int platform_class_cp_register_ops(unsigned int role,
+-				   struct platform_class_cp_ops *ops,
+-				   void *data)
+-{
++				   struct platform_class_cp_ops *ops, void *data)
++{
++	struct platform_cp_class_ops_data *entry;
++
+ 	if (role >= CP_ROLE_MAX || !data || !ops)
+-		return -EOPNOTSUPP;
+-
+-	g_platform_cp_data[role].data = data;
+-	g_platform_cp_data[role].ops = ops;
+-
++		return -EINVAL;
++	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++	entry->data = data;
++	entry->ops = ops;
++	mutex_lock(&mca_ops_lock);
++	if (rcu_access_pointer(g_platform_cp_data[role])) {
++		mutex_unlock(&mca_ops_lock);
++		kfree(entry);
++		return -EEXIST;
++	}
++	rcu_assign_pointer(g_platform_cp_data[role], entry);
++	mutex_unlock(&mca_ops_lock);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(platform_class_cp_register_ops);
+ 
++void platform_class_cp_unregister_ops(unsigned int role, void *data)
++{
++	struct platform_cp_class_ops_data *entry;
++
++	if (role >= CP_ROLE_MAX)
++		return;
++	mutex_lock(&mca_ops_lock);
++	entry = rcu_dereference_protected(g_platform_cp_data[role],
++					  lockdep_is_held(&mca_ops_lock));
++	if (!entry || entry->data != data) {
++		mutex_unlock(&mca_ops_lock);
++		return;
++	}
++	rcu_assign_pointer(g_platform_cp_data[role], NULL);
++	mutex_unlock(&mca_ops_lock);
++	synchronize_srcu(&mca_ops_srcu);
++	kfree(entry);
++}
++EXPORT_SYMBOL(platform_class_cp_unregister_ops);
++
++
+ int platform_class_cp_set_charging_enable(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -117,6 +153,8 @@
+ 
+ int platform_class_cp_get_charging_enabled(unsigned int role, bool *en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -129,6 +167,8 @@
+ 
+ int platform_class_cp_set_present(unsigned int role, bool present)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -141,6 +181,8 @@
+ 
+ int platform_class_cp_set_revchg(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data = platform_cp_class_get_ic_ops(role);
+ 
+ 	if (platform_cp_ops_invalid(temp_data, cp_set_revchg))
+@@ -152,6 +194,8 @@
+ 
+ int platform_class_cp_set_adjustadble_timeout(unsigned int role, int timeout)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data = platform_cp_class_get_ic_ops(role);
+ 
+ 	if (platform_cp_ops_invalid(temp_data, cp_set_adjustadble_timeout))
+@@ -163,6 +207,8 @@
+ 
+ int platform_class_cp_get_vbus_present(unsigned int role, bool *present)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -175,6 +221,8 @@
+ 
+ int platform_class_cp_get_present(unsigned int role, bool *present)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -187,6 +235,8 @@
+ 
+ int platform_class_cp_get_battery_present(unsigned int role, bool *present)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -199,6 +249,8 @@
+ 
+ int platform_class_cp_get_battery_voltage(unsigned int role, int *vbat)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -211,6 +263,8 @@
+ 
+ int platform_class_cp_get_battery_current(unsigned int role, int *ibat)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -223,6 +277,8 @@
+ 
+ int platform_class_cp_get_battery_temperature(unsigned int role, int *tbat)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -236,6 +292,8 @@
+ 
+ int platform_class_cp_get_bus_voltage(unsigned int role, int *vbus)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -248,6 +306,8 @@
+ 
+ int platform_class_cp_get_bus_current(unsigned int role, int *ibus)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -260,6 +320,8 @@
+ 
+ int platform_class_cp_get_bus_temperature(unsigned int role, int *tbus)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -272,6 +334,8 @@
+ 
+ int platform_class_cp_get_die_temperature(unsigned int role, int *tdie)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -284,6 +348,8 @@
+ 
+ int platform_class_cp_get_alarm_status(unsigned int role, int *alarm_status)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -297,6 +363,8 @@
+ 
+ int platform_class_cp_get_fault_status(unsigned int role, int *fault_status)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -310,6 +378,8 @@
+ 
+ int platform_class_cp_get_bus_error_status(unsigned int role, int *error_status)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -323,6 +393,8 @@
+ 
+ int platform_class_cp_get_reg_status(unsigned int role, int *reg_status)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -335,6 +407,8 @@
+ 
+ int platform_class_cp_set_mode(unsigned int role, int mode)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -347,6 +421,8 @@
+ 
+ int platform_class_cp_get_mode(unsigned int role, int *mode)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -359,6 +435,8 @@
+ 
+ int platform_class_cp_device_init(unsigned int role, int value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -371,6 +449,8 @@
+ 
+ int platform_class_cp_enable_adc(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -383,6 +463,8 @@
+ 
+ int platform_class_cp_get_bypass_support(unsigned int role, bool *status)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -395,6 +477,8 @@
+ 
+ int platform_class_cp_dump_register(unsigned int role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -407,6 +491,8 @@
+ 
+ int platform_class_cp_get_chip_vendor(unsigned int role, int *chip_vendor)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -419,6 +505,8 @@
+ 
+ int platform_class_cp_get_probe_ok(unsigned int role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -431,6 +519,8 @@
+ 
+ int platform_class_cp_get_int_stat(unsigned int role, int channel, bool *result)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -444,6 +534,8 @@
+ 
+ int platform_class_cp_enable_acdrv_manual(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -456,6 +548,8 @@
+ 
+ int platform_class_cp_enable_wpcgate(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -468,6 +562,8 @@
+ 
+ int platform_class_cp_enable_ovpgate(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -481,6 +577,8 @@
+ int platform_class_cp_enable_ovpgate_with_check(unsigned int role,
+ 						int type_temp, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -494,6 +592,8 @@
+ 
+ int platform_class_cp_get_ovpgate_status(unsigned int role, bool *en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -506,6 +606,8 @@
+ 
+ int platform_class_cp_get_usb_voltage(unsigned int role, int *vusb)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -556,6 +658,8 @@
+ 
+ int platform_class_cp_get_errorhl_stat(unsigned int role, int *stat)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -568,6 +672,8 @@
+ 
+ int platform_class_cp_enable_busucp(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -580,6 +686,8 @@
+ 
+ int platform_class_cp_get_battery_vout(unsigned int role, u32 *val)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -592,6 +700,8 @@
+ 
+ int platform_class_cp_get_adc_enabled(unsigned int role, bool *en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -604,6 +714,8 @@
+ 
+ int platform_class_cp_set_busovp(unsigned int role, int val)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -616,6 +728,8 @@
+ 
+ int platform_class_cp_enable_vbus_errorhi(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -628,6 +742,8 @@
+ 
+ int platform_class_cp_enable_vbus_errorlo(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -640,6 +756,8 @@
+ 
+ int platform_class_cp_set_manual_revchg_mode(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -652,6 +770,8 @@
+ 
+ int platform_class_cp_set_cp_reverse_mode(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -664,19 +784,25 @@
+ 
+ int platform_class_cp_set_fsw(unsigned int role, int fsw)
+ {
+-	struct platform_cp_class_ops_data *temp_data =
+-		platform_cp_class_get_ic_ops(role);
+-
++	guard(srcu)(&mca_ops_srcu);
++
++	struct platform_cp_class_ops_data *temp_data =
++		platform_cp_class_get_ic_ops(role);
++
++	mutex_lock(&cp_state_lock);
+ 	if (g_platform_cp_dev) {
+ 		if (g_platform_cp_dev->force_fsw > 0) {
+ 			mca_log_info("force_fsw has set: %d\n",
+ 				     g_platform_cp_dev->force_fsw);
++			mutex_unlock(&cp_state_lock);
+ 			return 0;
+ 		} else if (g_platform_cp_dev->force_fsw < 0) {
+ 			g_platform_cp_dev->force_fsw *= -1;
+ 		}
+ 	}
+ 
++	mutex_unlock(&cp_state_lock);
++
+ 	if (platform_cp_ops_invalid(temp_data, cp_set_fsw))
+ 		return -1;
+ 
+@@ -684,8 +810,10 @@
+ }
+ EXPORT_SYMBOL(platform_class_cp_set_fsw);
+ 
+-extern int platform_class_cp_set_default_fsw(unsigned int role)
+-{
++int platform_class_cp_set_default_fsw(unsigned int role)
++{
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -698,6 +826,8 @@
+ 
+ int platform_class_cp_get_fsw(unsigned int role, int *fsw)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -710,6 +840,8 @@
+ 
+ int platform_class_cp_get_fsw_step(unsigned int role, int *fsw_step)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -722,6 +854,8 @@
+ 
+ int platform_class_cp_get_tdie(unsigned int role, int *tdie)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -734,6 +868,8 @@
+ 
+ int platform_class_cp_set_qb(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -746,6 +882,8 @@
+ 
+ int platform_class_cp_set_rcp(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -758,6 +896,8 @@
+ 
+ int platform_class_cp_set_pmid2outuvp_th(unsigned int role, int value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_cp_class_get_ic_ops(role);
+ 
+@@ -789,8 +929,8 @@
+ 					    1);
+ 	mca_log_err("cp dir list max count: %d, %d\n", count, cp->cp_num);
+ 
+-	if (count != cp->cp_num)
+-		mca_log_err("cp_num can't match cp_dir_list count\n");
++	if (count <= 0 || count > MCA_CP_MAX_NUM || count != cp->cp_num)
++		return -EINVAL;
+ 
+ 	for (i = 0; i < count; i++) {
+ 		ret = mca_parse_dts_string_index(node, "cp-dir-list", i,
+@@ -835,6 +975,7 @@
+ static ssize_t cp_sysfs_show(struct device *dev, struct device_attribute *attr,
+ 			     char *buf)
+ {
++	int ret;
+ 	struct mca_sysfs_attr_info *attr_info;
+ 	int *cp_index;
+ 	union platform_cp_propval val;
+@@ -854,49 +995,77 @@
+ 
+ 	switch (attr_info->sysfs_attr_name) {
+ 	case CP_PROP_CHIP_OK:
+-		platform_class_cp_get_present(*cp_index, &(val.boolval));
++		ret = platform_class_cp_get_present(*cp_index, &(val.boolval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.boolval);
+ 		break;
+ 	case CP_PROP_VBUS:
+-		platform_class_cp_enable_adc(*cp_index, true);
+-		platform_class_cp_get_bus_voltage(*cp_index, &(val.intval));
++		ret = platform_class_cp_enable_adc(*cp_index, true);
++		if (ret)
++			return ret;
++		ret = platform_class_cp_get_bus_voltage(*cp_index, &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+ 		break;
+ 	case CP_PROP_VUSB:
+-		platform_class_cp_enable_adc(*cp_index, true);
+-		platform_class_cp_get_usb_voltage(*cp_index, &(val.intval));
++		ret = platform_class_cp_enable_adc(*cp_index, true);
++		if (ret)
++			return ret;
++		ret = platform_class_cp_get_usb_voltage(*cp_index, &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+ 		break;
+ 	case CP_PROP_IBUS:
+-		platform_class_cp_enable_adc(*cp_index, true);
+-		platform_class_cp_get_bus_current(*cp_index, &(val.intval));
++		ret = platform_class_cp_enable_adc(*cp_index, true);
++		if (ret)
++			return ret;
++		ret = platform_class_cp_get_bus_current(*cp_index, &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+ 		break;
+ 	case CP_PROP_BATT_PRESENT:
+-		platform_class_cp_get_battery_present(*cp_index,
++		ret = platform_class_cp_get_battery_present(*cp_index,
+ 						      (bool *)&(val.uintval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.uintval);
+ 		break;
+ 	case CP_PROP_BATT_TEMP:
+-		platform_class_cp_get_battery_temperature(*cp_index,
++		ret = platform_class_cp_get_battery_temperature(*cp_index,
+ 							  &(val.uintval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.uintval);
+ 		break;
+ 	case CP_PROP_VPACK:
+-		platform_class_cp_enable_adc(*cp_index, true);
+-		platform_class_cp_get_battery_voltage(*cp_index, &(val.intval));
++		ret = platform_class_cp_enable_adc(*cp_index, true);
++		if (ret)
++			return ret;
++		ret = platform_class_cp_get_battery_voltage(*cp_index, &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+ 		break;
+ 	case CP_PROP_OVPGATE:
+-		platform_class_cp_get_ovpgate_status(*cp_index, &(val.boolval));
++		ret = platform_class_cp_get_ovpgate_status(*cp_index, &(val.boolval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.boolval);
+ 		break;
+ 	case CP_PROP_FSW:
+-		platform_class_cp_get_fsw(*cp_index, &(val.intval));
++		ret = platform_class_cp_get_fsw(*cp_index, &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+ 		break;
+ 	case CP_PROP_TDIE:
+-		platform_class_cp_get_tdie(*cp_index, &(val.intval));
++		ret = platform_class_cp_get_tdie(*cp_index, &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+ 		break;
+ 	default:
+@@ -908,6 +1077,7 @@
+ static ssize_t cp_sysfs_store(struct device *dev, struct device_attribute *attr,
+ 			      const char *buf, size_t count)
+ {
++	int ret;
+ 	struct mca_sysfs_attr_info *attr_info;
+ 	int *cp_index;
+ 	int val = 0;
+@@ -929,15 +1099,22 @@
+ 	case CP_PROP_OVPGATE:
+ 		if (kstrtoint(buf, 10, &val))
+ 			return -EINVAL;
+-		platform_class_cp_enable_ovpgate(*cp_index, val);
++		ret = platform_class_cp_enable_ovpgate(*cp_index, val);
++		if (ret)
++			return ret;
+ 		break;
+ 	case CP_PROP_FSW:
+ 		if (kstrtoint(buf, 10, &val))
+ 			return -EINVAL;
+-		if (g_platform_cp_dev && val >= 0) {
++		if (val < 0)
++			return -EINVAL;
++		mutex_lock(&cp_state_lock);
++		if (g_platform_cp_dev)
+ 			g_platform_cp_dev->force_fsw = -val;
+-			platform_class_cp_set_fsw(*cp_index, val);
+-		}
++		mutex_unlock(&cp_state_lock);
++		val = platform_class_cp_set_fsw(*cp_index, val);
++		if (val)
++			return val;
+ 		break;
+ 	default:
+ 		break;
+@@ -952,46 +1129,46 @@
+ 	[CP_ROLE_THIRD] = "third",
+ };
+ 
+-static void cp_sysfs_create_group(struct platform_cp_dev *cp)
+-{
+-	const char *cp_dev_name;
++static void cp_sysfs_remove_groups(struct platform_cp_dev *info)
++{
+ 	int i;
++
++	for (i = 0; i < MCA_CP_MAX_NUM; i++) {
++		if (!info->sysfs_dev[i])
++			continue;
++		mca_sysfs_remove_group("xm_power", info->sysfs_dev[i],
++				       &cp_sysfs_attr_group);
++		info->sysfs_dev[i] = NULL;
++	}
++}
++
++static int cp_sysfs_create_group(struct platform_cp_dev *info)
++{
++	int i, role, ret = -EINVAL;
+ 
+ 	mca_sysfs_init_attrs(cp_sysfs_attrs, cp_sysfs_field_tbl,
+ 			     CP_SYSFS_ATTRS_SIZE);
+-	for (i = 0; i < cp->cp_num; i++) {
+-		if (i > MCA_CP_MAX_NUM) {
+-			mca_log_err("cp sysfsdev out of limit\n");
+-			return;
++	if (info->cp_num <= 0 || info->cp_num > MCA_CP_MAX_NUM)
++		return -EINVAL;
++	for (i = 0; i < info->cp_num; i++) {
++		for (role = 0; role < MCA_CP_MAX_NUM; role++)
++			if (strstr(info->cp_dir_list[i], cp_dev_list[role]))
++				break;
++		if (role == MCA_CP_MAX_NUM)
++			goto error;
++		info->cp_dev_index[i] = role;
++		info->sysfs_dev[i] = mca_sysfs_create_group("xm_power",
++			info->cp_dir_list[i], &cp_sysfs_attr_group);
++		if (!info->sysfs_dev[i]) {
++			ret = -ENOMEM;
++			goto error;
+ 		}
+-		cp->sysfs_dev[i] = mca_sysfs_create_group(
+-			"xm_power", cp->cp_dir_list[i], &cp_sysfs_attr_group);
+-		if (!cp->sysfs_dev[i])
+-			mca_log_err("creat cp[%d] sysfs fail\n", i);
+-	}
+-
+-	for (i = 0; i < cp->cp_num; i++) {
+-		int j;
+-
+-		cp_dev_name = dev_name(cp->sysfs_dev[i]);
+-		for (j = 0; j < MCA_CP_MAX_NUM; j++) {
+-			if (strstr(cp_dev_name, cp_dev_list[j])) {
+-				cp->cp_dev_index[j] = j;
+-				dev_set_drvdata(cp->sysfs_dev[i],
+-						&cp->cp_dev_index[j]);
+-				mca_log_err(
+-					"success match cp_dev_name = %s, cp_dev_list[%d]=%s\n",
+-					cp_dev_name, j, cp_dev_list[j]);
+-				break;
+-			}
+-		}
+-
+-		if (j >= MCA_CP_MAX_NUM) {
+-			dev_set_drvdata(cp->sysfs_dev[j], NULL);
+-			mca_log_err("fail match cp_dev_name =%s\n",
+-				    cp_dev_name);
+-		}
+-	}
++		dev_set_drvdata(info->sysfs_dev[i], &info->cp_dev_index[i]);
++	}
++	return 0;
++error:
++	cp_sysfs_remove_groups(info);
++	return ret;
+ }
+ 
+ static ssize_t platform_cp_sysfs_show(struct device *dev,
+@@ -1082,18 +1259,41 @@
+ 		return rc;
+ 	}
+ 
++
++	rc = cp_sysfs_create_group(l_dev);
++	if (rc)
++		return rc;
++	rc = platform_cp_sysfs_create_group(l_dev->dev);
++	if (rc) {
++		cp_sysfs_remove_groups(l_dev);
++		return rc;
++	}
++	mutex_lock(&cp_state_lock);
++	if (g_platform_cp_dev) {
++		mutex_unlock(&cp_state_lock);
++		mca_sysfs_remove_link_group("charger", "chargerpump", l_dev->dev,
++					    &platform_cp_sysfs_attr_group);
++		cp_sysfs_remove_groups(l_dev);
++		return -EBUSY;
++	}
+ 	g_platform_cp_dev = l_dev;
+-
+-	cp_sysfs_create_group(l_dev);
+-	platform_cp_sysfs_create_group(l_dev->dev);
++	mutex_unlock(&cp_state_lock);
+ 	mca_log_err("%s success %d\n", __func__, ++probe_cnt);
+ 
+ 	return 0;
+ }
+ 
+-static int platform_cp_class_remove(struct platform_device *pdev)
+-{
+-	return 0;
++static void platform_cp_class_remove(struct platform_device *pdev)
++{
++	struct platform_cp_dev *info = platform_get_drvdata(pdev);
++
++	mca_sysfs_remove_link_group("charger", "chargerpump", info->dev,
++				    &platform_cp_sysfs_attr_group);
++	cp_sysfs_remove_groups(info);
++	mutex_lock(&cp_state_lock);
++	if (g_platform_cp_dev == info)
++		g_platform_cp_dev = NULL;
++	mutex_unlock(&cp_state_lock);
+ }
+ 
+ static void platform_cp_class_shutdown(struct platform_device *pdev)
+@@ -1104,6 +1304,8 @@
+ 	{ .compatible = "mca,platform_cp" },
+ 	{},
+ };
++
++MODULE_DEVICE_TABLE(of, match_table);
+ 
+ static struct platform_driver platform_cp_class_driver = {
+ 	.driver	= {
+--- a/drivers/power/supply/mca/mca_platform/mca_platform_loadsw_class.c
++++ b/drivers/power/supply/mca/mca_platform/mca_platform_loadsw_class.c
+@@ -20,6 +20,8 @@
+ #include <linux/string.h>
+ #include <linux/device.h>
+ #include <linux/module.h>
++#include <linux/srcu.h>
++#include <linux/slab.h>
+ #include <linux/platform_device.h>
+ #include <mca/platform/platform_loadsw_class.h>
+ #include <mca/common/mca_log.h>
+@@ -50,7 +52,6 @@
+ 	bool low_power;
+ };
+ 
+-static struct platform_loadsw_dev *g_platform_loadsw_dev;
+ 
+ union platform_loadsw_propval {
+ 	unsigned int uintval;
+@@ -65,33 +66,66 @@
+ 	LOADSW_PROP_LOW_POWER,
+ };
+ 
+-static struct platform_cp_class_ops_data g_platform_cp_data[LOADSW_ROLE_MAX];
+-
+-static inline struct platform_cp_class_ops_data *
+-platform_loadsw_class_get_ic_ops(unsigned int role)
+-{
+-	if (role >= LOADSW_ROLE_MAX || g_platform_cp_data[role].ops == NULL)
++static struct platform_cp_class_ops_data __rcu *g_platform_cp_data[LOADSW_ROLE_MAX];
++static DEFINE_MUTEX(mca_ops_lock);
++DEFINE_STATIC_SRCU(mca_ops_srcu);
++
++static struct platform_cp_class_ops_data *platform_loadsw_class_get_ic_ops(unsigned int role)
++{
++	if (role >= LOADSW_ROLE_MAX)
+ 		return NULL;
+-
+-	return &g_platform_cp_data[role];
++	return srcu_dereference(g_platform_cp_data[role], &mca_ops_srcu);
+ }
+ 
+ int platform_class_loadsw_register_ops(unsigned int role,
+-				       struct platform_class_loadsw_ops *ops,
+-				       void *data)
+-{
++				       struct platform_class_loadsw_ops *ops, void *data)
++{
++	struct platform_cp_class_ops_data *entry;
++
+ 	if (role >= LOADSW_ROLE_MAX || !data || !ops)
+-		return -EOPNOTSUPP;
+-
+-	g_platform_cp_data[role].data = data;
+-	g_platform_cp_data[role].ops = ops;
+-
++		return -EINVAL;
++	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++	entry->data = data;
++	entry->ops = ops;
++	mutex_lock(&mca_ops_lock);
++	if (rcu_access_pointer(g_platform_cp_data[role])) {
++		mutex_unlock(&mca_ops_lock);
++		kfree(entry);
++		return -EEXIST;
++	}
++	rcu_assign_pointer(g_platform_cp_data[role], entry);
++	mutex_unlock(&mca_ops_lock);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(platform_class_loadsw_register_ops);
+ 
++void platform_class_loadsw_unregister_ops(unsigned int role, void *data)
++{
++	struct platform_cp_class_ops_data *entry;
++
++	if (role >= LOADSW_ROLE_MAX)
++		return;
++	mutex_lock(&mca_ops_lock);
++	entry = rcu_dereference_protected(g_platform_cp_data[role],
++					  lockdep_is_held(&mca_ops_lock));
++	if (!entry || entry->data != data) {
++		mutex_unlock(&mca_ops_lock);
++		return;
++	}
++	rcu_assign_pointer(g_platform_cp_data[role], NULL);
++	mutex_unlock(&mca_ops_lock);
++	synchronize_srcu(&mca_ops_srcu);
++	kfree(entry);
++}
++EXPORT_SYMBOL(platform_class_loadsw_unregister_ops);
++
++
+ int platform_class_loadsw_get_present(unsigned int role, bool *present)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_loadsw_class_get_ic_ops(role);
+ 
+@@ -104,6 +138,8 @@
+ 
+ int platform_class_loadsw_get_ibat_limit(unsigned int role, int *ibat_limit)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_loadsw_class_get_ic_ops(role);
+ 
+@@ -117,6 +153,8 @@
+ 
+ int platform_class_loadsw_set_ibat_limit(unsigned int role, int val)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_loadsw_class_get_ic_ops(role);
+ 
+@@ -129,6 +167,8 @@
+ 
+ int platform_class_loadsw_set_lowpower_mode(unsigned int role, bool mode)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_loadsw_class_get_ic_ops(role);
+ 
+@@ -141,6 +181,8 @@
+ 
+ int platform_class_loadsw_get_lowpower_mode(unsigned int role, bool *mode)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_cp_class_ops_data *temp_data =
+ 		platform_loadsw_class_get_ic_ops(role);
+ 
+@@ -172,8 +214,8 @@
+ 	mca_log_info("loadsw dir list max count: %d, %d\n", count,
+ 		     loadsw->loadsw_num);
+ 
+-	if (count != loadsw->loadsw_num)
+-		mca_log_err("loadsw_num can't match loadsw_dir_list count\n");
++	if (count <= 0 || count > MCA_LOADSW_MAX_NUM || count != loadsw->loadsw_num)
++		return -EINVAL;
+ 
+ 	for (int i = 0; i < count; i++) {
+ 		ret = mca_parse_dts_string_index(node, "loadsw-dir-list", i,
+@@ -214,6 +256,7 @@
+ static ssize_t loadsw_sysfs_show(struct device *dev,
+ 				 struct device_attribute *attr, char *buf)
+ {
++	int ret;
+ 	struct mca_sysfs_attr_info *attr_info;
+ 	int *loadsw_index;
+ 	union platform_loadsw_propval val;
+@@ -234,18 +277,24 @@
+ 
+ 	switch (attr_info->sysfs_attr_name) {
+ 	case LOADSW_PROP_CHIP_OK:
+-		platform_class_loadsw_get_present(*loadsw_index,
++		ret = platform_class_loadsw_get_present(*loadsw_index,
+ 						  &(val.boolval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.boolval);
+ 		break;
+ 	case LOADSW_PROP_IBAT_LIMIT:
+-		platform_class_loadsw_get_ibat_limit(*loadsw_index,
++		ret = platform_class_loadsw_get_ibat_limit(*loadsw_index,
+ 						     &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.boolval);
+ 		break;
+ 	case LOADSW_PROP_LOW_POWER:
+-		platform_class_loadsw_get_lowpower_mode(*loadsw_index,
++		ret = platform_class_loadsw_get_lowpower_mode(*loadsw_index,
+ 							&(val.boolval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.boolval);
+ 		break;
+ 	default:
+@@ -258,6 +307,7 @@
+ 				  struct device_attribute *attr,
+ 				  const char *buf, size_t count)
+ {
++	int ret;
+ 	struct mca_sysfs_attr_info *attr_info;
+ 	int *loadsw_index;
+ 	int val = 0;
+@@ -280,14 +330,18 @@
+ 	case LOADSW_PROP_IBAT_LIMIT:
+ 		if (kstrtoint(buf, 10, &val))
+ 			return -EINVAL;
+-		platform_class_loadsw_set_ibat_limit(*loadsw_index, val);
++		ret = platform_class_loadsw_set_ibat_limit(*loadsw_index, val);
++		if (ret)
++			return ret;
+ 		mca_log_info("set ibat limit: %d\n", val);
+ 		break;
+ 	case LOADSW_PROP_LOW_POWER:
+ 		if (kstrtoint(buf, 10, &val))
+ 			return -EINVAL;
+-		platform_class_loadsw_set_lowpower_mode(*loadsw_index,
++		ret = platform_class_loadsw_set_lowpower_mode(*loadsw_index,
+ 							(bool)val);
++		if (ret)
++			return ret;
+ 		mca_log_info("set low power %d\n", val);
+ 		break;
+ 	default:
+@@ -302,46 +356,46 @@
+ 	[LOADSW_ROLE_SLAVE] = "slave",
+ };
+ 
+-static void loadsw_sysfs_create_group(struct platform_loadsw_dev *loadsw)
+-{
+-	const char *loadsw_dev_name;
++static void loadsw_sysfs_remove_groups(struct platform_loadsw_dev *info)
++{
++	int i;
++
++	for (i = 0; i < MCA_LOADSW_MAX_NUM; i++) {
++		if (!info->sysfs_dev[i])
++			continue;
++		mca_sysfs_remove_group("xm_power", info->sysfs_dev[i],
++				       &loadsw_sysfs_attr_group);
++		info->sysfs_dev[i] = NULL;
++	}
++}
++
++static int loadsw_sysfs_create_group(struct platform_loadsw_dev *info)
++{
++	int i, role, ret = -EINVAL;
+ 
+ 	mca_sysfs_init_attrs(loadsw_sysfs_attrs, loadsw_sysfs_field_tbl,
+ 			     LOADSW_SYSFS_ATTRS_SIZE);
+-	for (int i = 0; i < loadsw->loadsw_num; i++) {
+-		if (i > MCA_LOADSW_MAX_NUM) {
+-			mca_log_err("loadsw sysfsdev out of limit\n");
+-			return;
++	if (info->loadsw_num <= 0 || info->loadsw_num > MCA_LOADSW_MAX_NUM)
++		return -EINVAL;
++	for (i = 0; i < info->loadsw_num; i++) {
++		for (role = 0; role < MCA_LOADSW_MAX_NUM; role++)
++			if (strstr(info->loadsw_dir_list[i], loadsw_dev_list[role]))
++				break;
++		if (role == MCA_LOADSW_MAX_NUM)
++			goto error;
++		info->loadsw_dev_index[i] = role;
++		info->sysfs_dev[i] = mca_sysfs_create_group("xm_power",
++			info->loadsw_dir_list[i], &loadsw_sysfs_attr_group);
++		if (!info->sysfs_dev[i]) {
++			ret = -ENOMEM;
++			goto error;
+ 		}
+-		loadsw->sysfs_dev[i] = mca_sysfs_create_group(
+-			"xm_power", loadsw->loadsw_dir_list[i],
+-			&loadsw_sysfs_attr_group);
+-		if (!loadsw->sysfs_dev[i])
+-			mca_log_err("creat loadsw[%d] sysfs fail\n", i);
+-	}
+-
+-	for (int i = 0; i < loadsw->loadsw_num; i++) {
+-		int j;
+-
+-		loadsw_dev_name = dev_name(loadsw->sysfs_dev[i]);
+-		for (j = 0; j < MCA_LOADSW_MAX_NUM; j++) {
+-			if (strstr(loadsw_dev_name, loadsw_dev_list[j])) {
+-				loadsw->loadsw_dev_index[j] = j;
+-				dev_set_drvdata(loadsw->sysfs_dev[i],
+-						&loadsw->loadsw_dev_index[j]);
+-				mca_log_err(
+-					"success match loadsw_dev_name = %s, loadsw_dev_list[%d]=%s\n",
+-					loadsw_dev_name, j, loadsw_dev_list[j]);
+-				break;
+-			}
+-		}
+-
+-		if (j >= MCA_LOADSW_MAX_NUM) {
+-			dev_set_drvdata(loadsw->sysfs_dev[j], NULL);
+-			mca_log_err("fail match loadsw_dev_name =%s\n",
+-				    loadsw_dev_name);
+-		}
+-	}
++		dev_set_drvdata(info->sysfs_dev[i], &info->loadsw_dev_index[i]);
++	}
++	return 0;
++error:
++	loadsw_sysfs_remove_groups(info);
++	return ret;
+ }
+ 
+ static int platform_loadsw_class_probe(struct platform_device *pdev)
+@@ -363,18 +417,19 @@
+ 		return rc;
+ 	}
+ 
+-	g_platform_loadsw_dev = l_dev;
+-
+-	loadsw_sysfs_create_group(l_dev);
++
++	rc = loadsw_sysfs_create_group(l_dev);
++	if (rc)
++		return rc;
+ 
+ 	mca_log_err("%s success %d\n", __func__, ++probe_cnt);
+ 
+ 	return 0;
+ }
+ 
+-static int platform_loadsw_class_remove(struct platform_device *pdev)
+-{
+-	return 0;
++static void platform_loadsw_class_remove(struct platform_device *pdev)
++{
++	loadsw_sysfs_remove_groups(platform_get_drvdata(pdev));
+ }
+ 
+ static void platform_loadsw_class_shutdown(struct platform_device *pdev)
+@@ -385,6 +440,8 @@
+ 	{ .compatible = "mca,platform_loadsw" },
+ 	{},
+ };
++
++MODULE_DEVICE_TABLE(of, match_table);
+ 
+ static struct platform_driver platform_loadsw_class_driver = {
+ 	.driver	= {
+--- a/drivers/power/supply/mca/mca_platform/mca_platform_wireless_class.c
++++ b/drivers/power/supply/mca/mca_platform/mca_platform_wireless_class.c
+@@ -20,6 +20,8 @@
+ #include <linux/string.h>
+ #include <linux/device.h>
+ #include <linux/module.h>
++#include <linux/srcu.h>
++#include <linux/slab.h>
+ #include <linux/platform_device.h>
+ #include <mca/platform/platform_wireless_class.h>
+ #include <mca/common/mca_log.h>
+@@ -40,8 +42,9 @@
+ 	void *data;
+ };
+ 
+-static struct platform_wireless_class_ops_data
+-	platform_wireless_data[WIRELESS_ROLE_MAX];
++static struct platform_wireless_class_ops_data __rcu *platform_wireless_data[WIRELESS_ROLE_MAX];
++static DEFINE_MUTEX(mca_ops_lock);
++DEFINE_STATIC_SRCU(mca_ops_srcu);
+ 
+ struct platform_wireless_dev {
+ 	struct device *dev;
+@@ -51,7 +54,6 @@
+ 	int wireless_dev_index[MCA_WIRELESS_MAX_NUM];
+ };
+ 
+-static struct platform_wireless_dev *g_platform_wireless_dev;
+ 
+ union platform_wireless_propval {
+ 	unsigned int uintval;
+@@ -81,31 +83,63 @@
+ 	RX_SYSFS_TX_UUID,
+ };
+ 
+-static inline struct platform_wireless_class_ops_data *
++static struct platform_wireless_class_ops_data *
+ platform_wireless_class_get_ic_ops(unsigned int role)
+ {
+-	if (role >= WIRELESS_ROLE_MAX ||
+-	    platform_wireless_data[role].ops == NULL)
++	if (role >= WIRELESS_ROLE_MAX)
+ 		return NULL;
+-
+-	return &platform_wireless_data[role];
+-}
+-
+-int platform_class_wireless_register_ops(
+-	unsigned int role, void *data, struct platform_class_wireless_ops *ops)
+-{
++	return srcu_dereference(platform_wireless_data[role], &mca_ops_srcu);
++}
++
++int platform_class_wireless_register_ops(unsigned int role, void *data,
++				     struct platform_class_wireless_ops *ops)
++{
++	struct platform_wireless_class_ops_data *entry;
++
+ 	if (role >= WIRELESS_ROLE_MAX || !data || !ops)
+-		return -EOPNOTSUPP;
+-
+-	platform_wireless_data[role].data = data;
+-	platform_wireless_data[role].ops = ops;
+-
++		return -EINVAL;
++	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++	entry->data = data;
++	entry->ops = ops;
++	mutex_lock(&mca_ops_lock);
++	if (rcu_access_pointer(platform_wireless_data[role])) {
++		mutex_unlock(&mca_ops_lock);
++		kfree(entry);
++		return -EEXIST;
++	}
++	rcu_assign_pointer(platform_wireless_data[role], entry);
++	mutex_unlock(&mca_ops_lock);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(platform_class_wireless_register_ops);
+ 
++void platform_class_wireless_unregister_ops(unsigned int role, void *data)
++{
++	struct platform_wireless_class_ops_data *entry;
++
++	if (role >= WIRELESS_ROLE_MAX)
++		return;
++	mutex_lock(&mca_ops_lock);
++	entry = rcu_dereference_protected(platform_wireless_data[role],
++					  lockdep_is_held(&mca_ops_lock));
++	if (!entry || entry->data != data) {
++		mutex_unlock(&mca_ops_lock);
++		return;
++	}
++	rcu_assign_pointer(platform_wireless_data[role], NULL);
++	mutex_unlock(&mca_ops_lock);
++	synchronize_srcu(&mca_ops_srcu);
++	kfree(entry);
++}
++EXPORT_SYMBOL(platform_class_wireless_unregister_ops);
++
++
+ int platform_class_wireless_enable_reverse_chg(unsigned int role, bool enable)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -118,6 +152,8 @@
+ 
+ int platform_class_wireless_is_present(unsigned int role, int *present)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -131,6 +167,8 @@
+ int platform_class_wireless_get_fw_upgrade_fail_info(unsigned int role,
+ 						     char **info)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -145,6 +183,8 @@
+ 
+ int platform_class_wireless_get_rsv_eppmode_fail(unsigned int role, int *fail)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -157,6 +197,8 @@
+ 
+ int platform_class_wireless_set_vout(unsigned int role, int vout)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -169,6 +211,8 @@
+ 
+ int platform_class_wireless_get_vout(unsigned int role, int *vout)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -181,6 +225,8 @@
+ 
+ int platform_class_wireless_get_iout(unsigned int role, int *iout)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -193,6 +239,8 @@
+ 
+ int platform_class_wireless_get_vrect(unsigned int role, int *vrect)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -205,6 +253,8 @@
+ 
+ int platform_class_wireless_get_tx_adapter(unsigned int role, int *adapter)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -215,9 +265,11 @@
+ }
+ EXPORT_SYMBOL(platform_class_wireless_get_tx_adapter);
+ 
+-extern int platform_class_wireless_get_tx_adapter_by_i2c(unsigned int role,
++int platform_class_wireless_get_tx_adapter_by_i2c(unsigned int role,
+ 							 int *adapter)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -231,6 +283,8 @@
+ 
+ int platform_class_wireless_get_temp(unsigned int role, int *temp)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -243,6 +297,8 @@
+ 
+ int platform_class_wireless_set_enable_mode(unsigned int role, bool enable)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -255,6 +311,8 @@
+ 
+ int platform_class_wireless_is_car_adapter(unsigned int role, bool *enable)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -267,6 +325,8 @@
+ 
+ int platform_class_wireless_get_fw_version(unsigned int role, char *buf)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -279,6 +339,8 @@
+ 
+ int platform_class_wireless_get_rx_rtx_mode(unsigned int role, int *mode)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -292,6 +354,8 @@
+ int platform_class_wireless_set_fw_bin(unsigned int role, const char *buf,
+ 				       int count)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -305,6 +369,8 @@
+ int platform_class_wireless_set_input_current_limit(unsigned int role,
+ 						    int value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -319,6 +385,8 @@
+ 
+ int platform_class_wireless_get_rx_int_flag(unsigned int role, int *int_flag)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -331,6 +399,8 @@
+ 
+ int platform_class_wireless_get_rx_power_mode(unsigned int role, u8 *power_mode)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -344,6 +414,8 @@
+ 
+ int platform_class_wireless_get_tx_max_power(unsigned int role, u8 *max_power)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -356,6 +428,8 @@
+ 
+ int platform_class_wireless_get_auth_value(unsigned int role, int *value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -368,6 +442,8 @@
+ 
+ int platform_class_wireless_set_adapter_voltage(unsigned int role, int voltage)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -381,6 +457,8 @@
+ 
+ int platform_class_wireless_get_tx_uuid(unsigned int role, u8 *uuid)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -393,6 +471,8 @@
+ 
+ int platform_class_wireless_set_fod_params(unsigned int role, int value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -406,6 +486,8 @@
+ int platform_class_wireless_get_rx_fastcharge_status(unsigned int role,
+ 						     u8 *fc_flag)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -422,6 +504,8 @@
+ 						     u8 *rcv_value,
+ 						     int buff_len, int *rcv_len)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -437,6 +521,8 @@
+ int platform_class_wireless_send_transparent_data(unsigned int role,
+ 						  u8 *send_data, u8 length)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -450,6 +536,8 @@
+ 
+ int platform_class_wireless_get_ss_voltage(unsigned int role, int *ss_voltage)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -462,6 +550,8 @@
+ 
+ int platform_class_wireless_do_renego(unsigned int role, u8 max_power)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -475,6 +565,8 @@
+ int platform_class_wireless_set_parallel_charge(unsigned int role,
+ 						bool parallel)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -488,6 +580,8 @@
+ 
+ int platform_class_wireless_get_vout_setted(unsigned int role, int *vout_setted)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -502,6 +596,8 @@
+ int platform_class_wireless_get_poweroff_err_code(unsigned int role,
+ 						  u8 *err_code)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -515,6 +611,8 @@
+ 
+ int platform_class_wireless_get_rx_err_code(unsigned int role, u8 *err_code)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -527,6 +625,8 @@
+ 
+ int platform_class_wireless_get_tx_err_code(unsigned int role, u8 *err_code)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -540,6 +640,8 @@
+ int platform_class_wireless_get_project_vendor(unsigned int role,
+ 					       int *project_vendor)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -553,6 +655,8 @@
+ 
+ int platform_class_wireless_check_i2c_is_ok(unsigned int role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -565,6 +669,8 @@
+ 
+ int platform_class_wireless_enable_rev_fod(unsigned int role, bool enable)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -577,6 +683,8 @@
+ 
+ int platform_class_wireless_send_tx_q_value(unsigned int role, u8 value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -589,6 +697,8 @@
+ 
+ int platform_class_wireless_set_tx_fan_speed(unsigned int role, int value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -601,6 +711,8 @@
+ 
+ int platform_class_wireless_get_tx_fan_speed(unsigned int role, int *value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -613,6 +725,8 @@
+ 
+ int platform_class_wireless_set_rx_offset(unsigned int role, int rx_offset)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -625,6 +739,8 @@
+ 
+ int platform_class_wireless_get_rx_offset(unsigned int role, int *rx_offset)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -638,6 +754,8 @@
+ int platform_class_wireless_set_rx_sleep_mode(unsigned int role,
+ 					      int sleep_for_dam)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -651,6 +769,8 @@
+ 
+ int platform_class_wireless_download_fw_from_bin(unsigned int role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -663,6 +783,8 @@
+ 
+ int platform_class_wireless_erase_fw(unsigned int role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -676,6 +798,8 @@
+ int platform_class_wireless_get_fw_version_check(unsigned int role,
+ 						 u8 *check_result)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -689,6 +813,8 @@
+ 
+ int platform_class_wireless_download_fw(unsigned int role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -701,6 +827,8 @@
+ 
+ int platform_class_wireless_set_confirm_data(unsigned int role, u8 confirm_data)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -715,6 +843,8 @@
+ int platform_class_wireless_receive_test_cmd(unsigned int role, u8 *rev_data,
+ 					     int *length)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -728,6 +858,8 @@
+ 
+ int platform_class_wireless_process_factory_cmd(unsigned int role, u8 cmd)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -741,6 +873,8 @@
+ int platform_class_wireless_get_hall_gpio_status(unsigned int role,
+ 						 bool *status)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -755,6 +889,8 @@
+ int platform_class_wireless_get_magnetic_case_flag(unsigned int role,
+ 						   bool *status)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -770,6 +906,8 @@
+ int platform_class_wireless_check_firmware_state(unsigned int role,
+ 						 bool *update)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -784,6 +922,8 @@
+ int platform_class_wireless_set_debug_fod(unsigned int role, int *args,
+ 					  int count)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -797,6 +937,8 @@
+ int platform_class_wireless_get_debug_fod_type(unsigned int role,
+ 					       WLS_DEBUG_SET_FOD_TYPE *type)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -809,6 +951,8 @@
+ 
+ int platform_class_wireless_set_debug_fod_params(unsigned int role)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -821,6 +965,8 @@
+ 
+ int platform_class_wireless_enable_vsys_ctrl(unsigned int role, bool enable)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -833,6 +979,8 @@
+ 
+ int platform_class_wireless_get_trx_isense(unsigned int role, int *isense)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -845,6 +993,8 @@
+ 
+ int platform_class_wireless_get_trx_vrect(unsigned int role, int *vrect)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -857,6 +1007,8 @@
+ 
+ int platform_class_wireless_get_phone_case_category(unsigned int role, int *category)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data = platform_wireless_class_get_ic_ops(role);
+ 
+ 	if (platform_wireless_ops_invalid(temp_data, wls_get_phone_case_category))
+@@ -868,6 +1020,8 @@
+ 
+ int platform_class_wireless_set_phone_case_category(unsigned int role, int category)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data = platform_wireless_class_get_ic_ops(role);
+ 
+ 	if (platform_wireless_ops_invalid(temp_data, wls_set_phone_case_category))
+@@ -879,6 +1033,8 @@
+ 
+ int platform_class_wireless_switch_bridge(unsigned int role, bool full)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -891,6 +1047,8 @@
+ 
+ int platform_class_wireless_get_pen_hall3(unsigned int role, int *val)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -903,6 +1061,8 @@
+ 
+ int platform_class_wireless_get_pen_hall3_s(unsigned int role, int *val)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -915,6 +1075,8 @@
+ 
+ int platform_class_wireless_get_pen_hall4(unsigned int role, int *val)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -927,6 +1089,8 @@
+ 
+ int platform_class_wireless_get_pen_hall4_s(unsigned int role, int *val)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -939,6 +1103,8 @@
+ 
+ int platform_class_wireless_get_pen_hall_ppe_n(unsigned int role, int *val)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -951,6 +1117,8 @@
+ 
+ int platform_class_wireless_get_pen_hall_ppe_s(unsigned int role, int *val)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -963,6 +1131,8 @@
+ 
+ int platform_class_wireless_get_pen_full_flag(unsigned int role, bool *flag)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -975,6 +1145,8 @@
+ 
+ int platform_class_wireless_get_pen_place_err(unsigned int role, int *err)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -987,6 +1159,8 @@
+ 
+ int platform_class_wireless_set_pen_place_err(unsigned int role, int err)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -999,6 +1173,8 @@
+ 
+ int platform_class_wireless_get_pen_mac(unsigned int role, u8 *mac)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -1011,6 +1187,8 @@
+ 
+ int platform_class_wireless_get_pen_soc(unsigned int role, int *soc)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -1023,6 +1201,8 @@
+ 
+ int platform_class_wireless_get_reverse_chg_en(unsigned int role, bool *en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -1035,6 +1215,8 @@
+ 
+ int platform_class_wireless_set_hboost_enable(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -1047,6 +1229,8 @@
+ 
+ int platform_class_wireless_set_charge_type(unsigned int role, int type)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -1059,6 +1243,8 @@
+ 
+ int platform_class_wireless_set_external_boost_enable(unsigned int role, bool en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -1071,6 +1257,8 @@
+ 
+ int platform_class_wireless_get_tx_iout(unsigned int role, int *iout)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -1083,6 +1271,8 @@
+ 
+ int platform_class_wireless_get_tx_vout(unsigned int role, int *vout)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -1095,6 +1285,8 @@
+ 
+ int platform_class_wireless_get_rx_brg_status(unsigned int role, int *status)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_wireless_class_ops_data *temp_data =
+ 		platform_wireless_class_get_ic_ops(role);
+ 
+@@ -1129,9 +1321,8 @@
+ 	mca_log_err("wireless dir list max count: %d, %d\n", count,
+ 		    wireless->wireless_num);
+ 
+-	if (count != wireless->wireless_num)
+-		mca_log_err(
+-			"wireless_num can't match wireless_dir_list count\n");
++	if (count <= 0 || count > MCA_WIRELESS_MAX_NUM || count != wireless->wireless_num)
++		return -EINVAL;
+ 
+ 	for (i = 0; i < count; i++) {
+ 		ret = mca_parse_dts_string_index(
+@@ -1192,6 +1383,7 @@
+ static ssize_t wireless_sysfs_show(struct device *dev,
+ 				   struct device_attribute *attr, char *buf)
+ {
++	int ret;
+ 	struct mca_sysfs_attr_info *attr_info;
+ 	int *wireless_index;
+ 	union platform_wireless_propval val;
+@@ -1213,28 +1405,38 @@
+ 
+ 	switch (attr_info->sysfs_attr_name) {
+ 	case RX_SYSFS_RX_VOUT:
+-		platform_class_wireless_get_vout(*wireless_index,
++		ret = platform_class_wireless_get_vout(*wireless_index,
+ 						 &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+ 		break;
+ 	case RX_SYSFS_RX_VRECT:
+-		platform_class_wireless_get_vrect(*wireless_index,
++		ret = platform_class_wireless_get_vrect(*wireless_index,
+ 						  &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+ 		break;
+ 	case RX_SYSFS_RX_IOUT:
+-		platform_class_wireless_get_iout(*wireless_index,
++		ret = platform_class_wireless_get_iout(*wireless_index,
+ 						 &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+ 		break;
+ 	case RX_SYSFS_FW_VERSION:
+-		platform_class_wireless_get_fw_version(*wireless_index,
++		ret = platform_class_wireless_get_fw_version(*wireless_index,
+ 						       val.strval);
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%s\n", val.strval);
+ 		break;
+ 	case RX_SYSFS_TX_ADAPTER:
+-		platform_class_wireless_get_tx_adapter(*wireless_index,
++		ret = platform_class_wireless_get_tx_adapter(*wireless_index,
+ 						       &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+ 		break;
+ 	case RX_SYSFS_BT_STATE:
+@@ -1246,27 +1448,37 @@
+ 	case RX_SYSFS_TX_MAC:
+ 		break;
+ 	case RX_SYSFS_WLS_DIE_TEMP:
+-		platform_class_wireless_get_temp(*wireless_index,
++		ret = platform_class_wireless_get_temp(*wireless_index,
+ 						 &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+ 		break;
+ 	case RX_SYSFS_WLS_TX_SPEED:
+-		platform_class_wireless_get_tx_fan_speed(*wireless_index,
++		ret = platform_class_wireless_get_tx_fan_speed(*wireless_index,
+ 							 &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+ 		break;
+ 	case RX_SYSFS_RX_SS:
+-		platform_class_wireless_get_ss_voltage(*wireless_index,
++		ret = platform_class_wireless_get_ss_voltage(*wireless_index,
+ 						       &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+ 		break;
+ 	case RX_SYSFS_RX_OFFSET:
+-		platform_class_wireless_get_rx_offset(*wireless_index,
++		ret = platform_class_wireless_get_rx_offset(*wireless_index,
+ 						      &(val.intval));
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+ 		break;
+ 	case RX_SYSFS_TX_UUID:
+-		platform_class_wireless_get_tx_uuid(*wireless_index, uuid);
++		ret = platform_class_wireless_get_tx_uuid(*wireless_index, uuid);
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%02x.%02x.%02x.%02x\n",
+ 				  uuid[0], uuid[1], uuid[2], uuid[3]);
+ 		break;
+@@ -1281,6 +1493,7 @@
+ 				    struct device_attribute *attr,
+ 				    const char *buf, size_t count)
+ {
++	int ret;
+ 	struct mca_sysfs_attr_info *attr_info;
+ 	int *wireless_index;
+ 	union platform_wireless_propval val;
+@@ -1302,32 +1515,42 @@
+ 	case RX_SYSFS_FW_VERSION:
+ 		break;
+ 	case RX_SYSFS_FW_BIN:
+-		platform_class_wireless_set_fw_bin(*wireless_index, buf,
++		ret = platform_class_wireless_set_fw_bin(*wireless_index, buf,
+ 						   (int)count);
++		if (ret)
++			return ret;
+ 		break;
+ 	case RX_SYSFS_SLEEP_RX:
+ 		if (kstrtoint(buf, 10, &val.intval))
+ 			return -EINVAL;
+-		platform_class_wireless_set_enable_mode(*wireless_index,
++		ret = platform_class_wireless_set_enable_mode(*wireless_index,
+ 							val.intval);
++		if (ret)
++			return ret;
+ 		break;
+ 	case RX_SYSFS_WLS_TX_SPEED:
+ 		if (kstrtoint(buf, 10, &val.intval))
+ 			return -EINVAL;
+-		platform_class_wireless_set_tx_fan_speed(*wireless_index,
++		ret = platform_class_wireless_set_tx_fan_speed(*wireless_index,
+ 							 val.intval);
++		if (ret)
++			return ret;
+ 		break;
+ 	case RX_SYSFS_RX_OFFSET:
+ 		if (kstrtoint(buf, 10, &val.intval))
+ 			return -EINVAL;
+-		platform_class_wireless_set_rx_offset(*wireless_index,
++		ret = platform_class_wireless_set_rx_offset(*wireless_index,
+ 						      val.intval);
++		if (ret)
++			return ret;
+ 		break;
+ 	case RX_SYSFS_RX_SLEEP_MODE:
+ 		if (kstrtoint(buf, 10, &val.intval))
+ 			return -EINVAL;
+-		platform_class_wireless_set_rx_sleep_mode(*wireless_index,
++		ret = platform_class_wireless_set_rx_sleep_mode(*wireless_index,
+ 							  val.intval);
++		if (ret)
++			return ret;
+ 		break;
+ 	default:
+ 		break;
+@@ -1341,49 +1564,46 @@
+ 	[WIRELESS_ROLE_SLAVE] = "slave",
+ };
+ 
+-static void wireless_sysfs_create_group(struct platform_wireless_dev *wireless)
+-{
+-	const char *wireless_dev_name;
++static void wireless_sysfs_remove_groups(struct platform_wireless_dev *info)
++{
+ 	int i;
++
++	for (i = 0; i < MCA_WIRELESS_MAX_NUM; i++) {
++		if (!info->sysfs_dev[i])
++			continue;
++		mca_sysfs_remove_group("xm_power", info->sysfs_dev[i],
++				       &wireless_sysfs_attr_group);
++		info->sysfs_dev[i] = NULL;
++	}
++}
++
++static int wireless_sysfs_create_group(struct platform_wireless_dev *info)
++{
++	int i, role, ret = -EINVAL;
+ 
+ 	mca_sysfs_init_attrs(wireless_sysfs_attrs, wireless_sysfs_field_tbl,
+ 			     WIRELESS_SYSFS_ATTRS_SIZE);
+-	for (i = 0; i < wireless->wireless_num; i++) {
+-		if (i > MCA_WIRELESS_MAX_NUM) {
+-			mca_log_err("wireless sysfsdev out of limit\n");
+-			return;
++	if (info->wireless_num <= 0 || info->wireless_num > MCA_WIRELESS_MAX_NUM)
++		return -EINVAL;
++	for (i = 0; i < info->wireless_num; i++) {
++		for (role = 0; role < MCA_WIRELESS_MAX_NUM; role++)
++			if (strstr(info->wireless_dir_list[i], wireless_dev_list[role]))
++				break;
++		if (role == MCA_WIRELESS_MAX_NUM)
++			goto error;
++		info->wireless_dev_index[i] = role;
++		info->sysfs_dev[i] = mca_sysfs_create_group("xm_power",
++			info->wireless_dir_list[i], &wireless_sysfs_attr_group);
++		if (!info->sysfs_dev[i]) {
++			ret = -ENOMEM;
++			goto error;
+ 		}
+-		wireless->sysfs_dev[i] = mca_sysfs_create_group(
+-			"xm_power", wireless->wireless_dir_list[i],
+-			&wireless_sysfs_attr_group);
+-		if (!wireless->sysfs_dev[i])
+-			mca_log_err("creat wireless[%d] sysfs fail\n", i);
++		dev_set_drvdata(info->sysfs_dev[i], &info->wireless_dev_index[i]);
+ 	}
+-
+-	for (i = 0; i < wireless->wireless_num; i++) {
+-		int j;
+-
+-		wireless_dev_name = dev_name(wireless->sysfs_dev[i]);
+-		for (j = 0; j < MCA_WIRELESS_MAX_NUM; j++) {
+-			if (strstr(wireless_dev_name, wireless_dev_list[j])) {
+-				wireless->wireless_dev_index[j] = j;
+-				dev_set_drvdata(
+-					wireless->sysfs_dev[i],
+-					&wireless->wireless_dev_index[j]);
+-				mca_log_err(
+-					"success match wireless_dev_name = %s, wireless_dev_list[%d]=%s\n",
+-					wireless_dev_name, j,
+-					wireless_dev_list[j]);
+-				break;
+-			}
+-		}
+-
+-		if (j >= MCA_WIRELESS_MAX_NUM) {
+-			dev_set_drvdata(wireless->sysfs_dev[j], NULL);
+-			mca_log_err("fail match wireless_dev_name =%s\n",
+-				    wireless_dev_name);
+-		}
+-	}
++	return 0;
++error:
++	wireless_sysfs_remove_groups(info);
++	return ret;
+ }
+ 
+ static int platform_wireless_class_probe(struct platform_device *pdev)
+@@ -1405,18 +1625,19 @@
+ 		return rc;
+ 	}
+ 
+-	g_platform_wireless_dev = l_dev;
+-
+-	wireless_sysfs_create_group(l_dev);
++
++	rc = wireless_sysfs_create_group(l_dev);
++	if (rc)
++		return rc;
+ 
+ 	mca_log_err("success %d\n", ++probe_cnt);
+ 
+ 	return 0;
+ }
+ 
+-static int platform_wireless_class_remove(struct platform_device *pdev)
+-{
+-	return 0;
++static void platform_wireless_class_remove(struct platform_device *pdev)
++{
++	wireless_sysfs_remove_groups(platform_get_drvdata(pdev));
+ }
+ 
+ static void platform_wireless_class_shutdown(struct platform_device *pdev)
+@@ -1427,6 +1648,8 @@
+ 	{ .compatible = "mca,platform_wireless" },
+ 	{},
+ };
++
++MODULE_DEVICE_TABLE(of, match_table);
+ 
+ static struct platform_driver platform_wireless_class_driver = {
+ 	.driver	= {
+--- a/drivers/power/supply/mca/mca_strategy/mca_strategy_class.c
++++ b/drivers/power/supply/mca/mca_strategy/mca_strategy_class.c
+@@ -17,6 +17,7 @@
+  *
+  */
+ #include <linux/module.h>
++#include <linux/srcu.h>
+ #include <linux/stat.h>
+ #include <linux/init.h>
+ #include <linux/ctype.h>
+@@ -34,18 +35,22 @@
+ 	void *data;
+ };
+ 
+-static struct mca_strategy_func_data g_mca_stg_func[STRATEGY_FUNC_TYPE_MAX];
++static struct mca_strategy_func_data __rcu *g_mca_stg_func[STRATEGY_FUNC_TYPE_MAX];
++static DEFINE_MUTEX(mca_ops_lock);
++DEFINE_STATIC_SRCU(mca_ops_srcu);
+ 
+ static struct mca_strategy_func_data *mca_strategy_get_func_data(unsigned int type)
+ {
+ 	if (type >= STRATEGY_FUNC_TYPE_MAX)
+ 		return NULL;
+ 
+-	return &g_mca_stg_func[type];
++	return srcu_dereference(g_mca_stg_func[type], &mca_ops_srcu);
+ }
+ 
+ int mca_strategy_func_get_status(int type, int status, void *value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct mca_strategy_func_data *temp_data = mca_strategy_get_func_data(type);
+ 
+ 	if (!temp_data || !temp_data->get_func)
+@@ -57,6 +62,8 @@
+ 
+ int mca_strategy_func_process(unsigned int type, int event, int value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct mca_strategy_func_data *temp_data = mca_strategy_get_func_data(type);
+ 
+ 	if (!temp_data || !temp_data->func)
+@@ -68,6 +75,8 @@
+ 
+ int mca_strategy_func_set_config(int type, int conifg, int value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct mca_strategy_func_data *temp_data = mca_strategy_get_func_data(type);
+ 
+ 	if (!temp_data || !temp_data->set_config)
+@@ -80,16 +89,47 @@
+ int mca_strategy_ops_register(unsigned int type, mca_strategy_func func,
+ 	mca_strategy_get_status get_func, mca_strategy_set_config set_config, void *data)
+ {
+-	if (type >= STRATEGY_FUNC_TYPE_MAX)
+-		return -1;
++	struct mca_strategy_func_data *entry;
+ 
+-	g_mca_stg_func[type].func = func;
+-	g_mca_stg_func[type].get_func = get_func;
+-	g_mca_stg_func[type].set_config = set_config;
+-	g_mca_stg_func[type].data = data;
++	if (type >= STRATEGY_FUNC_TYPE_MAX || !data || (!func && !get_func && !set_config))
++		return -EINVAL;
++	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++	*entry = (struct mca_strategy_func_data) {
++		.func = func, .get_func = get_func, .set_config = set_config, .data = data,
++	};
++	mutex_lock(&mca_ops_lock);
++	if (rcu_access_pointer(g_mca_stg_func[type])) {
++		mutex_unlock(&mca_ops_lock);
++		kfree(entry);
++		return -EEXIST;
++	}
++	rcu_assign_pointer(g_mca_stg_func[type], entry);
++	mutex_unlock(&mca_ops_lock);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(mca_strategy_ops_register);
++
++void mca_strategy_ops_unregister(unsigned int type, void *data)
++{
++	struct mca_strategy_func_data *entry;
++
++	if (type >= STRATEGY_FUNC_TYPE_MAX)
++		return;
++	mutex_lock(&mca_ops_lock);
++	entry = rcu_dereference_protected(g_mca_stg_func[type], lockdep_is_held(&mca_ops_lock));
++	if (!entry || entry->data != data) {
++		mutex_unlock(&mca_ops_lock);
++		return;
++	}
++	rcu_assign_pointer(g_mca_stg_func[type], NULL);
++	mutex_unlock(&mca_ops_lock);
++	synchronize_srcu(&mca_ops_srcu);
++	kfree(entry);
++}
++EXPORT_SYMBOL(mca_strategy_ops_unregister);
++
+ 
+ static struct platform_driver mca_strategy_class_driver = {
+ 	.driver	= {
+--- a/drivers/power/supply/mca/mca_hardware_ic/charge_pump_ic/sc8581/sc8581.c
++++ b/drivers/power/supply/mca/mca_hardware_ic/charge_pump_ic/sc8581/sc8581.c
+@@ -22,7 +22,6 @@
+ #include "inc/sc8581.h"
+ #include <mca/common/mca_log.h>
+ #include <mca/common/mca_event.h>
+-#include <linux/version.h>
+ #include <mca/common/mca_parse_dts.h>
+ #include <mca/common/mca_sysfs.h>
+ #include <linux/pm_wakeup.h>
+@@ -41,6 +40,7 @@
+ #define EN_BUCK_PROJECT_HWID 0x10004
+ #define SC8581_EN_BUCK_CP_I2C_ADDR 0x6f
+ static int cp_get_adc_data(struct sc8581_device *bq, int channel, u32 *result);
++static void sc8581_cleanup(void *data);
+ /********i2c basic read/write interface***********/
+ static int cp_read_word(struct i2c_client *client, u8 reg, u16 *val)
+ {
+@@ -157,13 +157,18 @@
+ 
+ static int cp_update_bits(struct i2c_client *client, u8 reg, u8 mask, u8 val)
+ {
++	struct sc8581_device *bq = i2c_get_clientdata(client);
+ 	u8 tmp;
+-
+-	cp_read_byte(client, reg, &tmp);
+-	tmp &= ~mask;
+-	tmp |= val & mask;
+-	cp_write_byte(client, reg, tmp);
+-	return 0;
++	int ret;
++
++	mutex_lock(&bq->reg_lock);
++	ret = cp_read_byte(client, reg, &tmp);
++	if (!ret) {
++		tmp = (tmp & ~mask) | (val & mask);
++		ret = cp_write_byte(client, reg, tmp);
++	}
++	mutex_unlock(&bq->reg_lock);
++	return ret;
+ }
+ /***********************end **********************/
+ 
+@@ -211,6 +216,8 @@
+ 		for (i = 0; i < reg_info.count; i++) {
+ 			ret = cp_read_byte(dev_data->client,
+ 					   (reg_info.address + i), &val);
++			if (ret)
++				return ret;
+ 			count += scnprintf(read_buf, MAX_LENGTH_BYTE,
+ 					   "%02x: %02x\n", reg_info.address + i,
+ 					   val);
+@@ -243,18 +250,22 @@
+ 
+ 	switch (attr_info->debugfs_attr_name) {
+ 	case CP_DEBUG_PROP_ADDRESS:
++		if (val < 0 || val > 0xff)
++			return -EINVAL;
+ 		reg_info.address = val;
+ 		break;
+ 	case CP_DEBUG_PROP_COUNT:
+ 		if (val > MAX_REG_COUNT)
+ 			reg_info.count = MAX_REG_COUNT;
+-		else if (reg_info.count < 1)
++		else if (val < 1)
+ 			reg_info.count = 1;
+ 		else
+ 			reg_info.count = val;
+ 		break;
+ 	case CP_DEBUG_PROP_DATA:
+ 		ret = cp_write_byte(dev_data->client, reg_info.address, val);
++		if (ret)
++			return ret;
+ 		break;
+ 	default:
+ 		break;
+@@ -931,6 +942,8 @@
+ 	bq->operation_mode = val;
+ 
+ 	ret = sc8581_init_protection(bq, bq->work_mode);
++	if (ret)
++		return ret;
+ 	mca_log_info("%s set operation mode %d reg %d work_mode %d\n",
+ 		     bq->log_tag, operation_mode, val, bq->work_mode);
+ 	val <<= SC8581_MODE_SHIFT;
+@@ -1615,46 +1628,109 @@
+ 
+ static int sc8581_init_protection(struct sc8581_device *cp, int work_mode)
+ {
+-	int ret = 0;
++	int ret;
++
++	if (work_mode < 0 || work_mode >= CP_MODE_DIV_MAX)
++		return -EINVAL;
+ 
+ 	ret = sc8581_enable_batovp(cp, true);
++	if (ret)
++		return ret;
+ 	ret = sc8581_enable_batocp(cp, false);
++	if (ret)
++		return ret;
+ 	ret = sc8581_enable_busocp(cp, true);
++	if (ret)
++		return ret;
+ 	ret = sc8581_enable_busucp(cp, true);
++	if (ret)
++		return ret;
+ 	ret = sc8581_enable_pmid2outovp(cp, true);
++	if (ret)
++		return ret;
+ 	ret = sc8581_enable_pmid2outuvp(cp, true);
++	if (ret)
++		return ret;
+ 	ret = sc8581_enable_batovp_alarm(cp, true);
++	if (ret)
++		return ret;
+ 	ret = sc8581_enable_busocp_alarm(cp, true);
++	if (ret)
++		return ret;
+ 	ret = sc8581_set_batovp_th(cp, cp->cfg.bat_ovp_th);
++	if (ret)
++		return ret;
+ 	ret = sc8581_set_batocp_th(cp, BAT_OCP_TH);
++	if (ret)
++		return ret;
+ 	ret = sc8581_set_batovp_alarm_th(cp, cp->cfg.bat_ovp_alarm_th);
++	if (ret)
++		return ret;
+ 	ret = sc8581_set_busovp_th(cp, cp->cfg.bus_ovp_th[work_mode]);
++	if (ret)
++		return ret;
+ 	ret = sc8581_set_usbovp_th(cp, cp->cfg.usb_ovp_th[work_mode]);
++	if (ret)
++		return ret;
+ 	ret = sc8581_set_busocp_th(cp, cp->cfg.bus_ocp_th[work_mode]);
++	if (ret)
++		return ret;
+ 
+ 	ret = sc8581_set_wpcovp_th(cp, cp->cfg.wpc_ovp_th);
++	if (ret)
++		return ret;
+ 	ret = sc8581_set_outovp_th(cp, cp->cfg.out_ovp_th);
++	if (ret)
++		return ret;
+ 	ret = sc8581_set_pmid2outuvp_th(cp, cp->cfg.pmid2out_uvp_th);
++	if (ret)
++		return ret;
+ 	ret = sc8581_set_pmid2outovp_th(cp, cp->cfg.pmid2out_ovp_th);
++	if (ret)
++		return ret;
+ 
+ 	return ret;
+ }
+ 
+ static int sc8581_init_adc(struct sc8581_device *cp)
+ {
+-	sc8581_set_adc_scanrate(cp, false);
+-	sc8581_set_adc_scan(cp, ADC_IBUS, true);
+-	sc8581_set_adc_scan(cp, ADC_VBUS, true);
+-	sc8581_set_adc_scan(cp, ADC_VUSB, true);
+-	sc8581_set_adc_scan(cp, ADC_VWPC, true);
+-	sc8581_set_adc_scan(cp, ADC_VOUT, true);
+-	sc8581_set_adc_scan(cp, ADC_VBAT, true);
++	int ret;
++
++	ret = sc8581_set_adc_scanrate(cp, false);
++	if (ret)
++		return ret;
++	ret = sc8581_set_adc_scan(cp, ADC_IBUS, true);
++	if (ret)
++		return ret;
++	ret = sc8581_set_adc_scan(cp, ADC_VBUS, true);
++	if (ret)
++		return ret;
++	ret = sc8581_set_adc_scan(cp, ADC_VUSB, true);
++	if (ret)
++		return ret;
++	ret = sc8581_set_adc_scan(cp, ADC_VWPC, true);
++	if (ret)
++		return ret;
++	ret = sc8581_set_adc_scan(cp, ADC_VOUT, true);
++	if (ret)
++		return ret;
++	ret = sc8581_set_adc_scan(cp, ADC_VBAT, true);
++	if (ret)
++		return ret;
+ 	if (cp->chip_vendor != SC8585) {
+-		sc8581_set_adc_scan(cp, ADC_IBAT, true);
+-		sc8581_set_adc_scan(cp, ADC_TBAT, true);
+-	}
+-	sc8581_set_adc_scan(cp, ADC_TDIE, true);
+-	sc8581_enable_adc(cp, false);
++		ret = sc8581_set_adc_scan(cp, ADC_IBAT, true);
++		if (ret)
++			return ret;
++		ret = sc8581_set_adc_scan(cp, ADC_TBAT, true);
++		if (ret)
++			return ret;
++	}
++	ret = sc8581_set_adc_scan(cp, ADC_TDIE, true);
++	if (ret)
++		return ret;
++	ret = sc8581_enable_adc(cp, false);
++	if (ret)
++		return ret;
+ 
+ 	return 0;
+ }
+@@ -1664,11 +1740,16 @@
+ 	int ret = 0;
+ 	int retry_cnt = 0;
+ 
+-	sc8581_set_reg_reset(cp);
+-	sc8581_enable_parallel_func(cp, false);
++	ret = sc8581_set_reg_reset(cp);
++	if (ret)
++		return ret;
++	ret = sc8581_enable_parallel_func(cp, false);
++	if (ret)
++		return ret;
+ 
+ 	while (retry_cnt < ERROR_RECOVERY_COUNT) {
+-		sc8581_enable_acdrv_manual_ovpgate_wpcgate(cp, 1);
++		ret = 0;
++		ret |= sc8581_enable_acdrv_manual_ovpgate_wpcgate(cp, 1);
+ 		ret |= sc8581_set_ss_timeout(cp, SC8581_SS_TIMEOUT_5120MS);
+ 		ret |= sc8581_set_ucp_fall_dg(cp, SC8581_BUS_UCP_FALL_DG_5MS);
+ 		if (cp->chip_vendor != SC8585) {
+@@ -1703,15 +1784,15 @@
+ 
+ 		switch (cp->cp_role) {
+ 		case SC8581_MASTER:
+-			sc8581_set_fsw(cp, CP_DEFAULT_FSW);
++			ret |= sc8581_set_fsw(cp, CP_DEFAULT_FSW);
+ 			break;
+ 		case SC8581_SLAVE:
+-			sc8581_set_fsw(cp, CP_DEFAULT_FSW);
++			ret |= sc8581_set_fsw(cp, CP_DEFAULT_FSW);
+ 			break;
+ 		default:
+ 			break;
+ 		}
+-		cp_write_byte(cp->client, SC8581_REG_42,
++		ret |= cp_write_byte(cp->client, SC8581_REG_42,
+ 			      0x82); // pengwanglin@xiaomi.com: enable resonance
+ 
+ 		if (ret < 0) {
+@@ -2334,6 +2415,8 @@
+ 	}
+ 
+ 	mca_parse_dts_u32(np, "ic_role", &bq->cp_role, 0);
++	if (bq->cp_role < 0 || bq->cp_role >= CP_ROLE_MAX)
++		return -EINVAL;
+ 
+ 	if (bq->cp_role == SC8581_SLAVE)
+ 		strscpy(bq->log_tag, "[1]", sizeof("[1]"));
+@@ -2343,14 +2426,14 @@
+ 	bq->irq_gpio = of_get_named_gpio(np, "cp-int", 0);
+ 	if (!gpio_is_valid(bq->irq_gpio)) {
+ 		mca_log_err("%s failed to parse irq_gpio\n", bq->log_tag);
+-		return -1;
++		return bq->irq_gpio < 0 ? bq->irq_gpio : -EINVAL;
+ 	}
+ 
+ 	bq->nlpm_gpio = of_get_named_gpio(np, "cp-nlpm-gpio", 0);
+ 	if (!gpio_is_valid(bq->nlpm_gpio)) {
+ 		mca_log_err("%s failed to parse  sc858_nlpm_gpio\n",
+ 			    bq->log_tag);
+-		return -1;
++		return bq->nlpm_gpio < 0 ? bq->nlpm_gpio : -EINVAL;
+ 	}
+ 
+ 	mca_parse_dts_u32(np, "bat-ovp-threshold", &bq->cfg.bat_ovp_th,
+@@ -2388,7 +2471,7 @@
+ {
+ 	int ret = 0;
+ 
+-	ret = devm_gpio_request(bq->dev, bq->irq_gpio, dev_name(bq->dev));
++	ret = devm_gpio_request_one(bq->dev, bq->irq_gpio, GPIOF_IN, dev_name(bq->dev));
+ 	if (ret < 0) {
+ 		mca_log_info(" %s failed to master request gpio\n",
+ 			     bq->log_tag);
+@@ -2396,11 +2479,14 @@
+ 	}
+ 
+ 	bq->irq = gpio_to_irq(bq->irq_gpio);
+-	if (bq->irq_gpio < 0) {
++	if (bq->irq < 0) {
+ 		mca_log_info("%s failed to master get gpio_irq\n", bq->log_tag);
+ 		return -1;
+ 	}
+ 
++	ret = devm_add_action_or_reset(bq->dev, sc8581_cleanup, bq);
++	if (ret)
++		return ret;
+ 	ret = request_irq(bq->irq, sc8581_int_isr,
+ 			  IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+ 			  dev_name(bq->dev), bq);
+@@ -2409,7 +2495,11 @@
+ 		return -1;
+ 	}
+ 
+-	enable_irq_wake(bq->irq);
++	bq->irq_registered = true;
++	ret = enable_irq_wake(bq->irq);
++	if (ret)
++		return ret;
++	bq->irq_wake = true;
+ 
+ 	return 0;
+ }
+@@ -2421,7 +2511,7 @@
+ 	if (bq->cp_role != SC8581_MASTER)
+ 		return ret;
+ 
+-	ret = devm_gpio_request(bq->dev, bq->nlpm_gpio, dev_name(bq->dev));
++	ret = devm_gpio_request_one(bq->dev, bq->nlpm_gpio, GPIOF_OUT_INIT_HIGH, dev_name(bq->dev));
+ 	if (ret)
+ 		mca_log_info("%s unable to request nlpm gpio [%d]\n",
+ 			     bq->log_tag, bq->nlpm_gpio);
+@@ -2445,11 +2535,11 @@
+ 		return 0;
+ 
+ 	if (bq->cp_role == 0)
+-		return snprintf(
++		return scnprintf(
+ 			buf, size,
+ 			"cp_vusb cp_vbus cp_ibus cp_ibat cp_vbat cp_vout ");
+ 	else
+-		return snprintf(
++		return scnprintf(
+ 			buf, size,
+ 			"cp_vusb1 cp_vbus1 cp_ibus1 cp_ibat1 cp_vbat1 cp_vout1 ");
+ }
+@@ -2457,10 +2547,10 @@
+ static int sc8581_dump_log_context(void *data, char *buf, int size)
+ {
+ 	struct sc8581_device *bq = (struct sc8581_device *)data;
+-	unsigned int vbus, vusb, ibus, ibat, vbat, vout;
++	unsigned int vbus = 0, vusb = 0, ibus = 0, ibat = 0, vbat = 0, vout = 0;
+ 
+ 	if (!data)
+-		return snprintf(buf, size, "%-8d%-8d%-8d%-8d%-8d%-8d", -1, -1,
++		return scnprintf(buf, size, "%-8d%-8d%-8d%-8d%-8d%-8d", -1, -1,
+ 				-1, -1, -1, -1);
+ 
+ 	(void)ops_cp_get_vbus(&vbus, data);
+@@ -2471,10 +2561,10 @@
+ 	(void)ops_cp_get_vout(&vout, data);
+ 
+ 	if (bq->cp_role == 0)
+-		return snprintf(buf, size, "%-8u%-8u%-8u%-8u%-8u%-8u", vusb,
++		return scnprintf(buf, size, "%-8u%-8u%-8u%-8u%-8u%-8u", vusb,
+ 				vbus, ibus, ibat, vbat, vout);
+ 	else
+-		return snprintf(buf, size, "%-9u%-9u%-9u%-9u%-9u%-9u", vusb,
++		return scnprintf(buf, size, "%-9u%-9u%-9u%-9u%-9u%-9u", vusb,
+ 				vbus, ibus, ibat, vbat, vout);
+ }
+ 
+@@ -2496,12 +2586,30 @@
+ 	       hwid->hwid_value == EN_BUCK_PROJECT_HWID;
+ }
+ 
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 9))
++static void sc8581_cleanup(void *data)
++{
++	struct sc8581_device *bq = data;
++
++	if (bq->ops_registered)
++		platform_class_cp_unregister_ops(bq->cp_role, bq);
++	if (bq->log_registered)
++		mca_log_charge_log_unregister(bq->cp_role == SC8581_MASTER ?
++			MCA_CHARGE_LOG_ID_CP_MASTER_IC : MCA_CHARGE_LOG_ID_CP_SLAVE_IC, bq);
++	if (bq->debug_registered)
++		mca_debugfs_remove_group(bq->cp_role == SC8581_SLAVE ? "sc85xx_01" : "sc85xx_00");
++	if (bq->irq_wake)
++		disable_irq_wake(bq->irq);
++	if (bq->irq_registered)
++		free_irq(bq->irq, bq);
++	cancel_delayed_work_sync(&bq->irq_handle_work);
++	if (bq->chip_ok) {
++		sc8581_enable_charge(bq, false);
++		cp_enable_adc(bq, false);
++	}
++	device_init_wakeup(bq->dev, false);
++}
++
+ static int sc8581_probe(struct i2c_client *client)
+-#else
+-static int sc8581_probe(struct i2c_client *client,
+-			const struct i2c_device_id *id)
+-#endif
+ {
+ 	struct device *dev = &client->dev;
+ 	struct sc8581_device *bq;
+@@ -2514,6 +2622,9 @@
+ 	bq->client = client;
+ 	bq->dev = dev;
+ 	i2c_set_clientdata(client, bq);
++	mutex_init(&bq->reg_lock);
++	INIT_DELAYED_WORK(&bq->irq_handle_work, sc8581_irq_handler);
++
+ 
+ 	if (mca_cp_is_en_buck_project_hwid()) {
+ 		mca_log_err("adjust en buck CP addr");
+@@ -2529,6 +2640,8 @@
+ 	}
+ 
+ 	ret = sc8581_init_gpio(bq);
++	if (ret)
++		return ret;
+ 	ret = cp_charge_detect_device(bq);
+ 	if (ret) {
+ 		mca_log_err("%s failed to detect device\n", bq->log_tag);
+@@ -2537,7 +2650,7 @@
+ 		return ret;
+ 	}
+ 
+-	INIT_DELAYED_WORK(&bq->irq_handle_work, sc8581_irq_handler);
++	bq->chip_ok = true;
+ 	ret = sc8581_register_irq(bq);
+ 	if (ret) {
+ 		mca_log_err("%s failed to int irq\n", bq->log_tag);
+@@ -2552,7 +2665,6 @@
+ 		return ret;
+ 	}
+ 
+-	schedule_delayed_work(&bq->irq_handle_work, 0);
+ 	bq->chip_ok = true;
+ 	bq->ovpgate_en = true;
+ 	bq->i2c_is_working = true;
+@@ -2561,16 +2673,23 @@
+ 	reg_info.count = 1;
+ 
+ 	if (bq->cp_role == SC8581_SLAVE)
+-		mca_debugfs_create_group("sc85xx_01", cp_debugfs_field_tbl,
++		ret = mca_debugfs_create_group("sc85xx_01", cp_debugfs_field_tbl,
+ 					 CP_DEBUGFS_ATTRS_SIZE, bq);
+ 	else
+-		mca_debugfs_create_group("sc85xx_00", cp_debugfs_field_tbl,
++		ret = mca_debugfs_create_group("sc85xx_00", cp_debugfs_field_tbl,
+ 					 CP_DEBUGFS_ATTRS_SIZE, bq);
++	bq->debug_registered = !ret;
+ #endif
+-	platform_class_cp_register_ops(bq->cp_role, &sc8581_chg_ops, bq);
+-	mca_log_charge_log_register(MCA_CHARGE_LOG_ID_CP_MASTER_IC,
++	ret = platform_class_cp_register_ops(bq->cp_role, &sc8581_chg_ops, bq);
++	if (ret)
++		return ret;
++	bq->ops_registered = true;
++	mca_log_charge_log_register(bq->cp_role == SC8581_MASTER ?
++		MCA_CHARGE_LOG_ID_CP_MASTER_IC : MCA_CHARGE_LOG_ID_CP_SLAVE_IC,
+ 				    &g_sc8581_log_ops, bq);
++	bq->log_registered = true;
+ 	device_init_wakeup(bq->dev, true);
++	schedule_delayed_work(&bq->irq_handle_work, 0);
+ 	mca_log_err("%s probe success %d\n", bq->log_tag, ret);
+ 
+ 	return 0;
+@@ -2618,11 +2737,9 @@
+ static void sc8581_remove(struct i2c_client *client)
+ {
+ 	struct sc8581_device *bq = i2c_get_clientdata(client);
+-	int ret = 0;
+-
+-	ret = cp_enable_adc(bq, false);
+-	if (ret)
+-		mca_log_err("%s failed to disable ADC\n", bq->log_tag);
++
++	devm_remove_action(bq->dev, sc8581_cleanup, bq);
++	sc8581_cleanup(bq);
+ }
+ 
+ static void sc8581_shutdown(struct i2c_client *client)
+--- a/drivers/power/supply/mca/mca_hardware_ic/fuelgauge_ic/bq27z561/bq27z561.c
++++ b/drivers/power/supply/mca/mca_hardware_ic/fuelgauge_ic/bq27z561/bq27z561.c
+@@ -25,7 +25,6 @@
+ #include <linux/slab.h>
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+-#include <linux/version.h>
+ #include <mca/platform/platform_fg_ic_ops.h>
+ #include <mca/common/mca_log.h>
+ #include <mca/common/mca_parse_dts.h>
+@@ -83,184 +82,54 @@
+ static inline unsigned long fg_convert_u8_to_u16(unsigned char lsb, unsigned char hsb);
+ static int fg_read_max_cell_volt(struct bq_fg_chip *bq, int *max_volt);
+ 
+-#if 0
+-/* fg read write block can not too much type,read block may fail,
+-write block may make system crash*/
++
+ static int __fg_read_block(struct i2c_client *client, u8 reg, u8 *buf, u8 len)
+ {
+-	int ret;
+-	int retry_cnt = 0, count;
+-	u8 reg_now, len_now, *buf_now;
+-
+-	reg_now = reg;
+-	len_now = len;
+-	buf_now = buf;
+-	while(retry_cnt <= FG_I2C_RETRY_CNT) {
+-		while (len_now) {
+-			if (len_now <= 16)
+-				count = len_now;
+-			else
+-				count = 16;
+-
+-			ret = i2c_smbus_read_i2c_block_data(client, reg_now, count, buf_now);
+-			len_now -= count;
+-			if (len_now != 0) {
+-				reg_now += count;
+-				buf_now += count;
+-			}
++	struct i2c_msg msgs[2];
++	int ret = -EIO, attempt;
++
++	if (!buf || !len)
++		return -EINVAL;
++	msgs[0] = (struct i2c_msg) { .addr = client->addr, .len = 1, .buf = &reg };
++	msgs[1] = (struct i2c_msg) {
++		.addr = client->addr, .flags = I2C_M_RD, .len = len, .buf = buf,
++	};
++	for (attempt = 0; attempt < FG_I2C_RETRY_CNT; attempt++) {
++		ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++		if (ret == ARRAY_SIZE(msgs))
++			return 0;
++		if (ret >= 0)
++			ret = -EIO;
++		usleep_range(4000, 4100);
++	}
++	return ret;
++}
++
++static int __fg_write_block(struct i2c_client *client, u8 reg, u8 *buf, u8 len)
++{
++	struct i2c_msg msg;
++	u8 *data;
++	int ret = -EIO, attempt;
++
++	if (!buf || !len)
++		return -EINVAL;
++	data = kmalloc(len + 1, GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++	data[0] = reg;
++	memcpy(data + 1, buf, len);
++	msg = (struct i2c_msg) { .addr = client->addr, .len = len + 1, .buf = data };
++	for (attempt = 0; attempt < FG_I2C_RETRY_CNT; attempt++) {
++		ret = i2c_transfer(client->adapter, &msg, 1);
++		if (ret == 1) {
++			ret = 0;
++			break;
+ 		}
+-		if (ret < 0) {
+-			usleep_range(4000, 4100);
+-			retry_cnt++;
+-			reg_now = reg;
+-			len_now = len;
+-			buf_now = buf;
+-		} else {
+-			return ret;
+-		}
+-	}
+-
+-	mca_log_err("i2c read block fail: can't write to reg 0x%02X, ret:%d, cnt:%d\n",
+-			reg, ret, retry_cnt);
+-
+-	return ret;
+-}
+-
+-
+-static int __fg_write_block(struct i2c_client *client, u8 reg, u8 *buf, u8 len)
+-{
+-	int ret;
+-	int retry_cnt = 0, count;
+-	u8 reg_now, len_now, *buf_now;
+-
+-	reg_now = reg;
+-	len_now = len;
+-	buf_now = buf;
+-	while(retry_cnt <= FG_I2C_RETRY_CNT) {
+-		while (len_now) {
+-			if (len_now <= 16)
+-				count = len_now;
+-			else
+-				count = 16;
+-
+-			ret = i2c_smbus_write_i2c_block_data(client, reg_now, count, buf_now);
+-			len_now -= count;
+-			if (len_now != 0) {
+-				reg_now += count;
+-				buf_now += count;
+-			}
+-		}
+-
+-		if (ret < 0) {
+-			usleep_range(4000, 4100);
+-			retry_cnt++;
+-			reg_now = reg;
+-			len_now = len;
+-			buf_now = buf;
+-		} else {
+-			return ret;
+-		}
+-	}
+-
+-	mca_log_err("i2c write block fail: can't write to reg 0x%02X, ret:%d, cnt:%d\n",
+-			reg, ret, retry_cnt);
+-
+-	return ret;
+-}
+-#endif
+-
+-static int __fg_read_block(struct i2c_client *client, u8 reg, u8 *buf, u8 len)
+-{
+-	int ret = 0;
+-	int i;
+-	char tmp[1024];
+-	struct i2c_msg msgs[2];
+-	int cnt = 0, retry_cnt = 1;
+-
+-	/* write reg addr */
+-	msgs[0].addr = client->addr;
+-	msgs[0].flags = 0;
+-	msgs[0].len = 1;
+-	msgs[0].buf = &reg;
+-
+-	/* read data */
+-	msgs[1].addr = client->addr;
+-	msgs[1].flags = I2C_M_RD;
+-	msgs[1].len = len;
+-	msgs[1].buf = buf;
+-
+-	/* i2c_transfer may retry by itself or not. We should do it again*/
+-	while(retry_cnt <= FG_I2C_RETRY_CNT ) {
+-		ret = i2c_transfer(client->adapter, msgs, 2);
+-		if (ret < 0) {
+-			mca_log_err("i2c read block reg 0x%02X faild, ret:%d, cnt:%d\n", reg, ret, retry_cnt);
+-
+-			/* print block data */
+-			cnt = scnprintf(tmp, sizeof(tmp), "block data: ");
+-			for(i = 0; i < len; i++) {
+-				cnt = scnprintf(tmp + cnt, sizeof(tmp), "0x%02X ", buf[i]);
+-			}
+-			scnprintf(tmp + cnt, sizeof(tmp), "\n");
+-			mca_log_err("%s", tmp);
+-			usleep_range(4000, 4100);
+-			retry_cnt++;
+-		} else {
+-			return ret;
+-		}
+-	}
+-
+-	mca_log_err("i2c read block reg 0x%02X faild, ret:%d, cnt max:%d\n", reg, ret, FG_I2C_RETRY_CNT);
+-
+-	return ret;
+-}
+-
+-static int __fg_write_block(struct i2c_client *client, u8 reg, u8 *buf, u8 len)
+-{
+-	int ret = 0;
+-	int i = 0;
+-	int cnt = 0;
+-	char tmp[1024];
+-	struct i2c_msg msgs[1];
+-	int retry_cnt = 1;
+-	char *wbuf = NULL;
+-
+-	wbuf = kzalloc(len + 1, GFP_KERNEL);
+-	if(!wbuf) {
+-		return -ENOMEM;
+-	}
+-
+-	wbuf[0] = reg;	/* The first byte to write must be reg addr */
+-	memcpy(wbuf + 1, buf, len);		/* then goes CMD */
+-
+-	/* write reg data */
+-	msgs[0].addr = client->addr;
+-	msgs[0].flags = 0;	/* write */
+-	msgs[0].len = 1 + len;		/* sizeof(reg) + len */
+-	msgs[0].buf = wbuf;
+-
+-	/* i2c_transfer may retry by itself or not. We should do it again*/
+-	while(retry_cnt <= FG_I2C_RETRY_CNT ) {
+-		ret = i2c_transfer(client->adapter, msgs, 1);
+-		if(ret < 0) {
+-			mca_log_err("i2c write block reg 0x%02X faild, ret:%d, cnt:%d\n", reg, ret, retry_cnt);
+-
+-			/* print block data */
+-			cnt = scnprintf(tmp, sizeof(tmp), "block data: ");
+-			for(i = 0; i < len + 1; i++) {
+-				cnt = scnprintf(tmp + cnt, sizeof(tmp), "0x%02X ", wbuf[i]);
+-			}
+-			scnprintf(tmp + cnt, sizeof(tmp),"\n");
+-			mca_log_err("%s", tmp);
+-			usleep_range(4000, 4100);
+-			retry_cnt++;
+-		} else {
+-			goto out;
+-		}
+-	}
+-
+-	mca_log_err("i2c write block reg 0x%02X faild, ret:%d, cnt max:%d\n", reg, ret, FG_I2C_RETRY_CNT);
+-out:
+-	kfree(wbuf);
++		if (ret >= 0)
++			ret = -EIO;
++		usleep_range(4000, 4100);
++	}
++	kfree(data);
+ 	return ret;
+ }
+ 
+@@ -300,7 +169,7 @@
+ 			retry_cnt++;
+ 		} else {
+ 			*val = (u8)ret;
+-			return ret;
++			return 0;
+ 		}
+ 	}
+ 
+@@ -324,7 +193,7 @@
+ 			retry_cnt++;
+ 		}  else {
+ 			*val = (u16)ret;
+-			return ret;
++			return 0;
+ 		}
+ 	}
+ 
+@@ -466,43 +335,32 @@
+ 
+ static int fg_mac_read_block(struct bq_fg_chip *bq, u16 cmd, u8 *buf, u8 len)
+ {
+-	int ret = 0;
+-	u8 cksum_calc, cksum;
+-	u8 t_buf[40];
+-	u8 t_len;
+-	int i;
+-
+-	t_buf[0] = (u8)cmd;
+-	t_buf[1] = (u8)(cmd >> 8);
+-
++	u8 response[36] = { (u8)cmd, (u8)(cmd >> 8) };
++	u8 length;
++	int ret;
++
++	if (!buf || !len || len > 32)
++		return -EINVAL;
+ 	mutex_lock(&bq->data_lock);
+ 	mutex_lock(&bq->i2c_rw_lock);
+-	ret = fg_write_read_block(bq, bq->regs[BQ_FG_REG_ALT_MAC], t_buf, 2, 36);
++	ret = fg_write_read_block(bq, bq->regs[BQ_FG_REG_ALT_MAC], response, 2,
++				 sizeof(response));
+ 	mutex_unlock(&bq->i2c_rw_lock);
+-
+ 	if (ret < 0)
+ 		goto out;
+-
+-	cksum = t_buf[34];
+-	t_len = t_buf[35];
+-
+-	if (t_len > 42) {
+-		mca_log_err("cksum:%d, t_len err:%d.\n", cksum, t_len);
+-		t_len = 42;
+-	} else if (t_len < 2) {
+-		mca_log_err("cksum:%d, t_len err:%d.\n", cksum, t_len);
+-		t_len = 2;
+-	}
+-
+-	cksum_calc = checksum(t_buf, t_len - 2);
+-	if (cksum_calc != cksum) {
++	length = response[35];
++	/* Length includes the command, checksum and length bytes. */
++	if (length < 4 || length > sizeof(response) || len > length - 4) {
++		ret = -EMSGSIZE;
++		goto out;
++	}
++	if (response[0] != (u8)cmd || response[1] != (u8)(cmd >> 8) ||
++	    checksum(response, length - 2) != response[34]) {
+ 		ret = -EIO;
+ 		goto out;
+ 	}
+-
+-	for (i = 0; i < len; i++)
+-		buf[i] = t_buf[i+2];
+-
++	memcpy(buf, response + 2, len);
++	ret = 0;
+ out:
+ 	mutex_unlock(&bq->data_lock);
+ 	return ret;
+@@ -516,8 +374,8 @@
+ 	int i;
+ 	bool secure_delay = false;
+ 
+-	if (len > 32)
+-		return -1;
++	if (!data || !len || len > 32)
++		return -EINVAL;
+ 
+ 	if (cmd > 0x4000 || cmd == FG_MAC_CMD_UI_SOH || cmd == FG_MAC_CMD_CLEAR_COUNT_DATA)
+ 		secure_delay = true;
+@@ -556,7 +414,7 @@
+ 	int ret;
+ 	struct i2c_client *client = to_i2c_client(info->dev);
+ 
+-	if (!buf)
++	if (!buf || !len)
+ 		return -EINVAL;
+ 
+ 	if (!client || !client->adapter)
+@@ -577,7 +435,7 @@
+ 		return ret;
+ 	}
+ 
+-	return ret;
++	return ret == 2 ? 0 : -EIO;
+ }
+ 
+ #define FG_BATT_INFO_LEN 16
+@@ -1150,7 +1008,7 @@
+ 		return ret;
+ 	}
+ 
+-	ret = fg_mac_read_block(bq, FG_MAC_CMD_QMAX_CYCLECOUNT, t_buf, 36);
++	ret = fg_mac_read_block(bq, FG_MAC_CMD_QMAX_CYCLECOUNT, t_buf, 4);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -1776,7 +1634,7 @@
+ 	int ret = 0;
+ 	u8 t_buf[BATTERY_RANDOM_LEN] = {0};
+ 
+-	ret = fg_mac_read_block(bq, FG_MAC_CMD_CALIBRATION_INFO_1, t_buf, 36);
++	ret = fg_mac_read_block(bq, FG_MAC_CMD_CALIBRATION_INFO_1, t_buf, 30);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -1805,7 +1663,7 @@
+ 	int ret = 0;
+ 	u8 t_buf[BATTERY_RANDOM_LEN] = {0};
+ 
+-	ret = fg_mac_read_block(bq, FG_MAC_CMD_CALIBRATION_INFO_2, t_buf, 36);
++	ret = fg_mac_read_block(bq, FG_MAC_CMD_CALIBRATION_INFO_2, t_buf, 32);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -1834,7 +1692,7 @@
+ 	int ret = 0;
+ 	u8 t_buf[BATTERY_RANDOM_LEN] = {0};
+ 
+-	ret = fg_mac_read_block(bq, FG_MAC_CMD_CALIBRATION_INFO_4, t_buf, 36);
++	ret = fg_mac_read_block(bq, FG_MAC_CMD_CALIBRATION_INFO_4, t_buf, 3);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -2846,7 +2704,9 @@
+ 	rm = rm / 1000;
+ 	fcc = fcc / 1000;
+ 
+-	*raw_soc = (rm * 10000) / fcc;
++	if (fcc <= 0)
++		return -ERANGE;
++	*raw_soc = div_s64((s64)rm * 10000, fcc);
+ 	return 0;
+ }
+ 
+@@ -2855,7 +2715,7 @@
+ 	int ret;
+ 	u8 t_buf[BLOCK_LENGTH_MAX] = { 0 };
+ 
+-	ret = fg_mac_read_block(bq, FG_MAC_CMD_ITSTATUS1, t_buf, 36);
++	ret = fg_mac_read_block(bq, FG_MAC_CMD_ITSTATUS1, t_buf, 18);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -2872,7 +2732,7 @@
+ 	int ret;
+ 	u8 t_buf[BLOCK_LENGTH_MAX] = { 0 };
+ 
+-	ret = fg_mac_read_block(bq, FG_MAC_CMD_ITSTATUS1, t_buf, 36);
++	ret = fg_mac_read_block(bq, FG_MAC_CMD_ITSTATUS1, t_buf, 16);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -2889,7 +2749,7 @@
+ 	int ret;
+ 	u8 t_buf[BLOCK_LENGTH_MAX] = { 0 };
+ 
+-	ret = fg_mac_read_block(bq, FG_MAC_CMD_ITSTATUS1, t_buf, 36);
++	ret = fg_mac_read_block(bq, FG_MAC_CMD_ITSTATUS1, t_buf, 2);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -2902,7 +2762,7 @@
+ 	int ret;
+ 	u8 t_buf[BLOCK_LENGTH_MAX] = { 0 };
+ 
+-	ret = fg_mac_read_block(bq, FG_MAC_CMD_ITSTATUS1, t_buf, 36);
++	ret = fg_mac_read_block(bq, FG_MAC_CMD_ITSTATUS1, t_buf, 4);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -3284,7 +3144,7 @@
+ 		*value = t_buf[17];
+ 		break;
+ 	default:
+-		ret = fg_mac_read_block(bq, FG_MAC_CMD_LIFETIME1, t_buf, 36);
++		ret = fg_mac_read_block(bq, FG_MAC_CMD_LIFETIME1, t_buf, 8);
+ 		if (ret < 0)
+ 			return ret;
+ 
+@@ -4215,6 +4075,8 @@
+ 
+ 	of_get_property(node, "bq,soc_decimal_rate", &size);
+ 	if (size) {
++		if (size % (2 * sizeof(*bq->dec_rate_seq)))
++			return -EINVAL;
+ 		bq->dec_rate_seq = devm_kzalloc(bq->dev, size, GFP_KERNEL);
+ 		if (bq->dec_rate_seq) {
+ 			bq->dec_rate_len = (size / sizeof(*bq->dec_rate_seq));
+@@ -4230,11 +4092,14 @@
+ 				mca_log_info("Failed to get bq,soc_decimal_rate!\n");
+ 				return -EINVAL;
+ 			}
+-		} else
+-			mca_log_info("error allocating memory for dec_rate_seq\n");
++		} else {
++			return -ENOMEM;
++		}
+ 	}
+ 	mca_parse_dts_u32(node, "bq,charge-full-design", &bq->batt_dc, DEFUALT_FULL_DESIGN);
+ 	mca_parse_dts_u32(node, "ic_role", &bq->dev_role, 0);
++	if (bq->dev_role >= FG_IC_MAX)
++		return -EINVAL;
+ 	mca_parse_dts_u32(node, "soh_th", &bq->soh_th, FG_IC_SOH_TH_DEFAUL);
+ 	mca_parse_dts_u32(node, "cycle_th", &bq->cycle_th, FG_IC_CYCLE_TH_DEFAUL);
+ 	mca_parse_dts_u32(node, "cycle_step", &bq->cycle_step, FG_IC_CYCLE_STEP_DEFAUL);
+@@ -4276,8 +4141,8 @@
+ 		if (bq->co_gpio < 0) {
+ 			mca_log_err("failed to parse ctl_co_gpio\n");
+ 		} else {
+-			if (devm_gpio_request(bq->dev, bq->co_gpio,
+-					      dev_name(bq->dev)))
++			if (devm_gpio_request_one(bq->dev, bq->co_gpio,
++						  GPIOF_OUT_INIT_LOW, dev_name(bq->dev)))
+ 				mca_log_err("%s unable to request ctl_co gpio [%d]\n",
+ 					    dev_name(bq->dev), bq->co_gpio);
+ 			else if (gpiod_direction_output_raw(
+@@ -4520,7 +4385,7 @@
+ 	0xe2, 0x1a, 0xfb, 0x9e, 0x38, 0xc2, 0x38, 0xc2,
+ };
+ 
+-u8 GetCRC8(u8 *buf, int len)
++static u8 GetCRC8(u8 *buf, int len)
+ {
+ 	int crc = 0, i;
+ 
+@@ -6042,22 +5907,15 @@
+ 	return count;
+ }
+ 
+-static void fg_sysfs_create_group(struct bq_fg_chip *info)
+-{
+-	mca_sysfs_init_attrs(fg_sysfs_attrs, fg_sysfs_field_tbl,
+-		FG_SYSFS_ATTRS_SIZE);
+-
+-	if (info->dev_role == FG_MASTER)
+-		info->sysfs_dev = mca_sysfs_create_group("xm_power", "fg_master", &fg_sysfs_attr_group);
+-	else if (info->dev_role == FG_SLAVE)
+-		info->sysfs_dev = mca_sysfs_create_group("xm_power", "fg_slave", &fg_sysfs_attr_group);
+-	else
+-		mca_log_info("invalid device");
+-
+-	if (info->sysfs_dev) {
+-		dev_set_drvdata(info->sysfs_dev, info);
+-		mca_log_err("create fg sysfs success\n");
+-	}
++static int fg_sysfs_create_group(struct bq_fg_chip *info)
++{
++	mca_sysfs_init_attrs(fg_sysfs_attrs, fg_sysfs_field_tbl, FG_SYSFS_ATTRS_SIZE);
++	info->sysfs_dev = mca_sysfs_create_group("xm_power",
++		info->dev_role == FG_IC_MASTER ? "fg_master" : "fg_slave", &fg_sysfs_attr_group);
++	if (!info->sysfs_dev)
++		return -ENOMEM;
++	dev_set_drvdata(info->sysfs_dev, info);
++	return 0;
+ }
+ 
+ static void fg_sysfs_remove_group(struct device *dev)
+@@ -6263,18 +6121,11 @@
+ 		mca_log_err("not CN NVT device, none to do!\n");
+ }
+ 
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 9))
+ static int bq_fg_probe(struct i2c_client *client)
+-#else
+-static int bq_fg_probe(struct i2c_client *client, const struct i2c_device_id *id)
+-#endif
+ {
+ 	int ret;
+ 	struct bq_fg_chip *bq;
+ 	char data[32];
+-	static int probe_cnt;
+-
+-	mca_log_info("probe_cnt = %d\n", ++probe_cnt);
+ 
+ 	bq = devm_kzalloc(&client->dev, sizeof(*bq), GFP_KERNEL);
+ 	if (!bq)
+@@ -6293,19 +6144,14 @@
+ 	bq->update_fw_status = FG_FW_INIT;
+ 	strcpy(bq->fake_device_name, "");
+ 
+-	bq_parse_dt(bq);
++	ret = bq_parse_dt(bq);
++	if (ret)
++		return ret;
+ 	memcpy(bq->regs, bq27z561_regs, NUM_REGS);
+ 
+ 	ret = fg_mac_read_block(bq, FG_MAC_CMD_MANU_NAME, data, sizeof(data));
+-	if (ret < 0) {
+-		mca_log_err("fg device found: %d\n", ret);
+-		ret = -EPROBE_DEFER;
+-		if (probe_cnt >= PROBE_CNT_MAX)
+-			goto out;
+-		else
+-			return ret;
+-	} else if (ret)
+-		mca_log_err("fg cksum_calc failed\n");
++	if (ret)
++		return dev_err_probe(bq->dev, ret, "fuel gauge identity read failed\n");
+ 
+ 	device_init_wakeup(bq->dev, 1);
+ 	fg_set_term_config(bq);
+@@ -6321,26 +6167,24 @@
+ 	ret = platform_fg_ic_ops_register(bq->dev_role, bq, &g_bq_fg_ops);
+ 	if (ret) {
+ 		mca_log_err("reg ops fail, role = %u\n", bq->dev_role);
+-		goto out;
++		goto disable_wakeup;
+ 	}
+ 
+ 	mca_log_err("FuelGaugw probe successfully, role = %u\n", bq->dev_role);
+ 
+ 	fg_force_sim_soh_if_needed(bq);
+-out:
+-	fg_sysfs_create_group(bq);
+-	i2c_set_clientdata(client, bq);
+-	if (bq->dev_role)
+-		mca_log_charge_log_register(MCA_CHARGE_LOG_ID_FG_MASTER_IC,
+-			&g_bq27z516_log_ops, bq);
+-	else
+-		mca_log_charge_log_register(MCA_CHARGE_LOG_ID_FG_SLAVE_IC,
+-			&g_bq27z516_log_ops, bq);
+-	if (ret == -EPROBE_DEFER) {
+-		mca_strategy_func_process(STRATEGY_FUNC_TYPE_FG, MCA_EVENT_BQ_FG_ERROR, 0);
+-	}
+-	mca_log_err("%s !!\n", ret == -EPROBE_DEFER ? "Over probe cnt max" : "OK");
+-	return 0;
++	ret = fg_sysfs_create_group(bq);
++	if (ret)
++		goto unregister_ops;
++	mca_log_charge_log_register(bq->dev_role == FG_IC_MASTER ?
++		MCA_CHARGE_LOG_ID_FG_MASTER_IC : MCA_CHARGE_LOG_ID_FG_SLAVE_IC,
++		&g_bq27z516_log_ops, bq);
++	return 0;
++unregister_ops:
++	platform_fg_ic_ops_unregister(bq->dev_role, bq);
++disable_wakeup:
++	device_init_wakeup(bq->dev, false);
++	return ret;
+ }
+ 
+ static int bq_fg_suspend(struct device *dev)
+@@ -6377,9 +6221,11 @@
+ {
+ 	struct bq_fg_chip *bq = i2c_get_clientdata(client);
+ 
+-	mutex_destroy(&bq->data_lock);
+-	mutex_destroy(&bq->i2c_rw_lock);
++	mca_log_charge_log_unregister(bq->dev_role == FG_IC_MASTER ?
++		MCA_CHARGE_LOG_ID_FG_MASTER_IC : MCA_CHARGE_LOG_ID_FG_SLAVE_IC, bq);
+ 	fg_sysfs_remove_group(bq->sysfs_dev);
++	platform_fg_ic_ops_unregister(bq->dev_role, bq);
++	device_init_wakeup(bq->dev, false);
+ }
+ 
+ static void bq_fg_shutdown(struct i2c_client *client)
+--- a/drivers/power/supply/mca/include/mca/strategy/strategy_class.h
++++ b/drivers/power/supply/mca/include/mca/strategy/strategy_class.h
+@@ -101,4 +101,7 @@
+ 			      mca_strategy_get_status get_func,
+ 			      mca_strategy_set_config set_config, void *data);
+ 
++/* Unregister before freeing callback data; not callable from a callback. */
++void mca_strategy_ops_unregister(unsigned int type, void *data);
++
+ #endif /* _MCA_STRATEGY_STRATEGY_CLASS_H_ */
+--- a/drivers/power/supply/mca/include/mca/platform/platform_loadsw_class.h
++++ b/drivers/power/supply/mca/include/mca/platform/platform_loadsw_class.h
+@@ -26,4 +26,7 @@
+ int platform_class_loadsw_set_lowpower_mode(unsigned int role, bool mode);
+ int platform_class_loadsw_get_lowpower_mode(unsigned int role, bool *mode);
+ 
++/* Drain callbacks before freeing provider data; not callable from a callback. */
++void platform_class_loadsw_unregister_ops(unsigned int role, void *data);
++
+ #endif /* _MCA_PLATFORM_PLATFORM_LOADSW_CLASS_H_ */
+--- a/drivers/power/supply/mca/include/mca/platform/platform_wireless_class.h
++++ b/drivers/power/supply/mca/include/mca/platform/platform_wireless_class.h
+@@ -223,4 +223,7 @@
+ int platform_class_wireless_get_tx_iout(unsigned int role, int *iout);
+ int platform_class_wireless_get_tx_vout(unsigned int role, int *vout);
+ int platform_class_wireless_get_rx_brg_status(unsigned int role, int *status);
++/* Drain callbacks before freeing provider data; not callable from a callback. */
++void platform_class_wireless_unregister_ops(unsigned int role, void *data);
++
+ #endif /* _MCA_PLATFORM_PLATFORM_WIRELESS_CLASS_H_ */
+--- a/drivers/power/supply/mca/include/mca/platform/platform_buckchg_class.h
++++ b/drivers/power/supply/mca/include/mca/platform/platform_buckchg_class.h
+@@ -199,4 +199,7 @@
+ int platform_class_buckchg_ops_get_aicl_status(unsigned int role, int *status);
+ int platform_class_buckchg_ops_set_too_hot_limit(unsigned int role, int limit);
+ 
++/* Drain callbacks before freeing provider data; not callable from a callback. */
++void platform_class_buckchg_ops_unregister(unsigned int role, void *data);
++
+ #endif /* _MCA_PLATFORM_PLATFORM_BUCKCHG_CLASS_H_ */
+--- a/drivers/power/supply/mca/include/mca/platform/platform_fg_ic_ops.h
++++ b/drivers/power/supply/mca/include/mca/platform/platform_fg_ic_ops.h
+@@ -258,4 +258,7 @@
+ void platform_fg_ops_set_first_usage_date(unsigned int ic_role,
+ 					  const char *date);
+ void platform_fg_ops_qbg_send_chg_data(unsigned int ic_role);
++/* Drain callbacks before freeing provider data; not callable from a callback. */
++void platform_fg_ic_ops_unregister(unsigned int ic_role, void *data);
++
+ #endif /* _MCA_PLATFORM_PLATFORM_FG_IC_OPS_H_ */
+--- a/drivers/power/supply/mca/include/mca/platform/platform_cp_class.h
++++ b/drivers/power/supply/mca/include/mca/platform/platform_cp_class.h
+@@ -175,4 +175,7 @@
+ int platform_class_cp_set_qb(unsigned int role, bool en);
+ int platform_class_cp_set_rcp(unsigned int role, bool en);
+ int platform_class_cp_set_pmid2outuvp_th(unsigned int role, int value);
++/* Drain callbacks before freeing provider data; not callable from a callback. */
++void platform_class_cp_unregister_ops(unsigned int role, void *data);
++
+ #endif /* _MCA_PLATFORM_PLATFORM_CP_CLASS_H_ */
+--- a/drivers/power/supply/mca/mca_hardware_ic/charge_pump_ic/sc8581/inc/sc8581.h
++++ b/drivers/power/supply/mca/mca_hardware_ic/charge_pump_ic/sc8581/inc/sc8581.h
+@@ -130,6 +130,12 @@
+ 	unsigned int product_cfg;
+ 	int cp_role;
+ 
++	struct mutex reg_lock;
++	bool ops_registered;
++	bool log_registered;
++	bool debug_registered;
++	bool irq_registered;
++	bool irq_wake;
+ 	struct delayed_work irq_handle_work;
+ 	int irq_gpio;
+ 	int irq;
