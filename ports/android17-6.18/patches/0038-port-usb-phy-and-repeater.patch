@@ -1,0 +1,1430 @@
+--- a/drivers/usb/repeater/repeater.c
++++ b/drivers/usb/repeater/repeater.c
+@@ -14,12 +14,18 @@
+ static LIST_HEAD(repeater_list);
+ static DEFINE_SPINLOCK(repeater_lock);
+ 
++struct usb_repeater_ref {
++	struct device *dev;
++	struct module *owner;
++};
++
+ void usb_put_repeater(struct usb_repeater *r)
+ {
+ 	if (r) {
++		struct module *owner = r->dev->driver->owner;
++
+ 		put_device(r->dev);
+-		if (r->dev->driver && r->dev->driver->owner)
+-			module_put(r->dev->driver->owner);
++		module_put(owner);
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(usb_put_repeater);
+@@ -42,15 +48,20 @@
+ 
+ static void devm_usb_repeater_release_by_node(struct device *dev, void *res)
+ {
+-	usb_put_repeater(res);
++	struct usb_repeater_ref *ref = res;
++
++	put_device(ref->dev);
++	module_put(ref->owner);
+ }
+ 
+ struct usb_repeater *devm_usb_get_repeater_by_node(struct device *dev,
+ 			struct device_node *node)
+ {
+ 	struct usb_repeater *r = ERR_PTR(-ENOMEM);
+-	struct usb_repeater *r_devm;
+-	unsigned long flags;
++	struct usb_repeater_ref *r_devm;
++	struct device_link *link;
++	unsigned long flags;
++	int ret;
+ 
+ 	r_devm = devres_alloc(devm_usb_repeater_release_by_node,
+ 					sizeof(*r_devm), GFP_KERNEL);
+@@ -72,8 +83,36 @@
+ 		goto err0;
+ 	}
+ 
++	r_devm->dev = get_device(r->dev);
++	r_devm->owner = r->dev->driver->owner;
++	spin_unlock_irqrestore(&repeater_lock, flags);
++	/* Unbind this consumer before releasing its supplier's managed storage. */
++	link = device_link_add(dev, r_devm->dev, DL_FLAG_AUTOREMOVE_CONSUMER);
++	if (!link) {
++		ret = -ENOMEM;
++		goto release;
++	}
++	/* A supplier that is still probing or already unbinding cannot be used. */
++	if (READ_ONCE(link->status) != DL_STATE_CONSUMER_PROBE &&
++	    READ_ONCE(link->status) != DL_STATE_ACTIVE) {
++		ret = -EPROBE_DEFER;
++		goto release;
++	}
++	/* Recheck after linking in case the supplier rebound during setup. */
++	spin_lock_irqsave(&repeater_lock, flags);
++	r = of_usb_find_repeater(node);
++	ret = IS_ERR(r) ? PTR_ERR(r) :
++		(r->dev != r_devm->dev || r->dev->driver->owner != r_devm->owner) ?
++		-EPROBE_DEFER : 0;
++	spin_unlock_irqrestore(&repeater_lock, flags);
++	if (ret)
++		goto release;
+ 	devres_add(dev, r_devm);
+-	get_device(r->dev);
++	return r;
++release:
++	devm_usb_repeater_release_by_node(dev, r_devm);
++	devres_free(r_devm);
++	return ERR_PTR(ret);
+ err0:
+ 	spin_unlock_irqrestore(&repeater_lock, flags);
+ 	return r;
+@@ -151,14 +190,24 @@
+  */
+ int usb_add_repeater_dev(struct usb_repeater *r)
+ {
+-	if (!r || !r->dev) {
++	struct usb_repeater *entry;
++	unsigned long flags;
++
++	if (!r || !r->dev || !r->dev->driver) {
+ 		pr_err("no repeater device\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	spin_lock(&repeater_lock);
++	spin_lock_irqsave(&repeater_lock, flags);
++	list_for_each_entry(entry, &repeater_list, head) {
++		if (entry->dev == r->dev) {
++			spin_unlock_irqrestore(&repeater_lock, flags);
++			return -EEXIST;
++		}
++	}
++	INIT_LIST_HEAD(&r->head);
+ 	list_add_tail(&r->head, &repeater_list);
+-	spin_unlock(&repeater_lock);
++	spin_unlock_irqrestore(&repeater_lock, flags);
+ 
+ 	return 0;
+ }
+--- a/drivers/usb/repeater/repeater-qti-pmic-eusb2.c
++++ b/drivers/usb/repeater/repeater-qti-pmic-eusb2.c
+@@ -13,6 +13,7 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/usb/dwc3-msm.h>
+ #include <linux/usb/repeater.h>
++#include <linux/usb/onyx-power.h>
+ 
+ #define EUSB2_3P0_VOL_MIN			3075000 /* uV */
+ #define EUSB2_3P0_VOL_MAX			3300000 /* uV */
+@@ -98,7 +99,7 @@
+ 	u16			reg_base;
+ 	struct regulator	*vdd18;
+ 	struct regulator	*vdd3;
+-	bool			power_enabled;
++	struct onyx_usb_supply supplies[2];
+ 
+ 	struct dentry		*root;
+ 	u8			usb2_crossover;
+@@ -116,8 +117,8 @@
+ 
+ 	u32			*param_override_seq;
+ 	u32			*host_param_override_seq;
+-	u8			param_override_seq_cnt;
+-	u8			host_param_override_seq_cnt;
++	unsigned int		param_override_seq_cnt;
++	unsigned int		host_param_override_seq_cnt;
+ };
+ 
+ /* Perform one or more register read */
+@@ -169,28 +170,28 @@
+ 	return ret;
+ }
+ 
+-static void eusb2_repeater_update_seq(struct eusb2_repeater *er,
+-						u32 *seq, u8 cnt)
+-{
+-	int i;
+-
+-	dev_dbg(er->ur.dev, "param override seq count:%d\n", cnt);
+-	for (i = 0; i < cnt; i = i+2) {
+-		dev_dbg(er->ur.dev, "write 0x%02x to 0x%02x\n",
+-						seq[i], seq[i+1]);
+-		eusb2_repeater_reg_write(er, seq[i+1], seq[i]);
+-	}
++static int eusb2_repeater_update_seq(struct eusb2_repeater *er,
++				   u32 *seq, unsigned int count)
++{
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < count; i += 2) {
++		ret = eusb2_repeater_reg_write(er, seq[i + 1], seq[i]);
++		if (ret)
++			return ret;
++	}
++	return 0;
+ }
+ 
+ static int eusb2_repeater_get_version(struct usb_repeater *ur)
+ {
+-	struct eusb2_repeater *er =
+-			container_of(ur, struct eusb2_repeater, ur);
++	struct eusb2_repeater *er = container_of(ur, struct eusb2_repeater, ur);
+ 	u8 reg;
+-
+-	eusb2_repeater_reg_read(er, &reg, EUSB2_REVISION1, 1);
+-
+-	return reg;
++	int ret;
++
++	ret = eusb2_repeater_reg_read(er, &reg, EUSB2_REVISION1, 1);
++	return ret ?: reg;
+ }
+ 
+ static void eusb2_repeater_create_debugfs(struct eusb2_repeater *er)
+@@ -228,179 +229,130 @@
+ 
+ static int eusb2_repeater_power(struct eusb2_repeater *er, bool on)
+ {
+-	int ret = 0;
+-
+-	dev_dbg(er->ur.dev, "%s turn %s regulators. power_enabled:%d\n",
+-			__func__, on ? "on" : "off", er->power_enabled);
+-
+-	if (er->power_enabled == on) {
+-		dev_dbg(er->ur.dev, "regulators' regulators are already ON.\n");
+-		return 0;
+-	}
+-
+-	if (!on)
+-		goto disable_vdd3;
+-
+-	ret = regulator_set_load(er->vdd18, EUSB2_1P8_HPM_LOAD);
+-	if (ret < 0) {
+-		dev_err(er->ur.dev, "Unable to set HPM of vdd18:%d\n", ret);
+-		goto err_vdd18;
+-	}
+-
+-	ret = regulator_set_voltage(er->vdd18, EUSB2_1P8_VOL_MIN,
+-						EUSB2_1P8_VOL_MAX);
+-	if (ret) {
+-		dev_err(er->ur.dev,
+-				"Unable to set voltage for vdd18:%d\n", ret);
+-		goto put_vdd18_lpm;
+-	}
+-
+-	ret = regulator_enable(er->vdd18);
+-	if (ret) {
+-		dev_err(er->ur.dev, "Unable to enable vdd18:%d\n", ret);
+-		goto unset_vdd18;
+-	}
+-
+-	ret = regulator_set_load(er->vdd3, EUSB2_3P0_HPM_LOAD);
+-	if (ret < 0) {
+-		dev_err(er->ur.dev, "Unable to set HPM of vdd3:%d\n", ret);
+-		goto disable_vdd18;
+-	}
+-
+-	ret = regulator_set_voltage(er->vdd3, EUSB2_3P0_VOL_MIN,
+-						EUSB2_3P0_VOL_MAX);
+-	if (ret) {
+-		dev_err(er->ur.dev,
+-				"Unable to set voltage for vdd3:%d\n", ret);
+-		goto put_vdd3_lpm;
+-	}
+-
+-	ret = regulator_enable(er->vdd3);
+-	if (ret) {
+-		dev_err(er->ur.dev, "Unable to enable vdd3:%d\n", ret);
+-		goto unset_vdd3;
+-	}
+-
+-	er->power_enabled = true;
+-	dev_dbg(er->ur.dev, "eUSB2 repeater egulators are turned ON.\n");
+-	return ret;
+-
+-disable_vdd3:
+-	ret = regulator_disable(er->vdd3);
+-	if (ret)
+-		dev_err(er->ur.dev, "Unable to disable vdd3:%d\n", ret);
+-
+-unset_vdd3:
+-	ret = regulator_set_voltage(er->vdd3, 0, EUSB2_3P0_VOL_MAX);
+-	if (ret)
+-		dev_err(er->ur.dev,
+-			"Unable to set (0) voltage for vdd3:%d\n", ret);
+-
+-put_vdd3_lpm:
+-	ret = regulator_set_load(er->vdd3, 0);
+-	if (ret < 0)
+-		dev_err(er->ur.dev, "Unable to set (0) HPM of vdd3\n");
+-
+-disable_vdd18:
+-	ret = regulator_disable(er->vdd18);
+-	if (ret)
+-		dev_err(er->ur.dev, "Unable to disable vdd18:%d\n", ret);
+-
+-unset_vdd18:
+-	ret = regulator_set_voltage(er->vdd18, 0, EUSB2_1P8_VOL_MAX);
+-	if (ret)
+-		dev_err(er->ur.dev,
+-			"Unable to set (0) voltage for vdd18:%d\n", ret);
+-
+-put_vdd18_lpm:
+-	ret = regulator_set_load(er->vdd18, 0);
+-	if (ret < 0)
+-		dev_err(er->ur.dev, "Unable to set LPM of vdd18\n");
+-
+-err_vdd18:
+-	/* case handling when regulator turning on failed */
+-	if (!er->power_enabled)
+-		return -EINVAL;
+-
+-	er->power_enabled = false;
+-	dev_dbg(er->ur.dev, "eUSB2 repeater's regulators are turned OFF.\n");
+-	return ret;
++	return on ? onyx_usb_supplies_on(er->supplies, ARRAY_SIZE(er->supplies)) :
++		    onyx_usb_supplies_off(er->supplies, ARRAY_SIZE(er->supplies));
+ }
+ 
+ #define INIT_MAX_CNT 5
+ static int eusb2_repeater_init(struct usb_repeater *ur)
+ {
+ 	u8 status;
++	int ret;
+ 	struct eusb2_repeater *er =
+ 			container_of(ur, struct eusb2_repeater, ur);
+ 	unsigned int rptr_init_cnt = INIT_MAX_CNT;
+ 
+ 	/* override init sequence using devicetree based values */
+-	eusb2_repeater_update_seq(er, er->param_override_seq,
++	ret = eusb2_repeater_update_seq(er, er->param_override_seq,
+ 			er->param_override_seq_cnt);
+-
+-	if (ur->flags & PHY_HOST_MODE)
+-		eusb2_repeater_update_seq(er, er->host_param_override_seq,
++	if (ret)
++		return ret;
++
++	if (ur->flags & PHY_HOST_MODE) {
++		ret = eusb2_repeater_update_seq(er, er->host_param_override_seq,
+ 				er->host_param_override_seq_cnt);
++		if (ret)
++			return ret;
++	}
+ 
+ 	/* override tune params using debugfs based values */
+-	if (er->usb2_crossover <= 0x7)
+-		eusb2_repeater_masked_write(er, EUSB2_TUNE_USB2_CROSSOVER,
++	if (er->usb2_crossover <= 0x7) {
++		ret = eusb2_repeater_masked_write(er, EUSB2_TUNE_USB2_CROSSOVER,
+ 			TUNE_USB2_CROSSOVER_MASK, er->usb2_crossover);
+-
+-	if (er->iusb2 <= 0xf)
+-		eusb2_repeater_masked_write(er, EUSB2_TUNE_IUSB2,
++		if (ret)
++			return ret;
++	}
++
++	if (er->iusb2 <= 0xf) {
++		ret = eusb2_repeater_masked_write(er, EUSB2_TUNE_IUSB2,
+ 			TUNE_IUSB2_MASK, er->iusb2);
+-
+-	if (er->res_fsdif <= 0x7)
+-		eusb2_repeater_masked_write(er, EUSB2_TUNE_RES_FSDIF,
++		if (ret)
++			return ret;
++	}
++
++	if (er->res_fsdif <= 0x7) {
++		ret = eusb2_repeater_masked_write(er, EUSB2_TUNE_RES_FSDIF,
+ 			TUNE_RES_FSIDF_MASK, er->res_fsdif);
+-
+-	if (er->hsdisc <= 0x7)
+-		eusb2_repeater_masked_write(er, EUSB2_TUNE_HSDISC,
++		if (ret)
++			return ret;
++	}
++
++	if (er->hsdisc <= 0x7) {
++		ret = eusb2_repeater_masked_write(er, EUSB2_TUNE_HSDISC,
+ 			TUNE_HSDISC_MASK, er->hsdisc);
+-
+-	if (er->squelch_u <= 0x7)
+-		eusb2_repeater_masked_write(er, EUSB2_TUNE_SQUELCH_U,
++		if (ret)
++			return ret;
++	}
++
++	if (er->squelch_u <= 0x7) {
++		ret = eusb2_repeater_masked_write(er, EUSB2_TUNE_SQUELCH_U,
+ 			TUNE_SQELCH_U_MASK, er->squelch_u);
+-
+-	if (er->usb2_slew <= 0x3)
+-		eusb2_repeater_masked_write(er, EUSB2_TUNE_USB2_SLEW,
++		if (ret)
++			return ret;
++	}
++
++	if (er->usb2_slew <= 0x3) {
++		ret = eusb2_repeater_masked_write(er, EUSB2_TUNE_USB2_SLEW,
+ 			TUNE_USB2_SLEW_MASK, er->usb2_slew);
+-
+-	if (er->usb2_equ <= 0x3)
+-		eusb2_repeater_masked_write(er, EUSB2_TUNE_USB2_EQU,
++		if (ret)
++			return ret;
++	}
++
++	if (er->usb2_equ <= 0x3) {
++		ret = eusb2_repeater_masked_write(er, EUSB2_TUNE_USB2_EQU,
+ 			TUNE_USB2_EQU_MASK, er->usb2_equ);
+-
+-	if (er->usb2_preem <= 0x7)
+-		eusb2_repeater_masked_write(er, EUSB2_TUNE_USB2_PREEM,
++		if (ret)
++			return ret;
++	}
++
++	if (er->usb2_preem <= 0x7) {
++		ret = eusb2_repeater_masked_write(er, EUSB2_TUNE_USB2_PREEM,
+ 			TUNE_USB2_PREEM_MASK, er->usb2_preem);
+-
+-	if (er->hs_comp_current <= 0x3)
+-		eusb2_repeater_masked_write(er, EUSB2_TUNE_USB2_HS_COMP_CUR,
++		if (ret)
++			return ret;
++	}
++
++	if (er->hs_comp_current <= 0x3) {
++		ret = eusb2_repeater_masked_write(er, EUSB2_TUNE_USB2_HS_COMP_CUR,
+ 			TUNE_USB2_HS_COMP_CURRENT_MASK, er->hs_comp_current);
+-
+-	if (er->eusb_slew <= 0x3)
+-		eusb2_repeater_masked_write(er, EUSB2_TUNE_EUSB_SLEW,
++		if (ret)
++			return ret;
++	}
++
++	if (er->eusb_slew <= 0x3) {
++		ret = eusb2_repeater_masked_write(er, EUSB2_TUNE_EUSB_SLEW,
+ 			TUNE_EUSB_SLEW_MASK, er->eusb_slew);
+-
+-	if (er->eusb_equ <= 0x3)
+-		eusb2_repeater_masked_write(er, EUSB2_TUNE_EUSB_EQU,
++		if (ret)
++			return ret;
++	}
++
++	if (er->eusb_equ <= 0x3) {
++		ret = eusb2_repeater_masked_write(er, EUSB2_TUNE_EUSB_EQU,
+ 			TUNE_EUSB_EQU_MASK, er->eusb_equ);
+-
+-	if (er->eusb_hs_comp_current <= 0x3)
+-		eusb2_repeater_masked_write(er, EUSB2_TUNE_EUSB_HS_COMP_CUR,
++		if (ret)
++			return ret;
++	}
++
++	if (er->eusb_hs_comp_current <= 0x3) {
++		ret = eusb2_repeater_masked_write(er, EUSB2_TUNE_EUSB_HS_COMP_CUR,
+ 			TUNE_EUSB_HS_COMP_CUR_MASK, er->eusb_hs_comp_current);
++		if (ret)
++			return ret;
++	}
+ 	/*
+ 	 * CM.Lx is prohibited when repeater is already into Lx state as
+ 	 * per eUSB 1.2 Spec. Below implement software workaround until
+ 	 * PHY and controller is fixing seen observation.
+ 	 */
+ 	if (ur->flags & PHY_HOST_MODE) {
+-		eusb2_repeater_masked_write(er, EUSB2_FORCE_EN_5,
++		ret = eusb2_repeater_masked_write(er, EUSB2_FORCE_EN_5,
+ 			F_CLK_19P2M_EN, (1 << F_CLK_19P2M_EN_SHIFT));
+-		eusb2_repeater_masked_write(er, EUSB2_FORCE_VAL_5,
++		if (ret)
++			return ret;
++		ret = eusb2_repeater_masked_write(er, EUSB2_FORCE_VAL_5,
+ 			V_CLK_19P2M_EN, (1 << V_CLK_19P2M_EN_SHIFT));
++		if (ret)
++			return ret;
+ 	} else {
+ 		/*
+ 		 * In device mode clear host mode related workaround as there
+@@ -408,15 +360,21 @@
+ 		 * repeater doesn't clear previous value due to shared
+ 		 * regulators (say host <-> device mode switch).
+ 		 */
+-		eusb2_repeater_masked_write(er, EUSB2_FORCE_EN_5,
++		ret = eusb2_repeater_masked_write(er, EUSB2_FORCE_EN_5,
+ 			F_CLK_19P2M_EN, (0 << F_CLK_19P2M_EN_SHIFT));
+-		eusb2_repeater_masked_write(er, EUSB2_FORCE_VAL_5,
++		if (ret)
++			return ret;
++		ret = eusb2_repeater_masked_write(er, EUSB2_FORCE_VAL_5,
+ 			V_CLK_19P2M_EN, (0 << V_CLK_19P2M_EN_SHIFT));
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	/* Wait for RPTR_STATUS for OK */
+ 	do {
+-		eusb2_repeater_reg_read(er, &status, EUSB2_RPTR_STATUS, 1);
++		ret = eusb2_repeater_reg_read(er, &status, EUSB2_RPTR_STATUS, 1);
++		if (ret)
++			return ret;
+ 		if (status & RPTR_OK)
+ 			break;
+ 		usleep_range(10, 20);
+@@ -424,7 +382,7 @@
+ 
+ 	dev_info(er->ur.dev, "eUSB2 repeater status:%s\n",
+ 			(status & RPTR_OK) ? "OK" : "NOT OK");
+-	return 0;
++	return (status & RPTR_OK) ? 0 : -ETIMEDOUT;
+ }
+ 
+ static int eusb2_repeater_reset(struct usb_repeater *ur,
+@@ -435,9 +393,8 @@
+ 
+ 	dev_dbg(ur->dev, "eUSB2 repeater %s\n",
+ 		bring_out_of_reset ? "out of reset" : "hold into reset");
+-	eusb2_repeater_masked_write(er, EUSB2_EN_CTL1, EUSB2_RPTR_EN,
++	return eusb2_repeater_masked_write(er, EUSB2_EN_CTL1, EUSB2_RPTR_EN,
+ 		bring_out_of_reset ? EUSB2_RPTR_EN : 0x0);
+-	return 0;
+ }
+ 
+ static int eusb2_repeater_powerup(struct usb_repeater *ur)
+@@ -456,38 +413,47 @@
+ 	return eusb2_repeater_power(er, false);
+ }
+ 
++static int eusb2_repeater_validate_seq(const u32 *seq, unsigned int count)
++{
++	unsigned int i;
++
++	if (count % 2)
++		return -EINVAL;
++	for (i = 0; i < count; i += 2) {
++		if (seq[i] > U8_MAX || seq[i + 1] > U8_MAX)
++			return -EINVAL;
++	}
++	return 0;
++}
++
+ static int eusb2_repeater_read_overrides(struct device *dev, const char *prop,
+-		u32 **seq, u8 *seq_cnt)
+-{
+-	int num_elem, ret;
+-
+-	num_elem = of_property_count_elems_of_size(dev->of_node, prop, sizeof(**seq));
+-	if (num_elem > 0) {
+-		if (num_elem % 2) {
+-			dev_err(dev, "invalid len for %s\n", prop);
+-			return -EINVAL;
+-		}
+-
+-		*seq_cnt = num_elem;
+-		*seq = devm_kcalloc(dev, num_elem, sizeof(**seq), GFP_KERNEL);
+-		if (!*seq)
+-			return -ENOMEM;
+-
+-		ret = of_property_read_u32_array(dev->of_node, prop, *seq, num_elem);
+-		if (ret) {
+-			dev_err(dev, "%s read failed %d\n", prop, ret);
+-			return ret;
+-		}
+-	}
+-
+-	return 0;
++				       u32 **seq, unsigned int *seq_cnt)
++{
++	int count, ret;
++
++	if (!of_find_property(dev->of_node, prop, NULL))
++		return 0;
++	count = of_property_count_u32_elems(dev->of_node, prop);
++	if (count <= 0 || count % 2)
++		return -EINVAL;
++	*seq = devm_kcalloc(dev, count, sizeof(**seq), GFP_KERNEL);
++	if (!*seq)
++		return -ENOMEM;
++	ret = of_property_read_u32_array(dev->of_node, prop, *seq, count);
++	if (ret)
++		return ret;
++	ret = eusb2_repeater_validate_seq(*seq, count);
++	if (!ret)
++		*seq_cnt = count;
++	return ret;
+ }
+ 
+ static int eusb2_repeater_probe(struct platform_device *pdev)
+ {
+ 	struct eusb2_repeater *er;
+ 	struct device *dev = &pdev->dev;
+-	int ret = 0, base;
++	int ret = 0;
++	u32 base;
+ 
+ 	er = devm_kzalloc(dev, sizeof(*er), GFP_KERNEL);
+ 	if (!er) {
+@@ -508,6 +474,8 @@
+ 		goto err_probe;
+ 	}
+ 
++	if (base > U16_MAX - U8_MAX)
++		return -EINVAL;
+ 	er->reg_base = base;
+ 	er->vdd3 = devm_regulator_get(dev, "vdd3");
+ 	if (IS_ERR(er->vdd3)) {
+@@ -533,6 +501,14 @@
+ 	if (ret < 0)
+ 		goto err_probe;
+ 
++	er->supplies[0] = (struct onyx_usb_supply) {
++		.regulator = er->vdd18, .min_uv = EUSB2_1P8_VOL_MIN,
++		.max_uv = EUSB2_1P8_VOL_MAX, .load_ua = EUSB2_1P8_HPM_LOAD,
++	};
++	er->supplies[1] = (struct onyx_usb_supply) {
++		.regulator = er->vdd3, .min_uv = EUSB2_3P0_VOL_MIN,
++		.max_uv = EUSB2_3P0_VOL_MAX, .load_ua = EUSB2_3P0_HPM_LOAD,
++	};
+ 	er->ur.dev = dev;
+ 	platform_set_drvdata(pdev, er);
+ 
+@@ -542,28 +518,28 @@
+ 	er->ur.powerdown	= eusb2_repeater_powerdown;
+ 	er->ur.get_version	= eusb2_repeater_get_version;
+ 
++	eusb2_repeater_create_debugfs(er);
+ 	ret = usb_add_repeater_dev(&er->ur);
+-	if (ret)
+-		goto err_probe;
+-
+-	eusb2_repeater_create_debugfs(er);
++	if (ret) {
++		debugfs_remove_recursive(er->root);
++		goto err_probe;
++	}
+ 	return 0;
+ 
+ err_probe:
+ 	return ret;
+ }
+ 
+-static int eusb2_repeater_remove(struct platform_device *pdev)
++static void eusb2_repeater_remove(struct platform_device *pdev)
+ {
+ 	struct eusb2_repeater *er = platform_get_drvdata(pdev);
+ 
+ 	if (!er)
+-		return 0;
++		return;
+ 
+ 	debugfs_remove_recursive(er->root);
+ 	usb_remove_repeater_dev(&er->ur);
+ 	eusb2_repeater_power(er, false);
+-	return 0;
+ }
+ 
+ static const struct of_device_id eusb2_repeater_id_table[] = {
+--- a/drivers/usb/phy/phy-msm-snps-eusb2.c
++++ b/drivers/usb/phy/phy-msm-snps-eusb2.c
+@@ -19,11 +19,13 @@
+ #include <linux/firmware/qcom/qcom_scm.h>
+ #include <linux/reset.h>
+ #include <linux/slab.h>
++#include <linux/spinlock.h>
+ #include <linux/types.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/usb/dwc3-msm.h>
+ #include <linux/usb/phy.h>
+ #include <linux/usb/repeater.h>
++#include <linux/usb/onyx-power.h>
+ 
+ #define USB_PHY_UTMI_CTRL0		(0x3c)
+ #define OPMODE_MASK			(0x3 << 3)
+@@ -153,6 +155,7 @@
+ struct msm_eusb2_phy {
+ 	struct usb_phy		phy;
+ 	void __iomem		*base;
++	resource_size_t base_size;
+ 
+ 	/* EUD related parameters */
+ 	phys_addr_t		eud_reg;
+@@ -170,15 +173,18 @@
+ 	int			vdd_levels[3]; /* none, low, high */
+ 
+ 	bool			clocks_enabled;
+-	bool			power_enabled;
++	struct onyx_usb_supply supplies[3];
++	unsigned int supply_count;
+ 	bool			suspended;
+ 	bool			cable_connected;
+ 
+ 	struct power_supply	*usb_psy;
+ 	unsigned int		vbus_draw;
+ 	struct work_struct	vbus_draw_work;
+-
+-	int			*param_override_seq;
++	spinlock_t vbus_lock;
++	bool removing;
++
++	u32			*param_override_seq;
+ 	int			param_override_seq_cnt;
+ 
+ 	/* debugfs entries */
+@@ -201,23 +207,27 @@
+ 	return false;
+ }
+ 
+-static void msm_eusb2_phy_clocks(struct msm_eusb2_phy *phy, bool on)
+-{
+-	dev_dbg(phy->phy.dev, "clocks_enabled:%d on:%d\n",
+-			phy->clocks_enabled, on);
++static int msm_eusb2_phy_clocks(struct msm_eusb2_phy *phy, bool on)
++{
++	int ret;
+ 
+ 	if (phy->clocks_enabled == on)
+-		return;
+-
++		return 0;
+ 	if (on) {
+-		clk_prepare_enable(phy->ref_clk_src);
+-		clk_prepare_enable(phy->ref_clk);
++		ret = clk_prepare_enable(phy->ref_clk_src);
++		if (ret)
++			return ret;
++		ret = clk_prepare_enable(phy->ref_clk);
++		if (ret) {
++			clk_disable_unprepare(phy->ref_clk_src);
++			return ret;
++		}
+ 	} else {
+ 		clk_disable_unprepare(phy->ref_clk);
+ 		clk_disable_unprepare(phy->ref_clk_src);
+ 	}
+-
+ 	phy->clocks_enabled = on;
++	return 0;
+ }
+ 
+ static void msm_eusb2_phy_update_eud_detect(struct msm_eusb2_phy *phy, bool set)
+@@ -231,151 +241,21 @@
+ 
+ static int msm_eusb2_phy_power(struct msm_eusb2_phy *phy, bool on)
+ {
+-	int ret = 0;
+-
+-	dev_dbg(phy->phy.dev, "turn %s regulators. power_enabled:%d\n",
+-			on ? "on" : "off", phy->power_enabled);
+-
+-	if (phy->power_enabled == on)
+-		return 0;
+-
+-	if (!on)
+-		goto clear_eud_det;
+-
+-	ret = regulator_set_load(phy->vdd, USB_HSPHY_VDD_HPM_LOAD);
+-	if (ret < 0) {
+-		dev_err(phy->phy.dev, "Unable to set HPM of vdd:%d\n", ret);
+-		goto err_vdd;
+-	}
+-
+-	ret = regulator_set_voltage(phy->vdd, phy->vdd_levels[1],
+-				    phy->vdd_levels[2]);
+-	if (ret) {
+-		dev_err(phy->phy.dev, "Unable to set voltage for hsusb vdd\n");
+-		goto put_vdd_lpm;
+-	}
+-
+-	ret = regulator_enable(phy->vdd);
+-	if (ret) {
+-		dev_err(phy->phy.dev, "Unable to enable VDD\n");
+-		goto unconfig_vdd;
+-	}
+-
+-	ret = regulator_set_load(phy->vdda12, USB_HSPHY_1P2_HPM_LOAD);
+-	if (ret < 0) {
+-		dev_err(phy->phy.dev, "Unable to set HPM of vdda12:%d\n", ret);
+-		goto disable_vdd;
+-	}
+-
+-	ret = regulator_set_voltage(phy->vdda12, USB_HSPHY_1P2_VOL_MIN,
+-						USB_HSPHY_1P2_VOL_MAX);
+-	if (ret) {
+-		dev_err(phy->phy.dev,
+-				"Unable to set voltage for vdda12:%d\n", ret);
+-		goto put_vdda12_lpm;
+-	}
+-
+-	ret = regulator_enable(phy->vdda12);
+-	if (ret) {
+-		dev_err(phy->phy.dev, "Unable to enable vdda12:%d\n", ret);
+-		goto unset_vdda12;
+-	}
+-
+-	if (phy->vdd_refgen) {
+-		ret = regulator_set_load(phy->vdd_refgen, USB_HSPHY_VDD_HPM_LOAD);
+-		if (ret < 0) {
+-			dev_err(phy->phy.dev, "Unable to set HPM of vdd_refgen:%d\n", ret);
+-			goto disable_vdda12;
+-		}
+-
+-		ret = regulator_set_voltage(phy->vdd_refgen, phy->vdd_levels[1],
+-					phy->vdd_levels[2]);
+-		if (ret) {
+-			dev_err(phy->phy.dev,
+-				"Unable to set voltage for hsusb vdd_refgen\n");
+-			goto put_vdd_refgen_lpm;
+-		}
+-
+-		ret = regulator_enable(phy->vdd_refgen);
+-		if (ret) {
+-			dev_err(phy->phy.dev, "Unable to enable VDD refgen\n");
+-			goto unconfig_vdd_refgen;
+-		}
+-	}
+-	/* Make sure all the writes are processed before setting EUD_DETECT */
++	int ret;
++
++	if (!on) {
++		msm_eusb2_phy_update_eud_detect(phy, false);
++		/* Put EUD in reset before removing the PHY power votes. */
++		mb();
++		return onyx_usb_supplies_off(phy->supplies, phy->supply_count);
++	}
++	ret = onyx_usb_supplies_on(phy->supplies, phy->supply_count);
++	if (ret)
++		return ret;
++	/* Release EUD reset only after all PHY rails are powered. */
+ 	mb();
+-	/* Set eud_detect_reg after powering on eUSB PHY rails to bring EUD out of reset */
+ 	msm_eusb2_phy_update_eud_detect(phy, true);
+-
+-	phy->power_enabled = true;
+-	pr_debug("eUSB2_PHY's regulators are turned ON.\n");
+-	return ret;
+-
+-clear_eud_det:
+-	/* Clear eud_detect_reg to put EUD in reset */
+-	msm_eusb2_phy_update_eud_detect(phy, false);
+-
+-	/* Make sure clearing EUD_DETECT is completed before turning off the regulators */
+-	mb();
+-
+-	if (phy->vdd_refgen) {
+-		ret = regulator_disable(phy->vdd_refgen);
+-		if (ret)
+-			dev_err(phy->phy.dev, "Unable to disable vdd_refgen:%d\n", ret);
+-
+-unconfig_vdd_refgen:
+-		ret = regulator_set_voltage(phy->vdd_refgen, phy->vdd_levels[0],
+-				    phy->vdd_levels[2]);
+-		if (ret)
+-			dev_err(phy->phy.dev,
+-				"unable to set voltage for hsusb vdd_refgen\n");
+-
+-put_vdd_refgen_lpm:
+-		ret = regulator_set_load(phy->vdd_refgen, 0);
+-		if (ret < 0)
+-			dev_err(phy->phy.dev, "Unable to set LPM of vdd_refgen\n");
+-	}
+-
+-disable_vdda12:
+-	ret = regulator_disable(phy->vdda12);
+-	if (ret)
+-		dev_err(phy->phy.dev, "Unable to disable vdda12:%d\n", ret);
+-
+-unset_vdda12:
+-	ret = regulator_set_voltage(phy->vdda12, 0, USB_HSPHY_1P2_VOL_MAX);
+-	if (ret)
+-		dev_err(phy->phy.dev,
+-			"Unable to set (0) voltage for vdda12:%d\n", ret);
+-
+-put_vdda12_lpm:
+-	ret = regulator_set_load(phy->vdda12, 0);
+-	if (ret < 0)
+-		dev_err(phy->phy.dev, "Unable to set LPM of vdda12\n");
+-
+-disable_vdd:
+-	ret = regulator_disable(phy->vdd);
+-	if (ret)
+-		dev_err(phy->phy.dev, "Unable to disable vdd:%d\n", ret);
+-
+-unconfig_vdd:
+-	ret = regulator_set_voltage(phy->vdd, phy->vdd_levels[0],
+-				    phy->vdd_levels[2]);
+-	if (ret)
+-		dev_err(phy->phy.dev, "unable to set voltage for hsusb vdd\n");
+-
+-put_vdd_lpm:
+-	ret = regulator_set_load(phy->vdd, 0);
+-	if (ret < 0)
+-		dev_err(phy->phy.dev, "Unable to set LPM of vdd\n");
+-
+-	/* case handling when regulator turning on failed */
+-	if (!phy->power_enabled)
+-		return -EINVAL;
+-
+-err_vdd:
+-	phy->power_enabled = false;
+-	dev_dbg(phy->phy.dev, "eusb2_PHY's regulators are turned OFF.\n");
+-	return ret;
++	return 0;
+ }
+ 
+ static void msm_eusb2_write_readback(void __iomem *base, u32 offset,
+@@ -413,12 +293,12 @@
+ 
+ 	/* poll for cmd completion */
+ 	ret = readl_poll_timeout(phy->base + USB_PHY_APB_ACCESS_STATUS,
+-			val, APB_READ_ACCESS_DONE,
++			val, val & APB_READ_ACCESS_DONE,
+ 			APB_ACCESS_POLL_DELAY, APB_ACCESS_TIMEOUT);
+ 	if (ret < 0) {
+ 		dev_err(phy->phy.dev, "APB_ACCESS_STAUS(%x) timeout\n", val);
+ 		eusb2_phy_reset_seq(phy);
+-		return val;
++		return ret;
+ 	}
+ 
+ 	return 0;
+@@ -501,8 +381,11 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (copy_from_user(&buf, ubuf, min_t(size_t, sizeof(buf) - 1, count)))
++	if (!count || count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, count))
+ 		return -EFAULT;
++	buf[count] = '\0';
+ 
+ 	/*
+ 	 * For reading APB register: read <offset> e.g. read 0x33
+@@ -562,6 +445,7 @@
+ 	pr_info("To write APB register: write <offset> <value>\n");
+ 	pr_info("Valid range for offset: 0x00 - 0xFF\n");
+ 	pr_info("Valid range for value: 0x0000 - 0xFFFF\n");
++	return -EINVAL;
+ 
+ done:
+ 	return count;
+@@ -573,19 +457,15 @@
+ 	.release		= single_release,
+ };
+ 
+-static void msm_eusb2_phy_reset(struct msm_eusb2_phy *phy)
++static int msm_eusb2_phy_reset(struct msm_eusb2_phy *phy)
+ {
+ 	int ret;
+ 
+ 	ret = reset_control_assert(phy->phy_reset);
+ 	if (ret)
+-		dev_err(phy->phy.dev, "phy reset assert failed\n");
+-
++		return ret;
+ 	usleep_range(100, 150);
+-
+-	ret = reset_control_deassert(phy->phy_reset);
+-	if (ret)
+-		dev_err(phy->phy.dev, "phy reset deassert failed\n");
++	return reset_control_deassert(phy->phy_reset);
+ }
+ 
+ static void eusb2_phy_write_seq(void __iomem *base, u32 *seq, int cnt)
+@@ -652,7 +532,7 @@
+ 			(phy->tx_xv << PHY_CFG_TX_HS_XV_TUNE_SHIFT));
+ }
+ 
+-static void msm_eusb2_ref_clk_init(struct usb_phy *uphy)
++static int msm_eusb2_ref_clk_init(struct usb_phy *uphy)
+ {
+ 	unsigned long ref_clk_freq;
+ 	struct msm_eusb2_phy *phy = container_of(uphy, struct msm_eusb2_phy, phy);
+@@ -682,31 +562,29 @@
+ 	default:
+ 		dev_err(uphy->dev, "unsupported ref_clk_freq:%lu\n",
+ 						ref_clk_freq);
++		return -EINVAL;
+ 	}
+ 
+ 	msm_eusb2_write_readback(phy->base, USB_PHY_CFG_CTRL_3,
+ 			PHY_CFG_PLL_REF_DIV, PLL_REF_DIV_VAL);
++	return 0;
+ }
+ 
+ static int msm_eusb2_repeater_reset_and_init(struct msm_eusb2_phy *phy)
+ {
+ 	int ret;
+ 
+-	if (phy->ur)
+-		phy->ur->flags = phy->phy.flags;
+-
++	phy->ur->flags = phy->phy.flags;
+ 	ret = usb_repeater_powerup(phy->ur);
+ 	if (ret)
+-		dev_err(phy->phy.dev, "repeater powerup failed.\n");
+-
++		return ret;
+ 	ret = usb_repeater_reset(phy->ur, true);
+-	if (ret)
+-		dev_err(phy->phy.dev, "repeater reset failed.\n");
+-
+-	ret = usb_repeater_init(phy->ur);
+-	if (ret)
+-		dev_err(phy->phy.dev, "repeater init failed.\n");
+-
++	if (!ret)
++		ret = usb_repeater_init(phy->ur);
++	if (ret) {
++		usb_repeater_reset(phy->ur, false);
++		usb_repeater_powerdown(phy->ur);
++	}
+ 	return ret;
+ }
+ 
+@@ -715,31 +593,26 @@
+ 	struct msm_eusb2_phy *phy = container_of(uphy, struct msm_eusb2_phy, phy);
+ 	int ret;
+ 
+-	dev_dbg(uphy->dev, "phy_flags:%x\n", phy->phy.flags);
+-	if (is_eud_debug_mode_active(phy)) {
+-		/* if in host mode, disable EUD debug mode */
+-		if (phy->phy.flags & PHY_HOST_MODE) {
+-			qcom_scm_io_writel(phy->eud_reg, 0x0);
+-			phy->re_enable_eud = true;
+-		} else {
+-			msm_eusb2_phy_power(phy, true);
+-			msm_eusb2_phy_clocks(phy, true);
+-			return msm_eusb2_repeater_reset_and_init(phy);
+-		}
+-	}
+-
++	if (is_eud_debug_mode_active(phy) && (phy->phy.flags & PHY_HOST_MODE)) {
++		ret = qcom_scm_io_writel(phy->eud_reg, 0);
++		if (ret)
++			return ret;
++		phy->re_enable_eud = true;
++	}
+ 	ret = msm_eusb2_phy_power(phy, true);
+ 	if (ret)
+ 		return ret;
+-
+-	/* Bring eUSB2 repeater out of reset and initialized before eUSB2 PHY */
+ 	ret = msm_eusb2_repeater_reset_and_init(phy);
+ 	if (ret)
+-		return ret;
+-
+-	msm_eusb2_phy_clocks(phy, true);
+-
+-	msm_eusb2_phy_reset(phy);
++		goto power_off;
++	ret = msm_eusb2_phy_clocks(phy, true);
++	if (ret)
++		goto repeater_off;
++	if (is_eud_debug_mode_active(phy))
++		return 0;
++	ret = msm_eusb2_phy_reset(phy);
++	if (ret)
++		goto clocks_off;
+ 
+ 	msm_eusb2_write_readback(phy->base, USB_PHY_CFG0,
+ 			CMN_CTRL_OVERRIDE_EN, CMN_CTRL_OVERRIDE_EN);
+@@ -760,7 +633,9 @@
+ 			FSEL_SEL, FSEL_SEL);
+ 
+ 	/* update ref_clk related registers */
+-	msm_eusb2_ref_clk_init(uphy);
++	ret = msm_eusb2_ref_clk_init(uphy);
++	if (ret)
++		goto clocks_off;
+ 
+ 	msm_eusb2_write_readback(phy->base, USB_PHY_CFG_CTRL_1,
+ 			PHY_CFG_PLL_CPBIAS_CNTRL,
+@@ -812,11 +687,20 @@
+ 	msm_eusb2_write_readback(phy->base, USB_PHY_CFG0,
+ 			CMN_CTRL_OVERRIDE_EN, 0x00);
+ 	return 0;
++clocks_off:
++	msm_eusb2_phy_clocks(phy, false);
++repeater_off:
++	usb_repeater_reset(phy->ur, false);
++	usb_repeater_powerdown(phy->ur);
++power_off:
++	msm_eusb2_phy_power(phy, false);
++	return ret;
+ }
+ 
+ static int msm_eusb2_phy_set_suspend(struct usb_phy *uphy, int suspend)
+ {
+ 	struct msm_eusb2_phy *phy = container_of(uphy, struct msm_eusb2_phy, phy);
++	int ret;
+ 
+ 	if (phy->suspended && suspend) {
+ 		dev_dbg(uphy->dev, "USB PHY is already suspended\n");
+@@ -835,7 +719,9 @@
+ 		/* Cable disconnect handling */
+ 		if (phy->re_enable_eud) {
+ 			dev_dbg(uphy->dev, "re-enabling EUD\n");
+-			qcom_scm_io_writel(phy->eud_reg, 0x1);
++			ret = qcom_scm_io_writel(phy->eud_reg, 0x1);
++			if (ret)
++				return ret;
+ 			phy->re_enable_eud = false;
+ 		}
+ 
+@@ -844,15 +730,27 @@
+ 			goto suspend_exit;
+ 
+ 		msm_eusb2_phy_clocks(phy, false);
+-		msm_eusb2_phy_power(phy, false);
++		ret = msm_eusb2_phy_power(phy, false);
++		if (ret)
++			return ret;
+ 
+ 		/* Hold repeater into reset after powering down PHY */
+-		usb_repeater_reset(phy->ur, false);
+-		usb_repeater_powerdown(phy->ur);
++		ret = usb_repeater_reset(phy->ur, false);
++		if (ret)
++			return ret;
++		ret = usb_repeater_powerdown(phy->ur);
++		if (ret)
++			return ret;
+ 	} else {
+ 		/* Bus resume and cable connect handling */
+-		msm_eusb2_phy_power(phy, true);
+-		msm_eusb2_phy_clocks(phy, true);
++		ret = msm_eusb2_phy_power(phy, true);
++		if (ret)
++			return ret;
++		ret = msm_eusb2_phy_clocks(phy, true);
++		if (ret) {
++			msm_eusb2_phy_power(phy, false);
++			return ret;
++		}
+ 	}
+ 
+ suspend_exit:
+@@ -865,7 +763,7 @@
+ {
+ 	struct msm_eusb2_phy *phy = container_of(uphy, struct msm_eusb2_phy, phy);
+ 
+-	phy->cable_connected = true;
++	WRITE_ONCE(phy->cable_connected, true);
+ 
+ 	/*
+ 	 * SW WA for CV9 RESET DEVICE TEST(TD 9.23) compliance test failure.
+@@ -902,7 +800,7 @@
+ 		msm_eusb2_phy_update_eud_detect(phy, true);
+ 	}
+ 
+-	phy->cable_connected = false;
++	WRITE_ONCE(phy->cable_connected, false);
+ 	return 0;
+ }
+ 
+@@ -923,7 +821,7 @@
+ 
+ 	dev_info(phy->phy.dev, "Avail curr from USB = %u\n", phy->vbus_draw);
+ 	/* Set max current limit in uA */
+-	val.intval = 1000 * phy->vbus_draw;
++	val.intval = 1000 * READ_ONCE(phy->vbus_draw);
+ 	ret = power_supply_set_property(phy->usb_psy,
+ 			POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT, &val);
+ 	if (ret) {
+@@ -935,13 +833,20 @@
+ static int msm_eusb2_phy_set_power(struct usb_phy *uphy, unsigned int mA)
+ {
+ 	struct msm_eusb2_phy *phy = container_of(uphy, struct msm_eusb2_phy, phy);
+-
+-	if (phy->cable_connected && (mA == 0))
+-		return 0;
+-
+-	phy->vbus_draw = mA;
+-	schedule_work(&phy->vbus_draw_work);
+-
++	unsigned long flags;
++
++	if (mA > INT_MAX / 1000)
++		return -ERANGE;
++	spin_lock_irqsave(&phy->vbus_lock, flags);
++	if (phy->removing) {
++		spin_unlock_irqrestore(&phy->vbus_lock, flags);
++		return -ENODEV;
++	}
++	if (!READ_ONCE(phy->cable_connected) || mA) {
++		WRITE_ONCE(phy->vbus_draw, mA);
++		schedule_work(&phy->vbus_draw_work);
++	}
++	spin_unlock_irqrestore(&phy->vbus_lock, flags);
+ 	return 0;
+ }
+ 
+@@ -961,6 +866,19 @@
+ 					&apb_reg_rw_fops);
+ }
+ 
++static int msm_eusb2_validate_seq(const u32 *seq, unsigned int count, resource_size_t size)
++{
++	unsigned int i;
++
++	if (count % 2 || size < sizeof(u32))
++		return -EINVAL;
++	for (i = 0; i < count; i += 2) {
++		if (!IS_ALIGNED(seq[i + 1], sizeof(u32)) || seq[i + 1] > size - sizeof(u32))
++			return -EINVAL;
++	}
++	return 0;
++}
++
+ static int msm_eusb2_phy_probe(struct platform_device *pdev)
+ {
+ 	struct msm_eusb2_phy *phy;
+@@ -989,6 +907,7 @@
+ 		goto err_ret;
+ 	}
+ 
++	phy->base_size = resource_size(res);
+ 	phy->base = devm_ioremap_resource(dev, res);
+ 	if (IS_ERR(phy->base)) {
+ 		dev_err(dev, "ioremap failed\n");
+@@ -1066,18 +985,18 @@
+ 	if (of_property_read_bool(dev->of_node, "vdd_refgen-supply")) {
+ 		phy->vdd_refgen = devm_regulator_get_optional(dev, "vdd_refgen");
+ 		if (IS_ERR(phy->vdd_refgen)) {
+-			phy->vdd_refgen = NULL;
+-			dev_err(dev, "unable to get refgen supply\n");
++			ret = PTR_ERR(phy->vdd_refgen);
++			goto err_ret;
+ 		}
+ 	}
+ 
+-	phy->param_override_seq_cnt = of_property_count_elems_of_size(
+-					dev->of_node, "qcom,param-override-seq",
+-					sizeof(*phy->param_override_seq));
+-	if (phy->param_override_seq_cnt % 2) {
+-		dev_err(dev, "invalid param_override_seq_len\n");
+-		ret = -EINVAL;
+-		goto err_ret;
++	if (of_find_property(dev->of_node, "qcom,param-override-seq", NULL)) {
++		phy->param_override_seq_cnt = of_property_count_u32_elems(dev->of_node,
++								 "qcom,param-override-seq");
++		if (phy->param_override_seq_cnt <= 0 || phy->param_override_seq_cnt % 2) {
++			ret = -EINVAL;
++			goto err_ret;
++		}
+ 	}
+ 
+ 	if (phy->param_override_seq_cnt > 0) {
+@@ -1101,6 +1020,25 @@
+ 		}
+ 	}
+ 
++	ret = msm_eusb2_validate_seq(phy->param_override_seq,
++				   phy->param_override_seq_cnt, phy->base_size);
++	if (ret)
++		goto err_ret;
++	phy->supplies[0] = (struct onyx_usb_supply) {
++		.regulator = phy->vdd, .min_uv = phy->vdd_levels[1],
++		.max_uv = phy->vdd_levels[2], .off_uv = phy->vdd_levels[0],
++		.load_ua = USB_HSPHY_VDD_HPM_LOAD,
++	};
++	phy->supplies[1] = (struct onyx_usb_supply) {
++		.regulator = phy->vdda12, .min_uv = USB_HSPHY_1P2_VOL_MIN,
++		.max_uv = USB_HSPHY_1P2_VOL_MAX, .load_ua = USB_HSPHY_1P2_HPM_LOAD,
++	};
++	phy->supply_count = 2;
++	if (phy->vdd_refgen) {
++		phy->supplies[2] = phy->supplies[0];
++		phy->supplies[2].regulator = phy->vdd_refgen;
++		phy->supply_count++;
++	}
+ 	phy->ur = ur;
+ 	phy->phy.dev = dev;
+ 	platform_set_drvdata(pdev, phy);
+@@ -1112,6 +1050,7 @@
+ 	phy->phy.set_power		= msm_eusb2_phy_set_power;
+ 	phy->phy.type			= USB_PHY_TYPE_USB2;
+ 
++	spin_lock_init(&phy->vbus_lock);
+ 	INIT_WORK(&phy->vbus_draw_work, msm_eusb2_phy_vbus_draw_work);
+ 	msm_eusb2_phy_create_debugfs(phy);
+ 
+@@ -1121,36 +1060,43 @@
+ 	 * keep LDOs, clocks and repeater on here.
+ 	 */
+ 	if (is_eud_debug_mode_active(phy)) {
+-		msm_eusb2_phy_power(phy, true);
+-		msm_eusb2_phy_clocks(phy, true);
+-		msm_eusb2_repeater_reset_and_init(phy);
++		ret = msm_eusb2_phy_init(&phy->phy);
++		if (ret)
++			goto cleanup;
+ 	}
+ 
+ 	/* Placed at the end to ensure the probe is complete */
+ 	ret = usb_add_phy_dev(&phy->phy);
+-
++	if (!ret)
++		return 0;
++cleanup:
++	debugfs_remove_recursive(phy->root);
++	cancel_work_sync(&phy->vbus_draw_work);
++	msm_eusb2_phy_clocks(phy, false);
++	msm_eusb2_phy_power(phy, false);
++	usb_repeater_reset(phy->ur, false);
++	usb_repeater_powerdown(phy->ur);
+ err_ret:
+ 	return ret;
+ }
+ 
+-static int msm_eusb2_phy_remove(struct platform_device *pdev)
++static void msm_eusb2_phy_remove(struct platform_device *pdev)
+ {
+ 	struct msm_eusb2_phy *phy = platform_get_drvdata(pdev);
+-
+-	if (!phy)
+-		return 0;
+-
+-	flush_work(&phy->vbus_draw_work);
++	unsigned long flags;
++
++	spin_lock_irqsave(&phy->vbus_lock, flags);
++	phy->removing = true;
++	spin_unlock_irqrestore(&phy->vbus_lock, flags);
++	usb_remove_phy(&phy->phy);
++	debugfs_remove_recursive(phy->root);
++	cancel_work_sync(&phy->vbus_draw_work);
+ 	if (phy->usb_psy)
+ 		power_supply_put(phy->usb_psy);
+-
+-	debugfs_remove_recursive(phy->root);
+-	usb_remove_phy(&phy->phy);
+-	clk_disable_unprepare(phy->ref_clk);
+-	clk_disable_unprepare(phy->ref_clk_src);
+ 	msm_eusb2_phy_clocks(phy, false);
+ 	msm_eusb2_phy_power(phy, false);
+-	return 0;
++	usb_repeater_reset(phy->ur, false);
++	usb_repeater_powerdown(phy->ur);
+ }
+ 
+ static const struct of_device_id msm_usb_id_table[] = {
+--- a/include/linux/usb/dwc3-msm.h
++++ b/include/linux/usb/dwc3-msm.h
+@@ -291,7 +291,7 @@
+ int msm_ep_set_mode(struct usb_ep *ep, enum usb_hw_ep_mode mode);
+ int dwc3_core_stop_hw_active_transfers(struct dwc3 *dwc);
+ #else
+-void dwc3_msm_notify_event(struct dwc3 *dwc,
++static inline void dwc3_msm_notify_event(struct dwc3 *dwc,
+ 		enum dwc3_notify_event event, unsigned int value)
+ { }
+ static inline int usb_gsi_ep_op(struct usb_ep *ep, void *op_data,
+@@ -314,13 +314,13 @@
+ { return -ENODEV; }
+ static inline int dwc3_msm_release_ss_lane(struct device *dev)
+ { return -ENODEV; }
+-int msm_ep_update_ops(struct usb_ep *ep)
+-{ return -ENODEV; }
+-int msm_ep_clear_ops(struct usb_ep *ep)
+-{ return -ENODEV; }
+-int msm_ep_set_mode(struct usb_ep *ep, enum usb_hw_ep_mode mode)
+-{ return -ENODEV; }
+-inline int dwc3_core_stop_hw_active_transfers(struct dwc3 *dwc)
++static inline int msm_ep_update_ops(struct usb_ep *ep)
++{ return -ENODEV; }
++static inline int msm_ep_clear_ops(struct usb_ep *ep)
++{ return -ENODEV; }
++static inline int msm_ep_set_mode(struct usb_ep *ep, enum usb_hw_ep_mode mode)
++{ return -ENODEV; }
++static inline int dwc3_core_stop_hw_active_transfers(struct dwc3 *dwc)
+ { return 0; }
+ #endif
+ 
+--- /dev/null
++++ b/include/linux/usb/onyx-power.h
+@@ -0,0 +1,73 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __LINUX_USB_ONYX_POWER_H
++#define __LINUX_USB_ONYX_POWER_H
++
++#include <linux/regulator/consumer.h>
++
++struct onyx_usb_supply {
++	struct regulator *regulator;
++	int min_uv, max_uv, off_uv, load_ua;
++	bool enabled, voltage_set, load_set;
++};
++
++/* Keep failed cleanup votes recorded so a later shutdown can retry them. */
++static inline int onyx_usb_supplies_off(struct onyx_usb_supply *s, unsigned int count)
++{
++	int ret, error = 0;
++
++	while (count--) {
++		struct onyx_usb_supply *rail = &s[count];
++
++		if (rail->enabled) {
++			ret = regulator_disable(rail->regulator);
++			if (ret)
++				return error ?: ret;
++			rail->enabled = false;
++		}
++		if (rail->voltage_set) {
++			ret = regulator_set_voltage(rail->regulator, rail->off_uv, rail->max_uv);
++			if (!ret)
++				rail->voltage_set = false;
++			else if (!error)
++				error = ret;
++		}
++		if (rail->load_set) {
++			ret = regulator_set_load(rail->regulator, 0);
++			if (ret >= 0)
++				rail->load_set = false;
++			else if (!error)
++				error = ret;
++		}
++	}
++	return error;
++}
++
++/* Preserve the vendor's sequential rail order and the first enable error. */
++static inline int onyx_usb_supplies_on(struct onyx_usb_supply *s, unsigned int count)
++{
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < count; i++) {
++		if (s[i].enabled)
++			continue;
++		ret = regulator_set_load(s[i].regulator, s[i].load_ua);
++		if (ret < 0)
++			goto failed;
++		s[i].load_set = true;
++		ret = regulator_set_voltage(s[i].regulator, s[i].min_uv, s[i].max_uv);
++		if (ret)
++			goto failed;
++		s[i].voltage_set = true;
++		ret = regulator_enable(s[i].regulator);
++		if (ret)
++			goto failed;
++		s[i].enabled = true;
++	}
++	return 0;
++failed:
++	onyx_usb_supplies_off(s, count);
++	return ret;
++}
++
++#endif /* __LINUX_USB_ONYX_POWER_H */

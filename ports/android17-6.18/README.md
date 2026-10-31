@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 111 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 115 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 111 platform `.ko` files, their symbol tables and DDK configurations.
+- 115 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 5121
-imported symbol CRCs across all 111 modules.
+used. The current [validation report](validation-20261031.json) checks 5264
+imported symbol CRCs across all 115 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -660,3 +660,32 @@ its `cqhci` helper are not required. The builder asserts that disabled state.
 The port still needs the applicable second-stage and peripheral modules,
 matching boot/vendor_boot/DLKM images, custom features and installer validation;
 the current DT images alone are not a flashable package.
+
+
+## USB PHY and repeater
+
+The USB foundation adds the vendor repeater framework, PMIC eUSB2 repeater,
+Synopsys eUSB2 PHY and pinned common generic PHY. Managed repeater references
+retain device/module ownership snapshots and a supplier link; registration and
+lookup serialize. Power helpers retain individual load, voltage and enable
+votes, unwind in reverse order, and preserve failed cleanup for retry.
+
+The drivers propagate clock, reset, register I/O and initialization failures.
+DT register sequences validate counts, values, alignment and MMIO bounds. APB
+polling tests the returned status bit and reports timeouts. Debugfs input is
+bounded and terminated. Removal unregisters the PHY before draining charging
+work and releasing its power-supply reference; current updates reject teardown
+and overflow.
+
+`verify_usb_phy.py WORKSPACE` exercises actual staged helpers with simulated
+services under AddressSanitizer and UndefinedBehaviorSanitizer. The
+[recorded result](usb-phy-validation-20261031.json) covers 579 power failure
+pairs, 787,969 DT sequence cases, 312 repeater I/O/status cases, clock failures,
+APB polling, charging-work teardown and managed-reference release. It does not
+execute kernel device links, workqueues, USB enumeration or hardware.
+
+The full 115-module build passes 5,264 imported-symbol CRC checks without
+kernel compiler or modpost warnings; the adaptation passes checkpatch. Both
+device-tree overlay checks also pass, with the unchanged vendor DTC warnings
+recorded separately. The USB controller, its charging services and other
+peripheral drivers still need porting before image assembly.

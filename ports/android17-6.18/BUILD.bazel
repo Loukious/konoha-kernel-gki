@@ -1449,6 +1449,53 @@ ddk_module(
     kernel_build = "//common:kernel_aarch64",
 )
 
+ddk_headers(
+    name = "usb_phy_headers",
+    hdrs = ["include/linux/usb/repeater.h", "include/linux/usb/dwc3-msm.h",
+            "include/linux/usb/onyx-power.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "usb_repeater",
+    srcs = ["drivers/usb/repeater/repeater.c"],
+    out = "repeater.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":usb_phy_headers"],
+)
+
+ddk_module(
+    name = "eusb2_repeater",
+    srcs = ["drivers/usb/repeater/repeater-qti-pmic-eusb2.c"],
+    out = "repeater-qti-pmic-eusb2.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":usb_phy_headers", ":usb_repeater"],
+)
+
+ddk_module(
+    name = "msm_eusb2_phy",
+    srcs = ["drivers/usb/phy/phy-msm-snps-eusb2.c"],
+    out = "phy-msm-snps-eusb2.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":usb_phy_headers", ":usb_repeater", ":qcom_scm"],
+)
+
+ddk_module(
+    name = "usb_phy_generic",
+    srcs = ["drivers/usb/phy/phy-generic.c", "drivers/usb/phy/phy-generic.h"],
+    out = "phy-generic.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1547,6 +1594,10 @@ kernel_module_group(
         ":thermal_pause",
         ":cpu_hotplug",
         ":sg",
+        ":usb_repeater",
+        ":eusb2_repeater",
+        ":msm_eusb2_phy",
+        ":usb_phy_generic",
         ":nvmem_qfprom",
         ":qcom_cpufreq_thermal",
         ":qcom_cpufreq_hw",
