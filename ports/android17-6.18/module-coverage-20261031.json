@@ -6,8 +6,8 @@
     "/home/loukious/Android/custom-rom/out/target/product/onyx/vendor_dlkm/lib/modules/modules.load": "71ddc08a21c19c67a0f5a12fac978ccae626b64adc10b244309764ca7afb24b8"
   },
   "vendor_names": 466,
-  "built_vendor_names": 256,
-  "percent": 54.9,
+  "built_vendor_names": 258,
+  "percent": 55.4,
   "built_extra_names": [
     "deferred-free-helper",
     "onyx_relay",
@@ -85,9 +85,7 @@
     "leds-awrgb21024",
     "leds-qcom-flash",
     "leds-qcom-lpg",
-    "leds-qti-flash",
     "llcc_heuristics",
-    "lpass_cdc_dlkm",
     "lpass_cdc_rx_macro_dlkm",
     "lpass_cdc_tx_macro_dlkm",
     "lpass_cdc_va_macro_dlkm",
@@ -241,6 +239,8 @@
     "Relay requires clients to quiesce producers before close and file-removal callbacks to withdraw and drain new opens. Host tests cover ownership and hotplug serialization but do not establish actual kernel CPU-hotplug or VFS behavior.",
     "WCD core requires codec consumers to withdraw/drain borrowed IRQ-domain pointers and free nested handlers before wcd_irq_exit. Its supply helpers require caller serialization and balanced votes. Host tests do not establish hardware IRQ, regulator, DSP or playback behavior.",
     "LPASS BT parent requires consumers to release SoundWire references before controller/parent teardown. Type-C audio requires matching typec_analog_acc_exit before component/card destruction; LPASS CDC consumer integration remains pending. Clock forced teardown with exposed consumers or failed hardware release is quarantined, not claimed recoverable. No hardware audio/clock validation.",
-    "SLIMbus/NGD/Bluetooth preserve ROM dependencies; saved Onyx DT disables NGD and WCN7750 uses SoundWire. Removal drains software references; logged hardware stream-cleanup failures may need firmware/bus reset. Host tests do not validate real DMA/IRQ/SSR/SLIM hardware."
+    "SLIMbus/NGD/Bluetooth preserve ROM dependencies; saved Onyx DT disables NGD and WCN7750 uses SoundWire. Removal drains software references; logged hardware stream-cleanup failures may need firmware/bus reset. Host tests do not validate real DMA/IRQ/SSR/SLIM hardware.",
+    "LPASS CDC now owns Type-C cleanup before component/card destruction. Macro/codec consumers must balance registration and drain callbacks before removal; native borrowed device getters require provider lifetime serialization. Host tests do not establish live DSP, audio or SSR behavior.",
+    "Camera flash provider preserves the native disabled QTI_BATTERY_CHARGER contract: battery-resistance queries can return EINVAL. Software tests cover publication, timer/work and register failures; physical current, timing and shutdown on bus failure remain unvalidated."
   ]
 }

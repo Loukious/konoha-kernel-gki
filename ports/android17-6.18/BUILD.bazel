@@ -3433,6 +3433,41 @@ ddk_module(
 )
 
 
+ddk_headers(
+    name = "audio_lpasscdc_headers",
+    hdrs = ["qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/internal.h", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-clk-rsc.h", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-comp.h", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-registers.h", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.h", "qcom/opensource/audio-kernel/include/bindings/qcom,lpass-cdc-clk-rsc.h"],
+    includes = ["qcom/opensource/audio-kernel/include", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc"],
+)
+
+ddk_module(
+    name = "lpass_cdc_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-clk-rsc.c", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-comp.c", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-regmap.c", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-tables.c", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-utils.c", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "lpass_cdc_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_lpasscdc_headers", ":audio_swrctrl_headers", ":audio_spf_headers", ":audio_foundation_headers", ":soc_headers", ":spf_core_dlkm", ":snd_event_dlkm", ":qti_regmap_debugfs", ":audio_typec_headers", ":typec_analog_acc_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_headers(
+    name = "qti_flash_led_headers",
+    hdrs = ["include/linux/leds-qti-flash.h", "include/linux/soc/qcom/battery_charger.h"],
+    linux_includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "leds_qti_flash",
+    srcs = ["drivers/leds/leds-qti-flash.c", "drivers/leds/leds.h"],
+    out = "leds-qti-flash.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":qti_flash_led_headers"],
+    visibility = ["//visibility:public"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3682,6 +3717,8 @@ kernel_module_group(
         ":slimbus",
         ":slim_qcom_ngd_ctrl",
         ":btfm_slim_codec",
+        ":lpass_cdc_dlkm",
+        ":leds_qti_flash",
     ],
 )
 

@@ -1,0 +1,137 @@
+{
+  "tests": {
+    "controls": {
+      "timeout_bounds": 2000,
+      "io_fault_cases": 15,
+      "queued_on_cancellation": true,
+      "sleeping_timer_work": true,
+      "brightness_before_strobe": true,
+      "interior_switch_symmetry": true,
+      "native_battery_gap": true
+    },
+    "device": {
+      "probe_resource_failures": 13,
+      "setup_io_failures": 6,
+      "invalid_dt_cases": 13,
+      "all_shutdown_writes": true,
+      "unpublished_callbacks": true,
+      "node_and_battery_refs": true,
+      "u32_time_sort": true
+    },
+    "races": {
+      "query_remove_races": 200,
+      "worker_remove_races": 200,
+      "post_remove_callbacks_rejected": true
+    }
+  },
+  "negative_controls": {
+    "canceling_worker_rearms": {
+      "rejected": true,
+      "diagnostic": "canceling_worker_rearms: /tmp/flash-test-h0h9cd31/canceling_worker_rearms.c:1724: main: Assertion `io_calls==cancel_before&&!snodes[0].off_timer.active' failed."
+    },
+    "timer_does_io": {
+      "rejected": true,
+      "diagnostic": "timer_does_io: /tmp/flash-test-h0h9cd31/timer_does_io.c:102: io_check: Assertion `!atomic_context' failed."
+    },
+    "queued_on_not_drained": {
+      "rejected": true,
+      "diagnostic": "queued_on_not_drained: /tmp/flash-test-h0h9cd31/queued_on_not_drained.c:1726: main: Assertion `!snodes[0].on_work.pending&&!snodes[0].on_pending&&!snodes[0].off_timer.active&&!led.chan_en_map' failed."
+    },
+    "queued_brightness_not_drained": {
+      "rejected": true,
+      "diagnostic": "queued_brightness_not_drained: /tmp/flash-test-h0h9cd31/queued_brightness_not_drained.c:1720: main: Assertion `work_runs==1&&snodes[0].on_timer.active&&snodes[0].on_pending&&!led.chan_en_map' failed."
+    },
+    "timeout_underflow": {
+      "rejected": true,
+      "diagnostic": "timeout_underflow: /tmp/flash-test-h0h9cd31/timeout_underflow.c:1714: main: Assertion `code==-EINVAL' failed."
+    },
+    "timeout_rounded_above_limit": {
+      "rejected": true,
+      "diagnostic": "timeout_rounded_above_limit: /tmp/flash-test-h0h9cd31/timeout_rounded_above_limit.c:1714: main: Assertion `code>=0&&code<=127&&(code+1)*10<=n' failed."
+    },
+    "timeout_u64_overflow": {
+      "rejected": true,
+      "diagnostic": "timeout_u64_overflow: /tmp/flash-test-h0h9cd31/timeout_u64_overflow.c:1715: main: Assertion `!qti_flash_time_valid(KTIME_MAX/NSEC_PER_MSEC+1ULL)' failed."
+    },
+    "ten_ms_strobe_rejected": {
+      "rejected": true,
+      "diagnostic": "ten_ms_strobe_rejected: /tmp/flash-test-h0h9cd31/ten_ms_strobe_rejected.c:1729: main: Assertion `!qti_flash_strobe_set(&fnodes[0].fdev,true)' failed."
+    },
+    "symmetry_interior_pointer_oob": {
+      "rejected": true,
+      "diagnostic": "symmetry_interior_pointer_oob: /tmp/flash-test-h0h9cd31/symmetry_interior_pointer_oob.c:1741: main: Assertion `fnodes[i].current_ma==(i==4||i==7?300:150)' failed."
+    },
+    "native_battery_error_hidden": {
+      "rejected": true,
+      "diagnostic": "native_battery_error_hidden: /tmp/flash-test-h0h9cd31/native_battery_error_hidden.c:95: power_supply_get_property: Assertion `!\"native battery stub must fail first\"' failed."
+    },
+    "secure_current_output_missing": {
+      "rejected": true,
+      "diagnostic": "secure_current_output_missing: /tmp/flash-test-h0h9cd31/secure_current_output_missing.c:1729: main: Assertion `!qti_flash_led_prepare(&trigger,QUERY_MAX_AVAIL_CURRENT,&output)&&output==2000' failed."
+    },
+    "off_timer_retry_lost": {
+      "rejected": true,
+      "diagnostic": "off_timer_retry_lost: /tmp/flash-test-h0h9cd31/off_timer_retry_lost.c:1737: main: Assertion `snodes[0].off_timer.active' failed."
+    },
+    "channel_id_truncation": {
+      "rejected": true,
+      "diagnostic": "channel_id_truncation: /tmp/flash-test-h0h9cd31/channel_id_truncation.c:2338: main: Assertion `qti_flash_led_probe(&device)<0' failed."
+    },
+    "strobe_selector_truncation": {
+      "rejected": true,
+      "diagnostic": "strobe_selector_truncation: /tmp/flash-test-h0h9cd31/strobe_selector_truncation.c:2338: main: Assertion `qti_flash_led_probe(&device)<0' failed."
+    },
+    "paired_current_count_unchecked": {
+      "rejected": true,
+      "diagnostic": "paired_current_count_unchecked: /tmp/flash-test-h0h9cd31/paired_current_count_unchecked.c:2338: main: Assertion `qti_flash_led_probe(&device)<0' failed."
+    },
+    "configured_duration_limit_lost": {
+      "rejected": true,
+      "diagnostic": "configured_duration_limit_lost: /tmp/flash-test-h0h9cd31/configured_duration_limit_lost.c:2338: main: Assertion `qti_flash_led_probe(&device)<0' failed."
+    },
+    "gpio_defer_ignored": {
+      "rejected": true,
+      "diagnostic": "gpio_defer_ignored: /tmp/flash-test-h0h9cd31/gpio_defer_ignored.c:2338: main: Assertion `qti_flash_led_probe(&device)<0' failed."
+    },
+    "irq_defer_ignored": {
+      "rejected": true,
+      "diagnostic": "irq_defer_ignored: /tmp/flash-test-h0h9cd31/irq_defer_ignored.c:2338: main: Assertion `qti_flash_led_probe(&device)<0' failed."
+    },
+    "node_reference_lost": {
+      "rejected": true,
+      "diagnostic": "node_reference_lost: /tmp/flash-test-h0h9cd31/node_reference_lost.c:382: of_node_put: Assertion `p->refs>0' failed."
+    },
+    "battery_reference_leak": {
+      "rejected": true,
+      "diagnostic": "battery_reference_leak: /tmp/flash-test-h0h9cd31/battery_reference_leak.c:2333: main: Assertion `led->stopping&&!led->ready&&!led->snode[0].on_work.pending&&!led->snode[0].off_timer.active&&!battery.refs' failed."
+    },
+    "controller_registry_entry_leaked": {
+      "rejected": true,
+      "diagnostic": "controller_registry_entry_leaked: /tmp/flash-test-h0h9cd31/controller_registry_entry_leaked.c:2329: check_clean: Assertion `qti_flash_controllers.next==&qti_flash_controllers' failed."
+    },
+    "unpublished_and_stopping_gate_lost": {
+      "rejected": true,
+      "diagnostic": "unpublished_and_stopping_gate_lost: /tmp/flash-test-h0h9cd31/unpublished_and_stopping_gate_lost.c:400: devm_led_classdev_register: Assertion `c->brightness_set_blocking(c,1)==-ENODEV' failed."
+    },
+    "post_stop_operation_gate_lost": {
+      "rejected": true,
+      "diagnostic": "post_stop_operation_gate_lost: /tmp/flash-test-h0h9cd31/post_stop_operation_gate_lost.c:1773: main: Assertion `qti_flash_timeout_set(&fnodes[0].fdev,10000)==-ENODEV' failed."
+    }
+  },
+  "source_sha256": {
+    "drivers/leds/leds-qti-flash.c": "9ca334f58911b56a95bf3a622a02abfc4f9a5edbb43ea26b95b961a4f5e3d465",
+    "drivers/leds/leds.h": "a2edcf5dfb068b75d874b2b05f4ae2a5997a6add4718b2e6a261fa33834b6ce8",
+    "drivers/leds/Makefile": "c04578b711236e60c1f9ae98dfc98cc61e2761919dcb5615db985c4602259f36",
+    "drivers/leds/Kconfig": "5f84c8a52ed42bd6aae2c16bdfd98d189c8d586e0d38f4c6f57e3a76fcbfe0d4",
+    "include/linux/leds-qti-flash.h": "d5d8fea7a85fb7b83385d44e7bb3df94b509320ef516354cd588c209fd2aa671",
+    "include/linux/soc/qcom/battery_charger.h": "5a2fe5a5f9497dfc9cadc92e15d9eae2db3593d54df193e5cd2733d92a8bc01a"
+  },
+  "harness_sha256": {
+    "flash_controls.c": "569922067a9bc770610f2218d9080ba52b50505dfba175c763e3a38521bba88e",
+    "flash_device.c": "13339bdb7dd7c8f37280477512a018ebb4297473dfac6fa87b8838d87bf8eb5e",
+    "flash_device_fake.h": "a9b520cea8f958530107373ac0e5d50cd90a9207cb9d420a8cbc290bbcd209ce",
+    "flash_fake.h": "9d3b628339b7ad9594799fbd99f77d68aee673fd755044eb6740e458d53aa135",
+    "flash_races.c": "fe361ba12b6a327b042425d6dd7613db415f7ed16fc4afecdf55a4fba2859029"
+  },
+  "limits": "Extracted production source with mocked kernel, register I/O, LED core and pthread mutexes; no hardware, actual IRQ/workqueue/device-core or electrical validation."
+}

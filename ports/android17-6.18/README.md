@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 259 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 261 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 259 platform `.ko` files, their symbol tables and DDK configurations.
+- 261 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 15,745
-imported symbol CRCs across all 259 modules.
+used. The current [validation report](validation-20261031.json) checks 15,882
+imported symbol CRCs across all 261 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1705,3 +1705,28 @@ coverage is 256/466 (54.9%). Onyx's recorded NGD node remains disabled, and acti
 WCN7750 transport uses SoundWire; building these ROM-listed dependencies does not
 establish live SLIM hardware use. Remaining drivers, boot/DLKM images and ZIP
 packaging are still in progress, with no phone boot or flash claimed.
+
+
+## Native LPASS CDC and camera flash provider
+
+LPASS CDC retains its six native compilation units, 26 exports and four provider
+dependencies. Component removal drains users and invokes Type-C cleanup before
+card destruction; child publication, clock requests, PM votes and register errors
+now have explicit rollback and ownership. Thirteen sanitizer suites pass 184 cases
+and reject 26 deliberately broken changes against the integrated sources. The
+[CDC record](audio-lpasscdc-port.md) describes the remaining consumer contracts.
+
+The native camera flash provider retains its public header, both exports and DT
+settings. Sleeping register I/O runs in blocking callbacks or work, publication
+and removal drain operations, and failed shutdown remains retryable. Three
+sanitizer suites include 400 removal races and reject 23 deliberate regressions.
+Its [port record](flash-led-port.md) documents the native battery-query limitation
+and the limits of software tests for electrical behavior.
+
+Archive `artifacts/20261031T190054196405Z` contains 261 modules and passes 15,882
+imported-symbol CRC checks without compiler/modpost warnings. Device-tree checks
+pass with the existing vendor warnings. ROM module-name coverage is 258/466
+(55.4%); this measures build coverage, not device functionality or ZIP readiness.
+Remaining media, DSP, audio and peripheral drivers, KernelSU/NetHunter integration,
+boot/DLKM images and the installer are unfinished. No flashable ZIP or phone boot
+validation exists yet.

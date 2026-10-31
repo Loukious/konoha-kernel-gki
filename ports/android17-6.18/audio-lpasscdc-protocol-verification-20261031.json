@@ -1,0 +1,62 @@
+{
+  "native_exports": [
+    "lpass_cdc_check_core_votes",
+    "lpass_cdc_clear_amic_tx_hold",
+    "lpass_cdc_clk_rsc_enable_all_clocks",
+    "lpass_cdc_clk_rsc_fs_gen_request",
+    "lpass_cdc_clk_rsc_request_clock",
+    "lpass_cdc_dmic_clk_enable",
+    "lpass_cdc_get_device_ptr",
+    "lpass_cdc_get_rsc_clk_device_ptr",
+    "lpass_cdc_get_version",
+    "lpass_cdc_info_create_codec_entry",
+    "lpass_cdc_is_va_macro_registered",
+    "lpass_cdc_load_compander_coeff",
+    "lpass_cdc_notify_wcd_rx_clk",
+    "lpass_cdc_register_event_listener",
+    "lpass_cdc_register_macro",
+    "lpass_cdc_register_res_clk",
+    "lpass_cdc_register_wake_irq",
+    "lpass_cdc_rsc_clk_reset",
+    "lpass_cdc_runtime_resume",
+    "lpass_cdc_runtime_suspend",
+    "lpass_cdc_set_port_map",
+    "lpass_cdc_tx_mclk_enable",
+    "lpass_cdc_unregister_macro",
+    "lpass_cdc_unregister_res_clk",
+    "lpass_cdc_update_compander_setting",
+    "lpass_cdc_wsa_pa_on"
+  ],
+  "native_linked_units": [
+    "../sm8735-modules/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.o",
+    "../sm8735-modules/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-comp.o",
+    "../sm8735-modules/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-utils.o",
+    "../sm8735-modules/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-regmap.o",
+    "../sm8735-modules/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-tables.o",
+    "../sm8735-modules/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-clk-rsc.o"
+  ],
+  "unchanged_public_headers_and_tables": {
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-clk-rsc.h": "2fa8918c8a3aed99585be4b0aa2d73394872c746e8ba94d8239c554e938ad944",
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-comp.h": "54f2ec5691f7b0844263c30d935cfbda263c8537d0c834ea41698ed2d426598f",
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-registers.h": "b234711022f5644d64bec5c597041121bde836f7c51e89824394c006ad591469",
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.h": "7b1fb6d34a4442f3e65fb5db2fda6758648c7ab247e69a33da2289ea6086dbbc",
+    "qcom/opensource/audio-kernel/include/bindings/qcom,lpass-cdc-clk-rsc.h": "fd840453cf95e725cc130f59a9bc3cc1359cea1247f13d80fd0ab4a36dc28574",
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-tables.c": "75681146c939a8e60662173079884c217927f0f111121b750d5d39e177424eb8"
+  },
+  "regmap_defaults_and_volatile_configuration_exact": true,
+  "reused_provider_headers": {
+    "qcom/opensource/audio-kernel/asoc/codecs/typec_analog_acc.h": "8003aabe3f479e7f97b1a2e1529061f39b5a47335b3bb6045cc582499dd3b5a4",
+    "qcom/opensource/audio-kernel/include/dsp/digital-cdc-rsc-mgr.h": "629f4c4a248503feba6744e6b156d59fd9b633967cbf391e8cde5014da58c7d3",
+    "qcom/opensource/audio-kernel/include/soc/snd_event.h": "8dc3dba855a1b0b4d9881d589e33c97120fde2f013cf251da45f625a6dfb1bfd",
+    "qcom/opensource/audio-kernel/include/soc/swr-common.h": "5255dd2315331c183d0f0c2c762fa58ea7e650cf9e5739aebfbe7bad59e4ddc9"
+  },
+  "child_limit": 6,
+  "native_onyx_num_macros": 3,
+  "lifetime": "Synchronous owned children and OF refs; remove split consumers, macros, then clock manager. Keep platform data and parent clocks alive through child teardown. Component cleanup drains WCD calls, Type-C and snd_event before reverse macro exits. Provider removal closes and drains active operations without holding the operation mutex over callbacks. Registration/removal must not be called from a callback being drained.",
+  "borrowed_pointer_contract": "Native device getters remain borrowed: callers must serialize against driver removal. A device reference alone does not retain devres. Internal resource-clock calls hold the parent operation gate for their entire call.",
+  "typec_gate": "Preserved native presence of qcom,unsupported-typec-analog-acc. Successful init has component-specific exit before card destruction.",
+  "clock_ownership": "Track successful owned CCF enables separately from requested clocks. Preflight VA/TX transitions and mux fallback, roll back only new acquisitions, never drain global CCF enabled state. Native FS sequence order and duplicate-register writes retained.",
+  "error_limit": "Void native FS/all-clocks APIs log failures; internal helpers preserve errors. If a hardware rollback itself fails the error is logged; no hardware recovery claim.",
+  "frozen_snd_event_source_sha256": "124c8c13e32c716b219f180f887a700798d81890cf2a9a6656aa0b820cc41cc2",
+  "frozen_typec_source_sha256": "6c575bbc6b8eca5169c6ac592a62ad1859000dd45ae6fb3ded88671059b052ea"
+}

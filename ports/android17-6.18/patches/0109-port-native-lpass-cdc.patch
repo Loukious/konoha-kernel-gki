@@ -1,0 +1,3087 @@
+Subject: Port native LPASS CDC core to 6.18
+
+Retain native macro and register layout with bounded resource ownership.
+Integrate component-specific accessory cleanup and preserve errors.
+
+---
+
+--- a/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/internal.h
++++ b/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/internal.h
+@@ -6,6 +6,8 @@
+ #ifndef _LPASS_CDC_INTERNAL_H
+ #define _LPASS_CDC_INTERNAL_H
+ 
++#include <linux/atomic.h>
++#include <linux/wait.h>
+ #include "lpass-cdc-registers.h"
+ 
+ #define LPASS_CDC_CHILD_DEVICES_MAX 6
+@@ -53,6 +55,21 @@
+ 	struct snd_soc_component *component;
+ 	struct regmap *regmap;
+ 	struct mutex macro_lock;
++	/* Protects operation admission and callback teardown gates. */
++	struct mutex op_lock;
++	/* Serializes shared TX/VA DMIC counts and register updates. */
++	struct mutex dmic_lock;
++	wait_queue_head_t op_wait;
++	atomic_t active_ops;
++	atomic_t component_ops;
++	bool quiescing;
++	bool removing;
++	bool component_ready;
++	bool component_registered;
++	bool snd_event_registered;
++	bool typec_registered;
++	bool macro_initialized[MAX_MACRO];
++	u8 child_phase[LPASS_CDC_CHILD_DEVICES_MAX];
+ 	struct mutex io_lock;
+ 	struct mutex clk_lock;
+ 	struct mutex vote_lock;
+@@ -67,7 +84,6 @@
+ 	u16 num_macros_registered;
+ 	u16 num_macros;
+ 	u16 current_mclk_mux_macro[MAX_MACRO];
+-	struct work_struct lpass_cdc_add_child_devices_work;
+ 	u32 version;
+ 	struct clk *lpass_core_hw_vote;
+ 	struct clk *lpass_audio_hw_vote;
+@@ -106,6 +122,10 @@
+ 	struct proc_dir_entry *lpass_cdc_proc_entry;
+ };
+ 
++int lpass_cdc_clk_rsc_all_clocks(struct device *dev, bool enable);
++bool lpass_cdc_op_get(struct lpass_cdc_priv *priv, bool component);
++void lpass_cdc_op_put(struct lpass_cdc_priv *priv, bool component);
++
+ struct regmap *lpass_cdc_regmap_init(struct device *dev,
+ 				  const struct regmap_config *config);
+ int lpass_cdc_get_macro_id(bool va_no_dec_flag, u16 reg);
+--- a/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-clk-rsc.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-clk-rsc.c
+@@ -11,8 +11,9 @@
+ #include <linux/platform_device.h>
+ #include <linux/kernel.h>
+ #include <linux/clk.h>
+-#include <linux/clk-provider.h>
++#include <linux/limits.h>
+ #include "lpass-cdc.h"
++#include "internal.h"
+ #include "lpass-cdc-clk-rsc.h"
+ 
+ #define DRV_NAME "lpass-cdc-clk-rsc"
+@@ -36,7 +37,9 @@
+ 	struct clk *clk[MAX_CLK];
+ 	int clk_cnt[MAX_CLK];
+ 	int reg_seq_en_cnt;
+-	int va_tx_clk_cnt;
++	int request_count[MAX_CLK];
++	int owned[MAX_CLK];
++	int all_count;
+ 	bool dev_up;
+ 	bool dev_up_gfmux;
+ 	u32 num_fs_reg;
+@@ -102,441 +105,309 @@
+ 	return NULL;
+ }
+ 
++/* Parent removal drains these operations before releasing provider devres. */
++static struct lpass_cdc_clk_rsc *lpass_cdc_clk_get(struct device *dev,
++						   struct lpass_cdc_priv **cdc)
++{
++	struct lpass_cdc_priv *parent;
++	struct lpass_cdc_clk_rsc *priv;
++
++	if (!dev || !dev->parent ||
++	    !of_device_is_compatible(dev->parent->of_node, "qcom,lpass-cdc"))
++		return NULL;
++	parent = dev_get_drvdata(dev->parent);
++	if (!lpass_cdc_op_get(parent, false))
++		return NULL;
++	priv = parent->clk_dev ? dev_get_drvdata(parent->clk_dev) : NULL;
++	if (!priv) {
++		lpass_cdc_op_put(parent, false);
++		return NULL;
++	}
++	*cdc = parent;
++	return priv;
++}
++
++static int lpass_cdc_clock_enable(struct lpass_cdc_clk_rsc *priv, int id)
++{
++	int ret;
++
++	if (!priv->clk[id])
++		return -ENODEV;
++	ret = clk_prepare_enable(priv->clk[id]);
++	if (!ret)
++		priv->owned[id]++;
++	return ret;
++}
++
++static void lpass_cdc_clock_disable(struct lpass_cdc_clk_rsc *priv, int id)
++{
++	if (WARN_ON(!priv->owned[id]))
++		return;
++	clk_disable_unprepare(priv->clk[id]);
++	priv->owned[id]--;
++}
++
+ int lpass_cdc_rsc_clk_reset(struct device *dev, int clk_id)
+ {
+-	struct device *clk_dev = NULL;
+-	struct lpass_cdc_clk_rsc *priv = NULL;
+-	int count = 0;
+-
+-	if (!dev) {
+-		pr_err("%s: dev is null\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if (clk_id < 0 || clk_id >= MAX_CLK) {
+-		pr_err("%s: Invalid clk_id: %d\n",
+-			__func__, clk_id);
+-		return -EINVAL;
+-	}
+-
+-	clk_dev = lpass_cdc_get_rsc_clk_device_ptr(dev->parent);
+-	if (!clk_dev) {
+-		pr_err("%s: Invalid rsc clk device\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	priv = dev_get_drvdata(clk_dev);
+-	if (!priv) {
+-		pr_err("%s: Invalid rsc clk priviate data\n", __func__);
+-		return -EINVAL;
+-	}
++	struct lpass_cdc_priv *cdc;
++	struct lpass_cdc_clk_rsc *priv;
++	int wanted, ret = 0;
++
++	if (clk_id < 0 || clk_id >= MAX_CLK)
++		return -EINVAL;
++	priv = lpass_cdc_clk_get(dev, &cdc);
++	if (!priv)
++		return -ENODEV;
+ 	mutex_lock(&priv->rsc_clk_lock);
+-	while (__clk_is_enabled(priv->clk[clk_id])) {
+-		clk_disable_unprepare(priv->clk[clk_id]);
+-		count++;
+-	}
+-	dev_dbg(priv->dev,
+-		"%s: clock reset after ssr, count %d\n", __func__, count);
+-
+-	while (count--) {
+-		clk_prepare_enable(priv->clk[clk_id]);
+-	}
++	if (!priv->clk[clk_id]) {
++		ret = -ENODEV;
++		goto out;
++	}
++	wanted = !!priv->clk_cnt[clk_id] + !!priv->all_count;
++	while (priv->owned[clk_id])
++		lpass_cdc_clock_disable(priv, clk_id);
++	while (priv->owned[clk_id] < wanted) {
++		ret = lpass_cdc_clock_enable(priv, clk_id);
++		if (ret) {
++			priv->dev_up = false;
++			break;
++		}
++	}
++out:
+ 	mutex_unlock(&priv->rsc_clk_lock);
++	lpass_cdc_op_put(cdc, false);
++	return ret;
++}
++EXPORT_SYMBOL(lpass_cdc_rsc_clk_reset);
++
++int lpass_cdc_clk_rsc_all_clocks(struct device *dev, bool enable)
++{
++	struct lpass_cdc_priv *cdc;
++	struct lpass_cdc_clk_rsc *priv;
++	bool added[MAX_CLK] = {};
++	int i, ret = 0;
++
++	priv = lpass_cdc_clk_get(dev, &cdc);
++	if (!priv)
++		return -ENODEV;
++	mutex_lock(&priv->rsc_clk_lock);
++	if (enable) {
++		if (priv->all_count == INT_MAX) {
++			ret = -EOVERFLOW;
++			goto out;
++		}
++		if (!priv->all_count) {
++			for (i = 0; i < MAX_CLK; i++) {
++				if (!priv->clk[i])
++					continue;
++				ret = lpass_cdc_clock_enable(priv, i);
++				if (ret)
++					goto rollback;
++				added[i] = true;
++			}
++		}
++		priv->all_count++;
++	} else {
++		if (!priv->all_count) {
++			ret = -EINVAL;
++			goto out;
++		}
++		if (--priv->all_count == 0)
++			for (i = MAX_CLK - 1; i >= 0; i--)
++				if (priv->owned[i] > !!priv->clk_cnt[i])
++					lpass_cdc_clock_disable(priv, i);
++	}
++	goto out;
++rollback:
++	for (i = MAX_CLK - 1; i >= 0; i--)
++		if (added[i])
++			lpass_cdc_clock_disable(priv, i);
++out:
++	mutex_unlock(&priv->rsc_clk_lock);
++	lpass_cdc_op_put(cdc, false);
++	return ret;
++}
++
++void lpass_cdc_clk_rsc_enable_all_clocks(struct device *dev, bool enable)
++{
++	int ret = lpass_cdc_clk_rsc_all_clocks(dev, enable);
++
++	if (ret && dev)
++		dev_err_ratelimited(dev, "all-clocks request failed: %d\n", ret);
++}
++EXPORT_SYMBOL(lpass_cdc_clk_rsc_enable_all_clocks);
++
++/* Preflight the complete VA/TX transition. Acquire every needed source before
++ * changing a mux or dropping the previous source; failure only drops our new
++ * acquisitions. Logical references are committed after the hardware sequence.
++ */
++static int lpass_cdc_clock_request(struct lpass_cdc_clk_rsc *priv,
++				   int default_id, int id, bool enable)
++{
++	int requested[MAX_CLK], next[MAX_CLK], wanted[MAX_CLK];
++	int before[MAX_CLK];
++	char __iomem *mux = NULL;
++	int i, ret, active;
++	bool switch_mux, first, last;
++
++	if (id < 0 || id >= MAX_CLK || default_id < 0 || default_id >= MAX_CLK)
++		return -EINVAL;
++	if (enable && !priv->dev_up)
++		return -ENOTSYNC;
++	if (!priv->clk[id])
++		return -ENODEV;
++	active = priv->request_count[id];
++	if (active && priv->default_clk_id[id] != default_id)
++		return -EBUSY;
++	if (enable && active == INT_MAX)
++		return -EOVERFLOW;
++	if (!enable && !active)
++		return -EINVAL;
++	switch_mux = default_id != id && id != VA_CORE_CLK;
++	if (switch_mux) {
++		mux = lpass_cdc_clk_rsc_get_clk_muxsel(priv, id);
++		if (!mux || !priv->clk[default_id])
++			return -EINVAL;
++	}
++	memcpy(requested, priv->request_count, sizeof(requested));
++	requested[id] += enable ? 1 : -1;
++	memcpy(next, requested, sizeof(next));
++	if (requested[VA_CORE_CLK] && requested[TX_CORE_CLK] &&
++	    (id == VA_CORE_CLK ? default_id : priv->default_clk_id[VA_CORE_CLK])
++	    != VA_CORE_CLK) {
++		if (requested[VA_CORE_CLK] > INT_MAX - requested[TX_CORE_CLK])
++			return -EOVERFLOW;
++		next[TX_CORE_CLK] += requested[VA_CORE_CLK];
++		next[VA_CORE_CLK] = 0;
++	}
++	first = enable && !active;
++	last = !enable && active == 1;
++	memcpy(before, priv->owned, sizeof(before));
++	for (i = 0; i < MAX_CLK; i++) {
++		wanted[i] = !!next[i] + (priv->clk[i] && priv->all_count ? 1 : 0);
++		if (wanted[i] && !priv->clk[i])
++			return -ENODEV;
++	}
++	/* A mux edge needs its default source, including on disable. */
++	if (switch_mux && (first || last) && !priv->owned[default_id]) {
++		ret = lpass_cdc_clock_enable(priv, default_id);
++		if (ret)
++			return ret;
++	}
++	for (i = 0; i < MAX_CLK; i++) {
++		while (priv->owned[i] < wanted[i]) {
++			ret = lpass_cdc_clock_enable(priv, i);
++			if (ret)
++				goto rollback;
++		}
++	}
++	/* Native VA mux switching is performed by the DSP. */
++	if (switch_mux && (first || last) && priv->dev_up_gfmux) {
++		iowrite32(enable ? 1 : 0, mux);
++		ioread32(mux);
++	}
++	/* Keep the fallback source enabled until the old mux source is dropped. */
++	if (switch_mux && last)
++		while (priv->owned[id] > wanted[id])
++			lpass_cdc_clock_disable(priv, id);
++	for (i = MAX_CLK - 1; i >= 0; i--)
++		while (priv->owned[i] > wanted[i])
++			lpass_cdc_clock_disable(priv, i);
++	memcpy(priv->request_count, requested, sizeof(requested));
++	memcpy(priv->clk_cnt, next, sizeof(next));
++	priv->default_clk_id[id] = default_id;
+ 	return 0;
+-}
+-EXPORT_SYMBOL(lpass_cdc_rsc_clk_reset);
+-
+-void lpass_cdc_clk_rsc_enable_all_clocks(struct device *dev, bool enable)
+-{
+-	struct device *clk_dev = NULL;
+-	struct lpass_cdc_clk_rsc *priv = NULL;
+-	int i = 0;
+-
+-	if (!dev) {
+-		pr_err("%s: dev is null\n", __func__);
++rollback:
++	for (i = MAX_CLK - 1; i >= 0; i--)
++		while (priv->owned[i] > before[i])
++			lpass_cdc_clock_disable(priv, i);
++	return ret;
++}
++
++int lpass_cdc_clk_rsc_request_clock(struct device *dev, int default_clk_id,
++				    int clk_id_req, bool enable)
++{
++	struct lpass_cdc_priv *cdc;
++	struct lpass_cdc_clk_rsc *priv;
++	int ret;
++
++	if (clk_id_req < 0 || clk_id_req >= MAX_CLK ||
++	    default_clk_id < 0 || default_clk_id >= MAX_CLK)
++		return -EINVAL;
++	priv = lpass_cdc_clk_get(dev, &cdc);
++	if (!priv)
++		return -ENODEV;
++	mutex_lock(&priv->rsc_clk_lock);
++	ret = lpass_cdc_clock_request(priv, default_clk_id, clk_id_req, enable);
++	mutex_unlock(&priv->rsc_clk_lock);
++	lpass_cdc_op_put(cdc, false);
++	return ret;
++}
++EXPORT_SYMBOL(lpass_cdc_clk_rsc_request_clock);
++
++static int lpass_cdc_fs_gen_request(struct lpass_cdc_clk_rsc *priv, bool enable)
++{
++	unsigned int *old;
++	int n = priv->num_fs_reg, step, idx, ret = 0, err;
++
++	if (enable && priv->reg_seq_en_cnt == INT_MAX)
++		return -EOVERFLOW;
++	if (!enable && !priv->reg_seq_en_cnt)
++		return -EINVAL;
++	if ((enable && priv->reg_seq_en_cnt) ||
++	    (!enable && priv->reg_seq_en_cnt > 1)) {
++		priv->reg_seq_en_cnt += enable ? 1 : -1;
++		return 0;
++	}
++	old = kcalloc(n, sizeof(*old), GFP_KERNEL);
++	if (!old)
++		return -ENOMEM;
++	for (step = 0; step < n; step++) {
++		idx = (enable ? step : n - step - 1) * 3;
++		ret = regmap_read(priv->regmap, priv->fs_gen_seq[idx], &old[step]);
++		if (ret)
++			goto rollback;
++		ret = regmap_update_bits(priv->regmap, priv->fs_gen_seq[idx],
++					 priv->fs_gen_seq[idx + 1],
++					 enable ? priv->fs_gen_seq[idx + 2] : 0);
++		if (ret) {
++			/* Include the failed write: a transport can fail after writing. */
++			step++;
++			goto rollback;
++		}
++	}
++	priv->reg_seq_en_cnt += enable ? 1 : -1;
++	goto out;
++rollback:
++	while (step--) {
++		idx = (enable ? step : n - step - 1) * 3;
++		err = regmap_update_bits(priv->regmap, priv->fs_gen_seq[idx],
++					 priv->fs_gen_seq[idx + 1], old[step]);
++		if (err)
++			dev_err_ratelimited(priv->dev, "FS rollback failed: %d\n", err);
++	}
++out:
++	kfree(old);
++	return ret;
++}
++
++void lpass_cdc_clk_rsc_fs_gen_request(struct device *dev, bool enable)
++{
++	struct lpass_cdc_priv *cdc;
++	struct lpass_cdc_clk_rsc *priv;
++	int ret;
++
++	priv = lpass_cdc_clk_get(dev, &cdc);
++	if (!priv)
+ 		return;
+-	}
+-
+-	clk_dev = lpass_cdc_get_rsc_clk_device_ptr(dev->parent);
+-	if (!clk_dev) {
+-		pr_err("%s: Invalid rsc clk device\n", __func__);
+-		return;
+-	}
+-
+-	priv = dev_get_drvdata(clk_dev);
+-	if (!priv) {
+-		pr_err("%s: Invalid rsc clk private data\n", __func__);
+-		return;
+-	}
+-	mutex_lock(&priv->rsc_clk_lock);
+-	for (i = 0; i < MAX_CLK; i++) {
+-		if (enable) {
+-			if (priv->clk[i])
+-				clk_prepare_enable(priv->clk[i]);
+-		} else {
+-			if (priv->clk[i] && __clk_is_enabled(priv->clk[i]))
+-				clk_disable_unprepare(priv->clk[i]);
+-		}
+-	}
+-	mutex_unlock(&priv->rsc_clk_lock);
+-	return;
+-}
+-EXPORT_SYMBOL(lpass_cdc_clk_rsc_enable_all_clocks);
+-
+-static int lpass_cdc_clk_rsc_mux0_clk_request(struct lpass_cdc_clk_rsc *priv,
+-					   int clk_id,
+-					   bool enable)
+-{
+-	int ret = 0;
+-
+-	if (enable) {
+-		/* Enable Requested Core clk */
+-		if (priv->clk_cnt[clk_id] == 0) {
+-			ret = clk_prepare_enable(priv->clk[clk_id]);
+-			if (ret < 0) {
+-				dev_err_ratelimited(priv->dev, "%s:clk_id %d enable failed\n",
+-							__func__, clk_id);
+-				goto done;
+-			}
+-		}
+-		priv->clk_cnt[clk_id]++;
+-	} else {
+-		if (priv->clk_cnt[clk_id] <= 0) {
+-			dev_err_ratelimited(priv->dev, "%s: clk_id: %d is already disabled\n",
+-					__func__, clk_id);
+-			priv->clk_cnt[clk_id] = 0;
+-			goto done;
+-		}
+-		priv->clk_cnt[clk_id]--;
+-		if (priv->clk_cnt[clk_id] == 0)
+-			clk_disable_unprepare(priv->clk[clk_id]);
+-	}
+-done:
+-	return ret;
+-}
+-
+-static int lpass_cdc_clk_rsc_mux1_clk_request(struct lpass_cdc_clk_rsc *priv,
+-					   int clk_id,
+-					   bool enable)
+-{
+-	char __iomem *clk_muxsel = NULL;
+-	int ret = 0;
+-	int default_clk_id = priv->default_clk_id[clk_id];
+-	u32 muxsel = 0;
+-
+-	clk_muxsel = lpass_cdc_clk_rsc_get_clk_muxsel(priv, clk_id);
+-	if (!clk_muxsel && (clk_id != VA_CORE_CLK)) {
+-		ret = -EINVAL;
+-		goto done;
+-	}
+-
+-	if (enable) {
+-		if (priv->clk_cnt[clk_id] == 0) {
+-			if (clk_id != VA_CORE_CLK) {
+-				ret = lpass_cdc_clk_rsc_mux0_clk_request(priv,
+-							default_clk_id,
+-							true);
+-				if (ret < 0)
+-					goto done;
+-			}
+-
+-			ret = clk_prepare_enable(priv->clk[clk_id]);
+-			if (ret < 0) {
+-				dev_err_ratelimited(priv->dev, "%s:clk_id %d enable failed\n",
+-					__func__, clk_id);
+-				goto err_clk;
+-			}
+-			/*
+-			 * Temp SW workaround to address a glitch issue of
+-			 * VA GFMux instance responsible for switching from
+-			 * TX MCLK to VA MCLK. This configuration would be taken
+-			 * care in DSP itself
+-			 */
+-			if (clk_id != VA_CORE_CLK) {
+-				if (priv->dev_up_gfmux) {
+-					iowrite32(0x1, clk_muxsel);
+-					muxsel = ioread32(clk_muxsel);
+-				}
+-				lpass_cdc_clk_rsc_mux0_clk_request(priv, default_clk_id,
+-							   false);
+-			}
+-		}
+-		priv->clk_cnt[clk_id]++;
+-	} else {
+-		if (priv->clk_cnt[clk_id] <= 0) {
+-			dev_err_ratelimited(priv->dev, "%s: clk_id: %d is already disabled\n",
+-				__func__, clk_id);
+-			priv->clk_cnt[clk_id] = 0;
+-			goto done;
+-		}
+-		priv->clk_cnt[clk_id]--;
+-		if (priv->clk_cnt[clk_id] == 0) {
+-			/*
+-			 * Temp SW workaround to address a glitch issue
+-			 * of VA GFMux instance responsible for
+-			 * switching from TX MCLK to VA MCLK.
+-			 * This configuration would be taken
+-			 * care in DSP itself.
+-			 */
+-			if (clk_id != VA_CORE_CLK) {
+-				ret = lpass_cdc_clk_rsc_mux0_clk_request(priv,
+-						default_clk_id, true);
+-				if (!ret && priv->dev_up_gfmux) {
+-					iowrite32(0x0, clk_muxsel);
+-					muxsel = ioread32(clk_muxsel);
+-				}
+-			}
+-			clk_disable_unprepare(priv->clk[clk_id]);
+-			if (clk_id != VA_CORE_CLK && !ret)
+-				lpass_cdc_clk_rsc_mux0_clk_request(priv,
+-						default_clk_id, false);
+-		}
+-	}
+-	return ret;
+-
+-err_clk:
+-	if (clk_id != VA_CORE_CLK)
+-		lpass_cdc_clk_rsc_mux0_clk_request(priv, default_clk_id, false);
+-done:
+-	return ret;
+-}
+-
+-static int lpass_cdc_clk_rsc_check_and_update_va_clk(struct lpass_cdc_clk_rsc *priv,
+-						  bool mux_switch,
+-						  int clk_id,
+-						  bool enable)
+-{
+-	int ret = 0;
+-
+-	if (enable) {
+-		if (clk_id == VA_CORE_CLK && mux_switch) {
+-			/*
+-			 * Handle the following usecase scenarios during enable
+-			 * 1. VA only, Active clk is VA_CORE_CLK
+-			 * 2. record -> record + VA, Active clk is TX_CORE_CLK
+-			 */
+-			if (priv->clk_cnt[TX_CORE_CLK] == 0) {
+-				ret = lpass_cdc_clk_rsc_mux1_clk_request(priv,
+-							 VA_CORE_CLK, enable);
+-				if (ret < 0)
+-					goto err;
+-			} else {
+-				ret = lpass_cdc_clk_rsc_mux0_clk_request(priv,
+-							TX_CORE_CLK, enable);
+-				if (ret < 0)
+-					goto err;
+-				priv->va_tx_clk_cnt++;
+-			}
+-		} else if ((priv->clk_cnt[TX_CORE_CLK] > 0) &&
+-			   (priv->clk_cnt[VA_CORE_CLK] > 0)) {
+-			/*
+-			 * Handle following concurrency scenario during enable
+-			 * 1. VA-> Record+VA, Increment TX CLK and Disable VA
+-			 * 2. VA-> Playback+VA, Increment TX CLK and Disable VA
+-			 */
+-			while (priv->clk_cnt[VA_CORE_CLK] > 0) {
+-				ret = lpass_cdc_clk_rsc_mux0_clk_request(priv,
+-							TX_CORE_CLK, true);
+-				if (ret < 0)
+-					goto err;
+-
+-				lpass_cdc_clk_rsc_mux1_clk_request(priv,
+-							VA_CORE_CLK, false);
+-				priv->va_tx_clk_cnt++;
+-			}
+-		}
+-	} else {
+-		if (clk_id == VA_CORE_CLK && mux_switch) {
+-			/*
+-			 * Handle the following usecase scenarios during disable
+-			 * 1. VA only, disable VA_CORE_CLK
+-			 * 2. Record + VA -> Record, decrement TX CLK count
+-			 */
+-			if (priv->clk_cnt[VA_CORE_CLK]) {
+-				lpass_cdc_clk_rsc_mux1_clk_request(priv,
+-							VA_CORE_CLK, enable);
+-			} else if (priv->va_tx_clk_cnt) {
+-				lpass_cdc_clk_rsc_mux0_clk_request(priv,
+-							TX_CORE_CLK, enable);
+-				priv->va_tx_clk_cnt--;
+-			}
+-		} else if (priv->va_tx_clk_cnt == priv->clk_cnt[TX_CORE_CLK]) {
+-			/*
+-			 * Handle the following usecase scenarios during disable
+-			 * Record+VA-> VA: enable VA CLK, decrement TX CLK count
+-			 */
+-			while (priv->va_tx_clk_cnt) {
+-				ret = lpass_cdc_clk_rsc_mux1_clk_request(priv,
+-							VA_CORE_CLK, true);
+-				if (ret < 0)
+-					goto err;
+-
+-				lpass_cdc_clk_rsc_mux0_clk_request(priv,
+-							TX_CORE_CLK, false);
+-				priv->va_tx_clk_cnt--;
+-			}
+-		}
+-	}
+-
+-err:
+-	return ret;
+-}
+-
+-/**
+- * lpass_cdc_clk_rsc_fs_gen_request - request to enable/disable fs generation
+- * sequence
+- *
+- * @dev: Macro device pointer
+- * @enable: enable or disable flag
+- */
+-void lpass_cdc_clk_rsc_fs_gen_request(struct device *dev, bool enable)
+-{
+-	int i;
+-	struct regmap *regmap;
+-	struct device *clk_dev = NULL;
+-	struct lpass_cdc_clk_rsc *priv = NULL;
+-
+-	if (!dev) {
+-		pr_err("%s: dev is null\n", __func__);
+-		return;
+-	}
+-	clk_dev = lpass_cdc_get_rsc_clk_device_ptr(dev->parent);
+-	if (!clk_dev) {
+-		pr_err("%s: Invalid rsc clk device\n", __func__);
+-		return;
+-	}
+-	priv = dev_get_drvdata(clk_dev);
+-	if (!priv) {
+-		pr_err("%s: Invalid rsc clk priviate data\n", __func__);
+-		return;
+-	}
+-	regmap = dev_get_regmap(priv->dev->parent, NULL);
+-	if (!regmap) {
+-		pr_err("%s: regmap is null\n", __func__);
+-		return;
+-	}
+ 	mutex_lock(&priv->fs_gen_lock);
+-	if (enable) {
+-		if (priv->reg_seq_en_cnt++ == 0) {
+-			for (i = 0; i < (priv->num_fs_reg * 3); i += 3) {
+-				dev_dbg(priv->dev, "%s: Register: %d, mask: %d, value: %d\n",
+-					__func__, priv->fs_gen_seq[i],
+-					priv->fs_gen_seq[i + 1],
+-					priv->fs_gen_seq[i + 2]);
+-				regmap_update_bits(regmap,
+-						   priv->fs_gen_seq[i],
+-						   priv->fs_gen_seq[i + 1],
+-						   priv->fs_gen_seq[i + 2]);
+-			}
+-		}
+-	} else {
+-		if (priv->reg_seq_en_cnt <= 0) {
+-			dev_err_ratelimited(priv->dev, "%s: req_seq_cnt: %d is already disabled\n",
+-				__func__, priv->reg_seq_en_cnt);
+-			priv->reg_seq_en_cnt = 0;
+-			mutex_unlock(&priv->fs_gen_lock);
+-			return;
+-		}
+-		if (--priv->reg_seq_en_cnt == 0) {
+-			for (i = ((priv->num_fs_reg - 1) * 3); i >= 0; i -= 3) {
+-				dev_dbg(priv->dev, "%s: Register: %d, mask: %d\n",
+-					__func__, priv->fs_gen_seq[i],
+-					priv->fs_gen_seq[i + 1]);
+-				regmap_update_bits(regmap, priv->fs_gen_seq[i],
+-						priv->fs_gen_seq[i + 1], 0x0);
+-			}
+-		}
+-	}
++	ret = lpass_cdc_fs_gen_request(priv, enable);
+ 	mutex_unlock(&priv->fs_gen_lock);
++	if (ret)
++		dev_err_ratelimited(dev, "FS request failed: %d\n", ret);
++	lpass_cdc_op_put(cdc, false);
+ }
+ EXPORT_SYMBOL(lpass_cdc_clk_rsc_fs_gen_request);
+-
+-/**
+- * lpass_cdc_clk_rsc_request_clock - request for clock to
+- * enable/disable
+- *
+- * @dev: Macro device pointer.
+- * @default_clk_id: mux0 Core clock ID input.
+- * @clk_id_req: Core clock ID requested to enable/disable
+- * @enable: enable or disable clock flag
+- *
+- * Returns 0 on success or -EINVAL on error.
+- */
+-int lpass_cdc_clk_rsc_request_clock(struct device *dev,
+-				int default_clk_id,
+-				int clk_id_req,
+-				bool enable)
+-{
+-	int ret = 0;
+-	struct device *clk_dev = NULL;
+-	struct lpass_cdc_clk_rsc *priv = NULL;
+-	bool mux_switch = false;
+-
+-	if (!dev) {
+-		pr_err("%s: dev is null\n", __func__);
+-		return -EINVAL;
+-	}
+-	if ((clk_id_req < 0 || clk_id_req >= MAX_CLK) &&
+-		(default_clk_id < 0 || default_clk_id >= MAX_CLK)) {
+-		pr_err("%s: Invalid clk_id_req: %d or default_clk_id: %d\n",
+-				__func__, clk_id_req, default_clk_id);
+-		return -EINVAL;
+-	}
+-	clk_dev = lpass_cdc_get_rsc_clk_device_ptr(dev->parent);
+-	if (!clk_dev) {
+-		pr_err("%s: Invalid rsc clk device\n", __func__);
+-		return -EINVAL;
+-	}
+-	priv = dev_get_drvdata(clk_dev);
+-	if (!priv) {
+-		pr_err("%s: Invalid rsc clk priviate data\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	mutex_lock(&priv->rsc_clk_lock);
+-	if (!priv->dev_up && enable) {
+-		dev_err_ratelimited(priv->dev, "%s: SSR is in progress..\n",
+-				__func__);
+-		ret = -EINVAL;
+-		goto err;
+-	}
+-	priv->default_clk_id[clk_id_req] = default_clk_id;
+-	if (default_clk_id != clk_id_req)
+-		mux_switch = true;
+-
+-	if (mux_switch) {
+-		if (clk_id_req != VA_CORE_CLK) {
+-			ret = lpass_cdc_clk_rsc_mux1_clk_request(priv, clk_id_req,
+-							enable);
+-			if (ret < 0)
+-				goto err;
+-		}
+-	} else {
+-		ret = lpass_cdc_clk_rsc_mux0_clk_request(priv, clk_id_req, enable);
+-		if (ret < 0)
+-			goto err;
+-	}
+-
+-	ret = lpass_cdc_clk_rsc_check_and_update_va_clk(priv, mux_switch,
+-						 clk_id_req,
+-						 enable);
+-	if (ret < 0)
+-		goto err;
+-
+-	dev_dbg(priv->dev, "%s: clk_cnt: %d for requested clk: %d, enable: %d\n",
+-		__func__,  priv->clk_cnt[clk_id_req], clk_id_req,
+-		enable);
+-
+-	mutex_unlock(&priv->rsc_clk_lock);
+-
+-	return 0;
+-
+-err:
+-	mutex_unlock(&priv->rsc_clk_lock);
+-	return ret;
+-}
+-EXPORT_SYMBOL(lpass_cdc_clk_rsc_request_clock);
+-
+ 
+ static int lpass_cdc_clk_rsc_probe(struct platform_device *pdev)
+ {
+@@ -560,7 +431,9 @@
+ 		ret = -EINVAL;
+ 		goto err;
+ 	}
+-	priv->num_fs_reg = fs_gen_size/(3 * sizeof(u32));
++	if (fs_gen_size <= 0 || fs_gen_size % (3 * sizeof(u32)))
++		return -EINVAL;
++	priv->num_fs_reg = fs_gen_size / (3 * sizeof(u32));
+ 	priv->fs_gen_seq = devm_kzalloc(&pdev->dev, fs_gen_size, GFP_KERNEL);
+ 	if (!priv->fs_gen_seq) {
+ 		ret = -ENOMEM;
+@@ -578,6 +451,16 @@
+ 		goto err;
+ 	}
+ 
++	for (i = 0; i < priv->num_fs_reg * 3; i += 3) {
++		if (priv->fs_gen_seq[i] > U16_MAX || (priv->fs_gen_seq[i] & 3) ||
++		    !priv->fs_gen_seq[i + 1] || priv->fs_gen_seq[i + 1] > U8_MAX ||
++		    priv->fs_gen_seq[i + 2] & ~priv->fs_gen_seq[i + 1])
++			return -EINVAL;
++	}
++	priv->regmap = dev_get_regmap(pdev->dev.parent, NULL);
++	if (!priv->regmap)
++		return -EPROBE_DEFER;
++
+ 	/* Get clk details from device tree */
+ 	clk_cnt = of_property_count_strings(pdev->dev.of_node, "clock-names");
+ 	if (clk_cnt <= 0 || clk_cnt > MAX_CLK) {
+@@ -595,6 +478,8 @@
+ 
+ 	ret = of_property_read_string_array(pdev->dev.of_node, "clock-names",
+ 					clk_name_array, clk_cnt);
++	if (ret != clk_cnt)
++		return ret < 0 ? ret : -EINVAL;
+ 
+ 	for (i = 0; i < MAX_CLK; i++) {
+ 		priv->clk[i] = NULL;
+@@ -654,35 +539,29 @@
+ 		}
+ 	}
+ 
+-	ret = lpass_cdc_register_res_clk(&pdev->dev, lpass_cdc_clk_rsc_cb);
+-	if (ret < 0) {
+-		dev_err(&pdev->dev, "%s: Failed to register cb %d",
+-				__func__, ret);
+-		goto err;
+-	}
+ 	priv->dev = &pdev->dev;
+ 	priv->dev_up = true;
+ 	priv->dev_up_gfmux = true;
+ 	mutex_init(&priv->rsc_clk_lock);
+ 	mutex_init(&priv->fs_gen_lock);
+ 	dev_set_drvdata(&pdev->dev, priv);
++	ret = lpass_cdc_register_res_clk(&pdev->dev, lpass_cdc_clk_rsc_cb);
++	if (ret)
++		dev_set_drvdata(&pdev->dev, NULL);
+ 
+ err:
+ 	return ret;
+ }
+ 
+-static int lpass_cdc_clk_rsc_remove(struct platform_device *pdev)
++static void lpass_cdc_clk_rsc_remove(struct platform_device *pdev)
+ {
+ 	struct lpass_cdc_clk_rsc *priv = dev_get_drvdata(&pdev->dev);
++	int i;
+ 
+ 	lpass_cdc_unregister_res_clk(&pdev->dev);
+-	of_platform_depopulate(&pdev->dev);
+-	if (!priv)
+-		return -EINVAL;
+-	mutex_destroy(&priv->rsc_clk_lock);
+-	mutex_destroy(&priv->fs_gen_lock);
+-
+-	return 0;
++	for (i = MAX_CLK - 1; i >= 0; i--)
++		while (priv->owned[i])
++			lpass_cdc_clock_disable(priv, i);
+ }
+ 
+ static const struct of_device_id lpass_cdc_clk_rsc_dt_match[] = {
+--- a/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-comp.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-comp.c
+@@ -2,20 +2,29 @@
+ /* Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+  */
+ #include "lpass-cdc-comp.h"
++#include <linux/limits.h>
++#include <linux/overflow.h>
+ 
+ int lpass_cdc_load_compander_coeff(struct snd_soc_component *component,
+ 				   u16 lsb_reg, u16 msb_reg,
+ 				   struct comp_coeff_val *comp_coeff_table,
+ 				   u16 arr_size)
+ {
+-	int i = 0;
++	int i = 0, ret;
++
++	if (!component || (!comp_coeff_table && arr_size))
++		return -EINVAL;
+ 
+ 	/* Load Compander Coeff */
+ 	for (i = 0; i < arr_size; i++) {
+-		snd_soc_component_write(component, lsb_reg,
+-				comp_coeff_table[i].lsb);
+-		snd_soc_component_write(component, msb_reg,
+-				comp_coeff_table[i].msb);
++		ret = snd_soc_component_write(component, lsb_reg,
++					      comp_coeff_table[i].lsb);
++		if (ret)
++			return ret;
++		ret = snd_soc_component_write(component, msb_reg,
++					      comp_coeff_table[i].msb);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	return 0;
+@@ -30,17 +39,28 @@
+ 	int path_gain;
+ 	int max_attn;
+ 	int zone1_rms = 6;
+-	int upper_gain_int = comp_setting->upper_gain_int;
+-	int lower_gain_int = comp_setting->lower_gain_int;
+-	int ana_addr_map = comp_setting->ana_addr_map;
+-	int upper_gain_dig_int = upper_gain_int - lower_gain_int;
++	int upper_gain_int, lower_gain_int, ana_addr_map, upper_gain_dig_int;
++	int ret;
++
++	if (!component || !comp_setting)
++		return -EINVAL;
++	upper_gain_int = comp_setting->upper_gain_int;
++	lower_gain_int = comp_setting->lower_gain_int;
++	ana_addr_map = comp_setting->ana_addr_map;
++	if (lower_gain_int == INT_MIN ||
++	    check_sub_overflow(upper_gain_int, lower_gain_int, &upper_gain_dig_int) ||
++	    check_sub_overflow(upper_gain_dig_int, abs(lower_gain_int), &path_gain) ||
++	    start_addr > U16_MAX - 0x28)
++		return -EINVAL;
+ 
+ 	/* skip comp_ctl8, comp_ctl9 default settings is fine */
+ 
+ 	/* apply zone settings */
+-	snd_soc_component_write(component,
+-				start_addr + 8,
+-				zone1_rms);
++	ret = snd_soc_component_write(component,
++				      start_addr + 8,
++				      zone1_rms);
++	if (ret)
++		return ret;
+ 
+ 	if (upper_gain_dig_int >= 24)
+ 		zone2_rms = 18;
+@@ -48,9 +68,11 @@
+ 		zone2_rms = 12;
+ 	else
+ 		zone2_rms = upper_gain_dig_int;
+-	snd_soc_component_write(component,
+-				start_addr + 0xC,
+-				zone2_rms);
++	ret = snd_soc_component_write(component,
++				      start_addr + 0xC,
++				      zone2_rms);
++	if (ret)
++		return ret;
+ 
+ 	if (upper_gain_dig_int >= 66)
+ 		zone3_rms = 33;
+@@ -60,9 +82,11 @@
+ 		zone3_rms = 24;
+ 	else
+ 		zone3_rms = upper_gain_dig_int;
+-	snd_soc_component_write(component,
+-				start_addr + 0x10,
+-				zone3_rms);
++	ret = snd_soc_component_write(component,
++				      start_addr + 0x10,
++				      zone3_rms);
++	if (ret)
++		return ret;
+ 
+ 	if (upper_gain_dig_int >= 66)
+ 		zone4_rms = 48;
+@@ -72,9 +96,11 @@
+ 		zone4_rms = 36;
+ 	else
+ 		zone4_rms = upper_gain_dig_int;
+-	snd_soc_component_write(component,
+-				start_addr + 0x14,
+-				zone4_rms);
++	ret = snd_soc_component_write(component,
++				      start_addr + 0x14,
++				      zone4_rms);
++	if (ret)
++		return ret;
+ 
+ 	if (upper_gain_dig_int >= 69)
+ 		zone5_rms = 63;
+@@ -86,31 +112,41 @@
+ 		zone5_rms = 48;
+ 	else
+ 		zone5_rms = upper_gain_dig_int;
+-	snd_soc_component_write(component,
+-				start_addr + 0x18,
+-				zone5_rms);
++	ret = snd_soc_component_write(component,
++				      start_addr + 0x18,
++				      zone5_rms);
++	if (ret)
++		return ret;
+ 
+ 	zone6_rms = upper_gain_dig_int;
+-	snd_soc_component_write(component,
+-				start_addr + 0x1C,
+-				zone6_rms);
++	ret = snd_soc_component_write(component,
++				      start_addr + 0x1C,
++				      zone6_rms);
++	if (ret)
++		return ret;
+ 
+ 	if (lower_gain_int < 0)
+ 		max_attn = 256 + lower_gain_int;
+ 	else
+ 		max_attn = lower_gain_int;
+-	snd_soc_component_write(component,
+-				start_addr + 0x20,
+-				max_attn);
++	ret = snd_soc_component_write(component,
++				      start_addr + 0x20,
++				      max_attn);
++	if (ret)
++		return ret;
+ 
+ 	path_gain = zone6_rms - abs(lower_gain_int);
+-	snd_soc_component_write(component,
+-				start_addr + 0x24,
+-				path_gain);
++	ret = snd_soc_component_write(component,
++				      start_addr + 0x24,
++				      path_gain);
++	if (ret)
++		return ret;
+ 
+-	snd_soc_component_write(component,
+-				start_addr + 0x28,
+-				ana_addr_map);
++	ret = snd_soc_component_write(component,
++				      start_addr + 0x28,
++				      ana_addr_map);
++	if (ret)
++		return ret;
+ 
+ 	return 0;
+ }
+--- a/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-regmap.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-regmap.c
+@@ -6,6 +6,7 @@
+ #include <linux/regmap.h>
+ #include "lpass-cdc.h"
+ #include "internal.h"
++#include <linux/limits.h>
+ 
+ static const struct reg_default lpass_cdc_defaults[] = {
+ 	/* TX Macro */
+@@ -1226,7 +1227,7 @@
+ 	int macro_id;
+ 	u8 *reg_tbl = NULL;
+ 
+-	if (!priv)
++	if (!priv || reg > U16_MAX || (reg & 3))
+ 		return false;
+ 
+ 	macro_id = lpass_cdc_get_macro_id(priv->va_without_decimation,
+@@ -1251,7 +1252,7 @@
+ 	int macro_id;
+ 	const u8 *reg_tbl = NULL;
+ 
+-	if (!priv)
++	if (!priv || reg > U16_MAX || (reg & 3))
+ 		return false;
+ 
+ 	macro_id = lpass_cdc_get_macro_id(priv->va_without_decimation,
+--- a/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-utils.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-utils.c
+@@ -5,6 +5,8 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/regmap.h>
++#include <linux/unaligned.h>
++#include <linux/limits.h>
+ #include "lpass-cdc.h"
+ #include "internal.h"
+ 
+@@ -44,97 +46,83 @@
+ 			   void *val, size_t val_size)
+ {
+ 	struct device *dev = context;
+-	struct lpass_cdc_priv *priv = dev_get_drvdata(dev);
+-	u16 *reg_p;
+-	u16 __reg;
+-	int macro_id, i;
+-	u8 temp = 0;
+-	int ret = -EINVAL;
++	struct lpass_cdc_priv *priv;
++	u16 first, last, offset;
++	int macro_id, ret = 0;
++	size_t i;
+ 
+-	if (!priv) {
+-		dev_err_ratelimited(dev, "%s: priv is NULL\n", __func__);
+-		return ret;
++	if (!dev || !reg || !val || reg_size != REG_BYTES || !val_size)
++		return -EINVAL;
++	priv = dev_get_drvdata(dev);
++	if (!priv)
++		return -ENODEV;
++	first = get_unaligned((const u16 *)reg);
++	if ((first & 3) || val_size - 1 > (U16_MAX - first) / 4)
++		return -EINVAL;
++	last = first + (val_size - 1) * 4;
++	macro_id = lpass_cdc_get_macro_id(priv->va_without_decimation, first);
++	if (macro_id < 0 || macro_id !=
++	    lpass_cdc_get_macro_id(priv->va_without_decimation, last))
++		return -EINVAL;
++
++	if (!lpass_cdc_op_get(priv, false))
++		return -ENODEV;
++	mutex_lock(&priv->io_lock);
++	if (!priv->macros_supported[macro_id] || !priv->macro_params[macro_id].io_base) {
++		ret = -ENODEV;
++		goto unlock;
+ 	}
+-	if (!reg || !val) {
+-		dev_err_ratelimited(dev, "%s: reg or val is NULL\n", __func__);
+-		return ret;
++	for (i = 0; i < val_size; i++) {
++		offset = first + i * 4 - macro_id_base_offset[macro_id];
++		ret = priv->read_dev(priv, macro_id, offset, &((u8 *)val)[i]);
++		if (ret)
++			break;
+ 	}
+-	if (reg_size != REG_BYTES) {
+-		dev_err_ratelimited(dev, "%s: register size %zd bytes, not supported\n",
+-			__func__, reg_size);
+-		return ret;
+-	}
+-
+-	reg_p = (u16 *)reg;
+-	macro_id = lpass_cdc_get_macro_id(priv->va_without_decimation,
+-					   reg_p[0]);
+-	if (macro_id < 0 || !priv->macros_supported[macro_id])
+-		return 0;
+-
+-	mutex_lock(&priv->io_lock);
+-	for (i = 0; i < val_size; i++) {
+-		__reg = (reg_p[0] + i * 4) - macro_id_base_offset[macro_id];
+-		ret = priv->read_dev(priv, macro_id, __reg, &temp);
+-		if (ret < 0) {
+-			dev_err_ratelimited(dev,
+-			"%s: Codec read failed (%d), reg: 0x%x, size:%zd\n",
+-			__func__, ret, reg_p[0] + i * 4, val_size);
+-			break;
+-		}
+-		((u8 *)val)[i] = temp;
+-		dev_dbg(dev, "%s: Read 0x%02x from reg 0x%x\n",
+-			__func__, temp, reg_p[0] + i * 4);
+-	}
++unlock:
+ 	mutex_unlock(&priv->io_lock);
+-
++	lpass_cdc_op_put(priv, false);
+ 	return ret;
+ }
+ 
+-static int regmap_bus_gather_write(void *context,
+-				   const void *reg, size_t reg_size,
++static int regmap_bus_gather_write(void *context, const void *reg, size_t reg_size,
+ 				   const void *val, size_t val_size)
+ {
+ 	struct device *dev = context;
+-	struct lpass_cdc_priv *priv = dev_get_drvdata(dev);
+-	u16 *reg_p;
+-	u16 __reg;
+-	int macro_id, i;
+-	int ret = -EINVAL;
++	struct lpass_cdc_priv *priv;
++	u16 first, last, offset;
++	int macro_id, ret = 0;
++	size_t i;
+ 
+-	if (!priv) {
+-		dev_err_ratelimited(dev, "%s: priv is NULL\n", __func__);
+-		return ret;
++	if (!dev || !reg || !val || reg_size != REG_BYTES || !val_size)
++		return -EINVAL;
++	priv = dev_get_drvdata(dev);
++	if (!priv)
++		return -ENODEV;
++	first = get_unaligned((const u16 *)reg);
++	if ((first & 3) || val_size - 1 > (U16_MAX - first) / 4)
++		return -EINVAL;
++	last = first + (val_size - 1) * 4;
++	macro_id = lpass_cdc_get_macro_id(priv->va_without_decimation, first);
++	if (macro_id < 0 || macro_id !=
++	    lpass_cdc_get_macro_id(priv->va_without_decimation, last))
++		return -EINVAL;
++
++	if (!lpass_cdc_op_get(priv, false))
++		return -ENODEV;
++	mutex_lock(&priv->io_lock);
++	if (!priv->macros_supported[macro_id] || !priv->macro_params[macro_id].io_base) {
++		ret = -ENODEV;
++		goto unlock;
+ 	}
+-	if (!reg || !val) {
+-		dev_err_ratelimited(dev, "%s: reg or val is NULL\n", __func__);
+-		return ret;
++	for (i = 0; i < val_size; i++) {
++		offset = first + i * 4 - macro_id_base_offset[macro_id];
++		ret = priv->write_dev(priv, macro_id, offset, ((const u8 *)val)[i]);
++		if (ret)
++			break;
+ 	}
+-	if (reg_size != REG_BYTES) {
+-		dev_err_ratelimited(dev, "%s: register size %zd bytes, not supported\n",
+-			__func__, reg_size);
+-		return ret;
+-	}
+-
+-	reg_p = (u16 *)reg;
+-	macro_id = lpass_cdc_get_macro_id(priv->va_without_decimation,
+-					reg_p[0]);
+-	if (macro_id < 0 || !priv->macros_supported[macro_id])
+-		return 0;
+-
+-	mutex_lock(&priv->io_lock);
+-	for (i = 0; i < val_size; i++) {
+-		__reg = (reg_p[0] + i * 4) - macro_id_base_offset[macro_id];
+-		ret = priv->write_dev(priv, macro_id, __reg, ((u8 *)val)[i]);
+-		if (ret < 0) {
+-			dev_err_ratelimited(dev,
+-			"%s: Codec write failed (%d), reg:0x%x, size:%zd\n",
+-			__func__, ret, reg_p[0] + i * 4, val_size);
+-			break;
+-		}
+-		dev_dbg(dev, "Write %02x to reg 0x%x\n", ((u8 *)val)[i],
+-			reg_p[0] + i * 4);
+-	}
++unlock:
+ 	mutex_unlock(&priv->io_lock);
++	lpass_cdc_op_put(priv, false);
+ 	return ret;
+ }
+ 
+@@ -146,7 +134,7 @@
+ 	if (!priv)
+ 		return -EINVAL;
+ 
+-	if (count < REG_BYTES) {
++	if (!data || count <= REG_BYTES) {
+ 		dev_err_ratelimited(dev, "%s: count %zd bytes < %d, not supported\n",
+ 			__func__, count, REG_BYTES);
+ 		return -EINVAL;
+--- a/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.c
+@@ -21,7 +21,7 @@
+ #include "lpass-cdc-clk-rsc.h"
+ #include <linux/qti-regmap-debugfs.h>
+ #include <linux/proc_fs.h>
+-#include "../typec_analog_acc.h"
++#include <typec_analog_acc.h>
+ 
+ #define DRV_NAME "lpass-cdc"
+ 
+@@ -36,22 +36,77 @@
+ /* pm runtime auto suspend timer in msecs */
+ #define LPASS_CDC_AUTO_SUSPEND_DELAY          100 /* delay in msec */
+ 
+-/* MCLK_MUX table for all macros */
+-static u16 lpass_cdc_mclk_mux_tbl[MAX_MACRO][MCLK_MUX_MAX] = {
+-	{TX_MACRO, VA_MACRO},
+-	{TX_MACRO, RX_MACRO},
+-	{TX_MACRO, WSA_MACRO},
+-	{TX_MACRO, VA_MACRO},
+-};
+-
+ static bool lpass_cdc_is_valid_codec_dev(struct device *dev);
+ 
+-int lpass_cdc_set_port_map(struct snd_soc_component *component,
+-			u32 size, void *data)
++/* Readers may call other CDC helpers; never hold this lock over callbacks.
++ * Registration/removal must not run from a callback being drained.
++ */
++bool lpass_cdc_op_get(struct lpass_cdc_priv *priv, bool component)
++{
++	bool available;
++
++	if (!priv)
++		return false;
++	mutex_lock(&priv->op_lock);
++	available = !priv->quiescing && (!component || priv->component_ready);
++	if (available) {
++		atomic_inc(&priv->active_ops);
++		if (component)
++			atomic_inc(&priv->component_ops);
++	}
++	mutex_unlock(&priv->op_lock);
++	return available;
++}
++
++void lpass_cdc_op_put(struct lpass_cdc_priv *priv, bool component)
++{
++	if (component && atomic_dec_and_test(&priv->component_ops))
++		wake_up_all(&priv->op_wait);
++	if (atomic_dec_and_test(&priv->active_ops))
++		wake_up_all(&priv->op_wait);
++}
++
++static void lpass_cdc_quiesce(struct lpass_cdc_priv *priv)
++{
++	mutex_lock(&priv->op_lock);
++	priv->quiescing = true;
++	mutex_unlock(&priv->op_lock);
++	wait_event(priv->op_wait, !atomic_read(&priv->active_ops));
++}
++
++static void lpass_cdc_reopen(struct lpass_cdc_priv *priv)
++{
++	mutex_lock(&priv->op_lock);
++	priv->quiescing = false;
++	mutex_unlock(&priv->op_lock);
++}
++
++static void lpass_cdc_component_drain(struct lpass_cdc_priv *priv)
++{
++	mutex_lock(&priv->op_lock);
++	priv->component_ready = false;
++	mutex_unlock(&priv->op_lock);
++	wait_event(priv->op_wait, !atomic_read(&priv->component_ops));
++}
++
++static void lpass_cdc_unregister_component(struct lpass_cdc_priv *priv)
++{
++	lpass_cdc_component_drain(priv);
++	if (priv->component_registered) {
++		snd_soc_unregister_component(priv->dev);
++		priv->component_registered = false;
++	}
++	kfree(priv->lpass_cdc_dais);
++	priv->lpass_cdc_dais = NULL;
++}
++
++static int lpass_cdc_set_port_map_active(struct snd_soc_component *component,
++					 u32 size, void *data)
+ {
+ 	struct lpass_cdc_priv *priv = NULL;
+ 	struct swr_mstr_port_map *map = NULL;
+-	u16 idx;
++	u32 idx;
++	int ret;
+ 
+ 	if (!component || (size == 0) || !data)
+ 		return -EINVAL;
+@@ -66,16 +121,35 @@
+ 	}
+ 	map = (struct swr_mstr_port_map *)data;
+ 
++	for (idx = 0; idx < size; idx++)
++		if (map[idx].id >= MAX_MACRO)
++			return -EINVAL;
+ 	for (idx = 0; idx < size; idx++) {
+-		if (priv->macro_params[map->id].set_port_map)
+-			priv->macro_params[map->id].set_port_map(component,
++		if (priv->macro_params[map->id].set_port_map) {
++			ret = priv->macro_params[map->id].set_port_map(component,
+ 						map->uc,
+ 						SWR_MSTR_PORT_LEN,
+ 						map->swr_port_params);
++			if (ret)
++				return ret;
++		}
+ 		map += 1;
+ 	}
+ 
+ 	return 0;
++}
++
++int lpass_cdc_set_port_map(struct snd_soc_component *component,
++			   u32 size, void *data)
++{
++	struct lpass_cdc_priv *priv = component ? snd_soc_component_get_drvdata(component) : NULL;
++	int ret;
++
++	if (!lpass_cdc_op_get(priv, false))
++		return -ENODEV;
++	ret = lpass_cdc_set_port_map_active(component, size, data);
++					    lpass_cdc_op_put(priv, false);
++	return ret;
+ }
+ EXPORT_SYMBOL(lpass_cdc_set_port_map);
+ 
+@@ -110,10 +184,13 @@
+ 	}
+ 
+ 	if (priv->macro_params[VA_MACRO].dev) {
+-		pm_runtime_get_sync(priv->macro_params[VA_MACRO].dev);
++		ret = pm_runtime_resume_and_get(priv->macro_params[VA_MACRO].dev);
++		if (ret < 0)
++			goto ssr_err;
+ 		mutex_lock(&priv->vote_lock);
+ 		if (((priv->lpass_core_hw_vote && !priv->core_hw_vote_count) ||
+ 			(priv->lpass_audio_hw_vote && !priv->core_audio_vote_count))) {
++			ret = -ENOTSYNC;
+ 			goto vote_err;
+ 		}
+ 	}
+@@ -144,10 +221,13 @@
+ 		goto ssr_err;
+ 	}
+ 	if (priv->macro_params[VA_MACRO].dev) {
+-		pm_runtime_get_sync(priv->macro_params[VA_MACRO].dev);
++		ret = pm_runtime_resume_and_get(priv->macro_params[VA_MACRO].dev);
++		if (ret < 0)
++			goto ssr_err;
+ 		mutex_lock(&priv->vote_lock);
+ 		if (((priv->lpass_core_hw_vote && !priv->core_hw_vote_count) ||
+ 			(priv->lpass_audio_hw_vote && !priv->core_audio_vote_count))) {
++			ret = -ENOTSYNC;
+ 			goto vote_err;
+ 		}
+ 	}
+@@ -165,7 +245,7 @@
+ 	return ret;
+ }
+ 
+-static int lpass_cdc_update_wcd_event(void *handle, u16 event, u32 data)
++static int lpass_cdc_update_wcd_event_active(void *handle, u16 event, u32 data)
+ {
+ 	struct lpass_cdc_priv *priv = (struct lpass_cdc_priv *)handle;
+ 
+@@ -177,51 +257,43 @@
+ 	switch (event) {
+ 	case WCD_LPASS_CDC_EVT_RX_MUTE:
+ 		if (priv->macro_params[RX_MACRO].event_handler)
+-			priv->macro_params[RX_MACRO].event_handler(
+-				priv->component,
++			return priv->macro_params[RX_MACRO].event_handler(priv->component,
+ 				LPASS_CDC_MACRO_EVT_RX_MUTE, data);
+ 		break;
+ 	case WCD_LPASS_CDC_EVT_IMPED_TRUE:
+ 		if (priv->macro_params[RX_MACRO].event_handler)
+-			priv->macro_params[RX_MACRO].event_handler(
+-				priv->component,
++			return priv->macro_params[RX_MACRO].event_handler(priv->component,
+ 				LPASS_CDC_MACRO_EVT_IMPED_TRUE, data);
+ 		break;
+ 	case WCD_LPASS_CDC_EVT_IMPED_FALSE:
+ 		if (priv->macro_params[RX_MACRO].event_handler)
+-			priv->macro_params[RX_MACRO].event_handler(
+-				priv->component,
++			return priv->macro_params[RX_MACRO].event_handler(priv->component,
+ 				LPASS_CDC_MACRO_EVT_IMPED_FALSE, data);
+ 		break;
+ 	case WCD_LPASS_CDC_EVT_RX_COMPANDER_SOFT_RST:
+ 		if (priv->macro_params[RX_MACRO].event_handler)
+-			priv->macro_params[RX_MACRO].event_handler(
+-				priv->component,
++			return priv->macro_params[RX_MACRO].event_handler(priv->component,
+ 				LPASS_CDC_MACRO_EVT_RX_COMPANDER_SOFT_RST, data);
+ 		break;
+ 	case WCD_LPASS_CDC_EVT_BCS_CLK_OFF:
+ 		if (priv->macro_params[TX_MACRO].event_handler)
+-			priv->macro_params[TX_MACRO].event_handler(
+-				priv->component,
++			return priv->macro_params[TX_MACRO].event_handler(priv->component,
+ 				LPASS_CDC_MACRO_EVT_BCS_CLK_OFF, data);
+ 		break;
+ 	case WCD_LPASS_CDC_EVT_RX_PA_GAIN_UPDATE:
+ 		if (priv->macro_params[RX_MACRO].event_handler)
+-			priv->macro_params[RX_MACRO].event_handler(
+-				priv->component,
++			return priv->macro_params[RX_MACRO].event_handler(priv->component,
+ 				LPASS_CDC_MACRO_EVT_RX_PA_GAIN_UPDATE,
+ 				data);
+ 		break;
+ 	case WCD_LPASS_CDC_EVT_HPHL_HD2_ENABLE:
+ 		if (priv->macro_params[RX_MACRO].event_handler)
+-			priv->macro_params[RX_MACRO].event_handler(
+-				priv->component,
++			return priv->macro_params[RX_MACRO].event_handler(priv->component,
+ 				LPASS_CDC_MACRO_EVT_HPHL_HD2_ENABLE, data);
+ 		break;
+ 	case WCD_LPASS_CDC_EVT_HPHR_HD2_ENABLE:
+ 		if (priv->macro_params[RX_MACRO].event_handler)
+-			priv->macro_params[RX_MACRO].event_handler(
+-				priv->component,
++			return priv->macro_params[RX_MACRO].event_handler(priv->component,
+ 				LPASS_CDC_MACRO_EVT_HPHR_HD2_ENABLE, data);
+ 		break;
+ 	default:
+@@ -232,6 +304,19 @@
+ 	return 0;
+ }
+ 
++static int lpass_cdc_update_wcd_event(void *handle, u16 event, u32 data)
++{
++	struct lpass_cdc_priv *priv = handle;
++
++	int ret;
++
++	if (!lpass_cdc_op_get(priv, true))
++		return -ENODEV;
++	ret = lpass_cdc_update_wcd_event_active(handle, event, data);
++	lpass_cdc_op_put(priv, true);
++	return ret;
++}
++
+ static int lpass_cdc_register_notifier(void *handle,
+ 					struct notifier_block *nblock,
+ 					bool enable)
+@@ -253,14 +338,16 @@
+ static void lpass_cdc_notifier_call(struct lpass_cdc_priv *priv,
+ 				     u32 data)
+ {
+-	dev_dbg(priv->dev, "%s: notifier call, data:%d\n", __func__, data);
+-	blocking_notifier_call_chain(&priv->notifier,
+-				     data, (void *)priv->wcd_dev);
++	if (!lpass_cdc_op_get(priv, false))
++		return;
++	blocking_notifier_call_chain(&priv->notifier, data, priv->wcd_dev);
++	lpass_cdc_op_put(priv, false);
+ }
+ 
+ static bool lpass_cdc_is_valid_child_dev(struct device *dev)
+ {
+-	if (of_device_is_compatible(dev->parent->of_node, "qcom,lpass-cdc"))
++	if (dev && dev->parent &&
++	    of_device_is_compatible(dev->parent->of_node, "qcom,lpass-cdc"))
+ 		return true;
+ 
+ 	return false;
+@@ -268,7 +355,7 @@
+ 
+ static bool lpass_cdc_is_valid_codec_dev(struct device *dev)
+ {
+-	if (of_device_is_compatible(dev->of_node, "qcom,lpass-cdc"))
++	if (dev && of_device_is_compatible(dev->of_node, "qcom,lpass-cdc"))
+ 		return true;
+ 
+ 	return false;
+@@ -322,6 +409,9 @@
+  * @dev: lpass_cdc device ptr.
+  * @macro_id: ID of macro calling this API.
+  *
++ * Returns a borrowed pointer. The caller must serialize its use against
++ * provider removal; a device reference alone does not retain driver devres.
++ * Internal clock operations use the parent operation drain instead.
+  * Returns dev ptr on success or NULL on error.
+  */
+ struct device *lpass_cdc_get_device_ptr(struct device *dev, u16 macro_id)
+@@ -343,7 +433,7 @@
+ 		return NULL;
+ 	}
+ 
+-	return priv->macro_params[macro_id].dev;
++	return READ_ONCE(priv->macro_params[macro_id].dev);
+ }
+ EXPORT_SYMBOL(lpass_cdc_get_device_ptr);
+ 
+@@ -352,6 +442,9 @@
+  *
+  * @dev: lpass_cdc device ptr.
+  *
++ * Returns a borrowed pointer. The caller must serialize its use against
++ * provider removal; a device reference alone does not retain driver devres.
++ * Internal clock operations use the parent operation drain instead.
+  * Returns dev ptr on success or NULL on error.
+  */
+ struct device *lpass_cdc_get_rsc_clk_device_ptr(struct device *dev)
+@@ -373,36 +466,28 @@
+ 		return NULL;
+ 	}
+ 
+-	return priv->clk_dev;
++	return READ_ONCE(priv->clk_dev);
+ }
+ EXPORT_SYMBOL(lpass_cdc_get_rsc_clk_device_ptr);
+ 
+ static int lpass_cdc_copy_dais_from_macro(struct lpass_cdc_priv *priv)
+ {
+-	struct snd_soc_dai_driver *dai_ptr;
+-	u16 macro_idx;
+-
+-	/* memcpy into lpass_cdc_dais all macro dais */
+-	if (!priv->lpass_cdc_dais)
+-		priv->lpass_cdc_dais = devm_kzalloc(priv->dev,
+-						priv->num_dais *
+-						sizeof(
+-						struct snd_soc_dai_driver),
+-						GFP_KERNEL);
+-	if (!priv->lpass_cdc_dais)
++	struct snd_soc_dai_driver *dais, *next;
++	int i;
++
++	dais = kcalloc(priv->num_dais, sizeof(*dais), GFP_KERNEL);
++	if (!dais && priv->num_dais)
+ 		return -ENOMEM;
+-
+-	dai_ptr = priv->lpass_cdc_dais;
+-
+-	for (macro_idx = START_MACRO; macro_idx < MAX_MACRO; macro_idx++) {
+-		if (priv->macro_params[macro_idx].dai_ptr) {
+-			memcpy(dai_ptr,
+-			       priv->macro_params[macro_idx].dai_ptr,
+-			       priv->macro_params[macro_idx].num_dais *
+-			       sizeof(struct snd_soc_dai_driver));
+-			dai_ptr += priv->macro_params[macro_idx].num_dais;
+-		}
+-	}
++	next = dais;
++	for (i = 0; i < MAX_MACRO; i++) {
++		if (!priv->macro_params[i].num_dais)
++			continue;
++		memcpy(next, priv->macro_params[i].dai_ptr,
++		       priv->macro_params[i].num_dais * sizeof(*next));
++		next += priv->macro_params[i].num_dais;
++	}
++	kfree(priv->lpass_cdc_dais);
++	priv->lpass_cdc_dais = dais;
+ 	return 0;
+ }
+ 
+@@ -433,8 +518,16 @@
+ 		return -EINVAL;
+ 	}
+ 
++	mutex_lock(&priv->macro_lock);
++	if (priv->removing || priv->clk_dev) {
++		mutex_unlock(&priv->macro_lock);
++		return -EBUSY;
++	}
++	lpass_cdc_quiesce(priv);
+ 	priv->clk_dev = dev;
+ 	priv->rsc_clk_cb = rsc_clk_cb;
++	lpass_cdc_reopen(priv);
++	mutex_unlock(&priv->macro_lock);
+ 
+ 	return 0;
+ }
+@@ -464,148 +557,126 @@
+ 		return;
+ 	}
+ 
+-	priv->clk_dev = NULL;
+-	priv->rsc_clk_cb = NULL;
++	mutex_lock(&priv->macro_lock);
++	if (priv->clk_dev == dev) {
++		lpass_cdc_unregister_component(priv);
++		lpass_cdc_quiesce(priv);
++		priv->clk_dev = NULL;
++		priv->rsc_clk_cb = NULL;
++		lpass_cdc_reopen(priv);
++	}
++	mutex_unlock(&priv->macro_lock);
+ }
+ EXPORT_SYMBOL(lpass_cdc_unregister_res_clk);
+ 
+-static u8 lpass_cdc_dmic_clk_div_get(struct snd_soc_component *component,
+-				   u32 mode, u32 mic_pair)
+-{
+-	struct lpass_cdc_priv* priv = snd_soc_component_get_drvdata(component);
+-	int macro = (mode ? VA_MACRO : TX_MACRO);
+-	int ret = 0;
+-
+-	if (priv->macro_params[macro].clk_div_get) {
+-		ret = priv->macro_params[macro].clk_div_get(component, mic_pair);
+-		if (ret >= 0)
+-			return ret;
+-	}
+-
++static int lpass_cdc_dmic_clk_div_get(struct snd_soc_component *component,
++				      u32 mode, u32 mic_pair)
++{
++	struct lpass_cdc_priv *priv = snd_soc_component_get_drvdata(component);
++	int macro = mode ? VA_MACRO : TX_MACRO;
++
++	if (priv->macro_params[macro].clk_div_get)
++		return priv->macro_params[macro].clk_div_get(component, mic_pair);
+ 	return 1;
+ }
+ 
++static int lpass_cdc_dmic_clk_enable_active(struct snd_soc_component *component,
++					    u32 dmic, u32 tx_mode, bool enable)
++{
++	struct lpass_cdc_priv *priv = snd_soc_component_get_drvdata(component);
++	s32 *tx[] = { &priv->dmic_0_1_tx_clk_cnt, &priv->dmic_2_3_tx_clk_cnt,
++		     &priv->dmic_4_5_tx_clk_cnt, &priv->dmic_6_7_tx_clk_cnt };
++	s32 *va[] = { &priv->dmic_0_1_va_clk_cnt, &priv->dmic_2_3_va_clk_cnt,
++		     &priv->dmic_4_5_va_clk_cnt, &priv->dmic_6_7_va_clk_cnt };
++	u8 *div[] = { &priv->dmic_0_1_clk_div, &priv->dmic_2_3_clk_div,
++		      &priv->dmic_4_5_clk_div, &priv->dmic_6_7_clk_div };
++	const u16 regs[] = { LPASS_CDC_VA_TOP_CSR_DMIC0_CTL,
++		LPASS_CDC_VA_TOP_CSR_DMIC1_CTL, LPASS_CDC_VA_TOP_CSR_DMIC2_CTL,
++		LPASS_CDC_VA_TOP_CSR_DMIC3_CTL };
++	u16 cfg = LPASS_CDC_VA_TOP_CSR_DMIC_CFG, reg;
++	unsigned int old_cfg, old_ctl, pair, mask;
++	s32 *count, total;
++	int next_div, ret;
++
++	if (dmic > 7 || tx_mode > 1)
++		return -EINVAL;
++	pair = dmic / 2;
++	/* A macro callback can itself call CDC helpers. */
++	next_div = lpass_cdc_dmic_clk_div_get(component,
++					      enable ? tx_mode : !tx_mode, pair);
++	if (next_div < 0)
++		return next_div;
++	if (next_div > 7)
++		return -EINVAL;
++	reg = regs[pair];
++	mask = BIT(pair);
++	count = tx_mode ? va[pair] : tx[pair];
++	mutex_lock(&priv->dmic_lock);
++	if (*va[pair] > INT_MAX - *tx[pair]) {
++		ret = -EOVERFLOW;
++		goto out;
++	}
++	total = *va[pair] + *tx[pair];
++	if ((enable && total == INT_MAX) || (!enable && !*count)) {
++		ret = enable ? -EOVERFLOW : -EINVAL;
++		goto out;
++	}
++	if (enable && total && *div[pair] < next_div)
++		next_div = *div[pair];
++	if (!enable) {
++		if (total == 1)
++			next_div = 0;
++		else if (*count > 1)
++			next_div = *div[pair];
++	}
++	ret = regmap_read(priv->regmap, cfg, &old_cfg);
++	if (ret)
++		goto out;
++	ret = regmap_read(priv->regmap, reg, &old_ctl);
++	if (ret)
++		goto out;
++	if (enable && !total) {
++		ret = regmap_update_bits(priv->regmap, cfg, 0x80, 0);
++		if (!ret)
++			ret = regmap_update_bits(priv->regmap, reg, 0x0e, next_div << 1);
++		if (!ret)
++			ret = regmap_update_bits(priv->regmap, reg, 1, 1);
++	} else if (!enable && total == 1) {
++		ret = regmap_update_bits(priv->regmap, reg, 1, 0);
++		if (!ret)
++			ret = regmap_update_bits(priv->regmap, reg, 0x0e, 0);
++	} else if (*div[pair] != next_div) {
++		ret = regmap_update_bits(priv->regmap, cfg, mask, mask);
++		if (!ret)
++			ret = regmap_update_bits(priv->regmap, reg, 0x0e, next_div << 1);
++		if (!ret)
++			ret = regmap_update_bits(priv->regmap, cfg, mask, 0);
++	}
++	if (ret) {
++		if (regmap_update_bits(priv->regmap, reg, 0x0f, old_ctl))
++			dev_err_ratelimited(priv->dev, "DMIC control rollback failed\n");
++		if (regmap_update_bits(priv->regmap, cfg, mask | 0x80, old_cfg))
++			dev_err_ratelimited(priv->dev, "DMIC config rollback failed\n");
++		goto out;
++	}
++	*count += enable ? 1 : -1;
++	*div[pair] = next_div;
++out:
++	mutex_unlock(&priv->dmic_lock);
++	return ret;
++}
++
+ int lpass_cdc_dmic_clk_enable(struct snd_soc_component *component,
+-			   u32 dmic, u32 tx_mode, bool enable)
+-{
+-	struct lpass_cdc_priv* priv = snd_soc_component_get_drvdata(component);
+-	u8  dmic_clk_en = 0x01;
+-	u16 dmic_clk_reg = 0;
+-	s32 *dmic_clk_cnt = NULL;
+-	s32 *dmic_tx_clk_cnt = NULL;
+-	s32 *dmic_va_clk_cnt = NULL;
+-	u8 *dmic_clk_div = NULL;
+-	u8 freq_change_mask = 0;
+-	u8 clk_div = 0;
+-	u32 mic_pair = 0;
+-
+-	dev_dbg(component->dev, "%s: enable: %d, tx_mode:%d, dmic: %d\n",
+-		__func__, enable, tx_mode, dmic);
+-
+-	switch (dmic) {
+-	case 0:
+-	case 1:
+-		dmic_va_clk_cnt = &(priv->dmic_0_1_va_clk_cnt);
+-		dmic_tx_clk_cnt = &(priv->dmic_0_1_tx_clk_cnt);
+-
+-		dmic_clk_div = &(priv->dmic_0_1_clk_div);
+-		dmic_clk_reg = LPASS_CDC_VA_TOP_CSR_DMIC0_CTL;
+-		freq_change_mask = 0x01;
+-		mic_pair = MIC_PAIR01;
+-		break;
+-	case 2:
+-	case 3:
+-		dmic_va_clk_cnt = &(priv->dmic_2_3_va_clk_cnt);
+-		dmic_tx_clk_cnt = &(priv->dmic_2_3_tx_clk_cnt);
+-
+-		dmic_clk_div = &(priv->dmic_2_3_clk_div);
+-		dmic_clk_reg = LPASS_CDC_VA_TOP_CSR_DMIC1_CTL;
+-		freq_change_mask = 0x02;
+-		mic_pair = MIC_PAIR23;
+-		break;
+-	case 4:
+-	case 5:
+-		dmic_va_clk_cnt = &(priv->dmic_4_5_va_clk_cnt);
+-		dmic_tx_clk_cnt = &(priv->dmic_4_5_tx_clk_cnt);
+-
+-		dmic_clk_div = &(priv->dmic_4_5_clk_div);
+-		dmic_clk_reg = LPASS_CDC_VA_TOP_CSR_DMIC2_CTL;
+-		freq_change_mask = 0x04;
+-		mic_pair = MIC_PAIR45;
+-		break;
+-	case 6:
+-	case 7:
+-		dmic_va_clk_cnt = &(priv->dmic_6_7_va_clk_cnt);
+-		dmic_tx_clk_cnt = &(priv->dmic_6_7_tx_clk_cnt);
+-
+-		dmic_clk_div = &(priv->dmic_6_7_clk_div);
+-		dmic_clk_reg = LPASS_CDC_VA_TOP_CSR_DMIC3_CTL;
+-		freq_change_mask = 0x08;
+-		mic_pair = MIC_PAIR67;
+-		break;
+-	default:
+-		dev_err_ratelimited(component->dev, "%s: Invalid DMIC Selection\n",
+-			__func__);
+-		return -EINVAL;
+-	}
+-
+-	dmic_clk_cnt = (tx_mode) ? dmic_va_clk_cnt : dmic_tx_clk_cnt;
+-
+-	dev_dbg(component->dev, "%s: DMIC%d dmic_clk_cnt %d mic_pair %d\n",
+-			__func__, dmic, *dmic_clk_cnt, mic_pair);
+-	if (enable) {
+-		clk_div = lpass_cdc_dmic_clk_div_get(component, tx_mode, mic_pair);
+-		(*dmic_clk_cnt)++;
+-		if ((*dmic_va_clk_cnt + *dmic_tx_clk_cnt)  == 1) {
+-			snd_soc_component_update_bits(component,
+-					LPASS_CDC_VA_TOP_CSR_DMIC_CFG,
+-					0x80, 0x00);
+-			snd_soc_component_update_bits(component, dmic_clk_reg,
+-						0x0E, clk_div << 0x1);
+-			snd_soc_component_update_bits(component, dmic_clk_reg,
+-					dmic_clk_en, dmic_clk_en);
+-		} else {
+-			if (*dmic_clk_div > clk_div) {
+-				snd_soc_component_update_bits(component,
+-						LPASS_CDC_VA_TOP_CSR_DMIC_CFG,
+-						freq_change_mask, freq_change_mask);
+-				snd_soc_component_update_bits(component, dmic_clk_reg,
+-						0x0E, clk_div << 0x1);
+-				snd_soc_component_update_bits(component,
+-						LPASS_CDC_VA_TOP_CSR_DMIC_CFG,
+-						freq_change_mask, 0x00);
+-			} else {
+-				clk_div = *dmic_clk_div;
+-			}
+-		}
+-		*dmic_clk_div = clk_div;
+-	} else {
+-		(*dmic_clk_cnt)--;
+-		if ((*dmic_va_clk_cnt + *dmic_tx_clk_cnt)  == 0) {
+-			snd_soc_component_update_bits(component, dmic_clk_reg,
+-					dmic_clk_en, 0);
+-			clk_div = 0;
+-			snd_soc_component_update_bits(component, dmic_clk_reg,
+-							0x0E, clk_div << 0x1);
+-		} else if (*dmic_clk_cnt == 0) {
+-			clk_div = lpass_cdc_dmic_clk_div_get(component, !tx_mode, mic_pair);
+-
+-			if (*dmic_clk_div != clk_div) {
+-			/* Reset the div factor corresponding to the enabled Macro/path. */
+-				snd_soc_component_update_bits(component,
+-							LPASS_CDC_VA_TOP_CSR_DMIC_CFG,
+-							freq_change_mask, freq_change_mask);
+-				snd_soc_component_update_bits(component, dmic_clk_reg,
+-								0x0E, clk_div << 0x1);
+-				snd_soc_component_update_bits(component,
+-							LPASS_CDC_VA_TOP_CSR_DMIC_CFG,
+-							freq_change_mask, 0x00);
+-			}
+-		}
+-		*dmic_clk_div = clk_div;
+-	}
+-
+-	return 0;
++			      u32 dmic, u32 tx_mode, bool enable)
++{
++	struct lpass_cdc_priv *priv = component ? snd_soc_component_get_drvdata(component) : NULL;
++	int ret;
++
++	if (!lpass_cdc_op_get(priv, false))
++		return -ENODEV;
++	ret = lpass_cdc_dmic_clk_enable_active(component, dmic, tx_mode, enable);
++	lpass_cdc_op_put(priv, false);
++	return ret;
+ }
+ EXPORT_SYMBOL(lpass_cdc_dmic_clk_enable);
+ 
+@@ -627,7 +698,7 @@
+ 		dev_err_ratelimited(dev, "%s: priv is null\n", __func__);
+ 		return false;
+ 	}
+-	return priv->macros_supported[VA_MACRO];
++	return READ_ONCE(priv->macros_supported[VA_MACRO]);
+ }
+ EXPORT_SYMBOL(lpass_cdc_is_va_macro_registered);
+ 
+@@ -641,80 +712,63 @@
+  * Returns 0 on success or -EINVAL on error.
+  */
+ int lpass_cdc_register_macro(struct device *dev, u16 macro_id,
+-			  struct macro_ops *ops)
++			   struct macro_ops *ops)
+ {
+ 	struct lpass_cdc_priv *priv;
+-	int ret = -EINVAL;
+-
+-	if (!dev || !ops) {
+-		pr_err("%s: dev or ops is null\n", __func__);
+-		return -EINVAL;
+-	}
+-	if (!lpass_cdc_is_valid_child_dev(dev)) {
+-		dev_err(dev, "%s: child device for macro:%d not added yet\n",
+-			__func__, macro_id);
+-		return -EINVAL;
+-	}
++	int ret = 0;
++
++	if (!lpass_cdc_is_valid_child_dev(dev) || !ops || macro_id >= MAX_MACRO ||
++	    (ops->num_dais && !ops->dai_ptr) || !ops->io_base)
++		return -EINVAL;
+ 	priv = dev_get_drvdata(dev->parent);
+-	if (!priv || (macro_id >= MAX_MACRO)) {
+-		dev_err(dev, "%s: priv is null or invalid macro\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	priv->macro_params[macro_id].clk_id_req = ops->clk_id_req;
+-	priv->macro_params[macro_id].default_clk_id = ops->default_clk_id;
+-	priv->macro_params[macro_id].init = ops->init;
+-	priv->macro_params[macro_id].exit = ops->exit;
+-	priv->macro_params[macro_id].io_base = ops->io_base;
+-	priv->macro_params[macro_id].num_dais = ops->num_dais;
+-	priv->macro_params[macro_id].dai_ptr = ops->dai_ptr;
+-	priv->macro_params[macro_id].event_handler = ops->event_handler;
+-	priv->macro_params[macro_id].set_port_map = ops->set_port_map;
++	if (!priv)
++		return -ENODEV;
++	mutex_lock(&priv->macro_lock);
++	if (priv->removing || priv->macros_supported[macro_id]) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	if (priv->num_macros_registered >= priv->num_macros ||
++	    ops->num_dais > U16_MAX - priv->num_dais) {
++		ret = -EOVERFLOW;
++		goto unlock;
++	}
++	lpass_cdc_quiesce(priv);
++	priv->macro_params[macro_id] = *ops;
+ 	priv->macro_params[macro_id].dev = dev;
+-	priv->current_mclk_mux_macro[macro_id] =
+-				lpass_cdc_mclk_mux_tbl[macro_id][MCLK_MUX0];
+-	if (macro_id == TX_MACRO) {
+-		priv->macro_params[macro_id].reg_wake_irq = ops->reg_wake_irq;
+-		priv->macro_params[macro_id].reg_evt_listener =
+-							ops->reg_evt_listener;
+-		priv->macro_params[macro_id].clk_enable = ops->clk_enable;
+-	}
+-	if (macro_id == TX_MACRO || macro_id == VA_MACRO)
+-		priv->macro_params[macro_id].clk_div_get = ops->clk_div_get;
+-
+-	if (macro_id == VA_MACRO)
+-		priv->macro_params[macro_id].reg_wake_irq =
+-						ops->reg_wake_irq;
+-	mutex_lock(&priv->macro_lock);
+ 	priv->num_dais += ops->num_dais;
+ 	priv->num_macros_registered++;
+ 	priv->macros_supported[macro_id] = true;
+-
+-	dev_info(dev, "%s: register macro successful:%d\n", __func__, macro_id);
+-
+-	if (priv->num_macros_registered == priv->num_macros) {
+-		ret = lpass_cdc_copy_dais_from_macro(priv);
+-		if (ret < 0) {
+-			dev_err(dev, "%s: copy_dais failed\n", __func__);
+-			mutex_unlock(&priv->macro_lock);
+-			return ret;
+-		}
+-		if (priv->macros_supported[TX_MACRO] == false) {
+-			lpass_cdc_mclk_mux_tbl[WSA_MACRO][MCLK_MUX0] = WSA_MACRO;
+-			priv->current_mclk_mux_macro[WSA_MACRO] = WSA_MACRO;
+-			lpass_cdc_mclk_mux_tbl[VA_MACRO][MCLK_MUX0] = VA_MACRO;
+-			priv->current_mclk_mux_macro[VA_MACRO] = VA_MACRO;
+-		}
+-		ret = snd_soc_register_component(dev->parent, &lpass_cdc,
+-				priv->lpass_cdc_dais, priv->num_dais);
+-		if (ret < 0) {
+-			dev_err(dev, "%s: register codec failed\n", __func__);
+-			mutex_unlock(&priv->macro_lock);
+-			return ret;
+-		}
+-	}
++	priv->current_mclk_mux_macro[macro_id] = TX_MACRO;
++	lpass_cdc_reopen(priv);
++
++	if (priv->num_macros_registered != priv->num_macros)
++		goto unlock;
++	ret = lpass_cdc_copy_dais_from_macro(priv);
++	if (ret)
++		goto rollback;
++	if (!priv->macros_supported[TX_MACRO]) {
++		priv->current_mclk_mux_macro[WSA_MACRO] = WSA_MACRO;
++		priv->current_mclk_mux_macro[VA_MACRO] = VA_MACRO;
++	}
++	ret = snd_soc_register_component(priv->dev, &lpass_cdc,
++					 priv->lpass_cdc_dais, priv->num_dais);
++	if (!ret) {
++		priv->component_registered = true;
++		goto unlock;
++	}
++rollback:
++	lpass_cdc_quiesce(priv);
++	priv->num_dais -= ops->num_dais;
++	priv->num_macros_registered--;
++	priv->macros_supported[macro_id] = false;
++	memset(&priv->macro_params[macro_id], 0, sizeof(*ops));
++	kfree(priv->lpass_cdc_dais);
++	priv->lpass_cdc_dais = NULL;
++	lpass_cdc_reopen(priv);
++unlock:
+ 	mutex_unlock(&priv->macro_lock);
+-	return 0;
++	return ret;
+ }
+ EXPORT_SYMBOL(lpass_cdc_register_macro);
+ 
+@@ -729,40 +783,24 @@
+ {
+ 	struct lpass_cdc_priv *priv;
+ 
+-	if (!dev) {
+-		pr_err_ratelimited("%s: dev is null\n", __func__);
++	if (!lpass_cdc_is_valid_child_dev(dev) || macro_id >= MAX_MACRO)
+ 		return;
+-	}
+-	if (!lpass_cdc_is_valid_child_dev(dev)) {
+-		dev_err_ratelimited(dev, "%s: macro:%d not in valid registered macro-list\n",
+-			__func__, macro_id);
++	priv = dev_get_drvdata(dev->parent);
++	if (!priv)
+ 		return;
+-	}
+-	priv = dev_get_drvdata(dev->parent);
+-	if (!priv || (macro_id >= MAX_MACRO)) {
+-		dev_err_ratelimited(dev, "%s: priv is null or invalid macro\n", __func__);
+-		return;
+-	}
+-
+-	priv->macro_params[macro_id].init = NULL;
+-	priv->macro_params[macro_id].num_dais = 0;
+-	priv->macro_params[macro_id].dai_ptr = NULL;
+-	priv->macro_params[macro_id].event_handler = NULL;
+-	priv->macro_params[macro_id].dev = NULL;
+-	if (macro_id == TX_MACRO) {
+-		priv->macro_params[macro_id].reg_wake_irq = NULL;
+-		priv->macro_params[macro_id].reg_evt_listener = NULL;
+-		priv->macro_params[macro_id].clk_enable = NULL;
+-	}
+-	if (macro_id == TX_MACRO || macro_id == VA_MACRO)
+-		priv->macro_params[macro_id].clk_div_get = NULL;
+-
++	mutex_lock(&priv->macro_lock);
++	if (priv->macro_params[macro_id].dev != dev)
++		goto unlock;
++	/* Component and macro exits still need every callback and clock. */
++	lpass_cdc_unregister_component(priv);
++	lpass_cdc_quiesce(priv);
+ 	priv->num_dais -= priv->macro_params[macro_id].num_dais;
+ 	priv->num_macros_registered--;
+-
+-	/* UNREGISTER CODEC HERE */
+-	if (priv->num_macros - 1 == priv->num_macros_registered)
+-		snd_soc_unregister_component(dev->parent);
++	priv->macros_supported[macro_id] = false;
++	memset(&priv->macro_params[macro_id], 0, sizeof(struct macro_ops));
++	lpass_cdc_reopen(priv);
++unlock:
++	mutex_unlock(&priv->macro_lock);
+ }
+ EXPORT_SYMBOL(lpass_cdc_unregister_macro);
+ 
+@@ -887,91 +925,120 @@
+ 	return simple_read_from_buffer(buf, count, &pos, buffer, len);
+ }
+ 
+-static int lpass_cdc_ssr_enable(struct device *dev, void *data)
++static int lpass_cdc_macro_event(struct lpass_cdc_priv *priv, u16 event)
++{
++	int i, ret, first = 0;
++
++	for (i = 0; i < MAX_MACRO; i++) {
++		if (!priv->macro_params[i].event_handler)
++			continue;
++		ret = priv->macro_params[i].event_handler(priv->component, event, 0);
++		if (ret && !first)
++			first = ret;
++		if (ret && event != LPASS_CDC_MACRO_EVT_SSR_DOWN)
++			break;
++	}
++	return first;
++}
++
++static void lpass_cdc_ssr_down(struct lpass_cdc_priv *priv)
++{
++	int ret;
++
++	regcache_cache_only(priv->regmap, true);
++	mutex_lock(&priv->clk_lock);
++	priv->dev_up = false;
++	mutex_unlock(&priv->clk_lock);
++	mutex_lock(&priv->vote_lock);
++	priv->pre_dev_up = false;
++	mutex_unlock(&priv->vote_lock);
++	if (priv->rsc_clk_cb) {
++		ret = priv->rsc_clk_cb(priv->clk_dev, LPASS_CDC_MACRO_EVT_SSR_DOWN);
++		if (ret)
++			dev_err_ratelimited(priv->dev, "clock SSR down failed: %d\n", ret);
++	}
++	ret = lpass_cdc_macro_event(priv, LPASS_CDC_MACRO_EVT_SSR_DOWN);
++	if (ret)
++		dev_err_ratelimited(priv->dev, "macro SSR down failed: %d\n", ret);
++	lpass_cdc_notifier_call(priv, LPASS_CDC_WCD_EVT_SSR_DOWN);
++}
++
++static int lpass_cdc_ssr_enable_active(struct device *dev, void *data)
+ {
+ 	struct lpass_cdc_priv *priv = data;
+-	int macro_idx;
++	int ret;
+ 
+ 	if (priv->initial_boot) {
+ 		priv->initial_boot = false;
+ 		return 0;
+ 	}
+-
+-	if (priv->rsc_clk_cb)
+-		priv->rsc_clk_cb(priv->clk_dev, LPASS_CDC_MACRO_EVT_SSR_UP);
+-
+-	for (macro_idx = START_MACRO; macro_idx < MAX_MACRO; macro_idx++) {
+-		if (priv->macro_params[macro_idx].event_handler)
+-			priv->macro_params[macro_idx].event_handler(
+-				priv->component,
+-				LPASS_CDC_MACRO_EVT_CLK_RESET, 0x0);
+-	}
+-
+-	mutex_lock(&priv->clk_lock);
++	if (!priv->rsc_clk_cb)
++		return -ENODEV;
++	ret = priv->rsc_clk_cb(priv->clk_dev, LPASS_CDC_MACRO_EVT_SSR_UP);
++	if (ret)
++		goto fail;
++	ret = lpass_cdc_macro_event(priv, LPASS_CDC_MACRO_EVT_CLK_RESET);
++	if (ret)
++		goto fail;
++	mutex_lock(&priv->vote_lock);
+ 	priv->pre_dev_up = true;
+-	mutex_unlock(&priv->clk_lock);
+-
+-	if (priv->rsc_clk_cb)
+-		priv->rsc_clk_cb(priv->clk_dev, LPASS_CDC_MACRO_EVT_SSR_GFMUX_UP);
+-
+-	for (macro_idx = START_MACRO; macro_idx < MAX_MACRO; macro_idx++) {
+-		if (!priv->macro_params[macro_idx].event_handler)
+-			continue;
+-		priv->macro_params[macro_idx].event_handler(
+-			priv->component,
+-			LPASS_CDC_MACRO_EVT_PRE_SSR_UP, 0x0);
+-	}
+-
++	mutex_unlock(&priv->vote_lock);
++	ret = priv->rsc_clk_cb(priv->clk_dev, LPASS_CDC_MACRO_EVT_SSR_GFMUX_UP);
++	if (ret)
++		goto fail;
++	ret = lpass_cdc_macro_event(priv, LPASS_CDC_MACRO_EVT_PRE_SSR_UP);
++	if (ret)
++		goto fail;
+ 	regcache_cache_only(priv->regmap, false);
+ 	mutex_lock(&priv->clk_lock);
+ 	priv->dev_up = true;
+ 	mutex_unlock(&priv->clk_lock);
+ 	regcache_mark_dirty(priv->regmap);
+-	lpass_cdc_clk_rsc_enable_all_clocks(priv->clk_dev, true);
+-	regcache_sync(priv->regmap);
+-	/* Add a 100usec sleep to ensure last register write is done */
+-	usleep_range(100,110);
+-	lpass_cdc_clk_rsc_enable_all_clocks(priv->clk_dev, false);
+-	/* call ssr event for supported macros */
+-	for (macro_idx = START_MACRO; macro_idx < MAX_MACRO; macro_idx++) {
+-		if (!priv->macro_params[macro_idx].event_handler)
+-			continue;
+-		priv->macro_params[macro_idx].event_handler(
+-			priv->component,
+-			LPASS_CDC_MACRO_EVT_SSR_UP, 0x0);
+-	}
++	ret = lpass_cdc_clk_rsc_all_clocks(priv->clk_dev, true);
++	if (ret)
++		goto fail;
++	ret = regcache_sync(priv->regmap);
++	/* Ensure the last native register write has reached the device. */
++	usleep_range(100, 110);
++	lpass_cdc_clk_rsc_all_clocks(priv->clk_dev, false);
++	if (ret)
++		goto fail;
++	ret = lpass_cdc_macro_event(priv, LPASS_CDC_MACRO_EVT_SSR_UP);
++	if (ret)
++		goto fail;
+ 	lpass_cdc_notifier_call(priv, LPASS_CDC_WCD_EVT_SSR_UP);
+ 	return 0;
++fail:
++	lpass_cdc_ssr_down(priv);
++	return ret;
++}
++
++static int lpass_cdc_ssr_enable(struct device *dev, void *data)
++{
++	struct lpass_cdc_priv *priv = data;
++
++	int ret;
++
++	if (!lpass_cdc_op_get(priv, false))
++		return -ENODEV;
++	ret = lpass_cdc_ssr_enable_active(dev, data);
++	lpass_cdc_op_put(priv, false);
++	return ret;
++}
++
++static void lpass_cdc_ssr_disable_active(struct device *dev, void *data)
++{
++	lpass_cdc_ssr_down(data);
+ }
+ 
+ static void lpass_cdc_ssr_disable(struct device *dev, void *data)
+ {
+ 	struct lpass_cdc_priv *priv = data;
+-	int macro_idx;
+-
+-	if (!priv->dev_up) {
+-		dev_err_ratelimited(priv->dev,
+-				    "%s: already disabled\n", __func__);
++
++	if (!lpass_cdc_op_get(priv, false))
+ 		return;
+-	}
+-
+-	regcache_cache_only(priv->regmap, true);
+-
+-	mutex_lock(&priv->clk_lock);
+-	priv->dev_up = false;
+-	priv->pre_dev_up = false;
+-	mutex_unlock(&priv->clk_lock);
+-	if (priv->rsc_clk_cb)
+-		priv->rsc_clk_cb(priv->clk_dev, LPASS_CDC_MACRO_EVT_SSR_DOWN);
+-	/* call ssr event for supported macros */
+-	for (macro_idx = START_MACRO; macro_idx < MAX_MACRO; macro_idx++) {
+-		if (!priv->macro_params[macro_idx].event_handler)
+-			continue;
+-		priv->macro_params[macro_idx].event_handler(
+-			priv->component,
+-			LPASS_CDC_MACRO_EVT_SSR_DOWN, 0x0);
+-	}
+-	lpass_cdc_notifier_call(priv, LPASS_CDC_WCD_EVT_SSR_DOWN);
++	lpass_cdc_ssr_disable_active(dev, data);
++	lpass_cdc_op_put(priv, false);
+ }
+ 
+ static struct snd_info_entry_ops lpass_cdc_info_ops = {
+@@ -1020,6 +1087,7 @@
+ 	priv->entry->mode = S_IFDIR | 0555;
+ 	if (snd_info_register(priv->entry) < 0) {
+ 		snd_info_free_entry(priv->entry);
++		priv->entry = NULL;
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -1030,6 +1098,7 @@
+ 		dev_err_ratelimited(component->dev, "%s: failed to create lpass_cdc version entry\n",
+ 			__func__);
+ 		snd_info_free_entry(priv->entry);
++		priv->entry = NULL;
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -1041,6 +1110,7 @@
+ 	if (snd_info_register(version_entry) < 0) {
+ 		snd_info_free_entry(version_entry);
+ 		snd_info_free_entry(priv->entry);
++		priv->entry = NULL;
+ 		return -ENOMEM;
+ 	}
+ 	priv->version_entry = version_entry;
+@@ -1057,8 +1127,8 @@
+  *
+  * Return: 0 on success or negative error code on failure.
+  */
+-int lpass_cdc_register_wake_irq(struct snd_soc_component *component,
+-			     u32 ipc_wakeup)
++static int lpass_cdc_register_wake_irq_active(struct snd_soc_component *component,
++					      u32 ipc_wakeup)
+ {
+ 	struct lpass_cdc_priv *priv = NULL;
+ 
+@@ -1075,10 +1145,22 @@
+ 	}
+ 
+ 	if (priv->macro_params[VA_MACRO].reg_wake_irq)
+-		priv->macro_params[VA_MACRO].reg_wake_irq(
+-				component, ipc_wakeup);
++		return priv->macro_params[VA_MACRO].reg_wake_irq(component, ipc_wakeup);
+ 
+ 	return 0;
++}
++
++int lpass_cdc_register_wake_irq(struct snd_soc_component *component,
++				u32 ipc_wakeup)
++{
++	struct lpass_cdc_priv *priv = component ? snd_soc_component_get_drvdata(component) : NULL;
++	int ret;
++
++	if (!lpass_cdc_op_get(priv, false))
++		return -ENODEV;
++	ret = lpass_cdc_register_wake_irq_active(component, ipc_wakeup);
++						 lpass_cdc_op_put(priv, false);
++	return ret;
+ }
+ EXPORT_SYMBOL(lpass_cdc_register_wake_irq);
+ 
+@@ -1090,8 +1172,8 @@
+  *
+  * Returns 0 on success or -EINVAL on error.
+  */
+-int lpass_cdc_tx_mclk_enable(struct snd_soc_component *component,
+-			  bool enable)
++static int lpass_cdc_tx_mclk_enable_active(struct snd_soc_component *component,
++					   bool enable)
+ {
+ 	struct lpass_cdc_priv *priv = NULL;
+ 	int ret = 0;
+@@ -1114,6 +1196,18 @@
+ 
+ 	return ret;
+ }
++
++int lpass_cdc_tx_mclk_enable(struct snd_soc_component *component, bool enable)
++{
++	struct lpass_cdc_priv *priv = component ? snd_soc_component_get_drvdata(component) : NULL;
++	int ret;
++
++	if (!lpass_cdc_op_get(priv, false))
++		return -ENODEV;
++	ret = lpass_cdc_tx_mclk_enable_active(component, enable);
++					      lpass_cdc_op_put(priv, false);
++	return ret;
++}
+ EXPORT_SYMBOL(lpass_cdc_tx_mclk_enable);
+ 
+ /**
+@@ -1125,8 +1219,8 @@
+  *
+  * Returns 0 on success or -EINVAL on error.
+  */
+-int lpass_cdc_register_event_listener(struct snd_soc_component *component,
+-				   bool enable)
++static int lpass_cdc_register_event_listener_active(struct snd_soc_component *component,
++						    bool enable)
+ {
+ 	struct lpass_cdc_priv *priv = NULL;
+ 	int ret = 0;
+@@ -1149,7 +1243,48 @@
+ 
+ 	return ret;
+ }
++
++int lpass_cdc_register_event_listener(struct snd_soc_component *component,
++				      bool enable)
++{
++	struct lpass_cdc_priv *priv = component ? snd_soc_component_get_drvdata(component) : NULL;
++	int ret;
++
++	if (!lpass_cdc_op_get(priv, false))
++		return -ENODEV;
++	ret = lpass_cdc_register_event_listener_active(component, enable);
++						       lpass_cdc_op_put(priv, false);
++	return ret;
++}
+ EXPORT_SYMBOL(lpass_cdc_register_event_listener);
++
++static void lpass_cdc_component_cleanup(struct lpass_cdc_priv *priv,
++					struct snd_soc_component *component)
++{
++	int i;
++
++	lpass_cdc_component_drain(priv);
++	if (priv->typec_registered) {
++		typec_analog_acc_exit(component);
++		priv->typec_registered = false;
++	}
++	if (priv->snd_event_registered) {
++		snd_event_client_deregister(priv->dev);
++		priv->snd_event_registered = false;
++	}
++	if (priv->entry) {
++		snd_info_free_entry(priv->entry);
++		priv->entry = NULL;
++		priv->version_entry = NULL;
++	}
++	for (i = MAX_MACRO - 1; i >= 0; i--) {
++		if (priv->macro_initialized[i] && priv->macro_params[i].exit)
++			priv->macro_params[i].exit(component);
++		priv->macro_initialized[i] = false;
++	}
++	priv->component = NULL;
++	snd_soc_component_exit_regmap(component);
++}
+ 
+ static int lpass_cdc_soc_codec_probe(struct snd_soc_component *component)
+ {
+@@ -1158,6 +1293,7 @@
+ 	u8 core_id_0 = 0, core_id_1 = 0, core_id_2 = 0;
+ 
+ 	snd_soc_component_init_regmap(component, priv->regmap);
++	priv->component = component;
+ 
+ 	if (!priv->version) {
+ 		/*
+@@ -1201,50 +1337,40 @@
+ 					__func__, macro_idx);
+ 				goto err;
+ 			}
++			priv->macro_initialized[macro_idx] = true;
+ 		}
+ 	}
+-	priv->component = component;
+ 
+ 	ret = snd_event_client_register(priv->dev, &lpass_cdc_ssr_ops, priv);
+-	if (!ret) {
+-		snd_event_notify(priv->dev, SND_EVENT_UP);
+-	} else {
+-		dev_err(component->dev,
+-			"%s: Registration with SND event FWK failed ret = %d\n",
+-			__func__, ret);
++	if (ret)
+ 		goto err;
+-	}
+-
++	priv->snd_event_registered = true;
++	ret = snd_event_notify(priv->dev, SND_EVENT_UP);
++	if (ret)
++		goto err;
++
++	/* Preserve the native presence-based DT selection. */
+ 	if (of_find_property(component->card->dev->of_node,
+-		"qcom,unsupported-typec-analog-acc", NULL)) {
+-		dev_info(component->dev,"%s: typec_analog_acc is unsupported\n",
+-				__func__);
++			     "qcom,unsupported-typec-analog-acc", NULL)) {
+ 		ret = typec_analog_acc_init(component);
+-		if (!ret) {
+-			dev_err(component->dev,
+-				"%s: init typec analog accessory failed ret = %d\n",
+-				__func__, ret);
+-		}
+-	}
+-
+-	dev_dbg(component->dev, "%s: lpass_cdc soc codec probe success\n",
+-		__func__);
++		if (ret)
++			goto err;
++		priv->typec_registered = true;
++	}
++	mutex_lock(&priv->op_lock);
++	priv->component_ready = true;
++	mutex_unlock(&priv->op_lock);
++	return 0;
+ err:
++	lpass_cdc_component_cleanup(priv, component);
+ 	return ret;
+ }
+ 
+ static void lpass_cdc_soc_codec_remove(struct snd_soc_component *component)
+ {
+ 	struct lpass_cdc_priv *priv = dev_get_drvdata(component->dev);
+-	int macro_idx;
+-
+-	snd_event_client_deregister(priv->dev);
+-	/* call exit for supported macros */
+-	for (macro_idx = START_MACRO; macro_idx < MAX_MACRO; macro_idx++)
+-		if (priv->macro_params[macro_idx].exit)
+-			priv->macro_params[macro_idx].exit(component);
+-
+-	return;
++
++	lpass_cdc_component_cleanup(priv, component);
+ }
+ 
+ static const struct snd_soc_component_driver lpass_cdc = {
+@@ -1253,81 +1379,78 @@
+ 	.remove = lpass_cdc_soc_codec_remove,
+ };
+ 
+-static void lpass_cdc_add_child_devices(struct work_struct *work)
+-{
+-	struct lpass_cdc_priv *priv;
+-	bool split_codec = false;
+-	struct platform_device *pdev;
++static void lpass_cdc_remove_child_devices(struct lpass_cdc_priv *priv)
++{
++	struct platform_device *child;
++	int phase, i;
++
++	/* Drain split-codec consumers before macros, then their clock provider. */
++	for (phase = 0; phase < 3; phase++) {
++		for (i = priv->child_count - 1; i >= 0; i--) {
++			child = priv->pdev_child_devices[i];
++			if (!child || priv->child_phase[i] != phase)
++				continue;
++			if (priv->wcd_dev == &child->dev) {
++				mutex_lock(&priv->macro_lock);
++				lpass_cdc_quiesce(priv);
++				priv->wcd_dev = NULL;
++				lpass_cdc_reopen(priv);
++				mutex_unlock(&priv->macro_lock);
++			}
++			platform_device_unregister(child);
++			priv->pdev_child_devices[i] = NULL;
++		}
++	}
++	priv->wcd_dev = NULL;
++	priv->child_count = 0;
++	priv->dev->platform_data = NULL;
++}
++
++static int lpass_cdc_add_child_devices(struct lpass_cdc_priv *priv)
++{
++	struct platform_device *child;
+ 	struct device_node *node;
+-	int ret = 0, count = 0;
+-	struct wcd_ctrl_platform_data *platdata = NULL;
+-	char plat_dev_name[LPASS_CDC_STRING_LEN] = "";
+-
+-	priv = container_of(work, struct lpass_cdc_priv,
+-			    lpass_cdc_add_child_devices_work);
+-	if (!priv) {
+-		pr_err("%s: Memory for lpass_cdc priv does not exist\n",
+-			__func__);
+-		return;
+-	}
+-	if (!priv->dev || !priv->dev->of_node) {
+-		dev_err(priv->dev, "%s: DT node for lpass_cdc does not exist\n",
+-			__func__);
+-		return;
+-	}
+-
+-	platdata = &priv->plat_data;
+-	priv->child_count = 0;
+-
++	int ret;
++
++	priv->dev->platform_data = &priv->plat_data;
+ 	for_each_available_child_of_node(priv->dev->of_node, node) {
+-		split_codec = false;
+-		if (of_find_property(node, "qcom,split-codec", NULL)) {
+-			split_codec = true;
+-			dev_dbg(priv->dev, "%s: split codec slave exists\n",
+-				__func__);
++		if (priv->child_count == LPASS_CDC_CHILD_DEVICES_MAX) {
++			ret = -E2BIG;
++			goto fail;
+ 		}
+-
+-		strscpy(plat_dev_name, node->name,
+-				(LPASS_CDC_STRING_LEN - 1));
+-
+-		pdev = platform_device_alloc(plat_dev_name, -1);
+-		if (!pdev) {
+-			dev_err(priv->dev, "%s: pdev memory alloc failed\n",
+-				__func__);
++		child = platform_device_alloc(node->name, PLATFORM_DEVID_NONE);
++		if (!child) {
+ 			ret = -ENOMEM;
+-			goto err;
++			goto fail;
+ 		}
+-		pdev->dev.parent = priv->dev;
+-		pdev->dev.of_node = node;
+-
+-		priv->dev->platform_data = platdata;
+-		if (split_codec)
+-			priv->wcd_dev = &pdev->dev;
+-
+-		ret = platform_device_add(pdev);
++		child->dev.parent = priv->dev;
++		child->dev.of_node = of_node_get(node);
++		if (of_property_read_bool(node, "qcom,split-codec")) {
++			priv->child_phase[priv->child_count] = 0;
++			priv->wcd_dev = &child->dev;
++		} else if (of_device_is_compatible(node, "qcom,lpass-cdc-clk-rsc-mngr")) {
++			priv->child_phase[priv->child_count] = 2;
++		} else {
++			priv->child_phase[priv->child_count] = 1;
++		}
++		ret = platform_device_add(child);
+ 		if (ret) {
+-			dev_err(&pdev->dev,
+-				"%s: Cannot add platform device\n",
+-				__func__);
+-			platform_device_put(pdev);
+-			goto fail_pdev_add;
++			if (priv->wcd_dev == &child->dev)
++				priv->wcd_dev = NULL;
++			platform_device_put(child);
++			goto fail;
+ 		}
+-
+-		if (priv->child_count < LPASS_CDC_CHILD_DEVICES_MAX)
+-			priv->pdev_child_devices[priv->child_count++] = pdev;
+-		else
+-			goto err;
+-	}
+-	return;
+-fail_pdev_add:
+-	for (count = 0; count < priv->child_count; count++)
+-		platform_device_put(priv->pdev_child_devices[count]);
+-err:
+-	return;
+-}
+-
+-static int regdump_read(struct regmap *map, int baseReg, int endReg,
+-		char __user *user_buf, size_t count, loff_t *ppos)
++		priv->pdev_child_devices[priv->child_count++] = child;
++	}
++	return 0;
++fail:
++	of_node_put(node);
++	lpass_cdc_remove_child_devices(priv);
++	return ret;
++}
++
++static int regdump_read(struct regmap *map, int base_reg, int end_reg,
++			char __user *user_buf, size_t count, loff_t *ppos)
+ {
+ 	int i = 0, ret = 0;
+ 	size_t pos = 0;
+@@ -1335,19 +1458,20 @@
+ 	unsigned int reg_val = 0, reg_len = 0;
+ 	unsigned int reg_val_len = 0, regdump_wr_len = 0;
+ 
+-	i  = ((int) *ppos + baseReg);
++	if (*ppos < 0 || *ppos > end_reg - base_reg)
++		return 0;
++	count = min_t(size_t, count, PAGE_SIZE);
++	i = *ppos + base_reg;
+ 
+ 	buf = kzalloc(count, GFP_KERNEL);
+ 	if (!buf)
+ 		return -ENOMEM;
+ 
+-	reg_len = scnprintf(buf, count, "%x", endReg);
++	reg_len = scnprintf(buf, count, "%x", end_reg);
+ 	reg_val_len = 2 * DIV_ROUND_UP(REGDUMP_PRINT_LEN, 8);
+ 	regdump_wr_len = reg_len + reg_val_len + 3;
+ 
+-	/* Disable reading/writing from regmap-cache */
+-	regcache_cache_bypass(map, true);
+-	for (; i >= 0 && i <= endReg; i += REGDUMP_PRINT_STRIDE) {
++	for (; i >= 0 && i <= end_reg; i += REGDUMP_PRINT_STRIDE) {
+ 		/*
+ 		 * Check not to overwrite the buffer, by ensuring we have
+ 		 * space for writing the register data
+@@ -1362,7 +1486,7 @@
+ 
+ 		scnprintf(buf+pos, count-pos, "%.*x: ", reg_len, i);
+ 		pos += reg_len + 2;
+-		ret = regmap_read(map, i, &reg_val);
++		ret = regmap_read_bypassed(map, i, &reg_val);
+ 		if (ret == 0)
+ 			scnprintf(buf+pos, count-pos, "%.*x", reg_val_len, reg_val);
+ 		else
+@@ -1371,13 +1495,12 @@
+ 		pos +=  reg_val_len;
+ 		buf[pos++] = '\n';
+ 	}
+-	/* Enable reading/writing from regmap-cache */
+-	regcache_cache_bypass(map, false);
+-
+-	*ppos = i;
++
+ 	ret = pos;
+ 	if (copy_to_user(user_buf, buf, pos))
+ 		ret = -EFAULT;
++	else
++		*ppos = i - base_reg;
+ 
+ 	kfree(buf);
+ 	return ret;
+@@ -1424,13 +1547,9 @@
+ 			__func__);
+ 		return ret;
+ 	}
++	if (!num_macros || num_macros > MAX_MACRO)
++		return -EINVAL;
+ 	priv->num_macros = num_macros;
+-	if (priv->num_macros > MAX_MACRO) {
+-		dev_err(&pdev->dev,
+-			"%s:num_macros(%d) > MAX_MACRO(%d) than supported\n",
+-			__func__, priv->num_macros, MAX_MACRO);
+-		return -EINVAL;
+-	}
+ 
+ 	ret = of_property_read_u32(pdev->dev.of_node,
+ 				"qcom,lpass-cdc-version", &priv->version);
+@@ -1445,13 +1564,47 @@
+ 	priv->dev_up = true;
+ 	priv->pre_dev_up = true;
+ 	priv->initial_boot = true;
++
++	priv->read_dev = __lpass_cdc_reg_read;
++	priv->write_dev = __lpass_cdc_reg_write;
++
++	priv->plat_data.handle = (void *)priv;
++	priv->plat_data.update_wcd_event = lpass_cdc_update_wcd_event;
++	priv->plat_data.register_notifier = lpass_cdc_register_notifier;
++
++	priv->core_hw_vote_count = 0;
++	priv->core_audio_vote_count = 0;
++
++	dev_set_drvdata(&pdev->dev, priv);
++	mutex_init(&priv->macro_lock);
++	mutex_init(&priv->io_lock);
++	mutex_init(&priv->clk_lock);
++	mutex_init(&priv->vote_lock);
++	mutex_init(&priv->op_lock);
++	mutex_init(&priv->dmic_lock);
++	init_waitqueue_head(&priv->op_wait);
++	atomic_set(&priv->active_ops, 0);
++	atomic_set(&priv->component_ops, 0);
++
++	/* Register LPASS core hw vote */
++	lpass_core_hw_vote = devm_clk_get_optional(&pdev->dev, "lpass_core_hw_vote");
++	if (IS_ERR(lpass_core_hw_vote))
++		return PTR_ERR(lpass_core_hw_vote);
++	priv->lpass_core_hw_vote = lpass_core_hw_vote;
++
++	/* Register LPASS audio hw vote */
++	lpass_audio_hw_vote = devm_clk_get_optional(&pdev->dev, "lpass_audio_hw_vote");
++	if (IS_ERR(lpass_audio_hw_vote))
++		return PTR_ERR(lpass_audio_hw_vote);
++	priv->lpass_audio_hw_vote = lpass_audio_hw_vote;
+ 	priv->regmap = lpass_cdc_regmap_init(priv->dev,
+ 					  &lpass_cdc_regmap_config);
+-	if (IS_ERR_OR_NULL((void *)(priv->regmap))) {
+-		dev_err(&pdev->dev, "%s:regmap init failed\n", __func__);
+-		return -EINVAL;
+-	}
+-
++	if (IS_ERR(priv->regmap))
++		return PTR_ERR(priv->regmap);
++
++	ret = lpass_cdc_add_child_devices(priv);
++	if (ret)
++		return ret;
+ 	devm_regmap_qti_debugfs_register(priv->dev, priv->regmap);
+ 
+ 	priv->lpass_cdc_proc_entry = proc_mkdir("lpass_cdc_reginfo", NULL);
+@@ -1469,169 +1622,114 @@
+ 		dev_err(&pdev->dev, "%s: error creating proc dir interface\n", __func__);
+ 	}
+ 
+-	priv->read_dev = __lpass_cdc_reg_read;
+-	priv->write_dev = __lpass_cdc_reg_write;
+-
+-	priv->plat_data.handle = (void *) priv;
+-	priv->plat_data.update_wcd_event = lpass_cdc_update_wcd_event;
+-	priv->plat_data.register_notifier = lpass_cdc_register_notifier;
+-
+-	priv->core_hw_vote_count = 0;
+-	priv->core_audio_vote_count = 0;
+-
+-	dev_set_drvdata(&pdev->dev, priv);
+-	mutex_init(&priv->macro_lock);
+-	mutex_init(&priv->io_lock);
+-	mutex_init(&priv->clk_lock);
+-	mutex_init(&priv->vote_lock);
+-	INIT_WORK(&priv->lpass_cdc_add_child_devices_work,
+-		  lpass_cdc_add_child_devices);
+-
+-	/* Register LPASS core hw vote */
+-	lpass_core_hw_vote = devm_clk_get(&pdev->dev, "lpass_core_hw_vote");
+-	if (IS_ERR(lpass_core_hw_vote)) {
+-		ret = PTR_ERR(lpass_core_hw_vote);
+-		dev_dbg(&pdev->dev, "%s: clk get %s failed %d\n",
+-			__func__, "lpass_core_hw_vote", ret);
+-		lpass_core_hw_vote = NULL;
+-		ret = 0;
+-	}
+-	priv->lpass_core_hw_vote = lpass_core_hw_vote;
+-
+-	/* Register LPASS audio hw vote */
+-	lpass_audio_hw_vote = devm_clk_get(&pdev->dev, "lpass_audio_hw_vote");
+-	if (IS_ERR(lpass_audio_hw_vote)) {
+-		ret = PTR_ERR(lpass_audio_hw_vote);
+-		dev_dbg(&pdev->dev, "%s: clk get %s failed %d\n",
+-			__func__, "lpass_audio_hw_vote", ret);
+-		lpass_audio_hw_vote = NULL;
+-		ret = 0;
+-	}
+-	priv->lpass_audio_hw_vote = lpass_audio_hw_vote;
+-	schedule_work(&priv->lpass_cdc_add_child_devices_work);
+-
+ 	return 0;
+ }
+ 
+-static int lpass_cdc_remove(struct platform_device *pdev)
++static void lpass_cdc_remove(struct platform_device *pdev)
+ {
+ 	struct lpass_cdc_priv *priv = dev_get_drvdata(&pdev->dev);
+ 
+-	if (!priv)
+-		return -EINVAL;
+-
+-	if (priv->lpass_cdc_proc_entry)
+-		proc_remove(priv->lpass_cdc_proc_entry);
+-
+-	of_platform_depopulate(&pdev->dev);
+-	mutex_destroy(&priv->macro_lock);
+-	mutex_destroy(&priv->io_lock);
+-	mutex_destroy(&priv->clk_lock);
+-	mutex_destroy(&priv->vote_lock);
+-	return 0;
++	proc_remove(priv->lpass_cdc_proc_entry);
++	mutex_lock(&priv->macro_lock);
++	priv->removing = true;
++	mutex_unlock(&priv->macro_lock);
++	lpass_cdc_remove_child_devices(priv);
++	mutex_lock(&priv->macro_lock);
++	lpass_cdc_unregister_component(priv);
++	lpass_cdc_quiesce(priv);
++	if (priv->core_audio_vote_count)
++		digital_cdc_rsc_mgr_hw_vote_disable(priv->lpass_audio_hw_vote, priv->dev);
++	if (priv->core_hw_vote_count)
++		digital_cdc_rsc_mgr_hw_vote_disable(priv->lpass_core_hw_vote, priv->dev);
++	mutex_unlock(&priv->macro_lock);
+ }
+ 
+ #ifdef CONFIG_PM
+ int lpass_cdc_runtime_resume(struct device *dev)
+ {
+-	struct lpass_cdc_priv *priv = dev_get_drvdata(dev->parent);
++	struct lpass_cdc_priv *priv;
++	bool core = false, audio = false;
+ 	int ret = 0;
+ 
+-	dev_dbg(dev,"%s, enter\n", __func__);
++	if (!lpass_cdc_is_valid_child_dev(dev))
++		return -EINVAL;
++	priv = dev_get_drvdata(dev->parent);
++	if (!lpass_cdc_op_get(priv, false))
++		return -ENODEV;
+ 	mutex_lock(&priv->vote_lock);
+-	if (priv->lpass_core_hw_vote == NULL) {
+-		dev_dbg(dev, "%s: Invalid lpass core hw node\n", __func__);
+-		goto audio_vote;
+-	}
+-
+-	if (priv->core_hw_vote_count == 0) {
++	if (priv->core_hw_vote_count == INT_MAX ||
++	    priv->core_audio_vote_count == INT_MAX ||
++	    priv->core_clk_vote_count == INT_MAX) {
++		ret = -EOVERFLOW;
++		goto out;
++	}
++	if (priv->lpass_core_hw_vote && !priv->core_hw_vote_count) {
+ 		ret = digital_cdc_rsc_mgr_hw_vote_enable(priv->lpass_core_hw_vote, dev);
+-		if (ret < 0) {
+-			dev_err_ratelimited(dev, "%s:lpass core hw enable failed\n",
+-				__func__);
+-			goto audio_vote;
+-		}
+-	}
+-	priv->core_hw_vote_count++;
+-
+-audio_vote:
+-	if (priv->lpass_audio_hw_vote == NULL) {
+-		dev_dbg(dev, "%s: Invalid lpass audio hw node\n", __func__);
+-		goto done;
+-	}
+-
+-	if (priv->core_audio_vote_count == 0) {
++		if (ret)
++			goto out;
++		core = true;
++	}
++	if (priv->lpass_audio_hw_vote && !priv->core_audio_vote_count) {
+ 		ret = digital_cdc_rsc_mgr_hw_vote_enable(priv->lpass_audio_hw_vote, dev);
+-		if (ret < 0) {
+-			dev_err_ratelimited(dev, "%s:lpass audio hw enable failed\n",
+-				__func__);
+-			goto core_clk_vote;
+-		}
+-	}
+-	priv->core_audio_vote_count++;
+-
+-core_clk_vote:
+-	if (priv->core_clk_vote_count == 0) {
+-		ret = lpass_cdc_clk_rsc_request_clock(dev, TX_CORE_CLK,
+-							  TX_CORE_CLK, true);
+-		if (ret < 0) {
+-			dev_err_ratelimited(dev, "%s:lpass Tx core clk enable failed\n",
+-				__func__);
+-			goto done;
+-		}
+-	}
++		if (ret)
++			goto unwind;
++		audio = true;
++	}
++	if (!priv->core_clk_vote_count) {
++		ret = lpass_cdc_clk_rsc_request_clock(dev, TX_CORE_CLK, TX_CORE_CLK, true);
++		if (ret)
++			goto unwind;
++	}
++	if (priv->lpass_core_hw_vote)
++		priv->core_hw_vote_count++;
++	if (priv->lpass_audio_hw_vote)
++		priv->core_audio_vote_count++;
+ 	priv->core_clk_vote_count++;
+-
+-done:
++	pm_runtime_set_autosuspend_delay(priv->dev, LPASS_CDC_AUTO_SUSPEND_DELAY);
++	goto out;
++unwind:
++	if (audio)
++		digital_cdc_rsc_mgr_hw_vote_disable(priv->lpass_audio_hw_vote, dev);
++	if (core)
++		digital_cdc_rsc_mgr_hw_vote_disable(priv->lpass_core_hw_vote, dev);
++out:
+ 	mutex_unlock(&priv->vote_lock);
+-	dev_dbg(dev, "%s, leave, hw_vote %d, audio_vote %d, core_clk_vote %d\n",
+-		 __func__, priv->core_hw_vote_count,
+-		 priv->core_audio_vote_count, priv->core_clk_vote_count);
+-	pm_runtime_set_autosuspend_delay(priv->dev, LPASS_CDC_AUTO_SUSPEND_DELAY);
+-	return 0;
++	lpass_cdc_op_put(priv, false);
++	return ret;
+ }
+ EXPORT_SYMBOL(lpass_cdc_runtime_resume);
+ 
+ int lpass_cdc_runtime_suspend(struct device *dev)
+ {
+-	struct lpass_cdc_priv *priv = dev_get_drvdata(dev->parent);
+-
+-	dev_dbg(dev,"%s, enter\n", __func__);
++	struct lpass_cdc_priv *priv;
++	int ret = 0;
++
++	if (!lpass_cdc_is_valid_child_dev(dev))
++		return -EINVAL;
++	priv = dev_get_drvdata(dev->parent);
++	if (!lpass_cdc_op_get(priv, false))
++		return -ENODEV;
+ 	mutex_lock(&priv->vote_lock);
+-	if (priv->lpass_core_hw_vote != NULL) {
+-		if (--priv->core_hw_vote_count == 0)
+-			digital_cdc_rsc_mgr_hw_vote_disable(
+-					priv->lpass_core_hw_vote, dev);
+-		if (priv->core_hw_vote_count < 0)
+-			priv->core_hw_vote_count = 0;
+-	} else {
+-		dev_dbg(dev, "%s: Invalid lpass core hw node\n",
+-			__func__);
+-	}
+-
+-	if (priv->lpass_audio_hw_vote != NULL) {
+-		if (--priv->core_audio_vote_count == 0)
+-			digital_cdc_rsc_mgr_hw_vote_disable(
+-					priv->lpass_audio_hw_vote, dev);
+-		if (priv->core_audio_vote_count < 0)
+-			priv->core_audio_vote_count = 0;
+-	} else {
+-		dev_dbg(dev, "%s: Invalid lpass audio hw node\n",
+-			__func__);
+-	}
+-
+-	if (--priv->core_clk_vote_count == 0) {
+-		lpass_cdc_clk_rsc_request_clock(dev, TX_CORE_CLK,
+-						  TX_CORE_CLK, false);
+-	}
+-	if (priv->core_clk_vote_count < 0)
+-		priv->core_clk_vote_count = 0;
+-
++	if (!priv->core_clk_vote_count ||
++	    (priv->lpass_core_hw_vote && !priv->core_hw_vote_count) ||
++	    (priv->lpass_audio_hw_vote && !priv->core_audio_vote_count)) {
++		ret = -EINVAL;
++		goto out;
++	}
++	if (priv->core_clk_vote_count == 1) {
++		ret = lpass_cdc_clk_rsc_request_clock(dev, TX_CORE_CLK, TX_CORE_CLK, false);
++		if (ret)
++			goto out;
++	}
++	priv->core_clk_vote_count--;
++	if (priv->lpass_audio_hw_vote && !--priv->core_audio_vote_count)
++		digital_cdc_rsc_mgr_hw_vote_disable(priv->lpass_audio_hw_vote, dev);
++	if (priv->lpass_core_hw_vote && !--priv->core_hw_vote_count)
++		digital_cdc_rsc_mgr_hw_vote_disable(priv->lpass_core_hw_vote, dev);
++out:
+ 	mutex_unlock(&priv->vote_lock);
+-	dev_dbg(dev, "%s, leave, hw_vote %d, audio_vote %d, core_clk_vote %d\n",
+-		 __func__, priv->core_hw_vote_count,
+-		 priv->core_audio_vote_count, priv->core_clk_vote_count);
+-	return 0;
++	lpass_cdc_op_put(priv, false);
++	return ret;
+ }
+ EXPORT_SYMBOL(lpass_cdc_runtime_suspend);
+ #endif /* CONFIG_PM */
+@@ -1680,16 +1778,22 @@
+ 
+ static int __init lpass_cdc_init(void)
+ {
+-	lpass_cdc_drv_init();
+-	lpass_cdc_clk_rsc_mgr_init();
+-	return 0;
++	int ret;
++
++	ret = lpass_cdc_clk_rsc_mgr_init();
++	if (ret)
++		return ret;
++	ret = lpass_cdc_drv_init();
++	if (ret)
++		lpass_cdc_clk_rsc_mgr_exit();
++	return ret;
+ }
+ module_init(lpass_cdc_init);
+ 
+ static void __exit lpass_cdc_exit(void)
+ {
++	lpass_cdc_drv_exit();
+ 	lpass_cdc_clk_rsc_mgr_exit();
+-	lpass_cdc_drv_exit();
+ }
+ module_exit(lpass_cdc_exit);
+ 
