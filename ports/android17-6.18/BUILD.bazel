@@ -3589,6 +3589,80 @@ ddk_module(
     visibility = ["//visibility:public"],
 )
 
+ddk_module(
+    name = "lpass_cdc_tx_macro_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-tx-macro.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "lpass_cdc_tx_macro_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_lpasscdc_headers", ":audio_wcdcore_headers", ":lpass_cdc_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_headers(
+    name = "thermal_endpoint_headers",
+    hdrs = ["drivers/thermal/qcom/thermal_mitigation_device_service_v01.h", "drivers/thermal/qcom/thermal_sensor_service_v02.h", "drivers/thermal/qcom/qmi_sensors.h", "drivers/thermal/qcom/thermal_zone_internal.h", "drivers/thermal/thermal_core.h", "drivers/thermal/thermal_netlink.h", "drivers/thermal/thermal_debugfs.h"],
+    includes = ["drivers/thermal/qcom"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "qti_cpufreq_cdev",
+    srcs = ["drivers/thermal/qcom/qti_cpufreq_cdev.c"],
+    out = "qti_cpufreq_cdev.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":thermal_endpoint_headers", ":thermal_headers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "qti_devfreq_cdev",
+    srcs = ["drivers/thermal/qcom/qti_devfreq_cdev.c"],
+    out = "qti_devfreq_cdev.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":thermal_endpoint_headers", ":thermal_headers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "qti_userspace_cdev",
+    srcs = ["drivers/thermal/qcom/qti_userspace_cdev.c"],
+    out = "qti_userspace_cdev.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":thermal_endpoint_headers", ":thermal_headers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "qti_qmi_cdev",
+    srcs = ["drivers/thermal/qcom/thermal_mitigation_device_service_v01.c", "drivers/thermal/qcom/qmi_cooling.c"],
+    out = "qti_qmi_cdev.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":thermal_endpoint_headers", ":thermal_headers", ":remote_headers", ":qmi_helpers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "qti_qmi_sensor_v2",
+    srcs = ["drivers/thermal/qcom/thermal_sensor_service_v02.c", "drivers/thermal/qcom/qmi_sensors_v2.c"],
+    out = "qti_qmi_sensor_v2.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":thermal_endpoint_headers", ":thermal_headers", ":remote_headers", ":qmi_helpers"],
+    visibility = ["//visibility:public"],
+)
+
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3848,6 +3922,12 @@ kernel_module_group(
         ":qcom_rng",
         ":qrng_dlkm",
         ":msm_eva",
+        ":lpass_cdc_tx_macro_dlkm",
+        ":qti_cpufreq_cdev",
+        ":qti_devfreq_cdev",
+        ":qti_userspace_cdev",
+        ":qti_qmi_cdev",
+        ":qti_qmi_sensor_v2",
     ],
 )
 

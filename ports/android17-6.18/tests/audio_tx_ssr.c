@@ -1,0 +1,6 @@
+/* SERVICES */
+static int reset_id;
+static int lpass_cdc_rsc_clk_reset(struct device*d,int id){reset_id=id;return fail()?-EIO:0;}
+/* SOURCE */
+int main(void){struct device parent={0},d={.parent=&parent};struct lpass_cdc_tx_macro_priv p;struct snd_soc_component c={.dev=&parent};static struct regmap map;parent.regmap=&map;macro_dev=&d;init_tx(&p,&d);p.component=&c;d.pm_refs=2;int cases=0;
+assert(!lpass_cdc_tx_macro_event_handler(&c,LPASS_CDC_MACRO_EVT_SSR_DOWN,0)&&!p.pre_dev_up&&d.pm_refs==2);assert(!lpass_cdc_tx_macro_event_handler(&c,LPASS_CDC_MACRO_EVT_PRE_SSR_UP,0)&&p.pre_dev_up);fault=steps+1;assert(lpass_cdc_tx_macro_event_handler(&c,LPASS_CDC_MACRO_EVT_CLK_RESET,0)==-EIO);fault=0;assert(!lpass_cdc_tx_macro_event_handler(&c,LPASS_CDC_MACRO_EVT_CLK_RESET,0)&&reset_id==0);cases+=4;p.bcs_clk_en=true;fault=steps+1;assert(lpass_cdc_tx_macro_event_handler(&c,LPASS_CDC_MACRO_EVT_BCS_CLK_OFF,1)==-EIO&&!p.hs_slow_insert_complete);fault=0;assert(!lpass_cdc_tx_macro_event_handler(&c,LPASS_CDC_MACRO_EVT_BCS_CLK_OFF,1)&&p.hs_slow_insert_complete&&map.values[LPASS_CDC_TX0_TX_PATH_SEC7]==64);assert(!lpass_cdc_tx_macro_event_handler(&c,LPASS_CDC_MACRO_EVT_BCS_CLK_OFF,0)&&!p.hs_slow_insert_complete&&!map.values[LPASS_CDC_TX0_TX_PATH_SEC7]);assert(lpass_cdc_tx_macro_event_handler(&c,LPASS_CDC_MACRO_EVT_BCS_CLK_OFF,2)==-EINVAL);cases+=4;printf("{\"ssr\":%d}\n",cases);}

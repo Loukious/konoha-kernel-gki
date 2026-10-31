@@ -1,0 +1,7 @@
+/* SERVICES */
+static int dapm_calls;
+static struct snd_soc_dapm_widget *snd_soc_dapm_kcontrol_widget(struct snd_kcontrol*k){return k->widget;}
+static int snd_soc_dapm_put_enum_double(struct snd_kcontrol*k,struct snd_ctl_elem_value*v){dapm_calls++;return 1;}
+/* SOURCE */
+int main(void){struct device parent={0},d={.parent=&parent};struct lpass_cdc_tx_macro_priv p;struct snd_soc_component c={.dev=&parent};static struct regmap map;parent.regmap=&map;macro_dev=&d;init_tx(&p,&d);p.component=&c;struct snd_soc_dapm_context dapm={.component=&c};struct snd_soc_dapm_widget w={.dapm=&dapm,.name="TX DMIC"};struct soc_enum e={.items=13};struct snd_kcontrol k={.widget=&w,.private_value=(unsigned long)&e};struct snd_ctl_elem_value v={0};int cases=0;v.value.enumerated.item[0]=1;
+for(int i=0;i<8;i++){e.reg=LPASS_CDC_TX_INP_MUX_ADC_MUX0_CFG0+i*LPASS_CDC_TX_MACRO_ADC_MUX_CFG_OFFSET;assert(lpass_cdc_tx_macro_put_dec_enum(&k,&v)==1&&map.values[LPASS_CDC_TX0_TX_PATH_CFG0+i*LPASS_CDC_TX_MACRO_TX_PATH_OFFSET]==128);cases++;}int calls=dapm_calls;v.value.enumerated.item[0]=13;assert(lpass_cdc_tx_macro_put_dec_enum(&k,&v)==-EINVAL&&dapm_calls==calls);v.value.enumerated.item[0]=1;e.reg=0;assert(lpass_cdc_tx_macro_put_dec_enum(&k,&v)==-EINVAL);e.reg=LPASS_CDC_TX_INP_MUX_ADC_MUX0_CFG0;w.name="TX SMIC";p.swr_dmic_enable=true;for(int f=1;f<=2;f++){fault=steps+f;assert(lpass_cdc_tx_macro_put_dec_enum(&k,&v)==-EIO&&dapm_calls==calls);fault=0;cases++;}cases+=2;printf("{\"enum\":%d}\n",cases);}

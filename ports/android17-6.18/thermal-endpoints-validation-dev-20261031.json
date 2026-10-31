@@ -1,0 +1,198 @@
+{
+  "tests": {
+    "frequency": {
+      "sparse_cpu_tables": true,
+      "gpu_opp_limits": true,
+      "qos_faults_and_deferred_drain": true,
+      "userspace_failure_and_node_refs": true
+    },
+    "cooling": {
+      "qmi_transactions_and_generation": true,
+      "cooling_replay_and_bounds": true,
+      "probe_failure_cleanup": true,
+      "removal_races": 100
+    },
+    "sensor": {
+      "sensor_protocol_and_pagination": true,
+      "indication_during_transaction": true,
+      "threshold_retry_suspend_replay": true,
+      "probe_faults_and_cleanup": true,
+      "removal_races": 100
+    }
+  },
+  "negative_controls": {
+    "cpu_sparse_entries_ignored": {
+      "rejected": true,
+      "diagnostic": "cpu_sparse_entries_ignored: /tmp/thermal-endpoints-test-wdhfa1_0/cpu_sparse_entries_ignored.c:813: cpu_cases: Assertion `d->freq_table[0]==1800&&d->freq_table[1]==1200&&d->freq_table[2]==600' failed."
+    },
+    "cpu_table_ascending": {
+      "rejected": true,
+      "diagnostic": "cpu_table_ascending: /tmp/thermal-endpoints-test-wdhfa1_0/cpu_table_ascending.c:813: cpu_cases: Assertion `d->freq_table[0]==1800&&d->freq_table[1]==1200&&d->freq_table[2]==600' failed."
+    },
+    "cpu_qos_add_error_ignored": {
+      "rejected": true,
+      "diagnostic": "cpu_qos_add_error_ignored: /tmp/thermal-endpoints-test-wdhfa1_0/cpu_qos_add_error_ignored.c:817: cpu_cases: Assertion `!d->cdev&&!d->freq_table' failed."
+    },
+    "cpu_qos_update_error_hidden": {
+      "rejected": true,
+      "diagnostic": "cpu_qos_update_error_hidden: /tmp/thermal-endpoints-test-wdhfa1_0/cpu_qos_update_error_hidden.c:813: cpu_cases: Assertion `cpufreq_cdev_set_state(d->cdev,1)==-EIO&&d->cur_state==2' failed."
+    },
+    "cpu_deferred_work_not_drained": {
+      "rejected": true,
+      "diagnostic": "cpu_deferred_work_not_drained: /tmp/thermal-endpoints-test-wdhfa1_0/cpu_deferred_work_not_drained.c:192: clean: Assertion `!alloc_live&&!qos_live&&!cdev_live&&!zone_live&&!handle_live&&!txn_live&&!notifier_live&&!hp_live&&!work_pending&&!opp_refs&&!policy.refs' failed."
+    },
+    "cpu_policy_reference_leak": {
+      "rejected": true,
+      "diagnostic": "cpu_policy_reference_leak: /tmp/thermal-endpoints-test-wdhfa1_0/cpu_policy_reference_leak.c:192: clean: Assertion `!alloc_live&&!qos_live&&!cdev_live&&!zone_live&&!handle_live&&!txn_live&&!notifier_live&&!hp_live&&!work_pending&&!opp_refs&&!policy.refs' failed."
+    },
+    "cpu_registry_not_withdrawn": {
+      "rejected": true,
+      "diagnostic": "cpu_registry_not_withdrawn: /tmp/thermal-endpoints-test-wdhfa1_0/cpu_registry_not_withdrawn.c:811: cpu_cases: Assertion `!cpufreq_controller' failed."
+    },
+    "gpu_opp_count_zero_allowed": {
+      "rejected": true,
+      "diagnostic": "gpu_opp_count_zero_allowed: /tmp/thermal-endpoints-test-wdhfa1_0/gpu_opp_count_zero_allowed.c:826: gpu_cases: Assertion `!d->cdev' failed."
+    },
+    "gpu_qos_frequency_truncation": {
+      "rejected": true,
+      "diagnostic": "gpu_qos_frequency_truncation: /tmp/thermal-endpoints-test-wdhfa1_0/gpu_qos_frequency_truncation.c:826: gpu_cases: Assertion `!d->cdev' failed."
+    },
+    "gpu_node_reference_leak": {
+      "rejected": true,
+      "diagnostic": "gpu_node_reference_leak: /tmp/thermal-endpoints-test-wdhfa1_0/gpu_node_reference_leak.c:826: gpu_cases: Assertion `gpu_supplier.dev.refs==1&&target.refs==1' failed."
+    },
+    "userspace_registration_error_hidden": {
+      "rejected": true,
+      "diagnostic": "userspace_registration_error_hidden: /tmp/thermal-endpoints-test-wdhfa1_0/userspace_registration_error_hidden.c:834: userspace_cases: Assertion `userspace_device_probe(&p)<0' failed."
+    },
+    "userspace_borrowed_root_put": {
+      "rejected": true,
+      "diagnostic": "userspace_borrowed_root_put: /tmp/thermal-endpoints-test-wdhfa1_0/userspace_borrowed_root_put.c:85: of_node_put: Assertion `--n->refs>=1' failed."
+    },
+    "userspace_level_bounds_lost": {
+      "rejected": true,
+      "diagnostic": "userspace_level_bounds_lost: /tmp/thermal-endpoints-test-wdhfa1_0/userspace_level_bounds_lost.c:833: userspace_cases: Assertion `userspace_set_cur_state(cdevs[i],ULONG_MAX)==-EINVAL' failed."
+    },
+    "cooling_stale_generation_accepted": {
+      "rejected": true,
+      "diagnostic": "cooling_stale_generation_accepted: /tmp/thermal-endpoints-test-wdhfa1_0/cooling_stale_generation_accepted.c:885: controls: Assertion `qmi_set_cur_state(d->cdev,2)==-ENETRESET' failed."
+    },
+    "cooling_remote_error_positive": {
+      "rejected": true,
+      "diagnostic": "cooling_remote_error_positive: /tmp/thermal-endpoints-test-wdhfa1_0/cooling_remote_error_positive.c:883: controls: Assertion `qmi_set_cur_state(d->cdev,6)==-EREMOTEIO&&d->mtgn_state==6&&d->pending' failed."
+    },
+    "cooling_failed_state_not_retried": {
+      "rejected": true,
+      "diagnostic": "cooling_failed_state_not_retried: /tmp/thermal-endpoints-test-wdhfa1_0/cooling_failed_state_not_retried.c:883: controls: Assertion `!qmi_set_cur_state(d->cdev,6)&&!d->pending&&txn_sends==sends+1' failed."
+    },
+    "cooling_desired_state_discarded": {
+      "rejected": true,
+      "diagnostic": "cooling_desired_state_discarded: /tmp/thermal-endpoints-test-wdhfa1_0/cooling_desired_state_discarded.c:883: controls: Assertion `!qmi_set_cur_state(d->cdev,5)&&last_state==5' failed."
+    },
+    "cooling_reconnect_limit_not_clamped": {
+      "rejected": true,
+      "diagnostic": "cooling_reconnect_limit_not_clamped: /tmp/thermal-endpoints-test-wdhfa1_0/cooling_reconnect_limit_not_clamped.c:884: controls: Assertion `last_state==7&&d->mtgn_state==7&&d->max_level==7&&d->cdev->max_state==7' failed."
+    },
+    "cooling_core_max_not_updated": {
+      "rejected": true,
+      "diagnostic": "cooling_core_max_not_updated: /tmp/thermal-endpoints-test-wdhfa1_0/cooling_core_max_not_updated.c:884: controls: Assertion `last_state==7&&d->mtgn_state==7&&d->max_level==7&&d->cdev->max_state==7' failed."
+    },
+    "cooling_primary_list_bound_lost": {
+      "rejected": true,
+      "diagnostic": "cooling_primary_list_bound_lost: /tmp/thermal-endpoints-test-wdhfa1_0/cooling_primary_list_bound_lost.c:887: controls: Assertion `verify_devices_and_register(t)==-EPROTO' failed."
+    },
+    "cooling_optional_list_flag_ignored": {
+      "rejected": true,
+      "diagnostic": "cooling_optional_list_flag_ignored: /tmp/thermal-endpoints-test-wdhfa1_0/cooling_optional_list_flag_ignored.c:887: controls: Assertion `!verify_devices_and_register(t)&&txn_sends==sends+1' failed."
+    },
+    "cooling_handle_release_before_init": {
+      "rejected": true,
+      "diagnostic": "cooling_handle_release_before_init: /tmp/thermal-endpoints-test-wdhfa1_0/cooling_handle_release_before_init.c:182: qmi_handle_release: Assertion `h->live&&!held_count&&!spins' failed."
+    },
+    "cooling_arrival_work_not_drained": {
+      "rejected": true,
+      "diagnostic": "cooling_arrival_work_not_drained: /tmp/thermal-endpoints-test-wdhfa1_0/cooling_arrival_work_not_drained.c:888: controls: Assertion `!work_pending' failed."
+    },
+    "cooling_unrelated_server_deleted": {
+      "rejected": true,
+      "diagnostic": "cooling_unrelated_server_deleted: /tmp/thermal-endpoints-test-wdhfa1_0/cooling_unrelated_server_deleted.c:888: controls: Assertion `t->online' failed."
+    },
+    "sensor_stale_generation_accepted": {
+      "rejected": true,
+      "diagnostic": "sensor_stale_generation_accepted: /tmp/thermal-endpoints-test-wdhfa1_0/sensor_stale_generation_accepted.c:1099: controls: Assertion `qmi_sensor_set_trips(s->tz_dev,75,975)==-ENETRESET' failed."
+    },
+    "sensor_suspend_ignored": {
+      "rejected": true,
+      "diagnostic": "sensor_suspend_ignored: /tmp/thermal-endpoints-test-wdhfa1_0/sensor_suspend_ignored.c:1098: controls: Assertion `!qmi_sensor_set_trips(s->tz_dev,70,970)&&s->trips_pending' failed."
+    },
+    "sensor_temperature_not_updated": {
+      "rejected": true,
+      "diagnostic": "sensor_temperature_not_updated: /tmp/thermal-endpoints-test-wdhfa1_0/sensor_temperature_not_updated.c:1096: controls: Assertion `s->last_reading==200&&!s->therm_notify_work.pending' failed."
+    },
+    "sensor_invalid_temperature_used": {
+      "rejected": true,
+      "diagnostic": "sensor_invalid_temperature_used: /tmp/thermal-endpoints-test-wdhfa1_0/sensor_invalid_temperature_used.c:1096: controls: Assertion `s->last_reading==900' failed."
+    },
+    "sensor_source_not_checked": {
+      "rejected": true,
+      "diagnostic": "sensor_source_not_checked: /tmp/thermal-endpoints-test-wdhfa1_0/sensor_source_not_checked.c:1096: controls: Assertion `s->last_reading==900' failed."
+    },
+    "sensor_high_threshold_equality_lost": {
+      "rejected": true,
+      "diagnostic": "sensor_high_threshold_equality_lost: /tmp/thermal-endpoints-test-wdhfa1_0/sensor_high_threshold_equality_lost.c:1096: controls: Assertion `s->therm_notify_work.pending' failed."
+    },
+    "sensor_remote_error_positive": {
+      "rejected": true,
+      "diagnostic": "sensor_remote_error_positive: /tmp/thermal-endpoints-test-wdhfa1_0/sensor_remote_error_positive.c:1097: controls: Assertion `qmi_sensor_set_trips(s->tz_dev,50,950)==-EREMOTEIO&&s->trips_pending' failed."
+    },
+    "sensor_failed_threshold_not_retried": {
+      "rejected": true,
+      "diagnostic": "sensor_failed_threshold_not_retried: /tmp/thermal-endpoints-test-wdhfa1_0/sensor_failed_threshold_not_retried.c:1097: controls: Assertion `!qmi_sensor_set_trips(s->tz_dev,50,950)&&!s->trips_pending' failed."
+    },
+    "sensor_high_sentinel_ignored": {
+      "rejected": true,
+      "diagnostic": "sensor_high_sentinel_ignored: /tmp/thermal-endpoints-test-wdhfa1_0/sensor_high_sentinel_ignored.c:1097: controls: Assertion `!last_req.temp_threshold_low_valid&&!last_req.temp_threshold_high_valid' failed."
+    },
+    "sensor_list_bounds_lost": {
+      "rejected": true,
+      "diagnostic": "==2480854==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x7ddecb1e44ec at pc 0x7feecce8b5c8 bp 0x7ffd004664c0 sp 0x7ffd00465c78"
+    },
+    "sensor_notification_work_not_drained": {
+      "rejected": true,
+      "diagnostic": "sensor_notification_work_not_drained: /tmp/thermal-endpoints-test-wdhfa1_0/sensor_notification_work_not_drained.c:192: clean: Assertion `!alloc_live&&!qos_live&&!cdev_live&&!zone_live&&!handle_live&&!txn_live&&!notifier_live&&!hp_live&&!work_pending&&!opp_refs&&!policy.refs' failed."
+    },
+    "sensor_notifier_unregistration_lost": {
+      "rejected": true,
+      "diagnostic": "sensor_notifier_unregistration_lost: /tmp/thermal-endpoints-test-wdhfa1_0/sensor_notifier_unregistration_lost.c:192: clean: Assertion `!alloc_live&&!qos_live&&!cdev_live&&!zone_live&&!handle_live&&!txn_live&&!notifier_live&&!hp_live&&!work_pending&&!opp_refs&&!policy.refs' failed."
+    },
+    "sensor_zone_unregistration_lost": {
+      "rejected": true,
+      "diagnostic": "sensor_zone_unregistration_lost: /tmp/thermal-endpoints-test-wdhfa1_0/sensor_zone_unregistration_lost.c:182: qmi_handle_release: Assertion `!txn_live&&!zone_live&&!cdev_live' failed."
+    },
+    "sensor_lookup_handle_leak": {
+      "rejected": true,
+      "diagnostic": "sensor_lookup_handle_leak: /tmp/thermal-endpoints-test-wdhfa1_0/sensor_lookup_handle_leak.c:192: clean: Assertion `!alloc_live&&!qos_live&&!cdev_live&&!zone_live&&!handle_live&&!txn_live&&!notifier_live&&!hp_live&&!work_pending&&!opp_refs&&!policy.refs' failed."
+    }
+  },
+  "source_sha256": {
+    "drivers/thermal/qcom/qti_cpufreq_cdev.c": "c77bd44176028f0edf0f58fb977d05754c23b776e902f27d34d5855eb5ebee8a",
+    "drivers/thermal/qcom/qti_devfreq_cdev.c": "e90b681df95097bb53c7d81662878bbc7a41b170db4d88cf641209af90f02c25",
+    "drivers/thermal/qcom/qti_userspace_cdev.c": "df981cf576f3f01809cd6246eb927817448ab200691db56b02d9ac4f1df842b6",
+    "drivers/thermal/qcom/thermal_mitigation_device_service_v01.c": "f4030b467dec34bc18af1b0649a37c6689ffd535d001d2049459376a04cf342c",
+    "drivers/thermal/qcom/qmi_cooling.c": "4515873038eff08fdbd39dc3fecceec83a757365572334323e0f62c2996d9c02",
+    "drivers/thermal/qcom/thermal_sensor_service_v02.c": "dbc8b29b3cbc9b56b423182bc4168d24100cf7b43ced0c051db53886bb808dd1",
+    "drivers/thermal/qcom/qmi_sensors_v2.c": "9f4a62573ed07d06a95dd435a8121fe8cd8c1dd8c3f934422cd68038fd60b35e",
+    "drivers/thermal/qcom/thermal_mitigation_device_service_v01.h": "c6fe815bb53b676d406f046461db255d786ac5fb43cea99f4dc977b9e0ad7e5d",
+    "drivers/thermal/qcom/thermal_sensor_service_v02.h": "75d8bb4cd4aece0faa59fceb530e85b35dfc10e09b4b706c764ed10ffa6d0c8a",
+    "drivers/thermal/qcom/qmi_sensors.h": "a6149f75211e968bbbb3c68b25a3a869ec3349bd1498d34f667cbac8f430d6cf",
+    "drivers/thermal/qcom/Kconfig": "7f119e21cafd5f73d0cf07ffcd5afdfe0cddf6660b38f448ea94533ba79593eb",
+    "drivers/thermal/qcom/Makefile": "d8e900fa2e2266678af0907533c11221236d74e3990151cac10f2b7558f6f8f4"
+  },
+  "harness_sha256": {
+    "cooling_cases.c": "c2c02fe30ee7c5aa6a5bbaa27d7263ca921bf97fa08f640e6f0363bf704dbeb9",
+    "frequency_cases.c": "6da8cff51b8601121720684c735e5bfaffcb8a0f23573759245da320703af006",
+    "sensor_cases.c": "4b0487a1fee7add1c8c70ef97242aa8a7fafac97aa822f759f8bec60353d28c2",
+    "thermal_fake.h": "391a7892b35de0d9e825a5eb570c2d92893b218642bff75cd0a2a613bb689807"
+  },
+  "limits": "Extracted production source using native protocol structs/name tables with mocked kernel thermal/QoS/QMI/DT/device/workqueue services and pthread serialization. No actual QMI codec, kernel framework, modem/DSP, hardware or thermal-control validation."
+}

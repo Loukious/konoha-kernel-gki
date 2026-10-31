@@ -1161,3 +1161,57 @@ config HW_RANDOM_MSM_LEGACY
 config MSM_EVA
 	tristate "Native Qualcomm EVA video accelerator"
 	depends on RPMSG && DMA_SHARED_BUFFER
+
+# Native TX macro selection comes from the frozen sunautoconf.h.
+
+config QTI_CPUFREQ_CDEV
+	tristate "QTI CPU frequency cooling device"
+	depends on CPU_FREQ && THERMAL && PM_OPP
+	help
+	   This enables the QTI cpufreq cooling device, which
+	   will help register the cpu freq devices with thermal
+	   framework and allow limiting the cpu frequency by
+	   userspace.
+
+
+config QTI_DEVFREQ_CDEV
+	tristate "QTI Devfreq cooling device"
+	depends on PM_DEVFREQ && THERMAL && PM_OPP
+	help
+	   This enables the QTI devfreq cooling device, which
+	   will help register the devfreq cooling devices with
+	   thermal framework and allow limiting the devfreq
+	   frequency.
+
+
+config QTI_USERSPACE_CDEV
+	tristate "QTI Userspace cooling device"
+	depends on THERMAL_OF
+	help
+	   This enables the QTI userspace cooling device, which will help
+	   send the mitigation notification via thermal framework netlink
+	   socket, so that userspace cooling device can perform a mitigation
+	   action.
+
+
+config QTI_QMI_COOLING_DEVICE
+	tristate "QTI QMI cooling devices"
+	depends on QCOM_QMI_HELPERS && THERMAL
+	help
+	   This enables the QTI remote subsystem cooling devices. These cooling
+	   devices will be used by QTI chipset to place various remote
+	   subsystem mitigations like remote processor passive mitigation,
+	   remote subsystem voltage restriction at low temperatures etc.
+	   The QMI cooling device will interface with remote subsystem
+	   using QTI QMI interface.
+
+
+config QTI_QMI_SENSOR_V2
+	tristate "QTI QMI TS V2 sensor driver"
+	depends on THERMAL_OF
+	select QCOM_QMI_HELPERS
+	help
+	   This enables to list the QTI remote subsystem temperature sensors
+	   with QMI TS V2 interface. This driver can read the temperature of
+	   the remote sensor. These sensors can take thresholds and notify the
+	   thermal framework when the threshold is reached.

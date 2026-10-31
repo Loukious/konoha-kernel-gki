@@ -1,0 +1,27 @@
+{
+  "native_exports": [
+    "lpass_cdc_tx_macro_mute_hs"
+  ],
+  "native_linked_units": [
+    "../sm8735-modules/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-tx-macro.o"
+  ],
+  "native_dai_control_route_tables_exact": true,
+  "native_tables_sha256": "807c8bc91dab3475502ffb6100c257ba367b60c3d97447ef99cfe62777a0f236",
+  "native_feature_constants_and_conditionals_exact": true,
+  "native_platform_driver_pm_and_of_registration_exact": true,
+  "native_macro_ops_callback_assignments_exact": true,
+  "native_micbias_noop_preserved": true,
+  "reused_provider_headers": {
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.h": "7b1fb6d34a4442f3e65fb5db2fda6758648c7ab247e69a33da2289ea6086dbbc",
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-registers.h": "b234711022f5644d64bec5c597041121bde836f7c51e89824394c006ad591469",
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-clk-rsc.h": "2fa8918c8a3aed99585be4b0aa2d73394872c746e8ba94d8239c554e938ad944",
+    "qcom/opensource/audio-kernel/include/asoc/msm-cdc-pinctrl.h": "5ed3b36ec782747347a8ead566af2c2f607f7ce9869dc8fbc0de37f139471bcb",
+    "qcom/opensource/audio-kernel/include/bindings/qcom,lpass-cdc-clk-rsc.h": "fd840453cf95e725cc130f59a9bc3cc1359cea1247f13d80fd0ab4a36dc28574"
+  },
+  "lifetime": "All delayed jobs initialize before macro registration. Global headset pointer publishes only after component init. Export calls acquire a gate, then serialize requests; component/physical teardown closes admission, drains calls, and cancels all work before clearing component. No callback may remove a provider synchronously while being drained.",
+  "ownership": "MCLK/FS and first/last register sequencing retain native order, propagate errors and retain bare clock ownership on rollback failure. Component cleanup releases only its tracked DAPM clock before physical cleanup drains remaining callback requests. Shared DMIC source and per-DAI stream masks are retained; headset repeated requests keep original mute state and restore the owned mask even after mixer changes. Stream/headset writes serialize with a shared mutex.",
+  "error_limits": "Native FS and AMIC TX-hold APIs are void; ALSA component reads do not expose read errors. Provider errors there cannot become TX callback status. Persistent hardware rollback failures are logged with retained ownership. No physical teardown, audio or SSR success is claimed from mocked host tests.",
+  "native_rates": "Unchanged DAI 8,16,32,48,96,192 kHz rates, three DAIs with eight capture channels; native 384-kHz hw_params branch retained.",
+  "native_controls": "All twelve BCS channels and original routes/DAIs/formats preserved. Native tx_unmute_delay parameter remains exported but is not consumed by the original source scheduling path.",
+  "scope": "Exactly one native TX C input. No RX/WSA/WSA2 unit imported in this handoff."
+}

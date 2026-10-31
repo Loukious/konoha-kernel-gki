@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 269 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 275 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 269 platform `.ko` files, their symbol tables and DDK configurations.
+- 275 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 16,865
-imported symbol CRCs across all 269 modules.
+used. The current [validation report](validation-20261031.json) checks 17,109
+imported symbol CRCs across all 275 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1817,5 +1817,30 @@ Archive `artifacts/20261031T200031808490Z` contains 269 modules and passes 16,86
 imported-symbol CRC checks without compiler/modpost warnings. Device-tree and
 overlay checks pass with existing vendor warnings. ROM module-name coverage
 is 266/466 (57.1%). Main camera, remaining audio/peripherals, KernelSU and
+NetHunter integration and boot/DLKM/ZIP packaging remain. No flashable ZIP or
+phone/hardware validation is claimed.
+
+
+## Native TX macro and thermal endpoints
+
+The TX audio macro preserves its native source, sole export, CDC dependency,
+parameter and DAI/control/route tables. The port retains headset and stream
+ownership across repeated calls, checks resource rollback and drains delayed
+work on removal. Fifteen sanitizer groups pass 184 cases and reject 37 deliberate
+regressions. The [TX record](audio-tx-port.md) documents the native effective
+40-ms unmute delay and provider/runtime limits.
+
+Five thermal endpoints add seven native units with unchanged QMI protocol
+schemas, sensor IDs and client names. CPU/GPU QoS setup validates sparse tables
+and rolls back references; QMI transactions use explicit peer addresses and
+connection generations, and removal drains callbacks and work. Three sanitizer
+suites cover 200 QMI removal races and reject 38 deliberate regressions. The
+[thermal record](thermal-endpoints-port.md) describes the mocked services and
+remaining hardware limits.
+
+Archive `artifacts/20261031T202635774067Z` contains 275 modules and passes 17,109
+imported-symbol CRC checks without compiler/modpost warnings. Device-tree and
+overlay checks pass with existing vendor warnings. ROM module-name coverage
+is 272/466 (58.4%). Main camera, remaining audio/peripherals, KernelSU and
 NetHunter integration and boot/DLKM/ZIP packaging remain. No flashable ZIP or
 phone/hardware validation is claimed.

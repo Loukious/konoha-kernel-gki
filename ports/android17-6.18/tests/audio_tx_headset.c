@@ -1,0 +1,11 @@
+/* SERVICES */
+static atomic_int block_read,entered,release,closed;
+static int hs_read(struct regmap*m,unsigned int reg,unsigned int*v){if(atomic_load(&block_read)){atomic_store(&entered,1);while(!atomic_load(&release))usleep(100);}return regmap_read(m,reg,v);}
+#define regmap_read hs_read
+/* SOURCE */
+static struct lpass_cdc_tx_macro_priv p;
+static void *call(void*x){lpass_cdc_tx_macro_mute_hs();return NULL;}
+static void *close_call(void*x){lpass_cdc_tx_macro_close_headset(&p);atomic_store(&closed,1);return NULL;}
+int main(void){struct device parent={0},d={.parent=&parent};static struct regmap map;parent.regmap=&map;struct snd_soc_component c={.dev=&parent};init_tx(&p,&d);p.component=&c;g_lpass_cdc_tx_priv=&p;int cases=0;unsigned int r0=LPASS_CDC_TX0_TX_PATH_CTL,r1=r0+LPASS_CDC_TX_MACRO_TX_PATH_OFFSET;p.active_ch_mask[1]=3;map.values[r1]=16;lpass_cdc_tx_macro_mute_hs();assert(p.hs_muted_mask==3&&p.reg_before_mute[0]==0&&p.reg_before_mute[1]==16&&map.values[r0]==16&&map.values[r1]==16&&p.tx_hs_unmute_dwork.pending&&p.tx_hs_unmute_dwork.delay==1200);cases++;lpass_cdc_tx_macro_mute_hs();assert(p.reg_before_mute[0]==0&&p.reg_before_mute[1]==16&&p.hs_muted_mask==3);p.active_ch_mask[1]=0;p.tx_hs_unmute_dwork.pending=false;tx_macro_hs_unmute_dwork(&p.tx_hs_unmute_dwork.work);assert(map.values[r0]==0&&map.values[r1]==16&&!p.hs_muted_mask&&!d.pm_refs);cases+=2;
+p.active_ch_mask[1]=1;steps=0;fault=1;lpass_cdc_tx_macro_mute_hs();assert(!p.hs_muted_mask&&!d.pm_refs);steps=0;fault=2;lpass_cdc_tx_macro_mute_hs();assert(!p.hs_muted_mask&&!d.pm_refs);steps=0;fault=3;lpass_cdc_tx_macro_mute_hs();assert(p.hs_muted_mask==1&&p.tx_hs_unmute_dwork.pending&&!d.pm_refs);fault=0;p.tx_hs_unmute_dwork.pending=false;tx_macro_hs_unmute_dwork(&p.tx_hs_unmute_dwork.work);assert(!p.hs_muted_mask);cases+=4;
+atomic_store(&block_read,1);pthread_t a,b;pthread_create(&a,NULL,call,NULL);while(!atomic_load(&entered))usleep(100);pthread_create(&b,NULL,close_call,NULL);usleep(20000);assert(!atomic_load(&closed));lpass_cdc_tx_macro_mute_hs();atomic_store(&release,1);pthread_join(a,NULL);pthread_join(b,NULL);assert(p.hs_closing&&!g_lpass_cdc_tx_priv&&!atomic_load(&p.hs_calls)&&atomic_load(&closed));p.tx_hs_unmute_dwork.pending=false;tx_macro_hs_unmute_dwork(&p.tx_hs_unmute_dwork.work);assert(!p.hs_muted_mask&&!d.pm_refs);cases+=3;printf("{\"headset\":%d}\n",cases);}

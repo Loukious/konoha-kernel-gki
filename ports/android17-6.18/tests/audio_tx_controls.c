@@ -1,0 +1,6 @@
+/* SERVICES */
+static const char *bcs_ch_sel_mux_text[12];
+/* SOURCE */
+int main(void){struct device parent={0},d={.parent=&parent};struct lpass_cdc_tx_macro_priv p;struct snd_soc_component c={.dev=&parent};static struct regmap map;parent.regmap=&map;macro_dev=&d;init_tx(&p,&d);p.component=&c;struct snd_kcontrol k={.component=&c};struct snd_ctl_elem_value v={0};int cases=0;
+for(int i=0;i<12;i++){v.value.enumerated.item[0]=i;assert(!lpass_cdc_tx_macro_bcs_ch_put(&k,&v)&&p.bcs_ch==i);v.value.integer.value[0]=i;assert(!lpass_cdc_tx_macro_put_bcs_ch_sel(&k,&v)&&map.values[LPASS_CDC_VA_TOP_CSR_SWR_CTRL]==i);cases+=2;}v.value.enumerated.item[0]=12;assert(lpass_cdc_tx_macro_bcs_ch_put(&k,&v)==-EINVAL);v.value.integer.value[0]=12;assert(lpass_cdc_tx_macro_put_bcs_ch_sel(&k,&v)==-EINVAL);v.value.integer.value[0]=1;fault=steps+1;assert(lpass_cdc_tx_macro_put_bcs_ch_sel(&k,&v)==-EIO);fault=0;cases+=3;
+int (*setters[])(struct snd_kcontrol*,struct snd_ctl_elem_value*)={lpass_cdc_tx_macro_swr_dmic_put,lpass_cdc_tx_macro_put_dec_gain_bypass,lpass_cdc_tx_macro_set_bcs};for(int i=0;i<3;i++){v.value.integer.value[0]=1;assert(!setters[i](&k,&v));v.value.integer.value[0]=2;assert(setters[i](&k,&v)==-EINVAL);v.value.integer.value[0]=-1;assert(setters[i](&k,&v)==-EINVAL);cases+=3;}printf("{\"controls\":%d}\n",cases);}
