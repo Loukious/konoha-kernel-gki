@@ -1343,6 +1343,42 @@ ddk_module(
     deps = [":thermal_headers", ":adc_headers", ":platform_headers", ":qcom_vadc_common", ":qcom_ipc_logging"],
 )
 
+ddk_headers(
+    name = "memory_dump_headers",
+    hdrs = ["include/soc/qcom/memory_dump.h", "include/dt-bindings/soc/qcom,dcc_v2.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "memory_dump_v2",
+    srcs = ["drivers/soc/qcom/memory_dump_v2.c"],
+    out = "memory_dump_v2.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":scm_headers", ":memory_dump_headers", ":minidump", ":qcom_scm"],
+)
+
+ddk_module(
+    name = "dcc_v2",
+    srcs = ["drivers/soc/qcom/dcc_v2.c"],
+    out = "dcc_v2.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":scm_headers", ":memory_dump_headers", ":memory_dump_v2", ":minidump"],
+)
+
+ddk_module(
+    name = "qcom_dload_mode",
+    srcs = ["drivers/power/reset/qcom-dload-mode.c"],
+    out = "qcom-dload-mode.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":scm_headers", ":memory_dump_headers", ":minidump", ":qcom_scm"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1432,6 +1468,9 @@ kernel_module_group(
         ":pinctrl_spmi_gpio",
         ":qcom_vadc_common",
         ":qcom_spmi_adc5_gen3",
+        ":memory_dump_v2",
+        ":dcc_v2",
+        ":qcom_dload_mode",
         ":nvmem_qfprom",
         ":qcom_cpufreq_thermal",
         ":qcom_cpufreq_hw",

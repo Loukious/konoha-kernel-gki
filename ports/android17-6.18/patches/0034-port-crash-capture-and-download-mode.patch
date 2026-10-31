@@ -1,0 +1,1661 @@
+--- a/drivers/soc/qcom/dcc_v2.c
++++ b/drivers/soc/qcom/dcc_v2.c
+@@ -160,6 +160,13 @@
+ 	uint32_t		val;
+ };
+ 
++struct dcc_sram_device {
++	struct cdev cdev;
++	struct device dev;
++	struct mutex lock;
++	struct dcc_drvdata *drvdata;
++};
++
+ struct dcc_drvdata {
+ 	void __iomem		*base;
+ 	uint32_t		reg_size;
+@@ -179,7 +186,9 @@
+ 	bool			*configured;
+ 	bool			interrupt_disable;
+ 	char			*sram_node;
+-	struct cdev		sram_dev;
++	struct dcc_sram_device *sram_dev;
++	struct md_region md_entry;
++	bool md_registered;
+ 	struct class		*sram_class;
+ 	struct list_head	*cfg_head;
+ 	uint32_t		*nr_config;
+@@ -1366,7 +1375,7 @@
+ 				struct device_attribute *attr,
+ 				const char *buf, size_t size)
+ {
+-	int ret, len, apb_bus;
++	int ret, len = 1, apb_bus = 0;
+ 	unsigned int base;
+ 	struct dcc_drvdata *drvdata = dev_get_drvdata(dev);
+ 	int nval;
+@@ -1750,122 +1759,171 @@
+ 	NULL,
+ };
+ 
++static void dcc_remove_files(struct device *dev)
++{
++	int i;
++
++	for (i = 0; dcc_attrs[i]; i++)
++		device_remove_file(dev, dcc_attrs[i]);
++}
++
+ static int dcc_create_files(struct device *dev,
+ 			    const struct device_attribute **attrs)
+ {
+-	int ret = 0, i;
+-
+-	for (i = 0; attrs[i] != NULL; i++) {
++	int ret, i;
++
++	for (i = 0; attrs[i]; i++) {
+ 		ret = device_create_file(dev, attrs[i]);
+ 		if (ret) {
+-			dev_err(dev, "DCC: Couldn't create sysfs attribute: %s\n",
+-				attrs[i]->attr.name);
+-			break;
++			while (i--)
++				device_remove_file(dev, attrs[i]);
++			return ret;
+ 		}
+ 	}
+-	return ret;
++	return 0;
+ }
+ 
+ static int dcc_sram_open(struct inode *inode, struct file *file)
+ {
+-	struct dcc_drvdata *drvdata = container_of(inode->i_cdev,
+-						   struct dcc_drvdata,
+-						   sram_dev);
+-	file->private_data = drvdata;
+-
+-	return  0;
++	struct dcc_sram_device *sram = container_of(inode->i_cdev,
++						 struct dcc_sram_device, cdev);
++
++	get_device(&sram->dev);
++	file->private_data = sram;
++	return nonseekable_open(inode, file);
++}
++
++static int dcc_sram_release(struct inode *inode, struct file *file)
++{
++	struct dcc_sram_device *sram = file->private_data;
++
++	put_device(&sram->dev);
++	return 0;
+ }
+ 
+ static ssize_t dcc_sram_read(struct file *file, char __user *data,
+ 			     size_t len, loff_t *ppos)
+ {
++	struct dcc_sram_device *sram = file->private_data;
++	struct dcc_drvdata *drvdata;
+ 	unsigned char *buf;
+-	struct dcc_drvdata *drvdata = file->private_data;
+-
+-	/* EOF check */
+-	if (drvdata->ram_size <= *ppos)
++	size_t start, skip, count;
++	ssize_t ret;
++
++	if (*ppos < 0)
++		return -EINVAL;
++	if (!len)
+ 		return 0;
+-
+-	if ((*ppos + len) < len
+-		|| (*ppos + len) > drvdata->ram_size)
+-		len = (drvdata->ram_size - *ppos);
+-
+-	buf = kzalloc(len, GFP_KERNEL);
+-	if (!buf)
+-		return -ENOMEM;
+-
+-	dcc_sram_memcpy(buf, (drvdata->ram_base + *ppos), len);
+-
+-	if (copy_to_user(data, buf, len)) {
+-		dev_err(drvdata->dev,
+-			"DCC: Couldn't copy all data to user\n");
+-		kfree(buf);
+-		return -EFAULT;
+-	}
+-
+-	*ppos += len;
+-
++	mutex_lock(&sram->lock);
++	drvdata = sram->drvdata;
++	if (!drvdata) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	if (*ppos >= drvdata->ram_size) {
++		ret = 0;
++		goto unlock;
++	}
++	len = min_t(size_t, len, drvdata->ram_size - *ppos);
++	start = round_down((size_t)*ppos, sizeof(u32));
++	skip = *ppos - start;
++	count = ALIGN(skip + len, sizeof(u32));
++	buf = kmalloc(count, GFP_KERNEL);
++	if (!buf) {
++		ret = -ENOMEM;
++		goto unlock;
++	}
++	/* SRAM requires word accesses even when userspace requests byte ranges. */
++	mutex_lock(&drvdata->mutex);
++	ret = dcc_sram_memcpy(buf, drvdata->ram_base + start, count);
++	mutex_unlock(&drvdata->mutex);
++	if (!ret) {
++		if (copy_to_user(data, buf + skip, len))
++			ret = -EFAULT;
++		else {
++			*ppos += len;
++			ret = len;
++		}
++	}
+ 	kfree(buf);
+-
+-	return len;
++unlock:
++	mutex_unlock(&sram->lock);
++	return ret;
+ }
+ 
+ static const struct file_operations dcc_sram_fops = {
+ 	.owner		= THIS_MODULE,
+ 	.open		= dcc_sram_open,
++	.release	= dcc_sram_release,
+ 	.read		= dcc_sram_read,
+-	.llseek		= no_llseek,
+ };
+ 
++static void dcc_sram_device_release(struct device *dev)
++{
++	struct dcc_sram_device *sram = container_of(dev, struct dcc_sram_device, dev);
++
++	kfree(sram);
++}
++
+ static int dcc_sram_dev_register(struct dcc_drvdata *drvdata)
+ {
++	struct dcc_sram_device *sram;
++	dev_t devt;
+ 	int ret;
+-	struct device *device;
+-	dev_t dev;
+-
+-	ret = alloc_chrdev_region(&dev, 0, 1, drvdata->sram_node);
++
++	sram = kzalloc(sizeof(*sram), GFP_KERNEL);
++	if (!sram)
++		return -ENOMEM;
++	device_initialize(&sram->dev);
++	sram->dev.release = dcc_sram_device_release;
++	sram->dev.parent = drvdata->dev;
++	mutex_init(&sram->lock);
++	sram->drvdata = drvdata;
++	ret = alloc_chrdev_region(&devt, 0, 1, drvdata->sram_node);
+ 	if (ret)
+-		goto err_alloc;
+-
+-	cdev_init(&drvdata->sram_dev, &dcc_sram_fops);
+-
+-	drvdata->sram_dev.owner = THIS_MODULE;
+-	ret = cdev_add(&drvdata->sram_dev, dev, 1);
+-	if (ret)
+-		goto err_cdev_add;
+-
+-	drvdata->sram_class = class_create(
+-					   drvdata->sram_node);
++		goto put;
++	sram->dev.devt = devt;
++	drvdata->sram_class = class_create(drvdata->sram_node);
+ 	if (IS_ERR(drvdata->sram_class)) {
+ 		ret = PTR_ERR(drvdata->sram_class);
+-		goto err_class_create;
+-	}
+-
+-	device = device_create(drvdata->sram_class, NULL,
+-			       drvdata->sram_dev.dev, drvdata,
+-			       drvdata->sram_node);
+-	if (IS_ERR(device)) {
+-		ret = PTR_ERR(device);
+-		goto err_dev_create;
+-	}
+-
++		goto unregister;
++	}
++	sram->dev.class = drvdata->sram_class;
++	ret = dev_set_name(&sram->dev, "%s", drvdata->sram_node);
++	if (ret)
++		goto destroy_class;
++	cdev_init(&sram->cdev, &dcc_sram_fops);
++	sram->cdev.owner = THIS_MODULE;
++	ret = cdev_device_add(&sram->cdev, &sram->dev);
++	if (ret)
++		goto destroy_class;
++	drvdata->sram_dev = sram;
+ 	return 0;
+-err_dev_create:
++
++destroy_class:
+ 	class_destroy(drvdata->sram_class);
+-err_class_create:
+-	cdev_del(&drvdata->sram_dev);
+-err_cdev_add:
+-	unregister_chrdev_region(drvdata->sram_dev.dev, 1);
+-err_alloc:
++unregister:
++	unregister_chrdev_region(devt, 1);
++put:
++	/* cdev_device_add can expose open files even when device_add fails. */
++	mutex_lock(&sram->lock);
++	sram->drvdata = NULL;
++	mutex_unlock(&sram->lock);
++	put_device(&sram->dev);
+ 	return ret;
+ }
+ 
+ static void dcc_sram_dev_deregister(struct dcc_drvdata *drvdata)
+ {
+-	device_destroy(drvdata->sram_class, drvdata->sram_dev.dev);
++	struct dcc_sram_device *sram = drvdata->sram_dev;
++
++	mutex_lock(&sram->lock);
++	sram->drvdata = NULL;
++	mutex_unlock(&sram->lock);
++	cdev_device_del(&sram->cdev, &sram->dev);
++	unregister_chrdev_region(sram->dev.devt, 1);
+ 	class_destroy(drvdata->sram_class);
+-	cdev_del(&drvdata->sram_dev);
+-	unregister_chrdev_region(drvdata->sram_dev.dev, 1);
++	put_device(&sram->dev);
+ }
+ 
+ static int dcc_sram_dev_init(struct dcc_drvdata *drvdata)
+@@ -1898,7 +1956,8 @@
+ {
+ 	int i, ret = -1;
+ 	const __be32 *prop;
+-	uint32_t len, entry, val1, val2, apb_bus;
++	int len;
++	u32 entry, val1, val2, apb_bus;
+ 	uint32_t curr_link_list;
+ 	const char *data_sink;
+ 
+@@ -1909,7 +1968,7 @@
+ 
+ 	if (curr_link_list >= drvdata->nr_link_list) {
+ 		dev_err(drvdata->dev, "List configuration failed.\n");
+-		return ret;
++		return -EINVAL;
+ 	}
+ 	drvdata->curr_list = curr_link_list;
+ 
+@@ -1934,6 +1993,8 @@
+ 
+ 	prop = of_get_property(np, "qcom,link-list", &len);
+ 	if (prop) {
++		if (len <= 0 || len % (4 * sizeof(__be32)))
++			return -EINVAL;
+ 		len /= sizeof(__be32);
+ 		i = 0;
+ 		while (i < len) {
+@@ -1941,6 +2002,8 @@
+ 			val1 = be32_to_cpu(prop[i++]);
+ 			val2 = be32_to_cpu(prop[i++]);
+ 			apb_bus = be32_to_cpu(prop[i++]);
++			if (apb_bus > 1)
++				return -EINVAL;
+ 
+ 			switch (entry) {
+ 			case DCC_READ:
+@@ -1984,6 +2047,7 @@
+ 		if (ret) {
+ 			dev_err(drvdata->dev,
+ 				"DCC link list config failed err:%d\n", ret);
++			of_node_put(link_node);
+ 			break;
+ 		}
+ 	}
+@@ -2001,7 +2065,7 @@
+ 	struct device *dev = &pdev->dev;
+ 	struct dcc_drvdata *drvdata;
+ 	struct resource *res;
+-	struct md_region md_entry;
++	struct md_region md_entry = {};
+ 
+ 	drvdata = devm_kzalloc(dev, sizeof(*drvdata), GFP_KERNEL);
+ 	if (!drvdata)
+@@ -2014,6 +2078,9 @@
+ 	if (!res)
+ 		return -EINVAL;
+ 
++	if (resource_size(res) < DCC_LL_NUM_INFO + sizeof(u32) ||
++	    resource_size(res) > U32_MAX)
++		return -EINVAL;
+ 	drvdata->reg_size = resource_size(res);
+ 	drvdata->base = devm_ioremap(dev, res->start, resource_size(res));
+ 	if (!drvdata->base)
+@@ -2024,6 +2091,9 @@
+ 	if (!res)
+ 		return -EINVAL;
+ 
++	if (resource_size(res) < sizeof(u32) || resource_size(res) > U32_MAX ||
++	    !IS_ALIGNED(resource_size(res), sizeof(u32)))
++		return -EINVAL;
+ 	drvdata->ram_size = resource_size(res);
+ 	drvdata->ram_base = devm_ioremap(dev, res->start, resource_size(res));
+ 	if (!drvdata->ram_base)
+@@ -2031,7 +2101,8 @@
+ 
+ 	ret = of_property_read_u32(pdev->dev.of_node, "dcc-ram-offset",
+ 				   &drvdata->ram_offset);
+-	if (ret)
++	if (ret || !IS_ALIGNED(drvdata->ram_offset, sizeof(u32)) ||
++	    drvdata->ram_offset > U32_MAX - drvdata->ram_size)
+ 		return -EINVAL;
+ 
+ 	drvdata->ll_state_cnt = of_property_count_elems_of_size(dev->of_node,
+@@ -2060,6 +2131,15 @@
+ 		drvdata->mem_map_ver = DCC_MEM_MAP_VER1;
+ 		drvdata->nr_link_list = DCC_MAX_LINK_LIST;
+ 	}
++
++	if (drvdata->nr_link_list >= DCC_INVALID_LINK_LIST ||
++	    dcc_offset_conv(drvdata, DCC_QAD_OUTPUT(drvdata->nr_link_list - 1)) >
++			drvdata->reg_size - sizeof(u32))
++		return -EINVAL;
++	if (drvdata->ll_state_cnt && (!drvdata->per_ll_reg_cnt ||
++	    drvdata->per_ll_reg_cnt > drvdata->reg_size / sizeof(u32) ||
++	    drvdata->ll_state_cnt > drvdata->nr_link_list * drvdata->per_ll_reg_cnt))
++		return -EINVAL;
+ 
+ 	if ((dcc_readl(drvdata, DCC_HW_INFO) & BIT(6)) == BIT(6))
+ 		drvdata->loopoff = DCC_FIX_LOOP_OFFSET;
+@@ -2119,38 +2199,47 @@
+ 
+ 	drvdata->curr_list = DCC_INVALID_LINK_LIST;
+ 
++	dcc_configure_list(drvdata, pdev->dev.of_node);
++	ret = dcc_create_files(dev, dcc_attrs);
++	if (ret)
++		goto reset_config;
+ 	ret = dcc_sram_dev_init(drvdata);
+ 	if (ret)
+-		goto err;
+-
+-	ret = dcc_create_files(dev, dcc_attrs);
+-	if (ret)
+-		goto err;
+-
+-	dcc_configure_list(drvdata, pdev->dev.of_node);
++		goto remove_files;
+ 
+ 	/* Add dcc info to minidump table */
+ 	strscpy(md_entry.name, "KDCCDATA", sizeof(md_entry.name));
+ 	md_entry.virt_addr = (uintptr_t)drvdata->ram_base;
+ 	md_entry.phys_addr = res->start;
+ 	md_entry.size = drvdata->ram_size;
+-	if (msm_minidump_add_region(&md_entry) < 0)
++	if (msm_minidump_add_region(&md_entry) < 0) {
+ 		dev_err(drvdata->dev, "Failed to add DCC data in Minidump\n");
++	} else {
++		drvdata->md_entry = md_entry;
++		drvdata->md_registered = true;
++	}
+ 
+ 	return 0;
+-err:
+-	return ret;
+-}
+-
+-static int dcc_remove(struct platform_device *pdev)
++remove_files:
++	dcc_remove_files(dev);
++reset_config:
++	dcc_disable(drvdata);
++	dcc_config_reset(drvdata);
++	return ret;
++}
++
++static void dcc_remove(struct platform_device *pdev)
+ {
+ 	struct dcc_drvdata *drvdata = platform_get_drvdata(pdev);
+ 
++	dcc_remove_files(&pdev->dev);
+ 	dcc_sram_dev_exit(drvdata);
+-
++	dcc_disable(drvdata);
+ 	dcc_config_reset(drvdata);
+-
+-	return 0;
++	if (drvdata->md_registered)
++		msm_minidump_remove_region(&drvdata->md_entry);
++	kfree(drvdata->sram_state);
++	kfree(drvdata->ll_state);
+ }
+ 
+ #if defined(CONFIG_DEEPSLEEP) || defined(CONFIG_HIBERNATION)
+@@ -2165,21 +2254,27 @@
+ 		return -EINVAL;
+ 	}
+ 
++	mutex_lock(&drvdata->mutex);
++	if (drvdata->sram_state || drvdata->ll_state) {
++		ret = -EBUSY;
++		goto unlock;
++	}
+ 	if (!is_dcc_enabled(drvdata)) {
+ 		dev_dbg(dev, "DCC is not enabled.\n");
+-		return 0;
++		goto unlock;
+ 	}
+ 
+ 	if (!drvdata->ll_state_cnt) {
+ 		dev_dbg(dev, "reg-offsets property doesn't exist\n");
+-		return 0;
++		goto unlock;
+ 	}
+ 
+ 	n = drvdata->ll_state_cnt;
+ 	ll_reg_offsets = kcalloc(n, sizeof(u32), GFP_KERNEL);
+ 	if (!ll_reg_offsets) {
+ 		dev_err(dev, "Failed to alloc memory for reg_offsets\n");
+-		return -ENOMEM;
++		ret = -ENOMEM;
++		goto unlock;
+ 	}
+ 
+ 	ret = of_property_read_variable_u32_array(dev->of_node,
+@@ -2189,7 +2284,18 @@
+ 		goto out;
+ 	}
+ 
+-	drvdata->ll_state = kzalloc(n * sizeof(struct reg_state), GFP_KERNEL);
++	for (i = 0; i < n; i++) {
++		if (!IS_ALIGNED(ll_reg_offsets[i], sizeof(u32)) ||
++		    ll_reg_offsets[i] > drvdata->reg_size - sizeof(u32)) {
++			ret = -EINVAL;
++			goto out;
++		}
++	}
++	if (drvdata->ram_cpy_len > drvdata->ram_size) {
++		ret = -EINVAL;
++		goto out;
++	}
++	drvdata->ll_state = kcalloc(n, sizeof(struct reg_state), GFP_KERNEL);
+ 	if (!drvdata->ll_state) {
+ 		ret = -ENOMEM;
+ 		goto out;
+@@ -2208,17 +2314,13 @@
+ 		goto sram_cpy_err;
+ 	}
+ 
+-	mutex_lock(&drvdata->mutex);
+-
+ 	for (i = 0; i < n; i++) {
+ 		drvdata->ll_state[i].offset = ll_reg_offsets[i];
+ 		drvdata->ll_state[i].val    = __raw_readl(drvdata->base + ll_reg_offsets[i]);
+ 	}
+ 
+-	mutex_unlock(&drvdata->mutex);
+-
+-	kfree(ll_reg_offsets);
+-	return 0;
++	ret = 0;
++	goto out;
+ 
+ sram_cpy_err:
+ 	kfree(drvdata->sram_state);
+@@ -2228,6 +2330,8 @@
+ 	drvdata->ll_state = NULL;
+ out:
+ 	kfree(ll_reg_offsets);
++unlock:
++	mutex_unlock(&drvdata->mutex);
+ 	return ret;
+ }
+ 
+@@ -2244,6 +2348,7 @@
+ 		return -EINVAL;
+ 	}
+ 
++	mutex_lock(&drvdata->mutex);
+ 	if (!is_dcc_enabled(drvdata)) {
+ 		dev_dbg(dev, "DCC is not enabled.\n");
+ 		ret = 0;
+@@ -2269,8 +2374,6 @@
+ 	for (i = 0; i < ram_cpy_wlen; i++)
+ 		dcc_sram_writel(drvdata, sram_state[i], i * 4);
+ 
+-	mutex_lock(&drvdata->mutex);
+-
+ 	for (i = 0, dcc_ll_index = 0;
+ 		 (dcc_ll_index < drvdata->nr_link_list) && (i < n);
+ 		 dcc_ll_index++) {
+@@ -2280,12 +2383,11 @@
+ 			continue;
+ 		}
+ 
+-		for (j = 0; j < drvdata->per_ll_reg_cnt; i++, j++)
++		for (j = 0; j < drvdata->per_ll_reg_cnt && i < n; i++, j++)
+ 			__raw_writel(drvdata->ll_state[i].val,
+ 						drvdata->base + drvdata->ll_state[i].offset);
+ 	}
+ 
+-	mutex_unlock(&drvdata->mutex);
+ out:
+ 	kfree(drvdata->sram_state);
+ 	drvdata->sram_state = NULL;
+@@ -2293,6 +2395,7 @@
+ 	kfree(drvdata->ll_state);
+ 	drvdata->ll_state = NULL;
+ 
++	mutex_unlock(&drvdata->mutex);
+ 	return ret;
+ }
+ #endif
+@@ -2340,15 +2443,17 @@
+ {
+ 	struct dcc_drvdata *drvdata = dev_get_drvdata(dev);
+ 
+-	if (!drvdata || !drvdata->ll_state || !drvdata->sram_state) {
++	if (!drvdata) {
+ 		dev_err(dev, "Err: %s Invalid argument\n", __func__);
+ 		return -EINVAL;
+ 	}
+ 
++	mutex_lock(&drvdata->mutex);
+ 	kfree(drvdata->sram_state);
+ 	kfree(drvdata->ll_state);
+ 	drvdata->sram_state = NULL;
+ 	drvdata->ll_state = NULL;
++	mutex_unlock(&drvdata->mutex);
+ 
+ 	return 0;
+ }
+--- a/drivers/soc/qcom/memory_dump_v2.c
++++ b/drivers/soc/qcom/memory_dump_v2.c
+@@ -21,6 +21,8 @@
+ #include <linux/of_reserved_mem.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
+ #include <linux/debugfs.h>
++#include <linux/platform_device.h>
++#include <linux/overflow.h>
+ 
+ #define MSM_DUMP_TABLE_VERSION		MSM_DUMP_MAKE_VERSION(2, 0)
+ 
+@@ -85,6 +87,8 @@
+ };
+ 
+ struct cpuss_dump_data {
++	unsigned int initialized;
++	unsigned int created;
+ 	struct mutex mutex;
+ 	struct cpuss_regdump_data *cpussregdata;
+ 	struct sprs_dump_data *sprdata[MAX_CORE_NUM];
+@@ -127,9 +131,14 @@
+ #define PERCORE_REG_INITIALIZED BIT(0)
+ #define SPRS_INITIALIZED BIT(1)
+ 
++#ifdef CONFIG_QCOM_DYNAMIC_MEMORY_DUMP
+ static LIST_HEAD(dynamic_dump_list);
+-DEFINE_MUTEX(dump_mutex);
++static DEFINE_MUTEX(dump_mutex);
++#endif
+ static struct msm_memory_dump memdump;
++static bool memdump_ready;
++static DEFINE_MUTEX(memdump_probe_lock);
++static DEFINE_SPINLOCK(memdump_table_lock);
+ 
+ /**
+  * reset_sprs_dump_table - reset the sprs dump table
+@@ -186,17 +195,17 @@
+  *
+  * Returns 0 on success, or -ENOMEM on error of no enough memory.
+  */
+-static int update_reg_dump_table(struct device *dev, u32 core_reg_num)
++static int __update_reg_dump_table(struct device *dev, u32 core_reg_num)
+ {
+ 	int ret = 0;
+-	u32 system_regs_input_index = SYSTEM_REGS_INPUT_INDEX +
+-			core_reg_num * 2;
+-	u32 regdump_output_byte_offset = (system_regs_input_index + 1)
++	u64 system_regs_input_index = SYSTEM_REGS_INPUT_INDEX +
++			(u64)core_reg_num * 2;
++	u64 regdump_output_byte_offset = (system_regs_input_index + 1)
+ 			* sizeof(uint32_t);
+ 	struct reg_dump_data *p;
+ 	struct cpuss_dump_data *cpudata = dev_get_drvdata(dev);
+ 
+-	mutex_lock(&cpudata->mutex);
++	lockdep_assert_held(&cpudata->mutex);
+ 
+ 	if (regdump_output_byte_offset >= cpudata->cpussregdata->size ||
+ 			regdump_output_byte_offset / sizeof(uint32_t)
+@@ -222,6 +231,16 @@
+ 			* sizeof(uint32_t));
+ 
+ err:
++	return ret;
++}
++
++static int update_reg_dump_table(struct device *dev, u32 core_reg_num)
++{
++	struct cpuss_dump_data *cpudata = dev_get_drvdata(dev);
++	int ret;
++
++	mutex_lock(&cpudata->mutex);
++	ret = __update_reg_dump_table(dev, core_reg_num);
+ 	mutex_unlock(&cpudata->mutex);
+ 	return ret;
+ }
+@@ -266,20 +285,12 @@
+ 		return size;
+ 	}
+ 
+-	mutex_unlock(&cpudata->mutex);
+-
+-	ret = update_reg_dump_table(dev, val);
+-	if (ret) {
+-		dev_err(dev, "Couldn't set core_reg_num, no enough memory\n");
+-		return ret;
+-	}
+-
+-	return size;
+-
++	ret = __update_reg_dump_table(dev, val);
+ err:
+ 	mutex_unlock(&cpudata->mutex);
+-	return ret;
+-}
++	return ret ?: size;
++}
++
+ static DEVICE_ATTR_RW(core_reg_num);
+ 
+ /**
+@@ -380,7 +391,7 @@
+ 	}
+ 
+ 	mutex_unlock(&cpudata->mutex);
+-	return count;
++	return strnlen(buf, PAGE_SIZE);
+ }
+ 
+ static int config_cpuss_register(struct device *dev,
+@@ -583,9 +594,7 @@
+ 	if (val != 1)
+ 		return -EINVAL;
+ 
+-	update_reg_dump_table(dev, CORE_REG_NUM_DEFAULT);
+-
+-	return size;
++	return update_reg_dump_table(dev, CORE_REG_NUM_DEFAULT) ?: size;
+ }
+ static DEVICE_ATTR_WO(register_reset);
+ 
+@@ -639,7 +648,7 @@
+ 	}
+ 
+ 	mutex_unlock(&cpudata->mutex);
+-	return count;
++	return strnlen(buf, PAGE_SIZE);
+ }
+ 
+ /**
+@@ -712,9 +721,7 @@
+ 	if (val != 1)
+ 		return -EINVAL;
+ 
+-	reset_sprs_dump_table(dev);
+-
+-	return size;
++	return reset_sprs_dump_table(dev) ?: size;
+ }
+ static DEVICE_ATTR_WO(sprs_register_reset);
+ 
+@@ -744,7 +751,7 @@
+ 	}
+ 
+ 	mutex_unlock(&cpudata->mutex);
+-	return count;
++	return strnlen(buf, PAGE_SIZE);
+ }
+ static DEVICE_ATTR_RO(sprs_format_version);
+ 
+@@ -786,21 +793,23 @@
+ static void cpuss_create_nodes(struct device *dev,
+ 			int initialized)
+ {
+-	static int created;
+-
+-	initialized &= ~created;
++	struct cpuss_dump_data *cpudata = dev_get_drvdata(dev);
++
++	if (!cpudata)
++		return;
++	initialized &= ~cpudata->created;
+ 
+ 	if (initialized & PERCORE_REG_INITIALIZED) {
+ 		if (memory_dump_create_files(dev, register_dump_attrs))
+ 			dev_err(dev, "Fail to create files for cpuss register dump\n");
+ 		else
+-			created |= PERCORE_REG_INITIALIZED;
++			cpudata->created |= PERCORE_REG_INITIALIZED;
+ 	}
+ 	if (initialized & SPRS_INITIALIZED) {
+ 		if (memory_dump_create_files(dev, spr_dump_attrs))
+ 			dev_err(dev, "Fail to create files for spr dump\n");
+ 		else
+-			created |= SPRS_INITIALIZED;
++			cpudata->created |= SPRS_INITIALIZED;
+ 	}
+ }
+ 
+@@ -810,54 +819,37 @@
+ }
+ EXPORT_SYMBOL(msm_dump_table_version);
+ 
+-static int msm_dump_table_register(struct msm_dump_entry *entry)
+-{
+-	struct msm_dump_entry *e;
++
++
++static struct msm_dump_table *msm_dump_get_table(enum msm_dump_table_ids id)
++{
+ 	struct msm_dump_table *table = memdump.table;
+-
+-	if (!table || table->num_entries >= MAX_NUM_ENTRIES)
+-		return -EINVAL;
+-
+-	e = &table->entries[table->num_entries];
+-	e->id = entry->id;
+-	e->type = MSM_DUMP_TYPE_TABLE;
+-	e->addr = entry->addr;
+-	table->num_entries++;
+-
+-	return 0;
+-}
+-
+-static struct msm_dump_table *msm_dump_get_table(enum msm_dump_table_ids id)
+-{
+-	struct msm_dump_table *table = memdump.table;
+-	int i;
+-	unsigned long offset;
+-
+-	if (!table) {
+-		pr_err("mem dump base table does not exist\n");
++	unsigned int i;
++	u64 offset;
++
++	if (!table)
++		return ERR_PTR(-EPROBE_DEFER);
++	if (table->num_entries > MAX_NUM_ENTRIES)
+ 		return ERR_PTR(-EINVAL);
+-	}
+-
+-	for (i = 0; i < MAX_NUM_ENTRIES; i++) {
+-		if (table->entries[i].id == id)
+-			break;
+-	}
+-	if (i == MAX_NUM_ENTRIES || !table->entries[i].addr) {
+-		pr_err("mem dump base table entry %d invalid\n", id);
+-		return ERR_PTR(-EINVAL);
+-	}
+-
+-	offset = table->entries[i].addr - memdump.table_phys;
+-	/* Get the apps table pointer */
+-	table = (void *)memdump.table + offset;
+-
+-	return table;
++	for (i = 0; i < table->num_entries; i++) {
++		if (table->entries[i].id != id)
++			continue;
++		if (table->entries[i].type != MSM_DUMP_TYPE_TABLE ||
++		    table->entries[i].addr < memdump.table_phys)
++			return ERR_PTR(-EINVAL);
++		offset = table->entries[i].addr - memdump.table_phys;
++		/* This format contains a root table followed by one apps table. */
++		if (offset != sizeof(*table))
++			return ERR_PTR(-EINVAL);
++		return (void *)table + offset;
++	}
++	return ERR_PTR(-EINVAL);
+ }
+ 
+ static int msm_dump_data_add_minidump(struct msm_dump_entry *entry)
+ {
+ 	struct msm_dump_data *data;
+-	struct md_region md_entry;
++	struct md_region md_entry = {};
+ 
+ 	data = (struct msm_dump_data *)(phys_to_virt(entry->addr));
+ 
+@@ -882,25 +874,35 @@
+ }
+ 
+ static int register_dump_table_entry(enum msm_dump_table_ids id,
+-					struct msm_dump_entry *entry)
++				     struct msm_dump_entry *entry)
+ {
+ 	struct msm_dump_entry *e;
+ 	struct msm_dump_table *table;
+-
++	unsigned long flags;
++	int ret = 0;
++
++	if (!entry || !entry->addr)
++		return -EINVAL;
++	spin_lock_irqsave(&memdump_table_lock, flags);
+ 	table = msm_dump_get_table(id);
+-	if (IS_ERR(table))
+-		return PTR_ERR(table);
+-
+-	if (!table || table->num_entries >= MAX_NUM_ENTRIES)
+-		return -EINVAL;
+-
++	if (IS_ERR(table)) {
++		ret = PTR_ERR(table);
++		goto out;
++	}
++	if (table->num_entries >= MAX_NUM_ENTRIES) {
++		ret = -ENOSPC;
++		goto out;
++	}
+ 	e = &table->entries[table->num_entries];
+ 	e->id = entry->id;
+ 	e->type = MSM_DUMP_TYPE_DATA;
+ 	e->addr = entry->addr;
+-	table->num_entries++;
+-
+-	return 0;
++	/* Firmware must see the complete entry before the new count. */
++	wmb();
++	WRITE_ONCE(table->num_entries, table->num_entries + 1);
++out:
++	spin_unlock_irqrestore(&memdump_table_lock, flags);
++	return ret;
+ }
+ 
+ /**
+@@ -914,6 +916,9 @@
+ {
+ 	int ret;
+ 
++	/* Acquire the tables published after firmware setup. */
++	if (!smp_load_acquire(&memdump_ready))
++		return -EPROBE_DEFER;
+ 	ret = register_dump_table_entry(id, entry);
+ 	if (!ret)
+ 		if (msm_dump_data_add_minidump(entry) < 0)
+@@ -932,6 +937,9 @@
+ int msm_dump_data_register_nominidump(enum msm_dump_table_ids id,
+ 			   struct msm_dump_entry *entry)
+ {
++	/* Acquire the tables published after firmware setup. */
++	if (!smp_load_acquire(&memdump_ready))
++		return -EPROBE_DEFER;
+ 	return register_dump_table_entry(id, entry);
+ }
+ EXPORT_SYMBOL(msm_dump_data_register_nominidump);
+@@ -939,57 +947,51 @@
+ #define MSM_DUMP_TOTAL_SIZE_OFFSET	0x724
+ static int init_memdump_imem_area(size_t size)
+ {
+-	struct device_node *np;
++	struct device_node *np, *parent;
++	struct resource res, window;
+ 	void __iomem *imem_base;
+-
+-	np = of_find_compatible_node(NULL, NULL,
+-				     "qcom,msm-imem-mem_dump_table");
+-	if (!np) {
+-		pr_err("mem dump base table DT node does not exist\n");
++	size_t map_size = MSM_DUMP_TOTAL_SIZE_OFFSET + sizeof(u64);
++	u64 total_size = size;
++	int ret;
++
++	np = of_find_compatible_node(NULL, NULL, "qcom,msm-imem-mem_dump_table");
++	if (!np)
+ 		return -ENODEV;
+-	}
+-
+-	imem_base = of_iomap(np, 0);
+-	if (!imem_base) {
+-		pr_err("mem dump base table imem offset mapping failed\n");
++	ret = of_address_to_resource(np, 0, &res);
++	parent = of_get_parent(np);
++	of_node_put(np);
++	if (!ret)
++		ret = of_address_to_resource(parent, 0, &window);
++	of_node_put(parent);
++	if (ret)
++		return ret;
++	/* The size word follows the 8-byte child resource, inside parent IMEM. */
++	if (res.start < window.start || res.start > window.end ||
++	    map_size > window.end - res.start + 1)
++		return -EINVAL;
++	imem_base = ioremap(res.start, map_size);
++	if (!imem_base)
+ 		return -ENOMEM;
+-	}
+-
+-	memcpy_toio(imem_base, &memdump.table_phys,
+-			sizeof(memdump.table_phys));
+-	memcpy_toio(imem_base + MSM_DUMP_TOTAL_SIZE_OFFSET,
+-			&size, sizeof(size_t));
+-
+-	/* Ensure write to imem_base is complete before unmapping */
++	memcpy_toio(imem_base, &memdump.table_phys, sizeof(memdump.table_phys));
++	memcpy_toio(imem_base + MSM_DUMP_TOTAL_SIZE_OFFSET, &total_size, sizeof(total_size));
+ 	mb();
+-	pr_info("MSM Memory Dump base table set up in IMEM\n");
+-
+ 	iounmap(imem_base);
+ 	return 0;
+ }
+ 
+ static int init_memory_dump(void *dump_vaddr, phys_addr_t phys_addr)
+ {
+-	struct msm_dump_table *table;
+-	struct msm_dump_entry entry;
+-	int ret;
+-
+-	memdump.table = dump_vaddr;
+-	memdump.table->version = MSM_DUMP_TABLE_VERSION;
++	struct msm_dump_table *root = dump_vaddr;
++	struct msm_dump_table *apps = root + 1;
++
++	root->version = MSM_DUMP_TABLE_VERSION;
++	apps->version = MSM_DUMP_TABLE_VERSION;
++	root->entries[0].id = MSM_DUMP_TABLE_APPS;
++	root->entries[0].type = MSM_DUMP_TYPE_TABLE;
++	root->entries[0].addr = phys_addr + sizeof(*root);
++	root->num_entries = 1;
+ 	memdump.table_phys = phys_addr;
+-	dump_vaddr +=  sizeof(*table);
+-	phys_addr += sizeof(*table);
+-	table = dump_vaddr;
+-	table->version = MSM_DUMP_TABLE_VERSION;
+-	entry.id = MSM_DUMP_TABLE_APPS;
+-	entry.addr = phys_addr;
+-	ret = msm_dump_table_register(&entry);
+-	if (ret) {
+-		pr_err("mem dump apps data table register failed\n");
+-		return ret;
+-	}
+-	pr_info("MSM Memory Dump apps data table set up\n");
+-
++	memdump.table = root;
+ 	return 0;
+ }
+ 
+@@ -998,6 +1000,8 @@
+ {
+ 	struct cpuss_dump_data *cpudata = dev_get_drvdata(dev);
+ 
++	if (size < (SYSTEM_REGS_INPUT_INDEX + 4) * sizeof(u32) || cpudata->cpussregdata)
++		return -EINVAL;
+ 	cpudata->cpussregdata = devm_kzalloc(dev,
+ 		sizeof(struct cpuss_regdump_data), GFP_KERNEL);
+ 
+@@ -1016,6 +1020,10 @@
+ 	int core_num = 0;
+ 
+ 	core_num = id - SPR_DUMP_CPU0;
++	if (core_num < 0 || core_num >= MAX_CORE_NUM ||
++	    size < (SPR_DATA_HEADER_SIZE + SPR_INPUT_DATA_TAIL_SIZE) * sizeof(u32) ||
++	    cpudata->sprdata[core_num])
++		return -EINVAL;
+ 
+ 	cpudata->sprdata[core_num] = devm_kzalloc(dev,
+ 		sizeof(struct sprs_dump_data), GFP_KERNEL);
+@@ -1031,7 +1039,7 @@
+ 		void *dump_vaddr, u32 size, u32 id)
+ {
+ 	struct cpuss_dump_data *cpudata = dev_get_drvdata(dev);
+-	static int initialized;
++	int initialized = cpudata ? cpudata->initialized : 0;
+ 
+ 	if (!cpudata) {
+ 		cpudata = devm_kzalloc(dev,
+@@ -1051,11 +1059,12 @@
+ 			initialized |= SPRS_INITIALIZED;
+ 	}
+ 
++	cpudata->initialized = initialized;
+ 	return initialized;
+ }
+ 
+ #define MSM_DUMP_DATA_SIZE sizeof(struct msm_dump_data)
+-static void mem_dump_parse_register_entry(struct memdump_info *dump_info)
++static int mem_dump_parse_register_entry(struct memdump_info *dump_info)
+ {
+ 	u32 size, id;
+ 	int ret;
+@@ -1065,6 +1074,7 @@
+ 	phys_addr_t phys_addr = dump_info->base;
+ 	void *dump_vaddr = dump_info->vbase;
+ 	int initialized = 0;
++	size_t used = 0, entry_size;
+ 
+ 	for_each_available_child_of_node(dump_info->dev_node, child_node) {
+ 		ret = of_property_read_u32(child_node, "qcom,dump-size", &size);
+@@ -1080,6 +1090,13 @@
+ 			continue;
+ 		}
+ 
++		entry_size = (size_t)size + MSM_DUMP_DATA_SIZE;
++		if (!IS_ALIGNED(size, sizeof(u64)) || !size ||
++		    used > dump_info->size || entry_size > dump_info->size - used) {
++			of_node_put(child_node);
++			return -EINVAL;
++		}
++		used += entry_size;
+ 		dump_data = dump_vaddr;
+ 		dump_data->addr = phys_addr + MSM_DUMP_DATA_SIZE;
+ 		dump_data->len = size;
+@@ -1087,11 +1104,12 @@
+ 		strscpy(dump_data->name, child_node->name,
+ 					sizeof(dump_data->name));
+ 		dump_entry.addr = phys_addr;
+-		ret = msm_dump_data_register_nominidump(MSM_DUMP_TABLE_APPS,
++		ret = register_dump_table_entry(MSM_DUMP_TABLE_APPS,
+ 					&dump_entry);
+-		if (ret)
+-			dev_err(dump_info->dev, "Data dump setup failed, id = %d\n",
+-				id);
++		if (ret) {
++			of_node_put(child_node);
++			return ret;
++		}
+ 
+ 		if ((id == CPUSS_REGDUMP) ||
+ 				((id >= SPR_DUMP_CPU0) && (id <= SPR_DUMP_CPU7)))
+@@ -1102,58 +1120,56 @@
+ 		phys_addr += (size  + MSM_DUMP_DATA_SIZE);
+ 	}
+ 
+-	cpuss_create_nodes(dump_info->dev, initialized);
+ 	if (initialized & SPRS_INITIALIZED)
+ 		reset_sprs_dump_table(dump_info->dev);
++	if (initialized & PERCORE_REG_INITIALIZED)
++		update_reg_dump_table(dump_info->dev, CORE_REG_NUM_DEFAULT);
++	return 0;
+ }
+ 
+ static size_t mem_dump_calc_dump_total_size(const struct device_node *node)
+ {
+-	size_t total_size, no_of_nodes;
+-	u32 size;
++	size_t total_size = 0;
++	u32 size, id;
++	unsigned int entries = 0;
+ 	struct device_node *child_node;
+-	int ret;
+-
+-	ret = total_size = size = no_of_nodes = 0;
++
+ 	for_each_available_child_of_node(node, child_node) {
+-		ret = of_property_read_u32(child_node, "qcom,dump-size", &size);
+-		if (ret)
++		if (of_property_read_u32(child_node, "qcom,dump-size", &size) ||
++		    of_property_read_u32(child_node, "qcom,dump-id", &id))
+ 			continue;
+-
+-		total_size += size;
+-		no_of_nodes++;
+-	}
+-
+-	total_size += (MSM_DUMP_DATA_SIZE * no_of_nodes);
+-
++		if (!size || !IS_ALIGNED(size, sizeof(u64)) ||
++		    ++entries > MAX_NUM_ENTRIES ||
++		    check_add_overflow(total_size, (size_t)size + MSM_DUMP_DATA_SIZE,
++				       &total_size)) {
++			of_node_put(child_node);
++			return SIZE_MAX;
++		}
++	}
+ 	return total_size;
+ }
+ 
+ static int mem_dump_alloc(struct platform_device *pdev, struct device_node *node,
+-			  phys_addr_t phys_addr, void *dump_vaddr)
+-{
+-	struct memdump_info *dump_info;
+-
+-	dump_info = devm_kzalloc(&pdev->dev, sizeof(*dump_info), GFP_KERNEL);
+-	if (!dump_info)
+-		return  -ENOMEM;
+-
+-	dump_info->vbase = dump_vaddr;
+-	dump_info->base = phys_addr;
+-	dump_info->dev_node = node;
+-	dump_info->dev = &pdev->dev;
+-	mem_dump_parse_register_entry(dump_info);
+-
+-	return 0;
+-}
+-
+-static void mem_dump_free_rmem(phys_addr_t base, uint32_t size)
++			  phys_addr_t phys_addr, void *dump_vaddr, size_t size)
++{
++	struct memdump_info dump_info = {
++		.vbase = dump_vaddr,
++		.base = phys_addr,
++		.dev_node = node,
++		.dev = &pdev->dev,
++		.size = size,
++	};
++
++	return mem_dump_parse_register_entry(&dump_info);
++}
++
++static void mem_dump_free_rmem(phys_addr_t base, size_t size)
+ {
+ 	u64 tmp;
+ 
+ 	for (tmp = base; tmp < base + size; tmp += PAGE_SIZE)
+ 		free_reserved_page(phys_to_page(tmp));
+-	pr_info("free unused reserved memory: %uK\n", size/1024);
++	pr_info("free unused reserved memory: %zuK\n", size / 1024);
+ 
+ }
+ 
+@@ -1415,100 +1431,84 @@
+ 	return ret;
+ }
+ 
+-#else
+-static int dynamic_mem_dump_alloc(struct platform_device *pdev, struct device_node *node,
+-	struct reserved_mem *rmem, size_t *rmem_offset)
+-{
+-	return 0;
+-}
+ #endif
+ 
+ static int mem_dump_alloc_with_rmem(struct platform_device *pdev,
+ 				    struct device_node *rmem_node)
+ {
++	struct device *dev = &pdev->dev;
++	struct reserved_mem *rmem = of_reserved_mem_lookup(rmem_node);
++	struct device_node *child;
++	size_t node_size, used_size = ALIGN(sizeof(struct msm_dump_table) * 2, SZ_4K);
++	size_t offset = used_size;
++	void *buffer;
++	u64 bridge;
++	u32 vmid = VMID_HLOS, perms = PERM_READ | PERM_WRITE;
++	struct md_region md_entry = {};
+ 	int ret;
+-	const struct device_node *node = pdev->dev.of_node;
+-	struct reserved_mem *rmem;
+-	struct device_node *child_node;
+-	size_t node_size;
+-	uint32_t ns_vmids[] = {VMID_HLOS};
+-	uint32_t ns_vm_perms[] = {PERM_READ | PERM_WRITE};
+-	u64 shm_bridge_handle;
+-	size_t free_size, used_size = 0;
+-	void *memdump_vaddr, *dump_vaddr;
+-	phys_addr_t phys_addr, dump_paddr;
+-	struct md_region md_entry;
+-
+-	rmem = of_reserved_mem_lookup(rmem_node);
+-	if (!rmem) {
+-		dev_err(&pdev->dev, "reserved memory for dump fail\n");
+-		return -EINVAL;
+-	}
+-
+-	used_size = sizeof(struct msm_dump_table) * 2;
+-	used_size = ALIGN(used_size, SZ_4K);
+-	phys_addr = rmem->base;
+-	memdump_vaddr = memremap(phys_addr, used_size, MEMREMAP_WB);
+-	if (!memdump_vaddr)
+-		return -ENOMEM;
+-	memset(memdump_vaddr, 0x0, used_size);
+-
+-	ret = init_memory_dump(memdump_vaddr, phys_addr);
++
++	if (!rmem || !IS_ALIGNED(rmem->base, PAGE_SIZE) ||
++	    !IS_ALIGNED(rmem->size, PAGE_SIZE) || used_size > rmem->size)
++		return -EINVAL;
++	for_each_available_child_of_node(dev->of_node, child) {
++		if (!of_property_read_bool(child, "qcom,static-mem-dump"))
++			continue;
++		node_size = mem_dump_calc_dump_total_size(child);
++		if (node_size > SIZE_MAX - (SZ_4K - 1)) {
++			of_node_put(child);
++			return -EINVAL;
++		}
++		node_size = ALIGN(node_size, SZ_4K);
++		if (node_size > rmem->size - used_size) {
++			of_node_put(child);
++			return -ENOSPC;
++		}
++		used_size += node_size;
++	}
++
++	buffer = devm_memremap(dev, rmem->base, used_size, MEMREMAP_WB);
++	if (IS_ERR(buffer))
++		return PTR_ERR(buffer);
++	memset(buffer, 0, used_size);
++	init_memory_dump(buffer, rmem->base);
++	for_each_available_child_of_node(dev->of_node, child) {
++		if (!of_property_read_bool(child, "qcom,static-mem-dump"))
++			continue;
++		node_size = ALIGN(mem_dump_calc_dump_total_size(child), SZ_4K);
++		ret = mem_dump_alloc(pdev, child, rmem->base + offset, buffer + offset, node_size);
++		if (ret) {
++			of_node_put(child);
++			return ret;
++		}
++		offset += node_size;
++	}
++
++	ret = qtee_shmbridge_register(rmem->base, used_size, &vmid, &perms, 1, perms, &bridge);
++	if (ret)
++		return ret;
++	ret = qcom_scm_assign_dump_table_region(1, rmem->base, used_size);
++	if (ret)
++		ret = init_memdump_imem_area(used_size);
+ 	if (ret) {
+-		dev_err(&pdev->dev, "Memory Dump table set up is failed\n");
++		qtee_shmbridge_deregister(bridge);
+ 		return ret;
+ 	}
+ 
+-	for_each_available_child_of_node(node, child_node) {
+-		if (of_property_read_bool(child_node, "qcom,dynamic-mem-dump")) {
+-			ret = dynamic_mem_dump_alloc(pdev, child_node, rmem, &used_size);
+-			if (ret)
+-				dev_err(&pdev->dev, "dynamic dump alloc failed\n");
+-		} else if (of_property_read_bool(child_node, "qcom,static-mem-dump")) {
+-			node_size = mem_dump_calc_dump_total_size(child_node);
+-			if (!node_size)
+-				continue;
+-			node_size = ALIGN(node_size, SZ_4K);
+-			dump_paddr = rmem->base + used_size;
+-			dump_vaddr = memremap(dump_paddr, node_size, MEMREMAP_WB);
+-			if (!dump_vaddr)
+-				return -ENOMEM;
+-			memset(dump_vaddr, 0x0, node_size);
+-			ret = mem_dump_alloc(pdev, child_node, dump_paddr, dump_vaddr);
+-			if (ret)
+-				dev_err(&pdev->dev, "static dump alloc failed\n");
+-			used_size += node_size;
+-		}
+-	}
+-
+-	free_size = rmem->size - used_size;
+-	if (free_size > 0)
+-		mem_dump_free_rmem(rmem->base + used_size, free_size);
+-
+-	ret = qtee_shmbridge_register(phys_addr, used_size, ns_vmids,
+-			ns_vm_perms, 1, PERM_READ|PERM_WRITE, &shm_bridge_handle);
+-	if (ret) {
+-		dev_err(&pdev->dev, "Failed to create shm bridge.ret=%d\n", ret);
+-		return ret;
+-	}
+-
+-	ret = qcom_scm_assign_dump_table_region(1, phys_addr, used_size);
+-	if (ret) {
+-		ret = init_memdump_imem_area(used_size);
+-		if (ret) {
+-			qtee_shmbridge_deregister(shm_bridge_handle);
+-			return ret;
+-		}
+-	}
+-
+-	md_entry.phys_addr = phys_addr;
+-	md_entry.virt_addr = (u64)memdump_vaddr;
++	/* Firmware retains this mapping and bridge for the rest of the boot. */
++	md_entry.phys_addr = rmem->base;
++	md_entry.virt_addr = (uintptr_t)buffer;
+ 	md_entry.size = used_size;
+ 	strscpy(md_entry.name, "MEMDUMP", sizeof(md_entry.name));
+ 	if (msm_minidump_add_region(&md_entry) < 0)
+-		dev_err(&pdev->dev, "Mini dump entry failed name = %s\n", md_entry.name);
+-
+-	return ret;
++		dev_err(dev, "Memory dump minidump registration failed\n");
++	if (rmem->size > used_size)
++		mem_dump_free_rmem(rmem->base + used_size, rmem->size - used_size);
++	return 0;
++}
++
++static void mem_dump_release_rmem(void *data)
++{
++	of_reserved_mem_device_release(data);
+ }
+ 
+ static int mem_dump_alloc_with_cma(struct platform_device *pdev,
+@@ -1516,7 +1516,7 @@
+ {
+ 	struct device_node *node = pdev->dev.of_node;
+ 	struct device *dev = &pdev->dev;
+-	struct md_region md_entry;
++	struct md_region md_entry = {};
+ 	size_t total_size;
+ 	dma_addr_t dma_handle;
+ 	phys_addr_t phys_addr, mini_phys_addr;
+@@ -1528,16 +1528,19 @@
+ 	int ret;
+ 
+ 	ret = of_reserved_mem_device_init_by_idx(dev, dev->of_node, 0);
+-	of_node_put(dev->of_node);
+ 	if (ret) {
+ 		dev_err(dev,
+ 			"Failed to initialize reserved mem, ret %d\n", ret);
+ 		return ret;
+ 	}
+ 
++	ret = devm_add_action_or_reset(dev, mem_dump_release_rmem, dev);
++	if (ret)
++		return ret;
++
+ 	total_size = ret = 0;
+-	total_size += mem_dump_calc_dump_total_size(node);
+-	if (!total_size)
++	total_size = mem_dump_calc_dump_total_size(node);
++	if (!total_size || total_size > SIZE_MAX - sizeof(struct msm_dump_table) * 2 - SZ_4K)
+ 		return -ENOMEM;
+ 	/* For dump table registration with IMEM */
+ 	total_size += sizeof(struct msm_dump_table) * 2;
+@@ -1548,8 +1551,13 @@
+ 	if (!dump_vaddr)
+ 		return -ENOMEM;
+ 
+-	dma_get_sgtable(&pdev->dev, &mem_dump_sgt, dump_vaddr,
+-						dma_handle, total_size);
++	ret = dma_get_sgtable(&pdev->dev, &mem_dump_sgt, dump_vaddr, dma_handle, total_size);
++	if (ret)
++		return ret;
++	if (mem_dump_sgt.orig_nents != 1) {
++		sg_free_table(&mem_dump_sgt);
++		return -EINVAL;
++	}
+ 	phys_addr = page_to_phys(sg_page(mem_dump_sgt.sgl));
+ 	sg_free_table(&mem_dump_sgt);
+ 
+@@ -1568,21 +1576,19 @@
+ 		return ret;
+ 	}
+ 
+-	ret = qcom_scm_assign_dump_table_region(1, phys_addr, total_size);
+-	if (ret) {
+-		ret = init_memdump_imem_area(total_size);
+-		if (ret) {
+-			qtee_shmbridge_deregister(shm_bridge_handle);
+-			return ret;
+-		}
+-	}
+-
+ 	mini_dump_vaddr = dump_vaddr;
+ 	mini_phys_addr = phys_addr;
+-	dump_vaddr += (sizeof(struct msm_dump_table) * 2);
+-	phys_addr += (sizeof(struct msm_dump_table) * 2);
+-
+-	mem_dump_alloc(pdev, node, phys_addr, dump_vaddr);
++	dump_vaddr += sizeof(struct msm_dump_table) * 2;
++	phys_addr += sizeof(struct msm_dump_table) * 2;
++	ret = mem_dump_alloc(pdev, node, phys_addr, dump_vaddr,
++			     total_size - sizeof(struct msm_dump_table) * 2);
++	if (ret)
++		goto deregister_bridge;
++	ret = qcom_scm_assign_dump_table_region(1, mini_phys_addr, total_size);
++	if (ret)
++		ret = init_memdump_imem_area(total_size);
++	if (ret)
++		goto deregister_bridge;
+ 
+ 	md_entry.phys_addr = mini_phys_addr;
+ 	md_entry.virt_addr = (u64)mini_dump_vaddr;
+@@ -1591,29 +1597,51 @@
+ 	if (msm_minidump_add_region(&md_entry) < 0)
+ 		dev_err(&pdev->dev, "Mini dump entry failed name = %s\n", md_entry.name);
+ 
++	return 0;
++
++deregister_bridge:
++	qtee_shmbridge_deregister(shm_bridge_handle);
+ 	return ret;
+ }
+ 
+ static int mem_dump_probe(struct platform_device *pdev)
+ {
++	struct device_node *rmem_node;
++	struct cpuss_dump_data *cpudata;
+ 	int ret;
+-	struct device_node *rmem_node;
+-
++
++	if (!qcom_scm_is_available() || !msm_minidump_enabled())
++		return -EPROBE_DEFER;
+ 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+-	if (ret < 0)
++	if (ret)
+ 		return ret;
+-
+ 	rmem_node = of_parse_phandle(pdev->dev.of_node, "memory-region", 0);
+-	if (!rmem_node) {
+-		dev_err(&pdev->dev, "no memory-region for dump\n");
+-		return -EINVAL;
+-	}
+-
++	if (!rmem_node)
++		return -EINVAL;
++
++	mutex_lock(&memdump_probe_lock);
++	if (memdump.table) {
++		ret = -EBUSY;
++		goto out;
++	}
+ 	if (of_property_read_bool(rmem_node, "reusable"))
+ 		ret = mem_dump_alloc_with_cma(pdev, rmem_node);
+ 	else
+ 		ret = mem_dump_alloc_with_rmem(pdev, rmem_node);
+-
++	if (ret) {
++		memdump.table = NULL;
++		memdump.table_phys = 0;
++		goto out;
++	}
++	/* No failure path may release these buffers after the firmware handoff. */
++	cpudata = platform_get_drvdata(pdev);
++	if (cpudata)
++		cpuss_create_nodes(&pdev->dev, cpudata->initialized);
++	/* Publish completed table contents to all registering clients. */
++	smp_store_release(&memdump_ready, true);
++out:
++	mutex_unlock(&memdump_probe_lock);
++	of_node_put(rmem_node);
+ 	return ret;
+ }
+ 
+@@ -1622,15 +1650,23 @@
+ 	{}
+ };
+ 
++MODULE_DEVICE_TABLE(of, mem_dump_match_table);
++
+ static struct platform_driver mem_dump_driver = {
+ 	.probe = mem_dump_probe,
+ 	.driver = {
+ 		.name = "msm_mem_dump",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = mem_dump_match_table,
+ 	},
+ };
+ 
+-module_platform_driver(mem_dump_driver);
++/* No firmware API revokes the table or all client descriptors. */
++static int __init mem_dump_init(void)
++{
++	return platform_driver_register(&mem_dump_driver);
++}
++module_init(mem_dump_init);
+ 
+ MODULE_DESCRIPTION("Memory Dump V2 Driver");
+ MODULE_LICENSE("GPL");
+--- a/drivers/power/reset/qcom-dload-mode.c
++++ b/drivers/power/reset/qcom-dload-mode.c
+@@ -155,7 +155,17 @@
+ 	.store	= attr_store,
+ };
+ 
++static void qcom_dload_release(struct kobject *kobj)
++{
++	struct qcom_dload *poweroff = to_qcom_dload(kobj);
++
++	if (poweroff->dload_dest_addr)
++		iounmap(poweroff->dload_dest_addr);
++	kfree(poweroff);
++}
++
+ static const struct kobj_type qcom_dload_kobj_type = {
++	.release	= qcom_dload_release,
+ 	.sysfs_ops	= &reset_sysfs_ops,
+ };
+ 
+@@ -305,6 +315,7 @@
+ 	}
+ 
+ 	addr = of_iomap(np, 0);
++	of_node_put(np);
+ 	if (!addr)
+ 		pr_err("Unable to map memory for DT property: %s\n", propname);
+ 	return addr;
+@@ -313,70 +324,77 @@
+ static int qcom_dload_probe(struct platform_device *pdev)
+ {
+ 	struct qcom_dload *poweroff;
+-	int ret, temp;
+-
+-	if (IS_ENABLED(CONFIG_QCOM_MINIDUMP) && !msm_minidump_enabled())
++	int ret;
++	unsigned int temp;
++
++	if (!qcom_scm_is_available() ||
++	    (IS_ENABLED(CONFIG_QCOM_MINIDUMP) && !msm_minidump_enabled()))
+ 		return -EPROBE_DEFER;
+ 
+-	poweroff = devm_kzalloc(&pdev->dev, sizeof(*poweroff), GFP_KERNEL);
++	poweroff = kzalloc(sizeof(*poweroff), GFP_KERNEL);
+ 	if (!poweroff)
+ 		return -ENOMEM;
+-
+-	ret = kobject_init_and_add(&poweroff->kobj, &qcom_dload_kobj_type,
+-				   kernel_kobj, "dload");
+-	if (ret) {
+-		pr_err("%s: Error in creation kobject_add\n", __func__);
+-		kobject_put(&poweroff->kobj);
+-		return ret;
+-	}
+-
+-	ret = sysfs_create_group(&poweroff->kobj, &qcom_dload_attr_group);
+-	if (ret) {
+-		pr_err("%s: Error in creation sysfs_create_group\n", __func__);
+-		kobject_del(&poweroff->kobj);
+-		return ret;
+-	}
+-
++	kobject_init(&poweroff->kobj, &qcom_dload_kobj_type);
+ 	poweroff->dload_dest_addr = map_prop_mem("qcom,msm-imem-dload-type");
++
++	poweroff->panic_nb.notifier_call = qcom_dload_panic;
++	poweroff->panic_nb.priority = INT_MAX;
++	ret = atomic_notifier_chain_register(&panic_notifier_list, &poweroff->panic_nb);
++	if (ret)
++		goto put_kobject;
++
++	poweroff->reboot_nb.notifier_call = qcom_dload_reboot;
++	poweroff->reboot_nb.priority = 255;
++	ret = register_reboot_notifier(&poweroff->reboot_nb);
++	if (ret)
++		goto unregister_panic;
++
++	poweroff->restart_nb.notifier_call = qcom_dload_restart;
++	poweroff->restart_nb.priority = 201;
++	ret = register_restart_handler(&poweroff->restart_nb);
++	if (ret)
++		goto unregister_reboot;
++
+ 	msm_enable_dump_mode(enable_dump);
+-	dump_mode = qcom_scm_get_download_mode(&temp) ? dump_mode : temp;
++	if (!qcom_scm_get_download_mode(&temp))
++		dump_mode = temp;
+ 	pr_info("%s: Current dump mode: 0x%x\n", __func__, dump_mode);
+-
+ 	if (!enable_dump)
+ 		qcom_scm_disable_sdi();
+ 
+-	poweroff->panic_nb.notifier_call = qcom_dload_panic;
+-	poweroff->panic_nb.priority = INT_MAX;
+-	atomic_notifier_chain_register(&panic_notifier_list,
+-				       &poweroff->panic_nb);
+-
+-	poweroff->reboot_nb.notifier_call = qcom_dload_reboot;
+-	poweroff->reboot_nb.priority = 255;
+-	register_reboot_notifier(&poweroff->reboot_nb);
+-
+-	poweroff->restart_nb.notifier_call = qcom_dload_restart;
+-	poweroff->restart_nb.priority = 201;
+-	register_restart_handler(&poweroff->restart_nb);
++	ret = kobject_add(&poweroff->kobj, kernel_kobj, "dload");
++	if (ret)
++		goto unregister_restart;
++	ret = sysfs_create_group(&poweroff->kobj, &qcom_dload_attr_group);
++	if (ret)
++		goto delete_kobject;
+ 
+ 	platform_set_drvdata(pdev, poweroff);
+-
+ 	return 0;
+-}
+-
+-static int qcom_dload_remove(struct platform_device *pdev)
++
++delete_kobject:
++	kobject_del(&poweroff->kobj);
++unregister_restart:
++	unregister_restart_handler(&poweroff->restart_nb);
++unregister_reboot:
++	unregister_reboot_notifier(&poweroff->reboot_nb);
++unregister_panic:
++	atomic_notifier_chain_unregister(&panic_notifier_list, &poweroff->panic_nb);
++put_kobject:
++	kobject_put(&poweroff->kobj);
++	return ret;
++}
++
++static void qcom_dload_remove(struct platform_device *pdev)
+ {
+ 	struct qcom_dload *poweroff = platform_get_drvdata(pdev);
+ 
+-	atomic_notifier_chain_unregister(&panic_notifier_list,
+-					 &poweroff->panic_nb);
+-
++	sysfs_remove_group(&poweroff->kobj, &qcom_dload_attr_group);
++	kobject_del(&poweroff->kobj);
++	atomic_notifier_chain_unregister(&panic_notifier_list, &poweroff->panic_nb);
+ 	unregister_restart_handler(&poweroff->restart_nb);
+ 	unregister_reboot_notifier(&poweroff->reboot_nb);
+-
+-	if (poweroff->dload_dest_addr)
+-		iounmap(poweroff->dload_dest_addr);
+-
+-	return 0;
++	kobject_put(&poweroff->kobj);
+ }
+ 
+ static const struct platform_device_id qcom_dload_id_match[] = {
