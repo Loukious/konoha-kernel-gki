@@ -1,0 +1,155 @@
+{
+  "status": "PASS",
+  "tests": {
+    "wsa": {
+      "setup_failure_sites": 8,
+      "child_count_cases": 5,
+      "non_swr_children": 1,
+      "notification_reentry": 1,
+      "notification_overflow": 1,
+      "withdrawal_reentry_races": 100
+    },
+    "wsa2": {
+      "setup_failure_sites": 8,
+      "child_count_cases": 5,
+      "non_swr_children": 1,
+      "notification_reentry": 1,
+      "notification_overflow": 1,
+      "withdrawal_reentry_races": 100
+    }
+  },
+  "negative_controls": [
+    {
+      "module": "wsa",
+      "name": "registered_child_put",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa",
+      "name": "missing_node_reference",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa",
+      "name": "failed_device_leaked",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa",
+      "name": "iterator_reference_leaked",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa",
+      "name": "child_rollback_removed",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa",
+      "name": "failed_storage_leaked",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa",
+      "name": "notification_error_lost",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa",
+      "name": "notification_count_overflow",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa",
+      "name": "target_withdrawal_missing",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa",
+      "name": "notifications_not_drained",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa2",
+      "name": "registered_child_put",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa2",
+      "name": "missing_node_reference",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa2",
+      "name": "failed_device_leaked",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa2",
+      "name": "iterator_reference_leaked",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa2",
+      "name": "child_rollback_removed",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa2",
+      "name": "failed_storage_leaked",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa2",
+      "name": "notification_error_lost",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa2",
+      "name": "notification_count_overflow",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa2",
+      "name": "target_withdrawal_missing",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "module": "wsa2",
+      "name": "notifications_not_drained",
+      "rejected": true,
+      "returncode": -6
+    }
+  ],
+  "source_sha256": {
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-wsa-macro.c": "70e63fe1092fe9ad5eb4e3c961b4e74f184a799d4b715061bda893911c187173",
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-wsa2-macro.c": "6465a348227c8c4588d7be5213f0b559e6c8ace4102962b7aa5e5d929ec94450"
+  },
+  "harness_sha256": {
+    "audio_wsa_children.c": "52750db47d014a131bbedf6021fe9403a5898377287f915e4a946f6e20e3c2d6",
+    "audio_wsa2_children.c": "52bf8f60f766174af376e163323cedb3d016b93aa422c83e90fd5c390afe8ff4"
+  },
+  "verifier_sha256": {
+    "verify_children.py": "4488ea48114af797bf7a38de5fee188956fad72e6a0d2a6dca792ba94d8b181d"
+  },
+  "limits": "The actual child setup, cleanup and notification functions execute with pthread synchronization and mocked OF/platform/SoundWire services. The suite covers known child filtering, allocation failures, reference rollback and reentrant notification/removal; it does not exercise complete probe, ALSA, PM, firmware or hardware."
+}

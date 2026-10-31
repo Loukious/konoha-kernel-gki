@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 277 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 288 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,9 +35,10 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 277 platform `.ko` files, their symbol tables and DDK configurations.
+- 288 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
-- Input manifests, source/blob pins, patches and staged-file hashes.
+- Input manifests, source/blob pins, patches, staged-file hashes and the new
+  validation records/host-test fixtures.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
 
@@ -71,8 +72,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 17,656
-imported symbol CRCs across all 277 modules.
+used. The current [validation report](validation-20261031.json) checks 18,369
+imported symbol CRCs across all 288 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1880,3 +1881,28 @@ CRC checks without compiler/modpost warnings. Device-tree and overlay checks pas
 with existing vendor warnings. ROM module-name coverage is 274/466 (58.8%).
 Codec/speaker and remaining data/peripheral drivers, KernelSU/NetHunter and
 boot/DLKM/ZIP packaging remain. No flashable ZIP or phone/audio validation exists.
+
+
+## Native headset, speaker macros and RMNET extensions
+
+WCD9xxx/MBHC add managed clock cleanup, ordered headset initialization and
+drained notifications/work while preserving native interfaces and calibration
+formats. WSA/WSA2 add both native speaker macros with bounded child setup and
+component/cooling cleanup. The seven RMNET extensions retain the native data
+paths and adapt timers, TCP lookup and queue accounting to 6.18. SHS OOM reclaim
+is confined to the current online CPU to avoid a CPU-hotplug deadlock with the
+stock GKI export set. The full compiler and KMI checks remain enabled.
+
+The [codec support](audio-codec-support-port.md),
+[speaker macro](audio-wsa-port.md) and [RMNET](rmnet-ext-port.md) records describe
+the changes, software checks and remaining consumer/hardware limits. Integrated
+host checks pass and reject 52 compiled deliberate regressions. The build now
+archives their reports and test fixtures alongside its other inputs.
+
+Archive `artifacts/20261031T232938953896Z` contains 288 modules and passes 18,369 imported-symbol
+CRC checks without compiler/modpost warnings. Device-tree/overlay checks pass
+with 1,084 existing vendor DTC warnings. ROM module-name coverage is 285/466
+(61.2%); 181 names remain to assess or port, including alternative hardware.
+The GKI Image and symbol table match the preceding 277-module checkpoint.
+Codec/amplifier/machine and peripheral work, KernelSU/NetHunter, boot/DLKM images
+and ZIP packaging remain. No flashable ZIP or phone validation exists yet.

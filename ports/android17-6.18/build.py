@@ -81,6 +81,9 @@ def main():
                  "build_devicetrees.py", "devicetrees.json"]:
         shutil.copyfile(HERE / name, inputs / name)
     shutil.copytree(HERE / "patches", inputs / "patches")
+    if (HERE / "validation").is_dir():
+        shutil.copytree(HERE / "validation", inputs / "validation",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     shutil.copyfile(workspace / "onyx/.staged-files.json", inputs / "staged-files.json")
     hashes = {}
     for path in sorted(artifacts.rglob("*")):

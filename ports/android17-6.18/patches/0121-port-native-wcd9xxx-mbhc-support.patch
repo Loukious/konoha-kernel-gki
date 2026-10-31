@@ -1,0 +1,1247 @@
+Subject: Port native WCD9xxx and MBHC support to 6.18
+
+Preserve native audio interfaces with explicit resource ownership.
+
+---
+
+--- a/qcom/opensource/audio-kernel/asoc/codecs/audio-ext-clk-up.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/audio-ext-clk-up.c
+@@ -15,10 +15,9 @@
+ #include <linux/platform_device.h>
+ #include <bindings/qcom,audio-ext-clk.h>
+ #include <linux/ratelimit.h>
++#include "audio-ext-clk-up.h"
+ #ifdef CONFIG_AUDIO_PRM
+ #include <dsp/audio_prm.h>
+-#else
+-#include "audio-ext-clk-up.h"
+ #endif
+ enum {
+ 	AUDIO_EXT_CLK_PMI,
+@@ -62,6 +61,9 @@
+ 	struct device *dev;
+ 	int clk_src;
+ 	uint32_t enable;
++	bool pins_active;
++	bool gate_enabled;
++	const struct clk_init_data *clk_init;
+ #ifdef CONFIG_AUDIO_PRM
+ 	struct clk_cfg prm_clk_cfg;
+ #endif
+@@ -76,91 +78,97 @@
+ 	return container_of(hw, struct audio_ext_clk_priv, audio_clk.fact.hw);
+ }
+ 
++static int audio_ext_clk_set_vote(struct audio_ext_clk_priv *clk_priv,
++				  bool enable)
++{
++#ifdef CONFIG_AUDIO_PRM
++	return audio_prm_set_lpass_clk_cfg(&clk_priv->prm_clk_cfg, enable);
++#else
++	return -EPERM;
++#endif
++}
++
+ static int audio_ext_clk_prepare(struct clk_hw *hw)
++{
++	struct audio_ext_clk_priv *clk_priv = to_audio_clk(hw);
++	struct pinctrl_info *pnctrl_info = &clk_priv->audio_clk.pnctrl_info;
++	bool acquired = false;
++	int ret;
++
++	if (clk_priv->clk_src >= AUDIO_EXT_CLK_LPASS &&
++	    clk_priv->clk_src < AUDIO_EXT_CLK_LPASS_MAX && !clk_priv->enable) {
++		ret = audio_ext_clk_set_vote(clk_priv, true);
++		if (ret < 0) {
++			pr_err_ratelimited("%s: clock request failed: %d\n",
++					   __func__, ret);
++			return ret;
++		}
++		clk_priv->enable = 1;
++		acquired = true;
++	}
++
++	if (pnctrl_info->pinctrl) {
++		ret = pinctrl_select_state(pnctrl_info->pinctrl,
++					   pnctrl_info->active);
++		if (ret) {
++			if (acquired) {
++				int rollback = audio_ext_clk_set_vote(clk_priv, false);
++
++				if (rollback >= 0)
++					clk_priv->enable = 0;
++				else
++					pr_err("%s: clock rollback failed: %d\n",
++					       __func__, rollback);
++			}
++			return ret;
++		}
++		clk_priv->pins_active = true;
++	}
++
++	if (pnctrl_info->base) {
++		iowrite32(1, pnctrl_info->base);
++		clk_priv->gate_enabled = true;
++	}
++	return 0;
++}
++
++static void audio_ext_clk_unprepare(struct clk_hw *hw)
+ {
+ 	struct audio_ext_clk_priv *clk_priv = to_audio_clk(hw);
+ 	struct pinctrl_info *pnctrl_info = &clk_priv->audio_clk.pnctrl_info;
+ 	int ret;
+-	static DEFINE_RATELIMIT_STATE(rtl, 1 * HZ, 1);
+-
+-	if ((clk_priv->clk_src >= AUDIO_EXT_CLK_LPASS) &&
+-		(clk_priv->clk_src < AUDIO_EXT_CLK_LPASS_MAX) && !clk_priv->enable)  {
+-#ifdef CONFIG_AUDIO_PRM
+-	    pr_debug("%s: clk_id %x ", __func__, clk_priv->prm_clk_cfg.clk_id);
+-		ret = audio_prm_set_lpass_clk_cfg(&clk_priv->prm_clk_cfg,1);
+-#else
+-		pr_debug("%s: audio prm not enabled", __func__);
+-		ret = -EPERM;
+-#endif
+-		if (ret < 0) {
+-			if (__ratelimit(&rtl))
+-				pr_err_ratelimited("%s prm set lpass clk failed\n",
+-				__func__);
+-			return ret;
+-		}
+-		clk_priv->enable = 1;
+-	}
+-
+-	if (pnctrl_info->pinctrl) {
+-		ret = pinctrl_select_state(pnctrl_info->pinctrl,
+-				pnctrl_info->active);
+-		if (ret) {
+-			pr_err("%s: active state select failed with %d\n",
+-				__func__, ret);
+-			return -EIO;
+-		}
+-	}
+-
+-	if (pnctrl_info->base)
+-		iowrite32(1, pnctrl_info->base);
+-	return 0;
+-}
+-
+-static void audio_ext_clk_unprepare(struct clk_hw *hw)
+-{
+-	struct audio_ext_clk_priv *clk_priv = to_audio_clk(hw);
+-	struct pinctrl_info *pnctrl_info = &clk_priv->audio_clk.pnctrl_info;
+-	int ret;
+-	static DEFINE_RATELIMIT_STATE(rtl, 1 * HZ, 1);
+-
+-	if (pnctrl_info->pinctrl) {
++
++	if (clk_priv->pins_active) {
+ 		ret = pinctrl_select_state(pnctrl_info->pinctrl,
+ 					   pnctrl_info->sleep);
+ 		if (ret) {
+-			pr_err("%s: active state select failed with %d\n",
+-				__func__, ret);
++			pr_err("%s: sleep state select failed: %d\n", __func__, ret);
+ 			return;
+ 		}
+-	}
+-
+-	if ((clk_priv->clk_src >= AUDIO_EXT_CLK_LPASS) &&
+-		(clk_priv->clk_src < AUDIO_EXT_CLK_LPASS_MAX))  {
+-		clk_priv->enable = 0;
+-#ifdef CONFIG_AUDIO_PRM
+-		pr_debug("%s: clk_id %x", __func__,
+-				clk_priv->prm_clk_cfg.clk_id);
+-		ret = audio_prm_set_lpass_clk_cfg(&clk_priv->prm_clk_cfg, 0);
+-#else
+-		pr_debug("%s: audio prm not enabled", __func__);
+-		ret = -EPERM;
+-#endif
+-		if (ret < 0) {
+-			if (__ratelimit(&rtl))
+-				pr_err_ratelimited("%s: unset lpass clk cfg failed, ret = %d\n",
+-				__func__, ret);
+-		}
+-	}
+-
+-	if (pnctrl_info->base)
++		clk_priv->pins_active = false;
++	}
++
++	if (clk_priv->enable) {
++		ret = audio_ext_clk_set_vote(clk_priv, false);
++		if (ret < 0)
++			pr_err_ratelimited("%s: clock release failed: %d\n",
++					   __func__, ret);
++		else
++			clk_priv->enable = 0;
++	}
++
++	if (clk_priv->gate_enabled) {
+ 		iowrite32(0, pnctrl_info->base);
++		clk_priv->gate_enabled = false;
++	}
+ }
+ 
+ static u8 audio_ext_clk_get_parent(struct clk_hw *hw)
+ {
+ 	struct audio_ext_clk_priv *clk_priv = to_audio_clk(hw);
+ 	int num_parents = clk_hw_get_num_parents(hw);
+-	const char * const *parent_names = hw->init->parent_names;
+-	u8 i = 0, ret = hw->init->num_parents + 1;
++	const char * const *parent_names = clk_priv->clk_init->parent_names;
++	u8 i = 0, ret = clk_priv->clk_init->num_parents + 1;
+ 
+ 	if ((clk_priv->clk_src == AUDIO_EXT_CLK_PMI) && clk_priv->clk_name) {
+ 		for (i = 0; i < num_parents; i++) {
+@@ -173,84 +181,51 @@
+ 		return 0;
+ }
+ 
++static int lpass_hw_set_vote(struct audio_ext_clk_priv *clk_priv, bool enable)
++{
++#ifdef CONFIG_AUDIO_PRM
++	int core;
++
++	if (clk_priv->clk_src == AUDIO_EXT_CLK_LPASS_CORE_HW_VOTE)
++		core = HW_CORE_ID_LPASS;
++	else if (clk_priv->clk_src == AUDIO_EXT_CLK_LPASS_AUDIO_HW_VOTE)
++		core = HW_CORE_ID_DCODEC;
++	else
++		return -EINVAL;
++	return audio_prm_set_lpass_hw_core_req(&clk_priv->prm_clk_cfg, core, enable);
++#else
++	return -EPERM;
++#endif
++}
++
+ static int lpass_hw_vote_prepare(struct clk_hw *hw)
+ {
+ 	struct audio_ext_clk_priv *clk_priv = to_audio_clk(hw);
+ 	int ret;
+-	static DEFINE_RATELIMIT_STATE(rtl, 1 * HZ, 1);
+-
+-	if (clk_priv->clk_src == AUDIO_EXT_CLK_LPASS_CORE_HW_VOTE)  {
+-#ifdef CONFIG_AUDIO_PRM
+-		pr_debug("%s: core vote clk_id %x \n", __func__, clk_priv->prm_clk_cfg.clk_id);
+-		ret = audio_prm_set_lpass_hw_core_req(&clk_priv->prm_clk_cfg,
+-			HW_CORE_ID_LPASS, 1);
+-#else
+-		pr_debug("%s: audio prm not enabled", __func__);
+-		ret = -EPERM;
+-#endif
+-		if (ret < 0) {
+-			if (__ratelimit(&rtl))
+-				pr_err("%s lpass core hw vote failed %d\n",
+-					__func__, ret);
+-			return ret;
+-		}
+-	}
+-
+-	if (clk_priv->clk_src == AUDIO_EXT_CLK_LPASS_AUDIO_HW_VOTE)  {
+-#ifdef CONFIG_AUDIO_PRM
+-		pr_debug("%s: audio vote clk_id %x \n", __func__, clk_priv->prm_clk_cfg.clk_id);
+-		ret = audio_prm_set_lpass_hw_core_req(&clk_priv->prm_clk_cfg,
+-			HW_CORE_ID_DCODEC, 1);
+-#else
+-		pr_debug("%s: audio prm not enabled", __func__);
+-		ret = -EPERM;
+-#endif
+-		if (ret < 0) {
+-			if (__ratelimit(&rtl))
+-				pr_err("%s lpass audio hw vote failed %d\n",
+-				__func__, ret);
+-			return ret;
+-		}
+-	}
+-
++
++	if (clk_priv->enable)
++		return 0;
++	ret = lpass_hw_set_vote(clk_priv, true);
++	if (ret < 0) {
++		pr_err_ratelimited("%s: core request failed: %d\n", __func__, ret);
++		return ret;
++	}
++	clk_priv->enable = 1;
+ 	return 0;
+ }
+ 
+ static void lpass_hw_vote_unprepare(struct clk_hw *hw)
+ {
+ 	struct audio_ext_clk_priv *clk_priv = to_audio_clk(hw);
+-	int ret = 0;
+-
+-	if (clk_priv->clk_src == AUDIO_EXT_CLK_LPASS_CORE_HW_VOTE) {
+-#ifdef CONFIG_AUDIO_PRM
+-		pr_debug("%s: core vote clk_id %x \n", __func__, clk_priv->prm_clk_cfg.clk_id);
+-		ret = audio_prm_set_lpass_hw_core_req(&clk_priv->prm_clk_cfg,
+-				HW_CORE_ID_LPASS, 0);
+-#else
+-		pr_debug("%s: audio prm not enabled", __func__);
+-		ret = -EPERM;
+-#endif
+-		if (ret < 0) {
+-			pr_err("%s lpass core hw vote failed %d\n",
+-				__func__, ret);
+-		}
+-	}
+-
+-	if (clk_priv->clk_src == AUDIO_EXT_CLK_LPASS_AUDIO_HW_VOTE) {
+-
+-#ifdef CONFIG_AUDIO_PRM
+-		pr_debug("%s: audio vote clk_id %x \n", __func__, clk_priv->prm_clk_cfg.clk_id);
+-		ret = audio_prm_set_lpass_hw_core_req(&clk_priv->prm_clk_cfg,
+-				HW_CORE_ID_DCODEC, 0);
+-#else
+-		pr_debug("%s: audio prm not enabled", __func__);
+-		ret = -EPERM;
+-#endif
+-		if (ret < 0) {
+-			pr_err("%s lpass audio hw unvote failed %d\n",
+-				__func__, ret);
+-		}
+-	}
++	int ret;
++
++	if (!clk_priv->enable)
++		return;
++	ret = lpass_hw_set_vote(clk_priv, false);
++	if (ret < 0)
++		pr_err("%s: core release failed: %d\n", __func__, ret);
++	else
++		clk_priv->enable = 0;
+ }
+ 
+ static const struct clk_ops audio_ext_clk_ops = {
+@@ -524,118 +499,66 @@
+ 
+ static int audio_get_pinctrl(struct platform_device *pdev)
+ {
+-	struct device *dev =  &pdev->dev;
++	struct device *dev = &pdev->dev;
+ 	struct audio_ext_clk_priv *clk_priv = platform_get_drvdata(pdev);
+-	struct pinctrl_info *pnctrl_info;
+-	struct pinctrl *pinctrl;
++	struct pinctrl_info *pnctrl_info = &clk_priv->audio_clk.pnctrl_info;
+ 	int ret;
+ 	u32 reg;
+ 
+-	pnctrl_info = &clk_priv->audio_clk.pnctrl_info;
+-	if (pnctrl_info->pinctrl) {
+-		dev_err(dev, "%s: already requested before\n",
+-			__func__);
+-		return -EINVAL;
+-	}
+-
+-	pinctrl = devm_pinctrl_get(dev);
+-	if (IS_ERR_OR_NULL(pinctrl)) {
+-		dev_err(dev, "%s: Unable to get pinctrl handle\n",
+-			__func__);
+-		return -EINVAL;
+-	}
+-	pnctrl_info->pinctrl = pinctrl;
+-	/* get all state handles from Device Tree */
+-	pnctrl_info->sleep = pinctrl_lookup_state(pinctrl, "sleep");
+-	if (IS_ERR(pnctrl_info->sleep)) {
+-		dev_err(dev, "%s: could not get sleep pinstate\n",
+-			__func__);
+-		goto err;
+-	}
+-	pnctrl_info->active = pinctrl_lookup_state(pinctrl, "active");
+-	if (IS_ERR(pnctrl_info->active)) {
+-		dev_err(dev, "%s: could not get active pinstate\n",
+-			__func__);
+-		goto err;
+-	}
+-	/* Reset the TLMM pins to a default state */
+-	ret = pinctrl_select_state(pnctrl_info->pinctrl,
+-				   pnctrl_info->sleep);
+-	if (ret) {
+-		dev_err(dev, "%s: Disable TLMM pins failed with %d\n",
+-			__func__, ret);
+-		goto err;
+-	}
++	pnctrl_info->pinctrl = devm_pinctrl_get(dev);
++	if (IS_ERR(pnctrl_info->pinctrl))
++		return PTR_ERR(pnctrl_info->pinctrl);
++	pnctrl_info->sleep = pinctrl_lookup_state(pnctrl_info->pinctrl, "sleep");
++	if (IS_ERR(pnctrl_info->sleep))
++		return PTR_ERR(pnctrl_info->sleep);
++	pnctrl_info->active = pinctrl_lookup_state(pnctrl_info->pinctrl, "active");
++	if (IS_ERR(pnctrl_info->active))
++		return PTR_ERR(pnctrl_info->active);
++	ret = pinctrl_select_state(pnctrl_info->pinctrl, pnctrl_info->sleep);
++	if (ret)
++		return ret;
+ 
+ 	ret = of_property_read_u32(dev->of_node, "qcom,mclk-clk-reg", &reg);
+-	if (ret < 0) {
+-		dev_dbg(dev, "%s: miss mclk reg\n", __func__);
+-	} else {
+-		pnctrl_info->base = ioremap(reg, sizeof(u32));
+-		if (pnctrl_info->base ==  NULL) {
+-			dev_err(dev, "%s ioremap failed\n", __func__);
+-			goto err;
+-		}
+-	}
+-
++	if (!ret) {
++		pnctrl_info->base = devm_ioremap(dev, reg, sizeof(u32));
++		if (!pnctrl_info->base)
++			return -ENOMEM;
++	}
+ 	return 0;
+-
+-err:
+-	devm_pinctrl_put(pnctrl_info->pinctrl);
+-	return -EINVAL;
+-}
+-
+-static int audio_put_pinctrl(struct platform_device *pdev)
++}
++
++static void audio_ref_clk_cleanup(void *data)
++{
++	struct audio_ext_clk_priv *clk_priv = data;
++	struct clk_hw *hw = &clk_priv->audio_clk.fact.hw;
++
++	/* Devres unregisters the provider and clock before releasing votes/pins. */
++	if (clk_priv->clk_src == AUDIO_EXT_CLK_LPASS_CORE_HW_VOTE ||
++	    clk_priv->clk_src == AUDIO_EXT_CLK_LPASS_AUDIO_HW_VOTE)
++		lpass_hw_vote_unprepare(hw);
++	else
++		audio_ext_clk_unprepare(hw);
++	if (clk_priv->enable || clk_priv->pins_active || clk_priv->gate_enabled)
++		dev_err(clk_priv->dev, "external clock cleanup requires hardware recovery\n");
++}
++
++static int audio_get_clk_data(struct platform_device *pdev)
+ {
+ 	struct audio_ext_clk_priv *clk_priv = platform_get_drvdata(pdev);
+-	struct pinctrl_info *pnctrl_info = NULL;
+-
+-	pnctrl_info = &clk_priv->audio_clk.pnctrl_info;
+-	if (pnctrl_info && pnctrl_info->pinctrl) {
+-		devm_pinctrl_put(pnctrl_info->pinctrl);
+-		pnctrl_info->pinctrl = NULL;
+-	}
+-
+-	return 0;
+-}
+-
+-static int audio_get_clk_data(struct platform_device *pdev)
+-{
++	struct clk_hw *hw = &clk_priv->audio_clk.fact.hw;
++	struct clk_hw_onecell_data *clk_data;
+ 	int ret;
+-	struct clk *audio_clk;
+-	struct clk_hw *clkhw;
+-	struct clk_onecell_data *clk_data;
+-	struct audio_ext_clk_priv *clk_priv = platform_get_drvdata(pdev);
+-
+-	clk_data = devm_kzalloc(&pdev->dev, sizeof(*clk_data), GFP_KERNEL);
++
++	clk_data = devm_kzalloc(&pdev->dev, struct_size(clk_data, hws, 1), GFP_KERNEL);
+ 	if (!clk_data)
+ 		return -ENOMEM;
+-
+-	clk_data->clk_num = 1;
+-	clk_data->clks = devm_kzalloc(&pdev->dev,
+-				sizeof(struct clk *),
+-				GFP_KERNEL);
+-	if (!clk_data->clks)
+-		return -ENOMEM;
+-
+-	clkhw = &clk_priv->audio_clk.fact.hw;
+-	audio_clk = devm_clk_register(&pdev->dev, clkhw);
+-	if (IS_ERR(audio_clk)) {
+-		dev_err(&pdev->dev,
+-			"%s: clock register failed for clk_src = %d\\n",
+-			__func__, clk_priv->clk_src);
+-		ret = PTR_ERR(audio_clk);
++	clk_data->num = 1;
++	clk_data->hws[0] = hw;
++
++	ret = devm_clk_hw_register(&pdev->dev, hw);
++	if (ret)
+ 		return ret;
+-	}
+-	clk_data->clks[0] = audio_clk;
+-
+-	ret = of_clk_add_provider(pdev->dev.of_node,
+-			 of_clk_src_onecell_get, clk_data);
+-	if (ret)
+-		dev_err(&pdev->dev, "%s: clock add failed for clk_src = %d\n",
+-			__func__, clk_priv->clk_src);
+-
+-	return ret;
++	return devm_of_clk_add_hw_provider(&pdev->dev, of_clk_hw_onecell_get, clk_data);
+ }
+ 
+ static int audio_ref_clk_probe(struct platform_device *pdev)
+@@ -662,10 +585,13 @@
+ 				__func__, clk_src);
+ 		return -EINVAL;
+ 	}
++	clk_priv->dev = &pdev->dev;
+ 	clk_priv->clk_name = NULL;
+ 	clk_priv->clk_src = clk_src;
+ 	memcpy(&clk_priv->audio_clk, &audio_clk_array[clk_src],
+ 		   sizeof(struct audio_ext_clk));
++	/* The clock core clears hw.init after registration. */
++	clk_priv->clk_init = clk_priv->audio_clk.fact.hw.init;
+ 
+ #ifdef CONFIG_AUDIO_PRM
+ 	/* Init prm clk cfg default values */
+@@ -725,20 +651,16 @@
+ 		}
+ 	}
+ 
++	ret = devm_add_action_or_reset(&pdev->dev, audio_ref_clk_cleanup, clk_priv);
++	if (ret)
++		return ret;
++
+ 	ret = audio_get_clk_data(pdev);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "%s: clk_init is failed\n",
+ 			__func__);
+-		audio_put_pinctrl(pdev);
+ 		return ret;
+ 	}
+-	return 0;
+-}
+-
+-static int audio_ref_clk_remove(struct platform_device *pdev)
+-{
+-	audio_put_pinctrl(pdev);
+-
+ 	return 0;
+ }
+ 
+@@ -756,7 +678,6 @@
+ 		.suppress_bind_attrs = true,
+ 	},
+ 	.probe = audio_ref_clk_probe,
+-	.remove = audio_ref_clk_remove,
+ };
+ 
+ int audio_ref_clk_platform_init(void)
+--- a/qcom/opensource/audio-kernel/asoc/codecs/wcd-mbhc-adc.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/wcd-mbhc-adc.c
+@@ -573,9 +573,13 @@
+ {
+ 	pr_debug("%s: scheduling correct_swch_plug\n", __func__);
+ 	WCD_MBHC_RSC_ASSERT_LOCKED(mbhc);
++	if (!mbhc->mbhc_started)
++		return;
+ 	mbhc->hs_detect_work_stop = false;
+-	mbhc->mbhc_cb->lock_sleep(mbhc, true);
+-	schedule_work(work);
++	if (!mbhc->mbhc_cb->lock_sleep(mbhc, true))
++		return;
++	if (!schedule_work(work))
++		mbhc->mbhc_cb->lock_sleep(mbhc, false);
+ }
+ 
+ /* called under codec_resource_lock acquisition */
+@@ -600,6 +604,8 @@
+ 
+ 	pr_debug("%s: enter\n", __func__);
+ 	WCD_MBHC_RSC_ASSERT_LOCKED(mbhc);
++	if (!mbhc->mbhc_started)
++		return;
+ 
+ 	if (mbhc->mbhc_cb->hph_pull_down_ctrl)
+ 		mbhc->mbhc_cb->hph_pull_down_ctrl(component, false);
+@@ -1028,6 +1034,8 @@
+ 
+ 	pr_debug("%s: enter\n", __func__);
+ 	WCD_MBHC_RSC_LOCK(mbhc);
++	if (!mbhc->mbhc_started)
++		goto exit;
+ 
+ 	timeout = jiffies +
+ 		  msecs_to_jiffies(WCD_FAKE_REMOVAL_MIN_PERIOD_MS);
+@@ -1149,6 +1157,8 @@
+ 	u8 clamp_retry = WCD_MBHC_FAKE_INS_RETRY;
+ 
+ 	pr_debug("%s: enter\n", __func__);
++	if (!wcd_mbhc_is_started(mbhc))
++		return IRQ_HANDLED;
+ 
+ 	/*
+ 	 * ADC COMPLETE and ELEC_REM interrupts are both enabled for HEADPHONE,
+@@ -1175,6 +1185,10 @@
+ 	} while (--clamp_retry);
+ 
+ 	WCD_MBHC_RSC_LOCK(mbhc);
++	if (!mbhc->mbhc_started) {
++		WCD_MBHC_RSC_UNLOCK(mbhc);
++		return IRQ_HANDLED;
++	}
+ 
+ 	if (!(test_bit(WCD_MBHC_ELEC_HS_INS, &mbhc->intr_status))) {
+ 		WCD_MBHC_RSC_UNLOCK(mbhc);
+--- a/qcom/opensource/audio-kernel/asoc/codecs/wcd-mbhc-v2.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/wcd-mbhc-v2.c
+@@ -27,7 +27,7 @@
+ #endif
+ #include <linux/usb/typec.h>
+ #include <sound/soc.h>
+-#include "lpass-cdc/lpass-cdc.h"
++#include "lpass-cdc.h"
+ #include <sound/jack.h>
+ #include <asoc/msm-cdc-pinctrl.h>
+ #include <asoc/wcdcal-hwdep.h>
+@@ -367,6 +367,9 @@
+ 	bool micbias1 = false;
+ 	u8 fsm_en = 0;
+ 
++	if (!wcd_mbhc_is_started(mbhc))
++		return NOTIFY_DONE;
++
+ 	pr_debug("%s: event %s (%d)\n", __func__,
+ 		 wcd_mbhc_get_event_string(event), event);
+ 	if (mbhc->mbhc_cb->micbias_enable_status) {
+@@ -717,6 +720,8 @@
+ 	int extdev_type = 0;
+ 
+ 	WCD_MBHC_RSC_ASSERT_LOCKED(mbhc);
++	if (!mbhc->mbhc_started)
++		return;
+ 
+ 	pr_debug("%s: enter insertion %d hph_status %x\n",
+ 		 __func__, insertion, mbhc->hph_status);
+@@ -955,6 +960,8 @@
+ 						&mbhc->correct_plug_swch);
+ 	else
+ 		pr_info("%s: hs_detect_plug work not cancelled\n", __func__);
++	if (!mbhc->mbhc_started)
++		return;
+ 
+ 	pr_debug("%s: Report extension cable\n", __func__);
+ 	wcd_mbhc_report_plug(mbhc, 1, SND_JACK_LINEOUT);
+@@ -991,7 +998,8 @@
+ 	enum snd_jack_types jack_type;
+ 	int ret = 0;
+ 
+-	if (mbhc->deinit_in_progress) {
++	if (!wcd_mbhc_is_started(mbhc) ||
++	    READ_ONCE(mbhc->deinit_in_progress)) {
+ 		pr_info("%s: mbhc deinit in progess: ignore report\n", __func__);
+ 		return;
+ 	}
+@@ -1152,6 +1160,8 @@
+ 
+ 	dev_dbg(component->dev, "%s: enter\n", __func__);
+ 	WCD_MBHC_RSC_LOCK(mbhc);
++	if (!mbhc->mbhc_started)
++		goto done;
+ 	mbhc->in_swch_irq_handler = true;
+ 
+ 	/* cancel pending button press */
+@@ -1171,6 +1181,9 @@
+ 						&mbhc->correct_plug_swch);
+ 	else
+ 		pr_info("%s: hs_detect_plug work not cancelled\n", __func__);
++	/* The cancellation callback drops codec_resource_lock while waiting. */
++	if (!mbhc->mbhc_started)
++		goto done;
+ 
+ 	/* Enable micbias ramp */
+ 	if (mbhc->mbhc_cb->mbhc_micb_ramp_control)
+@@ -1340,6 +1353,8 @@
+ 		pr_err("%s: NULL irq data\n", __func__);
+ 		return IRQ_NONE;
+ 	}
++	if (!wcd_mbhc_is_started(mbhc))
++		return IRQ_HANDLED;
+ 	/* WCD USB AATC did not required mech plug detection, will receive
+ 	 * insertion/removal events from UCSI layer
+ 	 */
+@@ -1404,6 +1419,8 @@
+ 
+ 	dwork = to_delayed_work(work);
+ 	mbhc = container_of(dwork, struct wcd_mbhc, mbhc_btn_dwork);
++	if (!wcd_mbhc_is_started(mbhc))
++		goto done;
+ 
+ 	WCD_MBHC_REG_READ(WCD_MBHC_BTN_RESULT, btn_result);
+ 	if (mbhc->current_plug == MBHC_PLUG_TYPE_HEADSET) {
+@@ -1413,6 +1430,7 @@
+ 				mbhc->buttons_pressed, mbhc->buttons_pressed);
+ 	}
+ 	pr_debug("%s: leave\n", __func__);
++done:
+ 	mbhc->mbhc_cb->lock_sleep(mbhc, false);
+ }
+ 
+@@ -1449,6 +1467,8 @@
+ 	pr_debug("%s: enter\n", __func__);
+ 	complete(&mbhc->btn_press_compl);
+ 	WCD_MBHC_RSC_LOCK(mbhc);
++	if (!mbhc->mbhc_started)
++		goto done;
+ 	wcd_cancel_btn_work(mbhc);
+ 	if (wcd_swch_level_remove(mbhc)) {
+ 		pr_debug("%s: Switch level is low [TF-HEADSET]", __func__);
+@@ -1502,6 +1522,8 @@
+ 
+ 	pr_debug("%s: enter\n", __func__);
+ 	WCD_MBHC_RSC_LOCK(mbhc);
++	if (!mbhc->mbhc_started)
++		goto exit;
+ 	if (wcd_swch_level_remove(mbhc)) {
+ 		pr_debug("%s: Switch level is low [TF-HEADSET]", __func__);
+ 		goto exit;
+@@ -1565,6 +1587,9 @@
+ 	struct wcd_mbhc *mbhc = data;
+ 	int val;
+ 
++	if (!mbhc || !wcd_mbhc_is_started(mbhc))
++		return IRQ_HANDLED;
++
+ 	pr_debug("%s: received HPHL OCP irq\n", __func__);
+ 	if (mbhc) {
+ 		if (mbhc->mbhc_cb->hph_register_recovery) {
+@@ -1605,6 +1630,9 @@
+ {
+ 	struct wcd_mbhc *mbhc = data;
+ 
++	if (!mbhc || !wcd_mbhc_is_started(mbhc))
++		return IRQ_HANDLED;
++
+ 	pr_debug("%s: received HPHR OCP irq\n", __func__);
+ 
+ 	if (!mbhc) {
+@@ -1649,13 +1677,10 @@
+ 
+ 	pr_debug("%s: enter\n", __func__);
+ 	WCD_MBHC_RSC_LOCK(mbhc);
+-
+-	mbhc_debugfs_dir = debugfs_create_dir(DEBUGFS_DIR_NAME, NULL);
+-	if (!IS_ERR(mbhc_debugfs_dir)) {
+-		debugfs_create_file(DEBUGFS_HEADSET_STATUS_FILE_NAME, 0666,
+-				mbhc_debugfs_dir, NULL, &mbhc_headset_status_fops);
+-	}
+-
++	if (!mbhc->mbhc_started) {
++		WCD_MBHC_RSC_UNLOCK(mbhc);
++		return -ESHUTDOWN;
++	}
+ 
+ 	/* enable HS detection */
+ 	if (mbhc->mbhc_cb->hph_pull_up_control_v2)
+@@ -1750,7 +1775,7 @@
+ 	struct delayed_work *dwork;
+ 	struct wcd_mbhc *mbhc;
+ 	struct snd_soc_component *component;
+-	const struct firmware *fw;
++	const struct firmware *fw = NULL;
+ 	struct firmware_cal *fw_data = NULL;
+ 	int ret = -1, retry = 0;
+ 	bool use_default_cal = false;
+@@ -1760,6 +1785,8 @@
+ 	component = mbhc->component;
+ 
+ 	while (retry < FW_READ_ATTEMPTS) {
++		if (!wcd_mbhc_is_started(mbhc))
++			return;
+ 		retry++;
+ 		pr_debug("%s:Attempt %d to request MBHC firmware\n",
+ 			__func__, retry);
+@@ -1782,6 +1809,11 @@
+ 					__func__);
+ 			break;
+ 		}
++	}
++	if (!wcd_mbhc_is_started(mbhc)) {
++		if (!fw_data && !ret)
++			release_firmware(fw);
++		return;
+ 	}
+ 	if (!fw_data)
+ 		pr_debug("%s: using request_firmware\n", __func__);
+@@ -1921,8 +1953,8 @@
+ 	bool *cable_status = (bool*) ptr;
+ #endif
+ 
+-	if (!mbhc)
+-		return -EINVAL;
++	if (!wcd_mbhc_is_started(mbhc))
++		return NOTIFY_DONE;
+ 
+ 
+ 	if (mode == TYPEC_ACCESSORY_AUDIO) {
+@@ -2003,6 +2035,27 @@
+ }
+ #endif
+ 
++static void wcd_mbhc_unregister_notifiers(struct wcd_mbhc *mbhc)
++{
++	if (mbhc->notifier_registered) {
++		mbhc->mbhc_cb->register_notifier(mbhc, &mbhc->nblock, false);
++		mbhc->notifier_registered = false;
++	}
++	if (!mbhc->usbc_notifier_registered)
++		return;
++#if IS_ENABLED(CONFIG_QCOM_WCD_USBSS_I2C)
++	if (mbhc->wcd_usbss_aatc_dev_np)
++		wcd_usbss_unreg_notifier(&mbhc->aatc_dev_nb,
++					 mbhc->wcd_usbss_aatc_dev_np);
++#endif
++#if IS_ENABLED(CONFIG_QCOM_FSA4480_I2C)
++	if (mbhc->fsa_aatc_dev_np)
++		fsa4480_unreg_notifier(&mbhc->aatc_dev_nb,
++				       mbhc->fsa_aatc_dev_np);
++#endif
++	mbhc->usbc_notifier_registered = false;
++}
++
+ int wcd_mbhc_start(struct wcd_mbhc *mbhc, struct wcd_mbhc_config *mbhc_cfg)
+ {
+ 	int rc = 0;
+@@ -2010,14 +2063,19 @@
+ 	struct snd_soc_card *card;
+ 	const char *usb_c_dt = "qcom,msm-mbhc-usbc-audio-supported";
+ 
+-	if (!mbhc || !mbhc_cfg)
++	if (!mbhc || !mbhc_cfg || !mbhc->mbhc_initialized)
+ 		return -EINVAL;
++	if (READ_ONCE(mbhc->deinit_in_progress))
++		return -ESHUTDOWN;
++	if (wcd_mbhc_is_started(mbhc))
++		return mbhc->mbhc_cfg == mbhc_cfg ? 0 : -EBUSY;
+ 
+ 	component = mbhc->component;
+ 	card = component->card;
+ 
+ 	/* update the mbhc config */
+ 	mbhc->mbhc_cfg = mbhc_cfg;
++	mbhc->default_calibration = mbhc_cfg->calibration;
+ 
+ 	dev_dbg(mbhc->component->dev, "%s: enter\n", __func__);
+ 
+@@ -2037,6 +2095,11 @@
+ 
+ 	/* Parse wcd_usbss/fsa switch handle */
+ 	if (mbhc_cfg->enable_usbc_analog) {
++		/* One notifier block cannot be linked into two provider chains. */
++		if (mbhc->wcd_usbss_aatc_dev_np && mbhc->fsa_aatc_dev_np) {
++			rc = -EINVAL;
++			goto err;
++		}
+ #ifdef CONFIG_AUDIO_UART_DEBUG
+ 		if (of_find_property(card->dev->of_node,
+ 					"qcom,uart-audio-sw-gpio",
+@@ -2045,6 +2108,7 @@
+ 					"qcom,uart-audio-sw-gpio",
+ 					&mbhc_cfg->uart_audio_switch_gpio,
+ 					&mbhc_cfg->uart_audio_switch_gpio_p);
++			mbhc->uart_audio_node = mbhc_cfg->uart_audio_switch_gpio_p;
+ 			if (rc)
+ 				goto err;
+ 		}
+@@ -2072,6 +2136,16 @@
+ 	if ((!mbhc->is_btn_already_regd) && wcd_mbhc_set_keycode(mbhc))
+ 		pr_err("Set btn key code error!!!\n");
+ 
++	if (!mbhc->notifier_registered && mbhc->mbhc_cb->register_notifier) {
++		rc = mbhc->mbhc_cb->register_notifier(mbhc, &mbhc->nblock, true);
++		if (rc)
++			goto err;
++		mbhc->notifier_registered = true;
++	}
++	WCD_MBHC_RSC_LOCK(mbhc);
++	wcd_mbhc_set_started(mbhc, true);
++	WCD_MBHC_RSC_UNLOCK(mbhc);
++
+ 	if (!mbhc->mbhc_cfg->read_fw_bin ||
+ 	    (mbhc->mbhc_cfg->read_fw_bin && mbhc->mbhc_fw) ||
+ 	    (mbhc->mbhc_cfg->read_fw_bin && mbhc->mbhc_cal)) {
+@@ -2093,6 +2167,9 @@
+ 	if (mbhc_cfg->enable_usbc_analog) {
+ 		mbhc->aatc_dev_nb.notifier_call = wcd_mbhc_usbc_ana_event_handler;
+ 		mbhc->aatc_dev_nb.priority = 0;
++		rc = -EOPNOTSUPP;
++		/* USBSS can report an error after linking the notifier. */
++		mbhc->usbc_notifier_registered = true;
+ #if IS_ENABLED(CONFIG_QCOM_WCD_USBSS_I2C)
+ 		if (mbhc->wcd_usbss_aatc_dev_np)
+ 			rc = wcd_usbss_reg_notifier(&mbhc->aatc_dev_nb,
+@@ -2102,10 +2179,13 @@
+ 		if (mbhc->fsa_aatc_dev_np)
+ 			rc = fsa4480_reg_notifier(&mbhc->aatc_dev_nb, mbhc->fsa_aatc_dev_np);
+ #endif
++		if (rc)
++			goto err;
+ 	}
+ 
+ 	return rc;
+ err:
++	wcd_mbhc_stop(mbhc);
+ 	dev_dbg(mbhc->component->dev, "%s: leave %d\n", __func__, rc);
+ 	return rc;
+ }
+@@ -2113,15 +2193,34 @@
+ 
+ void wcd_mbhc_stop(struct wcd_mbhc *mbhc)
+ {
++	const struct firmware *fw;
++	bool was_started;
++
+ 	pr_debug("%s: enter\n", __func__);
+-
+-	if (mbhc->current_plug != MBHC_PLUG_TYPE_NONE) {
+-		if (mbhc->mbhc_cb && mbhc->mbhc_cb->skip_imped_detect)
+-			mbhc->mbhc_cb->skip_imped_detect(mbhc->component);
+-	}
++	if (!mbhc || !mbhc->mbhc_initialized)
++		return;
++
++	/* Preserve the native unlocked notification before waiting for work. */
++	if (READ_ONCE(mbhc->current_plug) != MBHC_PLUG_TYPE_NONE &&
++	    mbhc->mbhc_cb->skip_imped_detect)
++		mbhc->mbhc_cb->skip_imped_detect(mbhc->component);
++
++	/* Close the enqueue gate before draining either notifier chain. */
++	WCD_MBHC_RSC_LOCK(mbhc);
++	was_started = mbhc->mbhc_started;
++	wcd_mbhc_set_started(mbhc, false);
++	WCD_MBHC_RSC_UNLOCK(mbhc);
++	wcd_mbhc_unregister_notifiers(mbhc);
++	/* Pending firmware has no mbhc_fw pointer until its read completes. */
++	cancel_delayed_work_sync(&mbhc->mbhc_firmware_dwork);
++	WCD_MBHC_RSC_LOCK(mbhc);
++	mbhc->mbhc_fn->wcd_cancel_hs_detect_plug(mbhc,
++					      &mbhc->correct_plug_swch);
++	wcd_cancel_btn_work(mbhc);
++
+ 	mbhc->current_plug = MBHC_PLUG_TYPE_NONE;
+ 	mbhc->hph_status = 0;
+-	if (mbhc->mbhc_cb && mbhc->mbhc_cb->irq_control) {
++	if (was_started) {
+ 		mbhc->mbhc_cb->irq_control(mbhc->component,
+ 				mbhc->intr_ids->hph_left_ocp,
+ 				false);
+@@ -2129,22 +2228,20 @@
+ 				mbhc->intr_ids->hph_right_ocp,
+ 				false);
+ 	}
+-	if (mbhc->mbhc_fw || mbhc->mbhc_cal) {
+-		cancel_delayed_work_sync(&mbhc->mbhc_firmware_dwork);
+-		if (!mbhc->mbhc_cal)
+-			release_firmware(mbhc->mbhc_fw);
+-		mbhc->mbhc_fw = NULL;
+-		mbhc->mbhc_cal = NULL;
+-	}
+-
+-#if IS_ENABLED(CONFIG_QCOM_WCD_USBSS_I2C)
+-	if (mbhc->mbhc_cfg->enable_usbc_analog  && mbhc->wcd_usbss_aatc_dev_np)
+-		wcd_usbss_unreg_notifier(&mbhc->aatc_dev_nb, mbhc->wcd_usbss_aatc_dev_np);
++	fw = mbhc->mbhc_fw;
++	if (mbhc->mbhc_cfg) {
++		mbhc->mbhc_cfg->calibration = mbhc->default_calibration;
++#ifdef CONFIG_AUDIO_UART_DEBUG
++		if (mbhc->mbhc_cfg->uart_audio_switch_gpio_p == mbhc->uart_audio_node)
++			mbhc->mbhc_cfg->uart_audio_switch_gpio_p = NULL;
+ #endif
+-#if IS_ENABLED(CONFIG_QCOM_FSA4480_I2C)
+-	if (mbhc->mbhc_cfg->enable_usbc_analog && mbhc->fsa_aatc_dev_np)
+-		fsa4480_unreg_notifier(&mbhc->aatc_dev_nb, mbhc->fsa_aatc_dev_np);
+-#endif
++	}
++	of_node_put(mbhc->uart_audio_node);
++	mbhc->uart_audio_node = NULL;
++	mbhc->mbhc_fw = NULL;
++	mbhc->mbhc_cal = NULL;
++	WCD_MBHC_RSC_UNLOCK(mbhc);
++	release_firmware(fw);
+ 
+ 	pr_debug("%s: leave\n", __func__);
+ }
+@@ -2165,13 +2262,28 @@
+ 	int hph_swh = 0;
+ 	int gnd_swh = 0;
+ 	u32 hph_moist_config[3];
+-	struct snd_soc_card *card = component->card;
++	struct snd_soc_card *card;
++	struct extcon_dev *extdev;
+ 	const char *hph_switch = "qcom,msm-mbhc-hphl-swh";
+ 	const char *gnd_switch = "qcom,msm-mbhc-gnd-swh";
+ 	const char *hs_thre = "qcom,msm-mbhc-hs-mic-max-threshold-mv";
+ 	const char *hph_thre = "qcom,msm-mbhc-hs-mic-min-threshold-mv";
+ 
+ 	pr_debug("%s: enter\n", __func__);
++	if (!mbhc || !component || !component->card || !mbhc_cdc_intr_ids ||
++	    !wcd_mbhc_regs || !mbhc_cb || !mbhc_cb->request_irq ||
++	    !mbhc_cb->irq_control || !mbhc_cb->free_irq ||
++	    !mbhc_cb->map_btn_code_to_num || !mbhc_cb->lock_sleep ||
++	    !mbhc_cb->mbhc_bias || !mbhc_cb->set_btn_thr)
++		return -EINVAL;
++	if (mbhc->mbhc_initialized)
++		return -EBUSY;
++	card = component->card;
++	wcd_mbhc_set_started(mbhc, false);
++	WRITE_ONCE(mbhc->deinit_in_progress, true);
++	mbhc->mbhc_cfg = NULL;
++	mbhc->notifier_registered = false;
++	mbhc->usbc_notifier_registered = false;
+ 
+ 	ret = of_property_read_u32(card->dev->of_node, hph_switch, &hph_swh);
+ 	if (ret) {
+@@ -2213,11 +2325,6 @@
+ 		mbhc->moist_iref = hph_moist_config[1];
+ 		mbhc->moist_rref = hph_moist_config[2];
+ 	}
+-
+-	mbhc->wcd_usbss_aatc_dev_np = of_parse_phandle(card->dev->of_node,
+-					"wcd939x-i2c-handle", 0);
+-	mbhc->fsa_aatc_dev_np = of_parse_phandle(card->dev->of_node,
+-					"fsa4480-i2c-handle", 0);
+ 
+ 	mbhc->in_swch_irq_handler = false;
+ 	mbhc->current_plug = MBHC_PLUG_TYPE_NONE;
+@@ -2239,26 +2346,6 @@
+ 	mbhc->hphl_cross_conn_thr = HPHL_CROSS_CONN_THRESHOLD;
+ 	mbhc->hphr_cross_conn_thr = HPHR_CROSS_CONN_THRESHOLD;
+ 
+-	if (mbhc->intr_ids == NULL) {
+-		pr_err("%s: Interrupt mapping not provided\n", __func__);
+-		return -EINVAL;
+-	}
+-	if (!mbhc->wcd_mbhc_regs) {
+-		dev_err(component->dev, "%s: mbhc registers are not defined\n",
+-			__func__);
+-		return -EINVAL;
+-	}
+-
+-	/* Check if IRQ and other required callbacks are defined or not */
+-	if (!mbhc_cb || !mbhc_cb->request_irq || !mbhc_cb->irq_control ||
+-	    !mbhc_cb->free_irq || !mbhc_cb->map_btn_code_to_num ||
+-	    !mbhc_cb->lock_sleep || !mbhc_cb->mbhc_bias ||
+-	    !mbhc_cb->set_btn_thr) {
+-		dev_err(component->dev, "%s: required mbhc callbacks are not defined\n",
+-			__func__);
+-		return -EINVAL;
+-	}
+-
+ 	/* No need to create new sound card jacks if is is already created */
+ 	if (mbhc->headset_jack.jack == NULL) {
+ 		ret = snd_soc_card_jack_new(component->card,
+@@ -2268,7 +2355,8 @@
+ 			pr_err("%s: Failed to create new jack\n", __func__);
+ 			return ret;
+ 		}
+-
++	}
++	if (!mbhc->button_jack.jack) {
+ 		ret = snd_soc_card_jack_new(component->card,
+ 					    "Button Jack",
+ 					    WCD_MBHC_JACK_BUTTON_MASK,
+@@ -2277,7 +2365,8 @@
+ 			pr_err("Failed to create new jack\n");
+ 			return ret;
+ 		}
+-
++	}
++	if (!mbhc->is_btn_already_regd) {
+ 		ret = snd_jack_set_key(mbhc->button_jack.jack,
+ 				       SND_JACK_BTN_0,
+ 				       KEY_MEDIA);
+@@ -2286,28 +2375,14 @@
+ 				__func__);
+ 			return ret;
+ 		}
+-
+-		INIT_DELAYED_WORK(&mbhc->mbhc_firmware_dwork,
+-				  wcd_mbhc_fw_read);
+-		INIT_DELAYED_WORK(&mbhc->mbhc_btn_dwork, wcd_btn_lpress_fn);
+-	}
++	}
++	INIT_DELAYED_WORK(&mbhc->mbhc_firmware_dwork, wcd_mbhc_fw_read);
++	INIT_DELAYED_WORK(&mbhc->mbhc_btn_dwork, wcd_btn_lpress_fn);
+ 	init_completion(&mbhc->btn_press_compl);
+-
+-	/* Register event notifier */
+-	mbhc->nblock.notifier_call = wcd_event_notify;
+-	if (mbhc->mbhc_cb->register_notifier) {
+-		ret = mbhc->mbhc_cb->register_notifier(mbhc, &mbhc->nblock,
+-						       true);
+-		if (ret) {
+-			pr_err("%s: Failed to register notifier %d\n",
+-				__func__, ret);
+-			return ret;
+-		}
+-	}
+-
+ 	init_waitqueue_head(&mbhc->wait_btn_press);
+ 	mutex_init(&mbhc->codec_resource_lock);
+ 
++	mbhc->mbhc_fn = NULL;
+ 	switch (mbhc->mbhc_detection_logic) {
+ 	case WCD_DETECTION_LEGACY:
+ 		wcd_mbhc_legacy_init(mbhc);
+@@ -2327,7 +2402,34 @@
+ 	    !mbhc->mbhc_fn->wcd_mbhc_detect_plug_type ||
+ 	    !mbhc->mbhc_fn->wcd_cancel_hs_detect_plug) {
+ 		pr_err("%s: mbhc function pointer is NULL\n", __func__);
+-		goto err_mbhc_sw_irq;
++		ret = -EINVAL;
++		goto err_lock;
++	}
++	/* Publish neither callbacks nor IRQs before all their storage is ready. */
++	if (!mbhc->extdev) {
++		extdev = devm_extcon_dev_allocate(component->dev,
++						  mbhc_ext_dev_supported_table);
++		if (IS_ERR(extdev)) {
++			ret = PTR_ERR(extdev);
++			goto err_lock;
++		}
++		ret = devm_extcon_dev_register(component->dev, extdev);
++		if (ret) {
++			devm_extcon_dev_free(component->dev, extdev);
++			goto err_lock;
++		}
++		mbhc->extdev = extdev;
++	}
++	mbhc->wcd_usbss_aatc_dev_np = of_parse_phandle(card->dev->of_node,
++						       "wcd939x-i2c-handle", 0);
++	mbhc->fsa_aatc_dev_np = of_parse_phandle(card->dev->of_node,
++						 "fsa4480-i2c-handle", 0);
++	mbhc->nblock.notifier_call = wcd_event_notify;
++	if (mbhc_cb->register_notifier) {
++		ret = mbhc_cb->register_notifier(mbhc, &mbhc->nblock, true);
++		if (ret)
++			goto err_mbhc_sw_irq;
++		mbhc->notifier_registered = true;
+ 	}
+ 	ret = mbhc->mbhc_cb->request_irq(component,
+ 				mbhc->intr_ids->mbhc_sw_intr,
+@@ -2404,26 +2506,11 @@
+ 		       mbhc->intr_ids->hph_right_ocp);
+ 		goto err_hphr_ocp_irq;
+ 	}
+-	if (!mbhc->extdev) {
+-		mbhc->extdev =
+-			devm_extcon_dev_allocate(component->dev,
+-				mbhc_ext_dev_supported_table);
+-		if (IS_ERR(mbhc->extdev)) {
+-			goto err_ext_dev;
+-			ret = PTR_ERR(mbhc->extdev);
+-		}
+-		ret = devm_extcon_dev_register(component->dev, mbhc->extdev);
+-		if (ret) {
+-			pr_err("%s:audio registration failed\n", __func__);
+-			goto err_ext_dev;
+-		}
+-	}
+-	mbhc->deinit_in_progress = false;
++	mbhc->mbhc_initialized = true;
++	WRITE_ONCE(mbhc->deinit_in_progress, false);
+ 	pr_debug("%s: leave ret %d\n", __func__, ret);
+ 	return ret;
+ 
+-err_ext_dev:
+-	mbhc->mbhc_cb->free_irq(component, mbhc->intr_ids->hph_right_ocp, mbhc);
+ err_hphr_ocp_irq:
+ 	mbhc->mbhc_cb->free_irq(component, mbhc->intr_ids->hph_left_ocp, mbhc);
+ err_hphl_ocp_irq:
+@@ -2442,8 +2529,12 @@
+ err_btn_press_irq:
+ 	mbhc->mbhc_cb->free_irq(component, mbhc->intr_ids->mbhc_sw_intr, mbhc);
+ err_mbhc_sw_irq:
+-	if (mbhc->mbhc_cb->register_notifier)
+-		mbhc->mbhc_cb->register_notifier(mbhc, &mbhc->nblock, false);
++	wcd_mbhc_unregister_notifiers(mbhc);
++	of_node_put(mbhc->wcd_usbss_aatc_dev_np);
++	mbhc->wcd_usbss_aatc_dev_np = NULL;
++	of_node_put(mbhc->fsa_aatc_dev_np);
++	mbhc->fsa_aatc_dev_np = NULL;
++err_lock:
+ 	mutex_destroy(&mbhc->codec_resource_lock);
+ err:
+ 	pr_debug("%s: leave ret %d\n", __func__, ret);
+@@ -2453,7 +2544,13 @@
+ 
+ void wcd_mbhc_deinit(struct wcd_mbhc *mbhc)
+ {
+-	struct snd_soc_component *component = mbhc->component;
++	struct snd_soc_component *component;
++
++	if (!mbhc || !mbhc->mbhc_initialized)
++		return;
++	component = mbhc->component;
++	WRITE_ONCE(mbhc->deinit_in_progress, true);
++	wcd_mbhc_stop(mbhc);
+ 
+ 	mbhc->mbhc_cb->free_irq(component, mbhc->intr_ids->mbhc_sw_intr, mbhc);
+ 	mbhc->mbhc_cb->free_irq(component, mbhc->intr_ids->mbhc_btn_press_intr,
+@@ -2467,14 +2564,11 @@
+ 				mbhc);
+ 	mbhc->mbhc_cb->free_irq(component, mbhc->intr_ids->hph_left_ocp, mbhc);
+ 	mbhc->mbhc_cb->free_irq(component, mbhc->intr_ids->hph_right_ocp, mbhc);
+-	if (mbhc->mbhc_cb && mbhc->mbhc_cb->register_notifier)
+-		mbhc->mbhc_cb->register_notifier(mbhc, &mbhc->nblock, false);
+-	if (mbhc->mbhc_fn->wcd_cancel_hs_detect_plug) {
+-		WCD_MBHC_RSC_LOCK(mbhc);
+-		mbhc->mbhc_fn->wcd_cancel_hs_detect_plug(mbhc,
+-					&mbhc->correct_plug_swch);
+-		WCD_MBHC_RSC_UNLOCK(mbhc);
+-	}
++	of_node_put(mbhc->wcd_usbss_aatc_dev_np);
++	mbhc->wcd_usbss_aatc_dev_np = NULL;
++	of_node_put(mbhc->fsa_aatc_dev_np);
++	mbhc->fsa_aatc_dev_np = NULL;
++	mbhc->mbhc_initialized = false;
+ 	mutex_destroy(&mbhc->codec_resource_lock);
+ }
+ EXPORT_SYMBOL(wcd_mbhc_deinit);
+@@ -2483,11 +2577,16 @@
+ {
+ 	mutex_init(&hphl_pa_lock);
+ 	mutex_init(&hphr_pa_lock);
++	mbhc_debugfs_dir = debugfs_create_dir(DEBUGFS_DIR_NAME, NULL);
++	if (!IS_ERR_OR_NULL(mbhc_debugfs_dir))
++		debugfs_create_file(DEBUGFS_HEADSET_STATUS_FILE_NAME, 0666,
++				    mbhc_debugfs_dir, NULL, &mbhc_headset_status_fops);
+ 	return 0;
+ }
+ 
+ static void __exit mbhc_exit(void)
+ {
++	debugfs_remove_recursive(mbhc_debugfs_dir);
+ 	mutex_destroy(&hphl_pa_lock);
+ 	mutex_destroy(&hphr_pa_lock);
+ }
+--- a/qcom/opensource/audio-kernel/include/asoc/wcd-mbhc-v2.h
++++ b/qcom/opensource/audio-kernel/include/asoc/wcd-mbhc-v2.h
+@@ -635,7 +635,26 @@
+ 	struct notifier_block aatc_dev_nb;
+ 
+ 	struct extcon_dev *extdev;
+-};
++	/* The codec owner serializes init/start/stop/deinit. */
++	bool mbhc_initialized;
++	bool mbhc_started;
++	bool notifier_registered;
++	bool usbc_notifier_registered;
++	void *default_calibration;
++	struct device_node *uart_audio_node;
++};
++
++static inline bool wcd_mbhc_is_started(const struct wcd_mbhc *mbhc)
++{
++	/* Pair with start publication before reading the callback configuration. */
++	return smp_load_acquire(&mbhc->mbhc_started);
++}
++
++static inline void wcd_mbhc_set_started(struct wcd_mbhc *mbhc, bool started)
++{
++	/* Publish the initialized configuration to IRQ and notifier callbacks. */
++	smp_store_release(&mbhc->mbhc_started, started);
++}
+ 
+ void wcd_mbhc_find_plug_and_report(struct wcd_mbhc *mbhc,
+ 				   enum wcd_mbhc_plug_type plug_type);

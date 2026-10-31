@@ -3693,6 +3693,140 @@ ddk_module(
     copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
 )
 
+ddk_headers(
+    name = "audio_codec_support_headers",
+    hdrs = ["qcom/opensource/audio-kernel/asoc/codecs/audio-ext-clk-up.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd-mbhc-adc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd-mbhc-legacy.h", "qcom/opensource/audio-kernel/include/asoc/wcd-clsh.h", "qcom/opensource/audio-kernel/include/asoc/wcd-mbhc-v2-api.h", "qcom/opensource/audio-kernel/include/asoc/wcd-mbhc-v2.h", "qcom/opensource/audio-kernel/include/asoc/wcdcal-hwdep.h", "qcom/opensource/audio-kernel/include/bindings/qcom,audio-ext-clk.h", "qcom/opensource/audio-kernel/include/uapi/audio/sound/msmcal-hwdep.h", ":audio_foundation_headers", ":audio_lpasscdc_headers", ":audio_prm_headers", ":audio_wcdcore_headers", ":wcd_headers", ":altmode_headers"],
+    includes = ["qcom/opensource/audio-kernel/include", "qcom/opensource/audio-kernel/include/uapi/audio", "qcom/opensource/audio-kernel/asoc/codecs"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wcd9xxx_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd-clsh.c", "qcom/opensource/audio-kernel/asoc/codecs/wcdcal-hwdep.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd9xxx-soc-init.c", "qcom/opensource/audio-kernel/asoc/codecs/audio-ext-clk-up.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wcd9xxx_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_codec_support_headers", ":audio_prm_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mbhc_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd-mbhc-v2.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd-mbhc-adc.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "mbhc_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_codec_support_headers", ":lpass_cdc_tx_macro_dlkm", ":wcd_usbss_i2c", ":fsa4480_i2c", ":wcd_core_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)
+
+
+ddk_module(
+    name = "lpass_cdc_wsa_macro_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-wsa-macro.c", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-wsa-macro.h", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "lpass_cdc_wsa_macro_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_lpasscdc_headers", ":audio_swrctrl_headers", ":audio_wcdcore_headers", ":audio_spf_headers", ":lpass_cdc_dlkm", ":wcd_core_dlkm", ":swr_ctrl_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "lpass_cdc_wsa2_macro_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-wsa2-macro.c", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-wsa2-macro.h", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "lpass_cdc_wsa2_macro_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_lpasscdc_headers", ":audio_swrctrl_headers", ":audio_wcdcore_headers", ":audio_spf_headers", ":lpass_cdc_dlkm", ":wcd_core_dlkm", ":swr_ctrl_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "rmnet_aps",
+    srcs = ["qcom/opensource/datarmnet-ext/aps/rmnet_aps_main.c", "qcom/opensource/datarmnet-ext/aps/rmnet_aps_genl.c", "qcom/opensource/datarmnet-ext/aps/rmnet_aps.h", "qcom/opensource/datarmnet-ext/aps/rmnet_aps_genl.h"],
+    out = "rmnet_aps.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":rmnet_headers", ":rmnet_core"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "rmnet_offload",
+    srcs = ["qcom/opensource/datarmnet-ext/offload/rmnet_offload_state.c", "qcom/opensource/datarmnet-ext/offload/rmnet_offload_main.c", "qcom/opensource/datarmnet-ext/offload/rmnet_offload_engine.c", "qcom/opensource/datarmnet-ext/offload/rmnet_offload_tcp.c", "qcom/opensource/datarmnet-ext/offload/rmnet_offload_udp.c", "qcom/opensource/datarmnet-ext/offload/rmnet_offload_stats.c", "qcom/opensource/datarmnet-ext/offload/rmnet_offload_knob.c", "qcom/opensource/datarmnet-ext/offload/rmnet_offload_engine.h", "qcom/opensource/datarmnet-ext/offload/rmnet_offload_knob.h", "qcom/opensource/datarmnet-ext/offload/rmnet_offload_main.h", "qcom/opensource/datarmnet-ext/offload/rmnet_offload_state.h", "qcom/opensource/datarmnet-ext/offload/rmnet_offload_stats.h", "qcom/opensource/datarmnet-ext/offload/rmnet_offload_tcp.h", "qcom/opensource/datarmnet-ext/offload/rmnet_offload_udp.h"],
+    out = "rmnet_offload.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":rmnet_headers", ":rmnet_core"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "rmnet_perf",
+    srcs = ["qcom/opensource/datarmnet-ext/perf/rmnet_perf_main.c", "qcom/opensource/datarmnet-ext/perf/rmnet_perf_tcp.c", "qcom/opensource/datarmnet-ext/perf/rmnet_perf_udp.c", "qcom/opensource/datarmnet-ext/perf/rmnet_perf_tcp.h", "qcom/opensource/datarmnet-ext/perf/rmnet_perf_udp.h"],
+    out = "rmnet_perf.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":rmnet_headers", ":rmnet_core"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "rmnet_perf_tether",
+    srcs = ["qcom/opensource/datarmnet-ext/perf_tether/rmnet_perf_tether_main.c"],
+    out = "rmnet_perf_tether.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":rmnet_headers", ":rmnet_core"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "rmnet_sch",
+    srcs = ["qcom/opensource/datarmnet-ext/sch/rmnet_sch_main.c"],
+    out = "rmnet_sch.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "rmnet_shs",
+    srcs = ["qcom/opensource/datarmnet-ext/shs/rmnet_shs_config.c", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_ll.c", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_main.c", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_common.c", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_wq.c", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_freq.c", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_wq_mem.c", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_wq_genl.c", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_modules.c", "qcom/opensource/datarmnet-ext/shs/rmnet_shs.h", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_common.h", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_config.h", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_freq.h", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_ll.h", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_modules.h", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_wq.h", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_wq_genl.h", "qcom/opensource/datarmnet-ext/shs/rmnet_shs_wq_mem.h"],
+    out = "rmnet_shs.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":rmnet_headers", ":rmnet_core", ":walt_headers", ":sched_walt"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "rmnet_wlan",
+    srcs = ["qcom/opensource/datarmnet-ext/wlan/rmnet_wlan_main.c", "qcom/opensource/datarmnet-ext/wlan/rmnet_wlan_genl.c", "qcom/opensource/datarmnet-ext/wlan/rmnet_wlan_stats.c", "qcom/opensource/datarmnet-ext/wlan/rmnet_wlan_fragment.c", "qcom/opensource/datarmnet-ext/wlan/rmnet_wlan_connection.c", "qcom/opensource/datarmnet-ext/wlan/rmnet_wlan.h", "qcom/opensource/datarmnet-ext/wlan/rmnet_wlan_connection.h", "qcom/opensource/datarmnet-ext/wlan/rmnet_wlan_fragment.h", "qcom/opensource/datarmnet-ext/wlan/rmnet_wlan_genl.h", "qcom/opensource/datarmnet-ext/wlan/rmnet_wlan_stats.h"],
+    out = "rmnet_wlan.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":rmnet_headers", ":rmnet_core"],
+    visibility = ["//visibility:public"],
+)
+
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3960,6 +4094,17 @@ kernel_module_group(
         ":qti_qmi_sensor_v2",
         ":camera",
         ":lpass_cdc_rx_macro_dlkm",
+        ":wcd9xxx_dlkm",
+        ":mbhc_dlkm",
+        ":lpass_cdc_wsa_macro_dlkm",
+        ":lpass_cdc_wsa2_macro_dlkm",
+        ":rmnet_aps",
+        ":rmnet_offload",
+        ":rmnet_perf",
+        ":rmnet_perf_tether",
+        ":rmnet_sch",
+        ":rmnet_shs",
+        ":rmnet_wlan",
     ],
 )
 

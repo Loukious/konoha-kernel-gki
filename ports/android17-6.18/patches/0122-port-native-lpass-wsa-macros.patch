@@ -1,0 +1,1408 @@
+Subject: Port native LPASS WSA and WSA2 macros to 6.18
+
+Preserve native speaker routes and provider interfaces.
+
+---
+
+--- a/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-wsa-macro.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-wsa-macro.c
+@@ -10,6 +10,7 @@
+ #include <linux/clk.h>
+ #include <linux/thermal.h>
+ #include <linux/pm_runtime.h>
++#include <linux/wait.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dapm.h>
+ #include <sound/pcm_params.h>
+@@ -194,9 +195,9 @@
+ static int lpass_cdc_wsa_macro_hw_params(struct snd_pcm_substream *substream,
+ 			       struct snd_pcm_hw_params *params,
+ 			       struct snd_soc_dai *dai);
+-static int lpass_cdc_wsa_macro_get_channel_map(struct snd_soc_dai *dai,
+-				unsigned int *tx_num, unsigned int *tx_slot,
+-				unsigned int *rx_num, unsigned int *rx_slot);
++static int lpass_cdc_wsa_macro_get_channel_map(const struct snd_soc_dai *dai,
++					       unsigned int *tx_num, unsigned int *tx_slot,
++					       unsigned int *rx_num, unsigned int *rx_slot);
+ static int lpass_cdc_wsa_macro_mute_stream(struct snd_soc_dai *dai, int mute, int stream);
+ 
+ #define LPASS_CDC_WSA_MACRO_VTH_TO_REG(vth) ((vth) == 0 ? 255 : (vth))
+@@ -262,7 +263,6 @@
+  * @swr_clk_lock: to lock swr master clock operations
+  * @swr_ctrl_data: SoundWire data structure
+  * @swr_plat_data: Soundwire platform data
+- * @lpass_cdc_wsa_macro_add_child_devices_work: work for adding child devices
+  * @wsa_swr_gpio_p: used by pinctrl API
+  * @component: codec handle
+  * @rx_0_count: RX0 interpolation users
+@@ -289,9 +289,14 @@
+ 	unsigned int vi_feed_value;
+ 	struct mutex mclk_lock;
+ 	struct mutex swr_clk_lock;
++	/* Serialize controller publication and notification references. */
++	struct mutex swr_ctrl_lock;
++	wait_queue_head_t swr_ctrl_wait;
++	unsigned int swr_ctrl_users;
++	/* Drain cooling register I/O before releasing the component. */
++	struct mutex component_lock;
+ 	struct lpass_cdc_wsa_macro_swr_ctrl_data *swr_ctrl_data;
+ 	struct lpass_cdc_wsa_macro_swr_ctrl_platform_data swr_plat_data;
+-	struct work_struct lpass_cdc_wsa_macro_add_child_devices_work;
+ 	struct device_node *wsa_swr_gpio_p;
+ 	struct snd_soc_component *component;
+ 	int rx_0_count;
+@@ -303,7 +308,7 @@
+ 	char __iomem *wsa_io_base;
+ 	struct platform_device *pdev_child_devices
+ 			[LPASS_CDC_WSA_MACRO_CHILD_DEVICES_MAX];
+-	int child_count;
++	unsigned int child_count;
+ 	int wsa_spkrrecv;
+ 	int spkr_gain_offset;
+ 	int spkr_mode;
+@@ -570,6 +575,33 @@
+ 	return true;
+ }
+ 
++static int lpass_cdc_wsa_macro_notify_swr(struct lpass_cdc_wsa_macro_priv *wsa_priv,
++					  u32 event, void *data)
++{
++	struct platform_device *target;
++	int ret;
++
++	mutex_lock(&wsa_priv->swr_ctrl_lock);
++	if (!wsa_priv->swr_ctrl_data) {
++		mutex_unlock(&wsa_priv->swr_ctrl_lock);
++		return 0;
++	}
++	if (wsa_priv->swr_ctrl_users == UINT_MAX) {
++		mutex_unlock(&wsa_priv->swr_ctrl_lock);
++		return -EOVERFLOW;
++	}
++	target = wsa_priv->swr_ctrl_data[0].wsa_swr_pdev;
++	wsa_priv->swr_ctrl_users++;
++	mutex_unlock(&wsa_priv->swr_ctrl_lock);
++	/* Controller callbacks may reenter this macro. */
++	ret = swrm_wcd_notify(target, event, data);
++	mutex_lock(&wsa_priv->swr_ctrl_lock);
++	if (!--wsa_priv->swr_ctrl_users)
++		wake_up_all(&wsa_priv->swr_ctrl_wait);
++	mutex_unlock(&wsa_priv->swr_ctrl_lock);
++	return ret;
++}
++
+ static int lpass_cdc_wsa_macro_set_port_map(struct snd_soc_component *component,
+ 				u32 usecase, u32 size, void *data)
+ {
+@@ -586,10 +618,7 @@
+ 	port_cfg.size = size;
+ 	port_cfg.params = data;
+ 
+-	if (wsa_priv->swr_ctrl_data)
+-		ret = swrm_wcd_notify(
+-			wsa_priv->swr_ctrl_data[0].wsa_swr_pdev,
+-			SWR_SET_PORT_MAP, &port_cfg);
++	ret = lpass_cdc_wsa_macro_notify_swr(wsa_priv, SWR_SET_PORT_MAP, &port_cfg);
+ 
+ 	return ret;
+ }
+@@ -831,9 +860,9 @@
+ 	return 0;
+ }
+ 
+-static int lpass_cdc_wsa_macro_get_channel_map(struct snd_soc_dai *dai,
+-				unsigned int *tx_num, unsigned int *tx_slot,
+-				unsigned int *rx_num, unsigned int *rx_slot)
++static int lpass_cdc_wsa_macro_get_channel_map(const struct snd_soc_dai *dai,
++					       unsigned int *tx_num, unsigned int *tx_slot,
++					       unsigned int *rx_num, unsigned int *rx_slot)
+ {
+ 	struct snd_soc_component *component = dai->component;
+ 	struct device *wsa_dev = NULL;
+@@ -1096,11 +1125,7 @@
+ 	switch (event) {
+ 	case LPASS_CDC_MACRO_EVT_SSR_DOWN:
+ 		wsa_priv->pre_dev_up = false;
+-		if (wsa_priv->swr_ctrl_data) {
+-			swrm_wcd_notify(
+-				wsa_priv->swr_ctrl_data[0].wsa_swr_pdev,
+-				SWR_DEVICE_SSR_DOWN, NULL);
+-		}
++		lpass_cdc_wsa_macro_notify_swr(wsa_priv, SWR_DEVICE_SSR_DOWN, NULL);
+ 		if ((!pm_runtime_enabled(wsa_dev) ||
+ 		     !pm_runtime_suspended(wsa_dev))) {
+ 			ret = lpass_cdc_runtime_suspend(wsa_dev);
+@@ -1117,10 +1142,7 @@
+ 		wsa_priv->pre_dev_up = true;
+ 		/* reset swr after ssr/pdr */
+ 		wsa_priv->reset_swr = true;
+-		if (wsa_priv->swr_ctrl_data)
+-			swrm_wcd_notify(
+-				wsa_priv->swr_ctrl_data[0].wsa_swr_pdev,
+-				SWR_DEVICE_SSR_UP, NULL);
++		lpass_cdc_wsa_macro_notify_swr(wsa_priv, SWR_DEVICE_SSR_UP, NULL);
+ 		break;
+ 	case LPASS_CDC_MACRO_EVT_CLK_RESET:
+ 		lpass_cdc_rsc_clk_reset(wsa_dev, WSA_CORE_CLK);
+@@ -1145,7 +1167,9 @@
+ 	wsa_priv = wsa_vi_dec_enable_work->wsa_priv;
+ 	component = wsa_priv->component;
+ 
+-	lpass_cdc_wsa_macro_get_data(component, &wsa_dev, &wsa_priv, __func__);
++	if (!component ||
++	    !lpass_cdc_wsa_macro_get_data(component, &wsa_dev, &wsa_priv, __func__))
++		return;
+ 
+ 	usleep_range(5000, 5500);
+ 	dev_dbg(wsa_dev, "%s: wsa_priv->pcm_rate_vi %d\n", __func__, wsa_priv->pcm_rate_vi);
+@@ -1354,11 +1378,7 @@
+ 			wsa_priv->rx_1_count++;
+ 		ch_cnt = wsa_priv->rx_0_count + wsa_priv->rx_1_count;
+ 
+-		if (wsa_priv->swr_ctrl_data) {
+-			swrm_wcd_notify(
+-				wsa_priv->swr_ctrl_data[0].wsa_swr_pdev,
+-				SWR_DEVICE_UP, NULL);
+-		}
++		lpass_cdc_wsa_macro_notify_swr(wsa_priv, SWR_DEVICE_UP, NULL);
+ 		break;
+ 	case SND_SOC_DAPM_POST_PMD:
+ 		if (!(strnstr(w->name, "RX0", sizeof("WSA_RX0"))) &&
+@@ -3585,7 +3605,7 @@
+ 		pr_err_ratelimited("%s: cdev->devdata is NULL\n", __func__);
+ 		return -EINVAL;
+ 	}
+-	*state = wsa_priv->thermal_cur_state;
++	*state = READ_ONCE(wsa_priv->thermal_cur_state);
+ 
+ 	pr_debug("%s: thermal current state:%lu\n", __func__, *state);
+ 	return 0;
+@@ -3603,7 +3623,7 @@
+ 	}
+ 
+ 	if (state <= wsa_priv->thermal_max_state) {
+-		wsa_priv->thermal_cur_state = state;
++		WRITE_ONCE(wsa_priv->thermal_cur_state, state);
+ 	} else {
+ 		dev_err_ratelimited(wsa_priv->dev,
+ 			"%s: incorrect requested state:%lu\n",
+@@ -3689,10 +3709,9 @@
+ 	snd_soc_dapm_ignore_suspend(dapm, "WSA_TX DEC1_INP");
+ 	snd_soc_dapm_sync(dapm);
+ 
+-	wsa_priv->wsa_vi_dec_enable_work.wsa_priv = wsa_priv;
+-	INIT_DELAYED_WORK(&wsa_priv->wsa_vi_dec_enable_work.dwork,
+-		lpass_cdc_wsa_macro_enable_vi_decimator);
++	mutex_lock(&wsa_priv->component_lock);
+ 	wsa_priv->component = component;
++	mutex_unlock(&wsa_priv->component_lock);
+ 	wsa_priv->spkr_gain_offset = LPASS_CDC_WSA_MACRO_GAIN_OFFSET_0_DB;
+ 	lpass_cdc_wsa_macro_init_reg(component);
+ 
+@@ -3707,177 +3726,142 @@
+ 	if (!lpass_cdc_wsa_macro_get_data(component, &wsa_dev, &wsa_priv, __func__))
+ 		return -EINVAL;
+ 
++	cancel_delayed_work_sync(&wsa_priv->wsa_vi_dec_enable_work.dwork);
++	mutex_lock(&wsa_priv->component_lock);
+ 	wsa_priv->component = NULL;
+-
+-	return 0;
+-}
+-
+-static void lpass_cdc_wsa_macro_add_child_devices(struct work_struct *work)
+-{
+-	struct lpass_cdc_wsa_macro_priv *wsa_priv;
++	mutex_unlock(&wsa_priv->component_lock);
++	cancel_work_sync(&wsa_priv->lpass_cdc_wsa_macro_cooling_work);
++
++	return 0;
++}
++
++static void lpass_cdc_wsa_macro_remove_child_devices(struct lpass_cdc_wsa_macro_priv *wsa_priv)
++{
++	struct lpass_cdc_wsa_macro_swr_ctrl_data *controllers;
++	struct platform_device *child;
++
++	mutex_lock(&wsa_priv->swr_ctrl_lock);
++	controllers = wsa_priv->swr_ctrl_data;
++	wsa_priv->swr_ctrl_data = NULL;
++	mutex_unlock(&wsa_priv->swr_ctrl_lock);
++	wait_event(wsa_priv->swr_ctrl_wait, !READ_ONCE(wsa_priv->swr_ctrl_users));
++	/* Wait for the last notifier to finish its unlock tail. */
++	mutex_lock(&wsa_priv->swr_ctrl_lock);
++	mutex_unlock(&wsa_priv->swr_ctrl_lock);
++	while (wsa_priv->child_count) {
++		child = wsa_priv->pdev_child_devices[--wsa_priv->child_count];
++		wsa_priv->pdev_child_devices[wsa_priv->child_count] = NULL;
++		platform_device_unregister(child);
++	}
++	kfree(controllers);
++}
++
++static int lpass_cdc_wsa_macro_add_child_devices(struct lpass_cdc_wsa_macro_priv *wsa_priv)
++{
++	struct lpass_cdc_wsa_macro_swr_ctrl_data *controllers;
+ 	struct platform_device *pdev;
+ 	struct device_node *node;
+-	struct lpass_cdc_wsa_macro_swr_ctrl_data *swr_ctrl_data = NULL, *temp;
++	unsigned int count = 0, ctrl_num = 0;
++	char name[LPASS_CDC_WSA_MACRO_SWR_STRING_LEN];
++	bool swr_master;
+ 	int ret;
+-	u16 count = 0, ctrl_num = 0;
+-	struct lpass_cdc_wsa_macro_swr_ctrl_platform_data *platdata;
+-	char plat_dev_name[LPASS_CDC_WSA_MACRO_SWR_STRING_LEN];
+-
+-	wsa_priv = container_of(work, struct lpass_cdc_wsa_macro_priv,
+-			     lpass_cdc_wsa_macro_add_child_devices_work);
+-	if (!wsa_priv) {
+-		pr_err("%s: Memory for wsa_priv does not exist\n",
+-			__func__);
+-		return;
+-	}
+-	if (!wsa_priv->dev || !wsa_priv->dev->of_node) {
+-		dev_err(wsa_priv->dev,
+-			"%s: DT node for wsa_priv does not exist\n", __func__);
+-		return;
+-	}
+-
+-	platdata = &wsa_priv->swr_plat_data;
+-	wsa_priv->child_count = 0;
+ 
+ 	for_each_available_child_of_node(wsa_priv->dev->of_node, node) {
+-		if (strnstr(node->name, "wsa_swr_master",
+-				strlen("wsa_swr_master")) != NULL)
+-			strscpy(plat_dev_name, "wsa_swr_ctrl",
+-				(LPASS_CDC_WSA_MACRO_SWR_STRING_LEN - 1));
+-		else if (strnstr(node->name, "msm_cdc_pinctrl",
+-				 strlen("msm_cdc_pinctrl")) != NULL)
+-			strscpy(plat_dev_name, node->name,
+-				(LPASS_CDC_WSA_MACRO_SWR_STRING_LEN - 1));
+-		else
++		if (strnstr(node->name, "wsa_swr_master", strlen("wsa_swr_master")) ||
++		    strnstr(node->name, "msm_cdc_pinctrl", strlen("msm_cdc_pinctrl")))
++			count++;
++	}
++	if (!count)
++		return 0;
++	if (count > LPASS_CDC_WSA_MACRO_CHILD_DEVICES_MAX)
++		return -EOVERFLOW;
++	controllers = kcalloc(count, sizeof(*controllers), GFP_KERNEL);
++	if (!controllers)
++		return -ENOMEM;
++
++	for_each_available_child_of_node(wsa_priv->dev->of_node, node) {
++		swr_master = strnstr(node->name, "wsa_swr_master", strlen("wsa_swr_master"));
++		if (!swr_master &&
++		    !strnstr(node->name, "msm_cdc_pinctrl", strlen("msm_cdc_pinctrl")))
+ 			continue;
+-
+-		pdev = platform_device_alloc(plat_dev_name, -1);
++		if (wsa_priv->child_count >= count) {
++			ret = -EOVERFLOW;
++			goto rollback;
++		}
++		strscpy(name, swr_master ? "wsa_swr_ctrl" : node->name,
++			LPASS_CDC_WSA_MACRO_SWR_STRING_LEN - 1);
++		pdev = platform_device_alloc(name, -1);
+ 		if (!pdev) {
+-			dev_err(wsa_priv->dev, "%s: pdev memory alloc failed\n",
+-				__func__);
+ 			ret = -ENOMEM;
+-			goto err;
++			goto rollback;
+ 		}
+ 		pdev->dev.parent = wsa_priv->dev;
+-		pdev->dev.of_node = node;
+-
+-		if (strnstr(node->name, "wsa_swr_master",
+-				strlen("wsa_swr_master")) != NULL) {
+-			ret = platform_device_add_data(pdev, platdata,
+-						       sizeof(*platdata));
+-			if (ret) {
+-				dev_err(&pdev->dev,
+-					"%s: cannot add plat data ctrl:%d\n",
+-					__func__, ctrl_num);
+-				goto fail_pdev_add;
+-			}
+-
+-			temp = krealloc(swr_ctrl_data,
+-					(ctrl_num + 1) * sizeof(
+-					struct lpass_cdc_wsa_macro_swr_ctrl_data),
+-					GFP_KERNEL);
+-			if (!temp) {
+-				dev_err(&pdev->dev, "out of memory\n");
+-				ret = -ENOMEM;
+-				goto fail_pdev_add;
+-			}
+-			swr_ctrl_data = temp;
+-			swr_ctrl_data[ctrl_num].wsa_swr_pdev = pdev;
+-			ctrl_num++;
+-			dev_dbg(&pdev->dev,
+-				"%s: Adding soundwire ctrl device(s)\n",
+-				__func__);
+-			wsa_priv->swr_ctrl_data = swr_ctrl_data;
+-		}
+-
++		pdev->dev.of_node = of_node_get(node);
++		if (swr_master) {
++			ret = platform_device_add_data(pdev, &wsa_priv->swr_plat_data,
++						       sizeof(wsa_priv->swr_plat_data));
++			if (ret)
++				goto put_device;
++		}
+ 		ret = platform_device_add(pdev);
+-		if (ret) {
+-			dev_err(&pdev->dev,
+-				"%s: Cannot add platform device\n",
+-				__func__);
+-			goto fail_pdev_add;
+-		}
+-
+-		if (wsa_priv->child_count < LPASS_CDC_WSA_MACRO_CHILD_DEVICES_MAX)
+-			wsa_priv->pdev_child_devices[
+-					wsa_priv->child_count++] = pdev;
+-		else
+-			goto err;
+-	}
+-
+-	return;
+-fail_pdev_add:
+-	for (count = 0; count < wsa_priv->child_count; count++)
+-		platform_device_put(wsa_priv->pdev_child_devices[count]);
+-err:
+-	return;
++		if (ret)
++			goto put_device;
++		wsa_priv->pdev_child_devices[wsa_priv->child_count++] = pdev;
++		if (swr_master)
++			controllers[ctrl_num++].wsa_swr_pdev = pdev;
++	}
++	if (ctrl_num) {
++		mutex_lock(&wsa_priv->swr_ctrl_lock);
++		wsa_priv->swr_ctrl_data = controllers;
++		mutex_unlock(&wsa_priv->swr_ctrl_lock);
++	} else {
++		kfree(controllers);
++	}
++	return 0;
++
++put_device:
++	platform_device_put(pdev);
++rollback:
++	of_node_put(node);
++	lpass_cdc_wsa_macro_remove_child_devices(wsa_priv);
++	kfree(controllers);
++	return ret;
+ }
+ 
+ static void lpass_cdc_wsa_macro_cooling_adjust_gain(struct work_struct *work)
+ {
+-	struct lpass_cdc_wsa_macro_priv *wsa_priv;
+-	u8 gain = 0;
+-
+-	wsa_priv = container_of(work, struct lpass_cdc_wsa_macro_priv,
+-			     lpass_cdc_wsa_macro_cooling_work);
+-	if (!wsa_priv) {
+-		pr_err("%s: priv is null for macro!\n",
+-			__func__);
+-		return;
+-	}
+-	if (!wsa_priv->dev || !wsa_priv->dev->of_node) {
+-		dev_err(wsa_priv->dev,
+-			"%s: DT node for wsa_priv does not exist\n", __func__);
+-		return;
+-	}
+-
+-	/* Only adjust the volume when WSA clock is enabled */
+-	if (wsa_priv->dapm_mclk_enable) {
+-		gain = (u8)(wsa_priv->rx0_origin_gain -
+-				wsa_priv->thermal_cur_state);
+-		snd_soc_component_update_bits(wsa_priv->component,
+-			LPASS_CDC_WSA_RX0_RX_VOL_CTL, 0xFF, gain);
+-		dev_dbg(wsa_priv->dev,
+-			"%s: RX0 current thermal state: %d, "
+-			"adjusted gain: %#x\n",
+-			__func__, wsa_priv->thermal_cur_state, gain);
+-
+-		gain = (u8)(wsa_priv->rx1_origin_gain -
+-				wsa_priv->thermal_cur_state);
+-		snd_soc_component_update_bits(wsa_priv->component,
+-			LPASS_CDC_WSA_RX1_RX_VOL_CTL, 0xFF, gain);
+-		dev_dbg(wsa_priv->dev,
+-			"%s: RX1 current thermal state: %d, "
+-			"adjusted gain: %#x\n",
+-			__func__, wsa_priv->thermal_cur_state, gain);
+-	}
+-
+-	return;
++	struct lpass_cdc_wsa_macro_priv *wsa_priv = container_of(work,
++		struct lpass_cdc_wsa_macro_priv, lpass_cdc_wsa_macro_cooling_work);
++	struct snd_soc_component *component;
++	u32 state;
++	u8 gain;
++
++	mutex_lock(&wsa_priv->component_lock);
++	component = wsa_priv->component;
++	if (!component || !wsa_priv->dapm_mclk_enable)
++		goto unlock;
++	state = READ_ONCE(wsa_priv->thermal_cur_state);
++	gain = (u8)(wsa_priv->rx0_origin_gain - state);
++	snd_soc_component_update_bits(component,
++				      LPASS_CDC_WSA_RX0_RX_VOL_CTL, 0xFF, gain);
++	gain = (u8)(wsa_priv->rx1_origin_gain - state);
++	snd_soc_component_update_bits(component,
++				      LPASS_CDC_WSA_RX1_RX_VOL_CTL, 0xFF, gain);
++unlock:
++	mutex_unlock(&wsa_priv->component_lock);
+ }
+ 
+ static int lpass_cdc_wsa_macro_read_array(struct platform_device *pdev,
+-					  const char *name, int num_values,
+-					  u32 *output)
+-{
+-	u32 len, ret, size;
+-
+-	if (!of_find_property(pdev->dev.of_node, name, &size)) {
+-		dev_info(&pdev->dev, "%s: missing %s\n", __func__, name);
++				     const char *name, int num_values, u32 *output)
++{
++	int size;
++
++	if (!of_find_property(pdev->dev.of_node, name, &size))
+ 		return 0;
+-	}
+-
+-	len = size / sizeof(u32);
+-	if (len != num_values) {
+-		dev_info(&pdev->dev, "%s: invalid number of %s\n", __func__, name);
+-		return -EINVAL;
+-	}
+-
+-	ret = of_property_read_u32_array(pdev->dev.of_node, name, output, len);
+-	if (ret)
+-		dev_info(&pdev->dev, "%s: Failed to read %s\n", __func__, name);
+-
+-	return 0;
+-
++	if (size != num_values * (int)sizeof(*output))
++		return -EINVAL;
++	return of_property_read_u32_array(pdev->dev.of_node, name, output,
++					  num_values);
+ }
+ 
+ static void lpass_cdc_wsa_macro_init_ops(struct macro_ops *ops,
+@@ -3893,6 +3877,11 @@
+ 	ops->set_port_map = lpass_cdc_wsa_macro_set_port_map;
+ }
+ 
++static void lpass_cdc_wsa_macro_put_node(void *node)
++{
++	of_node_put(node);
++}
++
+ static int lpass_cdc_wsa_macro_probe(struct platform_device *pdev)
+ {
+ 	struct macro_ops ops;
+@@ -3931,9 +3920,12 @@
+ 			__func__, "wsa_data_fs_ctl_reg");
+ 	}
+ 
+-	if (!wsa_priv->wsa_fs_reg_base && wsa_priv->wsa_fs_ctl_reg)
++	if (wsa_priv->wsa_fs_ctl_reg) {
+ 		wsa_priv->wsa_fs_reg_base = devm_ioremap(&pdev->dev,
+ 			wsa_priv->wsa_fs_ctl_reg, LPASS_CDC_WSA_MACRO_MAX_OFFSET);
++		if (!wsa_priv->wsa_fs_reg_base)
++			return -ENOMEM;
++	}
+ 
+ 	if (of_find_property(pdev->dev.of_node, is_used_wsa_swr_gpio_dt,
+ 			     NULL)) {
+@@ -3948,6 +3940,12 @@
+ 	}
+ 	wsa_priv->wsa_swr_gpio_p = of_parse_phandle(pdev->dev.of_node,
+ 					"qcom,wsa-swr-gpios", 0);
++	if (wsa_priv->wsa_swr_gpio_p) {
++		ret = devm_add_action_or_reset(&pdev->dev, lpass_cdc_wsa_macro_put_node,
++					       wsa_priv->wsa_swr_gpio_p);
++		if (ret)
++			return ret;
++	}
+ 	if (!wsa_priv->wsa_swr_gpio_p && is_used_wsa_swr_gpio) {
+ 		dev_err(&pdev->dev, "%s: swr_gpios handle not provided!\n",
+ 			__func__);
+@@ -3969,20 +3967,28 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	lpass_cdc_wsa_macro_read_array(pdev, "qcom,wsa-rloads",
+-		LPASS_CDC_WSA_MACRO_RX1 + 1, wsa_priv->wsa_rload);
+-	lpass_cdc_wsa_macro_read_array(pdev, "qcom,wsa-system-gains",
+-		2 * (LPASS_CDC_WSA_MACRO_RX1 + 1), wsa_priv->wsa_sys_gain);
+-	lpass_cdc_wsa_macro_read_array(pdev, "qcom,wsa-bat-cfgs",
+-		LPASS_CDC_WSA_MACRO_RX1 + 1, wsa_priv->wsa_bat_cfg);
++	ret = lpass_cdc_wsa_macro_read_array(pdev, "qcom,wsa-rloads",
++					     LPASS_CDC_WSA_MACRO_RX1 + 1, wsa_priv->wsa_rload);
++	if (ret)
++		return ret;
++	ret = lpass_cdc_wsa_macro_read_array(pdev, "qcom,wsa-system-gains",
++					     2 * (LPASS_CDC_WSA_MACRO_RX1 + 1),
++					     wsa_priv->wsa_sys_gain);
++	if (ret)
++		return ret;
++	ret = lpass_cdc_wsa_macro_read_array(pdev, "qcom,wsa-bat-cfgs",
++					     LPASS_CDC_WSA_MACRO_RX1 + 1, wsa_priv->wsa_bat_cfg);
++	if (ret)
++		return ret;
+ 
+ 
+ 	wsa_priv->wsa_io_base = wsa_io_base;
+ 	wsa_priv->reset_swr = true;
+-	INIT_WORK(&wsa_priv->lpass_cdc_wsa_macro_add_child_devices_work,
+-		  lpass_cdc_wsa_macro_add_child_devices);
+ 	INIT_WORK(&wsa_priv->lpass_cdc_wsa_macro_cooling_work,
+ 		  lpass_cdc_wsa_macro_cooling_adjust_gain);
++	wsa_priv->wsa_vi_dec_enable_work.wsa_priv = wsa_priv;
++	INIT_DELAYED_WORK(&wsa_priv->wsa_vi_dec_enable_work.dwork,
++			  lpass_cdc_wsa_macro_enable_vi_decimator);
+ 	wsa_priv->swr_plat_data.handle = (void *) wsa_priv;
+ 	wsa_priv->swr_plat_data.read = NULL;
+ 	wsa_priv->swr_plat_data.write = NULL;
+@@ -4004,14 +4010,37 @@
+ 	dev_set_drvdata(&pdev->dev, wsa_priv);
+ 	mutex_init(&wsa_priv->mclk_lock);
+ 	mutex_init(&wsa_priv->swr_clk_lock);
++	mutex_init(&wsa_priv->swr_ctrl_lock);
++	mutex_init(&wsa_priv->component_lock);
++	init_waitqueue_head(&wsa_priv->swr_ctrl_wait);
++	ret = of_property_read_u32(pdev->dev.of_node,
++				   "qcom,noise-gate-mode", &noise_gate_mode);
++	if (ret) {
++		dev_info(&pdev->dev, "%s: could not find %s entry in dt\n",
++			 __func__, "qcom,noise-gate-mode");
++		wsa_priv->noise_gate_mode = IDLE_DETECT;
++	} else {
++		if (noise_gate_mode >= IDLE_DETECT && noise_gate_mode <= NG3)
++			wsa_priv->noise_gate_mode = noise_gate_mode;
++		else
++			wsa_priv->noise_gate_mode = IDLE_DETECT;
++	}
++
+ 	lpass_cdc_wsa_macro_init_ops(&ops, wsa_io_base);
+ 	ops.clk_id_req = wsa_priv->default_clk_id;
+ 	ops.default_clk_id = wsa_priv->default_clk_id;
+ 
++	pm_runtime_set_autosuspend_delay(&pdev->dev, AUTO_SUSPEND_DELAY);
++	pm_runtime_use_autosuspend(&pdev->dev);
++	ret = pm_runtime_set_suspended(&pdev->dev);
++	if (ret)
++		goto destroy_locks;
++	pm_suspend_ignore_children(&pdev->dev, true);
++	pm_runtime_enable(&pdev->dev);
+ 	ret = lpass_cdc_register_macro(&pdev->dev, WSA_MACRO, &ops);
+ 	if (ret < 0) {
+ 		dev_err(&pdev->dev, "%s: register macro failed\n", __func__);
+-		goto reg_macro_fail;
++		goto disable_pm;
+ 	}
+ 
+ 	if (of_find_property(wsa_priv->dev->of_node, "#cooling-cells", NULL)) {
+@@ -4026,70 +4055,62 @@
+ 		} else {
+ 			wsa_priv->thermal_max_state = thermal_max_state;
+ 		}
+-		wsa_priv->tcdev = devm_thermal_of_cooling_device_register(
+-						&pdev->dev,
+-						wsa_priv->dev->of_node,
+-						"wsa", wsa_priv,
+-						&wsa_cooling_ops);
++		wsa_priv->tcdev = thermal_of_cooling_device_register(wsa_priv->dev->of_node,
++								     "wsa", wsa_priv,
++								     &wsa_cooling_ops);
+ 		if (IS_ERR(wsa_priv->tcdev)) {
+ 			dev_err(&pdev->dev,
+ 				"%s: failed to register wsa macro as cooling device\n",
+ 				__func__);
++			ret = PTR_ERR(wsa_priv->tcdev);
+ 			wsa_priv->tcdev = NULL;
+-		}
+-	}
+-
+-	ret = of_property_read_u32(pdev->dev.of_node,
+-				"qcom,noise-gate-mode", &noise_gate_mode);
+-	if (ret) {
+-		dev_info(&pdev->dev, "%s: could not find %s entry in dt\n",
+-			__func__, "qcom,noise-gate-mode");
+-		wsa_priv->noise_gate_mode = IDLE_DETECT;
+-	} else {
+-		if (noise_gate_mode >= IDLE_DETECT && noise_gate_mode <= NG3)
+-			wsa_priv->noise_gate_mode = noise_gate_mode;
+-		else
+-			wsa_priv->noise_gate_mode = IDLE_DETECT;
+-	}
+-
+-	pm_runtime_set_autosuspend_delay(&pdev->dev, AUTO_SUSPEND_DELAY);
+-	pm_runtime_use_autosuspend(&pdev->dev);
++			goto unregister_macro;
++		}
++	}
++
++	ret = lpass_cdc_wsa_macro_add_child_devices(wsa_priv);
++	if (ret)
++		goto unregister_cooling;
++	return 0;
++
++unregister_cooling:
++	if (wsa_priv->tcdev)
++		thermal_cooling_device_unregister(wsa_priv->tcdev);
++	cancel_work_sync(&wsa_priv->lpass_cdc_wsa_macro_cooling_work);
++unregister_macro:
++	lpass_cdc_unregister_macro(&pdev->dev, WSA_MACRO);
++disable_pm:
++	pm_runtime_disable(&pdev->dev);
+ 	pm_runtime_set_suspended(&pdev->dev);
+-	pm_suspend_ignore_children(&pdev->dev, true);
+-	pm_runtime_enable(&pdev->dev);
+-	schedule_work(&wsa_priv->lpass_cdc_wsa_macro_add_child_devices_work);
+-	return ret;
+-reg_macro_fail:
++destroy_locks:
++	dev_set_drvdata(&pdev->dev, NULL);
++	mutex_destroy(&wsa_priv->component_lock);
++	mutex_destroy(&wsa_priv->swr_ctrl_lock);
+ 	mutex_destroy(&wsa_priv->mclk_lock);
+ 	mutex_destroy(&wsa_priv->swr_clk_lock);
+ 	return ret;
+ }
+ 
+-static int lpass_cdc_wsa_macro_remove(struct platform_device *pdev)
+-{
+-	struct lpass_cdc_wsa_macro_priv *wsa_priv;
+-	u16 count = 0;
+-
+-	wsa_priv = dev_get_drvdata(&pdev->dev);
++static void lpass_cdc_wsa_macro_remove(struct platform_device *pdev)
++{
++	struct lpass_cdc_wsa_macro_priv *wsa_priv = dev_get_drvdata(&pdev->dev);
+ 
+ 	if (!wsa_priv)
+-		return -EINVAL;
+-
+-	cancel_delayed_work_sync(
+-			&wsa_priv->wsa_vi_dec_enable_work.dwork);
++		return;
+ 	if (wsa_priv->tcdev)
+ 		thermal_cooling_device_unregister(wsa_priv->tcdev);
+-
+-	for (count = 0; count < wsa_priv->child_count &&
+-		count < LPASS_CDC_WSA_MACRO_CHILD_DEVICES_MAX; count++)
+-		platform_device_unregister(wsa_priv->pdev_child_devices[count]);
+-
++	cancel_work_sync(&wsa_priv->lpass_cdc_wsa_macro_cooling_work);
++	lpass_cdc_wsa_macro_remove_child_devices(wsa_priv);
++	/* Parent cleanup may still access the macro's clocks and PM state. */
++	lpass_cdc_unregister_macro(&pdev->dev, WSA_MACRO);
++	cancel_delayed_work_sync(&wsa_priv->wsa_vi_dec_enable_work.dwork);
+ 	pm_runtime_disable(&pdev->dev);
+ 	pm_runtime_set_suspended(&pdev->dev);
+-	lpass_cdc_unregister_macro(&pdev->dev, WSA_MACRO);
++	dev_set_drvdata(&pdev->dev, NULL);
++	mutex_destroy(&wsa_priv->component_lock);
++	mutex_destroy(&wsa_priv->swr_ctrl_lock);
+ 	mutex_destroy(&wsa_priv->mclk_lock);
+ 	mutex_destroy(&wsa_priv->swr_clk_lock);
+-	return 0;
+ }
+ 
+ static const struct of_device_id lpass_cdc_wsa_macro_dt_match[] = {
+--- a/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-wsa2-macro.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-wsa2-macro.c
+@@ -10,6 +10,7 @@
+ #include <linux/clk.h>
+ #include <linux/thermal.h>
+ #include <linux/pm_runtime.h>
++#include <linux/wait.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dapm.h>
+ #include <sound/pcm_params.h>
+@@ -196,9 +197,9 @@
+ static int lpass_cdc_wsa2_macro_hw_params(struct snd_pcm_substream *substream,
+ 			       struct snd_pcm_hw_params *params,
+ 			       struct snd_soc_dai *dai);
+-static int lpass_cdc_wsa2_macro_get_channel_map(struct snd_soc_dai *dai,
+-				unsigned int *tx_num, unsigned int *tx_slot,
+-				unsigned int *rx_num, unsigned int *rx_slot);
++static int lpass_cdc_wsa2_macro_get_channel_map(const struct snd_soc_dai *dai,
++						unsigned int *tx_num, unsigned int *tx_slot,
++						unsigned int *rx_num, unsigned int *rx_slot);
+ static int lpass_cdc_wsa2_macro_mute_stream(struct snd_soc_dai *dai, int mute, int stream);
+ 
+ #define LPASS_CDC_WSA2_MACRO_VTH_TO_REG(vth) ((vth) == 0 ? 255 : (vth))
+@@ -260,7 +261,6 @@
+  * @swr_clk_lock: to lock swr master clock operations
+  * @swr_ctrl_data: SoundWire data structure
+  * @swr_plat_data: Soundwire platform data
+- * @lpass_cdc_wsa2_macro_add_child_devices_work: work for adding child devices
+  * @wsa2_swr_gpio_p: used by pinctrl API
+  * @component: codec handle
+  * @rx_0_count: RX0 interpolation users
+@@ -286,9 +286,14 @@
+ 	unsigned int vi_feed_value;
+ 	struct mutex mclk_lock;
+ 	struct mutex swr_clk_lock;
++	/* Serialize controller publication and notification references. */
++	struct mutex swr_ctrl_lock;
++	wait_queue_head_t swr_ctrl_wait;
++	unsigned int swr_ctrl_users;
++	/* Drain cooling register I/O before releasing the component. */
++	struct mutex component_lock;
+ 	struct lpass_cdc_wsa2_macro_swr_ctrl_data *swr_ctrl_data;
+ 	struct lpass_cdc_wsa2_macro_swr_ctrl_platform_data swr_plat_data;
+-	struct work_struct lpass_cdc_wsa2_macro_add_child_devices_work;
+ 	struct device_node *wsa2_swr_gpio_p;
+ 	struct snd_soc_component *component;
+ 	int rx_0_count;
+@@ -300,7 +305,7 @@
+ 	char __iomem *wsa2_io_base;
+ 	struct platform_device *pdev_child_devices
+ 			[LPASS_CDC_WSA2_MACRO_CHILD_DEVICES_MAX];
+-	int child_count;
++	unsigned int child_count;
+ 	int wsa2_spkrrecv;
+ 	int spkr_gain_offset;
+ 	int spkr_mode;
+@@ -569,6 +574,33 @@
+ 	return true;
+ }
+ 
++static int lpass_cdc_wsa2_macro_notify_swr(struct lpass_cdc_wsa2_macro_priv *wsa2_priv,
++					   u32 event, void *data)
++{
++	struct platform_device *target;
++	int ret;
++
++	mutex_lock(&wsa2_priv->swr_ctrl_lock);
++	if (!wsa2_priv->swr_ctrl_data) {
++		mutex_unlock(&wsa2_priv->swr_ctrl_lock);
++		return 0;
++	}
++	if (wsa2_priv->swr_ctrl_users == UINT_MAX) {
++		mutex_unlock(&wsa2_priv->swr_ctrl_lock);
++		return -EOVERFLOW;
++	}
++	target = wsa2_priv->swr_ctrl_data[0].wsa2_swr_pdev;
++	wsa2_priv->swr_ctrl_users++;
++	mutex_unlock(&wsa2_priv->swr_ctrl_lock);
++	/* Controller callbacks may reenter this macro. */
++	ret = swrm_wcd_notify(target, event, data);
++	mutex_lock(&wsa2_priv->swr_ctrl_lock);
++	if (!--wsa2_priv->swr_ctrl_users)
++		wake_up_all(&wsa2_priv->swr_ctrl_wait);
++	mutex_unlock(&wsa2_priv->swr_ctrl_lock);
++	return ret;
++}
++
+ static int lpass_cdc_wsa2_macro_set_port_map(struct snd_soc_component *component,
+ 				u32 usecase, u32 size, void *data)
+ {
+@@ -585,10 +617,7 @@
+ 	port_cfg.size = size;
+ 	port_cfg.params = data;
+ 
+-	if (wsa2_priv->swr_ctrl_data)
+-		ret = swrm_wcd_notify(
+-			wsa2_priv->swr_ctrl_data[0].wsa2_swr_pdev,
+-			SWR_SET_PORT_MAP, &port_cfg);
++	ret = lpass_cdc_wsa2_macro_notify_swr(wsa2_priv, SWR_SET_PORT_MAP, &port_cfg);
+ 
+ 	return ret;
+ }
+@@ -831,9 +860,9 @@
+ 	return 0;
+ }
+ 
+-static int lpass_cdc_wsa2_macro_get_channel_map(struct snd_soc_dai *dai,
+-				unsigned int *tx_num, unsigned int *tx_slot,
+-				unsigned int *rx_num, unsigned int *rx_slot)
++static int lpass_cdc_wsa2_macro_get_channel_map(const struct snd_soc_dai *dai,
++						unsigned int *tx_num, unsigned int *tx_slot,
++						unsigned int *rx_num, unsigned int *rx_slot)
+ {
+ 	struct snd_soc_component *component = dai->component;
+ 	struct device *wsa2_dev = NULL;
+@@ -1145,11 +1174,7 @@
+ 	switch (event) {
+ 	case LPASS_CDC_MACRO_EVT_SSR_DOWN:
+ 		wsa2_priv->pre_dev_up = false;
+-		if (wsa2_priv->swr_ctrl_data) {
+-			swrm_wcd_notify(
+-				wsa2_priv->swr_ctrl_data[0].wsa2_swr_pdev,
+-				SWR_DEVICE_SSR_DOWN, NULL);
+-		}
++		lpass_cdc_wsa2_macro_notify_swr(wsa2_priv, SWR_DEVICE_SSR_DOWN, NULL);
+ 		if ((!pm_runtime_enabled(wsa2_dev) ||
+ 		     !pm_runtime_suspended(wsa2_dev))) {
+ 			ret = lpass_cdc_runtime_suspend(wsa2_dev);
+@@ -1166,10 +1191,7 @@
+ 		wsa2_priv->pre_dev_up = true;
+ 		/* reset swr after ssr/pdr */
+ 		wsa2_priv->reset_swr = true;
+-		if (wsa2_priv->swr_ctrl_data)
+-			swrm_wcd_notify(
+-				wsa2_priv->swr_ctrl_data[0].wsa2_swr_pdev,
+-				SWR_DEVICE_SSR_UP, NULL);
++		lpass_cdc_wsa2_macro_notify_swr(wsa2_priv, SWR_DEVICE_SSR_UP, NULL);
+ 		break;
+ 	case LPASS_CDC_MACRO_EVT_CLK_RESET:
+ 		lpass_cdc_rsc_clk_reset(wsa2_dev, WSA2_CORE_CLK);
+@@ -1393,11 +1415,7 @@
+ 			wsa2_priv->rx_1_count++;
+ 		ch_cnt = wsa2_priv->rx_0_count + wsa2_priv->rx_1_count;
+ 
+-		if (wsa2_priv->swr_ctrl_data) {
+-			swrm_wcd_notify(
+-				wsa2_priv->swr_ctrl_data[0].wsa2_swr_pdev,
+-				SWR_DEVICE_UP, NULL);
+-		}
++		lpass_cdc_wsa2_macro_notify_swr(wsa2_priv, SWR_DEVICE_UP, NULL);
+ 		break;
+ 	case SND_SOC_DAPM_POST_PMD:
+ 		if (!(strnstr(w->name, "RX0", sizeof("WSA2_RX0"))) &&
+@@ -3684,7 +3702,7 @@
+ 		pr_err_ratelimited("%s: cdev->devdata is NULL\n", __func__);
+ 		return -EINVAL;
+ 	}
+-	*state = wsa2_priv->thermal_cur_state;
++	*state = READ_ONCE(wsa2_priv->thermal_cur_state);
+ 
+ 	pr_debug("%s: thermal current state:%lu\n", __func__, *state);
+ 	return 0;
+@@ -3702,7 +3720,7 @@
+ 	}
+ 
+ 	if (state <= wsa2_priv->thermal_max_state) {
+-		wsa2_priv->thermal_cur_state = state;
++		WRITE_ONCE(wsa2_priv->thermal_cur_state, state);
+ 	} else {
+ 		dev_err_ratelimited(wsa2_priv->dev,
+ 			"%s: incorrect requested state:%lu\n",
+@@ -3787,7 +3805,9 @@
+ 	snd_soc_dapm_ignore_suspend(dapm, "WSA2_TX DEC1_INP");
+ 	snd_soc_dapm_sync(dapm);
+ 
++	mutex_lock(&wsa2_priv->component_lock);
+ 	wsa2_priv->component = component;
++	mutex_unlock(&wsa2_priv->component_lock);
+ 	wsa2_priv->spkr_gain_offset = LPASS_CDC_WSA2_MACRO_GAIN_OFFSET_0_DB;
+ 	lpass_cdc_wsa2_macro_init_reg(component);
+ 
+@@ -3802,177 +3822,141 @@
+ 	if (!lpass_cdc_wsa2_macro_get_data(component, &wsa2_dev, &wsa2_priv, __func__))
+ 		return -EINVAL;
+ 
++	mutex_lock(&wsa2_priv->component_lock);
+ 	wsa2_priv->component = NULL;
+-
+-	return 0;
+-}
+-
+-static void lpass_cdc_wsa2_macro_add_child_devices(struct work_struct *work)
+-{
+-	struct lpass_cdc_wsa2_macro_priv *wsa2_priv;
++	mutex_unlock(&wsa2_priv->component_lock);
++	cancel_work_sync(&wsa2_priv->lpass_cdc_wsa2_macro_cooling_work);
++
++	return 0;
++}
++
++static void lpass_cdc_wsa2_macro_remove_child_devices(struct lpass_cdc_wsa2_macro_priv *wsa2_priv)
++{
++	struct lpass_cdc_wsa2_macro_swr_ctrl_data *controllers;
++	struct platform_device *child;
++
++	mutex_lock(&wsa2_priv->swr_ctrl_lock);
++	controllers = wsa2_priv->swr_ctrl_data;
++	wsa2_priv->swr_ctrl_data = NULL;
++	mutex_unlock(&wsa2_priv->swr_ctrl_lock);
++	wait_event(wsa2_priv->swr_ctrl_wait, !READ_ONCE(wsa2_priv->swr_ctrl_users));
++	/* Wait for the last notifier to finish its unlock tail. */
++	mutex_lock(&wsa2_priv->swr_ctrl_lock);
++	mutex_unlock(&wsa2_priv->swr_ctrl_lock);
++	while (wsa2_priv->child_count) {
++		child = wsa2_priv->pdev_child_devices[--wsa2_priv->child_count];
++		wsa2_priv->pdev_child_devices[wsa2_priv->child_count] = NULL;
++		platform_device_unregister(child);
++	}
++	kfree(controllers);
++}
++
++static int lpass_cdc_wsa2_macro_add_child_devices(struct lpass_cdc_wsa2_macro_priv *wsa2_priv)
++{
++	struct lpass_cdc_wsa2_macro_swr_ctrl_data *controllers;
+ 	struct platform_device *pdev;
+ 	struct device_node *node;
+-	struct lpass_cdc_wsa2_macro_swr_ctrl_data *swr_ctrl_data = NULL, *temp;
++	unsigned int count = 0, ctrl_num = 0;
++	char name[LPASS_CDC_WSA2_MACRO_SWR_STRING_LEN];
++	bool swr_master;
+ 	int ret;
+-	u16 count = 0, ctrl_num = 0;
+-	struct lpass_cdc_wsa2_macro_swr_ctrl_platform_data *platdata;
+-	char plat_dev_name[LPASS_CDC_WSA2_MACRO_SWR_STRING_LEN];
+-
+-	wsa2_priv = container_of(work, struct lpass_cdc_wsa2_macro_priv,
+-			     lpass_cdc_wsa2_macro_add_child_devices_work);
+-	if (!wsa2_priv) {
+-		pr_err("%s: Memory for wsa2_priv does not exist\n",
+-			__func__);
+-		return;
+-	}
+-	if (!wsa2_priv->dev || !wsa2_priv->dev->of_node) {
+-		dev_err(wsa2_priv->dev,
+-			"%s: DT node for wsa2_priv does not exist\n", __func__);
+-		return;
+-	}
+-
+-	platdata = &wsa2_priv->swr_plat_data;
+-	wsa2_priv->child_count = 0;
+ 
+ 	for_each_available_child_of_node(wsa2_priv->dev->of_node, node) {
+-		if (strnstr(node->name, "wsa2_swr_master",
+-				strlen("wsa2_swr_master")) != NULL)
+-			strscpy(plat_dev_name, "wsa2_swr_ctrl",
+-				(LPASS_CDC_WSA2_MACRO_SWR_STRING_LEN - 1));
+-		else if (strnstr(node->name, "msm_cdc_pinctrl",
+-				 strlen("msm_cdc_pinctrl")) != NULL)
+-			strscpy(plat_dev_name, node->name,
+-				(LPASS_CDC_WSA2_MACRO_SWR_STRING_LEN - 1));
+-		else
++		if (strnstr(node->name, "wsa2_swr_master", strlen("wsa2_swr_master")) ||
++		    strnstr(node->name, "msm_cdc_pinctrl", strlen("msm_cdc_pinctrl")))
++			count++;
++	}
++	if (!count)
++		return 0;
++	if (count > LPASS_CDC_WSA2_MACRO_CHILD_DEVICES_MAX)
++		return -EOVERFLOW;
++	controllers = kcalloc(count, sizeof(*controllers), GFP_KERNEL);
++	if (!controllers)
++		return -ENOMEM;
++
++	for_each_available_child_of_node(wsa2_priv->dev->of_node, node) {
++		swr_master = strnstr(node->name, "wsa2_swr_master", strlen("wsa2_swr_master"));
++		if (!swr_master &&
++		    !strnstr(node->name, "msm_cdc_pinctrl", strlen("msm_cdc_pinctrl")))
+ 			continue;
+-
+-		pdev = platform_device_alloc(plat_dev_name, -1);
++		if (wsa2_priv->child_count >= count) {
++			ret = -EOVERFLOW;
++			goto rollback;
++		}
++		strscpy(name, swr_master ? "wsa2_swr_ctrl" : node->name,
++			LPASS_CDC_WSA2_MACRO_SWR_STRING_LEN - 1);
++		pdev = platform_device_alloc(name, -1);
+ 		if (!pdev) {
+-			dev_err(wsa2_priv->dev, "%s: pdev memory alloc failed\n",
+-				__func__);
+ 			ret = -ENOMEM;
+-			goto err;
++			goto rollback;
+ 		}
+ 		pdev->dev.parent = wsa2_priv->dev;
+-		pdev->dev.of_node = node;
+-
+-		if (strnstr(node->name, "wsa2_swr_master",
+-				strlen("wsa2_swr_master")) != NULL) {
+-			ret = platform_device_add_data(pdev, platdata,
+-						       sizeof(*platdata));
+-			if (ret) {
+-				dev_err(&pdev->dev,
+-					"%s: cannot add plat data ctrl:%d\n",
+-					__func__, ctrl_num);
+-				goto fail_pdev_add;
+-			}
+-
+-			temp = krealloc(swr_ctrl_data,
+-					(ctrl_num + 1) * sizeof(
+-					struct lpass_cdc_wsa2_macro_swr_ctrl_data),
+-					GFP_KERNEL);
+-			if (!temp) {
+-				dev_err(&pdev->dev, "out of memory\n");
+-				ret = -ENOMEM;
+-				goto fail_pdev_add;
+-			}
+-			swr_ctrl_data = temp;
+-			swr_ctrl_data[ctrl_num].wsa2_swr_pdev = pdev;
+-			ctrl_num++;
+-			dev_dbg(&pdev->dev,
+-				"%s: Adding soundwire ctrl device(s)\n",
+-				__func__);
+-			wsa2_priv->swr_ctrl_data = swr_ctrl_data;
+-		}
+-
++		pdev->dev.of_node = of_node_get(node);
++		if (swr_master) {
++			ret = platform_device_add_data(pdev, &wsa2_priv->swr_plat_data,
++						       sizeof(wsa2_priv->swr_plat_data));
++			if (ret)
++				goto put_device;
++		}
+ 		ret = platform_device_add(pdev);
+-		if (ret) {
+-			dev_err(&pdev->dev,
+-				"%s: Cannot add platform device\n",
+-				__func__);
+-			goto fail_pdev_add;
+-		}
+-
+-		if (wsa2_priv->child_count < LPASS_CDC_WSA2_MACRO_CHILD_DEVICES_MAX)
+-			wsa2_priv->pdev_child_devices[
+-					wsa2_priv->child_count++] = pdev;
+-		else
+-			goto err;
+-	}
+-
+-	return;
+-fail_pdev_add:
+-	for (count = 0; count < wsa2_priv->child_count; count++)
+-		platform_device_put(wsa2_priv->pdev_child_devices[count]);
+-err:
+-	return;
++		if (ret)
++			goto put_device;
++		wsa2_priv->pdev_child_devices[wsa2_priv->child_count++] = pdev;
++		if (swr_master)
++			controllers[ctrl_num++].wsa2_swr_pdev = pdev;
++	}
++	if (ctrl_num) {
++		mutex_lock(&wsa2_priv->swr_ctrl_lock);
++		wsa2_priv->swr_ctrl_data = controllers;
++		mutex_unlock(&wsa2_priv->swr_ctrl_lock);
++	} else {
++		kfree(controllers);
++	}
++	return 0;
++
++put_device:
++	platform_device_put(pdev);
++rollback:
++	of_node_put(node);
++	lpass_cdc_wsa2_macro_remove_child_devices(wsa2_priv);
++	kfree(controllers);
++	return ret;
+ }
+ 
+ static void lpass_cdc_wsa2_macro_cooling_adjust_gain(struct work_struct *work)
+ {
+-	struct lpass_cdc_wsa2_macro_priv *wsa2_priv;
+-	u8 gain = 0;
+-
+-	wsa2_priv = container_of(work, struct lpass_cdc_wsa2_macro_priv,
+-			     lpass_cdc_wsa2_macro_cooling_work);
+-	if (!wsa2_priv) {
+-		pr_err("%s: priv is null for macro!\n",
+-			__func__);
+-		return;
+-	}
+-	if (!wsa2_priv->dev || !wsa2_priv->dev->of_node) {
+-		dev_err(wsa2_priv->dev,
+-			"%s: DT node for wsa2_priv does not exist\n", __func__);
+-		return;
+-	}
+-
+-	/* Only adjust the volume when WSA2 clock is enabled */
+-	if (wsa2_priv->dapm_mclk_enable) {
+-		gain = (u8)(wsa2_priv->rx0_origin_gain -
+-				wsa2_priv->thermal_cur_state);
+-		snd_soc_component_update_bits(wsa2_priv->component,
+-			LPASS_CDC_WSA2_RX0_RX_VOL_CTL, 0xFF, gain);
+-		dev_dbg(wsa2_priv->dev,
+-			"%s: RX0 current thermal state: %d, "
+-			"adjusted gain: %#x\n",
+-			__func__, wsa2_priv->thermal_cur_state, gain);
+-
+-		gain = (u8)(wsa2_priv->rx1_origin_gain -
+-				wsa2_priv->thermal_cur_state);
+-		snd_soc_component_update_bits(wsa2_priv->component,
+-			LPASS_CDC_WSA2_RX1_RX_VOL_CTL, 0xFF, gain);
+-		dev_dbg(wsa2_priv->dev,
+-			"%s: RX1 current thermal state: %d, "
+-			"adjusted gain: %#x\n",
+-			__func__, wsa2_priv->thermal_cur_state, gain);
+-	}
+-
+-	return;
++	struct lpass_cdc_wsa2_macro_priv *wsa2_priv = container_of(work,
++		struct lpass_cdc_wsa2_macro_priv, lpass_cdc_wsa2_macro_cooling_work);
++	struct snd_soc_component *component;
++	u32 state;
++	u8 gain;
++
++	mutex_lock(&wsa2_priv->component_lock);
++	component = wsa2_priv->component;
++	if (!component || !wsa2_priv->dapm_mclk_enable)
++		goto unlock;
++	state = READ_ONCE(wsa2_priv->thermal_cur_state);
++	gain = (u8)(wsa2_priv->rx0_origin_gain - state);
++	snd_soc_component_update_bits(component,
++				      LPASS_CDC_WSA2_RX0_RX_VOL_CTL, 0xFF, gain);
++	gain = (u8)(wsa2_priv->rx1_origin_gain - state);
++	snd_soc_component_update_bits(component,
++				      LPASS_CDC_WSA2_RX1_RX_VOL_CTL, 0xFF, gain);
++unlock:
++	mutex_unlock(&wsa2_priv->component_lock);
+ }
+ 
+ static int lpass_cdc_wsa2_macro_read_array(struct platform_device *pdev,
+-					  const char *name, int num_values,
+-					  u32 *output)
+-{
+-	u32 len, ret, size;
+-
+-	if (!of_find_property(pdev->dev.of_node, name, &size)) {
+-		dev_info(&pdev->dev, "%s: missing %s\n", __func__, name);
++				     const char *name, int num_values, u32 *output)
++{
++	int size;
++
++	if (!of_find_property(pdev->dev.of_node, name, &size))
+ 		return 0;
+-	}
+-
+-	len = size / sizeof(u32);
+-	if (len != num_values) {
+-		dev_info(&pdev->dev, "%s: invalid number of %s\n", __func__, name);
+-		return -EINVAL;
+-	}
+-
+-	ret = of_property_read_u32_array(pdev->dev.of_node, name, output, len);
+-	if (ret)
+-		dev_info(&pdev->dev, "%s: Failed to read %s\n", __func__, name);
+-
+-	return 0;
+-
++	if (size != num_values * (int)sizeof(*output))
++		return -EINVAL;
++	return of_property_read_u32_array(pdev->dev.of_node, name, output,
++					  num_values);
+ }
+ 
+ static void lpass_cdc_wsa2_macro_init_ops(struct macro_ops *ops,
+@@ -3988,6 +3972,11 @@
+ 	ops->set_port_map = lpass_cdc_wsa2_macro_set_port_map;
+ }
+ 
++static void lpass_cdc_wsa2_macro_put_node(void *node)
++{
++	of_node_put(node);
++}
++
+ static int lpass_cdc_wsa2_macro_probe(struct platform_device *pdev)
+ {
+ 	struct macro_ops ops;
+@@ -4026,9 +4015,12 @@
+ 			__func__, "wsa_data_fs_ctl_reg");
+ 	}
+ 
+-	if (!wsa2_priv->wsa2_fs_reg_base && wsa2_priv->wsa2_fs_ctl_reg)
++	if (wsa2_priv->wsa2_fs_ctl_reg) {
+ 		wsa2_priv->wsa2_fs_reg_base = devm_ioremap(&pdev->dev,
+ 			wsa2_priv->wsa2_fs_ctl_reg, LPASS_CDC_WSA2_MACRO_MAX_OFFSET);
++		if (!wsa2_priv->wsa2_fs_reg_base)
++			return -ENOMEM;
++	}
+ 
+ 	if (of_find_property(pdev->dev.of_node, is_used_wsa2_swr_gpio_dt,
+ 			     NULL)) {
+@@ -4043,6 +4035,12 @@
+ 	}
+ 	wsa2_priv->wsa2_swr_gpio_p = of_parse_phandle(pdev->dev.of_node,
+ 					"qcom,wsa2-swr-gpios", 0);
++	if (wsa2_priv->wsa2_swr_gpio_p) {
++		ret = devm_add_action_or_reset(&pdev->dev, lpass_cdc_wsa2_macro_put_node,
++					       wsa2_priv->wsa2_swr_gpio_p);
++		if (ret)
++			return ret;
++	}
+ 	if (!wsa2_priv->wsa2_swr_gpio_p && is_used_wsa2_swr_gpio) {
+ 		dev_err(&pdev->dev, "%s: swr_gpios handle not provided!\n",
+ 			__func__);
+@@ -4064,18 +4062,24 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	lpass_cdc_wsa2_macro_read_array(pdev, "qcom,wsa-rloads",
+-		LPASS_CDC_WSA2_MACRO_RX1 + 1, wsa2_priv->wsa2_rload);
+-	lpass_cdc_wsa2_macro_read_array(pdev, "qcom,wsa-system-gains",
+-		2 * (LPASS_CDC_WSA2_MACRO_RX1 + 1), wsa2_priv->wsa2_sys_gain);
+-	lpass_cdc_wsa2_macro_read_array(pdev, "qcom,wsa-bat-cfgs",
+-		LPASS_CDC_WSA2_MACRO_RX1 + 1, wsa2_priv->wsa2_bat_cfg);
++	ret = lpass_cdc_wsa2_macro_read_array(pdev, "qcom,wsa-rloads",
++					      LPASS_CDC_WSA2_MACRO_RX1 + 1, wsa2_priv->wsa2_rload);
++	if (ret)
++		return ret;
++	ret = lpass_cdc_wsa2_macro_read_array(pdev, "qcom,wsa-system-gains",
++					      2 * (LPASS_CDC_WSA2_MACRO_RX1 + 1),
++					      wsa2_priv->wsa2_sys_gain);
++	if (ret)
++		return ret;
++	ret = lpass_cdc_wsa2_macro_read_array(pdev, "qcom,wsa-bat-cfgs",
++					      LPASS_CDC_WSA2_MACRO_RX1 + 1,
++					      wsa2_priv->wsa2_bat_cfg);
++	if (ret)
++		return ret;
+ 
+ 
+ 	wsa2_priv->wsa2_io_base = wsa2_io_base;
+ 	wsa2_priv->reset_swr = true;
+-	INIT_WORK(&wsa2_priv->lpass_cdc_wsa2_macro_add_child_devices_work,
+-		  lpass_cdc_wsa2_macro_add_child_devices);
+ 	INIT_WORK(&wsa2_priv->lpass_cdc_wsa2_macro_cooling_work,
+ 		  lpass_cdc_wsa2_macro_cooling_adjust_gain);
+ 	wsa2_priv->swr_plat_data.handle = (void *) wsa2_priv;
+@@ -4099,14 +4103,37 @@
+ 	dev_set_drvdata(&pdev->dev, wsa2_priv);
+ 	mutex_init(&wsa2_priv->mclk_lock);
+ 	mutex_init(&wsa2_priv->swr_clk_lock);
++	mutex_init(&wsa2_priv->swr_ctrl_lock);
++	mutex_init(&wsa2_priv->component_lock);
++	init_waitqueue_head(&wsa2_priv->swr_ctrl_wait);
++	ret = of_property_read_u32(pdev->dev.of_node,
++				   "qcom,noise-gate-mode", &noise_gate_mode);
++	if (ret) {
++		dev_info(&pdev->dev, "%s: could not find %s entry in dt\n",
++			 __func__, "qcom,noise-gate-mode");
++		wsa2_priv->noise_gate_mode = IDLE_DETECT;
++	} else {
++		if (noise_gate_mode >= IDLE_DETECT && noise_gate_mode <= NG3)
++			wsa2_priv->noise_gate_mode = noise_gate_mode;
++		else
++			wsa2_priv->noise_gate_mode = IDLE_DETECT;
++	}
++
+ 	lpass_cdc_wsa2_macro_init_ops(&ops, wsa2_io_base);
+ 	ops.clk_id_req = wsa2_priv->default_clk_id;
+ 	ops.default_clk_id = wsa2_priv->default_clk_id;
+ 
++	pm_runtime_set_autosuspend_delay(&pdev->dev, AUTO_SUSPEND_DELAY);
++	pm_runtime_use_autosuspend(&pdev->dev);
++	ret = pm_runtime_set_suspended(&pdev->dev);
++	if (ret)
++		goto destroy_locks;
++	pm_suspend_ignore_children(&pdev->dev, true);
++	pm_runtime_enable(&pdev->dev);
+ 	ret = lpass_cdc_register_macro(&pdev->dev, WSA2_MACRO, &ops);
+ 	if (ret < 0) {
+ 		dev_err(&pdev->dev, "%s: register macro failed\n", __func__);
+-		goto reg_macro_fail;
++		goto disable_pm;
+ 	}
+ 
+ 	if (of_find_property(wsa2_priv->dev->of_node, "#cooling-cells", NULL)) {
+@@ -4121,68 +4148,61 @@
+ 		} else {
+ 			wsa2_priv->thermal_max_state = thermal_max_state;
+ 		}
+-		wsa2_priv->tcdev = devm_thermal_of_cooling_device_register(
+-						&pdev->dev,
+-						wsa2_priv->dev->of_node,
+-						"wsa2", wsa2_priv,
+-						&wsa2_cooling_ops);
++		wsa2_priv->tcdev = thermal_of_cooling_device_register(wsa2_priv->dev->of_node,
++								      "wsa2", wsa2_priv,
++								      &wsa2_cooling_ops);
+ 		if (IS_ERR(wsa2_priv->tcdev)) {
+ 			dev_err(&pdev->dev,
+ 				"%s: failed to register wsa2 macro as cooling device\n",
+ 				__func__);
++			ret = PTR_ERR(wsa2_priv->tcdev);
+ 			wsa2_priv->tcdev = NULL;
+-		}
+-	}
+-
+-	ret = of_property_read_u32(pdev->dev.of_node,
+-				"qcom,noise-gate-mode", &noise_gate_mode);
+-	if (ret) {
+-		dev_info(&pdev->dev, "%s: could not find %s entry in dt\n",
+-			__func__, "qcom,noise-gate-mode");
+-		wsa2_priv->noise_gate_mode = IDLE_DETECT;
+-	} else {
+-		if (noise_gate_mode >= IDLE_DETECT && noise_gate_mode <= NG3)
+-			wsa2_priv->noise_gate_mode = noise_gate_mode;
+-		else
+-			wsa2_priv->noise_gate_mode = IDLE_DETECT;
+-	}
+-
+-	pm_runtime_set_autosuspend_delay(&pdev->dev, AUTO_SUSPEND_DELAY);
+-	pm_runtime_use_autosuspend(&pdev->dev);
++			goto unregister_macro;
++		}
++	}
++
++	ret = lpass_cdc_wsa2_macro_add_child_devices(wsa2_priv);
++	if (ret)
++		goto unregister_cooling;
++	return 0;
++
++unregister_cooling:
++	if (wsa2_priv->tcdev)
++		thermal_cooling_device_unregister(wsa2_priv->tcdev);
++	cancel_work_sync(&wsa2_priv->lpass_cdc_wsa2_macro_cooling_work);
++unregister_macro:
++	lpass_cdc_unregister_macro(&pdev->dev, WSA2_MACRO);
++disable_pm:
++	pm_runtime_disable(&pdev->dev);
+ 	pm_runtime_set_suspended(&pdev->dev);
+-	pm_suspend_ignore_children(&pdev->dev, true);
+-	pm_runtime_enable(&pdev->dev);
+-	schedule_work(&wsa2_priv->lpass_cdc_wsa2_macro_add_child_devices_work);
+-	return ret;
+-reg_macro_fail:
++destroy_locks:
++	dev_set_drvdata(&pdev->dev, NULL);
++	mutex_destroy(&wsa2_priv->component_lock);
++	mutex_destroy(&wsa2_priv->swr_ctrl_lock);
+ 	mutex_destroy(&wsa2_priv->mclk_lock);
+ 	mutex_destroy(&wsa2_priv->swr_clk_lock);
+ 	return ret;
+ }
+ 
+-static int lpass_cdc_wsa2_macro_remove(struct platform_device *pdev)
+-{
+-	struct lpass_cdc_wsa2_macro_priv *wsa2_priv;
+-	u16 count = 0;
+-
+-	wsa2_priv = dev_get_drvdata(&pdev->dev);
++static void lpass_cdc_wsa2_macro_remove(struct platform_device *pdev)
++{
++	struct lpass_cdc_wsa2_macro_priv *wsa2_priv = dev_get_drvdata(&pdev->dev);
+ 
+ 	if (!wsa2_priv)
+-		return -EINVAL;
+-
++		return;
+ 	if (wsa2_priv->tcdev)
+ 		thermal_cooling_device_unregister(wsa2_priv->tcdev);
+-
+-	for (count = 0; count < wsa2_priv->child_count &&
+-		count < LPASS_CDC_WSA2_MACRO_CHILD_DEVICES_MAX; count++)
+-		platform_device_unregister(wsa2_priv->pdev_child_devices[count]);
+-
++	cancel_work_sync(&wsa2_priv->lpass_cdc_wsa2_macro_cooling_work);
++	lpass_cdc_wsa2_macro_remove_child_devices(wsa2_priv);
++	/* Parent cleanup may still access the macro's clocks and PM state. */
++	lpass_cdc_unregister_macro(&pdev->dev, WSA2_MACRO);
+ 	pm_runtime_disable(&pdev->dev);
+ 	pm_runtime_set_suspended(&pdev->dev);
+-	lpass_cdc_unregister_macro(&pdev->dev, WSA2_MACRO);
++	dev_set_drvdata(&pdev->dev, NULL);
++	mutex_destroy(&wsa2_priv->component_lock);
++	mutex_destroy(&wsa2_priv->swr_ctrl_lock);
+ 	mutex_destroy(&wsa2_priv->mclk_lock);
+ 	mutex_destroy(&wsa2_priv->swr_clk_lock);
+-	return 0;
+ }
+ 
+ static const struct of_device_id lpass_cdc_wsa2_macro_dt_match[] = {

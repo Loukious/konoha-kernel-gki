@@ -1,0 +1,64 @@
+{
+  "result": "passed",
+  "scenarios": 26,
+  "compiler": "/home/loukious/Android/konoha-android17-6.18-port-20261031/prebuilts/clang/host/linux-x86/clang-r584948c/bin/clang",
+  "sanitizers": [
+    "address",
+    "undefined"
+  ],
+  "functions": {
+    "wcd_mbhc_is_started": "e4c7bfba3eee89f0e973c818ebc22d8b1339acb8fbe0c0609d34e814b0912063",
+    "wcd_mbhc_set_started": "ac531a5d2229c9c2a89aca698e83a94a7b6dc259a604f1d28e1b1df7d567b187",
+    "wcd_mbhc_init_gpio": "dbcb1ed8f772977587911b474d00cd5db5f594c3fb751d7e17fb0db9ce271a4c",
+    "wcd_mbhc_unregister_notifiers": "587f04e143cbb6c2b921556cd9a0c97982a31897c3e51a792702af4abf406d9d",
+    "wcd_mbhc_start": "17cbe044ec32002d847fd3b9d4c6e7f9661034ba696dc584b29e067a5f2d2f50",
+    "wcd_mbhc_stop": "c63b7c144ed6c463de5df8aacc7eafce17d6f4ec7e4c89e11f46d4c3b1d8c04c",
+    "wcd_mbhc_init": "e008fa8c961c3addbf90d0c4e6cc35c098b6b52c830b30bb980bdfa0f612743a",
+    "wcd_mbhc_deinit": "f0649ab1cf48a0dd40aadd741b1c4383e133e01b79af26b3b30a2d381804da73",
+    "wcd_mbhc_mech_plug_detect_irq": "bc4022957282916fe7361da1769f455b199c7fed8962e66457c45dee61fafa83",
+    "wcd_mbhc_fw_read": "e6bc86c4239f47980f7d80bab3ae29b2a0c50c4665c3590ca7f4b4ed8c0ab948",
+    "wcd_schedule_hs_detect_plug": "2cc0d57ddeaa44ff14b411ba69906efc1a8d89cfd526849d5b703f8b89447343",
+    "wcd_cancel_hs_detect_plug": "1ab8fa5503ce6aa5b29546f4f960b2fc4ee7cac4f8a43e4f764758c1507ff52a"
+  },
+  "negative_controls": {
+    "pending-firmware-not-cancelled": {
+      "result": "compiled and rejected",
+      "diagnostic": "test: /tmp/mbhc-lifecycle-tv7g4ntx/test.c:1084: int main(void): Assertion `cancel_fw && cancel_btn && cancel_detect' failed."
+    },
+    "no-enqueue-gate": {
+      "result": "compiled and rejected",
+      "diagnostic": "test: /tmp/mbhc-lifecycle-tv7g4ntx/test.c:239: int notifier_stub(struct wcd_mbhc *, struct notifier_block *, _Bool): Assertion `!m->correct_plug_swch.pending' failed."
+    },
+    "extcon-error-lost": {
+      "result": "compiled and rejected",
+      "diagnostic": "test: /tmp/mbhc-lifecycle-tv7g4ntx/test.c:1057: int main(void): Assertion `init(&m)==expected' failed."
+    },
+    "failed-init-notifier-leak": {
+      "result": "compiled and rejected",
+      "diagnostic": "test: /tmp/mbhc-lifecycle-tv7g4ntx/test.c:1039: void clean(struct wcd_mbhc *): Assertion `!codec_notifier && !usb_notifier && !wake_votes' failed."
+    },
+    "usbss-failure-not-unregistered": {
+      "result": "compiled and rejected",
+      "diagnostic": "test: /tmp/mbhc-lifecycle-tv7g4ntx/test.c:280: int cancel_delayed_work_sync(struct delayed_work *): Assertion `!cur->mbhc_started && !codec_notifier && !usb_notifier' failed."
+    },
+    "calibration-not-restored": {
+      "result": "compiled and rejected",
+      "diagnostic": "test: /tmp/mbhc-lifecycle-tv7g4ntx/test.c:294: void release_firmware(const struct firmware *): Assertion `cur->mbhc_cfg->calibration!=fw->data' failed."
+    },
+    "duplicate-wake-vote": {
+      "result": "compiled and rejected",
+      "diagnostic": "test: /tmp/mbhc-lifecycle-tv7g4ntx/test.c:1116: int main(void): Assertion `wake_votes==1' failed."
+    },
+    "mechanical-irq-before-start": {
+      "result": "compiled and rejected",
+      "diagnostic": "/tmp/mbhc-lifecycle-tv7g4ntx/test.c:888:22: runtime error: member access within null pointer of type 'struct wcd_mbhc_config'"
+    }
+  },
+  "source_sha256": {
+    "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx_audio_codec_support/qcom/opensource/audio-kernel/asoc/codecs/wcd-mbhc-v2.c": "c518031fc50df24050986f741232a137b7e7e31c250d8214860e9ba89d763601",
+    "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx_audio_codec_support/qcom/opensource/audio-kernel/asoc/codecs/wcd-mbhc-adc.c": "7bc86402bf653e343a6d2ada33ef87286d4fbbe25b81cac4f300d47e6e46fd5e",
+    "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx_audio_codec_support/qcom/opensource/audio-kernel/include/asoc/wcd-mbhc-v2.h": "0738c84da715d72bf4a29ffd2b0a6cd32fd2a41f10972bd2556f7e831bb5c3d5"
+  },
+  "harness_sha256": "60335001a68bae9e949292944b0997ba4849a9d2e78c4d0422380ec7caa9e9e8",
+  "limits": "Extracted production lifecycle functions with mocked IRQ/notifier/workqueue, ALSA/extcon, DT and firmware services. Mechanical IRQ entry and ADC scheduling/cancellation execute; other IRQ handlers, analog hardware helpers and detection algorithm are mocked. Lifecycle entrypoints require serialization by the codec owner. No complete kernel execution, physical audio, concurrent IRQ/DSP or provider-removal validation."
+}
