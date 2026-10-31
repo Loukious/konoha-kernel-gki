@@ -73,7 +73,8 @@ def main():
     inputs = artifacts / "inputs"
     inputs.mkdir()
     for name in ["sources.json", "imports.json", "onyx-port.xml", "dependency-lock.xml",
-                 "BUILD.bazel", "Kconfig", "scm_defconfig", "platform_defconfig", "modules.json"]:
+                 "BUILD.bazel", "Kconfig", "scm_defconfig", "platform_defconfig", "modules.json",
+                 "build.py", "prepare.py", "stage.py", "verify_modules.py"]:
         shutil.copyfile(HERE / name, inputs / name)
     shutil.copytree(HERE / "patches", inputs / "patches")
     shutil.copyfile(workspace / "onyx/.staged-files.json", inputs / "staged-files.json")

@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 31 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 45 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,9 +35,10 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 31 platform `.ko` files, their symbol tables and DDK configurations.
+- 45 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
-- A build log and `report.json` with SHA-256 hashes and imported-CRC checks.
+- A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
+  duplicate-provider rejection. The build/staging/verification tools are archived too.
 
 The default Kleaf build uses `6.18.33-android17-5-maybe-dirty-4k` without SCM
 stamping. The common source is clean; exact revisions are recorded separately.
@@ -69,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 1218
-imported symbol CRCs across all 31 modules.
+used. The current [validation report](validation-20261031.json) checks 1523
+imported symbol CRCs across all 45 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -95,6 +96,19 @@ It retains the vendor PLL, RCG, voltage-voting and CRM behavior. Internal helper
 are made static; trace strings and DT iterators use 6.18 interfaces. The critical
 clock walk now keeps node references alive through parent traversal, releases
 parsed clock references on every path, and skips failed phandle parses.
+
+The interconnect group builds the BCM voter, RPMh provider, QoS and debug
+libraries, and the complete Tuna NoC topology. It uses the stock GKI translation
+helper (whose behavior matches the vendor implementation) and its 6.18
+header. The private interconnect core layout also comes from pinned common.
+
+The storage PHY and PMIC group builds the vendor UFS PHY core and Sun PHY
+calibration tables, SPMI SDAM NVMEM, PM8xxx RTC, power-on logs, reboot reasons,
+PON and stub-regulator driver. The reboot-mode library comes from 6.18 common.
+The RTC retains its `rtc_us_val` attribute using device sysfs APIs exported by
+GKI, with managed removal before RTC teardown. Onyx's reboot-reason DT node
+uses the NVMEM cell path; the legacy QPNP power-on fallback remains disabled.
+These PHY outputs do not yet provide a working UFS host controller.
 
 `CONFIG_QCOM_SCM=m` and `CONFIG_QTEE_SHM_BRIDGE=y` are set in the DDK module
 configuration. Common Kconfig also selects `QCOM_TZMEM`; the vendor composite
@@ -128,8 +142,7 @@ changes are captured for later porting; they are not in this initial group.
 
 ## Next implementation gates
 
-1. Complete the Gunyah host/VM, interconnect,
-   IOMMU and storage dependencies needed for Onyx early boot. Test probe
+1. Complete the Gunyah host/VM, IOMMU and UFS host/encryption dependencies needed for Onyx early boot. Test probe
    ordering, GPIO wakeups, SCM wait queues and shared-memory operations.
 2. Port the device trees and remaining first-stage list; produce matching
    vendor_boot, DTBO and DLKM images with complete dependency/load lists.

@@ -1,0 +1,103 @@
+diff --git a/drivers/interconnect/qcom/bcm-voter.c b/drivers/interconnect/qcom/bcm-voter.c
+index 80374e0..b88a060 100644
+--- a/drivers/interconnect/qcom/bcm-voter.c
++++ b/drivers/interconnect/qcom/bcm-voter.c
+@@ -594,7 +594,7 @@ static int qcom_icc_bcm_voter_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
+-static int qcom_icc_bcm_voter_remove(struct platform_device *pdev)
++static void qcom_icc_bcm_voter_remove(struct platform_device *pdev)
+ {
+ 	struct device_node *np = pdev->dev.of_node;
+ 	struct bcm_voter *voter, *temp;
+@@ -607,8 +607,6 @@ static int qcom_icc_bcm_voter_remove(struct platform_device *pdev)
+ 		}
+ 	}
+ 	mutex_unlock(&bcm_voter_lock);
+-
+-	return 0;
+ }
+ 
+ static const struct of_device_id bcm_voter_of_match[] = {
+diff --git a/drivers/interconnect/qcom/icc-debug.c b/drivers/interconnect/qcom/icc-debug.c
+index bee6fb6..ecd7ecb 100644
+--- a/drivers/interconnect/qcom/icc-debug.c
++++ b/drivers/interconnect/qcom/icc-debug.c
+@@ -10,6 +10,7 @@
+ #include <trace/events/power.h>
+ 
+ #include "../internal.h"
++#include "icc-debug.h"
+ 
+ static LIST_HEAD(icc_providers);
+ static DEFINE_MUTEX(debug_lock);
+diff --git a/drivers/interconnect/qcom/icc-rpmh.c b/drivers/interconnect/qcom/icc-rpmh.c
+index 75bb261..2a711cc 100644
+--- a/drivers/interconnect/qcom/icc-rpmh.c
++++ b/drivers/interconnect/qcom/icc-rpmh.c
+@@ -179,7 +179,7 @@ int qcom_icc_get_bw_stub(struct icc_node *node, u32 *avg, u32 *peak)
+ }
+ EXPORT_SYMBOL(qcom_icc_get_bw_stub);
+ 
+-int qcom_icc_get_bw(struct icc_node *node, u32 *avg, u32 *peak)
++static int qcom_icc_get_bw(struct icc_node *node, u32 *avg, u32 *peak)
+ {
+ 	struct qcom_icc_node *qn = node->data;
+ 
+@@ -581,7 +581,7 @@ err_remove_nodes:
+ }
+ EXPORT_SYMBOL_GPL(qcom_icc_rpmh_probe);
+ 
+-int qcom_icc_rpmh_remove(struct platform_device *pdev)
++void qcom_icc_rpmh_remove(struct platform_device *pdev)
+ {
+ 	struct qcom_icc_provider *qp = platform_get_drvdata(pdev);
+ 
+@@ -590,9 +590,8 @@ int qcom_icc_rpmh_remove(struct platform_device *pdev)
+ 
+ 	icc_provider_deregister(&qp->provider);
+ 	icc_nodes_remove(&qp->provider);
+-
+-	return 0;
+ }
+ EXPORT_SYMBOL_GPL(qcom_icc_rpmh_remove);
+ 
++MODULE_DESCRIPTION("Qualcomm RPMh interconnect provider");
+ MODULE_LICENSE("GPL v2");
+diff --git a/drivers/interconnect/qcom/icc-rpmh.h b/drivers/interconnect/qcom/icc-rpmh.h
+index 7b52867..84e8d21 100644
+--- a/drivers/interconnect/qcom/icc-rpmh.h
++++ b/drivers/interconnect/qcom/icc-rpmh.h
+@@ -197,7 +197,7 @@ int qcom_icc_set_stub(struct icc_node *src, struct icc_node *dst);
+ int qcom_icc_bcm_init(struct qcom_icc_provider *qp, struct qcom_icc_bcm *bcm, struct device *dev);
+ void qcom_icc_pre_aggregate(struct icc_node *node);
+ int qcom_icc_rpmh_probe(struct platform_device *pdev);
+-int qcom_icc_rpmh_remove(struct platform_device *pdev);
++void qcom_icc_rpmh_remove(struct platform_device *pdev);
+ int qcom_icc_get_bw_stub(struct icc_node *node, u32 *avg, u32 *peak);
+ int qcom_icc_rpmh_configure_qos(struct qcom_icc_provider *qp);
+ #endif
+diff --git a/drivers/interconnect/qcom/qnoc-qos.c b/drivers/interconnect/qcom/qnoc-qos.c
+index 8cedb71..e8de3f6 100644
+--- a/drivers/interconnect/qcom/qnoc-qos.c
++++ b/drivers/interconnect/qcom/qnoc-qos.c
+@@ -66,4 +66,5 @@ const struct qcom_icc_noc_ops qcom_qnoc4_ops = {
+ };
+ EXPORT_SYMBOL(qcom_qnoc4_ops);
+ 
++MODULE_DESCRIPTION("Qualcomm NoC quality of service");
+ MODULE_LICENSE("GPL");
+diff --git a/drivers/interconnect/qcom/trace.h b/drivers/interconnect/qcom/trace.h
+index 8a67320..4c3c2dd 100644
+--- a/drivers/interconnect/qcom/trace.h
++++ b/drivers/interconnect/qcom/trace.h
+@@ -26,7 +26,7 @@ TRACE_EVENT(bcm_voter_commit,
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(state_name, rpmh_state);
++		__assign_str(state_name);
+ 		__entry->addr = cmd->addr;
+ 		__entry->data = cmd->data;
+ 		__entry->wait = cmd->wait;

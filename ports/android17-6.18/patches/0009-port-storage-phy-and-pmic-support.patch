@@ -1,0 +1,132 @@
+diff --git a/drivers/rtc/rtc-pm8xxx.c b/drivers/rtc/rtc-pm8xxx.c
+index 72e475d..c0a5f29 100644
+--- a/drivers/rtc/rtc-pm8xxx.c
++++ b/drivers/rtc/rtc-pm8xxx.c
+@@ -20,7 +20,7 @@
+ #include <linux/suspend.h>
+ #include <linux/math64.h>
+ 
+-#include <asm/unaligned.h>
++#include <linux/unaligned.h>
+ 
+ /* RTC_CTRL register bit fields */
+ #define PM8xxx_RTC_ENABLE		BIT(7)
+@@ -550,6 +550,13 @@ static const struct of_device_id pm8xxx_id_table[] = {
+ };
+ MODULE_DEVICE_TABLE(of, pm8xxx_id_table);
+ 
++static void pm8xxx_rtc_remove_group(void *data)
++{
++	struct rtc_device *rtc = data;
++
++	device_remove_group(&rtc->dev, &pm8xxx_rtc_group);
++}
++
+ static int pm8xxx_rtc_probe(struct platform_device *pdev)
+ {
+ 	const struct of_device_id *match;
+@@ -607,12 +614,6 @@ static int pm8xxx_rtc_probe(struct platform_device *pdev)
+ 	rtc_dd->rtc->ops = &pm8xxx_rtc_ops;
+ 	rtc_dd->rtc->range_max = U32_MAX;
+ 
+-
+-	rc = rtc_add_group(rtc_dd->rtc, &pm8xxx_rtc_group);
+-	if (rc)
+-		return rc;
+-
+-
+ 	/* Request the alarm IRQ */
+ 	rc = devm_request_any_context_irq(&pdev->dev, rtc_dd->alarm_irq,
+ 					  pm8xxx_alarm_trigger,
+@@ -625,6 +626,16 @@ static int pm8xxx_rtc_probe(struct platform_device *pdev)
+ 	if (rc)
+ 		return rc;
+ 
++	rc = device_add_group(&rtc_dd->rtc->dev, &pm8xxx_rtc_group);
++	if (rc)
++		return rc;
++
++	/* Remove the group before devm unregisters the RTC device. */
++	rc = devm_add_action_or_reset(&pdev->dev, pm8xxx_rtc_remove_group,
++				      rtc_dd->rtc);
++	if (rc)
++		return rc;
++
+ 	rc = dev_pm_set_wake_irq(&pdev->dev, rtc_dd->alarm_irq);
+ 	if (rc)
+ 		return rc;
+@@ -646,7 +657,7 @@ static void pm8xxx_rtc_shutdown(struct platform_device *pdev)
+ 
+ static struct platform_driver pm8xxx_rtc_driver = {
+ 	.probe		= pm8xxx_rtc_probe,
+-	.remove_new	= pm8xxx_remove,
++	.remove		= pm8xxx_remove,
+ 	.driver	= {
+ 		.name		= "rtc-pm8xxx",
+ 		.of_match_table	= pm8xxx_id_table,
+diff --git a/drivers/soc/qcom/pmic-pon-log.c b/drivers/soc/qcom/pmic-pon-log.c
+index 6f04599..19e34ef 100644
+--- a/drivers/soc/qcom/pmic-pon-log.c
++++ b/drivers/soc/qcom/pmic-pon-log.c
+@@ -725,13 +725,11 @@ static int pmic_pon_log_probe(struct platform_device *pdev)
+ 	return ret;
+ }
+ 
+-static int pmic_pon_log_remove(struct platform_device *pdev)
++static void pmic_pon_log_remove(struct platform_device *pdev)
+ {
+ 	struct pmic_pon_log_dev *pon_dev = platform_get_drvdata(pdev);
+ 
+ 	ipc_log_context_destroy(pon_dev->ipc_log);
+-
+-	return 0;
+ }
+ 
+ static const struct of_device_id pmic_pon_log_of_match[] = {
+diff --git a/drivers/power/reset/qcom-reboot-reason.c b/drivers/power/reset/qcom-reboot-reason.c
+index 1eee61e..6a57511 100644
+--- a/drivers/power/reset/qcom-reboot-reason.c
++++ b/drivers/power/reset/qcom-reboot-reason.c
+@@ -139,15 +139,13 @@ static int qcom_reboot_reason_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
+-static int qcom_reboot_reason_remove(struct platform_device *pdev)
++static void qcom_reboot_reason_remove(struct platform_device *pdev)
+ {
+ 	struct qcom_reboot_reason *reboot = platform_get_drvdata(pdev);
+ 
+ 	atomic_notifier_chain_unregister(&panic_notifier_list,
+ 					 &reboot->panic_nb);
+ 	unregister_reboot_notifier(&reboot->reboot_nb);
+-
+-	return 0;
+ }
+ 
+ static const struct of_device_id of_qcom_reboot_reason_match[] = {
+diff --git a/drivers/regulator/stub-regulator.c b/drivers/regulator/stub-regulator.c
+index 08e503f..9486984 100644
+--- a/drivers/regulator/stub-regulator.c
++++ b/drivers/regulator/stub-regulator.c
+@@ -229,7 +229,7 @@ static struct platform_driver regulator_stub_driver = {
+ 	.probe	= regulator_stub_probe,
+ };
+ 
+-int __init regulator_stub_init(void)
++static int __init regulator_stub_init(void)
+ {
+ 	return platform_driver_register(&regulator_stub_driver);
+ }
+diff --git a/include/linux/phy/phy-qcom-ufs.h b/include/linux/phy/phy-qcom-ufs.h
+index f54bc72..b1a4dec 100644
+--- a/include/linux/phy/phy-qcom-ufs.h
++++ b/include/linux/phy/phy-qcom-ufs.h
+@@ -7,7 +7,7 @@
+ #ifndef PHY_QCOM_UFS_H_
+ #define PHY_QCOM_UFS_H_
+ 
+-#include "phy.h"
++#include <linux/phy/phy.h>
+ 
+ void ufs_qcom_phy_ctrl_rx_linecfg(struct phy *generic_phy, bool ctrl);
+ void ufs_qcom_phy_set_tx_lane_enable(struct phy *generic_phy, u32 tx_lanes);

@@ -14,6 +14,7 @@ import subprocess
 
 def verify(modules, symvers, release):
     exports = {}
+    providers = {}
     for path in symvers:
         for line in path.read_text().splitlines():
             fields = line.split()
@@ -22,7 +23,11 @@ def verify(modules, symvers, release):
             crc, name = int(fields[0], 16), fields[1]
             if name in exports and exports[name] != crc:
                 raise ValueError(f"conflicting provider CRCs for {name}")
+            if name in providers and providers[name] != fields[2]:
+                raise ValueError(f"duplicate symbol providers for {name}: "
+                                 f"{providers[name]} and {fields[2]}")
             exports[name] = crc
+            providers[name] = fields[2]
 
     result = []
     for module in modules:

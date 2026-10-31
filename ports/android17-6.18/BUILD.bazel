@@ -414,6 +414,170 @@ ddk_module(
     deps = [":clock_headers", ":platform_headers", ":regulator_headers", ":clk_qcom"],
 )
 
+ddk_headers(
+    name = "interconnect_headers",
+    hdrs = glob([
+        "drivers/interconnect/qcom/*.h",
+        "include/dt-bindings/interconnect/*.h",
+    ]) + ["drivers/interconnect/internal.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "icc_bcm_voter",
+    srcs = ["drivers/interconnect/qcom/bcm-voter.c"],
+    includes = ["drivers/interconnect/qcom"],
+    out = "icc-bcm-voter.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":interconnect_headers", ":platform_headers", ":soc_headers", ":qcom_rpmh", ":crm_v2"],
+)
+
+ddk_module(
+    name = "icc_debug",
+    srcs = ["drivers/interconnect/qcom/icc-debug.c"],
+    includes = ["drivers/interconnect/qcom"],
+    out = "icc-debug.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":interconnect_headers", ":platform_headers", ":soc_headers"],
+)
+
+ddk_module(
+    name = "qnoc_qos",
+    srcs = ["drivers/interconnect/qcom/qnoc-qos.c"],
+    includes = ["drivers/interconnect/qcom"],
+    out = "qnoc-qos.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":interconnect_headers", ":platform_headers", ":soc_headers"],
+)
+
+ddk_module(
+    name = "icc_rpmh",
+    srcs = ["drivers/interconnect/qcom/icc-rpmh.c"],
+    includes = ["drivers/interconnect/qcom"],
+    out = "icc-rpmh.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":interconnect_headers", ":platform_headers", ":soc_headers", ":icc_bcm_voter", ":icc_debug", ":qnoc_qos", ":cmd_db", ":socinfo"],
+)
+
+ddk_module(
+    name = "qnoc_tuna",
+    srcs = ["drivers/interconnect/qcom/tuna.c"],
+    includes = ["drivers/interconnect/qcom"],
+    out = "qnoc-tuna.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":interconnect_headers", ":platform_headers", ":soc_headers", ":icc_rpmh", ":qnoc_qos"],
+)
+
+ddk_headers(
+    name = "storage_pmic_headers",
+    hdrs = glob(["drivers/phy/qualcomm/*.h"]) + [
+        "include/linux/phy/phy-qcom-ufs.h",
+        "include/linux/input/qpnp-power-on.h",
+        "include/dt-bindings/input/qcom,qpnp-power-on.h",
+    ],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "phy_qcom_ufs",
+    srcs = ["drivers/phy/qualcomm/phy-qcom-ufs.c"],
+    out = "phy-qcom-ufs.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":storage_pmic_headers", ":platform_headers", ":regulator_headers"],
+)
+
+ddk_module(
+    name = "phy_qcom_ufs_sun",
+    srcs = ["drivers/phy/qualcomm/phy-qcom-ufs-qmp-v4-sun.c"],
+    out = "phy-qcom-ufs-qmp-v4-sun.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":storage_pmic_headers", ":platform_headers", ":regulator_headers", ":phy_qcom_ufs"],
+)
+
+ddk_module(
+    name = "nvmem_qcom_spmi_sdam",
+    srcs = ["drivers/nvmem/qcom-spmi-sdam.c"],
+    out = "nvmem_qcom-spmi-sdam.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":storage_pmic_headers", ":platform_headers", ":regulator_headers"],
+)
+
+ddk_module(
+    name = "rtc_pm8xxx",
+    srcs = ["drivers/rtc/rtc-pm8xxx.c"],
+    out = "rtc-pm8xxx.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":storage_pmic_headers", ":platform_headers", ":regulator_headers"],
+)
+
+ddk_module(
+    name = "pmic_pon_log",
+    srcs = ["drivers/soc/qcom/pmic-pon-log.c"],
+    out = "pmic-pon-log.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":storage_pmic_headers", ":platform_headers", ":regulator_headers", ":qcom_ipc_logging"],
+)
+
+ddk_module(
+    name = "qcom_reboot_reason",
+    srcs = ["drivers/power/reset/qcom-reboot-reason.c"],
+    out = "qcom-reboot-reason.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":storage_pmic_headers", ":platform_headers", ":regulator_headers"],
+)
+
+ddk_module(
+    name = "qcom_pon",
+    srcs = ["drivers/power/reset/qcom-pon.c"],
+    out = "qcom-pon.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":storage_pmic_headers", ":platform_headers", ":regulator_headers", ":reboot_mode"],
+)
+
+ddk_module(
+    name = "reboot_mode",
+    srcs = ["drivers/power/reset/reboot-mode.c"],
+    out = "reboot-mode.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":storage_pmic_headers", ":platform_headers", ":regulator_headers"],
+)
+
+ddk_module(
+    name = "stub_regulator",
+    srcs = ["drivers/regulator/stub-regulator.c"],
+    out = "stub-regulator.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":storage_pmic_headers", ":platform_headers", ":regulator_headers", ":debug_regulator"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -435,6 +599,20 @@ kernel_module_group(
         ":tcsrcc_tuna",
         ":debugcc_tuna",
         ":evacc_tuna",
+        ":icc_bcm_voter",
+        ":icc_debug",
+        ":qnoc_qos",
+        ":icc_rpmh",
+        ":qnoc_tuna",
+        ":phy_qcom_ufs",
+        ":phy_qcom_ufs_sun",
+        ":nvmem_qcom_spmi_sdam",
+        ":rtc_pm8xxx",
+        ":pmic_pon_log",
+        ":qcom_reboot_reason",
+        ":qcom_pon",
+        ":reboot_mode",
+        ":stub_regulator",
     ],
 )
 
