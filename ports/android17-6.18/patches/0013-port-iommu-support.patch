@@ -1,0 +1,587 @@
+--- a/drivers/iommu/qcom-iommu-util.c
++++ b/drivers/iommu/qcom-iommu-util.c
+@@ -11,6 +11,9 @@
+ 
+ #include <linux/dma-mapping-fast.h>
+ #include <linux/module.h>
++#include <linux/xarray.h>
++#include <linux/srcu.h>
++#include "iommu-priv.h"
+ #include <linux/slab.h>
+ #include <linux/qcom-iommu-util.h>
+ #include <linux/iova.h>
+@@ -18,6 +21,104 @@
+ #include <trace/hooks/iommu.h>
+ #include "qcom-dma-iommu-generic.h"
+ #include "qcom-io-pgtable-alloc.h"
++
++/* Identity and other non-QCOM domains do not embed qcom_iommu_ops. */
++static DEFINE_XARRAY(qcom_iommu_ops_registry);
++
++static struct qcom_iommu_ops *to_qcom_iommu_ops(const struct iommu_domain_ops *ops)
++{
++	return xa_load(&qcom_iommu_ops_registry, (unsigned long)ops);
++}
++
++int register_qcom_iommu_ops(struct qcom_iommu_ops *ops)
++{
++	return xa_insert(&qcom_iommu_ops_registry, (unsigned long)&ops->domain_ops,
++			 ops, GFP_KERNEL);
++}
++EXPORT_SYMBOL_GPL(register_qcom_iommu_ops);
++
++void unregister_qcom_iommu_ops(struct qcom_iommu_ops *ops)
++{
++	xa_erase(&qcom_iommu_ops_registry, (unsigned long)&ops->domain_ops);
++}
++EXPORT_SYMBOL_GPL(unregister_qcom_iommu_ops);
++
++/* 6.18 IOPF handles page requests, not unrecoverable device faults. */
++struct qcom_iommu_device_fault_handler {
++	struct device *dev;
++	qcom_iommu_device_fault_handler_t handler;
++	void *data;
++	struct mutex lock; /* Serializes callbacks for this device. */
++};
++
++static DEFINE_XARRAY(qcom_iommu_device_faults);
++DEFINE_STATIC_SRCU(qcom_iommu_device_fault_srcu);
++
++int qcom_iommu_register_device_fault_handler(struct device *dev,
++					     qcom_iommu_device_fault_handler_t handler, void *data)
++{
++	struct qcom_iommu_device_fault_handler *entry;
++	int ret;
++
++	if (!dev || !dev->iommu || !handler)
++		return -EINVAL;
++
++	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++
++	entry->dev = get_device(dev);
++	entry->handler = handler;
++	entry->data = data;
++	mutex_init(&entry->lock);
++	ret = xa_insert(&qcom_iommu_device_faults, (unsigned long)dev,
++			entry, GFP_KERNEL);
++	if (ret) {
++		put_device(entry->dev);
++		kfree(entry);
++	}
++	return ret;
++}
++EXPORT_SYMBOL_GPL(qcom_iommu_register_device_fault_handler);
++
++/* Clients must unregister outside their callback before releasing its data. */
++int qcom_iommu_unregister_device_fault_handler(struct device *dev)
++{
++	struct qcom_iommu_device_fault_handler *entry;
++
++	if (!dev)
++		return -EINVAL;
++
++	entry = xa_erase(&qcom_iommu_device_faults, (unsigned long)dev);
++	if (!entry)
++		return 0;
++
++	synchronize_srcu(&qcom_iommu_device_fault_srcu);
++	put_device(entry->dev);
++	kfree(entry);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(qcom_iommu_unregister_device_fault_handler);
++
++int qcom_iommu_report_device_fault(struct device *dev, struct qcom_iommu_fault *fault)
++{
++	struct qcom_iommu_device_fault_handler *entry;
++	int idx, ret = -ENODEV;
++
++	if (!dev || !fault || fault->type != QCOM_IOMMU_FAULT_DMA_UNRECOV)
++		return -EINVAL;
++
++	idx = srcu_read_lock(&qcom_iommu_device_fault_srcu);
++	entry = xa_load(&qcom_iommu_device_faults, (unsigned long)dev);
++	if (entry) {
++		mutex_lock(&entry->lock);
++		ret = entry->handler(fault, entry->data);
++		mutex_unlock(&entry->lock);
++	}
++	srcu_read_unlock(&qcom_iommu_device_fault_srcu, idx);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(qcom_iommu_report_device_fault);
+ 
+ struct qcom_iommu_range_prop_cb_data {
+ 	int (*range_prop_entry_cb_fn)(const __be32 *p, int naddr, int nsize, void *arg);
+@@ -232,7 +333,11 @@
+ 
+ void qcom_iommu_get_resv_regions(struct device *dev, struct list_head *list)
+ {
+-	const struct iommu_ops *ops = dev->bus->iommu_ops;
++	const struct iommu_ops *ops;
++
++	if (!dev->iommu || !dev->iommu->iommu_dev)
++		return;
++	ops = dev_iommu_ops(dev);
+ 
+ 	if (ops && ops->get_resv_regions)
+ 		ops->get_resv_regions(dev, list);
+@@ -452,9 +557,9 @@
+ phys_addr_t qcom_iommu_iova_to_phys_hard(struct iommu_domain *domain,
+ 				    struct qcom_iommu_atos_txn *txn)
+ {
+-	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain->ops);
+-
+-	if (unlikely(ops->iova_to_phys_hard == NULL))
++	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain ? domain->ops : NULL);
++
++	if (!ops || unlikely(!ops->iova_to_phys_hard))
+ 		return 0;
+ 
+ 	return ops->iova_to_phys_hard(domain, txn);
+@@ -470,8 +575,8 @@
+ 	if (!domain)
+ 		return -EINVAL;
+ 
+-	ops = to_qcom_iommu_ops(domain->ops);
+-	if (unlikely(ops->sid_switch == NULL))
++	ops = to_qcom_iommu_ops(domain ? domain->ops : NULL);
++	if (!ops || unlikely(!ops->sid_switch))
+ 		return -EINVAL;
+ 
+ 	return ops->sid_switch(dev, dir);
+@@ -481,9 +586,9 @@
+ int qcom_iommu_get_fault_ids(struct iommu_domain *domain,
+ 			     struct qcom_iommu_fault_ids *f_ids)
+ {
+-	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain->ops);
+-
+-	if (unlikely(ops->get_fault_ids == NULL))
++	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain ? domain->ops : NULL);
++
++	if (!ops || unlikely(!ops->get_fault_ids))
+ 		return -EINVAL;
+ 
+ 	return ops->get_fault_ids(domain, f_ids);
+@@ -499,8 +604,8 @@
+ 	if (!domain)
+ 		return -EINVAL;
+ 
+-	ops = to_qcom_iommu_ops(domain->ops);
+-	if (unlikely(ops->skip_tlb_management == NULL))
++	ops = to_qcom_iommu_ops(domain ? domain->ops : NULL);
++	if (!ops || unlikely(!ops->skip_tlb_management))
+ 		return -EINVAL;
+ 
+ 	ops->skip_tlb_management(domain, skip);
+@@ -520,9 +625,9 @@
+ 
+ int qcom_iommu_get_context_bank_nr(struct iommu_domain *domain)
+ {
+-	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain->ops);
+-
+-	if (unlikely(ops->get_context_bank_nr == NULL))
++	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain ? domain->ops : NULL);
++
++	if (!ops || unlikely(!ops->get_context_bank_nr))
+ 		return -EINVAL;
+ 
+ 	return ops->get_context_bank_nr(domain);
+@@ -531,9 +636,9 @@
+ 
+ int qcom_iommu_get_asid_nr(struct iommu_domain *domain)
+ {
+-	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain->ops);
+-
+-	if (unlikely(ops->get_asid_nr == NULL))
++	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain ? domain->ops : NULL);
++
++	if (!ops || unlikely(!ops->get_asid_nr))
+ 		return -EINVAL;
+ 
+ 	return ops->get_asid_nr(domain);
+@@ -542,9 +647,9 @@
+ 
+ int qcom_iommu_set_secure_vmid(struct iommu_domain *domain, enum vmid vmid)
+ {
+-	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain->ops);
+-
+-	if (unlikely(ops->set_secure_vmid == NULL))
++	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain ? domain->ops : NULL);
++
++	if (!ops || unlikely(!ops->set_secure_vmid))
+ 		return -EINVAL;
+ 
+ 	return ops->set_secure_vmid(domain, vmid);
+@@ -553,9 +658,9 @@
+ 
+ int qcom_iommu_set_fault_model(struct iommu_domain *domain, int fault_model)
+ {
+-	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain->ops);
+-
+-	if (unlikely(ops->set_fault_model == NULL))
++	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain ? domain->ops : NULL);
++
++	if (!ops || unlikely(!ops->set_fault_model))
+ 		return -EINVAL;
+ 	else if (fault_model & ~(QCOM_IOMMU_FAULT_MODEL_NON_FATAL |
+ 				 QCOM_IOMMU_FAULT_MODEL_NO_CFRE |
+@@ -566,6 +671,19 @@
+ 	return ops->set_fault_model(domain, fault_model);
+ }
+ EXPORT_SYMBOL(qcom_iommu_set_fault_model);
++
++int qcom_iommu_set_fault_handler(struct iommu_domain *domain,
++				 iommu_fault_handler_t handler, void *token)
++{
++	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain ? domain->ops : NULL);
++
++	if (!ops || !ops->set_fault_handler)
++		return -EINVAL;
++
++	ops->set_fault_handler(domain, handler, token);
++	return 0;
++}
++EXPORT_SYMBOL(qcom_iommu_set_fault_handler);
+ 
+ /*
+  * Sets the client function which gets called during non-threaded irq
+@@ -577,9 +695,9 @@
+ int qcom_iommu_set_fault_handler_irq(struct iommu_domain *domain,
+ 	fault_handler_irq_t handler_irq, void *token)
+ {
+-	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain->ops);
+-
+-	if (unlikely(ops->set_fault_handler_irq == NULL))
++	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain ? domain->ops : NULL);
++
++	if (!ops || unlikely(!ops->set_fault_handler_irq))
+ 		return -EINVAL;
+ 
+ 	WARN_ONCE("%s API is deprecated\n", __func__);
+@@ -605,8 +723,8 @@
+ 	if (!domain)
+ 		return -EINVAL;
+ 
+-	ops = to_qcom_iommu_ops(domain->ops);
+-	if (!ops->register_device_fault_handler_irq)
++	ops = to_qcom_iommu_ops(domain ? domain->ops : NULL);
++	if (!ops || !ops->register_device_fault_handler_irq)
+ 		return -EINVAL;
+ 
+ 	ops->register_device_fault_handler_irq(dev, handler, token);
+@@ -616,9 +734,9 @@
+ 
+ int qcom_iommu_enable_s1_translation(struct iommu_domain *domain)
+ {
+-	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain->ops);
+-
+-	if (unlikely(ops->enable_s1_translation == NULL))
++	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain ? domain->ops : NULL);
++
++	if (!ops || unlikely(!ops->enable_s1_translation))
+ 		return -EINVAL;
+ 
+ 	return ops->enable_s1_translation(domain);
+@@ -627,9 +745,9 @@
+ 
+ int qcom_iommu_get_mappings_configuration(struct iommu_domain *domain)
+ {
+-	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain->ops);
+-
+-	if (unlikely(ops->get_mappings_configuration == NULL))
++	struct qcom_iommu_ops *ops = to_qcom_iommu_ops(domain ? domain->ops : NULL);
++
++	if (!ops || unlikely(!ops->get_mappings_configuration))
+ 		return -EINVAL;
+ 
+ 	return ops->get_mappings_configuration(domain);
+@@ -983,18 +1101,19 @@
+  * It is allowed to have a NULL exitcall corresponding to a non-NULL initcall.
+  */
+ static initcall_t init_table[] __initdata = {
+-	dma_mapping_fast_init,
+ 	qcom_dma_iommu_generic_driver_init,
+ 	qcom_arm_lpae_do_selftests,
+ 	qcom_io_pgtable_alloc_init,
++	/* Restricted hooks cannot be removed; register after fallible setup. */
++	dma_mapping_fast_init,
+ 	NULL
+ };
+ 
+ static exitcall_t exit_table[] = {
+-	NULL, /* dma_mapping_fast_exit */
+ 	qcom_dma_iommu_generic_driver_exit,
+ 	NULL, /*qcom_arm_lpae_do_selftests */
+ 	qcom_io_pgtable_alloc_exit,
++	NULL, /* dma_mapping_fast_exit */
+ 	NULL,
+ };
+ 
+@@ -1039,3 +1158,4 @@
+ #endif
+ 
+ MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Qualcomm IOMMU page tables and DMA support");
+--- a/drivers/iommu/qcom-io-pgtable-alloc.c
++++ b/drivers/iommu/qcom-io-pgtable-alloc.c
+@@ -6,6 +6,7 @@
+ 
+ #include <linux/module.h>
+ #include <linux/shrinker.h>
++#include "qcom-io-pgtable-alloc.h"
+ #include <linux/slab.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
+ 
+@@ -306,18 +307,22 @@
+ 	return count;
+ }
+ 
+-static struct shrinker io_pgtable_alloc_shrinker = {
+-	.count_objects = io_pgtable_alloc_count_objects,
+-	.scan_objects = io_pgtable_alloc_scan_objects,
+-	.seeks = DEFAULT_SEEKS,
+-};
++static struct shrinker *io_pgtable_alloc_shrinker;
+ 
+ int qcom_io_pgtable_alloc_init(void)
+ {
+-	return register_shrinker(&io_pgtable_alloc_shrinker, "io_pgtable_alloc");
++	io_pgtable_alloc_shrinker = shrinker_alloc(0, "io_pgtable_alloc");
++	if (!io_pgtable_alloc_shrinker)
++		return -ENOMEM;
++
++	io_pgtable_alloc_shrinker->count_objects = io_pgtable_alloc_count_objects;
++	io_pgtable_alloc_shrinker->scan_objects = io_pgtable_alloc_scan_objects;
++	io_pgtable_alloc_shrinker->seeks = DEFAULT_SEEKS;
++	shrinker_register(io_pgtable_alloc_shrinker);
++	return 0;
+ }
+ 
+ void qcom_io_pgtable_alloc_exit(void)
+ {
+-	unregister_shrinker(&io_pgtable_alloc_shrinker);
+-}
++	shrinker_free(io_pgtable_alloc_shrinker);
++}
+--- a/drivers/iommu/qcom-dma-iommu-generic.c
++++ b/drivers/iommu/qcom-dma-iommu-generic.c
+@@ -12,6 +12,7 @@
+ 
+ 
+ #include <linux/module.h>
++#include <linux/vmalloc.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
+ #include <linux/platform_device.h>
+@@ -250,7 +251,7 @@
+ 	if (!pages)
+ 		return NULL;
+ 	for (i = 0; i < count; i++)
+-		pages[i] = nth_page(page, i);
++		pages[i] = pfn_to_page(page_to_pfn(page) + i);
+ 	vaddr = vmap(pages, count, VM_DMA_COHERENT, prot);
+ 	kfree(pages);
+ 
+@@ -310,8 +311,8 @@
+ 	void *addr;
+ 	int ret = -ENOMEM;
+ 
+-	/* Cannot allocate larger than MAX_ORDER - 1 */
+-	order = min(get_order(pool_size), MAX_ORDER - 1);
++	/* Cannot allocate larger than MAX_PAGE_ORDER */
++	order = min(get_order(pool_size), MAX_PAGE_ORDER);
+ 
+ 	do {
+ 		pool_size = 1 << (PAGE_SHIFT + order);
+@@ -390,7 +391,7 @@
+ 	int ret = 0;
+ 	unsigned long pages;
+ 
+-	/* Default the pool size to 128KB per 1 GB of memory, min 128 KB, max MAX_ORDER - 1. */
++	/* Default the pool size to 128KB per 1 GB of memory, min 128 KB, max MAX_PAGE_ORDER. */
+ 	pages = totalram_pages() / (SZ_1G / SZ_128K);
+ 	pages = min_t(unsigned long, pages, MAX_ORDER_NR_PAGES);
+ 	atomic_pool_size = max_t(size_t, pages << PAGE_SHIFT, SZ_128K);
+@@ -782,10 +783,10 @@
+ }
+ EXPORT_SYMBOL(qcom_dma_iommu_is_ready);
+ 
+-static int qcom_dma_iommu_remove(struct platform_device *pdev)
+-{
++static void qcom_dma_iommu_remove(struct platform_device *pdev)
++{
++	probe_finished = false;
+ 	qcom_dma_atomic_pool_exit(&pdev->dev);
+-	return 0;
+ }
+ 
+ static const struct of_device_id qcom_dma_iommu_of_match[] = {
+--- a/drivers/iommu/dma-mapping-fast.c
++++ b/drivers/iommu/dma-mapping-fast.c
+@@ -983,7 +983,7 @@
+ 	spin_lock_irqsave(&fast->lock, flags);
+ 
+ 	/* MSI cookie has already been setup. */
+-	if (fast->domain->iova_cookie)
++	if (fast->domain->cookie_type != IOMMU_COOKIE_NONE)
+ 		goto out;
+ 
+ 	if (qcom_iommu_get_msi_size(dev, &msi_size) < 0)
+@@ -1031,6 +1031,9 @@
+ 		lo = max(fast->base, region->start);
+ 		hi = min(fast->base + fast->size - 1,
+ 			 region->start + region->length - 1);
++
++		if (lo > hi)
++			continue;
+ 
+ 		lo = (lo - fast->base) >> FAST_PAGE_SHIFT;
+ 		hi = (hi - fast->base) >> FAST_PAGE_SHIFT;
+@@ -1114,8 +1117,7 @@
+ }
+ EXPORT_SYMBOL(fast_smmu_init_mapping);
+ 
+-static void __fast_smmu_setup_dma_ops(void *data, struct device *dev,
+-					u64 dma_base, u64 dma_limit)
++static void __fast_smmu_setup_dma_ops(void *data, struct device *dev)
+ {
+ 	struct dma_fast_smmu_mapping *fast;
+ 	struct iommu_domain *domain;
+@@ -1136,6 +1138,7 @@
+ 	}
+ 
+ 	fast_smmu_reserve_iommu_regions(dev, fast);
++	dev->dma_iommu = false;
+ 	dev->dma_ops = &fast_smmu_dma_ops;
+ }
+ 
+@@ -1145,7 +1148,7 @@
+  */
+ void fast_smmu_setup_dma_ops(struct device *dev, u64 dma_base, u64 dma_limit)
+ {
+-	__fast_smmu_setup_dma_ops(NULL, dev, dma_base, dma_limit);
++	__fast_smmu_setup_dma_ops(NULL, dev);
+ }
+ EXPORT_SYMBOL(fast_smmu_setup_dma_ops);
+ 
+--- a/drivers/iommu/msm_dma_iommu_mapping.c
++++ b/drivers/iommu/msm_dma_iommu_mapping.c
+@@ -479,3 +479,5 @@
+ EXPORT_SYMBOL(msm_dma_buf_freed);
+ 
+ MODULE_LICENSE("GPL");
++
++MODULE_DESCRIPTION("Qualcomm reference-counted DMA-BUF mappings");
+--- a/include/linux/qcom-iommu-util.h
++++ b/include/linux/qcom-iommu-util.h
+@@ -92,6 +92,8 @@
+ 	int (*get_asid_nr)(struct iommu_domain *domain);
+ 	int (*set_secure_vmid)(struct iommu_domain *domain, enum vmid vmid);
+ 	int (*set_fault_model)(struct iommu_domain *domain, int fault_model);
++	void (*set_fault_handler)(struct iommu_domain *domain,
++				  iommu_fault_handler_t handler, void *token);
+ 	void (*set_fault_handler_irq)(struct iommu_domain *domain,
+ 			fault_handler_irq_t handler_irq, void *token);
+ 	void (*register_device_fault_handler_irq)(struct device *dev,
+@@ -102,7 +104,87 @@
+ 	struct iommu_ops iommu_ops;
+ 	struct iommu_domain_ops domain_ops;
+ };
+-#define to_qcom_iommu_ops(x) (container_of(x, struct qcom_iommu_ops, domain_ops))
++
++int register_qcom_iommu_ops(struct qcom_iommu_ops *ops);
++void unregister_qcom_iommu_ops(struct qcom_iommu_ops *ops);
++
++/* Preserve the 6.6 unrecoverable-fault payload outside the 6.18 IOPF API. */
++#define QCOM_IOMMU_FAULT_DMA_UNRECOV 1
++
++enum qcom_iommu_fault_reason {
++	QCOM_IOMMU_FAULT_REASON_UNKNOWN = 0,
++
++	/* Could not access the PASID table (fetch caused external abort) */
++	QCOM_IOMMU_FAULT_REASON_PASID_FETCH,
++
++	/* PASID entry is invalid or has configuration errors */
++	QCOM_IOMMU_FAULT_REASON_BAD_PASID_ENTRY,
++
++	/*
++	 * PASID is out of range (e.g. exceeds the maximum PASID
++	 * supported by the IOMMU) or disabled.
++	 */
++	QCOM_IOMMU_FAULT_REASON_PASID_INVALID,
++
++	/*
++	 * An external abort occurred fetching (or updating) a translation
++	 * table descriptor
++	 */
++	QCOM_IOMMU_FAULT_REASON_WALK_EABT,
++
++	/*
++	 * Could not access the page table entry (Bad address),
++	 * actual translation fault
++	 */
++	QCOM_IOMMU_FAULT_REASON_PTE_FETCH,
++
++	/* Protection flag check failed */
++	QCOM_IOMMU_FAULT_REASON_PERMISSION,
++
++	/* access flag check failed */
++	QCOM_IOMMU_FAULT_REASON_ACCESS,
++
++	/* Output address of a translation stage caused Address Size fault */
++	QCOM_IOMMU_FAULT_REASON_OOR_ADDRESS,
++};
++
++/**
++ * struct qcom_iommu_fault_unrecoverable - Unrecoverable fault data
++ * @reason: reason of the fault, from &enum qcom_iommu_fault_reason
++ * @flags: parameters of this fault (QCOM_IOMMU_FAULT_UNRECOV_* values)
++ * @pasid: Process Address Space ID
++ * @perm: requested permission access using by the incoming transaction
++ *        (IOMMU_FAULT_PERM_* values)
++ * @addr: offending page address
++ * @fetch_addr: address that caused a fetch abort, if any
++ */
++struct qcom_iommu_fault_unrecoverable {
++	__u32	reason;
++#define QCOM_IOMMU_FAULT_UNRECOV_PASID_VALID		BIT(0)
++#define QCOM_IOMMU_FAULT_UNRECOV_ADDR_VALID		BIT(1)
++#define QCOM_IOMMU_FAULT_UNRECOV_FETCH_ADDR_VALID	BIT(2)
++	__u32	flags;
++	__u32	pasid;
++	__u32	perm;
++	__u64	addr;
++	__u64	fetch_addr;
++};
++
++struct qcom_iommu_fault {
++	__u32 type;
++	__u32 padding;
++	union {
++		struct qcom_iommu_fault_unrecoverable event;
++		__u8 padding2[56];
++	};
++};
++
++typedef int (*qcom_iommu_device_fault_handler_t)(struct qcom_iommu_fault *fault,
++						 void *data);
++int qcom_iommu_register_device_fault_handler(struct device *dev,
++					     qcom_iommu_device_fault_handler_t handler, void *data);
++int qcom_iommu_unregister_device_fault_handler(struct device *dev);
++int qcom_iommu_report_device_fault(struct device *dev, struct qcom_iommu_fault *fault);
+ 
+ struct device_node *qcom_iommu_group_parse_phandle(struct device *dev);
+ int qcom_iommu_generate_dma_regions(struct device *dev,
+@@ -134,6 +216,9 @@
+ int qcom_iommu_set_secure_vmid(struct iommu_domain *domain, enum vmid vmid);
+ 
+ int qcom_iommu_set_fault_model(struct iommu_domain *domain, int fault_model);
++
++int qcom_iommu_set_fault_handler(struct iommu_domain *domain,
++				 iommu_fault_handler_t handler, void *token);
+ 
+ int qcom_iommu_set_fault_handler_irq(struct iommu_domain *domain,
+ 		fault_handler_irq_t handler_irq, void *token);

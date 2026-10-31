@@ -780,6 +780,78 @@ ddk_module(
     deps = [":loader_headers", ":gunyah_headers", ":scm_headers", ":gh_rm_drv", ":qcom_scm", ":secure_buffer", ":mdt_loader"],
 )
 
+ddk_headers(
+    name = "iommu_headers",
+    hdrs = glob(["drivers/iommu/*.h"]) + [
+        "include/linux/qcom-iommu-util.h",
+        "include/linux/qcom-io-pgtable.h",
+        "include/linux/dma-mapping-fast.h",
+        "include/linux/qcom-dma-mapping.h",
+        "include/linux/io-pgtable-fast.h",
+        "include/linux/io-pgtable-arm.h",
+        "include/linux/msm_dma_iommu_mapping.h",
+        "include/soc/qcom/secure_buffer.h",
+    ],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "qcom_iommu_util",
+    srcs = ["drivers/iommu/qcom-iommu-util.c", "drivers/iommu/qcom-io-pgtable-arm.c", "drivers/iommu/qcom-io-pgtable-alloc.c", "drivers/iommu/qcom-dma-iommu-generic.c", "drivers/iommu/io-pgtable-fast.c", "drivers/iommu/dma-mapping-fast.c"],
+    out = "qcom_iommu_util.ko",
+    includes = ["drivers/iommu"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":iommu_headers", ":scm_headers", ":qcom_scm", ":secure_buffer"],
+)
+
+ddk_module(
+    name = "msm_dma_iommu_mapping",
+    srcs = ["drivers/iommu/msm_dma_iommu_mapping.c"],
+    out = "msm_dma_iommu_mapping.ko",
+    includes = ["drivers/iommu"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":iommu_headers"],
+)
+
+ddk_module(
+    name = "iommu_logger",
+    srcs = ["drivers/iommu/iommu-logger.c"],
+    out = "iommu-logger.ko",
+    includes = ["drivers/iommu"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":iommu_headers"],
+)
+
+ddk_headers(
+    name = "smmu_headers",
+    hdrs = glob(["drivers/iommu/arm/arm-smmu/*.h"]) + ["include/linux/adreno-smmu-priv.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "arm_smmu",
+    srcs = [
+        "drivers/iommu/arm/arm-smmu/arm-smmu.c",
+        "drivers/iommu/arm/arm-smmu/arm-smmu-impl.c",
+        "drivers/iommu/arm/arm-smmu/arm-smmu-nvidia.c",
+        "drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c",
+        "drivers/iommu/arm/arm-smmu/arm-smmu-qcom-pm.c",
+        "drivers/iommu/arm/arm-smmu/arm-smmu-debug.c",
+    ],
+    out = "arm_smmu.ko",
+    includes = ["drivers/iommu/arm/arm-smmu", "drivers/iommu"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":smmu_headers", ":iommu_headers", ":scm_headers", ":qcom_iommu_util", ":qcom_scm", ":secure_buffer", ":iommu_logger"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -830,6 +902,10 @@ kernel_module_group(
         ":mdt_loader",
         ":secure_buffer",
         ":gunyah_loader",
+        ":qcom_iommu_util",
+        ":msm_dma_iommu_mapping",
+        ":iommu_logger",
+        ":arm_smmu",
     ],
 )
 

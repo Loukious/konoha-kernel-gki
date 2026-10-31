@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 60 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 64 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 60 platform `.ko` files, their symbol tables and DDK configurations.
+- 64 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 2429
-imported symbol CRCs across all 60 modules.
+used. The current [validation report](validation-20261031.json) checks 2767
+imported symbol CRCs across all 64 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -158,6 +158,28 @@ scheduling, memory assignment and virtio operation have not been tested on the
 phone. Checkpatch finds no code-style errors or warnings in these adaptation
 patches (commit-message and sign-off checks do not apply to source diffs).
 
+The IOMMU group builds `arm_smmu`, `qcom_iommu_util`,
+`msm_dma_iommu_mapping` and `iommu-logger`. It retains the Onyx SMMU/TBU,
+secure page-table assignment, fast mapping, fault registers and DMA-BUF mapping
+implementations. Paging allocation and per-domain page sizes use 6.18 APIs;
+identity and blocked domains have separate stream-map operations. Qualcomm
+extensions look up registered domain operations instead of treating every
+core domain as a vendor object. Controller initialization precedes IOMMU
+registration, which can synchronously attach consumers in 6.18.
+
+DMA-domain fault handlers use private storage because 6.18 shares core handler
+storage with the DMA cookie. Removal waits for active threaded callbacks.
+Unrecoverable per-device faults retain their 6.6 payload through the new
+`qcom_iommu_*device_fault*` interfaces, with device references and SRCU lifetime
+protection. Later WLAN imports must use these interfaces. Fast mappings retain
+unmanaged domains, reserve MSI space, and select their DMA ops explicitly.
+Out-of-aperture reserved ranges cannot underflow the allocation bitmap.
+Shrinker setup uses the 6.18 allocation API; restricted DMA hook registration
+follows fallible initialization. The full build has no compiler or modpost
+warnings. Checkpatch has one advisory for the required `-ENOSYS` fault-handler
+return convention used by the IOMMU core. Hardware faults, memory isolation,
+GPU translation and suspend/resume remain untested.
+
 ## Baseline inventory
 
 The sources in `sources.json` match the local crDroid 17.0 ROM lineage. Capture
@@ -179,7 +201,7 @@ changes are captured for later porting; they are not in this initial group.
 
 ## Next implementation gates
 
-1. Complete the VM IRQ-chip and IOMMU dependencies
+1. Complete the VM IRQ-chip, memory heaps and remaining dependencies
    needed for Onyx early boot.
    Test UFS/encryption, probe ordering, GPIO wakeups, SCM wait queues and
    shared-memory operations.

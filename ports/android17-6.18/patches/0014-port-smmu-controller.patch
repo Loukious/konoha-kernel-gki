@@ -1,0 +1,579 @@
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu.c
+@@ -47,6 +47,7 @@
+ #include "arm-smmu.h"
+ 
+ #include "../../dma-iommu.h"
++#include "../../iommu-priv.h"
+ #include "../../iommu-logger.h"
+ #include "../../qcom-dma-iommu-generic.h"
+ #include "../../qcom-io-pgtable-alloc.h"
+@@ -356,8 +357,7 @@
+ 		it.cur_count = 1;
+ 	}
+ 
+-	err = iommu_fwspec_init(dev, &smmu_dev->of_node->fwnode,
+-				&arm_smmu_ops.iommu_ops);
++	err = iommu_fwspec_init(dev, &smmu_dev->of_node->fwnode);
+ 	if (err)
+ 		return err;
+ 
+@@ -785,7 +785,7 @@
+ {
+ 	u32 fsr, fsynr;
+ 	unsigned long iova;
+-	int flags;
++	int flags, ret;
+ 
+ 	fsr = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_FSR);
+ 	fsynr = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_FSYNR0);
+@@ -803,8 +803,15 @@
+ 		flags |= IOMMU_FAULT_TRANSACTION_STALLED;
+ 
+ 
+-	return report_iommu_fault(&smmu_domain->domain,
+-				 smmu->dev, iova, flags);
++	ret = report_iommu_fault(&smmu_domain->domain, smmu->dev, iova, flags);
++
++	/* report_iommu_fault() uses -ENOSYS when no core handler is installed. */
++	mutex_lock(&smmu_domain->fault_handler_lock);
++	if (ret == -ENOSYS && smmu_domain->fault_handler)
++		ret = smmu_domain->fault_handler(&smmu_domain->domain,
++				smmu->dev, iova, flags, smmu_domain->fault_token);
++	mutex_unlock(&smmu_domain->fault_handler_lock);
++	return ret;
+ }
+ 
+ struct find_fault_device_by_sid_data {
+@@ -824,7 +831,7 @@
+ 		u16 mask = FIELD_GET(ARM_SMMU_SMR_MASK, fwspec->ids[i]);
+ 
+ 		if (!((data->sid ^ sid) & ~mask)) {
+-			data->dev = dev;
++			data->dev = get_device(dev);
+ 			return 1;
+ 		}
+ 	}
+@@ -839,17 +846,18 @@
+ 	struct arm_smmu_device *smmu, int cbidx)
+ {
+ 	struct find_fault_device_by_sid_data data = {0};
+-	struct iommu_fault_event fault_evt = {0};
++	struct qcom_iommu_fault fault = {0};
+ 	u32 i, reason, perm;
+ 	u64 val;
+ 
+ 	data.sid = arm_smmu_gr1_read(smmu, ARM_SMMU_GR1_CBFRSYNRA(cbidx)) &
+ 			CBFRSYNRA_SID_MASK;
+ 	for (i = 0; i < smmu->num_mapping_groups; i++) {
+-		if (cbidx == smmu->s2crs[i].cbndx) {
++		if (cbidx == smmu->s2crs[i].cbndx && smmu->s2crs[i].group) {
+ 			iommu_group_for_each_dev(smmu->s2crs[i].group, &data,
+ 						 find_fault_device_by_sid);
+-			break;
++			if (data.dev)
++				break;
+ 		}
+ 	}
+ 
+@@ -867,21 +875,22 @@
+ 
+ 	/* Extract fault type */
+ 	val = arm_smmu_cb_read(smmu, cbidx, ARM_SMMU_CB_FSR);
+-	reason = IOMMU_FAULT_REASON_UNKNOWN;
++	reason = QCOM_IOMMU_FAULT_REASON_UNKNOWN;
+ 	if (val & ARM_SMMU_FSR_TF)
+-		reason = IOMMU_FAULT_REASON_PTE_FETCH;
++		reason = QCOM_IOMMU_FAULT_REASON_PTE_FETCH;
+ 	else if (val & ARM_SMMU_FSR_PF)
+-		reason = IOMMU_FAULT_REASON_PERMISSION;
+-
+-	fault_evt.fault.type = IOMMU_FAULT_DMA_UNRECOV;
+-	fault_evt.fault.event = (struct iommu_fault_unrecoverable) {
++		reason = QCOM_IOMMU_FAULT_REASON_PERMISSION;
++
++	fault.type = QCOM_IOMMU_FAULT_DMA_UNRECOV;
++	fault.event = (struct qcom_iommu_fault_unrecoverable) {
+ 		.reason = reason,
+-		.flags = IOMMU_FAULT_UNRECOV_ADDR_VALID,
++		.flags = QCOM_IOMMU_FAULT_UNRECOV_ADDR_VALID,
+ 		.perm = perm,
+ 		.addr = arm_smmu_cb_readq(smmu, cbidx, ARM_SMMU_CB_FAR),
+ 	};
+ 
+-	iommu_report_device_fault(data.dev, &fault_evt);
++	qcom_iommu_report_device_fault(data.dev, &fault);
++	put_device(data.dev);
+ }
+ 
+ static int arm_smmu_get_fault_ids(struct iommu_domain *domain,
+@@ -1411,12 +1420,6 @@
+ 	if (ret) {
+ 		dev_err(dev, "%s: default domain setup failed\n",
+ 			__func__);
+-		goto out_unlock;
+-	}
+-
+-	if (domain->type == IOMMU_DOMAIN_IDENTITY) {
+-		smmu_domain->stage = ARM_SMMU_DOMAIN_BYPASS;
+-		smmu_domain->smmu = smmu;
+ 		goto out_unlock;
+ 	}
+ 
+@@ -1649,7 +1652,7 @@
+ 	int ret, irq, i;
+ 	bool pinned = false;
+ 
+-	if (!smmu || domain->type == IOMMU_DOMAIN_IDENTITY)
++	if (!smmu)
+ 		return;
+ 
+ 	ret = arm_smmu_rpm_get(smmu);
+@@ -1689,14 +1692,11 @@
+ 	arm_smmu_rpm_put(smmu);
+ }
+ 
+-static struct iommu_domain *arm_smmu_domain_alloc(unsigned type)
+-{
++static struct iommu_domain *arm_smmu_domain_alloc_paging(struct device *dev)
++{
++	struct arm_smmu_master_cfg *cfg = dev_iommu_priv_get(dev);
+ 	struct arm_smmu_domain *smmu_domain;
+ 
+-	if (type != IOMMU_DOMAIN_UNMANAGED && type != IOMMU_DOMAIN_IDENTITY) {
+-		if (using_legacy_binding || type != IOMMU_DOMAIN_DMA)
+-			return NULL;
+-	}
+ 	/*
+ 	 * Allocate the domain and initialise some of its data structures.
+ 	 * We can't really do anything meaningful until we've added a
+@@ -1707,10 +1707,12 @@
+ 		return NULL;
+ 
+ 	mutex_init(&smmu_domain->init_mutex);
++	mutex_init(&smmu_domain->fault_handler_lock);
+ 	spin_lock_init(&smmu_domain->cb_lock);
+ 	spin_lock_init(&smmu_domain->sync_lock);
+ 	spin_lock_init(&smmu_domain->iotlb_gather_lock);
+ 	smmu_domain->secure_vmid = VMID_INVAL;
++	smmu_domain->domain.pgsize_bitmap = cfg->smmu->pgsize_bitmap;
+ 
+ 	return &smmu_domain->domain;
+ }
+@@ -1957,20 +1959,13 @@
+ 	mutex_unlock(&smmu->stream_map_mutex);
+ }
+ 
+-static int arm_smmu_domain_add_master(struct arm_smmu_domain *smmu_domain,
+-				      struct arm_smmu_master_cfg *cfg,
+-				      struct iommu_fwspec *fwspec)
+-{
+-	struct arm_smmu_device *smmu = smmu_domain->smmu;
++static int arm_smmu_master_install_s2crs(struct arm_smmu_master_cfg *cfg,
++					 enum arm_smmu_s2cr_type type, u8 cbndx,
++				       struct iommu_fwspec *fwspec)
++{
++	struct arm_smmu_device *smmu = cfg->smmu;
+ 	struct arm_smmu_s2cr *s2cr = smmu->s2crs;
+-	u8 cbndx = smmu_domain->cfg.cbndx;
+-	enum arm_smmu_s2cr_type type;
+ 	int i, idx;
+-
+-	if (smmu_domain->stage == ARM_SMMU_DOMAIN_BYPASS)
+-		type = S2CR_TYPE_BYPASS;
+-	else
+-		type = S2CR_TYPE_TRANS;
+ 
+ 	mutex_lock(&smmu->stream_map_mutex);
+ 	for_each_cfg_sme(cfg, fwspec, i, idx) {
+@@ -2131,7 +2126,7 @@
+ 	struct arm_smmu_device *smmu;
+ 	int ret;
+ 
+-	if (!fwspec || fwspec->ops != &arm_smmu_ops.iommu_ops) {
++	if (!fwspec || dev_iommu_ops(dev) != &arm_smmu_ops.iommu_ops) {
+ 		dev_err(dev, "cannot attach to SMMU, is it on the same bus?\n");
+ 		return -ENXIO;
+ 	}
+@@ -2168,7 +2163,8 @@
+ 	}
+ 
+ 	/* Looks ok, so add the device to the domain */
+-	ret = arm_smmu_domain_add_master(smmu_domain, cfg, fwspec);
++	ret = arm_smmu_master_install_s2crs(cfg, S2CR_TYPE_TRANS,
++					    smmu_domain->cfg.cbndx, fwspec);
+ 	if (!ret)
+ 		if (iommu_logger_register(domain, dev, smmu_domain->pgtbl_ops))
+ 			dev_err(dev, "Registering iommu debug info failed, continuing.\n");
+@@ -2192,6 +2188,59 @@
+ 	return ret;
+ }
+ 
++static int arm_smmu_attach_dev_type(struct device *dev,
++				    enum arm_smmu_s2cr_type type)
++{
++	struct arm_smmu_master_cfg *cfg = dev_iommu_priv_get(dev);
++	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
++	struct arm_smmu_device *smmu;
++	int ret;
++
++	if (!cfg)
++		return -ENODEV;
++	smmu = cfg->smmu;
++
++	ret = arm_smmu_rpm_get(smmu);
++	if (ret < 0)
++		return ret;
++
++	arm_smmu_master_install_s2crs(cfg, type, 0, fwspec);
++	pm_runtime_set_autosuspend_delay(smmu->dev, 20);
++	pm_runtime_use_autosuspend(smmu->dev);
++	arm_smmu_rpm_put(smmu);
++	return 0;
++}
++
++static int arm_smmu_attach_dev_identity(struct iommu_domain *domain,
++					struct device *dev)
++{
++	return arm_smmu_attach_dev_type(dev, S2CR_TYPE_BYPASS);
++}
++
++static const struct iommu_domain_ops arm_smmu_identity_ops = {
++	.attach_dev = arm_smmu_attach_dev_identity,
++};
++
++static struct iommu_domain arm_smmu_identity_domain = {
++	.type = IOMMU_DOMAIN_IDENTITY,
++	.ops = &arm_smmu_identity_ops,
++};
++
++static int arm_smmu_attach_dev_blocked(struct iommu_domain *domain,
++				       struct device *dev)
++{
++	return arm_smmu_attach_dev_type(dev, S2CR_TYPE_FAULT);
++}
++
++static const struct iommu_domain_ops arm_smmu_blocked_ops = {
++	.attach_dev = arm_smmu_attach_dev_blocked,
++};
++
++static struct iommu_domain arm_smmu_blocked_domain = {
++	.type = IOMMU_DOMAIN_BLOCKED,
++	.ops = &arm_smmu_blocked_ops,
++};
++
+ static gfp_t arm_smmu_domain_gfp_flags(struct arm_smmu_domain *smmu_domain)
+ {
+ 	/*
+@@ -2473,7 +2522,7 @@
+ 		fwspec = dev_iommu_fwspec_get(dev);
+ 		if (ret)
+ 			goto out_free;
+-	} else if (fwspec && fwspec->ops == &arm_smmu_ops.iommu_ops) {
++	} else if (fwspec) {
+ 		smmu = arm_smmu_get_by_fwnode(fwspec->iommu_fwnode);
+ 
+ 		/*
+@@ -2534,9 +2583,10 @@
+ 	return &smmu->iommu;
+ 
+ out_cfg_free:
++	dev_iommu_priv_set(dev, NULL);
+ 	kfree(cfg);
+ out_free:
+-	iommu_fwspec_free(dev);
++	/* The IOMMU core releases the firmware specification on probe failure. */
+ 	return ERR_PTR(ret);
+ }
+ 
+@@ -2546,7 +2596,7 @@
+ 	struct arm_smmu_master_cfg *cfg = dev_iommu_priv_get(dev);
+ 	int ret;
+ 
+-	if (!fwspec || fwspec->ops != &arm_smmu_ops.iommu_ops)
++	if (!fwspec || dev_iommu_ops(dev) != &arm_smmu_ops.iommu_ops)
+ 		return;
+ 
+ 	cfg  = dev_iommu_priv_get(dev);
+@@ -2635,21 +2685,6 @@
+ 	return group;
+ }
+ 
+-static int arm_smmu_enable_nesting(struct iommu_domain *domain)
+-{
+-	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+-	int ret = 0;
+-
+-	mutex_lock(&smmu_domain->init_mutex);
+-	if (smmu_domain->smmu)
+-		ret = -EPERM;
+-	else
+-		smmu_domain->stage = ARM_SMMU_DOMAIN_NESTED;
+-	mutex_unlock(&smmu_domain->init_mutex);
+-
+-	return ret;
+-}
+-
+ static int arm_smmu_set_pgtable_quirks(struct iommu_domain *domain,
+ 		unsigned long quirks)
+ {
+@@ -2666,7 +2701,7 @@
+ 	return ret;
+ }
+ 
+-static int arm_smmu_of_xlate(struct device *dev, struct of_phandle_args *args)
++static int arm_smmu_of_xlate(struct device *dev, const struct of_phandle_args *args)
+ {
+ 	u32 mask, fwid = 0;
+ 
+@@ -2857,6 +2892,18 @@
+ 	return ret;
+ }
+ 
++static void arm_smmu_set_fault_handler(struct iommu_domain *domain,
++				       iommu_fault_handler_t handler, void *token)
++{
++	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
++
++	/* Call outside the fault callback; clearing waits for active callbacks. */
++	mutex_lock(&smmu_domain->fault_handler_lock);
++	smmu_domain->fault_token = token;
++	smmu_domain->fault_handler = handler;
++	mutex_unlock(&smmu_domain->fault_handler_lock);
++}
++
+ static void arm_smmu_set_fault_handler_irq(struct iommu_domain *domain,
+ 		fault_handler_irq_t handler_irq, void *token)
+ {
+@@ -2957,6 +3004,7 @@
+ 	.get_asid_nr			= arm_smmu_get_asid_nr,
+ 	.set_secure_vmid		= arm_smmu_set_secure_vmid,
+ 	.set_fault_model		= arm_smmu_set_fault_model,
++	.set_fault_handler		= arm_smmu_set_fault_handler,
+ 	.set_fault_handler_irq		= arm_smmu_set_fault_handler_irq,
+ 	.register_device_fault_handler_irq = arm_smmu_register_device_fault_handler_irq,
+ 	.enable_s1_translation		= arm_smmu_enable_s1_translation,
+@@ -2970,14 +3018,15 @@
+ 		.flush_iotlb_all	= arm_smmu_flush_iotlb_all,
+ 		.iotlb_sync		= arm_smmu_iotlb_sync,
+ 		.iova_to_phys		= arm_smmu_iova_to_phys,
+-		.enable_nesting		= arm_smmu_enable_nesting,
+ 		.set_pgtable_quirks	= arm_smmu_set_pgtable_quirks,
+ 		.free			= arm_smmu_domain_free,
+ 	},
+ 
+ 	.iommu_ops = {
+ 		.capable		= arm_smmu_capable,
+-		.domain_alloc		= arm_smmu_domain_alloc,
++		.domain_alloc_paging	= arm_smmu_domain_alloc_paging,
++		.identity_domain	= &arm_smmu_identity_domain,
++		.blocked_domain		= &arm_smmu_blocked_domain,
+ 		.probe_device		= arm_smmu_probe_device,
+ 		.release_device		= arm_smmu_release_device,
+ 		.probe_finalize		= arm_smmu_probe_finalize,
+@@ -2985,7 +3034,6 @@
+ 		.of_xlate		= arm_smmu_of_xlate,
+ 		.get_resv_regions	= arm_smmu_get_resv_regions,
+ 		.def_domain_type	= arm_smmu_def_domain_type,
+-		.pgsize_bitmap		= -1UL, /* Restricted during device attach */
+ 		.owner			= THIS_MODULE,
+ 		.default_domain_ops	= &arm_smmu_ops.domain_ops,
+ 	},
+@@ -3374,11 +3422,6 @@
+ 		smmu->pgsize_bitmap |= SZ_16K | SZ_32M;
+ 	if (smmu->features & ARM_SMMU_FEAT_FMT_AARCH64_64K)
+ 		smmu->pgsize_bitmap |= SZ_64K | SZ_512M;
+-
+-	if (arm_smmu_ops.iommu_ops.pgsize_bitmap == -1UL)
+-		arm_smmu_ops.iommu_ops.pgsize_bitmap = smmu->pgsize_bitmap;
+-	else
+-		arm_smmu_ops.iommu_ops.pgsize_bitmap |= smmu->pgsize_bitmap;
+ 	dev_notice(smmu->dev, "\tSupported page sizes: 0x%08lx\n",
+ 		   smmu->pgsize_bitmap);
+ 
+@@ -3682,15 +3725,18 @@
+ 	for (i = 0; i < global_irqs; i++) {
+ 		int irq = platform_get_irq(pdev, i);
+ 
+-		if (irq < 0)
+-			return irq;
++		if (irq < 0) {
++			err = irq;
++			goto out_power_off;
++		}
+ 
+ 		err = devm_request_irq(dev, irq, global_fault, IRQF_SHARED,
+ 				       "arm-smmu global fault", smmu);
+-		if (err)
+-			return dev_err_probe(dev, err,
+-					"failed to request global IRQ %d (%u)\n",
+-					i, irq);
++		if (err) {
++			dev_err_probe(dev, err, "failed to request global IRQ %d (%u)\n",
++				      i, irq);
++			goto out_power_off;
++		}
+ 	}
+ 
+ 	/* QCOM Additions */
+@@ -3705,6 +3751,16 @@
+ 	if (err)
+ 		goto out_power_off;
+ 
++	/* Registration can immediately attach clients and program contexts. */
++	platform_set_drvdata(pdev, smmu);
++
++	/* Check for RMRs and install bypass SMRs if any */
++	arm_smmu_rmr_install_bypass_smr(smmu);
++
++	arm_smmu_device_reset(smmu);
++	arm_smmu_test_smr_masks(smmu);
++	arm_smmu_interrupt_selftest(smmu);
++
+ 	err = iommu_device_sysfs_add(&smmu->iommu, smmu->dev, NULL,
+ 				     "smmu.%pa", &smmu->ioaddr);
+ 	if (err) {
+@@ -3717,15 +3773,6 @@
+ 		dev_err(dev, "Failed to register iommu\n");
+ 		goto remove_iommu_sysfs_node;
+ 	}
+-
+-	platform_set_drvdata(pdev, smmu);
+-
+-	/* Check for RMRs and install bypass SMRs if any */
+-	arm_smmu_rmr_install_bypass_smr(smmu);
+-
+-	arm_smmu_device_reset(smmu);
+-	arm_smmu_test_smr_masks(smmu);
+-	arm_smmu_interrupt_selftest(smmu);
+ 
+ 	/*
+ 	 * We want to avoid touching dev->power.lock in fastpaths unless
+@@ -3882,7 +3929,7 @@
+ 		.suppress_bind_attrs    = true,
+ 	},
+ 	.probe	= arm_smmu_device_probe,
+-	.remove_new = arm_smmu_device_remove,
++	.remove = arm_smmu_device_remove,
+ 	.shutdown = arm_smmu_device_shutdown,
+ };
+ 
+@@ -3890,19 +3937,27 @@
+ {
+ 	int ret;
+ 	ktime_t cur;
++
++	ret = register_qcom_iommu_ops(&arm_smmu_ops);
++	if (ret)
++		return ret;
+ 
+ 	cur = ktime_get();
+ 	ret = platform_driver_register(&qsmmuv500_tbu_driver);
+ 	if (ret)
+-		return ret;
++		goto unregister_ops;
+ 
+ 	ret = platform_driver_register(&arm_smmu_driver);
+ 	if (ret) {
+ 		platform_driver_unregister(&qsmmuv500_tbu_driver);
+-		return ret;
++		goto unregister_ops;
+ 	}
+ 
+ 	trace_smmu_init(ktime_us_delta(ktime_get(), cur));
++	return 0;
++
++unregister_ops:
++	unregister_qcom_iommu_ops(&arm_smmu_ops);
+ 	return ret;
+ }
+ subsys_initcall(arm_smmu_init);
+@@ -3911,6 +3966,7 @@
+ {
+ 	platform_driver_unregister(&arm_smmu_driver);
+ 	platform_driver_unregister(&qsmmuv500_tbu_driver);
++	unregister_qcom_iommu_ops(&arm_smmu_ops);
+ }
+ module_exit(arm_smmu_exit);
+ 
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu.h
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu.h
+@@ -509,6 +509,9 @@
+ 	struct arm_smmu_mapping_cfg	mapping_cfg;
+ 	bool				delayed_s1_trans_enable;
+ 	u32				secure_vmid;
++	struct mutex			fault_handler_lock; /* Protects callback lifetime */
++	iommu_fault_handler_t		fault_handler;
++	void				*fault_token;
+ 	fault_handler_irq_t		fault_handler_irq;
+ 	void				*handler_irq_token;
+ 	struct qcom_iommu_fault_param	fault_param;
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
+@@ -1151,7 +1151,7 @@
+ 	return ret;
+ }
+ 
+-int arm_tbu_micro_idle_wake(struct arm_smmu_power_resources *pwr)
++static int arm_tbu_micro_idle_wake(struct arm_smmu_power_resources *pwr)
+ {
+ 	struct qsmmuv500_tbu_device *tbu = dev_get_drvdata(pwr->dev);
+ 	struct arm_tbu_device *arm_tbu = to_arm_tbu(tbu);
+@@ -1165,7 +1165,7 @@
+ 	return __arm_tbu_micro_idle_cfg(tbu->smmu, val, val);
+ }
+ 
+-void arm_tbu_micro_idle_allow(struct arm_smmu_power_resources *pwr)
++static void arm_tbu_micro_idle_allow(struct arm_smmu_power_resources *pwr)
+ {
+ 	struct qsmmuv500_tbu_device *tbu = dev_get_drvdata(pwr->dev);
+ 	struct arm_tbu_device *arm_tbu = to_arm_tbu(tbu);
+@@ -2873,8 +2873,8 @@
+ 	.def_domain_type = qcom_def_domain_type,
+ };
+ 
+-struct arm_smmu_device *qsmmuv500_create(struct arm_smmu_device *smmu,
+-		const struct arm_smmu_impl *impl)
++static struct arm_smmu_device *qsmmuv500_create(struct arm_smmu_device *smmu,
++						const struct arm_smmu_impl *impl)
+ {
+ 	struct device *dev = smmu->dev;
+ 	struct qsmmuv500_archdata *data;
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu-trace.h
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu-trace.h
+@@ -28,7 +28,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(group_name, dev_name(domain->dev));
++		__assign_str(group_name);
+ 	),
+ 
+ 	TP_printk("group=%s",
+@@ -65,7 +65,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(group_name, dev_name(domain->dev));
++		__assign_str(group_name);
+ 		__entry->iova = iova;
+ 		__entry->ipa = ipa;
+ 		__entry->granule = granule;
+@@ -108,7 +108,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(group_name, dev_name(domain->dev));
++		__assign_str(group_name);
+ 		__entry->iova = iova;
+ 		__entry->pgsize = pgsize;
+ 		__entry->pgcount = pgcount;
+@@ -164,7 +164,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device, dev_name(dev));
++		__assign_str(device);
+ 	),
+ 
+ 	TP_printk("smmu=%s",
