@@ -1,0 +1,338 @@
+--- a/drivers/power/supply/mca/include/mca/protocol/protocol_class.h
++++ b/drivers/power/supply/mca/include/mca/protocol/protocol_class.h
+@@ -68,7 +68,7 @@
+ 	TYPEC_DEBUG_ACCESS_MODE,
+ };
+ 
+-#define ADAPTER_CAP_MAX_NR	7
++#define ADAPTER_CAP_MAX_NR 7
+ 
+ struct adapter_power_cap {
+ 	int unknown_0;
+@@ -82,7 +82,6 @@
+ 	int nums;
+ 	struct adapter_power_cap cap[ADAPTER_CAP_MAX_NR];
+ };
+-
+ 
+ struct adapter_vendor_info {
+ 	unsigned int vid;
+@@ -104,26 +103,40 @@
+ 	int (*get_adapter_pwr_max_power)(void *data, unsigned int *max_power);
+ 	int (*adapter_det_en)(void *data, int en);
+ 	int (*get_adapter_type)(void *data, int *type);
+-	int (*get_adapter_pwr_cap)(void *data, struct adapter_power_cap_info *cap);
++	int (*get_adapter_pwr_cap)(void *data,
++				   struct adapter_power_cap_info *cap);
+ 	int (*set_adapter_volt_and_curr)(void *data, int volt, int curr);
+ 	int (*get_adapter_volt_and_curr)(void *data, int *volt, int *curr);
+ 	int (*get_adapter_pps_ptf)(void *data, int *pps_ptf);
+ 	int (*get_adapter_info)(void *data, struct adapter_vendor_info *info);
+-	int (*get_adapter_power_curve)(void *data, struct adapter_power_curve *pwr_curve);
++	int (*get_adapter_power_curve)(void *data,
++				       struct adapter_power_curve *pwr_curve);
+ };
+ 
+-int protocol_class_register_ops(unsigned int protocol, struct adapter_protocol_class_ops *ops, void *data);
++int protocol_class_register_ops(unsigned int protocol,
++				struct adapter_protocol_class_ops *ops,
++				void *data);
+ int protocol_class_set_adapter_verified(unsigned int protocol, int verified);
+ int protocol_class_get_adapter_verified(unsigned int protocol, int *verified);
+-int protocol_class_get_adapter_max_power(unsigned int protocol, unsigned int *max_power);
+-int protocol_class_get_adapter_pwr_max_power(unsigned int protocol, unsigned int *max_power);
++int protocol_class_get_adapter_max_power(unsigned int protocol,
++					 unsigned int *max_power);
++int protocol_class_get_adapter_pwr_max_power(unsigned int protocol,
++					     unsigned int *max_power);
+ int protocol_class_det_adapter_type(unsigned int protocol, int en);
+ int protocol_class_get_adapter_type(unsigned int protocol, unsigned int *value);
+-int protocol_class_get_adapter_power_cap(unsigned int protocol, struct adapter_power_cap_info *cap);
+-int protocol_class_set_adapter_volt_and_curr(unsigned int protocol, int volt, int curr);
+-int protocol_class_get_adapter_volt_and_curr(unsigned int protocol, int *volt, int *curr);
++int protocol_class_get_adapter_power_cap(unsigned int protocol,
++					 struct adapter_power_cap_info *cap);
++int protocol_class_set_adapter_volt_and_curr(unsigned int protocol, int volt,
++					     int curr);
++int protocol_class_get_adapter_volt_and_curr(unsigned int protocol, int *volt,
++					     int *curr);
+ int protocol_class_get_adapter_pps_ptf(unsigned int protocol, int *pps_ptf);
+-int protocol_class_get_adapter_info(unsigned int protocol, struct adapter_vendor_info *info);
+-int protocol_class_get_adapter_power_curve(unsigned int protocol, struct adapter_power_curve *pwr_curve);
++int protocol_class_get_adapter_info(unsigned int protocol,
++				    struct adapter_vendor_info *info);
++int protocol_class_get_adapter_power_curve(
++	unsigned int protocol, struct adapter_power_curve *pwr_curve);
++
++/* Drain callbacks before freeing provider data; not callable from a callback. */
++void protocol_class_unregister_ops(unsigned int protocol, void *data);
+ 
+ #endif /* _MCA_PROTOCOL_PROTOCOL_CLASS_H_ */
+--- a/drivers/power/supply/mca/include/mca/protocol/protocol_pd_class.h
++++ b/drivers/power/supply/mca/include/mca/protocol/protocol_pd_class.h
+@@ -4,7 +4,7 @@
+ #include <linux/types.h>
+ #include <mca/protocol/protocol_class.h>
+ 
+-#define PROTOCOL_PD_MAX_PDO_NUMS	7
++#define PROTOCOL_PD_MAX_PDO_NUMS 7
+ #define PROTOCOL_PD_MAX_STRING_LEN 128
+ #define USBPD_UVDM_SS_LEN 8
+ #define USBPD_UVDM_AUTH_FIRST 4
+@@ -54,7 +54,8 @@
+ };
+ 
+ struct protocol_class_pd_ops {
+-	int (*protocol_pd_pps_get_max_power)(unsigned int *max_power, void *data);
++	int (*protocol_pd_pps_get_max_power)(unsigned int *max_power,
++					     void *data);
+ 	int (*protocol_pd_pps_pdo_select)(int volt, int curr, void *data);
+ 	int (*protocol_pd_get_pps_ptf)(int *pps_ptf, void *data);
+ 	int (*protocol_pd_fixed_pdo_set_vol)(int volt, void *data);
+@@ -73,23 +74,34 @@
+ 	int (*protocol_pd_get_pd_type)(int *type, void *data);
+ 	int (*protocol_pd_set_typec_mode)(int typec_mode, void *data);
+ 	int (*protocol_pd_get_typec_mode)(int *typec_mode, void *data);
+-	int (*protocol_pd_get_typec_cc_orientation)(int *cc_orientation, void *data);
+-	int (*protocol_pd_set_typec_cc_orientation)(int cc_orientation, void *data);
++	int (*protocol_pd_get_typec_cc_orientation)(int *cc_orientation,
++						    void *data);
++	int (*protocol_pd_set_typec_cc_orientation)(int cc_orientation,
++						    void *data);
+ 	int (*protocol_pd_set_in_hard_reset)(int in_hard_reset, void *data);
+ 	int (*protocol_pd_get_in_hard_reset)(int *in_hard_reset, void *data);
+ 	int (*protocol_pd_set_usb_suspend_supported)(int supported, void *data);
+-	int (*protocol_pd_get_usb_suspend_supported)(int *supported, void *data);
+-	int (*protocol_pd_set_pd_typec_accessory_mode)(int typec_accessory_mode, void *data);
+-	int (*protocol_pd_get_pd_typec_accessory_mode)(int *typec_accessory_mode, void *data);
+-	int (*protocol_pd_get_cap)(int cap_type, struct adapter_power_cap *tacap, void *data);
++	int (*protocol_pd_get_usb_suspend_supported)(int *supported,
++						     void *data);
++	int (*protocol_pd_set_pd_typec_accessory_mode)(int typec_accessory_mode,
++						       void *data);
++	int (*protocol_pd_get_pd_typec_accessory_mode)(
++		int *typec_accessory_mode, void *data);
++	int (*protocol_pd_get_cap)(int cap_type,
++				   struct adapter_power_cap *tacap, void *data);
+ 	int (*protocol_pd_get_adapter_id)(unsigned int *adapter_id, void *data);
+-	int (*protocol_pd_get_adapter_svid)(unsigned int *adapter_svid, void *data);
+-	int (*protocol_pd_request_vdm_cmd)(enum uvdm_state cmd, unsigned int *data,
+-		unsigned int data_len, void *priv);
+-	int (*protocol_pd_get_vdm_cmd)(int *cmd, struct usbpd_vdm_data *vdm_data, void *data);
++	int (*protocol_pd_get_adapter_svid)(unsigned int *adapter_svid,
++					    void *data);
++	int (*protocol_pd_request_vdm_cmd)(enum uvdm_state cmd,
++					   unsigned int *data,
++					   unsigned int data_len, void *priv);
++	int (*protocol_pd_get_vdm_cmd)(int *cmd,
++				       struct usbpd_vdm_data *vdm_data,
++				       void *data);
+ 	int (*protocol_pd_get_power_role)(unsigned char *pr, void *data);
+ 	int (*protocol_pd_get_data_role)(unsigned char *pr, void *data);
+-	int (*protocol_pd_get_current_state)(char *current_state, int len, void *data);
++	int (*protocol_pd_get_current_state)(char *current_state, int len,
++					     void *data);
+ 	int (*protocol_pd_get_pdos)(struct pd_pdo *pdos, int count, void *data);
+ 	int (*protocol_pd_set_verify_process)(int verify_process, void *data);
+ 	int (*protocol_pd_get_verify_process)(int *verify_process, void *data);
+@@ -103,62 +115,101 @@
+ 	int (*protocol_pd_get_snk_src_mode)(int *snk_src_mode, void *data);
+ 	int (*protocol_pd_get_cc_status)(bool *status, void *data);
+ 	int (*protocol_pd_get_cc_short_vbus)(int *cc_short_vbus, void *data);
+-	int (*protocol_pd_get_suspend_support_status)(bool *pdsuspendsupported, void *data);
+-	int (*protocol_pd_get_zimi_cypress_flag)(int *zimi_cypress_flag, void *data);
+-};
+-
+-int protocol_class_pd_register_ops(unsigned int port_num, struct protocol_class_pd_ops *ops, void *data);
+-int protocol_class_pd_get_pps_max_power(unsigned int port_num, unsigned int *max_power);
+-int protocol_class_pd_set_pps_pdo_select(unsigned int port_num, int volt, int curr);
++	int (*protocol_pd_get_suspend_support_status)(bool *pdsuspendsupported,
++						      void *data);
++	int (*protocol_pd_get_zimi_cypress_flag)(int *zimi_cypress_flag,
++						 void *data);
++};
++
++int protocol_class_pd_register_ops(unsigned int port_num,
++				   struct protocol_class_pd_ops *ops,
++				   void *data);
++int protocol_class_pd_get_pps_max_power(unsigned int port_num,
++					unsigned int *max_power);
++int protocol_class_pd_set_pps_pdo_select(unsigned int port_num, int volt,
++					 int curr);
+ int protocol_class_pd_get_pps_ptf(unsigned int port_num, int *pps_ptf);
+ int protocol_class_pd_set_fixed_volt(unsigned int port_num, int volt);
+ int protocol_class_pd_set_gear_shift(unsigned int port_num, int gear_shift);
+ int protocol_class_pd_set_pps_max_cur(unsigned int port_num, unsigned int curr);
+-int protocol_class_pd_get_pps_max_cur(unsigned int port_num, unsigned int *curr);
+-int protocol_class_pd_get_pps_status(unsigned int port_num, int *volt, int *curr);
++int protocol_class_pd_get_pps_max_cur(unsigned int port_num,
++				      unsigned int *curr);
++int protocol_class_pd_get_pps_status(unsigned int port_num, int *volt,
++				     int *curr);
+ int protocol_class_pd_set_pd_active(unsigned int port_num, int pd_active);
+ int protocol_class_pd_get_pd_active(unsigned int port_num, int *pd_active);
+-int protocol_class_pd_set_pps_min_volt(unsigned int port_num, unsigned int volt);
+-int protocol_class_pd_get_pps_min_volt(unsigned int port_num, unsigned int *volt);
+-int protocol_class_pd_set_pps_max_volt(unsigned int port_num, unsigned int volt);
+-int protocol_class_pd_get_pps_max_volt(unsigned int port_num, unsigned int *volt);
+-int protocol_class_pd_set_pps_apdo_max(unsigned int port_num, unsigned int apdo_max);
+-int protocol_class_pd_get_pps_apdo_max(unsigned int port_num, unsigned int *apdo_max);
++int protocol_class_pd_set_pps_min_volt(unsigned int port_num,
++				       unsigned int volt);
++int protocol_class_pd_get_pps_min_volt(unsigned int port_num,
++				       unsigned int *volt);
++int protocol_class_pd_set_pps_max_volt(unsigned int port_num,
++				       unsigned int volt);
++int protocol_class_pd_get_pps_max_volt(unsigned int port_num,
++				       unsigned int *volt);
++int protocol_class_pd_set_pps_apdo_max(unsigned int port_num,
++				       unsigned int apdo_max);
++int protocol_class_pd_get_pps_apdo_max(unsigned int port_num,
++				       unsigned int *apdo_max);
+ int protocol_class_pd_get_pd_type(unsigned int port_num, int *type);
+ int protocol_class_pd_set_typec_mode(unsigned int port_num, int typec_mode);
+ int protocol_class_pd_get_typec_mode(unsigned int port_num, int *typec_mode);
+-int protocol_class_pd_get_typec_cc_orientation(unsigned int port_num, int *cc_orientation);
+-int protocol_class_pd_set_typec_cc_orientation(unsigned int port_num, int cc_orientation);
+-int protocol_class_pd_set_pd_in_hard_reset(unsigned int port_num, int in_hard_reset);
+-int protocol_class_pd_get_pd_in_hard_reset(unsigned int port_num, int *in_hard_reset);
+-int protocol_class_pd_set_usb_suspend_supported(unsigned int port_num, int supported);
+-int protocol_class_pd_get_usb_suspend_supported(unsigned int port_num, int *supported);
+-int protocol_class_pd_set_pd_typec_accessory_mode(unsigned int port_num, int typec_accessory_mode);
+-int protocol_class_pd_get_pd_typec_accessory_mode(unsigned int port_num, int *typec_accessory_mode);
+-int protocol_class_pd_get_cap(unsigned int port_num, int cap_type, struct adapter_power_cap *tacap);
+-int protocol_class_pd_get_adapter_id(unsigned int port_num, unsigned int *adapter_id);
+-int protocol_class_pd_get_adapter_svid(unsigned int port_num, unsigned int *adapter_svid);
+-int protocol_class_pd_request_vdm_cmd(unsigned int port_num, enum uvdm_state cmd,
+-	unsigned int *data, unsigned int data_len);
+-int protocol_class_pd_get_vdm_cmd(unsigned int port_num, int *cmd, struct usbpd_vdm_data *vdm_data);
++int protocol_class_pd_get_typec_cc_orientation(unsigned int port_num,
++					       int *cc_orientation);
++int protocol_class_pd_set_typec_cc_orientation(unsigned int port_num,
++					       int cc_orientation);
++int protocol_class_pd_set_pd_in_hard_reset(unsigned int port_num,
++					   int in_hard_reset);
++int protocol_class_pd_get_pd_in_hard_reset(unsigned int port_num,
++					   int *in_hard_reset);
++int protocol_class_pd_set_usb_suspend_supported(unsigned int port_num,
++						int supported);
++int protocol_class_pd_get_usb_suspend_supported(unsigned int port_num,
++						int *supported);
++int protocol_class_pd_set_pd_typec_accessory_mode(unsigned int port_num,
++						  int typec_accessory_mode);
++int protocol_class_pd_get_pd_typec_accessory_mode(unsigned int port_num,
++						  int *typec_accessory_mode);
++int protocol_class_pd_get_cap(unsigned int port_num, int cap_type,
++			      struct adapter_power_cap *tacap);
++int protocol_class_pd_get_adapter_id(unsigned int port_num,
++				     unsigned int *adapter_id);
++int protocol_class_pd_get_adapter_svid(unsigned int port_num,
++				       unsigned int *adapter_svid);
++int protocol_class_pd_request_vdm_cmd(unsigned int port_num,
++				      enum uvdm_state cmd, unsigned int *data,
++				      unsigned int data_len);
++int protocol_class_pd_get_vdm_cmd(unsigned int port_num, int *cmd,
++				  struct usbpd_vdm_data *vdm_data);
+ int protocol_class_pd_get_power_role(unsigned int port_num, unsigned char *pr);
+ int protocol_class_pd_get_data_role(unsigned int port_num, unsigned char *pr);
+-int protocol_class_pd_get_current_state(unsigned int port_num, char *current_state, int len);
+-int protocol_class_pd_get_pdos(unsigned int port_num, struct pd_pdo *pdos, int count);
+-int protocol_class_pd_set_verify_process(unsigned int port_num, int verify_process);
+-int protocol_class_pd_get_verify_process(unsigned int port_num, int *verify_process);
++int protocol_class_pd_get_current_state(unsigned int port_num,
++					char *current_state, int len);
++int protocol_class_pd_get_pdos(unsigned int port_num, struct pd_pdo *pdos,
++			       int count);
++int protocol_class_pd_set_verify_process(unsigned int port_num,
++					 int verify_process);
++int protocol_class_pd_get_verify_process(unsigned int port_num,
++					 int *verify_process);
+ int protocol_class_pd_set_pd_verifed(unsigned int port_num, int pd_verifed);
+ int protocol_class_pd_get_pd_verifed(unsigned int port_num, int *pd_verifed);
+ int protocol_class_pd_get_has_dp(unsigned int port_num, bool *has_dp);
+ int protocol_class_pd_get_cid_status(unsigned int port_num, bool *status);
+-int protocol_class_pd_get_otg_plugin_status(unsigned int port_num, bool *status);
++int protocol_class_pd_get_otg_plugin_status(unsigned int port_num,
++					    bool *status);
+ int protocol_class_pd_set_cc_toggle(unsigned int port_num, bool en);
+ int protocol_class_pd_get_cc_toggle(unsigned int port_num, bool *en);
+-int protocol_class_pd_get_snk_src_mode(unsigned int port_num, int *snk_src_mode);
++int protocol_class_pd_get_snk_src_mode(unsigned int port_num,
++				       int *snk_src_mode);
+ int protocol_class_pd_get_cc_status(unsigned int port_num, bool *status);
+-int protocol_class_pd_get_cc_short_vbus(unsigned int port_num, int *cc_short_vbus);
+-int protocol_class_pd_get_suspend_support_status(unsigned int port_num, bool *pdsuspendsupported);
+-int protocol_class_pd_get_zimi_cypress_flag(unsigned int port_num, int *zimi_cypress_flag);
++int protocol_class_pd_get_cc_short_vbus(unsigned int port_num,
++					int *cc_short_vbus);
++int protocol_class_pd_get_suspend_support_status(unsigned int port_num,
++						 bool *pdsuspendsupported);
++int protocol_class_pd_get_zimi_cypress_flag(unsigned int port_num,
++					    int *zimi_cypress_flag);
+ int protocol_class_pd_get_port_num(void);
+ 
++/* Drain callbacks before freeing provider data; not callable from a callback. */
++void protocol_class_pd_unregister_ops(unsigned int port_num, void *data);
++
+ #endif /* _MCA_PROTOCOL_PROTOCOL_PD_CLASS_H_ */
+--- a/drivers/power/supply/mca/include/mca/protocol/protocol_qc_class.h
++++ b/drivers/power/supply/mca/include/mca/protocol/protocol_qc_class.h
+@@ -18,10 +18,15 @@
+ 	int (*protocol_qc_set_volt_cmd)(void *data, int hvdcp_cmd);
+ };
+ 
+-int protocol_class_qc_register_ops(unsigned int port_num, struct protocol_class_qc_ops *ops, void *data);
++int protocol_class_qc_register_ops(unsigned int port_num,
++				   struct protocol_class_qc_ops *ops,
++				   void *data);
+ int protocol_class_qc3_check_class_type(unsigned int port_num, int *type);
+ int protocol_class_qc_get_qc_type(unsigned int port_num, int *type);
+ int protocol_class_qc_set_volt(unsigned int port_num, int volt);
+ int protocol_class_qc_set_volt_cmd(unsigned int port_num, int hvdcp_cmd);
+ 
++/* Drain callbacks before freeing provider data; not callable from a callback. */
++void protocol_class_qc_unregister_ops(unsigned int port_num, void *data);
++
+ #endif /* _MCA_PROTOCOL_PROTOCOL_QC_CLASS_H_ */
+--- a/drivers/power/supply/mca/include/mca/platform/platform_bc12_class.h
++++ b/drivers/power/supply/mca/include/mca/platform/platform_bc12_class.h
+@@ -19,4 +19,7 @@
+ 				     struct platform_bc12_class_ops *ops,
+ 				     void *data);
+ 
++/* Drain callbacks before freeing provider data; not callable from a callback. */
++void platform_bc12_class_ops_unregister(unsigned int role, void *data);
++
+ #endif /* _MCA_PLATFORM_PLATFORM_BC12_CLASS_H_ */
+--- a/drivers/power/supply/mca/include/mca/shared_memory/charger_partition_class.h
++++ b/drivers/power/supply/mca/include/mca/shared_memory/charger_partition_class.h
+@@ -38,7 +38,7 @@
+ 	u32 magic;
+ 	u32 version;
+ 	u32 initialized;
+-	u32 avaliable;
++	u32 available;
+ 	u32 reserved;
+ } charger_partition_header;
+ 
+@@ -62,6 +62,12 @@
+ 	u32 reserved;
+ } charger_partition_info_2;
+ 
++/*
++ * A successful alloc holds the transaction lock until same-task dealloc.
++ * Always dealloc after success, including I/O errors. The read buffer remains
++ * valid only until the next read/write or dealloc in that transaction.
++ * Helpers and callbacks must not be called inside a raw transaction.
++ */
+ int charger_partition_alloc(u8 charger_partition_host_type,
+ 			    u8 charger_partition_info_type, uint32_t size);
+ int charger_partition_dealloc(u8 charger_partition_host_type,
+@@ -76,6 +82,7 @@
+ int charger_partition_read_double85(int *val);
+ int charger_partition_write_double85(int val);
+ int charger_partition_write_remove_temp_limit(int val);
++int charger_partition_read_remove_temp_limit(int *val);
+ int charger_partition_read_memory_test(int *val);
+ int charger_partition_write_memory_test(int val);
+ int charger_partition_read_soc_limit(int *val);

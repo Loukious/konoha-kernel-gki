@@ -1,0 +1,5739 @@
+--- a/drivers/power/supply/mca/mca_protocol/mca_protocol_class.c
++++ b/drivers/power/supply/mca/mca_protocol/mca_protocol_class.c
+@@ -17,6 +17,7 @@
+  *
+  */
+ #include <linux/module.h>
++#include <linux/srcu.h>
+ #include <linux/stat.h>
+ #include <linux/init.h>
+ #include <linux/ctype.h>
+@@ -35,39 +36,73 @@
+ 	struct adapter_protocol_class_ops *ops;
+ 	void *data;
+ };
+-static struct adapter_protocol_class_data
+-	g_protocol_class_data[ADAPTER_PROTOCOL_MAX];
++static struct adapter_protocol_class_data __rcu
++	*g_protocol_class_data[ADAPTER_PROTOCOL_MAX];
++static DEFINE_MUTEX(mca_ops_lock);
++DEFINE_STATIC_SRCU(mca_ops_srcu);
+ 
+ static struct adapter_protocol_class_data *
+ protocol_class_get_protocol_data(unsigned int protocol)
+ {
+ 	if (protocol >= ADAPTER_PROTOCOL_MAX)
+ 		return NULL;
+-
+-	return &g_protocol_class_data[protocol];
++	return srcu_dereference(g_protocol_class_data[protocol], &mca_ops_srcu);
+ }
+ 
+ int protocol_class_register_ops(unsigned int protocol,
+ 				struct adapter_protocol_class_ops *ops,
+ 				void *data)
+ {
+-	if (protocol >= ADAPTER_PROTOCOL_MAX || !ops)
+-		return -1;
+-
+-	g_protocol_class_data[protocol].ops = ops;
+-	g_protocol_class_data[protocol].data = data;
+-
++	struct adapter_protocol_class_data *entry;
++
++	if (protocol >= ADAPTER_PROTOCOL_MAX || !data || !ops)
++		return -EINVAL;
++	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++	entry->ops = ops;
++	entry->data = data;
++	mutex_lock(&mca_ops_lock);
++	if (rcu_access_pointer(g_protocol_class_data[protocol])) {
++		mutex_unlock(&mca_ops_lock);
++		kfree(entry);
++		return -EEXIST;
++	}
++	rcu_assign_pointer(g_protocol_class_data[protocol], entry);
++	mutex_unlock(&mca_ops_lock);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(protocol_class_register_ops);
+ 
++void protocol_class_unregister_ops(unsigned int protocol, void *data)
++{
++	struct adapter_protocol_class_data *entry;
++
++	if (protocol >= ADAPTER_PROTOCOL_MAX)
++		return;
++	mutex_lock(&mca_ops_lock);
++	entry = rcu_dereference_protected(g_protocol_class_data[protocol],
++					  lockdep_is_held(&mca_ops_lock));
++	if (!entry || entry->data != data) {
++		mutex_unlock(&mca_ops_lock);
++		return;
++	}
++	rcu_assign_pointer(g_protocol_class_data[protocol], NULL);
++	mutex_unlock(&mca_ops_lock);
++	synchronize_srcu(&mca_ops_srcu);
++	kfree(entry);
++}
++EXPORT_SYMBOL(protocol_class_unregister_ops);
++
+ int protocol_class_set_adapter_verified(unsigned int protocol, int verified)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct adapter_protocol_class_data *temp_data =
+ 		protocol_class_get_protocol_data(protocol);
+ 
+ 	if (adapter_protocol_invalid_ops(temp_data, set_adapter_verified))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->set_adapter_verified(temp_data->data, verified);
+ }
+@@ -75,11 +110,16 @@
+ 
+ int protocol_class_get_adapter_verified(unsigned int protocol, int *verified)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!verified)
++		return -EINVAL;
++
+ 	struct adapter_protocol_class_data *temp_data =
+ 		protocol_class_get_protocol_data(protocol);
+ 
+ 	if (adapter_protocol_invalid_ops(temp_data, get_adapter_verified))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->get_adapter_verified(temp_data->data, verified);
+ }
+@@ -88,11 +128,16 @@
+ int protocol_class_get_adapter_max_power(unsigned int protocol,
+ 					 unsigned int *max_power)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!max_power)
++		return -EINVAL;
++
+ 	struct adapter_protocol_class_data *temp_data =
+ 		protocol_class_get_protocol_data(protocol);
+ 
+ 	if (adapter_protocol_invalid_ops(temp_data, get_adapter_max_power))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->get_adapter_max_power(temp_data->data,
+ 						     max_power);
+@@ -102,11 +147,16 @@
+ int protocol_class_get_adapter_pwr_max_power(unsigned int protocol,
+ 					     unsigned int *max_power)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!max_power)
++		return -EINVAL;
++
+ 	struct adapter_protocol_class_data *temp_data =
+ 		protocol_class_get_protocol_data(protocol);
+ 
+ 	if (adapter_protocol_invalid_ops(temp_data, get_adapter_pwr_max_power))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->get_adapter_pwr_max_power(temp_data->data,
+ 							 max_power);
+@@ -115,11 +165,13 @@
+ 
+ int protocol_class_det_adapter_type(unsigned int protocol, int en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct adapter_protocol_class_data *temp_data =
+ 		protocol_class_get_protocol_data(protocol);
+ 
+ 	if (adapter_protocol_invalid_ops(temp_data, adapter_det_en))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->adapter_det_en(temp_data->data, en);
+ }
+@@ -127,11 +179,16 @@
+ 
+ int protocol_class_get_adapter_type(unsigned int protocol, unsigned int *value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!value)
++		return -EINVAL;
++
+ 	struct adapter_protocol_class_data *temp_data =
+ 		protocol_class_get_protocol_data(protocol);
+ 
+ 	if (adapter_protocol_invalid_ops(temp_data, get_adapter_type))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->get_adapter_type(temp_data->data, value);
+ }
+@@ -140,11 +197,16 @@
+ int protocol_class_get_adapter_power_cap(unsigned int protocol,
+ 					 struct adapter_power_cap_info *cap)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!cap)
++		return -EINVAL;
++
+ 	struct adapter_protocol_class_data *temp_data =
+ 		protocol_class_get_protocol_data(protocol);
+ 
+ 	if (adapter_protocol_invalid_ops(temp_data, get_adapter_pwr_cap))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->get_adapter_pwr_cap(temp_data->data, cap);
+ }
+@@ -153,11 +215,13 @@
+ int protocol_class_set_adapter_volt_and_curr(unsigned int protocol, int volt,
+ 					     int curr)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct adapter_protocol_class_data *temp_data =
+ 		protocol_class_get_protocol_data(protocol);
+ 
+ 	if (adapter_protocol_invalid_ops(temp_data, set_adapter_volt_and_curr))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->set_adapter_volt_and_curr(temp_data->data, volt,
+ 							 curr);
+@@ -167,11 +231,16 @@
+ int protocol_class_get_adapter_volt_and_curr(unsigned int protocol, int *volt,
+ 					     int *curr)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!volt || !curr)
++		return -EINVAL;
++
+ 	struct adapter_protocol_class_data *temp_data =
+ 		protocol_class_get_protocol_data(protocol);
+ 
+ 	if (adapter_protocol_invalid_ops(temp_data, get_adapter_volt_and_curr))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->get_adapter_volt_and_curr(temp_data->data, volt,
+ 							 curr);
+@@ -180,11 +249,16 @@
+ 
+ int protocol_class_get_adapter_pps_ptf(unsigned int protocol, int *pps_ptf)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!pps_ptf)
++		return -EINVAL;
++
+ 	struct adapter_protocol_class_data *temp_data =
+ 		protocol_class_get_protocol_data(protocol);
+ 
+ 	if (adapter_protocol_invalid_ops(temp_data, get_adapter_pps_ptf))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->get_adapter_pps_ptf(temp_data->data, pps_ptf);
+ }
+@@ -193,11 +267,16 @@
+ int protocol_class_get_adapter_info(unsigned int protocol,
+ 				    struct adapter_vendor_info *info)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!info)
++		return -EINVAL;
++
+ 	struct adapter_protocol_class_data *temp_data =
+ 		protocol_class_get_protocol_data(protocol);
+ 
+ 	if (adapter_protocol_invalid_ops(temp_data, get_adapter_info))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->get_adapter_info(temp_data->data, info);
+ }
+@@ -206,11 +285,16 @@
+ int protocol_class_get_adapter_power_curve(
+ 	unsigned int protocol, struct adapter_power_curve *pwr_curve)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!pwr_curve)
++		return -EINVAL;
++
+ 	struct adapter_protocol_class_data *temp_data =
+ 		protocol_class_get_protocol_data(protocol);
+ 
+ 	if (adapter_protocol_invalid_ops(temp_data, get_adapter_power_curve))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->get_adapter_power_curve(temp_data->data,
+ 						       pwr_curve);
+--- a/drivers/power/supply/mca/mca_protocol/protocol_pd/mca_protocol_pd_class.c
++++ b/drivers/power/supply/mca/mca_protocol/protocol_pd/mca_protocol_pd_class.c
+@@ -17,6 +17,7 @@
+  *
+  */
+ #include <linux/module.h>
++#include <linux/srcu.h>
+ #include <linux/stat.h>
+ #include <linux/init.h>
+ #include <linux/ctype.h>
+@@ -38,7 +39,8 @@
+ #define MCA_LOG_TAG "protocol_pd_class"
+ #endif
+ 
+-#define protocol_class_pd_invalid_ops(temp, name) (!temp || !temp->ops || !temp->ops->name)
++#define protocol_class_pd_invalid_ops(temp, name) \
++	(!temp || !temp->ops || !temp->ops->name)
+ #define MCA_PPS_MAX_VOL_10V 10000
+ 
+ enum mca_apdo_max {
+@@ -60,204 +62,323 @@
+ 	struct protocol_class_pd_ops *ops;
+ };
+ 
+-static struct protocol_class_pd_ops_data g_protocol_pd_data[TYPEC_PORT_MAX];
++static struct protocol_class_pd_ops_data __rcu
++	*g_protocol_pd_data[TYPEC_PORT_MAX];
++static DEFINE_MUTEX(mca_ops_lock);
++DEFINE_STATIC_SRCU(mca_ops_srcu);
+ static unsigned int g_cur_port;
+ static struct notifier_block g_pd_class_ntf;
+ static int device_max_power;
+ static int support_mode;
+ 
+-static int protocol_class_pps_get_pwr_cap(void *data, struct adapter_power_cap_info *pwr_cap);
+-
+-static struct protocol_class_pd_ops_data *protocol_class_pd_get_ops_data(unsigned int port_num)
+-{
+-	if (port_num >= TYPEC_PORT_MAX || !g_protocol_pd_data[port_num].ops)
++static int
++protocol_class_pps_get_pwr_cap(void *data,
++			       struct adapter_power_cap_info *pwr_cap);
++
++static struct protocol_class_pd_ops_data *
++protocol_class_pd_get_ops_data(unsigned int port_num)
++{
++	if (port_num >= TYPEC_PORT_MAX)
+ 		return NULL;
+-
+-	return &g_protocol_pd_data[port_num];
+-}
+-
+-int protocol_class_pd_get_pps_max_power(unsigned int port_num, unsigned int *max_power)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_pps_get_max_power))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_pps_get_max_power(max_power, temp_data->data);
++	return srcu_dereference(g_protocol_pd_data[port_num], &mca_ops_srcu);
++}
++
++int protocol_class_pd_get_pps_max_power(unsigned int port_num,
++					unsigned int *max_power)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!max_power)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_pps_get_max_power))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_pps_get_max_power(max_power,
++							     temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_pps_max_power);
+ 
+-int protocol_class_pd_set_pps_pdo_select(unsigned int port_num, int volt, int curr)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_pps_pdo_select))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_pps_pdo_select(volt, curr, temp_data->data);
++int protocol_class_pd_set_pps_pdo_select(unsigned int port_num, int volt,
++					 int curr)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_pps_pdo_select))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_pps_pdo_select(volt, curr,
++							  temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_pps_pdo_select);
+ 
+ int protocol_class_pd_get_pps_ptf(unsigned int port_num, int *pps_ptf)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!pps_ptf)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
+ 
+ 	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_pps_ptf))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_pps_ptf(pps_ptf, temp_data->data);
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_pps_ptf(pps_ptf,
++						       temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_pps_ptf);
+ 
+ int protocol_class_pd_set_fixed_volt(unsigned int port_num, int volt)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_fixed_pdo_set_vol))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_fixed_pdo_set_vol(volt, temp_data->data);
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_fixed_pdo_set_vol))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_fixed_pdo_set_vol(volt,
++							     temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_fixed_volt);
+ 
+ int protocol_class_pd_set_gear_shift(unsigned int port_num, int gear_shift)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_set_gear_shift))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_set_gear_shift(gear_shift, temp_data->data);
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_set_gear_shift))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_set_gear_shift(gear_shift,
++							  temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_gear_shift);
+ 
+ int protocol_class_pd_set_pps_max_cur(unsigned int port_num, unsigned int curr)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_set_pps_max_cur))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_set_pps_max_cur(curr, temp_data->data);
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_set_pps_max_cur))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_set_pps_max_cur(curr,
++							   temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_pps_max_cur);
+ 
+ int protocol_class_pd_get_pps_max_cur(unsigned int port_num, unsigned int *curr)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_pps_max_cur))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_pps_max_cur(curr, temp_data->data);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!curr)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_pps_max_cur))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_pps_max_cur(curr,
++							   temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_pps_max_cur);
+ 
+-int protocol_class_pd_get_pps_status(unsigned int port_num, int *volt, int *curr)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_pps_status))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_pps_status(volt, curr, temp_data->data);
++int protocol_class_pd_get_pps_status(unsigned int port_num, int *volt,
++				     int *curr)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!volt || !curr)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_pps_status))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_pps_status(volt, curr,
++							  temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_pps_status);
+ 
+ int protocol_class_pd_set_pd_active(unsigned int port_num, int pd_active)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
+ 
+ 	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_set_pd_active))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_set_pd_active(pd_active, temp_data->data);
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_set_pd_active(pd_active,
++							 temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_pd_active);
+ 
+ int protocol_class_pd_get_pd_active(unsigned int port_num, int *pd_active)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!pd_active)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
+ 
+ 	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_pd_active))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_pd_active(pd_active, temp_data->data);
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_pd_active(pd_active,
++							 temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_pd_active);
+ 
+ int protocol_class_pd_set_pps_min_volt(unsigned int port_num, unsigned int volt)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_set_pps_min_volt))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_set_pps_min_volt(volt, temp_data->data);
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_set_pps_min_volt))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_set_pps_min_volt(volt,
++							    temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_pps_min_volt);
+ 
+-int protocol_class_pd_get_pps_min_volt(unsigned int port_num, unsigned int *volt)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_pps_min_volt))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_pps_min_volt(volt, temp_data->data);
++int protocol_class_pd_get_pps_min_volt(unsigned int port_num,
++				       unsigned int *volt)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!volt)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_pps_min_volt))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_pps_min_volt(volt,
++							    temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_pps_min_volt);
+ 
+ int protocol_class_pd_set_pps_max_volt(unsigned int port_num, unsigned int volt)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_set_pps_max_volt))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_set_pps_max_volt(volt, temp_data->data);
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_set_pps_max_volt))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_set_pps_max_volt(volt,
++							    temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_pps_max_volt);
+ 
+-int protocol_class_pd_get_pps_max_volt(unsigned int port_num, unsigned int *volt)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_pps_max_volt))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_pps_max_volt(volt, temp_data->data);
++int protocol_class_pd_get_pps_max_volt(unsigned int port_num,
++				       unsigned int *volt)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!volt)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_pps_max_volt))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_pps_max_volt(volt,
++							    temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_pps_max_volt);
+ 
+-int protocol_class_pd_set_pps_apdo_max(unsigned int port_num, unsigned int apdo_max)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_set_pps_apdo_max))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_set_pps_apdo_max(apdo_max, temp_data->data);
++int protocol_class_pd_set_pps_apdo_max(unsigned int port_num,
++				       unsigned int apdo_max)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_set_pps_apdo_max))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_set_pps_apdo_max(apdo_max,
++							    temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_pps_apdo_max);
+ 
+-int protocol_class_pd_get_pps_apdo_max(unsigned int port_num, unsigned int *apdo_max)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_pps_apdo_max))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_pps_apdo_max(apdo_max, temp_data->data);
++int protocol_class_pd_get_pps_apdo_max(unsigned int port_num,
++				       unsigned int *apdo_max)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!apdo_max)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_pps_apdo_max))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_pps_apdo_max(apdo_max,
++							    temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_pps_apdo_max);
+ 
+ int protocol_class_pd_get_pd_type(unsigned int port_num, int *type)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!type)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
+ 
+ 	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_pd_type))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->protocol_pd_get_pd_type(type, temp_data->data);
+ }
+@@ -265,178 +386,299 @@
+ 
+ int protocol_class_pd_set_typec_mode(unsigned int port_num, int typec_mode)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_set_typec_mode))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_set_typec_mode(typec_mode, temp_data->data);
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_set_typec_mode))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_set_typec_mode(typec_mode,
++							  temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_typec_mode);
+ 
+ int protocol_class_pd_get_typec_mode(unsigned int port_num, int *typec_mode)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_typec_mode))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_typec_mode(typec_mode, temp_data->data);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!typec_mode)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_typec_mode))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_typec_mode(typec_mode,
++							  temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_typec_mode);
+ 
+-int protocol_class_pd_get_typec_cc_orientation(unsigned int port_num, int *cc_orientation)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_typec_cc_orientation))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_typec_cc_orientation(cc_orientation, temp_data->data);
++int protocol_class_pd_get_typec_cc_orientation(unsigned int port_num,
++					       int *cc_orientation)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!cc_orientation)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_typec_cc_orientation))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_typec_cc_orientation(
++		cc_orientation, temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_typec_cc_orientation);
+ 
+-int protocol_class_pd_set_typec_cc_orientation(unsigned int port_num, int cc_orientation)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_set_typec_cc_orientation))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_set_typec_cc_orientation(cc_orientation, temp_data->data);
++int protocol_class_pd_set_typec_cc_orientation(unsigned int port_num,
++					       int cc_orientation)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_set_typec_cc_orientation))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_set_typec_cc_orientation(
++		cc_orientation, temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_typec_cc_orientation);
+ 
+-int protocol_class_pd_set_pd_in_hard_reset(unsigned int port_num, int in_hard_reset)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_set_in_hard_reset))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_set_in_hard_reset(in_hard_reset, temp_data->data);
++int protocol_class_pd_set_pd_in_hard_reset(unsigned int port_num,
++					   int in_hard_reset)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_set_in_hard_reset))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_set_in_hard_reset(in_hard_reset,
++							     temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_pd_in_hard_reset);
+ 
+-int protocol_class_pd_get_pd_in_hard_reset(unsigned int port_num, int *in_hard_reset)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_in_hard_reset))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_in_hard_reset(in_hard_reset, temp_data->data);
++int protocol_class_pd_get_pd_in_hard_reset(unsigned int port_num,
++					   int *in_hard_reset)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!in_hard_reset)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_in_hard_reset))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_in_hard_reset(in_hard_reset,
++							     temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_pd_in_hard_reset);
+ 
+-int protocol_class_pd_set_usb_suspend_supported(unsigned int port_num, int supported)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_set_usb_suspend_supported))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_set_usb_suspend_supported(supported, temp_data->data);
++int protocol_class_pd_set_usb_suspend_supported(unsigned int port_num,
++						int supported)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(
++		    temp_data, protocol_pd_set_usb_suspend_supported))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_set_usb_suspend_supported(
++		supported, temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_usb_suspend_supported);
+ 
+-int protocol_class_pd_get_usb_suspend_supported(unsigned int port_num, int *supported)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_usb_suspend_supported))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_usb_suspend_supported(supported, temp_data->data);
++int protocol_class_pd_get_usb_suspend_supported(unsigned int port_num,
++						int *supported)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!supported)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(
++		    temp_data, protocol_pd_get_usb_suspend_supported))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_usb_suspend_supported(
++		supported, temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_usb_suspend_supported);
+ 
+-int protocol_class_pd_set_pd_typec_accessory_mode(unsigned int port_num, int typec_accessory_mode)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_set_pd_typec_accessory_mode))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_set_pd_typec_accessory_mode(typec_accessory_mode,
+-		temp_data->data);
++int protocol_class_pd_set_pd_typec_accessory_mode(unsigned int port_num,
++						  int typec_accessory_mode)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(
++		    temp_data, protocol_pd_set_pd_typec_accessory_mode))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_set_pd_typec_accessory_mode(
++		typec_accessory_mode, temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_pd_typec_accessory_mode);
+ 
+-int protocol_class_pd_get_pd_typec_accessory_mode(unsigned int port_num, int *typec_accessory_mode)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_pd_typec_accessory_mode))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_pd_typec_accessory_mode(typec_accessory_mode,
+-		temp_data->data);
++int protocol_class_pd_get_pd_typec_accessory_mode(unsigned int port_num,
++						  int *typec_accessory_mode)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!typec_accessory_mode)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(
++		    temp_data, protocol_pd_get_pd_typec_accessory_mode))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_pd_typec_accessory_mode(
++		typec_accessory_mode, temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_pd_typec_accessory_mode);
+ 
+-int protocol_class_pd_get_cap(unsigned int port_num, int cap_type, struct adapter_power_cap *tacap)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
++int protocol_class_pd_get_cap(unsigned int port_num, int cap_type,
++			      struct adapter_power_cap *tacap)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!tacap)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
+ 
+ 	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_cap))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_cap(cap_type, tacap, temp_data->data);
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_cap(cap_type, tacap,
++						   temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_cap);
+ 
+-int protocol_class_pd_get_adapter_id(unsigned int port_num, unsigned int *adapter_id)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_adapter_id))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_adapter_id(adapter_id, temp_data->data);
++int protocol_class_pd_get_adapter_id(unsigned int port_num,
++				     unsigned int *adapter_id)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!adapter_id)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_adapter_id))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_adapter_id(adapter_id,
++							  temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_adapter_id);
+ 
+-int protocol_class_pd_get_adapter_svid(unsigned int port_num, unsigned int *adapter_svid)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_adapter_svid))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_adapter_svid(adapter_svid, temp_data->data);
++int protocol_class_pd_get_adapter_svid(unsigned int port_num,
++				       unsigned int *adapter_svid)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!adapter_svid)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_adapter_svid))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_adapter_svid(adapter_svid,
++							    temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_adapter_svid);
+ 
+-int protocol_class_pd_request_vdm_cmd(unsigned int port_num, enum uvdm_state cmd,
+-	unsigned int *data, unsigned int data_len)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_request_vdm_cmd))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_request_vdm_cmd(cmd, data, data_len, temp_data->data);
++int protocol_class_pd_request_vdm_cmd(unsigned int port_num,
++				      enum uvdm_state cmd, unsigned int *data,
++				      unsigned int data_len)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!data)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_request_vdm_cmd))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_request_vdm_cmd(cmd, data, data_len,
++							   temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_request_vdm_cmd);
+ 
+-int protocol_class_pd_get_vdm_cmd(unsigned int port_num, int *cmd, struct usbpd_vdm_data *vdm_data)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
++int protocol_class_pd_get_vdm_cmd(unsigned int port_num, int *cmd,
++				  struct usbpd_vdm_data *vdm_data)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!cmd || !vdm_data)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
+ 
+ 	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_vdm_cmd))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_vdm_cmd(cmd, vdm_data, temp_data->data);
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_vdm_cmd(cmd, vdm_data,
++						       temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_vdm_cmd);
+ 
+ int protocol_class_pd_get_power_role(unsigned int port_num, unsigned char *pr)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_power_role))
+-		return -1;
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!pr)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_power_role))
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->protocol_pd_get_power_role(pr, temp_data->data);
+ }
+@@ -444,87 +686,144 @@
+ 
+ int protocol_class_pd_get_data_role(unsigned int port_num, unsigned char *pr)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!pr)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
+ 
+ 	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_data_role))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->protocol_pd_get_data_role(pr, temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_data_role);
+ 
+-int protocol_class_pd_get_current_state(unsigned int port_num, char *current_state, int len)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_current_state))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_current_state(current_state, len, temp_data->data);
++int protocol_class_pd_get_current_state(unsigned int port_num,
++					char *current_state, int len)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!current_state)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_current_state))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_current_state(current_state, len,
++							     temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_current_state);
+ 
+-int protocol_class_pd_get_pdos(unsigned int port_num, struct pd_pdo *pdos, int count)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
++int protocol_class_pd_get_pdos(unsigned int port_num, struct pd_pdo *pdos,
++			       int count)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!pdos)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
+ 
+ 	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_pdos))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_pdos(pdos, count, temp_data->data);
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_pdos(pdos, count,
++						    temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_pdos);
+ 
+-int protocol_class_pd_set_verify_process(unsigned int port_num, int verify_process)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_set_verify_process))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_set_verify_process(verify_process, temp_data->data);
++int protocol_class_pd_set_verify_process(unsigned int port_num,
++					 int verify_process)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_set_verify_process))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_set_verify_process(verify_process,
++							      temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_verify_process);
+ 
+-int protocol_class_pd_get_verify_process(unsigned int port_num, int *verify_process)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_verify_process))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_verify_process(verify_process, temp_data->data);
++int protocol_class_pd_get_verify_process(unsigned int port_num,
++					 int *verify_process)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!verify_process)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_verify_process))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_verify_process(verify_process,
++							      temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_verify_process);
+ 
+ int protocol_class_pd_set_pd_verifed(unsigned int port_num, int pd_verifed)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_set_pd_verifed))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_set_pd_verifed(pd_verifed, temp_data->data);
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_set_pd_verifed))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_set_pd_verifed(pd_verifed,
++							  temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_pd_verifed);
+ 
+ int protocol_class_pd_get_pd_verifed(unsigned int port_num, int *pd_verifed)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_pd_verifed))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_pd_verifed(pd_verifed, temp_data->data);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!pd_verifed)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_pd_verifed))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_pd_verifed(pd_verifed,
++							  temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_pd_verifed);
+ 
+ int protocol_class_pd_get_has_dp(unsigned int port_num, bool *has_dp)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!has_dp)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
+ 
+ 	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_has_dp))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->protocol_pd_get_has_dp(has_dp, temp_data->data);
+ }
+@@ -532,44 +831,68 @@
+ 
+ int protocol_class_pd_get_cid_status(unsigned int port_num, bool *status)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_cid_status))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_cid_status(status, temp_data->data);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!status)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_cid_status))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_cid_status(status,
++							  temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_cid_status);
+ 
+ int protocol_class_pd_get_otg_plugin_status(unsigned int port_num, bool *status)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_otg_plugin_status))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_otg_plugin_status(status, temp_data->data);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!status)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_otg_plugin_status))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_otg_plugin_status(
++		status, temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_otg_plugin_status);
+ 
+ int protocol_class_pd_set_cc_toggle(unsigned int port_num, bool en)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
+ 
+ 	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_set_cc_toggle))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->protocol_pd_set_cc_toggle(en, temp_data->data);
+-
+ }
+ EXPORT_SYMBOL(protocol_class_pd_set_cc_toggle);
+ 
+ int protocol_class_pd_get_cc_toggle(unsigned int port_num, bool *en)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!en)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
+ 
+ 	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_cc_toggle))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->protocol_pd_get_cc_toggle(en, temp_data->data);
+ }
+@@ -577,163 +900,291 @@
+ 
+ int protocol_class_pd_get_snk_src_mode(unsigned int port_num, int *snk_src_mode)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_snk_src_mode))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_snk_src_mode(snk_src_mode, temp_data->data);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!snk_src_mode)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_snk_src_mode))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_snk_src_mode(snk_src_mode,
++							    temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_snk_src_mode);
+ 
+ int protocol_class_pd_get_cc_status(unsigned int port_num, bool *status)
+ {
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!status)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
+ 
+ 	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_cc_status))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_cc_status(status, temp_data->data);
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_cc_status(status,
++							 temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_cc_status);
+ 
+-int protocol_class_pd_get_cc_short_vbus(unsigned int port_num, int *cc_short_vbus)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_cc_short_vbus))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_cc_short_vbus(cc_short_vbus, temp_data->data);
++int protocol_class_pd_get_cc_short_vbus(unsigned int port_num,
++					int *cc_short_vbus)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!cc_short_vbus)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_cc_short_vbus))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_cc_short_vbus(cc_short_vbus,
++							     temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_cc_short_vbus);
+ 
+-int protocol_class_pd_get_suspend_support_status(unsigned int port_num, bool *pdsuspendsupported)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_suspend_support_status))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_suspend_support_status(pdsuspendsupported, temp_data->data);
++int protocol_class_pd_get_suspend_support_status(unsigned int port_num,
++						 bool *pdsuspendsupported)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!pdsuspendsupported)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(
++		    temp_data, protocol_pd_get_suspend_support_status))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_suspend_support_status(
++		pdsuspendsupported, temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_suspend_support_status);
+ 
+-int protocol_class_pd_get_zimi_cypress_flag(unsigned int port_num, int *zimi_cypress_flag)
+-{
+-	struct protocol_class_pd_ops_data *temp_data = protocol_class_pd_get_ops_data(port_num);
+-
+-	if (protocol_class_pd_invalid_ops(temp_data, protocol_pd_get_zimi_cypress_flag))
+-		return -1;
+-
+-	return temp_data->ops->protocol_pd_get_zimi_cypress_flag(zimi_cypress_flag, temp_data->data);
++int protocol_class_pd_get_zimi_cypress_flag(unsigned int port_num,
++					    int *zimi_cypress_flag)
++{
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!zimi_cypress_flag)
++		return -EINVAL;
++
++	struct protocol_class_pd_ops_data *temp_data =
++		protocol_class_pd_get_ops_data(port_num);
++
++	if (protocol_class_pd_invalid_ops(temp_data,
++					  protocol_pd_get_zimi_cypress_flag))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_pd_get_zimi_cypress_flag(
++		zimi_cypress_flag, temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_zimi_cypress_flag);
+ 
+ int protocol_class_pd_get_port_num(void)
+ {
+-	return g_cur_port;
++	return READ_ONCE(g_cur_port);
+ }
+ EXPORT_SYMBOL(protocol_class_pd_get_port_num);
+ 
+-int protocol_class_pd_register_ops(unsigned int port_num, struct protocol_class_pd_ops *ops, void *data)
+-{
+-	if (port_num >= TYPEC_PORT_MAX || !ops)
+-		return -1;
+-
+-	g_protocol_pd_data[port_num].ops = ops;
+-	g_protocol_pd_data[port_num].data = data;
+-
++int protocol_class_pd_register_ops(unsigned int port_num,
++				   struct protocol_class_pd_ops *ops,
++				   void *data)
++{
++	struct protocol_class_pd_ops_data *entry;
++
++	if (port_num >= TYPEC_PORT_MAX || !data || !ops)
++		return -EINVAL;
++	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++	entry->ops = ops;
++	entry->data = data;
++	mutex_lock(&mca_ops_lock);
++	if (rcu_access_pointer(g_protocol_pd_data[port_num])) {
++		mutex_unlock(&mca_ops_lock);
++		kfree(entry);
++		return -EEXIST;
++	}
++	rcu_assign_pointer(g_protocol_pd_data[port_num], entry);
++	mutex_unlock(&mca_ops_lock);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(protocol_class_pd_register_ops);
+ 
++void protocol_class_pd_unregister_ops(unsigned int port_num, void *data)
++{
++	struct protocol_class_pd_ops_data *entry;
++
++	if (port_num >= TYPEC_PORT_MAX)
++		return;
++	mutex_lock(&mca_ops_lock);
++	entry = rcu_dereference_protected(g_protocol_pd_data[port_num],
++					  lockdep_is_held(&mca_ops_lock));
++	if (!entry || entry->data != data) {
++		mutex_unlock(&mca_ops_lock);
++		return;
++	}
++	rcu_assign_pointer(g_protocol_pd_data[port_num], NULL);
++	mutex_unlock(&mca_ops_lock);
++	synchronize_srcu(&mca_ops_srcu);
++	kfree(entry);
++}
++EXPORT_SYMBOL(protocol_class_pd_unregister_ops);
++
+ static int protocol_class_pd_set_adapter_verified(void *data, int verified)
+ {
+-	return protocol_class_pd_set_pd_verifed(g_cur_port, verified);
++	return protocol_class_pd_set_pd_verifed(READ_ONCE(g_cur_port),
++						verified);
+ }
+ 
+ static int protocol_class_pd_get_adapter_verified(void *data, int *verified)
+ {
+-	return protocol_class_pd_get_pd_verifed(g_cur_port, verified);
++	return protocol_class_pd_get_pd_verifed(READ_ONCE(g_cur_port),
++						verified);
+ }
+ 
+ static int protocol_class_pd_get_adapter_type(void *data, int *type)
+ {
+-	return protocol_class_pd_get_pd_type(g_cur_port, type);
++	return protocol_class_pd_get_pd_type(READ_ONCE(g_cur_port), type);
++}
++
++static int
++protocol_class_pd_collect_caps(struct adapter_power_cap_info *pwr_cap, bool pps)
++{
++	struct pd_pdo pdos[PROTOCOL_PD_MAX_PDO_NUMS] = {};
++	struct adapter_power_cap_info result = {};
++	int i, ret;
++
++	if (!pwr_cap)
++		return -EINVAL;
++	ret = protocol_class_pd_get_pdos(READ_ONCE(g_cur_port), pdos,
++					 ARRAY_SIZE(pdos));
++	if (ret)
++		return ret;
++	for (i = 0; i < ARRAY_SIZE(pdos); i++) {
++		struct pd_pdo *pdo = &pdos[i];
++		struct adapter_power_cap *cap;
++		s64 power;
++
++		if (!pdo->max_volt && !pdo->min_volt && !pdo->max_current)
++			continue;
++		if (pdo->min_volt <= 0 || pdo->max_volt < pdo->min_volt ||
++		    pdo->max_current <= 0)
++			return -EPROTO;
++		if ((pdo->max_volt != pdo->min_volt) != pps)
++			continue;
++		power = (s64)pdo->max_volt * pdo->max_current / 1000;
++		if (power > INT_MAX || result.nums >= ARRAY_SIZE(result.cap))
++			return -EOVERFLOW;
++		cap = &result.cap[result.nums++];
++		cap->max_voltage = pdo->max_volt;
++		cap->min_voltage = pdo->min_volt;
++		cap->max_current = pdo->max_current;
++		cap->max_power = power;
++	}
++	if (!result.nums)
++		return -ENODATA;
++	*pwr_cap = result;
++	return 0;
+ }
+ 
+ static int protocol_class_pd_get_max_power(void *data, unsigned int *max_power)
+ {
++	struct adapter_power_cap_info caps;
++	unsigned int power = 0;
++	int ret, i;
++
++	if (!max_power)
++		return -EINVAL;
++	ret = protocol_class_pd_collect_caps(&caps, false);
++	if (ret)
++		return ret;
++	for (i = 0; i < caps.nums; i++)
++		power = max(power, (unsigned int)caps.cap[i].max_power / 1000);
++	*max_power = power;
+ 	return 0;
+ }
+ 
+-static int protocol_class_pd_get_pwr_cap(void *data, struct adapter_power_cap_info *pwr_cap)
+-{
+-	struct pd_pdo pdos[PROTOCOL_PD_MAX_PDO_NUMS] = { 0 };
+-	int i, ret;
+-
+-	ret = protocol_class_pd_get_pdos(g_cur_port, pdos, PROTOCOL_PD_MAX_PDO_NUMS);
++static int protocol_class_pd_get_pwr_cap(void *data,
++					 struct adapter_power_cap_info *pwr_cap)
++{
++	return protocol_class_pd_collect_caps(pwr_cap, false);
++}
++
++static int protocol_class_pd_get_adapter_info(void *data,
++					      struct adapter_vendor_info *info)
++{
++	struct adapter_vendor_info value = {};
++	int ret;
++
++	if (!info)
++		return -EINVAL;
++	ret = protocol_class_pd_get_adapter_id(READ_ONCE(g_cur_port),
++					       &value.pid);
+ 	if (ret)
+-		return -1;
+-
+-	pwr_cap->nums = 0;
+-	for (i = 0; i < PROTOCOL_PD_MAX_PDO_NUMS; i++) {
+-		if (pdos[i].max_volt != 0 && pdos[i].max_volt == pdos[i].min_volt) {
+-			pwr_cap->cap[pwr_cap->nums].max_voltage = pdos[i].max_volt;
+-			pwr_cap->cap[pwr_cap->nums].min_voltage = pdos[i].min_volt;
+-			pwr_cap->cap[pwr_cap->nums].max_current = pdos[i].max_current;
+-			pwr_cap->cap[pwr_cap->nums].max_power = pdos[i].max_volt * pdos[i].max_current / 1000;
+-			pwr_cap->nums++;
+-			mca_log_info("pwr_cap[%d] vmin: %d, vmax: %d, imax: %d\n",
+-				i, pdos[i].min_volt, pdos[i].max_volt, pdos[i].max_current);
+-		}
++		return ret;
++	ret = protocol_class_pd_get_adapter_svid(READ_ONCE(g_cur_port),
++						 &value.vid);
++	if (!ret)
++		*info = value;
++	return ret;
++}
++
++static int protocol_class_pps_adapter_get_adv_current(
++	struct adapter_power_cap_info *pwr_cap, int max_volt, int *curr)
++{
++	int i;
++
++	if (!pwr_cap || !curr || pwr_cap->nums <= 0 ||
++	    pwr_cap->nums > ADAPTER_CAP_MAX_NR)
++		return -EINVAL;
++	*curr = 0;
++	for (i = 0; i < pwr_cap->nums; i++) {
++		if (max_volt >= pwr_cap->cap[i].min_voltage &&
++		    max_volt <= pwr_cap->cap[i].max_voltage)
++			*curr = max(*curr, pwr_cap->cap[i].max_current);
+ 	}
+-
+-	if (pwr_cap->nums == 0)
+-		return -1;
+-
+-	return 0;
+-}
+-
+-static int protocol_class_pd_get_adapter_info(void *data, struct adapter_vendor_info *info)
+-{
+-	return 0;
+-}
+-
+-static int protocol_class_pps_adapter_get_adv_current(struct adapter_power_cap_info *pwr_cap, int max_volt, int *curr)
+-{
+-	int i = 0;
+-
+-	if (pwr_cap == NULL || pwr_cap->nums == 0)
+-		return -1;
+-
+-	for (i = 0; i < ADAPTER_CAP_MAX_NR; i++) {
+-		if (max_volt >= pwr_cap->cap[i].min_voltage &&
+-			max_volt <= pwr_cap->cap[i].max_voltage) {
+-				*curr = pwr_cap->cap[i].max_current;
+-				break;
+-		}
+-	}
+-
+-	return 0;
+-}
+-
+-static int protocol_class_pps_adapter_get_max_power(void *data, unsigned int *max_power)
+-{
+-	struct adapter_power_cap_info pwr_cap = {0};
++	return *curr ? 0 : -ENODATA;
++}
++
++static int protocol_class_pps_adapter_get_max_power(void *data,
++						    unsigned int *max_power)
++{
++	struct adapter_power_cap_info pwr_cap = { 0 };
+ 	int type = XM_CHARGER_TYPE_UNKNOW;
+ 	int power = 0;
+ 	int adv_curr = 0;
+ 	int i = 0;
++	int ret;
+ 	bool is_eu_model = 0;
+ 
++	if (!max_power)
++		return -EINVAL;
+ 	*max_power = 0;
+-	protocol_class_pd_get_pd_type(g_cur_port, &type);
++	ret = protocol_class_pd_get_pd_type(READ_ONCE(g_cur_port), &type);
++	if (ret)
++		return ret;
+ 	if (type != XM_CHARGER_TYPE_PPS && type != XM_CHARGER_TYPE_PD_VERIFY)
+ 		return 0;
+ 
+-	protocol_class_pps_get_pwr_cap(NULL, &pwr_cap);
++	ret = protocol_class_pps_get_pwr_cap(NULL, &pwr_cap);
++	if (ret)
++		return ret;
+ 	for (i = 0; i < pwr_cap.nums; i++) {
+ 		if (support_mode == 2 && type == XM_CHARGER_TYPE_PPS &&
+ 		    pwr_cap.cap[i].max_voltage >= 11001)
+@@ -741,9 +1192,13 @@
+ 		power = max(power, pwr_cap.cap[i].max_power / 1000);
+ 	}
+ 
+-	protocol_class_pps_adapter_get_adv_current(&pwr_cap, MCA_PPS_MAX_VOL_10V, &adv_curr);
+-	charger_partition_get_eu_model(&is_eu_model);
+-	mca_log_info("is_eu_model: %d,device_max_power: %d, max_power: %d, adv_curr: %d\n",
++	protocol_class_pps_adapter_get_adv_current(
++		&pwr_cap, MCA_PPS_MAX_VOL_10V, &adv_curr);
++	ret = charger_partition_get_eu_model(&is_eu_model);
++	if (ret)
++		return ret;
++	mca_log_info(
++		"is_eu_model: %d,device_max_power: %d, max_power: %d, adv_curr: %d\n",
+ 		is_eu_model, device_max_power, power, adv_curr);
+ 
+ 	if (is_eu_model && type == XM_CHARGER_TYPE_PD_VERIFY) {
+@@ -753,7 +1208,8 @@
+ 	}
+ 
+ 	// 96 is for 110V AC voltage when used in some foreigns
+-	if ((power >= 96 && adv_curr == 4800) || (power >= 96 && adv_curr == 5000))
++	if ((power >= 96 && adv_curr == 4800) ||
++	    (power >= 96 && adv_curr == 5000))
+ 		power = MCA_APDO_MAX_100W;
+ 	else if (power >= 96 && power < 130)
+ 		power = MCA_APDO_MAX_120W;
+@@ -777,17 +1233,24 @@
+ static int protocol_class_pps_adapter_get_pwr_max_power(void *data,
+ 							unsigned int *max_power)
+ {
+-	struct adapter_power_cap_info pwr_cap = {0};
++	struct adapter_power_cap_info pwr_cap = { 0 };
+ 	int type = XM_CHARGER_TYPE_UNKNOW;
+ 	int power = 0;
+ 	int i = 0;
+-
++	int ret;
++
++	if (!max_power)
++		return -EINVAL;
+ 	*max_power = 0;
+-	protocol_class_pd_get_pd_type(g_cur_port, &type);
++	ret = protocol_class_pd_get_pd_type(READ_ONCE(g_cur_port), &type);
++	if (ret)
++		return ret;
+ 	if (type != XM_CHARGER_TYPE_PPS && type != XM_CHARGER_TYPE_PD_VERIFY)
+ 		return 0;
+ 
+-	protocol_class_pps_get_pwr_cap(NULL, &pwr_cap);
++	ret = protocol_class_pps_get_pwr_cap(NULL, &pwr_cap);
++	if (ret)
++		return ret;
+ 	for (i = 0; i < pwr_cap.nums; i++) {
+ 		if (support_mode == 2 && type == XM_CHARGER_TYPE_PPS &&
+ 		    pwr_cap.cap[i].max_voltage >= 11001)
+@@ -800,46 +1263,34 @@
+ 	return 0;
+ }
+ 
+-static int protocol_class_pps_get_pwr_cap(void *data, struct adapter_power_cap_info *pwr_cap)
+-{
+-	struct pd_pdo pdos[PROTOCOL_PD_MAX_PDO_NUMS] = { 0 };
+-	int i, ret;
+-
+-	ret = protocol_class_pd_get_pdos(g_cur_port, pdos, PROTOCOL_PD_MAX_PDO_NUMS);
+-	if (ret)
+-		return -1;
+-
+-	pwr_cap->nums = 0;
+-	for (i = 0; i < PROTOCOL_PD_MAX_PDO_NUMS; i++) {
+-		if (pdos[i].max_volt == pdos[i].min_volt)
+-			continue;
+-
+-		pwr_cap->cap[pwr_cap->nums].max_voltage = pdos[i].max_volt;
+-		pwr_cap->cap[pwr_cap->nums].min_voltage = pdos[i].min_volt;
+-		pwr_cap->cap[pwr_cap->nums].max_current = pdos[i].max_current;
+-		pwr_cap->cap[pwr_cap->nums].max_power = pdos[i].max_volt * pdos[i].max_current / 1000;
+-		pwr_cap->nums++;
+-	}
+-
+-	if (pwr_cap->nums == 0)
+-		return -1;
+-
+-	return 0;
++static int
++protocol_class_pps_get_pwr_cap(void *data,
++			       struct adapter_power_cap_info *pwr_cap)
++{
++	return protocol_class_pd_collect_caps(pwr_cap, true);
+ }
+ 
+ static int protocol_class_pps_set_volt_and_curr(void *data, int volt, int curr)
+ {
+-	return protocol_class_pd_set_pps_pdo_select(g_cur_port, volt, curr);
++	return protocol_class_pd_set_pps_pdo_select(READ_ONCE(g_cur_port), volt,
++						    curr);
+ }
+ 
+ static int protocol_class_pps_get_pps_ptf(void *data, int *pps_ptf)
+ {
+-	return protocol_class_pd_get_pps_ptf(g_cur_port, pps_ptf);
+-}
+-
+-static int protocol_class_pps_get_volt_and_curr(void *data, int *volt, int *curr)
+-{
+-	return protocol_class_pd_get_pps_status(g_cur_port, volt, curr);
++	return protocol_class_pd_get_pps_ptf(READ_ONCE(g_cur_port), pps_ptf);
++}
++
++static int protocol_class_pps_get_volt_and_curr(void *data, int *volt,
++						int *curr)
++{
++	return protocol_class_pd_get_pps_status(READ_ONCE(g_cur_port), volt,
++						curr);
++}
++
++static int protocol_class_pd_set_volt_and_curr(void *data, int volt, int curr)
++{
++	return protocol_class_pd_set_fixed_volt(READ_ONCE(g_cur_port), volt);
+ }
+ 
+ struct adapter_protocol_class_ops g_protocol_pd_ops = {
+@@ -848,14 +1299,15 @@
+ 	.get_adapter_type = protocol_class_pd_get_adapter_type,
+ 	.get_adapter_max_power = protocol_class_pd_get_max_power,
+ 	.get_adapter_pwr_cap = protocol_class_pd_get_pwr_cap,
+-	.set_adapter_volt_and_curr = protocol_class_pps_set_volt_and_curr,
++	.set_adapter_volt_and_curr = protocol_class_pd_set_volt_and_curr,
+ 	.get_adapter_pps_ptf = protocol_class_pps_get_pps_ptf,
+ 	.get_adapter_info = protocol_class_pd_get_adapter_info,
+ };
+ 
+ struct adapter_protocol_class_ops g_protocol_pps_ops = {
+ 	.get_adapter_max_power = protocol_class_pps_adapter_get_max_power,
+-	.get_adapter_pwr_max_power = protocol_class_pps_adapter_get_pwr_max_power,
++	.get_adapter_pwr_max_power =
++		protocol_class_pps_adapter_get_pwr_max_power,
+ 	.get_adapter_pwr_cap = protocol_class_pps_get_pwr_cap,
+ 	.set_adapter_volt_and_curr = protocol_class_pps_set_volt_and_curr,
+ 	.get_adapter_volt_and_curr = protocol_class_pps_get_volt_and_curr,
+@@ -867,21 +1319,23 @@
+ {
+ 	int snk_src_mode = TYPEC_UNATTACH;
+ 	int i;
+-	return 0;
+ 
+ 	for (i = 0; i < TYPEC_PORT_MAX; i++) {
+-		protocol_class_pd_get_snk_src_mode(i, &snk_src_mode);
+-		if (snk_src_mode >= TYPEC_SNK_MODE && snk_src_mode <= TYPEC_AUDIO_ACCESS_MODE)
++		if (protocol_class_pd_get_snk_src_mode(i, &snk_src_mode))
++			continue;
++		if (snk_src_mode >= TYPEC_SNK_MODE &&
++		    snk_src_mode <= TYPEC_AUDIO_ACCESS_MODE)
+ 			return i;
+ 	}
+ 
+ 	return TYPEC_PORT_0;
+ }
+ 
+-static int protocol_pd_notify_cb(struct notifier_block *nb, unsigned long action, void *data)
+-{
+-	g_cur_port = protocol_pd_update_port_num();
+-	mca_log_info("cur active port %d\n", g_cur_port);
++static int protocol_pd_notify_cb(struct notifier_block *nb,
++				 unsigned long action, void *data)
++{
++	WRITE_ONCE(g_cur_port, protocol_pd_update_port_num());
++	mca_log_info("cur active port %d\n", READ_ONCE(g_cur_port));
+ 
+ 	return NOTIFY_OK;
+ }
+@@ -899,146 +1353,150 @@
+ };
+ 
+ static ssize_t pd_class_sysfs_show(struct device *dev,
+-	struct device_attribute *attr, char *buff);
++				   struct device_attribute *attr, char *buff);
+ static ssize_t pd_class_sysfs_store(struct device *dev,
+-	struct device_attribute *attr, const char *buf, size_t count);
++				    struct device_attribute *attr,
++				    const char *buf, size_t count);
+ 
+ static struct mca_sysfs_attr_info pd_class_sysfs_field_tbl[] = {
+-	mca_sysfs_attr_ro(pd_class_sysfs, 0440, PD_PROP_CC_ORIENTATION, cc_orientation),
++	mca_sysfs_attr_ro(pd_class_sysfs, 0440, PD_PROP_CC_ORIENTATION,
++			  cc_orientation),
+ 	mca_sysfs_attr_ro(pd_class_sysfs, 0440, PD_PROP_APDO_MAX, apdo_max),
+ 	mca_sysfs_attr_ro(pd_class_sysfs, 0440, PD_PROP_HAS_DP, has_dp),
+ 	mca_sysfs_attr_ro(pd_class_sysfs, 0440, PD_PROP_CID_STATUS, cid_status),
+-	mca_sysfs_attr_ro(pd_class_sysfs, 0440, PD_PROP_OTG_UI_SUPPORT, otg_ui_support),
++	mca_sysfs_attr_ro(pd_class_sysfs, 0440, PD_PROP_OTG_UI_SUPPORT,
++			  otg_ui_support),
+ 	mca_sysfs_attr_rw(pd_class_sysfs, 0640, PD_PROP_CC_TOGGLE, cc_toggle),
+-	mca_sysfs_attr_rw(pd_class_sysfs, 0640, PD_PROP_PPS_PTF, pps_ptf),
+-	mca_sysfs_attr_ro(pd_class_sysfs, 0440, PD_PROP_CC_SHORT_VBUS, cc_short_vbus),
++	mca_sysfs_attr_ro(pd_class_sysfs, 0440, PD_PROP_PPS_PTF, pps_ptf),
++	mca_sysfs_attr_ro(pd_class_sysfs, 0440, PD_PROP_CC_SHORT_VBUS,
++			  cc_short_vbus),
+ 	mca_sysfs_attr_ro(pd_class_sysfs, 0440, PD_PROP_TYPEC_MODE, typec_mode),
+ };
+ 
+-#define PD_SYSFS_ATTRS_SIZE   ARRAY_SIZE(pd_class_sysfs_field_tbl)
++#define PD_SYSFS_ATTRS_SIZE ARRAY_SIZE(pd_class_sysfs_field_tbl)
+ 
+ static ssize_t pd_class_sysfs_show(struct device *dev,
+-	struct device_attribute *attr, char *buf)
+-{
+-	struct mca_sysfs_attr_info *attr_info;
+-	int val = 0;
+-	int type = XM_CHARGER_TYPE_UNKNOW;
+-	ssize_t count = 0;
+-
+-	attr_info = mca_sysfs_lookup_attr(attr->attr.name,
+-		pd_class_sysfs_field_tbl, PD_SYSFS_ATTRS_SIZE);
+-	if (!attr_info)
+-		return -1;
+-
+-	switch (attr_info->sysfs_attr_name) {
++				   struct device_attribute *attr, char *buf)
++{
++	struct mca_sysfs_attr_info *entry;
++	unsigned int port = READ_ONCE(g_cur_port), power;
++	int value = 0, type, ret = 0;
++	bool flag;
++
++	entry = mca_sysfs_lookup_attr(attr->attr.name, pd_class_sysfs_field_tbl,
++				      PD_SYSFS_ATTRS_SIZE);
++	if (!entry)
++		return -EINVAL;
++	switch (entry->sysfs_attr_name) {
+ 	case PD_PROP_CC_ORIENTATION:
+-		protocol_class_pd_get_typec_cc_orientation(g_cur_port, &val);
+-		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
+-		mca_log_info("cur typec port = %d, cc_orientation = %d\n", g_cur_port, val);
++		ret = protocol_class_pd_get_typec_cc_orientation(port, &value);
+ 		break;
+ 	case PD_PROP_APDO_MAX:
+-		protocol_class_pps_adapter_get_max_power(NULL, (unsigned int *)(&val));
+-		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
+-		mca_log_err("read apdo_max: %d\n", val);
++		ret = protocol_class_pps_adapter_get_max_power(NULL, &power);
++		if (!ret)
++			value = power;
+ 		break;
+ 	case PD_PROP_HAS_DP:
+-		protocol_class_pd_get_has_dp(g_cur_port, (bool *)(&val));
+-		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
+-		mca_log_err("read has_dp: %d\n", val);
++		ret = protocol_class_pd_get_has_dp(port, &flag);
++		if (!ret)
++			value = flag;
+ 		break;
+ 	case PD_PROP_CID_STATUS:
+-		protocol_class_pd_get_cid_status(g_cur_port, (bool *)(&val));
+-		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
++		ret = protocol_class_pd_get_cid_status(port, &flag);
++		if (!ret)
++			value = flag;
+ 		break;
+ 	case PD_PROP_OTG_UI_SUPPORT:
+-		val = 1;
+-		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
++		value = 1;
+ 		break;
+ 	case PD_PROP_CC_TOGGLE:
+-		protocol_class_pd_get_cc_toggle(g_cur_port, (bool *)(&val));
+-		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
++		ret = protocol_class_pd_get_cc_toggle(port, &flag);
++		if (!ret)
++			value = flag;
+ 		break;
+ 	case PD_PROP_CC_SHORT_VBUS:
+-		protocol_class_pd_get_cc_short_vbus(g_cur_port, &val);
+-		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
++		ret = protocol_class_pd_get_cc_short_vbus(port, &value);
+ 		break;
+ 	case PD_PROP_PPS_PTF:
+-		protocol_class_pd_get_pd_type(g_cur_port, &type);
+-		if (type == XM_CHARGER_TYPE_PPS || type == XM_CHARGER_TYPE_PD_VERIFY) {
+-			protocol_class_pd_get_pps_ptf(g_cur_port, &val);
+-		}
+-		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
+-		mca_log_err("read buf: %d\n", val);
++		ret = protocol_class_pd_get_pd_type(port, &type);
++		if (!ret && (type == XM_CHARGER_TYPE_PPS ||
++			     type == XM_CHARGER_TYPE_PD_VERIFY))
++			ret = protocol_class_pd_get_pps_ptf(port, &value);
+ 		break;
+ 	case PD_PROP_TYPEC_MODE:
+-		protocol_class_pd_get_typec_mode(g_cur_port, &val);
+-		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
++		ret = protocol_class_pd_get_typec_mode(port, &value);
+ 		break;
+ 	default:
+-		break;
++		return -EINVAL;
+ 	}
+-	return count;
++	return ret ? ret : sysfs_emit(buf, "%d\n", value);
+ }
+ 
+ static ssize_t pd_class_sysfs_store(struct device *dev,
+-	struct device_attribute *attr, const char *buf, size_t count)
+-{
+-	struct mca_sysfs_attr_info *attr_info;
+-	int val = 0;
+-
+-	attr_info = mca_sysfs_lookup_attr(attr->attr.name,
+-		pd_class_sysfs_field_tbl, PD_SYSFS_ATTRS_SIZE);
+-	if (!attr_info)
+-		return -1;
+-
+-	switch (attr_info->sysfs_attr_name) {
+-	case PD_PROP_CC_TOGGLE:
+-		if (kstrtoint(buf, 10, &val))
+-			return -EINVAL;
+-		protocol_class_pd_set_cc_toggle(g_cur_port, val);
+-		break;
+-	case PD_PROP_PPS_PTF:
+-		break;
+-	default:
+-		break;
+-	}
+-	return count;
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	struct mca_sysfs_attr_info *entry;
++	bool value;
++	int ret;
++
++	entry = mca_sysfs_lookup_attr(attr->attr.name, pd_class_sysfs_field_tbl,
++				      PD_SYSFS_ATTRS_SIZE);
++	if (!entry || entry->sysfs_attr_name != PD_PROP_CC_TOGGLE)
++		return -EOPNOTSUPP;
++	ret = kstrtobool(buf, &value);
++	if (!ret)
++		ret = protocol_class_pd_set_cc_toggle(READ_ONCE(g_cur_port),
++						      value);
++	return ret ? ret : count;
+ }
+ 
+ static int pd_sysfs_create_files(void)
+ {
+-	return mca_sysfs_create_files(SYSFS_DEV_3, pd_class_sysfs_field_tbl, PD_SYSFS_ATTRS_SIZE);
++	return mca_sysfs_create_files(SYSFS_DEV_3, pd_class_sysfs_field_tbl,
++				      PD_SYSFS_ATTRS_SIZE);
+ }
+ 
+ static int protocol_pd_class_probe(struct platform_device *pdev)
+ {
+ 	int ret;
+ 
+-	ret = protocol_class_register_ops(ADAPTER_PROTOCOL_PD, &g_protocol_pd_ops, NULL);
++	ret = protocol_class_register_ops(ADAPTER_PROTOCOL_PD,
++					  &g_protocol_pd_ops, pdev);
+ 	if (ret)
+ 		return ret;
+-	ret = protocol_class_register_ops(ADAPTER_PROTOCOL_PPS, &g_protocol_pps_ops, NULL);
++	ret = protocol_class_register_ops(ADAPTER_PROTOCOL_PPS,
++					  &g_protocol_pps_ops, pdev);
+ 	if (ret)
+-		return ret;
+-
++		goto remove_pd;
+ 	mca_parse_dts_u32(pdev->dev.of_node, "max_power", &device_max_power, 0);
+ 	mca_parse_dts_u32(pdev->dev.of_node, "support_mode", &support_mode, 0);
+-
++	g_cur_port = TYPEC_PORT_0;
+ 	g_pd_class_ntf.notifier_call = protocol_pd_notify_cb;
+-	ret = mca_event_block_notify_register(MCA_EVENT_TYPE_TYPEC_PORT_STATUS, &g_pd_class_ntf);
++	ret = mca_event_block_notify_register(MCA_EVENT_TYPE_TYPEC_PORT_STATUS,
++					      &g_pd_class_ntf);
+ 	if (ret)
+-		return -EPROBE_DEFER;
+-
+-	g_cur_port = 0;
+-
+-	pd_sysfs_create_files();
+-	mca_log_err("probe ok\n");
++		goto remove_pps;
++	ret = pd_sysfs_create_files();
++	if (!ret)
++		return 0;
++	mca_event_block_notify_unregister(MCA_EVENT_TYPE_TYPEC_PORT_STATUS,
++					  &g_pd_class_ntf);
++remove_pps:
++	protocol_class_unregister_ops(ADAPTER_PROTOCOL_PPS, pdev);
++remove_pd:
++	protocol_class_unregister_ops(ADAPTER_PROTOCOL_PD, pdev);
+ 	return ret;
+ }
+ 
+-static int protocol_pd_class_remove(struct platform_device *pdev)
+-{
+-	return 0;
++static void protocol_pd_class_remove(struct platform_device *pdev)
++{
++	mca_sysfs_remove_files(SYSFS_DEV_3, pd_class_sysfs_field_tbl,
++			       PD_SYSFS_ATTRS_SIZE);
++	mca_event_block_notify_unregister(MCA_EVENT_TYPE_TYPEC_PORT_STATUS,
++					  &g_pd_class_ntf);
++	protocol_class_unregister_ops(ADAPTER_PROTOCOL_PPS, pdev);
++	protocol_class_unregister_ops(ADAPTER_PROTOCOL_PD, pdev);
+ }
+ 
+ static void protocol_pd_class_shutdown(struct platform_device *pdev)
+@@ -1046,7 +1504,7 @@
+ }
+ 
+ static const struct of_device_id match_table[] = {
+-	{.compatible = "mca,protocol_pd"},
++	{ .compatible = "mca,protocol_pd" },
+ 	{},
+ };
+ 
+@@ -1073,8 +1531,6 @@
+ }
+ module_exit(protocol_pd_class_exit);
+ 
+-
+ MODULE_DESCRIPTION("protocol pd class");
+ MODULE_AUTHOR("liyuze1@xiaomi.com");
+ MODULE_LICENSE("GPL v2");
+-
+--- a/drivers/power/supply/mca/mca_protocol/protocol_qc/mca_protocol_qc_class.c
++++ b/drivers/power/supply/mca/mca_protocol/protocol_qc/mca_protocol_qc_class.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include <linux/module.h>
++#include <linux/srcu.h>
+ #include <linux/stat.h>
+ #include <linux/init.h>
+ #include <linux/ctype.h>
+@@ -35,7 +36,8 @@
+ #define MCA_LOG_TAG "protocol_qc_class"
+ #endif
+ 
+-#define protocol_class_qc_invalid_ops(temp, name) (!temp || !temp->ops || !temp->ops->name)
++#define protocol_class_qc_invalid_ops(temp, name) \
++	(!temp || !temp->ops || !temp->ops->name)
+ 
+ struct protocol_class_qc_ops_data {
+ 	void *data;
+@@ -43,33 +45,50 @@
+ };
+ 
+ static unsigned int g_cur_port;
+-static struct protocol_class_qc_ops_data g_protocol_qc_data[TYPEC_PORT_MAX];
+-
+-static struct protocol_class_qc_ops_data *protocol_class_qc_get_ops_data(unsigned int port_num)
+-{
+-	if (port_num >= TYPEC_PORT_MAX || !g_protocol_qc_data[port_num].ops)
++static struct protocol_class_qc_ops_data __rcu
++	*g_protocol_qc_data[TYPEC_PORT_MAX];
++static DEFINE_MUTEX(mca_ops_lock);
++DEFINE_STATIC_SRCU(mca_ops_srcu);
++
++static struct protocol_class_qc_ops_data *
++protocol_class_qc_get_ops_data(unsigned int port_num)
++{
++	if (port_num >= TYPEC_PORT_MAX)
+ 		return NULL;
+-
+-	return &g_protocol_qc_data[port_num];
++	return srcu_dereference(g_protocol_qc_data[port_num], &mca_ops_srcu);
+ }
+ 
+ int protocol_class_qc3_check_class_type(unsigned int port_num, int *type)
+ {
+-	struct protocol_class_qc_ops_data *temp_data = protocol_class_qc_get_ops_data(port_num);
+-
+-	if (protocol_class_qc_invalid_ops(temp_data, protocol_qc3_check_class_type))
+-		return -1;
+-
+-	return temp_data->ops->protocol_qc3_check_class_type(type, temp_data->data);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!type)
++		return -EINVAL;
++
++	struct protocol_class_qc_ops_data *temp_data =
++		protocol_class_qc_get_ops_data(port_num);
++
++	if (protocol_class_qc_invalid_ops(temp_data,
++					  protocol_qc3_check_class_type))
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_qc3_check_class_type(type,
++							     temp_data->data);
+ }
+ EXPORT_SYMBOL(protocol_class_qc3_check_class_type);
+ 
+ int protocol_class_qc_get_qc_type(unsigned int port_num, int *type)
+ {
+-	struct protocol_class_qc_ops_data *temp_data = protocol_class_qc_get_ops_data(port_num);
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!type)
++		return -EINVAL;
++
++	struct protocol_class_qc_ops_data *temp_data =
++		protocol_class_qc_get_ops_data(port_num);
+ 
+ 	if (protocol_class_qc_invalid_ops(temp_data, protocol_qc_get_qc_type))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->protocol_qc_get_qc_type(type, temp_data->data);
+ }
+@@ -77,10 +96,13 @@
+ 
+ int protocol_class_qc_set_volt(unsigned int port_num, int volt)
+ {
+-	struct protocol_class_qc_ops_data *temp_data = protocol_class_qc_get_ops_data(port_num);
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_qc_ops_data *temp_data =
++		protocol_class_qc_get_ops_data(port_num);
+ 
+ 	if (protocol_class_qc_invalid_ops(temp_data, protocol_qc_set_volt))
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->protocol_qc_set_volt(temp_data->data, volt);
+ }
+@@ -88,12 +110,16 @@
+ 
+ int protocol_class_qc_set_volt_cmd(unsigned int port_num, int hvdcp_cmd)
+ {
+-	struct protocol_class_qc_ops_data *temp_data = protocol_class_qc_get_ops_data(port_num);
++	guard(srcu)(&mca_ops_srcu);
++
++	struct protocol_class_qc_ops_data *temp_data =
++		protocol_class_qc_get_ops_data(port_num);
+ 
+ 	if (protocol_class_qc_invalid_ops(temp_data, protocol_qc_set_volt_cmd))
+-		return -1;
+-
+-	return temp_data->ops->protocol_qc_set_volt_cmd(temp_data->data, hvdcp_cmd);
++		return -EOPNOTSUPP;
++
++	return temp_data->ops->protocol_qc_set_volt_cmd(temp_data->data,
++							hvdcp_cmd);
+ }
+ EXPORT_SYMBOL(protocol_class_qc_set_volt_cmd);
+ 
+@@ -107,17 +133,50 @@
+ 	return protocol_class_qc_set_volt(g_cur_port, volt);
+ }
+ 
+-int protocol_class_qc_register_ops(unsigned int port_num, struct protocol_class_qc_ops *ops, void *data)
+-{
+-	if (port_num >= TYPEC_PORT_MAX || !ops)
+-		return -1;
+-
+-	g_protocol_qc_data[port_num].ops = ops;
+-	g_protocol_qc_data[port_num].data = data;
+-
++int protocol_class_qc_register_ops(unsigned int port_num,
++				   struct protocol_class_qc_ops *ops,
++				   void *data)
++{
++	struct protocol_class_qc_ops_data *entry;
++
++	if (port_num >= TYPEC_PORT_MAX || !data || !ops)
++		return -EINVAL;
++	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++	entry->ops = ops;
++	entry->data = data;
++	mutex_lock(&mca_ops_lock);
++	if (rcu_access_pointer(g_protocol_qc_data[port_num])) {
++		mutex_unlock(&mca_ops_lock);
++		kfree(entry);
++		return -EEXIST;
++	}
++	rcu_assign_pointer(g_protocol_qc_data[port_num], entry);
++	mutex_unlock(&mca_ops_lock);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(protocol_class_qc_register_ops);
++
++void protocol_class_qc_unregister_ops(unsigned int port_num, void *data)
++{
++	struct protocol_class_qc_ops_data *entry;
++
++	if (port_num >= TYPEC_PORT_MAX)
++		return;
++	mutex_lock(&mca_ops_lock);
++	entry = rcu_dereference_protected(g_protocol_qc_data[port_num],
++					  lockdep_is_held(&mca_ops_lock));
++	if (!entry || entry->data != data) {
++		mutex_unlock(&mca_ops_lock);
++		return;
++	}
++	rcu_assign_pointer(g_protocol_qc_data[port_num], NULL);
++	mutex_unlock(&mca_ops_lock);
++	synchronize_srcu(&mca_ops_srcu);
++	kfree(entry);
++}
++EXPORT_SYMBOL(protocol_class_qc_unregister_ops);
+ 
+ struct adapter_protocol_class_ops g_protocol_qc_ops = {
+ 	.get_adapter_type = protocol_class_qc_get_adapter_type,
+@@ -128,7 +187,8 @@
+ {
+ 	int ret;
+ 
+-	ret = protocol_class_register_ops(ADAPTER_PROTOCOL_QC, &g_protocol_qc_ops, NULL);
++	ret = protocol_class_register_ops(ADAPTER_PROTOCOL_QC,
++					  &g_protocol_qc_ops, pdev);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -137,9 +197,9 @@
+ 	return ret;
+ }
+ 
+-static int protocol_qc_class_remove(struct platform_device *pdev)
+-{
+-	return 0;
++static void protocol_qc_class_remove(struct platform_device *pdev)
++{
++	protocol_class_unregister_ops(ADAPTER_PROTOCOL_QC, pdev);
+ }
+ 
+ static void protocol_qc_class_shutdown(struct platform_device *pdev)
+@@ -147,7 +207,7 @@
+ }
+ 
+ static const struct of_device_id match_table[] = {
+-	{.compatible = "mca,protocol_qc"},
++	{ .compatible = "mca,protocol_qc" },
+ 	{},
+ };
+ 
+--- a/drivers/power/supply/mca/mca_protocol/protocol_pd/qcom_tcpc/qcom_adsp_pd_protocol.c
++++ b/drivers/power/supply/mca/mca_protocol/protocol_pd/qcom_tcpc/qcom_adsp_pd_protocol.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/of.h>
+@@ -70,21 +71,25 @@
+ 	struct notifier_block event_nb;
+ 	struct notifier_block abnormal_nb;
+ 	int verify_process;
++	struct mutex state_lock;
+ };
+ 
+ static int adsp_pd_protocol_get_pps_max_power(unsigned int *max_power,
+ 					      void *data)
+ {
+-	return mca_adsp_glink_write_prop(PD_PROP_PPS_MAX_POWER, max_power,
+-					 sizeof(*max_power));
++	return mca_adsp_glink_read_prop(PD_PROP_PPS_MAX_POWER, max_power,
++					sizeof(*max_power));
+ }
+ 
+ static int adsp_pd_protocol_select_pps_pdo(int volt, int curr, void *data)
+ {
+ 	u32 val;
+ 
++	if (volt <= 0 || volt / 20 > U16_MAX || curr <= 0 ||
++	    curr / 50 > U16_MAX)
++		return -EINVAL;
+ 	mca_log_info("vbus_mv: %d, ibus_ma: %d\n", volt, curr);
+-	val = (curr / 50) | ((volt / 20) << 16);
++	val = (curr / 50) | ((u32)(volt / 20) << 16);
+ 	return mca_adsp_glink_write_prop(PD_PROP_SELECT_PPS_PDO, &val,
+ 					 sizeof(val));
+ }
+@@ -98,13 +103,16 @@
+ static int adsp_pd_protocol_set_fixed_pd_volt(int volt, void *data)
+ {
+ 	struct adsp_pd_protocol *pd = data;
++	guard(mutex)(&pd->state_lock);
+ 	int val = volt;
+ 
+ 	mca_log_info("vbus_mv: %d\n", volt);
+ 	if (pd->verify_process) {
+ 		mca_log_err("pd verify processing, won't set fixed pd volt\n");
+-		return 0;
++		return -EBUSY;
+ 	}
++	if (volt <= 0)
++		return -EINVAL;
+ 	return mca_adsp_glink_write_prop(PD_PROP_FIXED_PD_VOLT, &val,
+ 					 sizeof(val));
+ }
+@@ -145,6 +153,8 @@
+ {
+ 	int ret, i;
+ 
++	if (!pdos || count <= 0 || count > PROTOCOL_PD_MAX_PDO_NUMS)
++		return -EINVAL;
+ 	ret = mca_adsp_glink_read_prop(PD_PROP_PDOS, pdos,
+ 				       count * sizeof(struct pd_pdo));
+ 	if (count > 0 && ret == 0) {
+@@ -160,6 +170,7 @@
+ static int adsp_pd_protocol_set_pd_active(int pd_active, void *data)
+ {
+ 	struct adsp_pd_protocol *pd = data;
++	guard(mutex)(&pd->state_lock);
+ 
+ 	if (!pd)
+ 		return -1;
+@@ -170,6 +181,7 @@
+ static int adsp_pd_protocol_get_pd_active(int *pd_active, void *data)
+ {
+ 	struct adsp_pd_protocol *pd = data;
++	guard(mutex)(&pd->state_lock);
+ 
+ 	if (!pd)
+ 		return -1;
+@@ -180,6 +192,7 @@
+ static int adsp_pd_protocol_get_pd_type(int *type, void *data)
+ {
+ 	struct adsp_pd_protocol *pd = data;
++	guard(mutex)(&pd->state_lock);
+ 	int real_type = 0;
+ 	int ret;
+ 
+@@ -201,12 +214,14 @@
+ static int adsp_pd_protocol_set_verify_process(int verify_process, void *data)
+ {
+ 	struct adsp_pd_protocol *pd = data;
+-	int val = verify_process;
+-
+-	pd->verify_process = verify_process;
+-	mca_log_err("verify_process: %d\n", verify_process);
+-	return mca_adsp_glink_write_prop(PD_PROP_VERIFY_PROCESS, &val,
+-					 sizeof(val));
++	int ret;
++
++	guard(mutex)(&pd->state_lock);
++	ret = mca_adsp_glink_write_prop(PD_PROP_VERIFY_PROCESS, &verify_process,
++					sizeof(verify_process));
++	if (!ret)
++		pd->verify_process = verify_process;
++	return ret;
+ }
+ 
+ static int adsp_pd_protocol_get_verify_process(int *verify_process, void *data)
+@@ -218,17 +233,20 @@
+ static int adsp_pd_protocol_set_pd_verifed(int pd_verifed, void *data)
+ {
+ 	struct adsp_pd_protocol *pd = data;
+-	int val = pd_verifed;
+-
+-	mca_log_err("set pd_verifed: %d\n", pd_verifed);
+-	pd->pd_verifed = pd_verifed;
+-	return mca_adsp_glink_write_prop(PD_PROP_PD_VERIFIED, &val,
+-					 sizeof(val));
++	int ret;
++
++	guard(mutex)(&pd->state_lock);
++	ret = mca_adsp_glink_write_prop(PD_PROP_PD_VERIFIED, &pd_verifed,
++					sizeof(pd_verifed));
++	if (!ret)
++		pd->pd_verifed = pd_verifed;
++	return ret;
+ }
+ 
+ static int adsp_pd_protocol_get_pd_verifed(int *pd_verifed, void *data)
+ {
+ 	struct adsp_pd_protocol *pd = data;
++	guard(mutex)(&pd->state_lock);
+ 
+ 	mca_log_info("get verifed %d\n", pd->pd_verifed);
+ 	*pd_verifed = pd->pd_verifed;
+@@ -273,7 +291,8 @@
+ 	int ret;
+ 
+ 	ret = mca_adsp_glink_read_prop(PD_PROP_DATA_ROLE, &val, sizeof(val));
+-	*pr = (unsigned char)val;
++	if (!ret)
++		*pr = (unsigned char)val;
+ 	mca_log_info("get data_role: %d\n", val & 0xff);
+ 	return ret;
+ }
+@@ -281,33 +300,21 @@
+ static int adsp_pd_protocol_get_current_state(char *current_state, int len,
+ 					      void *data)
+ {
+-	int state = 0;
+-	int ret;
+-
+-	if (len < 0x40)
+-		return -1;
+-
++	static const char *const states[] = { "SRC_Ready", "SNK_STARTUP",
++					      "SNK_Ready" };
++	const char *name;
++	int state, ret;
++
++	if (!current_state || len <= 0)
++		return -EINVAL;
+ 	ret = mca_adsp_glink_read_prop(PD_PROP_CURRENT_STATE, &state,
+ 				       sizeof(state));
+-	if (ret != 0)
++	if (ret)
+ 		return ret;
+-
+-	switch (state) {
+-	case 0:
+-		strscpy(current_state, "SRC_Ready", sizeof("SRC_Ready"));
+-		break;
+-	case 1:
+-		strscpy(current_state, "SNK_STARTUP", sizeof("SNK_STARTUP"));
+-		break;
+-	case 2:
+-		strscpy(current_state, "SNK_Ready", sizeof("SNK_Ready"));
+-		break;
+-	default:
+-		strscpy(current_state, "UNKNOWN", sizeof("UNKNOWN"));
+-		break;
+-	}
+-	mca_log_info("get current_state: %u => %s\n", state, current_state);
+-	return 0;
++	name = state >= 0 && state < ARRAY_SIZE(states) ? states[state] :
++							  "UNKNOWN";
++	ret = strscpy(current_state, name, len);
++	return ret < 0 ? ret : 0;
+ }
+ 
+ static void adsp_pd_vdm_bswap4(u32 *d)
+@@ -322,14 +329,13 @@
+ 					    unsigned int *vdm_data,
+ 					    unsigned int data_len, void *data)
+ {
++	u32 payload[4];
+ 	int prop;
+-
+-	if (!vdm_data)
+-		return -1;
+-
+-	mca_log_info("data_len=%d, cmd=%d, data=%d\n", data_len, cmd,
+-		     *vdm_data);
+-
++	bool swap = false;
++
++	/* data_len is bytes; never swap four words in the caller's buffer. */
++	if (!vdm_data || !data_len || data_len > sizeof(payload))
++		return -EINVAL;
+ 	switch (cmd) {
+ 	case USBPD_UVDM_CHARGER_VERSION:
+ 		prop = PD_PROP_VDM_VERSION;
+@@ -341,44 +347,38 @@
+ 		prop = PD_PROP_VDM_TEMP;
+ 		break;
+ 	case USBPD_UVDM_SESSION_SEED:
+-		if (data_len < 4) {
+-			prop = 0;
+-		} else {
+-			adsp_pd_vdm_bswap4(vdm_data);
+-			prop = PD_PROP_VDM_SESSION_SEED;
+-		}
++		prop = PD_PROP_VDM_SESSION_SEED;
++		swap = true;
+ 		break;
+ 	case USBPD_UVDM_AUTHENTICATION:
+-		if (data_len < 4)
+-			return -1;
+-		adsp_pd_vdm_bswap4(vdm_data);
+ 		prop = PD_PROP_VDM_AUTH;
++		swap = true;
++		break;
++	case USBPD_UVDM_REVERSE_AUTHEN:
++		prop = PD_PROP_VDM_REVERSE_AUTH;
++		swap = true;
+ 		break;
+ 	case USBPD_UVDM_VERIFIED:
+ 		prop = PD_PROP_VDM_VERIFIED;
+ 		break;
+ 	case USBPD_UVDM_REMOVE_COMPENSATION:
+ 		prop = PD_PROP_VDM_REMOVE_COMP;
+-		break;
+-	case USBPD_UVDM_REVERSE_AUTHEN:
+-		if (data_len < 4)
+-			return -1;
+-		adsp_pd_vdm_bswap4(vdm_data);
+-		prop = PD_PROP_VDM_REVERSE_AUTH;
+ 		break;
+ 	default:
+ 		if (cmd == ADSP_VDM_REQ_INIT)
+ 			prop = PD_PROP_DATA_ROLE;
+ 		else if (cmd == ADSP_VDM_REQ_NAK)
+ 			prop = PD_PROP_VDM_NAK;
+-		else {
+-			pr_info("cmd:%d is not support\n", cmd);
++		else
+ 			return -EINVAL;
+-		}
+ 		break;
+ 	}
+-
+-	return mca_adsp_glink_write_prop(prop, vdm_data, data_len);
++	if (swap && data_len != sizeof(payload))
++		return -EINVAL;
++	memcpy(payload, vdm_data, data_len);
++	if (swap)
++		adsp_pd_vdm_bswap4(payload);
++	return mca_adsp_glink_write_prop(prop, payload, data_len);
+ }
+ 
+ static int adsp_pd_protocol_get_vdm_cmd(int *cmd,
+@@ -387,7 +387,7 @@
+ {
+ 	int ret;
+ 
+-	if (!vdm_data)
++	if (!vdm_data || !cmd)
+ 		return -1;
+ 
+ 	ret = mca_adsp_glink_read_prop(PD_PROP_VDM_STATE, cmd, sizeof(*cmd));
+@@ -414,6 +414,8 @@
+ 
+ 		ret = mca_adsp_glink_read_prop(PD_PROP_VDM_AUTH, buf,
+ 					       sizeof(buf));
++		if (ret)
++			return ret;
+ 		vdm_data->s_secert[4] = buf[0];
+ 		vdm_data->s_secert[5] = buf[1];
+ 		vdm_data->s_secert[6] = buf[2];
+@@ -532,6 +534,7 @@
+ {
+ 	struct adsp_pd_protocol *pd =
+ 		container_of(nb, struct adsp_pd_protocol, event_nb);
++	guard(mutex)(&pd->state_lock);
+ 
+ 	if (action != MCA_EVENT_USB_DISCONNECT)
+ 		return 0;
+@@ -546,6 +549,7 @@
+ {
+ 	struct adsp_pd_protocol *pd =
+ 		container_of(nb, struct adsp_pd_protocol, abnormal_nb);
++	guard(mutex)(&pd->state_lock);
+ 
+ 	if (action == ADSP_GLINK_DOWN_CODE)
+ 		pd->pd_verifed = 0;
+@@ -555,35 +559,44 @@
+ static int adsp_pd_protocol_probe(struct platform_device *pdev)
+ {
+ 	struct adsp_pd_protocol *pd;
+-	int rc;
++	int ret;
+ 
+ 	pd = devm_kzalloc(&pdev->dev, sizeof(*pd), GFP_KERNEL);
+ 	if (!pd)
+ 		return -ENOMEM;
+-
+ 	pd->dev = &pdev->dev;
++	mutex_init(&pd->state_lock);
+ 	platform_set_drvdata(pdev, pd);
+-
+-	rc = protocol_class_pd_register_ops(0, &g_adsp_pd_ops, pd);
+-	if (rc) {
+-		mca_log_err("register ops fail\n");
+-		return rc;
+-	}
+-
+ 	pd->event_nb.notifier_call = adsp_pd_protocol_event_cb;
+-	mca_event_block_notify_register(MCA_EVENT_TYPE_CHARGER_CONNECT,
+-					&pd->event_nb);
++	ret = mca_event_block_notify_register(MCA_EVENT_TYPE_CHARGER_CONNECT,
++					      &pd->event_nb);
++	if (ret)
++		return ret;
+ 	pd->abnormal_nb.notifier_call = adsp_pd_protocol_abnormal_cb;
+-	mca_event_block_notify_register(MCA_EVENT_CHARGE_STATUS,
+-					&pd->abnormal_nb);
+-
+-	mca_log_err("probe ok\n");
+-	return 0;
+-}
+-
+-static int adsp_pd_protocol_remove(struct platform_device *pdev)
+-{
+-	return 0;
++	ret = mca_event_block_notify_register(MCA_EVENT_CHARGE_STATUS,
++					      &pd->abnormal_nb);
++	if (ret)
++		goto remove_event;
++	ret = protocol_class_pd_register_ops(TYPEC_PORT_0, &g_adsp_pd_ops, pd);
++	if (!ret)
++		return 0;
++	mca_event_block_notify_unregister(MCA_EVENT_CHARGE_STATUS,
++					  &pd->abnormal_nb);
++remove_event:
++	mca_event_block_notify_unregister(MCA_EVENT_TYPE_CHARGER_CONNECT,
++					  &pd->event_nb);
++	return ret;
++}
++
++static void adsp_pd_protocol_remove(struct platform_device *pdev)
++{
++	struct adsp_pd_protocol *pd = platform_get_drvdata(pdev);
++
++	protocol_class_pd_unregister_ops(TYPEC_PORT_0, pd);
++	mca_event_block_notify_unregister(MCA_EVENT_CHARGE_STATUS,
++					  &pd->abnormal_nb);
++	mca_event_block_notify_unregister(MCA_EVENT_TYPE_CHARGER_CONNECT,
++					  &pd->event_nb);
+ }
+ 
+ static void adsp_pd_protocol_shutdown(struct platform_device *pdev)
+--- a/drivers/power/supply/mca/mca_platform/mca_platform_bc12_class.c
++++ b/drivers/power/supply/mca/mca_platform/mca_platform_bc12_class.c
+@@ -17,6 +17,7 @@
+  *
+  */
+ #include <linux/module.h>
++#include <linux/srcu.h>
+ #include <linux/stat.h>
+ #include <linux/init.h>
+ #include <linux/ctype.h>
+@@ -43,49 +44,88 @@
+ 	bool support_multi_bc12;
+ };
+ 
+-static struct platform_class_bc12_ops_data g_bc12_ops_data[BC12_MAX_ROLE];
++static struct platform_class_bc12_ops_data __rcu *g_bc12_ops_data[BC12_MAX_ROLE];
++static DEFINE_MUTEX(mca_ops_lock);
++DEFINE_STATIC_SRCU(mca_ops_srcu);
+ 
+ int platform_bc12_class_ops_register(unsigned int role,
+ 				     struct platform_bc12_class_ops *ops,
+ 				     void *data)
+ {
+-	if (!ops || role >= BC12_MAX_ROLE)
+-		return -1;
+-
+-	g_bc12_ops_data[role].data = data;
+-	g_bc12_ops_data[role].ops = ops;
+-
++	struct platform_class_bc12_ops_data *entry;
++
++	if (role >= BC12_MAX_ROLE || !data || !ops)
++		return -EINVAL;
++	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++	entry->ops = ops;
++	entry->data = data;
++	mutex_lock(&mca_ops_lock);
++	if (rcu_access_pointer(g_bc12_ops_data[role])) {
++		mutex_unlock(&mca_ops_lock);
++		kfree(entry);
++		return -EEXIST;
++	}
++	rcu_assign_pointer(g_bc12_ops_data[role], entry);
++	mutex_unlock(&mca_ops_lock);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(platform_bc12_class_ops_register);
++
++void platform_bc12_class_ops_unregister(unsigned int role, void *data)
++{
++	struct platform_class_bc12_ops_data *entry;
++
++	if (role >= BC12_MAX_ROLE)
++		return;
++	mutex_lock(&mca_ops_lock);
++	entry = rcu_dereference_protected(g_bc12_ops_data[role],
++					  lockdep_is_held(&mca_ops_lock));
++	if (!entry || entry->data != data) {
++		mutex_unlock(&mca_ops_lock);
++		return;
++	}
++	rcu_assign_pointer(g_bc12_ops_data[role], NULL);
++	mutex_unlock(&mca_ops_lock);
++	synchronize_srcu(&mca_ops_srcu);
++	kfree(entry);
++}
++EXPORT_SYMBOL(platform_bc12_class_ops_unregister);
+ 
+ static struct platform_class_bc12_ops_data *
+ platform_class_bc12_get_ops_data(unsigned int role)
+ {
+ 	if (role >= BC12_MAX_ROLE)
+ 		return NULL;
+-
+-	return &g_bc12_ops_data[role];
++	return srcu_dereference(g_bc12_ops_data[role], &mca_ops_srcu);
+ }
+ 
+ static int platform_class_bc12_ops_det_en(unsigned int role, int en)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
+ 	struct platform_class_bc12_ops_data *temp_data =
+ 		platform_class_bc12_get_ops_data(role);
+ 
+ 	if (!temp_data || !temp_data->ops || !temp_data->ops->bc12_det_en)
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->bc12_det_en(en, temp_data->data);
+ }
+ 
+ static int platform_class_bc12_ops_get_chg_type(unsigned int role, int *value)
+ {
++	guard(srcu)(&mca_ops_srcu);
++
++	if (!value)
++		return -EINVAL;
++
+ 	struct platform_class_bc12_ops_data *temp_data =
+ 		platform_class_bc12_get_ops_data(role);
+ 
+ 	if (!temp_data || !temp_data->ops || !temp_data->ops->get_charge_type)
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	return temp_data->ops->get_charge_type(value, temp_data->data);
+ }
+@@ -112,7 +152,7 @@
+ 	unsigned int role;
+ 
+ 	if (!data)
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	role = platform_class_bc12_get_role(info);
+ 
+@@ -126,7 +166,7 @@
+ 	unsigned int role;
+ 
+ 	if (!data)
+-		return -1;
++		return -EOPNOTSUPP;
+ 
+ 	role = platform_class_bc12_get_role(info);
+ 
+@@ -151,6 +191,7 @@
+ static int platform_class_bc12_probe(struct platform_device *pdev)
+ {
+ 	struct platform_class_bc12_info *platform_class_bc12;
++	int ret;
+ 
+ 	platform_class_bc12 = devm_kzalloc(
+ 		&pdev->dev, sizeof(*platform_class_bc12), GFP_KERNEL);
+@@ -159,17 +200,20 @@
+ 
+ 	platform_class_bc12->dev = &pdev->dev;
+ 	platform_class_bc12_parse_dt(platform_class_bc12);
+-	(void)protocol_class_register_ops(ADAPTER_PROTOCOL_BC12, &g_bc12_ops,
++	ret = protocol_class_register_ops(ADAPTER_PROTOCOL_BC12, &g_bc12_ops,
+ 					  platform_class_bc12);
+ 
++	if (ret)
++		return ret;
+ 	platform_set_drvdata(pdev, platform_class_bc12);
+ 	mca_log_err("probe ok\n");
+ 	return 0;
+ }
+ 
+-static int platform_class_bc12_remove(struct platform_device *pdev)
+-{
+-	return 0;
++static void platform_class_bc12_remove(struct platform_device *pdev)
++{
++	protocol_class_unregister_ops(ADAPTER_PROTOCOL_BC12,
++				      platform_get_drvdata(pdev));
+ }
+ 
+ static void platform_class_bc12_shutdown(struct platform_device *pdev)
+--- a/drivers/power/supply/mca/mca_qcom_subpmic_proxy/mca_qcom_subpmic_proxy.c
++++ b/drivers/power/supply/mca/mca_qcom_subpmic_proxy/mca_qcom_subpmic_proxy.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/platform_device.h>
+@@ -121,6 +122,9 @@
+ 
+ struct qcom_subpmic {
+ 	struct device *dev;
++	bool stopping;
++	unsigned int sync_retries;
++	struct mutex qc_lock;
+ 
+ 	struct delayed_work update_usb_type_work;
+ 	struct work_struct notify_change_work;
+@@ -137,8 +141,7 @@
+ 	bool support_multi_bc12;
+ 	bool support_cid;
+ 	u32 cid_gpio_int;
+-	struct qcom_subpmic_otg_cfg
+-		otg_cfg;
++	struct qcom_subpmic_otg_cfg otg_cfg;
+ 	bool is_enable_shipmode;
+ 	u8 eu_model;
+ 
+@@ -160,106 +163,69 @@
+ 	int val;
+ };
+ 
+-static RAW_NOTIFIER_HEAD(hboost_notifier);
+-
+-int register_hboost_event_notifier(struct notifier_block *nb)
+-{
+-	return raw_notifier_chain_register(&hboost_notifier, nb);
+-}
+-EXPORT_SYMBOL(register_hboost_event_notifier);
+-
+-int unregister_hboost_event_notifier(struct notifier_block *nb)
+-{
+-	return raw_notifier_chain_unregister(&hboost_notifier, nb);
+-}
+-EXPORT_SYMBOL(unregister_hboost_event_notifier);
+-
+-int qti_battery_charger_get_prop(const char *name, int prop_id, int *val)
+-{
+-	if (!val)
+-		return -EINVAL;
+-
+-	*val = (prop_id != 0) ? 0 : 100000;
+-	return 0;
+-}
+-EXPORT_SYMBOL(qti_battery_charger_get_prop);
+-
+ static int qcom_subpmic_get_usb_real_type(int *type, void *data)
+ {
++	return mca_adsp_glink_read_prop(SUBPMIC_PROP_USB_REAL_TYPE, type,
++					sizeof(*type));
++}
++
++static int qcom_subpmic_bc12_det_en(int en, void *data)
++{
+ 	struct qcom_subpmic *sc = data;
+-	int rc;
+-
+-	rc = mca_adsp_glink_read_prop(SUBPMIC_PROP_USB_REAL_TYPE, type,
+-				      sizeof(*type));
+-	if (rc != 0)
+-		*type = sc->real_type;
+-
+-	return 0;
+-}
+-
+-static int qcom_subpmic_bc12_det_en(int en, void *data)
+-{
+-	return 0;
++	int type, ret;
++
++	/* Detection is autonomous in firmware; no disable command is exposed. */
++	if (en != 1)
++		return -EOPNOTSUPP;
++	ret = qcom_subpmic_get_usb_real_type(&type, sc);
++	if (!ret && !READ_ONCE(sc->stopping))
++		mod_delayed_work(system_wq, &sc->update_usb_type_work, 0);
++	return ret;
+ }
+ 
+ static int qcom_subpmic_set_qc_volt(void *data, int volt)
+ {
+ 	struct qcom_subpmic *sc = data;
+ 	ktime_t start;
+-	int volt_cmd = volt;
+-	int vbus = 0;
+-	int real_type;
+-	int step, target, delta;
+-	unsigned int settle_thd, step_count;
+-	int per_step_ms;
+-	int rc;
+-
++	int vbus, type, step, ret;
++	unsigned int timeout;
++
++	if (volt < SUBPMIC_QC_VOLT_MIN || volt > SUBPMIC_QC_VOLT_MAX)
++		return -EINVAL;
++	guard(mutex)(&sc->qc_lock);
++	type = READ_ONCE(sc->real_type);
++	step = type == XM_CHARGER_TYPE_HVDCP3P5 ? 20 : 200;
++	ret = mca_adsp_glink_read_prop(SUBPMIC_PROP_BUS_VOLT, &vbus,
++				       sizeof(vbus));
++	if (ret)
++		return ret;
++	vbus /= 1000;
++	if (vbus < 0 || vbus > 30000)
++		return -ERANGE;
++	timeout =
++		clamp_t(unsigned int, abs(volt - vbus) / step * 50, 100, 3000);
++	ret = mca_adsp_glink_write_prop(SUBPMIC_PROP_QC_VOLT, &volt,
++					sizeof(volt));
++	if (ret || type == XM_CHARGER_TYPE_HVDCP2 || volt == 5000)
++		return ret;
+ 	start = ktime_get_boottime();
+-	real_type = sc->real_type;
+-	settle_thd = (real_type != XM_CHARGER_TYPE_HVDCP3P5) ? 200 : 20;
+-	per_step_ms = (real_type != XM_CHARGER_TYPE_HVDCP3P5) ? 50 : 5;
+-
+-	if (volt < SUBPMIC_QC_VOLT_MIN || volt > SUBPMIC_QC_VOLT_MAX) {
+-		mca_log_err("invalid qc voltage: %d\n", volt);
+-		return -1;
+-	}
+-
+-	step = (real_type != XM_CHARGER_TYPE_HVDCP3P5) ? 800 : 500;
+-	mca_adsp_glink_read_prop(SUBPMIC_PROP_BUS_VOLT, &vbus, sizeof(vbus));
+-	vbus /= 1000;
+-	delta = volt - vbus;
+-	target = volt + ((delta == 0 || volt < vbus) ? step : -step);
+-	mca_log_info("real_type: %d, volt: %d, vbus: %d\n", sc->real_type, volt,
+-		     vbus);
+-
+-	rc = mca_adsp_glink_write_prop(SUBPMIC_PROP_QC_VOLT, &volt_cmd,
+-				       sizeof(volt_cmd));
+-	if (rc != 0 || sc->real_type == XM_CHARGER_TYPE_HVDCP2 ||
+-	    volt_cmd == 5000)
+-		return 0;
+-
+-	if (abs(delta) < (int)settle_thd)
+-		return 0;
+-
+-	step_count = settle_thd ? abs(delta) / settle_thd : 0;
+ 	do {
++		if (READ_ONCE(sc->stopping) || !READ_ONCE(sc->online))
++			return -ENODEV;
+ 		msleep(50);
+-		mca_adsp_glink_read_prop(SUBPMIC_PROP_BUS_VOLT, &vbus,
+-					 sizeof(vbus));
++		ret = mca_adsp_glink_read_prop(SUBPMIC_PROP_BUS_VOLT, &vbus,
++					       sizeof(vbus));
++		if (ret)
++			return ret;
+ 		vbus /= 1000;
+-		mca_log_info("vbus: %d\n", vbus);
+-		if (vbus < 4000 || sc->online == 0) {
+-			mca_log_err("usb removed, break\n");
+-			break;
+-		}
+-		if (((target < vbus && delta != 0) &&
+-		     (vbus <= target || delta >= 0)) ||
+-		    (vbus < target && delta < 0))
+-			break;
+-	} while (ktime_ms_delta(ktime_get_boottime(), start) <=
+-		 (s64)(step_count * per_step_ms));
+-
+-	return 0;
++		if (vbus < 4000)
++			return -ENODEV;
++		if (vbus > 30000)
++			return -ERANGE;
++		if (abs(volt - vbus) <= step)
++			return 0;
++	} while (ktime_ms_delta(ktime_get_boottime(), start) < timeout);
++	return -ETIMEDOUT;
+ }
+ 
+ static int qcom_subpmic_set_qc_volt_cmd(void *data, int cmd)
+@@ -267,8 +233,8 @@
+ 	int val = cmd;
+ 
+ 	mca_log_info("set_qc_volt_cmd: %d\n", cmd);
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_QC_VOLT_CMD, &val, sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_QC_VOLT_CMD, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_get_bus_volt(void *data, int *val)
+@@ -437,7 +403,7 @@
+ {
+ 	struct qcom_subpmic *sc = data;
+ 
+-	*online = sc->online;
++	*online = READ_ONCE(sc->online);
+ 	return 0;
+ }
+ 
+@@ -447,30 +413,28 @@
+ 
+ 	*src = sc->otg_cfg.otg_boost_src;
+ 	mca_log_info("get otg_boost_src: %d\n", *src);
+-	return sc->otg_cfg.otg_boost_src;
++	return 0;
+ }
+ 
+ static int qcom_subpmic_is_charge_done(void *data, bool *done)
+ {
+-	int status = 0;
+-	int rc;
+-
+-	rc = mca_adsp_glink_read_prop(SUBPMIC_PROP_CHG_STATUS, &status,
+-				      sizeof(status));
+-	if (rc >= 0)
+-		*done = (status == 5);
+-
+-	return 0;
++	int status, ret;
++
++	ret = mca_adsp_glink_read_prop(SUBPMIC_PROP_CHG_STATUS, &status,
++				       sizeof(status));
++	if (!ret)
++		*done = status == 5;
++	return ret;
+ }
+ 
+ static int qcom_subpmic_is_init_ok(void *data)
+ {
+ 	struct qcom_subpmic *sc = data;
+ 
+-	if (!sc || sc->init_ok == 0)
++	if (!sc || READ_ONCE(sc->init_ok) == 0)
+ 		return -1;
+ 
+-	return sc->init_ok;
++	return READ_ONCE(sc->init_ok);
+ }
+ 
+ static int qcom_subpmic_is_support_cid(void *data, bool *en)
+@@ -485,7 +449,7 @@
+ {
+ 	struct qcom_subpmic *sc = data;
+ 
+-	*en = sc->is_enable_shipmode;
++	*en = READ_ONCE(sc->is_enable_shipmode);
+ 	return 0;
+ }
+ 
+@@ -494,9 +458,8 @@
+ 	u8 val = en;
+ 
+ 	mca_log_info("set input suspend %d\n", en & 1);
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_INPUT_SUSPEND, &val,
+-				  sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_INPUT_SUSPEND, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_wireless_input_suspend(void *data, bool en)
+@@ -504,45 +467,40 @@
+ 	u8 val = en;
+ 
+ 	mca_log_info("set wls input suspend %d\n", en & 1);
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_WLS_INPUT_SUSPEND, &val,
+-				  sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_WLS_INPUT_SUSPEND, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_input_current_limit(void *data, int ma)
+ {
+ 	int val = ma;
+ 
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_INPUT_CURR_LIMIT, &val,
+-				  sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_INPUT_CURR_LIMIT, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_wls_input_current_limit(void *data, int ma)
+ {
+ 	int val = ma;
+ 
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_WLS_INPUT_CURR_LIMIT, &val,
+-				  sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_WLS_INPUT_CURR_LIMIT,
++					 &val, sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_input_volt_limit(void *data, int mv)
+ {
+ 	int val = mv;
+ 
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_INPUT_VOLT_LIMIT, &val,
+-				  sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_INPUT_VOLT_LIMIT, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_charge_current(void *data, int ma)
+ {
+ 	int val = ma;
+ 
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_CHARGE_CURRENT, &val,
+-				  sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_CHARGE_CURRENT, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_enable_charging(void *data, bool en)
+@@ -550,9 +508,8 @@
+ 	u8 val = en;
+ 
+ 	mca_log_info("enable charging: %d\n", en & 1);
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_ENABLE_CHARGING, &val,
+-				  sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_ENABLE_CHARGING, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_buck_fsw(void *data, int khz)
+@@ -560,8 +517,8 @@
+ 	int val = khz;
+ 
+ 	mca_log_info("set buck fsw: %d\n", khz);
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_BUCK_FSW, &val, sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_BUCK_FSW, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_term_current(void *data, int ma)
+@@ -569,8 +526,8 @@
+ 	int val = ma;
+ 
+ 	mca_log_info("set iterm: %d\n", ma);
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_TERM_CURRENT, &val, sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_TERM_CURRENT, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_term_volt(void *data, int mv)
+@@ -578,59 +535,56 @@
+ 	int val = mv;
+ 
+ 	mca_log_info("set vterm: %d\n", mv);
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_TERM_VOLT, &val, sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_TERM_VOLT, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_prechg_volt(void *data, int mv)
+ {
+ 	int val = mv;
+ 
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_PRECHG_VOLT, &val, sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_PRECHG_VOLT, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_prechg_current(void *data, int ma)
+ {
+ 	int val = ma;
+ 
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_PRECHG_CURRENT, &val,
+-				  sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_PRECHG_CURRENT, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_usb_aicl_cont_thd(void *data, int mv)
+ {
+ 	int val = mv;
+ 
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_USB_AICL_CONT_THD, &val,
+-				  sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_USB_AICL_CONT_THD, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_opt_fws(void *data, int val_in)
+ {
+ 	int val = val_in;
+ 
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_OPT_FWS, &val, sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_OPT_FWS, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_usb_adapter_allow_override(void *data, bool en)
+ {
+ 	u8 val = en;
+ 
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_USB_ADAP_OVERRIDE, &val,
+-				  sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_USB_ADAP_OVERRIDE, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_qc3_volt(void *data, int mv)
+ {
+ 	int val = mv;
+ 
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_QC3_VOLT, &val, sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_QC3_VOLT, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_boost_enable(void *data, int src_enable)
+@@ -638,8 +592,8 @@
+ 	int val = src_enable;
+ 
+ 	mca_log_info("set otg enable: 0x%2x\n", src_enable);
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_BOOST_ENABLE, &val, sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_BOOST_ENABLE, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_boost_voltage(void *data, int src_value)
+@@ -647,9 +601,8 @@
+ 	int val = src_value;
+ 
+ 	mca_log_info("set boost voltage: 0x%2x\n", src_value);
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_BOOST_VOLTAGE, &val,
+-				  sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_BOOST_VOLTAGE, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_aicl_enable(void *data, bool en)
+@@ -657,8 +610,8 @@
+ 	u8 val = en;
+ 
+ 	mca_log_info("set aicl enable: %d\n", en & 1);
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_AICL_ENABLE, &val, sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_AICL_ENABLE, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_rerun_aicl(void *data, bool en)
+@@ -666,8 +619,8 @@
+ 	u8 val = en;
+ 
+ 	mca_log_info("set rerun aicl: %d\n", en & 1);
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_RERUN_AICL, &val, sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_RERUN_AICL, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_restart_aicl(void *data, bool en)
+@@ -675,8 +628,8 @@
+ 	u8 val = en;
+ 
+ 	mca_log_info("set restart aicl: %d\n", en & 1);
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_RESTART_AICL, &val, sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_RESTART_AICL, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_wls_vdd_flag(void *data, bool en)
+@@ -684,49 +637,47 @@
+ 	u8 val = en;
+ 
+ 	mca_log_info("set wls vdd flag: %d\n", en & 1);
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_WLS_VDD_FLAG, &val, sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_WLS_VDD_FLAG, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_lpd_sbu1(void *data, int val_in)
+ {
+ 	int val = val_in;
+ 
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_LPD_SBU1, &val, sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_LPD_SBU1, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_lpd_control(void *data, int val_in)
+ {
+ 	int val = val_in;
+ 
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_LPD_CONTROL, &val, sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_LPD_CONTROL, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_lpd_uart_control(void *data, int val_in)
+ {
+ 	int val = val_in;
+ 
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_LPD_UART_CONTROL, &val,
+-				  sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_LPD_UART_CONTROL, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_too_hot_limit(void *data, int val_in)
+ {
+ 	int val = val_in;
+ 
+-	mca_adsp_glink_write_prop(SUBPMIC_PROP_TOO_HOT_LIMIT, &val,
+-				  sizeof(val));
+-	return 0;
++	return mca_adsp_glink_write_prop(SUBPMIC_PROP_TOO_HOT_LIMIT, &val,
++					 sizeof(val));
+ }
+ 
+ static int qcom_subpmic_set_ship_mode(void *data, bool en)
+ {
+ 	struct qcom_subpmic *sc = data;
+ 
+-	sc->is_enable_shipmode = en;
++	WRITE_ONCE(sc->is_enable_shipmode, en);
+ 	mca_log_err("is_enable_shipmode = %d\n", en & 1);
+ 	return 0;
+ }
+@@ -742,9 +693,9 @@
+ 	if (rc < 0)
+ 		mca_log_err("Failed to write eu model to adsp: %d\n", rc);
+ 
+-	sc->eu_model = val;
+-	mca_log_info("set_eu_model = %d\n", sc->eu_model);
+-	return 0;
++	if (!rc)
++		WRITE_ONCE(sc->eu_model, val);
++	return rc;
+ }
+ 
+ static struct protocol_class_qc_ops g_adsp_qc_ops = {
+@@ -849,12 +800,12 @@
+ 	if (sc->init_ok == 0) {
+ 		mca_event_block_notify(MCA_EVENT_TYPE_HW_INFO,
+ 				       MCA_EVENT_PMIC_INIT_DONE, NULL);
+-		sc->init_ok = 1;
++		WRITE_ONCE(sc->init_ok, 1);
+ 	}
+ 
+ 	if (sc->online != usb_online) {
+ 		mca_log_err("usb online: %d\n", usb_online);
+-		sc->online = usb_online;
++		WRITE_ONCE(sc->online, usb_online);
+ 		if (usb_online == 0) {
+ 			protocol_class_pd_set_pd_active(0, 0);
+ 			mca_event_block_notify(MCA_EVENT_TYPE_CHARGER_CONNECT,
+@@ -879,20 +830,20 @@
+ 			return;
+ 	} else {
+ 		mca_log_err("usb real_type: %d\n", real_type);
+-		sc->real_type = real_type;
+-	}
+-
+-	sc->glink_down = 0;
++		WRITE_ONCE(sc->real_type, real_type);
++	}
++
++	WRITE_ONCE(sc->glink_down, 0);
+ 	mca_event_block_notify(MCA_EVENT_TYPE_CHARGE_TYPE,
+ 			       MCA_EVENT_CHARGE_TYPE_CHANGE, &sc->real_type);
+ 	return;
+ 
+ retry:
++	if (READ_ONCE(sc->stopping))
++		return;
+ 	queue_delayed_work(system_wq, &sc->update_usb_type_work,
+ 			   msecs_to_jiffies(500));
+ }
+-
+-static int qcom_subpmic_sync_cfg_work_count;
+ 
+ static void qcom_subpmic_sync_cfg_work(struct work_struct *work)
+ {
+@@ -923,11 +874,10 @@
+ 	}
+ 	mca_log_err("Success to send otg cfg, rc=%d\n", 0);
+ 
+-	if (!sc->support_cid)
+-		return;
+-
+-	rc = mca_adsp_glink_write_prop(SUBPMIC_PROP_CID_CFG, &sc->cid_gpio_int,
+-				       sizeof(sc->cid_gpio_int));
++	if (sc->support_cid)
++		rc = mca_adsp_glink_write_prop(SUBPMIC_PROP_CID_CFG,
++					       &sc->cid_gpio_int,
++					       sizeof(sc->cid_gpio_int));
+ 	if (rc != 0) {
+ 		mca_log_err("Failed to send cid cfg, rc=%d\n", rc);
+ 		goto retry;
+@@ -944,7 +894,9 @@
+ 	return;
+ 
+ retry:
+-	if (qcom_subpmic_sync_cfg_work_count++ < 0x3c)
++	if (READ_ONCE(sc->stopping))
++		return;
++	if (sc->sync_retries++ < 0x3c)
+ 		queue_delayed_work(system_wq, &sc->sync_cfg_work,
+ 				   msecs_to_jiffies(250));
+ }
+@@ -1007,7 +959,7 @@
+ 	struct qcom_subpmic *sc = priv;
+ 
+ 	mca_log_info("glink down\n");
+-	sc->glink_down = 1;
++	WRITE_ONCE(sc->glink_down, 1);
+ 	mca_event_block_notify(MCA_EVENT_CHARGE_STATUS,
+ 			       SUBPMIC_RAW_CODE_GLINK_DOWN, NULL);
+ }
+@@ -1050,7 +1002,7 @@
+ 	struct mca_event_notify_data n_data;
+ 	char buf[128] = { 0 };
+ 
+-	n_data.event_len = snprintf(buf, sizeof(buf), fmt, val);
++	n_data.event_len = scnprintf(buf, sizeof(buf), fmt, val);
+ 	n_data.event = buf;
+ 	mca_event_report_uevent(&n_data);
+ }
+@@ -1059,10 +1011,16 @@
+ 				   void *priv)
+ {
+ 	struct qcom_subpmic *sc = priv;
+-	int *val = data;
+-
+-	if (!sc)
++	int value = 0;
++	int *val = &value;
++
++	if (!sc || READ_ONCE(sc->stopping))
+ 		return;
++	if (notify_type != SUBPMIC_NOTIFY_USB_TYPE) {
++		if (!data || len < sizeof(value))
++			return;
++		memcpy(&value, data, sizeof(value));
++	}
+ 
+ 	pm_wakeup_dev_event(sc->dev, 1000, true);
+ 
+@@ -1073,7 +1031,7 @@
+ 	case SUBPMIC_NOTIFY_CHARGE_TYPE:
+ 	case SUBPMIC_NOTIFY_ENABLE_BOOST:
+ 	case SUBPMIC_NOTIFY_PLATE_SHOCK:
+-		qcom_subpmic_queue_notify(sc, notify_type, val ? *val : 0);
++		qcom_subpmic_queue_notify(sc, notify_type, *val);
+ 		break;
+ 	case SUBPMIC_NOTIFY_LPD_STATUS:
+ 		sc->lpd_status = *val;
+@@ -1147,7 +1105,7 @@
+ 	int chip_vendor = -1;
+ 	int rc;
+ 
+-	if ((action & ~2UL) == 1 && sc->is_enable_shipmode) {
++	if ((action & ~2UL) == 1 && READ_ONCE(sc->is_enable_shipmode)) {
+ 		/* shutdown/ship notifier path: stock logs via raw printk here */
+ 		pr_info("subpmic: set adsp shipmode\n");
+ 		platform_class_cp_get_chip_vendor(0, &chip_vendor);
+@@ -1158,7 +1116,8 @@
+ 		rc = mca_adsp_glink_write_prop(SUBPMIC_PROP_SHIP_MODE, &reason,
+ 					       sizeof(reason));
+ 		if (rc < 0)
+-			pr_err("subpmic: Failed to send ship mode, rc=%d\n", rc);
++			pr_err("subpmic: Failed to send ship mode, rc=%d\n",
++			       rc);
+ 	}
+ 
+ 	return NOTIFY_DONE;
+@@ -1221,87 +1180,91 @@
+ 		sc->otg_cfg.vdd_boost_en, sc->otg_cfg.otg_ovp_en);
+ }
+ 
++static void qcom_subpmic_cleanup(void *data)
++{
++	struct qcom_subpmic *sc = data;
++	struct qcom_subpmic_notify_entry *entry, *tmp;
++
++	if (xchg(&sc->stopping, true))
++		return;
++	mca_adsp_glink_unregister_ops(&g_qcom_subpmic_glink_cb, sc);
++	platform_bc12_class_ops_unregister(TYPEC_PORT_0, sc);
++	protocol_class_qc_unregister_ops(TYPEC_PORT_0, sc);
++	platform_class_buckchg_ops_unregister(0, sc);
++	unregister_reboot_notifier(&sc->ship_mode_nb);
++	unregister_reboot_notifier(&sc->shutdown_nb);
++	disable_delayed_work_sync(&sc->update_usb_type_work);
++	disable_delayed_work_sync(&sc->sync_cfg_work);
++	disable_work_sync(&sc->notify_change_work);
++	list_for_each_entry_safe(entry, tmp, &sc->notify_list, node) {
++		list_del(&entry->node);
++		kfree(entry);
++	}
++	device_init_wakeup(sc->dev, false);
++}
++
+ static int qcom_subpmic_probe(struct platform_device *pdev)
+ {
+ 	struct qcom_subpmic *sc;
+-	int rc;
+-
+-	mca_log_info("probe start\n");
+-
++	int ret;
++
++	if (!mca_get_hwid_info())
++		return -EPROBE_DEFER;
+ 	sc = devm_kzalloc(&pdev->dev, sizeof(*sc), GFP_KERNEL);
+ 	if (!sc)
+ 		return -ENOMEM;
+-
+ 	sc->dev = &pdev->dev;
+-
+-	if (!mca_get_hwid_info()) {
+-		mca_log_err("%s parse dt fail\n", __func__);
+-		return -ENOMEM;
+-	}
+-
+ 	qcom_subpmic_parse_dt(sc, pdev->dev.of_node);
+-
+ 	INIT_LIST_HEAD(&sc->notify_list);
+ 	spin_lock_init(&sc->notify_lock);
++	mutex_init(&sc->qc_lock);
+ 	INIT_DELAYED_WORK(&sc->update_usb_type_work,
+ 			  qcom_subpmic_update_usb_type_work);
+ 	INIT_DELAYED_WORK(&sc->sync_cfg_work, qcom_subpmic_sync_cfg_work);
+ 	INIT_WORK(&sc->notify_change_work, qcom_subpmic_notify_change_work);
+-
+ 	sc->ship_mode_nb.notifier_call = qcom_subpmic_ship_mode;
+ 	sc->ship_mode_nb.priority = 255;
+-	register_reboot_notifier(&sc->ship_mode_nb);
+-
+ 	sc->shutdown_nb.notifier_call = qcom_subpmic_shutdown_cb;
+ 	sc->shutdown_nb.priority = 255;
+-	register_reboot_notifier(&sc->shutdown_nb);
+-
+-	device_set_wakeup_capable(sc->dev, true);
+-	device_wakeup_enable(sc->dev);
+ 	platform_set_drvdata(pdev, sc);
+-
+-	rc = platform_bc12_class_ops_register(0, &g_qcom_pmic_bc12_ops, sc);
+-	if (rc) {
+-		mca_log_err("%s register protocol ops fail\n", __func__);
+-		goto err;
+-	}
+-
+-	rc = protocol_class_qc_register_ops(0, &g_adsp_qc_ops, sc);
+-	if (rc) {
+-		mca_log_err("%s register qc ops fail\n", __func__);
+-		goto err;
+-	}
+-
+-	rc = platform_class_buckchg_ops_register(0, sc, &g_qcom_buckchg_ops);
+-	if (rc) {
+-		mca_log_err("%s register buckchg ops fail\n", __func__);
+-		goto err;
+-	}
+-
+-	rc = mca_adsp_glink_resister_ops(&g_qcom_subpmic_glink_cb, sc);
+-	if (rc) {
+-		mca_log_err("%s register glink ops fail\n", __func__);
+-		goto err;
+-	}
+-
++	ret = devm_add_action_or_reset(sc->dev, qcom_subpmic_cleanup, sc);
++	if (ret)
++		return ret;
++	ret = device_init_wakeup(sc->dev, true);
++	if (ret)
++		return ret;
++	ret = register_reboot_notifier(&sc->ship_mode_nb);
++	if (ret)
++		return ret;
++	ret = register_reboot_notifier(&sc->shutdown_nb);
++	if (ret)
++		return ret;
++	ret = platform_bc12_class_ops_register(TYPEC_PORT_0,
++					       &g_qcom_pmic_bc12_ops, sc);
++	if (ret)
++		return ret;
++	ret = protocol_class_qc_register_ops(TYPEC_PORT_0, &g_adsp_qc_ops, sc);
++	if (ret)
++		return ret;
++	ret = platform_class_buckchg_ops_register(0, sc, &g_qcom_buckchg_ops);
++	if (ret)
++		return ret;
++	ret = mca_adsp_glink_resister_ops(&g_qcom_subpmic_glink_cb, sc);
++	if (ret)
++		return ret;
+ 	queue_delayed_work(system_wq, &sc->update_usb_type_work, 0);
+ 	queue_delayed_work(system_wq, &sc->sync_cfg_work, msecs_to_jiffies(25));
+-	mca_log_err("probe ok\n");
+ 	return 0;
+-
+-err:
+-	unregister_reboot_notifier(&sc->ship_mode_nb);
+-	unregister_reboot_notifier(&sc->shutdown_nb);
+-	return rc;
+-}
+-
+-static int qcom_subpmic_remove(struct platform_device *pdev)
+-{
+-	return 0;
++}
++
++static void qcom_subpmic_remove(struct platform_device *pdev)
++{
++	qcom_subpmic_cleanup(platform_get_drvdata(pdev));
+ }
+ 
+ static void qcom_subpmic_shutdown(struct platform_device *pdev)
+ {
++	qcom_subpmic_cleanup(platform_get_drvdata(pdev));
+ }
+ 
+ static const struct of_device_id qcom_subpmic_match_table[] = {
+--- a/drivers/power/supply/mca/mca_shared_memory/charger_partition.c
++++ b/drivers/power/supply/mca/mca_shared_memory/charger_partition.c
+@@ -1,534 +1,419 @@
+ // SPDX-License-Identifier: GPL-2.0
+-/*
+- * charger_partition.c
+- *
+- * charger partition driver
+- *
+- * Copyright (c) 2024-2024 Xiaomi Technologies Co., Ltd.
+- *
+- * This software is licensed under the terms of the GNU General Public
+- * License version 2, as published by the Free Software Foundation, and
+- * may be copied, distributed, and modified under those terms.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+- * GNU General Public License for more details.
+- *
+- */
+-
++/* Xiaomi charger partition format, accessed through the public block API. */
++#include <linux/bio.h>
++#include <linux/blkdev.h>
++#include <linux/delay.h>
++#include <linux/file.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+-#include <linux/kernel.h>
+-#include <linux/module.h>
+-#include <linux/of_device.h>
++#include <linux/sched.h>
+ #include <linux/workqueue.h>
+-#include <linux/err.h>
+-#include <linux/blkdev.h>
+-#include <linux/init.h>
+-#include <linux/delay.h>
+-#include <linux/printk.h>
+-#include <linux/spinlock.h>
+-#include <linux/reboot.h>
+-#include <linux/types.h>
+-#include <linux/slab.h>
+-#include <linux/string.h>
+-#include <linux/types.h>
+-#include <linux/efi.h>
+-#include <linux/rcupdate.h>
+-#include <linux/of.h>
+-#include <scsi/scsi_device.h>
+-#include <scsi/scsi_cmnd.h>
+-#include <scsi/scsi_host.h>
+-#include <linux/completion.h>
+-#include <mca/common/mca_log.h>
++#include <mca/common/mca_event.h>
+ #include <mca/common/mca_sysfs.h>
++#include <mca/shared_memory/charger_partition_class.h>
+ #include <mca/strategy/strategy_class.h>
+-#include <mca/common/mca_event.h>
+-#include <mca/common/mca_hwid.h>
+ #include "inc/charger_partition.h"
+-#include <mca/shared_memory/charger_partition_class.h>
+-#include "hwid.h"
+-#include "sd.h"
+-
+-#define CHARGER_PART_PLATFORM_V9 9
+-#define CHARGER_PART_NUMBER_V9 25
+-#define CHARGER_PART_NUMBER_DEFAULT 22
+-
+-#ifndef MCA_LOG_TAG
+-#define MCA_LOG_TAG "charger_partition"
+-#endif
+-
+-struct ChargerPartition {
++
++struct charger_partition_device {
+ 	struct device *dev;
+-	struct scsi_device *sdev;
+-	struct delayed_work charger_partition_work;
+-
+-	int part_info_part_number;
+-	char *part_info_part_name;
+-
+-	bool is_charger_partition_rdy;
+-	bool is_eu_model;
+-	bool not_notify_module;
+-
+-	charger_partition_info_2 info_2;
++	struct file *file;
++	struct delayed_work discover_work;
++	unsigned int retries;
++	bool eu_valid;
++	bool eu_model;
+ };
+-static struct ChargerPartition *charger_partition;
+-static void *rw_buf;
+-
+-struct partinfo {
+-	sector_t part_start;
+-	sector_t part_size;
+-};
+-static struct partinfo part_info = { 0 };
+-
+-static int charger_scsi_read_partition(struct scsi_device *sdev, void *buf,
+-				       uint32_t lba, uint32_t blocks)
+-{
+-	uint8_t cdb[16];
++
++/* alloc/read/write/dealloc is one same-task transaction, including scratch. */
++static DEFINE_MUTEX(partition_lock);
++static struct charger_partition_device *partition;
++static struct task_struct *transaction_owner;
++static struct page *header_page;
++static struct page *data_page;
++static u8 transaction_host;
++static u8 transaction_info;
++static u32 transaction_size;
++
++static bool charger_partition_request_valid(u8 host, u8 info, u32 size)
++{
++	return host < CHARGER_PARTITION_HOST_LAST &&
++	       info > CHARGER_PARTITION_HEADER &&
++	       info < CHARGER_PARTITION_INFO_LAST && size &&
++	       size <= CHARGER_PARTITION_RWSIZE;
++}
++
++static int charger_partition_io(struct file *file, struct page *page, u8 info,
++				bool write)
++{
++	struct block_device *bdev = file_bdev(file);
++	struct bio *bio;
++	sector_t sector =
++		(sector_t)info * (CHARGER_PARTITION_RWSIZE >> SECTOR_SHIFT);
++	blk_opf_t op = write ? REQ_OP_WRITE | REQ_SYNC | REQ_FUA : REQ_OP_READ;
++	int ret;
++
++	if (info >= CHARGER_PARTITION_INFO_LAST ||
++	    bdev_nr_sectors(bdev) <
++		    sector + (CHARGER_PARTITION_RWSIZE >> SECTOR_SHIFT))
++		return -ERANGE;
++	bio = bio_alloc(bdev, 1, op, GFP_KERNEL);
++	if (!bio)
++		return -ENOMEM;
++	bio->bi_iter.bi_sector = sector;
++	if (bio_add_page(bio, page, CHARGER_PARTITION_RWSIZE, 0) !=
++	    CHARGER_PARTITION_RWSIZE) {
++		bio_put(bio);
++		return -EIO;
++	}
++	ret = submit_bio_wait(bio);
++	bio_put(bio);
++	return ret;
++}
++
++int charger_partition_alloc(u8 host, u8 info, u32 size)
++{
++	charger_partition_header *header;
++	int ret;
++
++	if (!charger_partition_request_valid(host, info, size))
++		return -EINVAL;
++	if (READ_ONCE(transaction_owner) == current)
++		return -EDEADLK;
++	mutex_lock(&partition_lock);
++	if (!partition || !partition->file) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	header_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
++	data_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
++	if (!header_page || !data_page) {
++		ret = -ENOMEM;
++		goto free;
++	}
++	ret = charger_partition_io(partition->file, header_page,
++				   CHARGER_PARTITION_HEADER, false);
++	if (ret)
++		goto free;
++	header = page_address(header_page);
++	if (header->magic != CHARGER_PARTITION_MAGIC || !header->initialized) {
++		ret = -EUCLEAN;
++		goto free;
++	}
++	if (!header->available) {
++		ret = -EBUSY;
++		goto free;
++	}
++	/* Preserve the firmware's header handshake and all unknown fields. */
++	header->available = 0;
++	ret = charger_partition_io(partition->file, header_page,
++				   CHARGER_PARTITION_HEADER, true);
++	if (ret)
++		goto free;
++	__module_get(THIS_MODULE);
++	transaction_host = host;
++	transaction_info = info;
++	transaction_size = size;
++	WRITE_ONCE(transaction_owner, current);
++	return 0;
++free:
++	if (data_page)
++		__free_page(data_page);
++	if (header_page)
++		__free_page(header_page);
++	data_page = NULL;
++	header_page = NULL;
++unlock:
++	mutex_unlock(&partition_lock);
++	return ret;
++}
++EXPORT_SYMBOL(charger_partition_alloc);
++
++static bool charger_partition_transaction_matches(u8 host, u8 info, u32 size)
++{
++	return READ_ONCE(transaction_owner) == current &&
++	       host == transaction_host && info == transaction_info &&
++	       size == transaction_size;
++}
++
++int charger_partition_dealloc(u8 host, u8 info, u32 size)
++{
++	charger_partition_header *header;
++	int ret;
++
++	if (!charger_partition_transaction_matches(host, info, size))
++		return -EPERM;
++	header = page_address(header_page);
++	header->available = 1;
++	ret = charger_partition_io(partition->file, header_page,
++				   CHARGER_PARTITION_HEADER, true);
++	__free_page(data_page);
++	__free_page(header_page);
++	data_page = NULL;
++	header_page = NULL;
++	WRITE_ONCE(transaction_owner, NULL);
++	mutex_unlock(&partition_lock);
++	module_put(THIS_MODULE);
++	return ret;
++}
++EXPORT_SYMBOL(charger_partition_dealloc);
++
++void *charger_partition_read(u8 host, u8 info, u32 size)
++{
++	if (!charger_partition_transaction_matches(host, info, size))
++		return NULL;
++	if (charger_partition_io(partition->file, data_page, info, false))
++		return NULL;
++	return page_address(data_page);
++}
++EXPORT_SYMBOL(charger_partition_read);
++
++int charger_partition_write(u8 host, u8 info, void *buf, u32 size)
++{
++	void *copy;
++	int ret;
++
++	if (!buf || !charger_partition_transaction_matches(host, info, size))
++		return -EINVAL;
++	/* buf may point into the scratch returned by charger_partition_read(). */
++	copy = kmemdup(buf, size, GFP_KERNEL);
++	if (!copy)
++		return -ENOMEM;
++	ret = charger_partition_io(partition->file, data_page, info, false);
++	if (!ret) {
++		memcpy(page_address(data_page), copy, size);
++		ret = charger_partition_io(partition->file, data_page, info,
++					   true);
++	}
++	kfree(copy);
++	return ret;
++}
++EXPORT_SYMBOL(charger_partition_write);
++
++static int charger_partition_field(u8 info, size_t offset, u32 *value,
++				   size_t size, bool write)
++{
++	u32 record_size = info == CHARGER_PARTITION_INFO_1 ?
++				  sizeof(charger_partition_info_1) :
++				  sizeof(charger_partition_info_2);
++	void *record;
++	int ret, end_ret;
++
++	if (!value || offset > record_size || size > record_size - offset)
++		return -EINVAL;
++	ret = charger_partition_alloc(CHARGER_PARTITION_HOST_KERNEL, info,
++				      record_size);
++	if (ret)
++		return ret;
++	record = charger_partition_read(CHARGER_PARTITION_HOST_KERNEL, info,
++					record_size);
++	if (!record) {
++		ret = -EIO;
++		goto end;
++	}
++	if (write) {
++		memcpy(record + offset, value, size);
++		/* data_page already contains a complete, preserved record block. */
++		ret = charger_partition_io(partition->file, data_page, info,
++					   true);
++	} else {
++		memcpy(value, record + offset, size);
++	}
++	if (!ret && info == CHARGER_PARTITION_INFO_2) {
++		partition->eu_model =
++			!!((charger_partition_info_2 *)record)->eu_mode;
++		partition->eu_valid = true;
++	}
++end:
++	end_ret = charger_partition_dealloc(CHARGER_PARTITION_HOST_KERNEL, info,
++					    record_size);
++	return ret ? ret : end_ret;
++}
++
++int charger_partition_get_eu_model(bool *eu_model)
++{
+ 	int ret = 0;
+-	struct scsi_sense_hdr sshdr = {};
+-	const struct scsi_exec_args exec_args = {
+-		.sshdr = &sshdr,
+-	};
+-	unsigned long flags = 0;
+-
+-	spin_lock_irqsave(sdev->host->host_lock, flags);
+-	ret = scsi_device_get(sdev);
+-	if (!ret && !scsi_device_online(sdev)) {
+-		ret = -ENODEV;
+-		scsi_device_put(sdev);
+-		mca_log_err("get device fail\n");
+-	}
+-	spin_unlock_irqrestore(sdev->host->host_lock, flags);
+-	if (ret) {
+-		mca_log_err("failed to get scsi device\n");
+-		return ret;
+-	}
+-	sdev->host->eh_noresume = 1;
+-
+-	// Fill in the CDB with SCSI command structure
+-	memset(cdb, 0, sizeof(cdb));
+-	cdb[0] = READ_10; // Command
+-	cdb[1] = 0;
+-	cdb[2] = (lba >> 24) & 0xff; // LBA
+-	cdb[3] = (lba >> 16) & 0xff;
+-	cdb[4] = (lba >> 8) & 0xff;
+-	cdb[5] = (lba) & 0xff;
+-	cdb[6] = 0; // Group Number
+-	cdb[7] = (blocks >> 8) & 0xff; // Transfer Len
+-	cdb[8] = (blocks) & 0xff;
+-	cdb[9] = 0; // Control
+-	ret = scsi_execute_cmd(sdev, cdb, REQ_OP_DRV_IN, buf,
+-			       (blocks * PART_BLOCK_SIZE),
+-			       msecs_to_jiffies(15000), 3, &exec_args);
+-	if (ret)
+-		mca_log_err("read error %d\n", ret);
+-
+-	scsi_device_put(sdev);
+-	sdev->host->eh_noresume = 0;
+-	return ret;
+-}
+-
+-static int charger_scsi_write_partition(struct scsi_device *sdev, void *buf,
+-					uint32_t lba, uint32_t blocks)
+-{
+-	uint8_t cdb[16];
+-	int ret = 0;
+-	struct scsi_sense_hdr sshdr = {};
+-	const struct scsi_exec_args exec_args = {
+-		.sshdr = &sshdr,
+-	};
+-	unsigned long flags = 0;
+-
+-	spin_lock_irqsave(sdev->host->host_lock, flags);
+-	ret = scsi_device_get(sdev);
+-	if (!ret && !scsi_device_online(sdev)) {
+-		ret = -ENODEV;
+-		scsi_device_put(sdev);
+-		mca_log_err("get device fail\n");
+-	}
+-	spin_unlock_irqrestore(sdev->host->host_lock, flags);
+-
+-	if (ret) {
+-		mca_log_err("get scsi fail\n");
+-		return ret;
+-	}
+-	sdev->host->eh_noresume = 1;
+-
+-	// Fill in the CDB with SCSI command structure
+-	memset(cdb, 0, sizeof(cdb));
+-	cdb[0] = WRITE_10; // Command
+-	cdb[1] = 0;
+-	cdb[2] = (lba >> 24) & 0xff; // LBA
+-	cdb[3] = (lba >> 16) & 0xff;
+-	cdb[4] = (lba >> 8) & 0xff;
+-	cdb[5] = (lba) & 0xff;
+-	cdb[6] = 0; // Group Number
+-	cdb[7] = (blocks >> 8) & 0xff; // Transfer Len
+-	cdb[8] = (blocks) & 0xff;
+-	cdb[9] = 0; // Control
+-	ret = scsi_execute_cmd(sdev, cdb, REQ_OP_DRV_OUT, buf,
+-			       (blocks * PART_BLOCK_SIZE),
+-			       msecs_to_jiffies(15000), 3, &exec_args);
+-	if (ret)
+-		mca_log_err("write error %d\n", ret);
+-
+-	scsi_device_put(sdev);
+-	sdev->host->eh_noresume = 0;
+-	return ret;
+-}
+-
+-int charger_partition_alloc(u8 charger_partition_host_type,
+-			    u8 charger_partition_info_type, uint32_t size)
+-{
+-	int ret = 0;
+-
+-	if (!charger_partition->is_charger_partition_rdy) {
+-		mca_log_err("charger partition not rdy, can't do rw!");
+-		return -1;
+-	}
+-	if (charger_partition_host_type >= CHARGER_PARTITION_HOST_LAST) {
+-		mca_log_err("charger_partition_host_type not support!");
+-		return -1;
+-	}
+-	if (charger_partition_info_type >= CHARGER_PARTITION_INFO_LAST) {
+-		mca_log_err("charger_partition_info_type not support!");
+-		return -1;
+-	}
+-	if (size >= CHARGER_PARTITION_RWSIZE) {
+-		mca_log_err("read %u size not support!", size);
+-		return -1;
+-	}
+-
+-	rw_buf = kzalloc(CHARGER_PARTITION_RWSIZE, GFP_KERNEL);
+-	if (!rw_buf) {
+-		mca_log_err("malloc buf error!\n");
+-		return -1;
+-	}
+-
+-	/* check if avaliable */
+-	ret = charger_scsi_read_partition(
+-		charger_partition->sdev, rw_buf,
+-		(part_info.part_start + CHARGER_PARTITION_HEADER),
+-		CHARGER_PARTITION_RWSIZE / PART_BLOCK_SIZE);
+-	if (ret) {
+-		mca_log_err("charger read error %d\n", ret);
+-		kfree(rw_buf);
+-		return -1;
+-	}
+-	if (0 == ((charger_partition_header *)rw_buf)->avaliable) {
+-		mca_log_err("not avaliable, can't do rw now!\n");
+-		kfree(rw_buf);
+-		return -1;
+-	}
+-	((charger_partition_header *)rw_buf)->avaliable = 0;
+-	ret = charger_scsi_write_partition(
+-		charger_partition->sdev, (void *)rw_buf,
+-		(part_info.part_start + CHARGER_PARTITION_HEADER),
+-		CHARGER_PARTITION_RWSIZE / PART_BLOCK_SIZE);
+-	if (ret) {
+-		mca_log_err("charger write error %d\n", ret);
+-		kfree(rw_buf);
+-		return -1;
+-	}
+-
+-	return ret;
+-}
+-EXPORT_SYMBOL(charger_partition_alloc);
+-
+-int charger_partition_dealloc(u8 charger_partition_host_type,
+-			      u8 charger_partition_info_type, uint32_t size)
+-{
+-	int ret = 0;
+-
+-	if (!charger_partition->is_charger_partition_rdy) {
+-		mca_log_err("charger partition not rdy, can't do rw!");
+-		return -1;
+-	}
+-	if (charger_partition_host_type >= CHARGER_PARTITION_HOST_LAST) {
+-		mca_log_err("charger_partition_host_type not support!");
+-		return -1;
+-	}
+-	if (charger_partition_info_type >= CHARGER_PARTITION_INFO_LAST) {
+-		mca_log_err("charger_partition_info_type not support!");
+-		return -1;
+-	}
+-	if (size >= CHARGER_PARTITION_RWSIZE) {
+-		mca_log_err("read %u size not support!", size);
+-		return -1;
+-	}
+-
+-	memset(rw_buf, 0, CHARGER_PARTITION_RWSIZE);
+-	ret = charger_scsi_read_partition(
+-		charger_partition->sdev, rw_buf,
+-		(part_info.part_start + CHARGER_PARTITION_HEADER),
+-		CHARGER_PARTITION_RWSIZE / PART_BLOCK_SIZE);
+-	if (ret) {
+-		mca_log_err("charger read error %d\n", ret);
+-		kfree(rw_buf);
+-		return -1;
+-	}
+-	((charger_partition_header *)rw_buf)->avaliable = 1;
+-	ret = charger_scsi_write_partition(
+-		charger_partition->sdev, (void *)rw_buf,
+-		(part_info.part_start + CHARGER_PARTITION_HEADER),
+-		CHARGER_PARTITION_RWSIZE / PART_BLOCK_SIZE);
+-	if (ret) {
+-		mca_log_err("charger write error %d\n", ret);
+-		kfree(rw_buf);
+-		return -1;
+-	}
+-
+-	kfree(rw_buf);
+-	return ret;
+-}
+-EXPORT_SYMBOL(charger_partition_dealloc);
+-
+-void *charger_partition_read(u8 charger_partition_host_type,
+-			     u8 charger_partition_info_type, uint32_t size)
+-{
+-	int ret = 0;
+-
+-	if (!charger_partition->is_charger_partition_rdy) {
+-		mca_log_err("charger partition not rdy, can't do read!");
+-		return NULL;
+-	}
+-	if (!rw_buf) {
+-		mca_log_err("rw_buf null, please alloc first!");
+-		return NULL;
+-	}
+-	if (charger_partition_host_type >= CHARGER_PARTITION_HOST_LAST) {
+-		mca_log_err("charger_partition_host_type not support!");
+-		return NULL;
+-	}
+-	if (charger_partition_info_type >= CHARGER_PARTITION_INFO_LAST) {
+-		mca_log_err("charger_partition_info_type not support!");
+-		return NULL;
+-	}
+-	if (size >= CHARGER_PARTITION_RWSIZE) {
+-		mca_log_err("read %u size not support!", size);
+-		return NULL;
+-	}
+-
+-	memset(rw_buf, 0, CHARGER_PARTITION_RWSIZE);
+-	ret = charger_scsi_read_partition(
+-		charger_partition->sdev, rw_buf,
+-		(part_info.part_start + charger_partition_info_type),
+-		CHARGER_PARTITION_RWSIZE / PART_BLOCK_SIZE);
+-	if (ret) {
+-		mca_log_err("charger read error %d\n", ret);
+-		return NULL;
+-	}
+-	return rw_buf;
+-}
+-EXPORT_SYMBOL(charger_partition_read);
+-
+-int charger_partition_write(u8 charger_partition_host_type,
+-			    u8 charger_partition_info_type, void *buf,
+-			    uint32_t size)
+-{
+-	int ret = 0;
+-
+-	if (!charger_partition->is_charger_partition_rdy) {
+-		mca_log_err("charger partition not rdy, can't do read!");
+-		return -1;
+-	}
+-	if (!rw_buf) {
+-		mca_log_err("rw_buf null, please alloc first!");
+-		return -1;
+-	}
+-	if (charger_partition_host_type >= CHARGER_PARTITION_HOST_LAST) {
+-		mca_log_err("charger_partition_host_type not support!");
+-		return -1;
+-	}
+-	if (charger_partition_info_type >= CHARGER_PARTITION_INFO_LAST) {
+-		mca_log_err("charger_partition_info_type not support!");
+-		return -1;
+-	}
+-	if (size >= CHARGER_PARTITION_RWSIZE) {
+-		mca_log_err("read %u size not support!", size);
+-		return -1;
+-	}
+-
+-	memset(rw_buf, 0, CHARGER_PARTITION_RWSIZE);
+-	ret = charger_scsi_read_partition(
+-		charger_partition->sdev, rw_buf,
+-		(part_info.part_start + charger_partition_info_type),
+-		CHARGER_PARTITION_RWSIZE / PART_BLOCK_SIZE);
+-	if (ret) {
+-		mca_log_err("charger read error %d\n", ret);
+-		return -1;
+-	}
+-	memcpy(rw_buf, buf, size);
+-
+-	ret = charger_scsi_write_partition(
+-		charger_partition->sdev, rw_buf,
+-		(part_info.part_start + charger_partition_info_type),
+-		CHARGER_PARTITION_RWSIZE / PART_BLOCK_SIZE);
+-	if (ret) {
+-		mca_log_err("charger write error %d\n", ret);
+-		return -1;
+-	}
+-
+-	return ret;
+-}
+-EXPORT_SYMBOL(charger_partition_write);
+-
+-int charger_partition_get_eu_model(bool *is_eu_model)
+-{
+-	if (!charger_partition) {
+-		mca_log_err("charger_partition init error\n");
+-		return -1;
+-	}
+-	*is_eu_model = charger_partition->is_eu_model;
+-	return 0;
++
++	if (!eu_model)
++		return -EINVAL;
++	if (READ_ONCE(transaction_owner) == current)
++		return -EDEADLK;
++	guard(mutex)(&partition_lock);
++	if (!partition || !partition->eu_valid)
++		ret = -EAGAIN;
++	else
++		*eu_model = partition->eu_model;
++	return ret;
+ }
+ EXPORT_SYMBOL(charger_partition_get_eu_model);
+ 
+-static int charger_partition_read_info_1(charger_partition_info_1 *out)
+-{
+-	charger_partition_info_1 *info_1;
+-	int ret;
+-
+-	ret = charger_partition_alloc(CHARGER_PARTITION_HOST_KERNEL,
+-				      CHARGER_PARTITION_INFO_1,
+-				      sizeof(charger_partition_info_1));
+-	if (ret < 0) {
+-		mca_log_err("failed to alloc\n");
+-		return -1;
+-	}
+-
+-	info_1 = (charger_partition_info_1 *)charger_partition_read(
+-		CHARGER_PARTITION_HOST_KERNEL, CHARGER_PARTITION_INFO_1,
+-		sizeof(charger_partition_info_1));
+-	if (info_1)
+-		*out = *info_1;
+-	else
+-		ret = -1;
+-
+-	(void)charger_partition_dealloc(CHARGER_PARTITION_HOST_KERNEL,
+-					CHARGER_PARTITION_INFO_1,
+-					sizeof(charger_partition_info_1));
+-	return ret;
+-}
+-
+-static int charger_partition_write_info_1(const charger_partition_info_1 *in)
+-{
+-	int ret;
+-
+-	ret = charger_partition_alloc(CHARGER_PARTITION_HOST_KERNEL,
+-				      CHARGER_PARTITION_INFO_1,
+-				      sizeof(charger_partition_info_1));
+-	if (ret < 0) {
+-		mca_log_err("failed to alloc\n");
+-		return -1;
+-	}
+-
+-	ret = charger_partition_write(CHARGER_PARTITION_HOST_KERNEL,
+-				      CHARGER_PARTITION_INFO_1, (void *)in,
+-				      sizeof(charger_partition_info_1));
+-	if (ret < 0)
+-		mca_log_err("failed to write\n");
+-
+-	(void)charger_partition_dealloc(CHARGER_PARTITION_HOST_KERNEL,
+-					CHARGER_PARTITION_INFO_1,
+-					sizeof(charger_partition_info_1));
+-	return ret;
+-}
+-
+-int charger_partition_read_double85(int *val)
+-{
+-	charger_partition_info_1 info_1 = { 0 };
+-
+-	(void)charger_partition_read_info_1(&info_1);
+-	*val = info_1.double85;
+-	return 0;
++int charger_partition_read_double85(int *value)
++{
++	return charger_partition_field(CHARGER_PARTITION_INFO_1,
++				       offsetof(charger_partition_info_1,
++						double85),
++				       (u32 *)value, sizeof(int), false);
+ }
+ EXPORT_SYMBOL(charger_partition_read_double85);
+ 
+-int charger_partition_write_double85(int val)
+-{
+-	charger_partition_info_1 info_1 = { 0 };
+-
+-	(void)charger_partition_read_info_1(&info_1);
+-	info_1.double85 = val;
+-	return charger_partition_write_info_1(&info_1);
++int charger_partition_write_double85(int value)
++{
++	return charger_partition_field(CHARGER_PARTITION_INFO_1,
++				       offsetof(charger_partition_info_1,
++						double85),
++				       (u32 *)&value, sizeof(int), true);
+ }
+ EXPORT_SYMBOL(charger_partition_write_double85);
+ 
+-int charger_partition_write_remove_temp_limit(int val)
+-{
+-	charger_partition_info_1 info_1 = { 0 };
+-
+-	(void)charger_partition_read_info_1(&info_1);
+-	info_1.remove_temp_limit = val;
+-	return charger_partition_write_info_1(&info_1);
++int charger_partition_read_remove_temp_limit(int *value)
++{
++	return charger_partition_field(CHARGER_PARTITION_INFO_1,
++				       offsetof(charger_partition_info_1,
++						remove_temp_limit),
++				       (u32 *)value, sizeof(int), false);
++}
++EXPORT_SYMBOL(charger_partition_read_remove_temp_limit);
++
++int charger_partition_write_remove_temp_limit(int value)
++{
++	return charger_partition_field(CHARGER_PARTITION_INFO_1,
++				       offsetof(charger_partition_info_1,
++						remove_temp_limit),
++				       (u32 *)&value, sizeof(int), true);
+ }
+ EXPORT_SYMBOL(charger_partition_write_remove_temp_limit);
+ 
+-int charger_partition_read_remove_temp_limit(int *val)
+-{
+-	charger_partition_info_1 info_1 = { 0 };
+-
+-	(void)charger_partition_read_info_1(&info_1);
+-	*val = info_1.remove_temp_limit;
+-	return 0;
+-}
+-
+-int charger_partition_read_memory_test(int *val)
+-{
+-	charger_partition_info_1 info_1 = { 0 };
+-
+-	(void)charger_partition_read_info_1(&info_1);
+-	*val = info_1.memory_test;
+-	return 0;
++int charger_partition_read_memory_test(int *value)
++{
++	return charger_partition_field(CHARGER_PARTITION_INFO_1,
++				       offsetof(charger_partition_info_1,
++						memory_test),
++				       (u32 *)value, sizeof(int), false);
+ }
+ EXPORT_SYMBOL(charger_partition_read_memory_test);
+ 
+-int charger_partition_write_memory_test(int val)
+-{
+-	charger_partition_info_1 info_1 = { 0 };
+-
+-	(void)charger_partition_read_info_1(&info_1);
+-	info_1.memory_test = val;
+-	return charger_partition_write_info_1(&info_1);
++int charger_partition_write_memory_test(int value)
++{
++	return charger_partition_field(CHARGER_PARTITION_INFO_1,
++				       offsetof(charger_partition_info_1,
++						memory_test),
++				       (u32 *)&value, sizeof(int), true);
+ }
+ EXPORT_SYMBOL(charger_partition_write_memory_test);
+ 
+-int charger_partition_read_soc_limit(int *val)
+-{
+-	charger_partition_info_1 info_1 = { 0 };
+-
+-	(void)charger_partition_read_info_1(&info_1);
+-	*val = info_1.soc_limit;
+-	return 0;
++int charger_partition_read_soc_limit(int *value)
++{
++	return charger_partition_field(CHARGER_PARTITION_INFO_1,
++				       offsetof(charger_partition_info_1,
++						soc_limit),
++				       (u32 *)value, sizeof(int), false);
+ }
+ EXPORT_SYMBOL(charger_partition_read_soc_limit);
+ 
+-int charger_partition_write_soc_limit(int val)
+-{
+-	charger_partition_info_1 info_1 = { 0 };
+-
+-	(void)charger_partition_read_info_1(&info_1);
+-	info_1.soc_limit = val;
+-	return charger_partition_write_info_1(&info_1);
++int charger_partition_write_soc_limit(int value)
++{
++	return charger_partition_field(CHARGER_PARTITION_INFO_1,
++				       offsetof(charger_partition_info_1,
++						soc_limit),
++				       (u32 *)&value, sizeof(int), true);
+ }
+ EXPORT_SYMBOL(charger_partition_write_soc_limit);
+ 
+ int charger_partition_get_mishow(bool *mishow)
+ {
+-	charger_partition_info_1 info_1 = { 0 };
+-
+-	if (!charger_partition) {
+-		mca_log_err("charger_partition init error\n");
+-		return -1;
+-	}
+-
+-	(void)charger_partition_read_info_1(&info_1);
+-	*mishow = !!info_1.mishow;
+-	return 0;
++	u32 value;
++	int ret;
++
++	if (!mishow)
++		return -EINVAL;
++	ret = charger_partition_field(CHARGER_PARTITION_INFO_1,
++				      offsetof(charger_partition_info_1,
++					       mishow),
++				      &value, sizeof(value), false);
++	if (!ret)
++		*mishow = !!value;
++	return ret;
+ }
+ EXPORT_SYMBOL(charger_partition_get_mishow);
++
++int charger_partition_read_ocd_count(u32 *v0, u32 *v1)
++{
++	u32 values[2];
++	int ret;
++
++	if (!v0 || !v1)
++		return -EINVAL;
++	ret = charger_partition_field(CHARGER_PARTITION_INFO_2,
++				      offsetof(charger_partition_info_2,
++					       ocd_count),
++				      values, sizeof(values), false);
++	if (!ret) {
++		*v0 = values[0];
++		*v1 = values[1];
++	}
++	return ret;
++}
++EXPORT_SYMBOL(charger_partition_read_ocd_count);
++
++int charger_partition_write_ocd_count(u32 v0, u32 v1)
++{
++	u32 values[] = { v0, v1 };
++
++	return charger_partition_field(CHARGER_PARTITION_INFO_2,
++				       offsetof(charger_partition_info_2,
++						ocd_count),
++				       values, sizeof(values), true);
++}
++EXPORT_SYMBOL(charger_partition_write_ocd_count);
++
++int charger_partition_read_cuv_count(u32 *v0, u32 *v1)
++{
++	u32 values[2];
++	int ret;
++
++	if (!v0 || !v1)
++		return -EINVAL;
++	ret = charger_partition_field(CHARGER_PARTITION_INFO_2,
++				      offsetof(charger_partition_info_2,
++					       cuv_count),
++				      values, sizeof(values), false);
++	if (!ret) {
++		*v0 = values[0];
++		*v1 = values[1];
++	}
++	return ret;
++}
++EXPORT_SYMBOL(charger_partition_read_cuv_count);
++
++int charger_partition_write_cuv_count(u32 v0, u32 v1)
++{
++	u32 values[] = { v0, v1 };
++
++	return charger_partition_field(CHARGER_PARTITION_INFO_2,
++				       offsetof(charger_partition_info_2,
++						cuv_count),
++				       values, sizeof(values), true);
++}
++EXPORT_SYMBOL(charger_partition_write_cuv_count);
++
++int charger_partition_read_hscd_count(u32 *value)
++{
++	return charger_partition_field(CHARGER_PARTITION_INFO_2,
++				       offsetof(charger_partition_info_2,
++						hscd_count),
++				       value, sizeof(*value), false);
++}
++EXPORT_SYMBOL(charger_partition_read_hscd_count);
++
++int charger_partition_write_hcsd_count(u32 value)
++{
++	return charger_partition_field(CHARGER_PARTITION_INFO_2,
++				       offsetof(charger_partition_info_2,
++						hscd_count),
++				       &value, sizeof(value), true);
++}
++EXPORT_SYMBOL(charger_partition_write_hcsd_count);
+ 
+ static ssize_t charger_partition_sysfs_show(struct device *dev,
+ 					    struct device_attribute *attr,
+@@ -536,10 +421,8 @@
+ static ssize_t charger_partition_sysfs_store(struct device *dev,
+ 					     struct device_attribute *attr,
+ 					     const char *buf, size_t count);
+-static int charger_partition_get_info_2(void);
+-static int charger_partition_set_info_2(void);
+-
+-struct mca_sysfs_attr_info charger_partition_sysfs_field_tbl[] = {
++
++static struct mca_sysfs_attr_info charger_partition_sysfs_field_tbl[] = {
+ 	mca_sysfs_attr_rw(charger_partition_sysfs, 0664,
+ 			  MCA_PROP_CHARGER_PARTITION_MISHOW,
+ 			  charger_partition_mishow),
+@@ -553,783 +436,212 @@
+ 
+ #define CHARGER_PARTITION_SYSFS_ATTRS_SIZE \
+ 	ARRAY_SIZE(charger_partition_sysfs_field_tbl)
+-
+ static struct attribute
+ 	*charger_partition_sysfs_attrs[CHARGER_PARTITION_SYSFS_ATTRS_SIZE + 1];
+-
+ static const struct attribute_group charger_partition_sysfs_attr_group = {
+ 	.attrs = charger_partition_sysfs_attrs,
+ };
+ 
++static int charger_partition_sysfs_value(struct device_attribute *attr,
++					 u32 *value, bool write)
++{
++	struct mca_sysfs_attr_info *entry;
++	size_t offset;
++	u8 info = CHARGER_PARTITION_INFO_1;
++
++	entry = mca_sysfs_lookup_attr(attr->attr.name,
++				      charger_partition_sysfs_field_tbl,
++				      CHARGER_PARTITION_SYSFS_ATTRS_SIZE);
++	if (!entry)
++		return -EINVAL;
++	switch (entry->sysfs_attr_name) {
++	case MCA_PROP_CHARGER_PARTITION_MISHOW:
++		offset = offsetof(charger_partition_info_1, mishow);
++		break;
++	case MCA_PROP_CHARGER_PARTITION_POWEROFFMODE:
++		offset = offsetof(charger_partition_info_1, power_off_mode);
++		break;
++	case MCA_PROP_CHARGER_PARTITION_PROP_EU_MODE:
++		info = CHARGER_PARTITION_INFO_2;
++		offset = offsetof(charger_partition_info_2, eu_mode);
++		if (write && *value > 1)
++			return -EINVAL;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return charger_partition_field(info, offset, value, sizeof(*value),
++				       write);
++}
++
+ static ssize_t charger_partition_sysfs_show(struct device *dev,
+ 					    struct device_attribute *attr,
+ 					    char *buf)
+ {
+-	struct mca_sysfs_attr_info *attr_info;
+-	ssize_t count = 0;
+-	int val = 0, ret = 0;
+-	charger_partition_info_1 *info_1 = NULL;
+-	charger_partition_info_2 *info_2 = NULL;
+-
+-	attr_info = mca_sysfs_lookup_attr(attr->attr.name,
+-					  charger_partition_sysfs_field_tbl,
+-					  CHARGER_PARTITION_SYSFS_ATTRS_SIZE);
+-	if (!attr_info)
+-		return -1;
+-
+-	switch (attr_info->sysfs_attr_name) {
+-	case MCA_PROP_CHARGER_PARTITION_MISHOW:
+-		ret = charger_partition_alloc(CHARGER_PARTITION_HOST_KERNEL,
+-					      CHARGER_PARTITION_INFO_1,
+-					      sizeof(charger_partition_info_1));
+-		if (ret < 0) {
+-			mca_log_err("failed to alloc\n");
+-			return -1;
+-		}
+-
+-		info_1 = (charger_partition_info_1 *)charger_partition_read(
+-			CHARGER_PARTITION_HOST_KERNEL, CHARGER_PARTITION_INFO_1,
+-			sizeof(charger_partition_info_1));
+-		if (!info_1) {
+-			mca_log_err("failed to read\n");
+-			ret = charger_partition_dealloc(
+-				CHARGER_PARTITION_HOST_KERNEL,
+-				CHARGER_PARTITION_INFO_1,
+-				sizeof(charger_partition_info_1));
+-			if (ret < 0) {
+-				mca_log_err("failed to dealloc\n");
+-				return -1;
+-			}
+-			return -1;
+-		}
+-		val = info_1->mishow;
+-
+-		ret = charger_partition_dealloc(
+-			CHARGER_PARTITION_HOST_KERNEL, CHARGER_PARTITION_INFO_1,
+-			sizeof(charger_partition_info_1));
+-		if (ret < 0) {
+-			mca_log_err("failed to dealloc\n");
+-			return -1;
+-		}
+-		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
+-		break;
+-	case MCA_PROP_CHARGER_PARTITION_POWEROFFMODE:
+-		ret = charger_partition_alloc(CHARGER_PARTITION_HOST_KERNEL,
+-					      CHARGER_PARTITION_INFO_1,
+-					      sizeof(charger_partition_info_1));
+-		if (ret < 0) {
+-			mca_log_err("failed to alloc\n");
+-			return -1;
+-		}
+-
+-		info_1 = (charger_partition_info_1 *)charger_partition_read(
+-			CHARGER_PARTITION_HOST_KERNEL, CHARGER_PARTITION_INFO_1,
+-			sizeof(charger_partition_info_1));
+-		if (!info_1) {
+-			mca_log_err("failed to read\n");
+-			ret = charger_partition_dealloc(
+-				CHARGER_PARTITION_HOST_KERNEL,
+-				CHARGER_PARTITION_INFO_1,
+-				sizeof(charger_partition_info_1));
+-			if (ret < 0) {
+-				mca_log_err("failed to dealloc\n");
+-				return -1;
+-			}
+-			return -1;
+-		}
+-		val = info_1->power_off_mode;
+-
+-		ret = charger_partition_dealloc(
+-			CHARGER_PARTITION_HOST_KERNEL, CHARGER_PARTITION_INFO_1,
+-			sizeof(charger_partition_info_1));
+-		if (ret < 0) {
+-			mca_log_err("failed to dealloc\n");
+-			return -1;
+-		}
+-		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
+-		break;
+-	case MCA_PROP_CHARGER_PARTITION_PROP_EU_MODE:
+-		ret = charger_partition_alloc(CHARGER_PARTITION_HOST_KERNEL,
+-					      CHARGER_PARTITION_INFO_2,
+-					      sizeof(charger_partition_info_2));
+-		if (ret < 0) {
+-			mca_log_err("failed to alloc\n");
+-			return -1;
+-		}
+-
+-		info_2 = (charger_partition_info_2 *)charger_partition_read(
+-			CHARGER_PARTITION_HOST_KERNEL, CHARGER_PARTITION_INFO_2,
+-			sizeof(charger_partition_info_2));
+-		if (!info_2) {
+-			mca_log_err("failed to read\n");
+-			ret = charger_partition_dealloc(
+-				CHARGER_PARTITION_HOST_KERNEL,
+-				CHARGER_PARTITION_INFO_2,
+-				sizeof(charger_partition_info_2));
+-			if (ret < 0) {
+-				mca_log_err(
+-					"[ChgPartition] failed to dealloc\n");
+-				return -1;
+-			}
+-			return -1;
+-		}
+-		val = info_2->eu_mode;
+-
+-		ret = charger_partition_dealloc(
+-			CHARGER_PARTITION_HOST_KERNEL, CHARGER_PARTITION_INFO_2,
+-			sizeof(charger_partition_info_2));
+-		if (ret < 0) {
+-			mca_log_err("[ChgPartition] failed to dealloc\n");
+-			return -1;
+-		}
+-		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	return count;
++	u32 value;
++	int ret = charger_partition_sysfs_value(attr, &value, false);
++
++	return ret ? ret : sysfs_emit(buf, "%u\n", value);
+ }
+ 
+ static ssize_t charger_partition_sysfs_store(struct device *dev,
+ 					     struct device_attribute *attr,
+ 					     const char *buf, size_t count)
+ {
+-	struct mca_sysfs_attr_info *attr_info;
+-	int val = 0, ret = 0;
+-
+-	attr_info = mca_sysfs_lookup_attr(attr->attr.name,
+-					  charger_partition_sysfs_field_tbl,
+-					  CHARGER_PARTITION_SYSFS_ATTRS_SIZE);
+-	if (!attr_info)
+-		return -1;
+-
+-	if (kstrtoint(buf, 0, &val))
+-		return -EINVAL;
+-
+-	switch (attr_info->sysfs_attr_name) {
+-	case MCA_PROP_CHARGER_PARTITION_MISHOW:
+-		ret = charger_partition_alloc(CHARGER_PARTITION_HOST_KERNEL,
+-					      CHARGER_PARTITION_INFO_1,
+-					      sizeof(charger_partition_info_1));
+-		if (ret < 0) {
+-			mca_log_err("failed to alloc\n");
+-			return -1;
++	u32 value;
++	int ret;
++
++	ret = kstrtou32(buf, 0, &value);
++	if (!ret)
++		ret = charger_partition_sysfs_value(attr, &value, true);
++	return ret ? ret : count;
++}
++
++static void charger_partition_publish(const charger_partition_info_1 *info,
++				      u32 eu)
++{
++	if (info->double85)
++		mca_event_block_notify(MCA_EVENT_TYPE_SUBPMIC_INFO,
++				       MCA_EVENT_DEBUG_CTRL_DOUBLE85,
++				       (void *)&info->double85);
++	if (info->remove_temp_limit)
++		mca_event_block_notify(MCA_EVENT_TYPE_SUBPMIC_INFO,
++				       MCA_EVENT_DEBUG_CTRL_REMOVE_TEMP_LIMIT,
++				       (void *)&info->remove_temp_limit);
++	if (info->memory_test)
++		mca_event_block_notify(MCA_EVENT_TYPE_SUBPMIC_INFO,
++				       MCA_EVENT_DEBUG_CTRL_MEMORY_TEST,
++				       (void *)&info->memory_test);
++	if (info->soc_limit)
++		mca_event_block_notify(MCA_EVENT_TYPE_SUBPMIC_INFO,
++				       MCA_EVENT_DEBUG_CTRL_SOC_LIMIT,
++				       (void *)&info->soc_limit);
++	mca_strategy_func_process(STRATEGY_FUNC_TYPE_FG, MCA_EVENT_IS_EU_MODEL,
++				  !!eu);
++	mca_strategy_func_process(STRATEGY_FUNC_TYPE_BUCK_CHARGE,
++				  MCA_EVENT_IS_EU_MODEL, !!eu);
++	mca_strategy_func_process(STRATEGY_FUNC_TYPE_QUICK_CHARGE,
++				  MCA_EVENT_IS_EU_MODEL, !!eu);
++}
++
++static void charger_partition_discover(struct work_struct *work)
++{
++	struct charger_partition_device *cp =
++		container_of(to_delayed_work(work),
++			     struct charger_partition_device, discover_work);
++	charger_partition_info_1 info;
++	struct block_device *bdev;
++	struct file *file;
++	u32 eu;
++	int ret;
++
++	mutex_lock(&partition_lock);
++	if (!cp->file) {
++		file = bdev_file_open_by_path("/dev/block/by-name/charger",
++					      BLK_OPEN_READ | BLK_OPEN_WRITE,
++					      NULL, NULL);
++		if (IS_ERR(file)) {
++			ret = PTR_ERR(file);
++			mutex_unlock(&partition_lock);
++			goto retry;
+ 		}
+-
+-		charger_partition_info_1 info_1_a = { .power_off_mode = 2,
+-						      .zero_speed_mode = 2,
+-						      .mishow = val,
+-						      .reserved = 0 };
+-
+-		ret = charger_partition_write(CHARGER_PARTITION_HOST_KERNEL,
+-					      CHARGER_PARTITION_INFO_1,
+-					      (void *)&info_1_a,
+-					      sizeof(charger_partition_info_1));
+-		if (ret < 0) {
+-			mca_log_err("failed to write\n");
+-			ret = charger_partition_dealloc(
+-				CHARGER_PARTITION_HOST_KERNEL,
+-				CHARGER_PARTITION_INFO_1,
+-				sizeof(charger_partition_info_1));
+-			if (ret < 0) {
+-				mca_log_err("failed to dealloc\n");
+-				return -1;
+-			}
+-			return -1;
++		bdev = file_bdev(file);
++		if (!bdev_is_partition(bdev) || !bdev->bd_meta_info ||
++		    strcmp(bdev->bd_meta_info->volname, PARTITION_NAME) ||
++		    bdev_nr_bytes(bdev) < CHARGER_PARTITION_INFO_LAST *
++						  CHARGER_PARTITION_RWSIZE ||
++		    bdev_logical_block_size(bdev) > CHARGER_PARTITION_RWSIZE) {
++			bdev_fput(file);
++			mutex_unlock(&partition_lock);
++			ret = -EINVAL;
++			goto retry;
+ 		}
+-
+-		ret = charger_partition_dealloc(
+-			CHARGER_PARTITION_HOST_KERNEL, CHARGER_PARTITION_INFO_1,
+-			sizeof(charger_partition_info_1));
+-		if (ret < 0) {
+-			mca_log_err("failed to dealloc\n");
+-			return -1;
+-		}
+-		break;
+-	case MCA_PROP_CHARGER_PARTITION_POWEROFFMODE:
+-		ret = charger_partition_alloc(CHARGER_PARTITION_HOST_KERNEL,
+-					      CHARGER_PARTITION_INFO_1,
+-					      sizeof(charger_partition_info_1));
+-		if (ret < 0) {
+-			mca_log_err("failed to alloc\n");
+-			return -1;
+-		}
+-
+-		charger_partition_info_1 info_1_b = { .power_off_mode = val,
+-						      .zero_speed_mode = 2,
+-						      .mishow = 0x34567890,
+-						      .reserved = 0 };
+-
+-		ret = charger_partition_write(CHARGER_PARTITION_HOST_KERNEL,
+-					      CHARGER_PARTITION_INFO_1,
+-					      (void *)&info_1_b,
+-					      sizeof(charger_partition_info_1));
+-		if (ret < 0) {
+-			mca_log_err("failed to write\n");
+-			ret = charger_partition_dealloc(
+-				CHARGER_PARTITION_HOST_KERNEL,
+-				CHARGER_PARTITION_INFO_1,
+-				sizeof(charger_partition_info_1));
+-			if (ret < 0) {
+-				mca_log_err("failed to dealloc\n");
+-				return -1;
+-			}
+-			return -1;
+-		}
+-
+-		ret = charger_partition_dealloc(
+-			CHARGER_PARTITION_HOST_KERNEL, CHARGER_PARTITION_INFO_1,
+-			sizeof(charger_partition_info_1));
+-		if (ret < 0) {
+-			mca_log_err("failed to dealloc\n");
+-			return -1;
+-		}
+-		break;
+-	case MCA_PROP_CHARGER_PARTITION_PROP_EU_MODE:
+-		charger_partition_get_info_2();
+-		charger_partition->info_2.eu_mode = val;
+-		charger_partition_set_info_2();
+-		break;
+-	default:
+-		break;
+-	}
+-	return count;
+-}
+-
+-static int charger_partition_sysfs_create_group(struct device *dev)
+-{
++		cp->file = file;
++	}
++	mutex_unlock(&partition_lock);
++	ret = charger_partition_field(CHARGER_PARTITION_INFO_2,
++				      offsetof(charger_partition_info_2,
++					       eu_mode),
++				      &eu, sizeof(eu), false);
++	if (ret)
++		goto retry;
++	ret = charger_partition_field(CHARGER_PARTITION_INFO_1, 0, (u32 *)&info,
++				      sizeof(info), false);
++	if (ret)
++		goto retry;
++	/* Publish only after releasing the transaction; listeners may read again. */
++	charger_partition_publish(&info, eu);
++	return;
++retry:
++	if (cp->retries++ < CHARGER_PARTITION_RETRY_TIMES)
++		schedule_delayed_work(&cp->discover_work,
++				      msecs_to_jiffies(CHARGER_WORK_DELAY_MS));
++	else
++		dev_err(cp->dev, "charger partition unavailable: %d\n", ret);
++}
++
++static int charger_partition_probe(struct platform_device *pdev)
++{
++	struct charger_partition_device *cp;
++	int ret;
++
++	cp = devm_kzalloc(&pdev->dev, sizeof(*cp), GFP_KERNEL);
++	if (!cp)
++		return -ENOMEM;
++	cp->dev = &pdev->dev;
++	INIT_DELAYED_WORK(&cp->discover_work, charger_partition_discover);
++	mutex_lock(&partition_lock);
++	if (partition) {
++		mutex_unlock(&partition_lock);
++		return -EBUSY;
++	}
++	partition = cp;
++	mutex_unlock(&partition_lock);
+ 	mca_sysfs_init_attrs(charger_partition_sysfs_attrs,
+ 			     charger_partition_sysfs_field_tbl,
+ 			     CHARGER_PARTITION_SYSFS_ATTRS_SIZE);
+-	return mca_sysfs_create_link_group("charger", "charger_partition", dev,
+-					   &charger_partition_sysfs_attr_group);
+-}
+-
+-static void charger_partition_sysfs_remove_group(struct device *dev)
+-{
+-	mca_sysfs_remove_link_group("charger", "charger_partition", dev,
++	ret = mca_sysfs_create_link_group("charger", "charger_partition",
++					  cp->dev,
++					  &charger_partition_sysfs_attr_group);
++	if (ret) {
++		guard(mutex)(&partition_lock);
++		partition = NULL;
++		return ret;
++	}
++	platform_set_drvdata(pdev, cp);
++	schedule_delayed_work(&cp->discover_work, 0);
++	return 0;
++}
++
++static void charger_partition_remove(struct platform_device *pdev)
++{
++	struct charger_partition_device *cp = platform_get_drvdata(pdev);
++
++	mca_sysfs_remove_link_group("charger", "charger_partition", cp->dev,
+ 				    &charger_partition_sysfs_attr_group);
+-}
+-
+-static bool look_up_scsi_device(int lun)
+-{
+-	struct Scsi_Host *shost;
+-
+-	shost = scsi_host_lookup(0);
+-	if (!shost)
+-		return false;
+-
+-	charger_partition->sdev = scsi_device_lookup(shost, 0, 0, lun);
+-	if (!charger_partition->sdev)
+-		return false;
+-
+-	scsi_host_put(shost);
+-	return true;
+-}
+-
+-static bool check_device_is_correct(void)
+-{
+-	if (strncmp(charger_partition->sdev->host->hostt->proc_name, UFSHCD,
+-		    strlen(UFSHCD))) {
+-		/*check if the device is ufs. If not, just return directly.*/
+-		mca_log_err("proc name is not ufshcd, name: %s\n",
+-			    charger_partition->sdev->host->hostt->proc_name);
+-		return false;
+-	}
+-
+-	return true;
+-}
+-
+-static bool get_charger_partition_info(void)
+-{
+-	struct scsi_disk *sdkp = NULL;
+-	struct scsi_device *sdev = charger_partition->sdev;
+-	int part_number = charger_partition->part_info_part_number;
+-	struct block_device *part;
+-
+-	if (!sdev->sdev_gendev.driver_data) {
+-		mca_log_err("scsi disk is null\n");
+-		return false;
+-	}
+-
+-	sdkp = (struct scsi_disk *)sdev->sdev_gendev.driver_data;
+-	if (!sdkp->disk) {
+-		mca_log_err("gendisk is null\n");
+-		return false;
+-	}
+-
+-	charger_partition->part_info_part_name = sdkp->disk->disk_name;
+-	mca_log_err("partion: %s part_number:%d\n",
+-		    charger_partition->part_info_part_name, part_number);
+-
+-	part = xa_load(&sdkp->disk->part_tbl, part_number);
+-	if (!part) {
+-		mca_log_err("device is null\n");
+-		return false;
+-	}
+-
+-	if (!part->bd_meta_info) {
+-		mca_log_err("part_num %d has no meta_info, skip\n",
+-			    part_number);
+-		return false;
+-	}
+-
+-	if (strncmp(part->bd_meta_info->volname, "charger",
+-		    sizeof("charger"))) {
+-		mca_log_err("[charger] this is not lun0\n");
+-		return false;
+-	}
+-
+-	part_info.part_start =
+-		part->bd_start_sect * PART_SECTOR_SIZE / PART_BLOCK_SIZE;
+-	part_info.part_size =
+-		bdev_nr_sectors(part) * PART_SECTOR_SIZE / PART_BLOCK_SIZE;
+-
+-	mca_log_err("partion: %s start %llu(block) size %llu(block)\n",
+-		    charger_partition->part_info_part_name,
+-		    part_info.part_start, part_info.part_size);
+-	return true;
+-}
+-
+-int check_charger_partition_header(void)
+-{
+-	int ret = 0;
+-	charger_partition_header *header = NULL;
+-
+-	header = kzalloc(CHARGER_PARTITION_RWSIZE, GFP_KERNEL);
+-	if (!header) {
+-		mca_log_err("malloc buf error!\n");
+-		return -1;
+-	}
+-
+-	ret = charger_scsi_read_partition(
+-		charger_partition->sdev, (void *)header,
+-		(part_info.part_start + CHARGER_PARTITION_HEADER),
+-		CHARGER_PARTITION_RWSIZE / PART_BLOCK_SIZE);
+-	if (ret) {
+-		mca_log_err("charger read error %d\n", ret);
+-		kfree(header);
+-		return -1;
+-	}
+-	mca_log_err("magic:0x%0x, version:%d\n", header->magic,
+-		    header->version);
+-
+-	if (header->magic != CHARGER_PARTITION_MAGIC) {
+-		mca_log_err("magic error, set to default!\n");
+-		header->magic = CHARGER_PARTITION_MAGIC;
+-	}
+-	header->initialized = 1;
+-	header->avaliable = 1;
+-
+-	ret = charger_scsi_write_partition(
+-		charger_partition->sdev, (void *)header,
+-		(part_info.part_start + CHARGER_PARTITION_HEADER),
+-		CHARGER_PARTITION_RWSIZE / PART_BLOCK_SIZE);
+-	if (ret) {
+-		mca_log_err("charger write error %d\n", ret);
+-		kfree(header);
+-		return -1;
+-	}
+-	mca_log_err("initiablized ok\n");
+-
+-	kfree(header);
+-	return ret;
+-}
+-
+-static int charger_partition_get_info_2(void)
+-{
+-	int ret = 0;
+-	charger_partition_info_2 *info_2 = NULL;
+-
+-	ret = charger_partition_alloc(CHARGER_PARTITION_HOST_KERNEL,
+-				      CHARGER_PARTITION_INFO_2,
+-				      sizeof(charger_partition_info_2));
+-	if (ret < 0) {
+-		mca_log_err("failed to alloc\n");
+-		return -1;
+-	}
+-
+-	info_2 = (charger_partition_info_2 *)charger_partition_read(
+-		CHARGER_PARTITION_HOST_KERNEL, CHARGER_PARTITION_INFO_2,
+-		sizeof(charger_partition_info_2));
+-	if (!info_2) {
+-		mca_log_err("failed to read\n");
+-		ret = charger_partition_dealloc(
+-			CHARGER_PARTITION_HOST_KERNEL, CHARGER_PARTITION_INFO_2,
+-			sizeof(charger_partition_info_2));
+-		if (ret < 0) {
+-			mca_log_err("[ChgPartition] failed to dealloc\n");
+-			return -1;
+-		}
+-		return -1;
+-	}
+-	charger_partition->info_2 = *info_2;
+-	charger_partition->is_eu_model = info_2->eu_mode;
+-	mca_log_err(" ret: %d, info_2->eu_mode: %u\n", ret, info_2->eu_mode);
+-
+-	if (info_2->eu_mode == 1) {
+-		mca_strategy_func_process(STRATEGY_FUNC_TYPE_FG,
+-					  MCA_EVENT_IS_EU_MODEL,
+-					  info_2->eu_mode);
+-		mca_strategy_func_process(STRATEGY_FUNC_TYPE_BUCK_CHARGE,
+-					  MCA_EVENT_IS_EU_MODEL,
+-					  info_2->eu_mode);
+-		mca_strategy_func_process(STRATEGY_FUNC_TYPE_QUICK_CHARGE,
+-					  MCA_EVENT_IS_EU_MODEL,
+-					  info_2->eu_mode);
+-	}
+-
+-	ret = charger_partition_dealloc(CHARGER_PARTITION_HOST_KERNEL,
+-					CHARGER_PARTITION_INFO_2,
+-					sizeof(charger_partition_info_2));
+-	if (ret < 0) {
+-		mca_log_err("[ChgPartition] failed to dealloc\n");
+-		return -1;
+-	}
+-	return 0;
+-}
+-
+-static int charger_partition_set_info_2(void)
+-{
+-	int ret = 0;
+-
+-	ret = charger_partition_alloc(CHARGER_PARTITION_HOST_KERNEL,
+-				      CHARGER_PARTITION_INFO_2,
+-				      sizeof(charger_partition_info_2));
+-	if (ret < 0) {
+-		mca_log_err("failed to alloc\n");
+-		return -1;
+-	}
+-
+-	ret = charger_partition_write(CHARGER_PARTITION_HOST_KERNEL,
+-				      CHARGER_PARTITION_INFO_2,
+-				      (void *)&charger_partition->info_2,
+-				      sizeof(charger_partition_info_2));
+-	if (ret < 0) {
+-		mca_log_err("failed to write\n");
+-		ret = charger_partition_dealloc(CHARGER_PARTITION_HOST_KERNEL,
+-						CHARGER_PARTITION_INFO_2,
+-						sizeof(charger_partition_info_2));
+-		if (ret < 0) {
+-			mca_log_err("failed to dealloc\n");
+-			return -1;
+-		}
+-		return -1;
+-	}
+-
+-	ret = charger_partition_dealloc(CHARGER_PARTITION_HOST_KERNEL,
+-					CHARGER_PARTITION_INFO_2,
+-					sizeof(charger_partition_info_2));
+-	if (ret < 0) {
+-		mca_log_err("failed to dealloc\n");
+-		return -1;
+-	}
+-	return 0;
+-}
+-
+-int charger_partition_read_ocd_count(u32 *ocd0, u32 *ocd1)
+-{
+-	charger_partition_get_info_2();
+-	*ocd0 = charger_partition->info_2.ocd_count[0];
+-	*ocd1 = charger_partition->info_2.ocd_count[1];
+-	return 0;
+-}
+-EXPORT_SYMBOL(charger_partition_read_ocd_count);
+-
+-int charger_partition_write_ocd_count(u32 ocd0, u32 ocd1)
+-{
+-	charger_partition_get_info_2();
+-	charger_partition->info_2.ocd_count[0] = ocd0;
+-	charger_partition->info_2.ocd_count[1] = ocd1;
+-	charger_partition_set_info_2();
+-	return 0;
+-}
+-EXPORT_SYMBOL(charger_partition_write_ocd_count);
+-
+-int charger_partition_read_cuv_count(u32 *cuv0, u32 *cuv1)
+-{
+-	charger_partition_get_info_2();
+-	*cuv0 = charger_partition->info_2.cuv_count[0];
+-	*cuv1 = charger_partition->info_2.cuv_count[1];
+-	return 0;
+-}
+-EXPORT_SYMBOL(charger_partition_read_cuv_count);
+-
+-int charger_partition_write_cuv_count(u32 cuv0, u32 cuv1)
+-{
+-	charger_partition_get_info_2();
+-	charger_partition->info_2.cuv_count[0] = cuv0;
+-	charger_partition->info_2.cuv_count[1] = cuv1;
+-	charger_partition_set_info_2();
+-	return 0;
+-}
+-EXPORT_SYMBOL(charger_partition_write_cuv_count);
+-
+-int charger_partition_read_hscd_count(u32 *hscd)
+-{
+-	charger_partition_get_info_2();
+-	*hscd = charger_partition->info_2.hscd_count;
+-	return 0;
+-}
+-EXPORT_SYMBOL(charger_partition_read_hscd_count);
+-
+-int charger_partition_write_hcsd_count(u32 hscd)
+-{
+-	charger_partition_get_info_2();
+-	charger_partition->info_2.hscd_count = hscd;
+-	charger_partition_set_info_2();
+-	return 0;
+-}
+-EXPORT_SYMBOL(charger_partition_write_hcsd_count);
+-
+-static int charger_partition_get_info_1(void)
+-{
+-	int ret = 0;
+-	charger_partition_info_1 *info_1 = NULL;
+-
+-	ret = charger_partition_alloc(CHARGER_PARTITION_HOST_KERNEL,
+-				      CHARGER_PARTITION_INFO_1,
+-				      sizeof(charger_partition_info_1));
+-	if (ret < 0) {
+-		mca_log_err("failed to alloc\n");
+-		return -1;
+-	}
+-
+-	info_1 = (charger_partition_info_1 *)charger_partition_read(
+-		CHARGER_PARTITION_HOST_KERNEL, CHARGER_PARTITION_INFO_1,
+-		sizeof(charger_partition_info_1));
+-	if (!info_1) {
+-		mca_log_err("failed to read\n");
+-		ret = charger_partition_dealloc(
+-			CHARGER_PARTITION_HOST_KERNEL, CHARGER_PARTITION_INFO_1,
+-			sizeof(charger_partition_info_1));
+-		if (ret < 0) {
+-			mca_log_err("failed to dealloc\n");
+-			return -1;
+-		}
+-		return -1;
+-	}
+-	mca_log_err(
+-		"ret: %d, mishow: 0x%0x, zero_speed_mode: %u, power_off_mode: %u, double85: %u, remove_temp_limit: %u, memory_test: %u, soc_limit: %d\n",
+-		ret, info_1->mishow, info_1->zero_speed_mode,
+-		info_1->power_off_mode, info_1->double85,
+-		info_1->remove_temp_limit, info_1->memory_test,
+-		info_1->soc_limit);
+-
+-	ret = charger_partition_dealloc(CHARGER_PARTITION_HOST_KERNEL,
+-					CHARGER_PARTITION_INFO_1,
+-					sizeof(charger_partition_info_1));
+-	if (ret < 0) {
+-		mca_log_err("failed to dealloc\n");
+-		return -1;
+-	}
+-	return 0;
+-}
+-
+-static int charger_partition_set_info_1(void)
+-{
+-	int ret = 0;
+-	charger_partition_info_1 info_1 = { .power_off_mode = 2,
+-					    .zero_speed_mode = 2,
+-					    .mishow = 0x23456789,
+-					    .reserved = 0 };
+-
+-	ret = charger_partition_alloc(CHARGER_PARTITION_HOST_KERNEL,
+-				      CHARGER_PARTITION_INFO_1,
+-				      sizeof(charger_partition_info_1));
+-	if (ret < 0) {
+-		mca_log_err("failed to alloc\n");
+-		return -1;
+-	}
+-
+-	ret = charger_partition_write(CHARGER_PARTITION_HOST_KERNEL,
+-				      CHARGER_PARTITION_INFO_1, (void *)&info_1,
+-				      sizeof(charger_partition_info_1));
+-	if (ret < 0) {
+-		mca_log_err("failed to write\n");
+-		ret = charger_partition_dealloc(
+-			CHARGER_PARTITION_HOST_KERNEL, CHARGER_PARTITION_INFO_1,
+-			sizeof(charger_partition_info_1));
+-		if (ret < 0) {
+-			mca_log_err("failed to dealloc\n");
+-			return -1;
+-		}
+-		return -1;
+-	}
+-
+-	ret = charger_partition_dealloc(CHARGER_PARTITION_HOST_KERNEL,
+-					CHARGER_PARTITION_INFO_1,
+-					sizeof(charger_partition_info_1));
+-	if (ret < 0) {
+-		mca_log_err("failed to dealloc\n");
+-		return -1;
+-	}
+-	return 0;
+-}
+-
+-static void charger_partition_prepare(void)
+-{
+-	charger_partition_info_1 info_1 = { 0 };
+-
+-	charger_partition_get_info_1();
+-	charger_partition_set_info_1();
+-	charger_partition_get_info_1();
+-
+-	(void)charger_partition_read_info_1(&info_1);
+-	if (info_1.double85)
+-		mca_event_block_notify(MCA_EVENT_TYPE_SUBPMIC_INFO, MCA_EVENT_DEBUG_CTRL_DOUBLE85, &info_1.double85);
+-	if (info_1.remove_temp_limit)
+-		mca_event_block_notify(MCA_EVENT_TYPE_SUBPMIC_INFO, MCA_EVENT_DEBUG_CTRL_REMOVE_TEMP_LIMIT, &info_1.remove_temp_limit);
+-	if (info_1.memory_test)
+-		mca_event_block_notify(MCA_EVENT_TYPE_SUBPMIC_INFO, MCA_EVENT_DEBUG_CTRL_MEMORY_TEST, &info_1.memory_test);
+-	if (info_1.soc_limit)
+-		mca_event_block_notify(MCA_EVENT_TYPE_SUBPMIC_INFO, MCA_EVENT_DEBUG_CTRL_SOC_LIMIT, &info_1.soc_limit);
+-
+-	charger_partition_get_info_2();
+-}
+-
+-static void charger_partition_work(struct work_struct *work)
+-{
+-	const struct mca_hwid *hwid = mca_get_hwid_info();
+-	int lun = 0;
+-	static int retry;
+-
+-	mca_log_err("get hw_country_ver: %u\n", get_hw_country_version());
+-	charger_partition->part_info_part_number =
+-		(hwid && hwid->platform_version == CHARGER_PART_PLATFORM_V9) ?
+-			CHARGER_PART_NUMBER_V9 :
+-			CHARGER_PART_NUMBER_DEFAULT;
+-
+-	// 1. find charger partition
+-	for (lun = 0; lun < 6; lun++) {
+-		/*find charger partition scsi device*/
+-		if (!look_up_scsi_device(lun)) {
+-			mca_log_err("not find, continue...\n");
+-			continue;
+-		}
+-
+-		/*check device is correct*/
+-		if (!check_device_is_correct()) {
+-			mca_log_err(
+-				"not find finally, won't read charger partition!!!\n");
+-			return;
+-		}
+-
+-		if (get_charger_partition_info()) {
+-			mca_log_err("get partition info ok\n");
+-			check_charger_partition_header();
+-			charger_partition->is_charger_partition_rdy = true;
+-			/*get info_2: is_eu_model*/
+-			if (charger_partition->not_notify_module) {
+-				charger_partition_get_info_2();
+-				charger_partition->not_notify_module = false;
+-				charger_partition->is_charger_partition_rdy =
+-					false;
+-			} else {
+-				/*reset info_1 + publish debug-control flags*/
+-				charger_partition_prepare();
+-			}
+-			break;
+-		}
+-	}
+-
+-	if (!charger_partition->is_charger_partition_rdy &&
+-	    retry++ < CHARGER_PARTITION_RETRY_TIMES) {
+-		mca_log_err("charger partition not ready, retry: %d/%d\n",
+-			    retry, CHARGER_PARTITION_RETRY_TIMES);
+-		schedule_delayed_work(
+-			&charger_partition->charger_partition_work,
+-			msecs_to_jiffies(CHARGER_WORK_DELAY_MS));
+-	}
+-	if (retry == CHARGER_PARTITION_RETRY_TIMES) {
+-		if (look_up_scsi_device(0)) {
+-			if (check_device_is_correct()) {
+-				if (get_charger_partition_info()) {
+-					mca_log_err("get partition info ok\n");
+-					check_charger_partition_header();
+-					charger_partition
+-						->is_charger_partition_rdy =
+-						true;
+-					/*get info_2: is_eu_model*/
+-					if (charger_partition
+-						    ->not_notify_module) {
+-						charger_partition_get_info_2();
+-						charger_partition
+-							->not_notify_module =
+-							false;
+-						charger_partition
+-							->is_charger_partition_rdy =
+-							false;
+-					} else {
+-						/*reset info_1: power_off_mode and zero_speed_mode*/
+-						charger_partition_get_info_1();
+-						charger_partition_set_info_1();
+-						charger_partition_get_info_1();
+-						charger_partition_get_info_2();
+-					}
+-				}
+-			}
+-		}
+-	}
+-}
+-
+-static int charger_partition_probe(struct platform_device *pdev)
+-{
+-	charger_partition = devm_kzalloc(
+-		&pdev->dev, sizeof(struct ChargerPartition), GFP_KERNEL);
+-	if (!charger_partition) {
+-		mca_log_err("out of memory\n");
+-		return -ENOMEM;
+-	}
+-	charger_partition->dev = &pdev->dev;
+-	platform_set_drvdata(pdev, charger_partition);
+-
+-	charger_partition_sysfs_create_group(charger_partition->dev);
+-
+-	charger_partition->not_notify_module = true;
+-	INIT_DELAYED_WORK(&charger_partition->charger_partition_work,
+-			  charger_partition_work);
+-	schedule_delayed_work(&charger_partition->charger_partition_work, 0);
+-	mca_log_err("probe ok\n");
+-	return 0;
+-}
+-
+-static int charger_partition_remove(struct platform_device *pdev)
+-{
+-	cancel_delayed_work(&charger_partition->charger_partition_work);
+-	charger_partition_sysfs_remove_group(&pdev->dev);
+-	kfree(charger_partition);
+-	return 0;
+-}
+-
+-static const struct of_device_id match_table[] = {
++	cancel_delayed_work_sync(&cp->discover_work);
++	mutex_lock(&partition_lock);
++	partition = NULL;
++	if (cp->file)
++		bdev_fput(cp->file);
++	mutex_unlock(&partition_lock);
++}
++
++static const struct of_device_id charger_partition_match[] = {
+ 	{ .compatible = "xiaomi,charger_partition" },
+-	{},
++	{}
+ };
++MODULE_DEVICE_TABLE(of, charger_partition_match);
+ 
+ static struct platform_driver charger_partition_driver = {
+ 	.driver = {
+-		.owner = THIS_MODULE,
+ 		.name = "charger_partition",
+-		.of_match_table = match_table,
++		.of_match_table = charger_partition_match,
+ 	},
+ 	.probe = charger_partition_probe,
+ 	.remove = charger_partition_remove,
+ };
+-
+-static int __init charger_partition_init(void)
+-{
+-	return platform_driver_register(&charger_partition_driver);
+-}
+-module_init(charger_partition_init);
+-
+-static void __exit charger_partition_exit(void)
+-{
+-	platform_driver_unregister(&charger_partition_driver);
+-}
+-module_exit(charger_partition_exit);
+-
+-MODULE_DESCRIPTION("smart charge driver");
+-MODULE_AUTHOR("liluting@xiaomi.com");
+-MODULE_LICENSE("GPL v2");
++module_platform_driver(charger_partition_driver);
++
++MODULE_DESCRIPTION("Xiaomi charger partition storage");
++MODULE_LICENSE("GPL");

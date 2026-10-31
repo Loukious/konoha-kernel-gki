@@ -2012,9 +2012,131 @@ ddk_module(
     visibility = ["//visibility:public"],
 )
 
+ddk_headers(
+    name = "chargepolicy_headers",
+    hdrs = glob(["drivers/power/supply/mca/**/*.h"]),
+    includes = ["drivers/power/supply/mca/include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_protocol_class",
+    srcs = ["drivers/power/supply/mca/mca_protocol/mca_protocol_class.c"],
+    out = "mca_protocol_class.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_hwid", ":mca_parse_dts"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_protocol_pd_class",
+    srcs = ["drivers/power/supply/mca/mca_protocol/protocol_pd/mca_protocol_pd_class.c"],
+    out = "mca_protocol_pd_class.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_hwid", ":mca_parse_dts", ":mca_protocol_class", ":charger_partition"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_protocol_qc_class",
+    srcs = ["drivers/power/supply/mca/mca_protocol/protocol_qc/mca_protocol_qc_class.c"],
+    out = "mca_protocol_qc_class.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_hwid", ":mca_parse_dts", ":mca_protocol_class"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "qcom_adsp_pd_protocol",
+    srcs = ["drivers/power/supply/mca/mca_protocol/protocol_pd/qcom_tcpc/qcom_adsp_pd_protocol.c"],
+    out = "qcom_adsp_pd_protocol.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_hwid", ":mca_parse_dts", ":mca_protocol_pd_class", ":mca_adsp_glink"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_platform_bc12_class",
+    srcs = ["drivers/power/supply/mca/mca_platform/mca_platform_bc12_class.c"],
+    out = "mca_platform_bc12_class.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_hwid", ":mca_parse_dts", ":mca_protocol_class", ":mca_protocol_pd_class"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_qcom_subpmic_proxy",
+    srcs = ["drivers/power/supply/mca/mca_qcom_subpmic_proxy/mca_qcom_subpmic_proxy.c"],
+    out = "mca_qcom_subpmic_proxy.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_hwid", ":mca_parse_dts", ":mca_platform_bc12_class", ":mca_protocol_pd_class", ":mca_protocol_qc_class", ":mca_adsp_glink", ":mca_platform_buckchg_class", ":mca_platform_cp_class", ":mca_strategy_class"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "charger_partition",
+    srcs = ["drivers/power/supply/mca/mca_shared_memory/charger_partition.c"],
+    out = "charger_partition.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event", ":mca_hwid", ":mca_parse_dts", ":mca_strategy_class"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_headers(
+    name = "perf_headers",
+    hdrs = ["include/linux/msm_sysstats.h", "include/uapi/linux/msm_sysstats.h", "include/soc/qcom/msm_performance.h"],
+    linux_includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "msm_sysstats",
+    srcs = ["kernel/msm_sysstats.c"],
+    out = "msm_sysstats.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":perf_headers", ":mem_buf_headers", ":qcom_dma_heaps"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "msm_performance",
+    srcs = ["drivers/soc/qcom/msm_performance.c"],
+    out = "msm_performance.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":perf_headers", ":walt_headers", ":sched_walt", ":pmu_headers", ":qcom_pmu_lib"],
+    visibility = ["//visibility:public"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
+        ":mca_protocol_class",
+        ":mca_protocol_pd_class",
+        ":mca_protocol_qc_class",
+        ":qcom_adsp_pd_protocol",
+        ":mca_platform_bc12_class",
+        ":mca_qcom_subpmic_proxy",
+        ":charger_partition",
+        ":msm_sysstats",
+        ":msm_performance",
         ":qcom_pil_info",
         ":qcom_ramdump",
         ":qcom_sysmon",

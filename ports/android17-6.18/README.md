@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 157 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 166 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 157 platform `.ko` files, their symbol tables and DDK configurations.
+- 166 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 7200
-imported symbol CRCs across all 157 modules.
+used. The current [validation report](validation-20261031.json) checks 7509
+imported symbol CRCs across all 166 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -804,3 +804,31 @@ Device-tree checks retain the 1,084 existing vendor DTC warnings. Coverage is
 156/466 distinct vendor load-list names (33.5%); 310 remain to assess or port.
 This raw count includes alternative hardware and does not measure overall ZIP
 readiness. All runtime and device-testing limitations above still apply.
+
+
+Seven charging protocol modules add the protocol/BC1.2/PD/QC registries, ADSP PD,
+sub-PMIC proxy and charger partition. SRCU dispatch protects provider removal;
+firmware errors, short notifications, VDM/PDO bounds and voltage/power arithmetic
+are checked. The persistent-state driver uses exported block-device/bio APIs,
+preserves the 4 KiB record and firmware ownership handshake, and reports storage
+errors. Raw transactions require same-task cleanup. Three unused QTI compatibility
+exports are omitted: the actual ROM haptic/flash modules do not import them and
+CONFIG_QTI_BATTERY_CHARGER is unset. MCA firmware operations remain implemented.
+`verify_chargepolicy.py` passes 65,536 partition request combinations plus
+allocation/I/O faults, notification lengths, wire-format and callback-lifetime
+checks with ASan/UBSan. Battery/USB business components and policies remain.
+
+`msm_sysstats` and `msm_performance` add the real GPU statistics/event providers.
+Their public/UAPI headers are unchanged. Parsing/QoS/PMU errors, ring bounds,
+8,000 concurrent producer events, callback replacement/unregister, FD locking
+and netlink attributes are checked by `verify_perf.py` with ASan/UBSan. The ROM
+MSM_SYSSTATS_STUB_NONEXPORTED_SYMBOLS configuration is retained: existing
+swap/vmalloc fields remain zero. QTI_PLH is absent from the ROM configuration.
+
+The 166-module combined build passes 7,509 imported-symbol CRC checks with no
+compiler or modpost warnings. Device-tree checks pass with 1,084 existing vendor
+DTC warnings. Coverage is 165/466 distinct vendor load-list names (35.4%); 301
+remain to assess or port, including alternative hardware. This is module
+coverage, not overall completion or ZIP readiness. The extracted host tests
+use simulated kernel services and do not establish firmware, charging, live
+SRCU/IRQ/workqueue behavior or device boot. No flashable 6.18 ZIP exists yet.

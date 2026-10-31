@@ -1,0 +1,1237 @@
+--- a/kernel/msm_sysstats.c
++++ b/kernel/msm_sysstats.c
+@@ -19,6 +19,8 @@
+ #include <linux/fdtable.h>
+ #include <linux/dma-buf.h>
+ #include <linux/dma-resv.h>
++#include <linux/srcu.h>
++#include <linux/mutex.h>
+ 
+ #include <linux/qcom_dma_heap.h>
+ 
+@@ -29,55 +31,48 @@
+ 
+ static struct genl_family family;
+ 
+-static u64 (*sysstats_kgsl_get_stats)(pid_t pid);
+-
+-static DEFINE_PER_CPU(__u32, sysstats_seqnum);
++static u64 (*sysstats_kgsl_get_stats)(pid_t pid) __rcu;
++DEFINE_STATIC_SRCU(sysstats_kgsl_srcu);
++static DEFINE_MUTEX(sysstats_kgsl_lock);
++
+ #define SYSSTATS_CMD_ATTR_MAX 3
+ static const struct nla_policy sysstats_cmd_get_policy[SYSSTATS_CMD_ATTR_MAX + 1] = {
+ 	[SYSSTATS_TASK_CMD_ATTR_PID]  = { .type = NLA_U32 },
+ 	[SYSSTATS_TASK_CMD_ATTR_FOREACH]  = { .type = NLA_U32 },
+-	[SYSSTATS_TASK_CMD_ATTR_PIDS_OF_NAME] = { .type = NLA_NUL_STRING}};
+-/*
+- * The below dummy function is a means to get rid of calling
+- * callbacks with out any external sync.
+- */
++	[SYSSTATS_TASK_CMD_ATTR_PIDS_OF_NAME] = {
++		.type = NLA_NUL_STRING, .len = TASK_COMM_LEN - 1 },
++};
+ static u64 sysstats_kgsl_stats(pid_t pid)
+ {
+-	return 0;
++	u64 (*callback)(pid_t pid);
++	u64 bytes = 0;
++	int index;
++
++	index = srcu_read_lock(&sysstats_kgsl_srcu);
++	callback = srcu_dereference(sysstats_kgsl_get_stats, &sysstats_kgsl_srcu);
++	if (callback)
++		bytes = callback(pid);
++	srcu_read_unlock(&sysstats_kgsl_srcu, index);
++	return bytes;
+ }
+ 
+ void sysstats_register_kgsl_stats_cb(u64 (*cb)(pid_t pid))
+ {
+-	sysstats_kgsl_get_stats = cb;
++	mutex_lock(&sysstats_kgsl_lock);
++	rcu_assign_pointer(sysstats_kgsl_get_stats, cb);
++	/* Replacing a callback must also finish every invocation of the old one. */
++	synchronize_srcu(&sysstats_kgsl_srcu);
++	mutex_unlock(&sysstats_kgsl_lock);
+ }
+ EXPORT_SYMBOL_GPL(sysstats_register_kgsl_stats_cb);
+ 
+ void sysstats_unregister_kgsl_stats_cb(void)
+ {
+-	sysstats_kgsl_get_stats = sysstats_kgsl_stats;
++	sysstats_register_kgsl_stats_cb(NULL);
+ }
+ EXPORT_SYMBOL_GPL(sysstats_unregister_kgsl_stats_cb);
+ 
+-static int sysstats_pre_doit(const struct genl_split_ops *ops, struct sk_buff *skb,
+-			      struct genl_info *info)
+-{
+-	const struct nla_policy *policy = NULL;
+-
+-	switch (ops->cmd) {
+-	case SYSSTATS_TASK_CMD_GET:
+-	case SYSSTATS_PIDS_CMD_GET:
+-		policy = sysstats_cmd_get_policy;
+-		break;
+-	case SYSSTATS_MEMINFO_CMD_GET:
+-		break;
+-	default:
+-		return -EINVAL;
+-	}
+-
+-	return nlmsg_validate_deprecated(info->nlhdr, GENL_HDRLEN,
+-					 SYSSTATS_CMD_ATTR_MAX, policy,
+-					 info->extack);
+-}
++
+ 
+ static int send_reply(struct sk_buff *skb, struct genl_info *info)
+ {
+@@ -99,12 +94,7 @@
+ 	if (!skb)
+ 		return -ENOMEM;
+ 
+-	if (!info) {
+-		int seq = this_cpu_inc_return(sysstats_seqnum) - 1;
+-
+-		reply = genlmsg_put(skb, 0, seq, &family, 0, cmd);
+-	} else
+-		reply = genlmsg_put_reply(skb, info, &family, 0, cmd);
++	reply = genlmsg_put_reply(skb, info, &family, 0, cmd);
+ 	if (reply == NULL) {
+ 		nlmsg_free(skb);
+ 		return -EINVAL;
+@@ -182,27 +172,22 @@
+ static unsigned long get_task_unreclaimable_info(struct task_struct *task)
+ {
+ 	struct task_struct *thread;
+-	struct files_struct *files;
+-	struct files_struct *group_leader_files = NULL;
++	struct files_struct *files, *leader_files;
+ 	unsigned long size = 0;
+-	int ret = 0;
+-
++
++	/* Never nest two task locks: parallel dump requests can visit the same group. */
++	rcu_read_lock();
++	task_lock(task->group_leader);
++	leader_files = task->group_leader->files;
++	task_unlock(task->group_leader);
+ 	for_each_thread(task, thread) {
+-		/* task is already locked don't lock/unlock again. */
+-		if (task != thread)
+-			task_lock(thread);
+-		if (unlikely(!group_leader_files))
+-			group_leader_files = task->group_leader->files;
++		task_lock(thread);
+ 		files = thread->files;
+-		if (files && (group_leader_files != files ||
+-			thread == task->group_leader))
+-			ret = iterate_fd(files, 0, get_dma_info, &size);
+-		if (task != thread)
+-			task_unlock(thread);
+-		if (ret)
+-			break;
+-	}
+-
++		if (files && (files != leader_files || thread == task->group_leader))
++			iterate_fd(files, 0, get_dma_info, &size);
++		task_unlock(thread);
++	}
++	rcu_read_unlock();
+ 	return size >> PAGE_SHIFT;
+ }
+ 
+@@ -212,15 +197,12 @@
+ 	unsigned long size = 0;
+ 
+ 	rcu_read_lock();
+-	for_each_process(task) {
+-		task_lock(task);
++	for_each_process(task)
+ 		size += get_task_unreclaimable_info(task);
+-		task_unlock(task);
+-	}
+ 	rcu_read_unlock();
+ 
+ 	/* Account the kgsl information. */
+-	size += sysstats_kgsl_get_stats(-1) >> PAGE_SHIFT;
++	size += sysstats_kgsl_stats(-1) >> PAGE_SHIFT;
+ 
+ 	return size;
+ }
+@@ -293,12 +275,12 @@
+ 		stats->file_rss = K(get_mm_counter(p->mm, MM_FILEPAGES));
+ 		stats->shmem_rss = K(get_mm_counter(p->mm, MM_SHMEMPAGES));
+ 		stats->swap_rss = K(get_mm_counter(p->mm, MM_SWAPENTS));
+-		stats->unreclaimable = K(get_task_unreclaimable_info(p));
+ #undef K
+ 		task_unlock(p);
+ 	}
+ 
+-	stats->unreclaimable += sysstats_kgsl_get_stats(stats->pid) >> 10;
++	stats->unreclaimable = get_task_unreclaimable_info(tsk) << (PAGE_SHIFT - 10);
++	stats->unreclaimable += sysstats_kgsl_stats(task_tgid_nr(tsk)) >> 10;
+ 
+ 	task_cputime(tsk, &utime, &stime);
+ 	stats->utime = div_u64(utime, NSEC_PER_USEC);
+@@ -306,8 +288,8 @@
+ 
+ 	if (sysstats_lock_task_sighand(tsk, &flags)) {
+ 		sig = tsk->signal;
+-		stats->cutime = sig->cutime;
+-		stats->cstime = sig->cstime;
++		stats->cutime = div_u64(sig->cutime, NSEC_PER_USEC);
++		stats->cstime = div_u64(sig->cstime, NSEC_PER_USEC);
+ 		unlock_task_sighand(tsk, &flags);
+ 	}
+ 
+@@ -319,7 +301,9 @@
+ 			task_active_pid_ns(current)) : 0;
+ 	rcu_read_unlock();
+ 
++	task_lock(tsk);
+ 	strscpy(stats->name, tsk->comm, sizeof(stats->name));
++	task_unlock(tsk);
+ 
+ #ifdef CONFIG_CPUSETS
+ 	css = task_get_css(tsk, cpuset_cgrp_id);
+@@ -376,10 +360,9 @@
+ 	struct nlattr *nla;
+ 	struct sysstats_pid *stats;
+ 	char *comm;
+-
+-	nla = nla_find(nlmsg_attrdata(cb->nlh, GENL_HDRLEN),
+-			nlmsg_attrlen(cb->nlh, GENL_HDRLEN),
+-			SYSSTATS_TASK_CMD_ATTR_PIDS_OF_NAME);
++	char task_comm[TASK_COMM_LEN];
++
++	nla = genl_info_dump(cb)->attrs[SYSSTATS_TASK_CMD_ATTR_PIDS_OF_NAME];
+ 	if (!nla)
+ 		goto out;
+ 
+@@ -392,10 +375,11 @@
+ 	for (iter = next_tgid(ns, iter); iter.task;
+ 			iter.tgid += 1, iter = next_tgid(ns, iter)) {
+ 
+-		if (strcmp(iter.task->comm, comm))
++		get_task_comm(task_comm, iter.task);
++		if (strcmp(task_comm, comm))
+ 			continue;
+ 		reply = genlmsg_put(skb, NETLINK_CB(cb->skb).portid,
+-			cb->nlh->nlmsg_seq, &family, 0, SYSSTATS_PIDS_CMD_GET);
++			cb->nlh->nlmsg_seq, &family, NLM_F_MULTI, SYSSTATS_PIDS_CMD_GET);
+ 		if (reply == NULL) {
+ 			put_task_struct(iter.task);
+ 			break;
+@@ -435,9 +419,7 @@
+ 	short oom_score_max;
+ 	u32 buf;
+ 
+-	nla = nla_find(nlmsg_attrdata(cb->nlh, GENL_HDRLEN),
+-			nlmsg_attrlen(cb->nlh, GENL_HDRLEN),
+-			SYSSTATS_TASK_CMD_ATTR_FOREACH);
++	nla = genl_info_dump(cb)->attrs[SYSSTATS_TASK_CMD_ATTR_FOREACH];
+ 
+ 	if (!nla)
+ 		goto out;
+@@ -460,7 +442,7 @@
+ 			continue;
+ 
+ 		reply = genlmsg_put(skb, NETLINK_CB(cb->skb).portid,
+-			cb->nlh->nlmsg_seq, &family, 0, SYSSTATS_TASK_CMD_GET);
++			cb->nlh->nlmsg_seq, &family, NLM_F_MULTI, SYSSTATS_TASK_CMD_GET);
+ 		if (reply == NULL) {
+ 			put_task_struct(iter.task);
+ 			break;
+@@ -491,10 +473,10 @@
+ 				K(get_mm_counter(p->mm, MM_SHMEMPAGES));
+ 			stats->swap_rss =
+ 				K(get_mm_counter(p->mm, MM_SWAPENTS));
+-			stats->unreclaimable = K(get_task_unreclaimable_info(p));
+ 			task_unlock(p);
+ #undef K
+ 		}
++		stats->unreclaimable = get_task_unreclaimable_info(iter.task) << (PAGE_SHIFT - 10);
+ 		genlmsg_end(skb, reply);
+ 	}
+ 
+@@ -568,7 +550,7 @@
+ 	}
+ 	stats->zram_compressed = K(zspages);
+ }
+-#elif
++#else
+ static void sysstats_fill_zoneinfo(struct sysstats_mem *stats)
+ {
+ }
+@@ -644,18 +626,18 @@
+ static const struct genl_ops sysstats_ops[] = {
+ 	{
+ 		.cmd		= SYSSTATS_TASK_CMD_GET,
+-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
++		.validate = GENL_DONT_VALIDATE_STRICT,
+ 		.doit		= sysstats_task_user_cmd,
+ 		.dumpit		= sysstats_task_foreach,
+ 	},
+ 	{
+ 		.cmd		= SYSSTATS_MEMINFO_CMD_GET,
+-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
++		.validate = GENL_DONT_VALIDATE_STRICT,
+ 		.doit		= sysstats_meminfo_user_cmd,
+ 	},
+ 	{
+ 		.cmd		= SYSSTATS_PIDS_CMD_GET,
+-		.validate	= GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
++		.validate	= GENL_DONT_VALIDATE_STRICT,
+ 		.dumpit		= sysstats_all_pids_of_name,
+ 	}
+ };
+@@ -667,7 +649,7 @@
+ 	.module		= THIS_MODULE,
+ 	.ops		= sysstats_ops,
+ 	.n_ops		= ARRAY_SIZE(sysstats_ops),
+-	.pre_doit	= sysstats_pre_doit,
++	.policy		= sysstats_cmd_get_policy,
+ 	.resv_start_op	= SYSSTATS_PIDS_CMD_GET + 1,
+ };
+ 
+@@ -679,7 +661,6 @@
+ 	if (rc)
+ 		return rc;
+ 
+-	sysstats_register_kgsl_stats_cb(sysstats_kgsl_stats);
+ 	pr_info("registered sysstats version %d\n", SYSSTATS_GENL_VERSION);
+ 	return 0;
+ }
+@@ -687,9 +668,11 @@
+ static void __exit sysstats_exit(void)
+ {
+ 	genl_unregister_family(&family);
++	sysstats_unregister_kgsl_stats_cb();
+ }
+ 
+ module_init(sysstats_init);
+ module_exit(sysstats_exit);
+-MODULE_IMPORT_NS(MINIDUMP);
++MODULE_IMPORT_NS("MINIDUMP");
++MODULE_DESCRIPTION("Onyx system and task statistics");
+ MODULE_LICENSE("GPL");
+--- a/drivers/soc/qcom/msm_performance.c
++++ b/drivers/soc/qcom/msm_performance.c
+@@ -43,6 +43,11 @@
+ static DEFINE_PER_CPU(bool, cpu_is_hp);
+ static DEFINE_MUTEX(perfevent_lock);
+ static DEFINE_MUTEX(freq_pmqos_lock);
++static DEFINE_MUTEX(gfx_read_lock);
++static DEFINE_MUTEX(core_ctl_lock);
++static bool perf_stopping = true;
++static int perf_hp_state = -1;
++static bool param_group_created, events_group_created, notify_group_created;
+ 
+ enum event_idx {
+ 	INST_EVENT,
+@@ -147,11 +152,13 @@
+ 		pr_err("msm_perf: Failed to create sysfs\n");
+ 		return ret;
+ 	}
++	param_group_created = true;
+ 	return 0;
+ }
+ 
+ /* To handle cpufreq min/max request */
+ struct cpu_status {
++	struct cpufreq_policy *policy;
+ 	unsigned int min;
+ 	unsigned int max;
+ };
+@@ -240,11 +247,12 @@
+ 		if (ret < 0) {
+ 			pr_err("%s: Failed to add max freq constraint (%d)\n",
+ 				__func__, ret);
++			freq_qos_remove_request(&per_cpu(qos_req_min, cpu));
+ 			cpufreq_cpu_put(policy);
+ 			goto cleanup;
+ 		}
+ 
+-		cpufreq_cpu_put(policy);
++		per_cpu(msm_perf_cpu_stats, cpu).policy = policy;
+ 	}
+ 	return 0;
+ 
+@@ -259,81 +267,102 @@
+ 		if (req && freq_qos_request_active(req))
+ 			freq_qos_remove_request(req);
+ 
++		if (per_cpu(msm_perf_cpu_stats, cpu).policy) {
++			cpufreq_cpu_put(per_cpu(msm_perf_cpu_stats, cpu).policy);
++			per_cpu(msm_perf_cpu_stats, cpu).policy = NULL;
++		}
+ 		per_cpu(msm_perf_cpu_stats, cpu).min = 0;
+ 		per_cpu(msm_perf_cpu_stats, cpu).max = FREQ_QOS_MAX_DEFAULT_VALUE;
+ 	}
+ 	return ret;
++}
++
++static int msm_perf_parse_freq(const char *buf, size_t count, cpumask_t *mask,
++			       unsigned int *values, bool maximum)
++{
++	char *copy, *cursor, *token, *value;
++	unsigned int cpu, frequency;
++	int ret = -EINVAL;
++
++	copy = kmemdup_nul(buf, count, GFP_KERNEL);
++	if (!copy)
++		return -ENOMEM;
++	cursor = copy;
++	cpumask_clear(mask);
++	while ((token = strsep(&cursor, " \t\n"))) {
++		if (!*token)
++			continue;
++		value = strchr(token, ':');
++		if (!value)
++			goto out;
++		*value++ = '\0';
++		if (kstrtouint(token, 10, &cpu) || kstrtouint(value, 10, &frequency) ||
++		    cpu >= nr_cpu_ids || !cpu_present(cpu))
++			goto out;
++		if (maximum)
++			frequency = min_t(unsigned int, frequency, FREQ_QOS_MAX_DEFAULT_VALUE);
++		else if (frequency > INT_MAX)
++			goto out;
++		values[cpu] = frequency;
++		cpumask_set_cpu(cpu, mask);
++	}
++	if (!cpumask_empty(mask))
++		ret = 0;
++out:
++	kfree(copy);
++	return ret;
++}
++
++static ssize_t msm_perf_set_freq(const char *buf, size_t count, bool maximum)
++{
++	unsigned int *values, cpu;
++	struct cpu_status *stats;
++	struct freq_qos_request *req;
++	cpumask_t *mask = maximum ? limit_mask_max : limit_mask_min;
++	int ret;
++
++	values = kcalloc(nr_cpu_ids, sizeof(*values), GFP_KERNEL);
++	if (!values)
++		return -ENOMEM;
++	mutex_lock(&freq_pmqos_lock);
++	cpus_read_lock();
++	if (READ_ONCE(perf_stopping)) {
++		ret = -ENODEV;
++		goto out;
++	}
++	ret = msm_perf_parse_freq(buf, count, mask, values, maximum);
++	if (ret)
++		goto out;
++	if (!ready_for_freq_updates) {
++		ret = freq_qos_request_init();
++		if (ret)
++			goto out;
++		ready_for_freq_updates = true;
++	}
++	for_each_cpu(cpu, mask) {
++		stats = &per_cpu(msm_perf_cpu_stats, cpu);
++		req = maximum ? &per_cpu(qos_req_max, cpu) : &per_cpu(qos_req_min, cpu);
++		ret = freq_qos_update_request(req, values[cpu]);
++		if (ret < 0)
++			goto out;
++		if (maximum)
++			stats->max = values[cpu];
++		else
++			stats->min = values[cpu];
++	}
++	ret = 0;
++out:
++	cpus_read_unlock();
++	mutex_unlock(&freq_pmqos_lock);
++	kfree(values);
++	return ret < 0 ? ret : count;
+ }
+ 
+ /*******************************sysfs start************************************/
+ static ssize_t set_cpu_min_freq(struct kobject *kobj,
+ 	struct kobj_attribute *attr, const char *buf, size_t count)
+ {
+-	int i, ntokens = 0;
+-	unsigned int val, cpu;
+-	const char *cp = buf;
+-	struct cpu_status *i_cpu_stats;
+-	struct freq_qos_request *req;
+-	int ret = 0;
+-
+-	mutex_lock(&freq_pmqos_lock);
+-	if (!ready_for_freq_updates) {
+-		ret = freq_qos_request_init();
+-		if (ret) {
+-			pr_err("%s: Failed to init qos requests policy for ret=%d\n",
+-				__func__, ret);
+-			mutex_unlock(&freq_pmqos_lock);
+-			return ret;
+-		}
+-		ready_for_freq_updates = true;
+-	}
+-	mutex_unlock(&freq_pmqos_lock);
+-
+-	while ((cp = strpbrk(cp + 1, " :")))
+-		ntokens++;
+-
+-	/* CPU:value pair */
+-	if (!(ntokens % 2))
+-		return -EINVAL;
+-
+-	cp = buf;
+-	cpumask_clear(limit_mask_min);
+-	for (i = 0; i < ntokens; i += 2) {
+-		if (sscanf(cp, "%u:%u", &cpu, &val) != 2)
+-			return -EINVAL;
+-		if (cpu >= nr_cpu_ids)
+-			break;
+-
+-		if (cpu_possible(cpu)) {
+-			i_cpu_stats = &per_cpu(msm_perf_cpu_stats, cpu);
+-
+-			i_cpu_stats->min = val;
+-			cpumask_set_cpu(cpu, limit_mask_min);
+-		}
+-
+-		cp = strnchr(cp, strlen(cp), ' ');
+-		cp++;
+-	}
+-
+-	/*
+-	 * Since on synchronous systems policy is shared amongst multiple
+-	 * CPUs only one CPU needs to be updated for the limit to be
+-	 * reflected for the entire cluster. We can avoid updating the policy
+-	 * of other CPUs in the cluster once it is done for at least one CPU
+-	 * in the cluster
+-	 */
+-	cpus_read_lock();
+-	for_each_cpu(i, limit_mask_min) {
+-		i_cpu_stats = &per_cpu(msm_perf_cpu_stats, i);
+-
+-		req = &per_cpu(qos_req_min, i);
+-		if (freq_qos_update_request(req, i_cpu_stats->min) < 0)
+-			continue;
+-
+-	}
+-	cpus_read_unlock();
+-
+-	return count;
++	return msm_perf_set_freq(buf, count, false);
+ }
+ 
+ static ssize_t get_cpu_min_freq(struct kobject *kobj,
+@@ -341,77 +370,21 @@
+ {
+ 	int cnt = 0, cpu;
+ 
++	mutex_lock(&freq_pmqos_lock);
+ 	for_each_present_cpu(cpu) {
+ 		cnt += scnprintf(buf + cnt, PAGE_SIZE - cnt,
+ 				"%d:%u ", cpu,
+ 				per_cpu(msm_perf_cpu_stats, cpu).min);
+ 	}
+ 	cnt += scnprintf(buf + cnt, PAGE_SIZE - cnt, "\n");
++	mutex_unlock(&freq_pmqos_lock);
+ 	return cnt;
+ }
+ 
+ static ssize_t set_cpu_max_freq(struct kobject *kobj,
+ 	struct kobj_attribute *attr, const char *buf, size_t count)
+ {
+-	int i, ntokens = 0;
+-	unsigned int val, cpu;
+-	const char *cp = buf;
+-	struct cpu_status *i_cpu_stats;
+-	struct freq_qos_request *req;
+-	int ret = 0;
+-
+-	mutex_lock(&freq_pmqos_lock);
+-	if (!ready_for_freq_updates) {
+-		ret = freq_qos_request_init();
+-		if (ret) {
+-			pr_err("%s: Failed to init qos requests policy for ret=%d\n",
+-				__func__, ret);
+-			mutex_unlock(&freq_pmqos_lock);
+-			return ret;
+-		}
+-		ready_for_freq_updates = true;
+-	}
+-	mutex_unlock(&freq_pmqos_lock);
+-
+-	while ((cp = strpbrk(cp + 1, " :")))
+-		ntokens++;
+-
+-	/* CPU:value pair */
+-	if (!(ntokens % 2))
+-		return -EINVAL;
+-
+-	cp = buf;
+-	cpumask_clear(limit_mask_max);
+-	for (i = 0; i < ntokens; i += 2) {
+-		if (sscanf(cp, "%u:%u", &cpu, &val) != 2)
+-			return -EINVAL;
+-		if (cpu >= nr_cpu_ids)
+-			break;
+-
+-		if (cpu_possible(cpu)) {
+-			i_cpu_stats = &per_cpu(msm_perf_cpu_stats, cpu);
+-
+-			i_cpu_stats->max = min_t(uint, val,
+-							(unsigned int)FREQ_QOS_MAX_DEFAULT_VALUE);
+-			cpumask_set_cpu(cpu, limit_mask_max);
+-		}
+-
+-		cp = strnchr(cp, strlen(cp), ' ');
+-		cp++;
+-	}
+-
+-	cpus_read_lock();
+-	for_each_cpu(i, limit_mask_max) {
+-		i_cpu_stats = &per_cpu(msm_perf_cpu_stats, i);
+-
+-		req = &per_cpu(qos_req_max, i);
+-		if (freq_qos_update_request(req, i_cpu_stats->max) < 0)
+-			continue;
+-
+-	}
+-	cpus_read_unlock();
+-
+-	return count;
++	return msm_perf_set_freq(buf, count, true);
+ }
+ 
+ static ssize_t get_cpu_max_freq(struct kobject *kobj,
+@@ -419,12 +392,14 @@
+ {
+ 	int cnt = 0, cpu;
+ 
++	mutex_lock(&freq_pmqos_lock);
+ 	for_each_present_cpu(cpu) {
+ 		cnt += scnprintf(buf + cnt, PAGE_SIZE - cnt,
+ 				"%d:%u ", cpu,
+ 				per_cpu(msm_perf_cpu_stats, cpu).max);
+ 	}
+ 	cnt += scnprintf(buf + cnt, PAGE_SIZE - cnt, "\n");
++	mutex_unlock(&freq_pmqos_lock);
+ 	return cnt;
+ }
+ 
+@@ -448,39 +423,44 @@
+ };
+ 
+ static ssize_t show_perf_gfx_evts(struct kobject *kobj,
+-			   struct kobj_attribute *attr,
+-			   char *buf)
+-{
+-	struct queue_indicies updated_pos;
++				struct kobj_attribute *attr, char *buf)
++{
++	/* Every formatted record is below 96 bytes, including integer maxima. */
++	struct gpu_data batch[PAGE_SIZE / 96];
+ 	unsigned long flags;
+-	ssize_t retval = 0;
+-	int idx = 0, size, act_idx, ret = -1;
+-
+-	ret = wait_for_completion_interruptible(&gfx_evt_arrival);
+-	if (ret)
+-		return 0;
+-	spin_lock_irqsave(&gfx_circ_buff_lock, flags);
+-	updated_pos.head = curr_pos.head;
+-	updated_pos.tail = curr_pos.tail;
+-	size = CIRC_CNT(updated_pos.head, updated_pos.tail, QUEUE_POOL_SIZE);
+-	curr_pos.tail = (curr_pos.tail + size) % QUEUE_POOL_SIZE;
+-	spin_unlock_irqrestore(&gfx_circ_buff_lock, flags);
+-
+-	for (idx = 0; idx < size; idx++) {
+-		act_idx = (updated_pos.tail + idx) % QUEUE_POOL_SIZE;
+-		retval += scnprintf(buf + retval, PAGE_SIZE - retval,
+-			  "%d %d %u %d %lld :",
+-			  gpu_circ_buff[act_idx].pid,
+-			  gpu_circ_buff[act_idx].ctx_id,
+-			  gpu_circ_buff[act_idx].timestamp,
+-			  gpu_circ_buff[act_idx].evt_typ,
+-			  ktime_to_us(gpu_circ_buff[act_idx].arrive_ts));
+-		if (retval >= PAGE_SIZE) {
+-			pr_err("msm_perf:data limit exceed\n");
++	unsigned int nr = 0, i;
++	bool more;
++	ssize_t ret = 0;
++
++	mutex_lock(&gfx_read_lock);
++	for (;;) {
++		if (READ_ONCE(perf_stopping)) {
++			ret = -ENODEV;
++			goto out;
++		}
++		ret = wait_for_completion_interruptible(&gfx_evt_arrival);
++		if (ret)
++			goto out;
++		spin_lock_irqsave(&gfx_circ_buff_lock, flags);
++		while (curr_pos.tail != curr_pos.head && nr < ARRAY_SIZE(batch)) {
++			batch[nr++] = gpu_circ_buff[curr_pos.tail];
++			curr_pos.tail = (curr_pos.tail + 1) % QUEUE_POOL_SIZE;
++		}
++		more = curr_pos.tail != curr_pos.head;
++		spin_unlock_irqrestore(&gfx_circ_buff_lock, flags);
++		if (nr)
+ 			break;
+-		}
+-	}
+-	return retval;
++	}
++	if (more)
++		complete(&gfx_evt_arrival);
++	ret = 0;
++	for (i = 0; i < nr; i++)
++		ret += scnprintf(buf + ret, PAGE_SIZE - ret, "%d %d %u %d %lld :",
++			batch[i].pid, batch[i].ctx_id, batch[i].timestamp, batch[i].evt_typ,
++			ktime_to_us(batch[i].arrive_ts));
++out:
++	mutex_unlock(&gfx_read_lock);
++	return ret;
+ }
+ 
+ static struct kobj_attribute gfx_event_info_attr =
+@@ -490,7 +470,7 @@
+ 			   struct kobj_attribute *attr,
+ 			   char *buf)
+ {
+-	return scnprintf(buf, PAGE_SIZE, "%u\n", aggr_big_nr);
++	return scnprintf(buf, PAGE_SIZE, "%u\n", READ_ONCE(aggr_big_nr));
+ }
+ 
+ static struct kobj_attribute big_nr_attr =
+@@ -500,7 +480,7 @@
+ 				 struct kobj_attribute *attr,
+ 				 char *buf)
+ {
+-	return scnprintf(buf, PAGE_SIZE, "%u\n", aggr_top_load);
++	return scnprintf(buf, PAGE_SIZE, "%u\n", READ_ONCE(aggr_top_load));
+ }
+ 
+ static struct kobj_attribute top_load_attr =
+@@ -548,19 +528,7 @@
+ /*******************************sysfs ends************************************/
+ 
+ /*****************PMU Data Collection*****************/
+-static int set_event(struct event_data *ev, int cpu)
+-{
+-	int ret;
+-
+-	ret = qcom_pmu_event_supported(ev->event_id, cpu);
+-	if (ret) {
+-		pr_err("msm_perf: %s failed, eventId:0x%x, cpu:%d, error code:%d\n",
+-				__func__, ev->event_id, cpu, ret);
+-		return ret;
+-	}
+-
+-	return 0;
+-}
++
+ 
+ static void free_pmu_counters(unsigned int cpu)
+ {
+@@ -576,81 +544,57 @@
+ 	}
+ }
+ 
++static void release_pmu_counters(void)
++{
++	int i;
++
++	if (!pmu_events)
++		return;
++	for (i = 0; i < NO_OF_EVENT; i++)
++		kfree(pmu_events[i]);
++	kfree(pmu_events);
++	pmu_events = NULL;
++}
++
+ static int init_pmu_counter(void)
+ {
+-	int cpu;
+-	unsigned long cpu_capacity;
+-	int ret = 0;
+-
+-	int i = 0, j = 0;
+-	int no_of_cpus = 0;
+-
+-	for_each_possible_cpu(cpu)
+-		no_of_cpus++;
+-
+-	pmu_events = kcalloc(NO_OF_EVENT, sizeof(struct event_data *), GFP_KERNEL);
++	unsigned int cpu;
++	int i;
++
++	pmu_events = kcalloc(NO_OF_EVENT, sizeof(*pmu_events), GFP_KERNEL);
+ 	if (!pmu_events)
+ 		return -ENOMEM;
+ 	for (i = 0; i < NO_OF_EVENT; i++) {
+-		pmu_events[i] = kcalloc(no_of_cpus, sizeof(struct event_data), GFP_KERNEL);
++		pmu_events[i] = kcalloc(nr_cpu_ids, sizeof(**pmu_events), GFP_KERNEL);
+ 		if (!pmu_events[i]) {
+-			for (j = i; j >= 0; j--) {
+-				kfree(pmu_events[j]);
+-				pmu_events[j] = NULL;
+-			}
+-			kfree(pmu_events);
+-			pmu_events = NULL;
++			release_pmu_counters();
+ 			return -ENOMEM;
+ 		}
+ 	}
+-
+-	/* Create events per CPU */
+ 	for_each_possible_cpu(cpu) {
+-		/* create Instruction event */
+ 		pmu_events[INST_EVENT][cpu].event_id = INST_EV;
+-		ret = set_event(&pmu_events[INST_EVENT][cpu], cpu);
+-		if (ret < 0)
+-			return ret;
+-		/* create cycle event */
+ 		pmu_events[CYC_EVENT][cpu].event_id = CYC_EV;
+-		ret = set_event(&pmu_events[CYC_EVENT][cpu], cpu);
+-		if (ret < 0) {
+-			free_pmu_counters(cpu);
+-			return ret;
+-		}
+-		/* find capacity per cpu */
+-		cpu_capacity = arch_scale_cpu_capacity(cpu);
+-		if (cpu_capacity < min_cpu_capacity)
+-			min_cpu_capacity = cpu_capacity;
++		min_cpu_capacity = min(min_cpu_capacity, arch_scale_cpu_capacity(cpu));
+ 	}
+ 	return 0;
+ }
+ 
+-static inline void msm_perf_read_event(struct event_data *event, int cpu)
+-{
+-	u64 ev_count = 0;
++/* Caller serializes a complete sample against readers and CPU hotplug. */
++static int msm_perf_read_event(struct event_data *event, int cpu)
++{
++	u64 total;
+ 	int ret;
+-	u64 total;
+-
+-	mutex_lock(&perfevent_lock);
+-	if (!event->event_id) {
+-		mutex_unlock(&perfevent_lock);
+-		return;
+-	}
+ 
+ 	if (!per_cpu(cpu_is_hp, cpu)) {
+ 		ret = qcom_pmu_read(cpu, event->event_id, &total);
+-		if (ret) {
+-			mutex_unlock(&perfevent_lock);
+-			return;
+-		}
+-	} else
++		if (ret)
++			return ret;
++	} else {
+ 		total = event->cached_total_count;
+-
+-	ev_count = total - event->prev_count;
++	}
++	event->cur_delta = total >= event->prev_count ? total - event->prev_count : total;
+ 	event->prev_count = total;
+-	event->cur_delta = ev_count;
+-	mutex_unlock(&perfevent_lock);
++	return 0;
+ }
+ 
+ static ssize_t get_cpu_total_instruction(struct kobject *kobj,
+@@ -662,25 +606,31 @@
+ 	u64 total_inst_little = 0;
+ 	u64 ipc_big = 0;
+ 	u64 ipc_little = 0;
+-	int cnt = 0, cpu;
+-
++	int cnt = 0, cpu, ret;
++
++	cpus_read_lock();
++	mutex_lock(&perfevent_lock);
+ 	for_each_possible_cpu(cpu) {
+ 		/* Read Instruction event */
+-		msm_perf_read_event(&pmu_events[INST_EVENT][cpu], cpu);
++		ret = msm_perf_read_event(&pmu_events[INST_EVENT][cpu], cpu);
++		if (ret)
++			goto error;
+ 		/* Read Cycle event */
+-		msm_perf_read_event(&pmu_events[CYC_EVENT][cpu], cpu);
++		ret = msm_perf_read_event(&pmu_events[CYC_EVENT][cpu], cpu);
++		if (ret)
++			goto error;
+ 		instruction = pmu_events[INST_EVENT][cpu].cur_delta;
+ 		cycles = pmu_events[CYC_EVENT][cpu].cur_delta;
+ 		/* collecting max inst and ipc for max cap and min cap cpus */
+ 		if (arch_scale_cpu_capacity(cpu) > min_cpu_capacity) {
+ 			if (cycles && cycles >= CPU_CYCLE_THRESHOLD)
+ 				ipc_big = max(ipc_big,
+-						((instruction*100)/cycles));
++						mul_u64_u64_div_u64(instruction, 100, cycles));
+ 			total_inst_big += instruction;
+ 		} else {
+ 			if (cycles)
+ 				ipc_little = max(ipc_little,
+-						((instruction*100)/cycles));
++						mul_u64_u64_div_u64(instruction, 100, cycles));
+ 			total_inst_little += instruction;
+ 		}
+ 	}
+@@ -689,7 +639,13 @@
+ 			total_inst_big, ipc_big,
+ 			total_inst_little, ipc_little);
+ 
++	mutex_unlock(&perfevent_lock);
++	cpus_read_unlock();
+ 	return cnt;
++error:
++	mutex_unlock(&perfevent_lock);
++	cpus_read_unlock();
++	return ret;
+ }
+ 
+ static int hotplug_notify_down(unsigned int cpu)
+@@ -725,7 +681,7 @@
+ 	unsigned long flags;
+ 	bool notify_change;
+ 
+-	while (1) {
++	while (!kthread_should_stop()) {
+ 
+ 		set_current_state(TASK_INTERRUPTIBLE);
+ 		spin_lock_irqsave(&(events_group.cpu_hotplug_lock), flags);
+@@ -750,6 +706,7 @@
+ 			sysfs_notify(events_kobj, NULL, "cpu_hotplug");
+ 	}
+ 
++	__set_current_state(TASK_RUNNING);
+ 	return 0;
+ }
+ 
+@@ -766,10 +723,10 @@
+ 
+ 	ret = sysfs_create_group(notify_kobj, &notify_attr_group);
+ 	if (ret) {
+-		kobject_put(notify_kobj);
+ 		pr_err("msm_perf: Failed to create sysfs\n");
+ 		return ret;
+ 	}
++	notify_group_created = true;
+ 	return 0;
+ }
+ 
+@@ -790,11 +747,15 @@
+ 		return ret;
+ 	}
+ 
++	events_group_created = true;
+ 	spin_lock_init(&(events_group.cpu_hotplug_lock));
+ 	events_notify_thread = kthread_run(events_notify_userspace,
+ 					NULL, "msm_perf:events_notify");
+-	if (IS_ERR(events_notify_thread))
+-		return PTR_ERR(events_notify_thread);
++	if (IS_ERR(events_notify_thread)) {
++		ret = PTR_ERR(events_notify_thread);
++		events_notify_thread = NULL;
++		return ret;
++	}
+ 
+ 	events_group.init_success = true;
+ 
+@@ -809,20 +770,24 @@
+ 	sysfs_notify(notify_kobj, NULL, "curr_cap_cluster");
+ }
+ 
++static DECLARE_WORK(sysfs_notify_work, nr_notify_userspace);
++
+ static int msm_perf_core_ctl_notify(struct notifier_block *nb,
+ 					unsigned long unused,
+ 					void *data)
+ {
+-	static DECLARE_WORK(sysfs_notify_work, nr_notify_userspace);
+ 	struct core_ctl_notif_data *d = data;
+ 	int cluster = 0;
+ 
++	if (!d || READ_ONCE(perf_stopping))
++		return NOTIFY_DONE;
++
+ 	for (cluster = 0; cluster < CLUSTER_MAX; cluster++) {
+-		top_load[cluster] = d->ta_util_pct[cluster];
+-		curr_cap[cluster] = d->cur_cap_pct[cluster];
+-	}
+-	aggr_top_load = d->coloc_load_pct;
+-	aggr_big_nr = d->nr_big;
++		WRITE_ONCE(top_load[cluster], d->ta_util_pct[cluster]);
++		WRITE_ONCE(curr_cap[cluster], d->cur_cap_pct[cluster]);
++	}
++	WRITE_ONCE(aggr_top_load, d->coloc_load_pct);
++	WRITE_ONCE(aggr_big_nr, d->nr_big);
+ 
+ 	schedule_work(&sysfs_notify_work);
+ 	return NOTIFY_OK;
+@@ -836,56 +801,61 @@
+ static ssize_t get_core_ctl_register(struct kobject *kobj,
+ 	struct kobj_attribute *attr, char *buf)
+ {
+-	return scnprintf(buf, PAGE_SIZE, "%c\n", core_ctl_register ? 'Y' : 'N');
++	return scnprintf(buf, PAGE_SIZE, "%c\n", READ_ONCE(core_ctl_register) ? 'Y' : 'N');
+ }
+ 
+ static ssize_t set_core_ctl_register(struct kobject *kobj,
+ 	struct kobj_attribute *attr, const char *buf, size_t count)
+ {
+-	bool old_val = core_ctl_register;
++	bool value;
+ 	int ret;
+ 
+-	ret = kstrtobool(buf, &core_ctl_register);
+-	if (ret < 0) {
+-		pr_err("msm_perf: getting new core_ctl_register failed, ret=%d\n", ret);
++	ret = kstrtobool(buf, &value);
++	if (ret)
+ 		return ret;
+-	}
+-
+-	if (core_ctl_register == old_val)
+-		return count;
+-
+-	if (core_ctl_register)
+-		core_ctl_notifier_register(&msm_perf_nb);
+-	else
+-		core_ctl_notifier_unregister(&msm_perf_nb);
+-
+-	return count;
+-}
+-
+-void  msm_perf_events_update(enum evt_update_t update_typ,
++	mutex_lock(&core_ctl_lock);
++	if (READ_ONCE(perf_stopping)) {
++		ret = -ENODEV;
++	} else if (value != core_ctl_register) {
++		if (value)
++			core_ctl_notifier_register(&msm_perf_nb);
++		else
++			core_ctl_notifier_unregister(&msm_perf_nb);
++		core_ctl_register = value;
++	}
++	mutex_unlock(&core_ctl_lock);
++	return ret ? ret : count;
++}
++
++void msm_perf_events_update(enum evt_update_t update_typ,
+ 			enum gfx_evt_t evt_typ, pid_t pid,
+-			uint32_t ctx_id, uint32_t timestamp, bool end_of_frame)
++			u32 ctx_id, u32 timestamp, bool end_of_frame)
+ {
+ 	unsigned long flags;
+-	int idx = 0;
+-
+-	if (update_typ != MSM_PERF_GFX)
++	struct gpu_data *event;
++	int next;
++
++	if (update_typ != MSM_PERF_GFX || evt_typ <= MSM_PERF_INVAL ||
++	    evt_typ > MSM_PERF_RETIRED || pid != atomic_read(&game_status_pid) ||
++	    !timestamp || !end_of_frame)
+ 		return;
+-
+-	if (pid != atomic_read(&game_status_pid) || (timestamp == 0)
+-		|| !(end_of_frame))
++	spin_lock_irqsave(&gfx_circ_buff_lock, flags);
++	if (perf_stopping) {
++		spin_unlock_irqrestore(&gfx_circ_buff_lock, flags);
+ 		return;
+-
+-	spin_lock_irqsave(&gfx_circ_buff_lock, flags);
+-	idx = curr_pos.head;
+-	curr_pos.head = ((curr_pos.head + 1) % QUEUE_POOL_SIZE);
++	}
++	next = (curr_pos.head + 1) % QUEUE_POOL_SIZE;
++	/* A full ring drops the oldest record, never a partially written one. */
++	if (next == curr_pos.tail)
++		curr_pos.tail = (curr_pos.tail + 1) % QUEUE_POOL_SIZE;
++	event = &gpu_circ_buff[curr_pos.head];
++	event->pid = pid;
++	event->ctx_id = ctx_id;
++	event->timestamp = timestamp;
++	event->evt_typ = evt_typ;
++	event->arrive_ts = ktime_get();
++	curr_pos.head = next;
+ 	spin_unlock_irqrestore(&gfx_circ_buff_lock, flags);
+-	gpu_circ_buff[idx].pid = pid;
+-	gpu_circ_buff[idx].ctx_id = ctx_id;
+-	gpu_circ_buff[idx].timestamp = timestamp;
+-	gpu_circ_buff[idx].evt_typ = evt_typ;
+-	gpu_circ_buff[idx].arrive_ts = ktime_get();
+-
+ 	if (evt_typ == MSM_PERF_QUEUE || evt_typ == MSM_PERF_RETIRED)
+ 		complete(&gfx_evt_arrival);
+ }
+@@ -902,6 +872,8 @@
+ 		pr_err("msm_perf: kstrtol failed, ret=%d\n", ret);
+ 		return ret;
+ 	}
++	if (usr_val < 0 || usr_val > INT_MAX)
++		return -EINVAL;
+ 	atomic_set(&game_status_pid, usr_val);
+ 	return count;
+ }
+@@ -1111,6 +1083,71 @@
+ }
+ #endif /* CONFIG_QTI_PLH */
+ 
++static void msm_performance_cleanup(void)
++{
++	unsigned long flags;
++	unsigned int cpu;
++
++	spin_lock_irqsave(&gfx_circ_buff_lock, flags);
++	WRITE_ONCE(perf_stopping, true);
++	spin_unlock_irqrestore(&gfx_circ_buff_lock, flags);
++	complete_all(&gfx_evt_arrival);
++	mutex_lock(&core_ctl_lock);
++	if (core_ctl_register) {
++		core_ctl_notifier_unregister(&msm_perf_nb);
++		core_ctl_register = false;
++	}
++	mutex_unlock(&core_ctl_lock);
++	if (perf_hp_state >= 0) {
++		cpuhp_remove_state_nocalls(perf_hp_state);
++		perf_hp_state = -1;
++	}
++	if (events_notify_thread) {
++		kthread_stop(events_notify_thread);
++		events_notify_thread = NULL;
++	}
++	events_group.init_success = false;
++	cancel_work_sync(&sysfs_notify_work);
++	if (param_kobj) {
++		if (param_group_created)
++			sysfs_remove_group(param_kobj, &param_attr_group);
++		param_group_created = false;
++		kobject_put(param_kobj);
++		param_kobj = NULL;
++	}
++	if (events_kobj) {
++		if (events_group_created)
++			sysfs_remove_group(events_kobj, &events_attr_group);
++		events_group_created = false;
++		kobject_put(events_kobj);
++		events_kobj = NULL;
++	}
++	if (notify_kobj) {
++		if (notify_group_created)
++			sysfs_remove_group(notify_kobj, &notify_attr_group);
++		notify_group_created = false;
++		kobject_put(notify_kobj);
++		notify_kobj = NULL;
++	}
++	for_each_possible_cpu(cpu) {
++		if (freq_qos_request_active(&per_cpu(qos_req_min, cpu)))
++			freq_qos_remove_request(&per_cpu(qos_req_min, cpu));
++		if (freq_qos_request_active(&per_cpu(qos_req_max, cpu)))
++			freq_qos_remove_request(&per_cpu(qos_req_max, cpu));
++		if (per_cpu(msm_perf_cpu_stats, cpu).policy) {
++			cpufreq_cpu_put(per_cpu(msm_perf_cpu_stats, cpu).policy);
++			per_cpu(msm_perf_cpu_stats, cpu).policy = NULL;
++		}
++	}
++	release_pmu_counters();
++	if (msm_perf_kset) {
++		kset_unregister(msm_perf_kset);
++		msm_perf_kset = NULL;
++	}
++	free_cpumask_var(limit_mask_min);
++	free_cpumask_var(limit_mask_max);
++}
++
+ static int __init msm_performance_init(void)
+ {
+ 	unsigned int cpu;
+@@ -1118,38 +1155,52 @@
+ 
+ 	if (!alloc_cpumask_var(&limit_mask_min, GFP_KERNEL))
+ 		return -ENOMEM;
+-
+ 	if (!alloc_cpumask_var(&limit_mask_max, GFP_KERNEL)) {
+ 		free_cpumask_var(limit_mask_min);
+ 		return -ENOMEM;
+ 	}
+-
++	for_each_possible_cpu(cpu) {
++		per_cpu(msm_perf_cpu_stats, cpu).min = 0;
++		per_cpu(msm_perf_cpu_stats, cpu).max = FREQ_QOS_MAX_DEFAULT_VALUE;
++	}
++	ret = init_pmu_counter();
++	if (ret)
++		goto error;
+ 	msm_perf_kset = kset_create_and_add("msm_performance", NULL, kernel_kobj);
+ 	if (!msm_perf_kset) {
+-		free_cpumask_var(limit_mask_min);
+-		free_cpumask_var(limit_mask_max);
+-		return -ENOMEM;
+-	}
+-
+-	add_module_params();
+-	init_events_group();
+-	init_notify_group();
+-	init_pmu_counter();
+-
++		ret = -ENOMEM;
++		goto error;
++	}
++	ret = add_module_params();
++	if (ret)
++		goto error;
++	ret = init_events_group();
++	if (ret)
++		goto error;
++	ret = init_notify_group();
++	if (ret)
++		goto error;
+ 	cpus_read_lock();
+-	for_each_possible_cpu(cpu) {
+-		if (!cpumask_test_cpu(cpu, cpu_online_mask))
+-			per_cpu(cpu_is_hp, cpu) = true;
+-	}
+-
++	for_each_possible_cpu(cpu)
++		per_cpu(cpu_is_hp, cpu) = !cpu_online(cpu);
+ 	ret = cpuhp_setup_state_nocalls_cpuslocked(CPUHP_AP_ONLINE_DYN,
+-		"msm_performance_cpu_hotplug",
+-		hotplug_notify_up,
+-		hotplug_notify_down);
+-
++			"msm_performance_cpu_hotplug", hotplug_notify_up, hotplug_notify_down);
+ 	cpus_read_unlock();
+-
++	if (ret < 0)
++		goto error;
++	perf_hp_state = ret;
++	WRITE_ONCE(perf_stopping, false);
+ 	return 0;
++error:
++	msm_performance_cleanup();
++	return ret;
++}
++
++static void __exit msm_performance_exit(void)
++{
++	msm_performance_cleanup();
+ }
+ MODULE_LICENSE("GPL");
+ late_initcall(msm_performance_init);
++module_exit(msm_performance_exit);
++MODULE_DESCRIPTION("Onyx performance controls and GPU events");
