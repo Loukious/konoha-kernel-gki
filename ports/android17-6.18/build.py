@@ -70,11 +70,15 @@ def main():
         config = kernel_dir.parent.parent / "onyx" / (target + "_config") / "out_dir/.config"
         shutil.copyfile(config, artifacts / "platform" / (target + ".config"))
     (artifacts / "gki/kernel.release").write_text(release + "\n")
+    subprocess.run([sys.executable, str(HERE / "build_devicetrees.py"), str(workspace),
+                    "--output", str(artifacts / "devicetrees")], check=True)
+    dt_report = json.loads((artifacts / "devicetrees/report.json").read_text())
     inputs = artifacts / "inputs"
     inputs.mkdir()
     for name in ["sources.json", "imports.json", "onyx-port.xml", "dependency-lock.xml",
                  "BUILD.bazel", "Kconfig", "scm_defconfig", "platform_defconfig", "modules.json",
-                 "build.py", "prepare.py", "stage.py", "verify_modules.py", "boot-parameters.txt"]:
+                 "build.py", "prepare.py", "stage.py", "verify_modules.py", "boot-parameters.txt",
+                 "build_devicetrees.py", "devicetrees.json"]:
         shutil.copyfile(HERE / name, inputs / name)
     shutil.copytree(HERE / "patches", inputs / "patches")
     shutil.copyfile(workspace / "onyx/.staged-files.json", inputs / "staged-files.json")
@@ -88,6 +92,13 @@ def main():
         "command": command,
         "kernel_release": release,
         "module_verification": verification,
+        "devicetree_verification": {
+            "overlay_engines_agree": dt_report["overlay_engines_agree"],
+            "bootloader_ids_preserved": dt_report["bootloader_ids_preserved"],
+            "dtbo_table_verified": dt_report["dtbo_table_verified"],
+            "dtc_warnings": dt_report["dtc_warnings"],
+            "report": "devicetrees/report.json",
+        },
         "sha256": hashes,
         "limits": [
             "Build and imported-symbol CRC checks only; no device boot or hardware validation.",

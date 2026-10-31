@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 110 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 111 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -26,7 +26,7 @@ python3 ports/android17-6.18/build.py /path/to/new-6.18-workspace
 `prepare.py --reference /path/to/existing/repo/workspace` can reuse local Git
 objects. Existing workspaces must have the expected manifest revision and no
 unexpected local manifests or tracked source changes. `--verify-only` checks
-all 45 selected project revisions without syncing. The original ROM checkout
+all 46 selected project revisions without syncing. The original ROM checkout
 and stable kernel checkout are not build destinations.
 
 `build.py` checks the source pins, stages exact Git blobs, applies the patches,
@@ -35,7 +35,8 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 110 platform `.ko` files, their symbol tables and DDK configurations.
+- 111 platform `.ko` files, their symbol tables and DDK configurations.
+- Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 5025
-imported symbol CRCs across all 110 modules.
+used. The current [validation report](validation-20261031.json) checks 5121
+imported symbol CRCs across all 111 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -614,3 +615,48 @@ failures, bounded retries, teardown and reentrant requests. The
 services; it does not test real workqueues, thermal hardware or CPU hotplug.
 The full 110-module build and both adaptation patches pass without warnings.
 Build archives now include `boot-parameters.txt` for image assembly.
+
+
+## Device-tree assembly and first-stage inventory
+
+`build.py` now invokes `build_devicetrees.py`. Standalone device-tree builds use:
+
+```sh
+python3 ports/android17-6.18/build_devicetrees.py /path/to/6.18-workspace
+```
+
+`devicetrees.json` records the ROM's ID-based overlay selection: two Tuna SoC
+bases, multimedia/service overlays, and the Onyx board overlay with its camera,
+audio, display, WLAN and Bluetooth additions. The builder uses pinned vendor
+binding headers, Clang and DTC, plus a pinned LineageOS libfdt with Qualcomm's
+`fdtoverlaymerge` implementation. The additional tools source is a separate
+project; it does not replace Kleaf's DTC. The host C compiler builds these two
+small tools, and their binaries and source hashes are archived.
+
+The builder preserves platform, board, PMIC and Xiaomi IDs; validates FDT
+structure and phandle uniqueness; applies the board overlay to both SoC bases;
+and compares every hardware node/property produced by libfdt and Android's
+libufdt. Their compiler symbol tables differ as expected: libufdt does not add
+new overlay labels. The DTBO container's header, padding, payload and partition
+size are checked. Output hashes and active-device inventories are in the
+[device-tree report](devicetree-validation-20261031.json).
+
+The [ROM parity check](devicetree-parity-20261031.json) also compares each final
+tree with the captured ROM build: all 4,560/4,559 nodes and their properties,
+including labels, match. It can be repeated with `verify_devicetrees.py
+ARTIFACT BASELINE_DTB_OBJ_OUT`. Device-tree compiler warnings remain visible:
+1,084 warnings originate in the unchanged vendor sources. This establishes
+assembly parity, not hardware compatibility of the new drivers.
+
+The SCSI-generic driver now builds unmodified from pinned 6.18 common as
+`sg.ko`; it is disabled in the stock GKI config and needed as an external module
+for the baseline load list. The full build passes 5,121 imported-symbol CRC
+checks across 111 modules, without kernel compiler or modpost warnings.
+
+The remaining names in the shared first-stage list are other-platform
+pinctrl/clock/NoC/UFS PHY variants, Sun's FAST CPUCP client, and SD-card support.
+Both assembled Onyx trees keep `/soc/sdhci@8804000` disabled, so `sdhci-msm` and
+its `cqhci` helper are not required. The builder asserts that disabled state.
+The port still needs the applicable second-stage and peripheral modules,
+matching boot/vendor_boot/DLKM images, custom features and installer validation;
+the current DT images alone are not a flashable package.

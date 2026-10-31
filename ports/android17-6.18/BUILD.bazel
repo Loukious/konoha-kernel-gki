@@ -1442,6 +1442,13 @@ ddk_module(
     deps = [":cpu_thermal_headers", ":walt_headers", ":sched_walt"],
 )
 
+ddk_module(
+    name = "sg",
+    srcs = ["drivers/scsi/sg.c", "drivers/scsi/scsi_logging.h"],
+    out = "sg.ko",
+    kernel_build = "//common:kernel_aarch64",
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1539,6 +1546,7 @@ kernel_module_group(
         ":sched_walt",
         ":thermal_pause",
         ":cpu_hotplug",
+        ":sg",
         ":nvmem_qfprom",
         ":qcom_cpufreq_thermal",
         ":qcom_cpufreq_hw",
