@@ -1,0 +1,4363 @@
+--- a/qcom/opensource/graphics-kernel/adreno.c
++++ b/qcom/opensource/graphics-kernel/adreno.c
+@@ -3774,11 +3774,11 @@
+ 			&adreno_ops, match);
+ }
+ 
+-static int adreno_remove(struct platform_device *pdev)
++static void adreno_remove(struct platform_device *pdev)
+ {
+ 	component_master_del(&pdev->dev, &adreno_ops);
+ 
+-	return 0;
++	return;
+ }
+ 
+ #if IS_ENABLED(CONFIG_QCOM_KGSL_HIBERNATION)
+@@ -4004,6 +4004,7 @@
+ 	.remove = adreno_remove,
+ 	.driver = {
+ 		.name = "kgsl-3d",
++		.suppress_bind_attrs = true,
+ 		.pm = &adreno_pm_ops,
+ 		.of_match_table = of_match_ptr(adreno_match_table),
+ 	}
+@@ -4016,21 +4017,30 @@
+ 	ret = kgsl_core_init();
+ 	if (ret)
+ 		return ret;
+-
+ 	ret = kgsl_mmu_init();
+-	if (ret) {
+-		kgsl_core_exit();
+-		return ret;
+-	}
+-
+-	gmu_core_register();
++	if (ret)
++		goto core_exit;
++	ret = gmu_core_register();
++	if (ret)
++		goto mmu_exit;
+ 	ret = platform_driver_register(&adreno_platform_driver);
+-	if (ret) {
+-		gmu_core_unregister();
+-		kgsl_mmu_exit();
+-		kgsl_core_exit();
+-	}
+-
++	if (ret)
++		goto gmu_exit;
++
++	/* No fallible initialization may follow restricted-hook registration. */
++	ret = kgsl_register_shmem_callback();
++	if (!ret) {
++		/* Publish all initialized core and device state to open(). */
++		smp_store_release(&kgsl_driver.ready, true);
++		return 0;
++	}
++	platform_driver_unregister(&adreno_platform_driver);
++gmu_exit:
++	gmu_core_unregister();
++mmu_exit:
++	kgsl_mmu_exit();
++core_exit:
++	kgsl_core_exit();
+ 	return ret;
+ }
+ 
+@@ -4058,5 +4068,5 @@
+ MODULE_LICENSE("GPL v2");
+ MODULE_SOFTDEP("pre: arm_smmu nvmem_qfprom socinfo governor_msm_adreno_tz governor_gpubw_mon");
+ #if (KERNEL_VERSION(5, 18, 0) <= LINUX_VERSION_CODE)
+-MODULE_IMPORT_NS(DMA_BUF);
++MODULE_IMPORT_NS("DMA_BUF");
+ #endif
+--- a/qcom/opensource/graphics-kernel/adreno_a5xx.c
++++ b/qcom/opensource/graphics-kernel/adreno_a5xx.c
+@@ -2372,7 +2372,7 @@
+ static void a5xx_remove(struct adreno_device *adreno_dev)
+ {
+ 	if (adreno_preemption_feature_set(adreno_dev))
+-		del_timer(&adreno_dev->preempt.timer);
++		timer_delete(&adreno_dev->preempt.timer);
+ }
+ 
+ static void a5xx_power_stats(struct adreno_device *adreno_dev,
+--- a/qcom/opensource/graphics-kernel/adreno_a5xx_preempt.c
++++ b/qcom/opensource/graphics-kernel/adreno_a5xx_preempt.c
+@@ -73,7 +73,7 @@
+ 		return;
+ 	}
+ 
+-	del_timer_sync(&adreno_dev->preempt.timer);
++	timer_delete_sync(&adreno_dev->preempt.timer);
+ 
+ 	trace_adreno_preempt_done(adreno_dev->cur_rb->id, adreno_dev->next_rb->id, 0, 0);
+ 
+@@ -204,7 +204,7 @@
+ 	}
+ 
+ 	/* Turn off the dispatcher timer */
+-	del_timer(&adreno_dev->dispatcher.timer);
++	timer_delete(&adreno_dev->dispatcher.timer);
+ 
+ 	/*
+ 	 * This is the most critical section - we need to take care not to race
+@@ -279,7 +279,7 @@
+ 		return;
+ 	}
+ 
+-	del_timer(&adreno_dev->preempt.timer);
++	timer_delete(&adreno_dev->preempt.timer);
+ 
+ 	trace_adreno_preempt_done(adreno_dev->cur_rb->id, adreno_dev->next_rb->id, 0, 0);
+ 
+--- a/qcom/opensource/graphics-kernel/adreno_a6xx.c
++++ b/qcom/opensource/graphics-kernel/adreno_a6xx.c
+@@ -548,7 +548,7 @@
+ 		kgsl_regwrite(device, A6XX_RBBM_GBIF_HALT, 0x0);
+ }
+ 
+-bool a6xx_gx_is_on(struct adreno_device *adreno_dev)
++static bool a6xx_gx_is_on(struct adreno_device *adreno_dev)
+ {
+ 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
+ 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
+@@ -2131,7 +2131,7 @@
+ static void a6xx_remove(struct adreno_device *adreno_dev)
+ {
+ 	if (adreno_preemption_feature_set(adreno_dev))
+-		del_timer(&adreno_dev->preempt.timer);
++		timer_delete(&adreno_dev->preempt.timer);
+ }
+ 
+ static void a6xx_read_bus_stats(struct kgsl_device *device,
+--- a/qcom/opensource/graphics-kernel/adreno_a6xx_gmu.c
++++ b/qcom/opensource/graphics-kernel/adreno_a6xx_gmu.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <dt-bindings/power/qcom-rpmpd.h>
+ #include <linux/clk.h>
+ #include <linux/component.h>
+@@ -3398,7 +3399,7 @@
+ 
+ 	clear_bit(GMU_PRIV_GPU_STARTED, &gmu->flags);
+ 
+-	del_timer_sync(&device->idle_timer);
++	timer_delete_sync(&device->idle_timer);
+ 
+ 	kgsl_pwrscale_sleep(device);
+ 
+@@ -3782,10 +3783,10 @@
+ 	return component_add(&pdev->dev, &a6xx_gmu_component_ops);
+ }
+ 
+-static int a6xx_gmu_remove_dev(struct platform_device *pdev)
++static void a6xx_gmu_remove_dev(struct platform_device *pdev)
+ {
+ 	component_del(&pdev->dev, &a6xx_gmu_component_ops);
+-	return 0;
++	return;
+ }
+ 
+ static const struct of_device_id a6xx_gmu_match_table[] = {
+--- a/qcom/opensource/graphics-kernel/adreno_a6xx_hwsched.c
++++ b/qcom/opensource/graphics-kernel/adreno_a6xx_hwsched.c
+@@ -660,7 +660,7 @@
+ 
+ 	clear_bit(GMU_PRIV_GPU_STARTED, &gmu->flags);
+ 
+-	del_timer_sync(&device->idle_timer);
++	timer_delete_sync(&device->idle_timer);
+ 
+ 	kgsl_pwrscale_sleep(device);
+ 
+--- a/qcom/opensource/graphics-kernel/adreno_a6xx_hwsched_hfi.c
++++ b/qcom/opensource/graphics-kernel/adreno_a6xx_hwsched_hfi.c
+@@ -1933,7 +1933,7 @@
+ 	if (test_bit(CMDOBJ_RECURRING_STOP, &cmdobj->priv)) {
+ 		adreno_hwsched_retire_cmdobj(hwsched, hwsched->recurring_cmdobj);
+ 		hwsched->recurring_cmdobj = NULL;
+-		del_timer_sync(&hwsched->lsr_timer);
++		timer_delete_sync(&hwsched->lsr_timer);
+ 		if (active)
+ 			adreno_active_count_put(adreno_dev);
+ 		active = false;
+--- a/qcom/opensource/graphics-kernel/adreno_a6xx_preempt.c
++++ b/qcom/opensource/graphics-kernel/adreno_a6xx_preempt.c
+@@ -135,7 +135,7 @@
+ 	 */
+ 	_power_collapse_set(adreno_dev, false);
+ 
+-	del_timer_sync(&adreno_dev->preempt.timer);
++	timer_delete_sync(&adreno_dev->preempt.timer);
+ 
+ 	kgsl_regread(device,  A6XX_CP_CONTEXT_SWITCH_LEVEL_STATUS, &status);
+ 
+@@ -270,7 +270,7 @@
+ 	}
+ 
+ 	/* Turn off the dispatcher timer */
+-	del_timer(&adreno_dev->dispatcher.timer);
++	timer_delete(&adreno_dev->dispatcher.timer);
+ 
+ 	/*
+ 	 * This is the most critical section - we need to take care not to race
+@@ -394,7 +394,7 @@
+ 	if (a6xx_fenced_write(adreno_dev, A6XX_CP_CONTEXT_SWITCH_CNTL, cntl,
+ 					FENCE_STATUS_WRITEDROPPED1_MASK)) {
+ 		adreno_dev->next_rb = NULL;
+-		del_timer(&adreno_dev->preempt.timer);
++		timer_delete(&adreno_dev->preempt.timer);
+ 		goto err;
+ 	}
+ 
+@@ -449,7 +449,7 @@
+ 	 */
+ 	_power_collapse_set(adreno_dev, false);
+ 
+-	del_timer(&adreno_dev->preempt.timer);
++	timer_delete(&adreno_dev->preempt.timer);
+ 
+ 	kgsl_regread(device, A6XX_CP_CONTEXT_SWITCH_LEVEL_STATUS, &status);
+ 
+--- a/qcom/opensource/graphics-kernel/adreno_a6xx_rgmu.c
++++ b/qcom/opensource/graphics-kernel/adreno_a6xx_rgmu.c
+@@ -1065,7 +1065,7 @@
+ 
+ 	clear_bit(RGMU_PRIV_GPU_STARTED, &rgmu->flags);
+ 
+-	del_timer_sync(&device->idle_timer);
++	timer_delete_sync(&device->idle_timer);
+ 
+ 	kgsl_pwrscale_sleep(device);
+ 
+@@ -1372,10 +1372,10 @@
+ 	return component_add(&pdev->dev, &a6xx_rgmu_component_ops);
+ }
+ 
+-static int a6xx_rgmu_remove_dev(struct platform_device *pdev)
++static void a6xx_rgmu_remove_dev(struct platform_device *pdev)
+ {
+ 	component_del(&pdev->dev, &a6xx_rgmu_component_ops);
+-	return 0;
++	return;
+ }
+ 
+ static const struct of_device_id a6xx_rgmu_match_table[] = {
+--- a/qcom/opensource/graphics-kernel/adreno_a6xx_ringbuffer.c
++++ b/qcom/opensource/graphics-kernel/adreno_a6xx_ringbuffer.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include "adreno.h"
+ #include "adreno_a6xx.h"
+ #include "adreno_pm4types.h"
+--- a/qcom/opensource/graphics-kernel/adreno_cp_parser.c
++++ b/qcom/opensource/graphics-kernel/adreno_cp_parser.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <linux/slab.h>
+ 
+ #include "adreno.h"
+--- a/qcom/opensource/graphics-kernel/adreno_dispatch.c
++++ b/qcom/opensource/graphics-kernel/adreno_dispatch.c
+@@ -1964,14 +1964,14 @@
+ 	}
+ 
+ 	/* Turn off all the timers */
+-	del_timer_sync(&dispatcher->timer);
++	timer_delete_sync(&dispatcher->timer);
+ 
+ 	/*
+ 	 * Deleting uninitialized timer will block for ever on kernel debug
+ 	 * disable build. Hence skip del timer if it is not initialized.
+ 	 */
+ 	if (adreno_is_preemption_enabled(adreno_dev))
+-		del_timer_sync(&adreno_dev->preempt.timer);
++		timer_delete_sync(&adreno_dev->preempt.timer);
+ 
+ 	if (gx_on)
+ 		adreno_readreg64(adreno_dev, ADRENO_REG_CP_RB_BASE,
+@@ -2430,7 +2430,7 @@
+ {
+ 	struct adreno_dispatcher *dispatcher = &adreno_dev->dispatcher;
+ 
+-	del_timer_sync(&dispatcher->timer);
++	timer_delete_sync(&dispatcher->timer);
+ }
+ 
+ /* Return the ringbuffer that matches the draw context priority */
+@@ -2548,7 +2548,7 @@
+ 	struct adreno_ringbuffer *rb;
+ 
+ 	mutex_lock(&dispatcher->mutex);
+-	del_timer_sync(&dispatcher->timer);
++	timer_delete_sync(&dispatcher->timer);
+ 
+ 	FOR_EACH_RINGBUFFER(adreno_dev, rb, i) {
+ 		struct adreno_dispatcher_drawqueue *dispatch_q =
+--- a/qcom/opensource/graphics-kernel/adreno_drawctxt.c
++++ b/qcom/opensource/graphics-kernel/adreno_drawctxt.c
+@@ -56,8 +56,8 @@
+ 	 * Use Spin trylock because dispatcher can acquire drawctxt->lock
+ 	 * if context is pending and the fence it is waiting on just got
+ 	 * signalled. Dispatcher acquires drawctxt->lock and tries to
+-	 * delete the sync obj timer using del_timer_sync().
+-	 * del_timer_sync() waits till timer and its pending handlers
++	 * delete the sync obj timer using timer_delete_sync().
++	 * timer_delete_sync() waits till timer and its pending handlers
+ 	 * are deleted. But if the timer expires at the same time,
+ 	 * timer handler could be waiting on drawctxt->lock leading to a
+ 	 * deadlock. To prevent this use spin_trylock_bh.
+--- a/qcom/opensource/graphics-kernel/adreno_gen7.c
++++ b/qcom/opensource/graphics-kernel/adreno_gen7.c
+@@ -451,7 +451,7 @@
+ 	adreno_dev->feature_fuse = feature_fuse;
+ }
+ 
+-void gen7_host_aperture_set(struct adreno_device *adreno_dev, u32 pipe_id)
++static void gen7_host_aperture_set(struct adreno_device *adreno_dev, u32 pipe_id)
+ {
+ 	struct gen7_device *gen7_dev = container_of(adreno_dev,
+ 					struct gen7_device, adreno_dev);
+@@ -478,7 +478,7 @@
+ 	mb();
+ }
+ 
+-void gen7_regread_aperture(struct kgsl_device *device,
++static void gen7_regread_aperture(struct kgsl_device *device,
+ 	u32 offsetwords, u32 *value, u32 pipe)
+ {
+ 	gen7_host_aperture_set(ADRENO_DEVICE(device), pipe);
+@@ -1894,7 +1894,7 @@
+ 	}
+ }
+ 
+-int gen7_perfcounter_remove(struct adreno_device *adreno_dev,
++static int gen7_perfcounter_remove(struct adreno_device *adreno_dev,
+ 	struct adreno_perfcount_register *reg, u32 groupid)
+ {
+ 	const struct adreno_perfcounters *counters = ADRENO_PERFCOUNTERS(adreno_dev);
+@@ -2137,7 +2137,7 @@
+ 	/* Make sure timer is initialized, otherwise WARN_ON is generated */
+ 	if (adreno_preemption_feature_set(adreno_dev) &&
+ 	    (test_bit(GMU_PRIV_FIRST_BOOT_DONE, &gmu->flags)))
+-		del_timer(&adreno_dev->preempt.timer);
++		timer_delete(&adreno_dev->preempt.timer);
+ }
+ 
+ static void gen7_read_bus_stats(struct kgsl_device *device,
+--- a/qcom/opensource/graphics-kernel/adreno_gen7_gmu.c
++++ b/qcom/opensource/graphics-kernel/adreno_gen7_gmu.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <dt-bindings/power/qcom-rpmpd.h>
+ #include <linux/clk.h>
+ #include <linux/component.h>
+@@ -3025,7 +3026,7 @@
+ 
+ 	clear_bit(GMU_PRIV_GPU_STARTED, &gmu->flags);
+ 
+-	del_timer_sync(&device->idle_timer);
++	timer_delete_sync(&device->idle_timer);
+ 
+ 	kgsl_pwrscale_sleep(device);
+ 
+@@ -3406,10 +3407,10 @@
+ 	return component_add(&pdev->dev, &gen7_gmu_component_ops);
+ }
+ 
+-static int gen7_gmu_remove_dev(struct platform_device *pdev)
++static void gen7_gmu_remove_dev(struct platform_device *pdev)
+ {
+ 	component_del(&pdev->dev, &gen7_gmu_component_ops);
+-	return 0;
++	return;
+ }
+ 
+ static const struct of_device_id gen7_gmu_match_table[] = {
+--- a/qcom/opensource/graphics-kernel/adreno_gen7_hwsched.c
++++ b/qcom/opensource/graphics-kernel/adreno_gen7_hwsched.c
+@@ -47,7 +47,7 @@
+ 
+ 	wake_up_all(&hfi->hw_fence.unack_wq);
+ 
+-	del_timer_sync(&hfi->hw_fence_timer);
++	timer_delete_sync(&hfi->hw_fence_timer);
+ }
+ 
+ void gen7_hwsched_fault(struct adreno_device *adreno_dev, u32 fault)
+@@ -931,7 +931,7 @@
+ 
+ 	clear_bit(GMU_PRIV_GPU_STARTED, &gmu->flags);
+ 
+-	del_timer_sync(&device->idle_timer);
++	timer_delete_sync(&device->idle_timer);
+ 
+ 	kgsl_pwrscale_sleep(device);
+ 
+--- a/qcom/opensource/graphics-kernel/adreno_gen7_hwsched_hfi.c
++++ b/qcom/opensource/graphics-kernel/adreno_gen7_hwsched_hfi.c
+@@ -824,8 +824,7 @@
+ 	char name[KGSL_FENCE_NAME_LEN];
+ 	char value[32] = "unknown";
+ 
+-	if (fence->ops->timeline_value_str)
+-		fence->ops->timeline_value_str(fence, value, sizeof(value));
++	kgsl_get_fence_value(fence, value, sizeof(value));
+ 
+ 	if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags)) {
+ 		dev_err(gmu_pdev_dev,
+@@ -1215,7 +1214,7 @@
+ 
+ 	spin_unlock(&hfi->hw_fence.lock);
+ 
+-	del_timer_sync(&hfi->hw_fence_timer);
++	timer_delete_sync(&hfi->hw_fence_timer);
+ 
+ 	/*
+ 	 * We need to handle the deferred context in another thread so that we can unblock the f2h
+@@ -2304,7 +2303,7 @@
+ 		return gen7_hwsched_coldboot_gpu(adreno_dev);
+ }
+ 
+-int gen7_hwsched_warmboot_init_gmu(struct adreno_device *adreno_dev)
++static int gen7_hwsched_warmboot_init_gmu(struct adreno_device *adreno_dev)
+ {
+ 	struct gen7_gmu_device *gmu = to_gen7_gmu(adreno_dev);
+ 	struct pending_cmd ack = {0};
+@@ -3756,7 +3755,7 @@
+ 
+ 	if (test_bit(CMDOBJ_RECURRING_STOP, &cmdobj->priv)) {
+ 		adreno_hwsched_retire_cmdobj(hwsched, hwsched->recurring_cmdobj);
+-		del_timer_sync(&hwsched->lsr_timer);
++		timer_delete_sync(&hwsched->lsr_timer);
+ 		hwsched->recurring_cmdobj = NULL;
+ 		if (active)
+ 			adreno_active_count_put(adreno_dev);
+--- a/qcom/opensource/graphics-kernel/adreno_gen7_preempt.c
++++ b/qcom/opensource/graphics-kernel/adreno_gen7_preempt.c
+@@ -106,7 +106,7 @@
+ 
+ 	adreno_dev->preempt.count++;
+ 
+-	del_timer_sync(&adreno_dev->preempt.timer);
++	timer_delete_sync(&adreno_dev->preempt.timer);
+ 
+ 	kgsl_regread(device, GEN7_CP_CONTEXT_SWITCH_LEVEL_STATUS, &status);
+ 
+@@ -242,7 +242,7 @@
+ 	}
+ 
+ 	/* Turn off the dispatcher timer */
+-	del_timer(&adreno_dev->dispatcher.timer);
++	timer_delete(&adreno_dev->dispatcher.timer);
+ 
+ 	/*
+ 	 * This is the most critical section - we need to take care not to race
+@@ -370,7 +370,7 @@
+ 	if (gen7_fenced_write(adreno_dev, GEN7_CP_CONTEXT_SWITCH_CNTL, cntl,
+ 					FENCE_STATUS_WRITEDROPPED1_MASK)) {
+ 		adreno_dev->next_rb = NULL;
+-		del_timer(&adreno_dev->preempt.timer);
++		timer_delete(&adreno_dev->preempt.timer);
+ 		goto err;
+ 	}
+ 
+@@ -425,7 +425,7 @@
+ 	 */
+ 	_power_collapse_set(adreno_dev, false);
+ 
+-	del_timer(&adreno_dev->preempt.timer);
++	timer_delete(&adreno_dev->preempt.timer);
+ 
+ 	kgsl_regread(device, GEN7_CP_CONTEXT_SWITCH_LEVEL_STATUS, &status);
+ 
+--- a/qcom/opensource/graphics-kernel/adreno_gen7_ringbuffer.c
++++ b/qcom/opensource/graphics-kernel/adreno_gen7_ringbuffer.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include "adreno.h"
+ #include "adreno_gen7.h"
+ #include "adreno_pm4types.h"
+--- a/qcom/opensource/graphics-kernel/adreno_gen8.c
++++ b/qcom/opensource/graphics-kernel/adreno_gen8.c
+@@ -2510,7 +2510,7 @@
+ 	kgsl_regwrite(KGSL_DEVICE(adreno_dev), GEN8_CP_SEMAPHORE_REG_0, 0);
+ }
+ 
+-int gen8_perfcounter_remove(struct adreno_device *adreno_dev,
++static int gen8_perfcounter_remove(struct adreno_device *adreno_dev,
+ 			    struct adreno_perfcount_register *reg, u32 groupid)
+ {
+ 	const struct adreno_perfcounters *counters = ADRENO_PERFCOUNTERS(adreno_dev);
+@@ -2739,7 +2739,7 @@
+ static void gen8_remove(struct adreno_device *adreno_dev)
+ {
+ 	if (adreno_preemption_feature_set(adreno_dev))
+-		del_timer(&adreno_dev->preempt.timer);
++		timer_delete(&adreno_dev->preempt.timer);
+ }
+ 
+ static void gen8_read_bus_stats(struct kgsl_device *device,
+--- a/qcom/opensource/graphics-kernel/adreno_gen8_gmu.c
++++ b/qcom/opensource/graphics-kernel/adreno_gen8_gmu.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <dt-bindings/power/qcom-rpmpd.h>
+ #include <linux/clk.h>
+ #include <linux/component.h>
+@@ -397,7 +398,7 @@
+ 		struct kgsl_memdesc *md = &gmu->gmu_globals[i];
+ 
+ 		if ((addr >= md->gmuaddr) &&
+-				(((addr + size) <= (md->gmuaddr + md->size))))
++				(((u64)addr + size <= (u64)md->gmuaddr + md->size)))
+ 			return md;
+ 	}
+ 
+@@ -412,7 +413,7 @@
+ 		struct gmu_vma_entry *vma = &gmu->vma[i];
+ 
+ 		if ((addr >= vma->start) &&
+-			((addr + size) <= (vma->start + vma->size)))
++			((u64)addr + size <= (u64)vma->start + vma->size))
+ 			return i;
+ 	}
+ 
+@@ -429,16 +430,41 @@
+ 		blk->size >> 2);
+ }
+ 
++static bool gen8_gmu_fw_valid(const u8 *data, size_t size)
++{
++	struct gmu_block_header block;
++	size_t offset = 0;
++
++	if (!data || !size)
++		return false;
++	while (offset < size) {
++		if (size - offset < sizeof(block))
++			return false;
++		memcpy(&block, data + offset, sizeof(block));
++		offset += sizeof(block);
++		if (block.size > size - offset || (u64)block.addr + block.size > BIT_ULL(32))
++			return false;
++		offset += block.size;
++	}
++	return true;
++}
++
+ int gen8_gmu_load_fw(struct adreno_device *adreno_dev)
+ {
+ 	struct gen8_gmu_device *gmu = to_gen8_gmu(adreno_dev);
+ 	struct device *gmu_pdev_dev = GMU_PDEV_DEV(KGSL_DEVICE(adreno_dev));
+-	const u8 *fw = (const u8 *)gmu->fw_image->data;
++	const u8 *fw;
++
++	if (!gmu->fw_image || !gen8_gmu_fw_valid(gmu->fw_image->data, gmu->fw_image->size))
++		return -EINVAL;
++	fw = gmu->fw_image->data;
+ 
+ 	while (fw < gmu->fw_image->data + gmu->fw_image->size) {
+-		const struct gmu_block_header *blk =
+-					(const struct gmu_block_header *)fw;
++		struct gmu_block_header block;
++		const struct gmu_block_header *blk = &block;
+ 		int id;
++
++		memcpy(&block, fw, sizeof(block));
+ 
+ 		fw += sizeof(*blk);
+ 
+@@ -454,6 +480,11 @@
+ 				blk->addr, blk->size);
+ 			return -EINVAL;
+ 		}
++
++		if ((id == GMU_ITCM || id == GMU_DTCM) &&
++			(!IS_ALIGNED(blk->addr, sizeof(u32)) ||
++			!IS_ALIGNED(blk->size, sizeof(u32))))
++			return -EINVAL;
+ 
+ 		if (id == GMU_ITCM) {
+ 			load_tcm(adreno_dev, fw,
+@@ -1269,8 +1300,9 @@
+ 	struct device *gmu_pdev_dev = GMU_PDEV_DEV(KGSL_DEVICE(adreno_dev));
+ 	struct gen8_gmu_device *gmu = to_gen8_gmu(adreno_dev);
+ 	const struct adreno_gen8_core *gen8_core = to_gen8_core(adreno_dev);
+-	struct gmu_block_header *blk;
+-	int ret, offset = 0;
++	struct gmu_block_header block, *blk = &block;
++	size_t offset = 0;
++	int ret;
+ 	const char *gmufw_name = gen8_core->gmufw_name;
+ 
+ 	/*
+@@ -1294,13 +1326,16 @@
+ 		}
+ 	}
+ 
++	if (!gen8_gmu_fw_valid(gmu->fw_image->data, gmu->fw_image->size))
++		return -EINVAL;
++
+ 	/*
+ 	 * Zero payload fw blocks contain metadata and are
+ 	 * guaranteed to precede fw load data. Parse the
+ 	 * metadata blocks.
+ 	 */
+ 	while (offset < gmu->fw_image->size) {
+-		blk = (struct gmu_block_header *)&gmu->fw_image->data[offset];
++		memcpy(blk, &gmu->fw_image->data[offset], sizeof(*blk));
+ 
+ 		if (offset + sizeof(*blk) > gmu->fw_image->size) {
+ 			dev_err(gmu_pdev_dev, "Invalid FW Block\n");
+@@ -2814,7 +2849,7 @@
+ 
+ 	clear_bit(GMU_PRIV_GPU_STARTED, &gmu->flags);
+ 
+-	del_timer_sync(&device->idle_timer);
++	timer_delete_sync(&device->idle_timer);
+ 
+ 	kgsl_pwrscale_sleep(device);
+ 
+@@ -3188,10 +3223,10 @@
+ 	return component_add(&pdev->dev, &gen8_gmu_component_ops);
+ }
+ 
+-static int gen8_gmu_remove_dev(struct platform_device *pdev)
++static void gen8_gmu_remove_dev(struct platform_device *pdev)
+ {
+ 	component_del(&pdev->dev, &gen8_gmu_component_ops);
+-	return 0;
++	return;
+ }
+ 
+ static const struct of_device_id gen8_gmu_match_table[] = {
+@@ -3204,6 +3239,7 @@
+ 	.remove = gen8_gmu_remove_dev,
+ 	.driver = {
+ 		.name = "adreno-gen8-gmu",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = gen8_gmu_match_table,
+ 	},
+ };
+--- a/qcom/opensource/graphics-kernel/adreno_gen8_hfi.c
++++ b/qcom/opensource/graphics-kernel/adreno_gen8_hfi.c
+@@ -31,6 +31,12 @@
+ 	return &gmu->hfi;
+ }
+ 
++static bool gen8_hfi_ring_valid(u32 size, u32 read, u32 write)
++{
++	return size == HFI_QUEUE_SIZE / sizeof(u32) && read < size && write < size &&
++		IS_ALIGNED(read, SZ_4) && IS_ALIGNED(write, SZ_4);
++}
++
+ /* Size in below functions are in unit of dwords */
+ int gen8_hfi_queue_read(struct gen8_gmu_device *gmu, u32 queue_idx,
+ 		u32 *output, u32 max_size)
+@@ -38,25 +44,41 @@
+ 	struct kgsl_device *device = KGSL_DEVICE(gen8_gmu_to_adreno(gmu));
+ 	struct kgsl_memdesc *mem_addr = gmu->hfi.hfi_mem;
+ 	struct hfi_queue_table *tbl = mem_addr->hostptr;
+-	struct hfi_queue_header *hdr = &tbl->qhdr[queue_idx];
++	struct hfi_queue_header *hdr;
+ 	u32 *queue;
+ 	u32 msg_hdr;
+-	u32 i, read;
++	u32 i, read, write, queue_size, avail;
+ 	u32 size;
+ 	int result = 0;
+ 
++	if (queue_idx >= ARRAY_SIZE(tbl->qhdr) ||
++		HFI_QUEUE_OFFSET(queue_idx) + HFI_QUEUE_SIZE > mem_addr->size)
++		return -EINVAL;
++	hdr = &tbl->qhdr[queue_idx];
++	queue_size = READ_ONCE(hdr->queue_size);
++	read = READ_ONCE(hdr->read_index);
++	write = READ_ONCE(hdr->write_index);
++	if (!gen8_hfi_ring_valid(queue_size, read, write))
++		return -EPROTO;
++	avail = write >= read ? write - read : queue_size - read + write;
++
+ 	if (hdr->status == HFI_QUEUE_STATUS_DISABLED)
+ 		return -EINVAL;
+ 
+-	if (hdr->read_index == hdr->write_index)
++	if (!avail)
+ 		return -ENODATA;
+ 
+ 	/* Clear the output data before populating */
+ 	memset(output, 0, max_size);
+ 
+ 	queue = HOST_QUEUE_START_ADDR(mem_addr, queue_idx);
+-	msg_hdr = queue[hdr->read_index];
++	/* Pair firmware payload writes with its published producer index. */
++	rmb();
++	msg_hdr = queue[read];
+ 	size = MSG_HDR_GET_SIZE(msg_hdr);
++	if (!size || ALIGN(size, SZ_4) > avail ||
++		(MSG_HDR_GET_TYPE(msg_hdr) == HFI_MSG_ACK && size < 2))
++		return -EPROTO;
+ 
+ 	if (size > (max_size >> 2)) {
+ 		dev_err(GMU_PDEV_DEV(device),
+@@ -66,12 +88,11 @@
+ 		goto done;
+ 	}
+ 
+-	read = hdr->read_index;
+-
+-	if (read < hdr->queue_size) {
++
++	if (read < queue_size) {
+ 		for (i = 0; i < size && i < (max_size >> 2); i++) {
+ 			output[i] = queue[read];
+-			read = (read + 1)%hdr->queue_size;
++			read = (read + 1)%queue_size;
+ 		}
+ 		result = size;
+ 	} else {
+@@ -82,7 +103,7 @@
+ 		result = -ENODATA;
+ 	}
+ 
+-	read = ALIGN(read, SZ_4) % hdr->queue_size;
++	read = ALIGN(read, SZ_4) % queue_size;
+ 
+ 	hfi_update_read_idx(hdr, read);
+ 
+@@ -104,23 +125,32 @@
+ {
+ 	struct gen8_gmu_device *gmu = to_gen8_gmu(adreno_dev);
+ 	struct hfi_queue_table *tbl = gmu->hfi.hfi_mem->hostptr;
+-	struct hfi_queue_header *hdr = &tbl->qhdr[queue_idx];
++	struct hfi_queue_header *hdr;
+ 	u32 *queue;
+-	u32 i, write_idx, read_idx, empty_space;
++	u32 i, write_idx, read_idx, empty_space, queue_size;
+ 	u32 size_dwords = size_bytes >> 2;
+ 	u32 align_size = ALIGN(size_dwords, SZ_4);
+-	u32 id = MSG_HDR_GET_ID(*msg);
++	u32 id;
++
++	if (!size_bytes || !msg || queue_idx >= ARRAY_SIZE(tbl->qhdr) ||
++		HFI_QUEUE_OFFSET(queue_idx) + HFI_QUEUE_SIZE > gmu->hfi.hfi_mem->size)
++		return -EINVAL;
++	hdr = &tbl->qhdr[queue_idx];
++	id = MSG_HDR_GET_ID(*msg);
+ 
+ 	if (hdr->status == HFI_QUEUE_STATUS_DISABLED || !IS_ALIGNED(size_bytes, sizeof(u32)))
+ 		return -EINVAL;
+ 
+ 	queue = HOST_QUEUE_START_ADDR(gmu->hfi.hfi_mem, queue_idx);
+ 
+-	write_idx = hdr->write_index;
+-	read_idx = hdr->read_index;
++	write_idx = READ_ONCE(hdr->write_index);
++	read_idx = READ_ONCE(hdr->read_index);
++	queue_size = READ_ONCE(hdr->queue_size);
++	if (!gen8_hfi_ring_valid(queue_size, read_idx, write_idx))
++		return -EPROTO;
+ 
+ 	empty_space = (write_idx >= read_idx) ?
+-			(hdr->queue_size - (write_idx - read_idx))
++			(queue_size - (write_idx - read_idx))
+ 			: (read_idx - write_idx);
+ 
+ 	if (empty_space <= align_size)
+@@ -128,13 +158,13 @@
+ 
+ 	for (i = 0; i < size_dwords; i++) {
+ 		queue[write_idx] = msg[i];
+-		write_idx = (write_idx + 1) % hdr->queue_size;
++		write_idx = (write_idx + 1) % queue_size;
+ 	}
+ 
+ 	/* Cookify any non used data at the end of the write buffer */
+ 	for (; i < align_size; i++) {
+ 		queue[write_idx] = 0xfafafafa;
+-		write_idx = (write_idx + 1) % hdr->queue_size;
++		write_idx = (write_idx + 1) % queue_size;
+ 	}
+ 
+ 	trace_kgsl_hfi_send(id, size_dwords, MSG_HDR_GET_SEQNUM(*msg));
+--- a/qcom/opensource/graphics-kernel/adreno_gen8_hwsched.c
++++ b/qcom/opensource/graphics-kernel/adreno_gen8_hwsched.c
+@@ -48,7 +48,7 @@
+ 
+ 	wake_up_all(&hfi->hw_fence.unack_wq);
+ 
+-	del_timer_sync(&hfi->hw_fence_timer);
++	timer_delete_sync(&hfi->hw_fence_timer);
+ }
+ 
+ void gen8_hwsched_fault(struct adreno_device *adreno_dev, u32 fault)
+@@ -1011,7 +1011,7 @@
+ 
+ 	clear_bit(GMU_PRIV_GPU_STARTED, &gmu->flags);
+ 
+-	del_timer_sync(&device->idle_timer);
++	timer_delete_sync(&device->idle_timer);
+ 
+ 	kgsl_pwrscale_sleep(device);
+ 
+--- a/qcom/opensource/graphics-kernel/adreno_gen8_hwsched_hfi.c
++++ b/qcom/opensource/graphics-kernel/adreno_gen8_hwsched_hfi.c
+@@ -711,8 +711,7 @@
+ 	char name[KGSL_FENCE_NAME_LEN];
+ 	char value[32] = "unknown";
+ 
+-	if (fence->ops->timeline_value_str)
+-		fence->ops->timeline_value_str(fence, value, sizeof(value));
++	kgsl_get_fence_value(fence, value, sizeof(value));
+ 
+ 	if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags)) {
+ 		dev_err(GMU_PDEV_DEV(KGSL_DEVICE(adreno_dev)),
+@@ -1101,7 +1100,7 @@
+ 
+ 	spin_unlock(&hfi->hw_fence.lock);
+ 
+-	del_timer_sync(&hfi->hw_fence_timer);
++	timer_delete_sync(&hfi->hw_fence_timer);
+ 
+ 	/*
+ 	 * We need to handle the deferred context in another thread so that we can unblock the f2h
+@@ -2161,7 +2160,7 @@
+ 		return gen8_hwsched_coldboot_gpu(adreno_dev);
+ }
+ 
+-int gen8_hwsched_warmboot_init_gmu(struct adreno_device *adreno_dev)
++static int gen8_hwsched_warmboot_init_gmu(struct adreno_device *adreno_dev)
+ {
+ 	struct gen8_gmu_device *gmu = to_gen8_gmu(adreno_dev);
+ 	struct pending_cmd ack = {0};
+@@ -3555,7 +3554,7 @@
+ 
+ 	if (test_bit(CMDOBJ_RECURRING_STOP, &cmdobj->priv)) {
+ 		adreno_hwsched_retire_cmdobj(hwsched, hwsched->recurring_cmdobj);
+-		del_timer_sync(&hwsched->lsr_timer);
++		timer_delete_sync(&hwsched->lsr_timer);
+ 		hwsched->recurring_cmdobj = NULL;
+ 		if (active)
+ 			adreno_active_count_put(adreno_dev);
+--- a/qcom/opensource/graphics-kernel/adreno_gen8_preempt.c
++++ b/qcom/opensource/graphics-kernel/adreno_gen8_preempt.c
+@@ -106,7 +106,7 @@
+ 
+ 	adreno_dev->preempt.count++;
+ 
+-	del_timer_sync(&adreno_dev->preempt.timer);
++	timer_delete_sync(&adreno_dev->preempt.timer);
+ 
+ 	kgsl_regread(device, GEN8_CP_CONTEXT_SWITCH_LEVEL_STATUS, &status);
+ 
+@@ -242,7 +242,7 @@
+ 	}
+ 
+ 	/* Turn off the dispatcher timer */
+-	del_timer(&adreno_dev->dispatcher.timer);
++	timer_delete(&adreno_dev->dispatcher.timer);
+ 
+ 	/*
+ 	 * This is the most critical section - we need to take care not to race
+@@ -370,7 +370,7 @@
+ 	if (gen8_fenced_write(adreno_dev, GEN8_CP_CONTEXT_SWITCH_CNTL, cntl,
+ 					FENCE_STATUS_WRITEDROPPED1_MASK)) {
+ 		adreno_dev->next_rb = NULL;
+-		del_timer(&adreno_dev->preempt.timer);
++		timer_delete(&adreno_dev->preempt.timer);
+ 		goto err;
+ 	}
+ 
+@@ -425,7 +425,7 @@
+ 	 */
+ 	_power_collapse_set(adreno_dev, false);
+ 
+-	del_timer(&adreno_dev->preempt.timer);
++	timer_delete(&adreno_dev->preempt.timer);
+ 
+ 	kgsl_regread(device, GEN8_CP_CONTEXT_SWITCH_LEVEL_STATUS, &status);
+ 
+--- a/qcom/opensource/graphics-kernel/adreno_gen8_ringbuffer.c
++++ b/qcom/opensource/graphics-kernel/adreno_gen8_ringbuffer.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include "adreno.h"
+ #include "adreno_gen8.h"
+ #include "adreno_pm4types.h"
+--- a/qcom/opensource/graphics-kernel/adreno_hwsched.c
++++ b/qcom/opensource/graphics-kernel/adreno_hwsched.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include "adreno.h"
+ #include "adreno_hfi.h"
+ #include "adreno_snapshot.h"
+@@ -1646,8 +1647,7 @@
+ 		bool signaled = test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags);
+ 		char value[32] = "unknown";
+ 
+-		if (fence->ops->timeline_value_str)
+-			fence->ops->timeline_value_str(fence, value, sizeof(value));
++		kgsl_get_fence_value(fence, value, sizeof(value));
+ 
+ 		dev_err(device->dev,
+ 			"dma fence[%d] signaled:%d kgsl:%d ctx:%llu seqno:%llu value:%s\n",
+--- a/qcom/opensource/graphics-kernel/adreno_ioctl.c
++++ b/qcom/opensource/graphics-kernel/adreno_ioctl.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <linux/slab.h>
+ 
+ #include "adreno.h"
+--- a/qcom/opensource/graphics-kernel/adreno_profile.c
++++ b/qcom/opensource/graphics-kernel/adreno_profile.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <linux/ctype.h>
+ #include <linux/debugfs.h>
+ #include <linux/sched/signal.h>
+--- a/qcom/opensource/graphics-kernel/adreno_snapshot.c
++++ b/qcom/opensource/graphics-kernel/adreno_snapshot.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <linux/utsname.h>
+ 
+ #include "adreno.h"
+--- a/qcom/opensource/graphics-kernel/adreno_trace.h
++++ b/qcom/opensource/graphics-kernel/adreno_trace.h
+@@ -70,8 +70,8 @@
+ 		__entry->context = context;
+ 		__entry->seqno = seqno;
+ 		__entry->flags = flags;
+-		__assign_str(fence_name, name);
+-		__assign_str(val, val);
++		__assign_str(fence_name);
++		__assign_str(val);
+ 	),
+ 	TP_printk(
+ 		"id=%lld seqno=%lld sw_status=%s name=%s val=%s",
+@@ -98,7 +98,7 @@
+ 		__entry->context = context;
+ 		__entry->seqno = seqno;
+ 		__entry->flags = flags;
+-		__assign_str(fence_name, name);
++		__assign_str(fence_name);
+ 	),
+ 	TP_printk(
+ 		"ctx=%u id=%lld seqno=%lld flags=%s name=%s",
+@@ -605,7 +605,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, adreno_dev->dev.name);
++		__assign_str(device_name);
+ 		__entry->status = status;
+ 	),
+ 
+@@ -675,7 +675,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, adreno_dev->dev.name);
++		__assign_str(device_name);
+ 		__entry->status = status;
+ 	),
+ 
+@@ -740,7 +740,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, adreno_dev->dev.name);
++		__assign_str(device_name);
+ 		__entry->status = status;
+ 	),
+ 
+--- a/qcom/opensource/graphics-kernel/kgsl.c
++++ b/qcom/opensource/graphics-kernel/kgsl.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <uapi/linux/sched/types.h>
+ #include <linux/bitfield.h>
+ #include <linux/ctype.h>
+@@ -375,13 +376,13 @@
+ 			 * were writable by the GPU.
+ 			 */
+ 			if (!(memdesc->flags & KGSL_MEMFLAGS_GPUREADONLY))
+-				set_page_dirty_lock(nth_page(page, j));
++				set_page_dirty_lock(kgsl_nth_page(page, j));
+ 
+ 			/*
+ 			 * Put the page reference taken using get_user_pages
+ 			 * during memdesc_sg_virt.
+ 			 */
+-			put_page(nth_page(page, j));
++			put_page(kgsl_nth_page(page, j));
+ 		}
+ 	}
+ 
+@@ -1472,6 +1473,10 @@
+ 	struct kgsl_device *device;
+ 	unsigned int minor = iminor(inodep);
+ 
++	/* Pair with the final module-init publication of core/device state. */
++	if (!smp_load_acquire(&kgsl_driver.ready))
++		return -ENODEV;
++
+ 	device = kgsl_get_minor(minor);
+ 	if (device == NULL) {
+ 		pr_err("kgsl: No device found\n");
+@@ -3198,7 +3203,7 @@
+ 		priv->stats[type].max = ret;
+ }
+ 
+-u64 kgsl_get_stats(pid_t pid)
++static u64 kgsl_get_stats(pid_t pid)
+ {
+ 	struct kgsl_process_private *process;
+ 	u64 ret;
+@@ -4746,7 +4751,7 @@
+ 	 * Do additoinal constraints checking on the address. Passing MAP_FIXED
+ 	 * ensures that the address we want gets checked
+ 	 */
+-	ret = current->mm->get_unmapped_area(file, addr, len, 0,
++	ret = mm_get_unmapped_area(current->mm, file, addr, len, 0,
+ 		flags & MAP_FIXED);
+ 
+ 	/* If it passes, attempt to set the region in the SVM */
+@@ -4847,7 +4852,7 @@
+ 	}
+ 
+ 	if (!kgsl_memdesc_use_cpu_map(&entry->memdesc)) {
+-		val = current->mm->get_unmapped_area(file, addr, len, 0, flags);
++		val = mm_get_unmapped_area(current->mm, file, addr, len, 0, flags);
+ 		if (IS_ERR_VALUE(val))
+ 			dev_err_ratelimited(device->dev,
+ 					       "get_unmapped_area: pid %d addr %lx pgoff %lx len %ld failed error %d\n",
+@@ -5128,7 +5133,7 @@
+ 	if (num < 0)
+ 		return num;
+ 
+-	ret = devm_request_irq(&pdev->dev, num, handler, IRQF_TRIGGER_HIGH,
++	ret = devm_request_irq(&pdev->dev, num, handler, IRQF_TRIGGER_HIGH | IRQF_NO_AUTOEN,
+ 		name, data);
+ 
+ 	if (ret) {
+@@ -5137,7 +5142,6 @@
+ 		return ret;
+ 	}
+ 
+-	disable_irq(num);
+ 	return num;
+ }
+ 
+@@ -5149,7 +5153,7 @@
+ 	if (num < 0)
+ 		return num;
+ 
+-	ret = devm_request_irq(&pdev->dev, num, handler, IRQF_TRIGGER_HIGH,
++	ret = devm_request_irq(&pdev->dev, num, handler, IRQF_TRIGGER_HIGH | IRQF_NO_AUTOEN,
+ 		name, data);
+ 
+ 	if (ret) {
+@@ -5158,7 +5162,6 @@
+ 		return ret;
+ 	}
+ 
+-	disable_irq(num);
+ 	return num;
+ }
+ 
+@@ -5251,7 +5254,8 @@
+ 
+ void kgsl_device_platform_remove(struct kgsl_device *device)
+ {
+-	del_timer(&device->work_period_timer);
++	timer_shutdown_sync(&device->work_period_timer);
++	cancel_work_sync(&device->work_period_ws);
+ 
+ 	kthread_destroy_worker(device->events_worker);
+ 
+@@ -5270,49 +5274,73 @@
+ 	_unregister_device(device);
+ }
+ 
++static bool kgsl_chrdev_registered;
++static bool kgsl_cdev_added;
++static bool kgsl_virtdev_initialized;
++static bool kgsl_virtdev_added;
++static bool kgsl_sysstats_registered;
++static DECLARE_COMPLETION(kgsl_virtdev_released);
++
++static void kgsl_virtdev_release(struct device *dev)
++{
++	/* The embedded device storage belongs to kgsl_driver. */
++	complete(&kgsl_virtdev_released);
++}
++
+ void kgsl_core_exit(void)
+ {
++	WRITE_ONCE(kgsl_driver.ready, false);
++	if (kgsl_sysstats_registered) {
++		sysstats_unregister_kgsl_stats_cb();
++		kgsl_sysstats_registered = false;
++	}
++	if (kgsl_cdev_added) {
++		cdev_del(kgsl_driver.cdev);
++		kgsl_cdev_added = false;
++		kgsl_driver.cdev = NULL;
++	} else if (kgsl_driver.cdev) {
++		kobject_put(&kgsl_driver.cdev->kobj);
++		kgsl_driver.cdev = NULL;
++	}
++	kgsl_reclaim_close();
+ 	kgsl_exit_page_pools();
+-	kgsl_eventlog_exit();
+ 
+ 	if (kgsl_driver.workqueue) {
+ 		destroy_workqueue(kgsl_driver.workqueue);
+ 		kgsl_driver.workqueue = NULL;
+ 	}
+-
+ 	if (kgsl_driver.lockless_workqueue) {
+ 		destroy_workqueue(kgsl_driver.lockless_workqueue);
+ 		kgsl_driver.lockless_workqueue = NULL;
+ 	}
+-
++	kgsl_eventlog_exit();
+ 	kgsl_events_exit();
+ 	kgsl_core_debugfs_close();
+-
+-	kgsl_reclaim_close();
+-
+-	/*
+-	 * We call device_unregister()
+-	 * only if kgsl_driver.virtdev has been populated.
+-	 * We check at least one member of kgsl_driver.virtdev to
+-	 * see if it is not NULL (and thus, has been populated).
+-	 */
+-	if (kgsl_driver.virtdev.class)
+-		device_unregister(&kgsl_driver.virtdev);
+-
++	kgsl_drawobjs_cache_exit();
++
++	kobject_put(kgsl_driver.prockobj);
++	kgsl_driver.prockobj = NULL;
++	kobject_put(kgsl_driver.ptkobj);
++	kgsl_driver.ptkobj = NULL;
++	if (kgsl_virtdev_initialized) {
++		if (kgsl_virtdev_added)
++			device_unregister(&kgsl_driver.virtdev);
++		else
++			put_device(&kgsl_driver.virtdev);
++		wait_for_completion(&kgsl_virtdev_released);
++		kgsl_virtdev_initialized = false;
++		kgsl_virtdev_added = false;
++	}
+ 	if (kgsl_driver.class) {
+ 		class_destroy(kgsl_driver.class);
+ 		kgsl_driver.class = NULL;
+ 	}
+-
+-	kgsl_drawobjs_cache_exit();
+-
+ 	kfree(memfree.list);
+ 	memset(&memfree, 0, sizeof(memfree));
+-
+-	unregister_chrdev_region(kgsl_driver.major,
+-		ARRAY_SIZE(kgsl_driver.devp));
+-
+-	sysstats_unregister_kgsl_stats_cb();
++	if (kgsl_chrdev_registered) {
++		unregister_chrdev_region(kgsl_driver.major, ARRAY_SIZE(kgsl_driver.devp));
++		kgsl_chrdev_registered = false;
++	}
+ }
+ 
+ int __init kgsl_core_init(void)
+@@ -5322,6 +5350,9 @@
+ 	int result = 0;
+ 
+ 	KGSL_BOOT_MARKER("KGSL Init");
++	INIT_LIST_HEAD(&kgsl_driver.process_list);
++	INIT_LIST_HEAD(&kgsl_driver.pagetable_list);
++	INIT_LIST_HEAD(&kgsl_driver.wp_list);
+ 
+ 	/* alloc major and minor device numbers */
+ 	result = alloc_chrdev_region(&kgsl_driver.major, 0,
+@@ -5333,10 +5364,15 @@
+ 		goto err;
+ 	}
+ 
+-	cdev_init(&kgsl_driver.cdev, &kgsl_fops);
+-	kgsl_driver.cdev.owner = THIS_MODULE;
+-	kgsl_driver.cdev.ops = &kgsl_fops;
+-	result = cdev_add(&kgsl_driver.cdev, MKDEV(MAJOR(kgsl_driver.major), 0),
++	kgsl_chrdev_registered = true;
++	kgsl_driver.cdev = cdev_alloc();
++	if (!kgsl_driver.cdev) {
++		result = -ENOMEM;
++		goto err;
++	}
++	kgsl_driver.cdev->owner = THIS_MODULE;
++	kgsl_driver.cdev->ops = &kgsl_fops;
++	result = cdev_add(kgsl_driver.cdev, MKDEV(MAJOR(kgsl_driver.major), 0),
+ 		ARRAY_SIZE(kgsl_driver.devp));
+ 
+ 	if (result) {
+@@ -5345,6 +5381,7 @@
+ 		goto err;
+ 	}
+ 
++	kgsl_cdev_added = true;
+ #if (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
+ 	kgsl_driver.class = class_create("kgsl");
+ #else
+@@ -5352,6 +5389,7 @@
+ #endif
+ 	if (IS_ERR(kgsl_driver.class)) {
+ 		result = PTR_ERR(kgsl_driver.class);
++		kgsl_driver.class = NULL;
+ 		pr_err("kgsl: failed to create class for kgsl\n");
+ 		goto err;
+ 	}
+@@ -5361,13 +5399,16 @@
+ 	 * in sysfs
+ 	 */
+ 	kgsl_driver.virtdev.class = kgsl_driver.class;
+-	dev_set_name(&kgsl_driver.virtdev, "kgsl");
+-	result = device_register(&kgsl_driver.virtdev);
+-	if (result) {
+-		put_device(&kgsl_driver.virtdev);
+-		pr_err("kgsl: driver_register failed\n");
++	kgsl_driver.virtdev.release = kgsl_virtdev_release;
++	device_initialize(&kgsl_driver.virtdev);
++	kgsl_virtdev_initialized = true;
++	result = dev_set_name(&kgsl_driver.virtdev, "kgsl");
++	if (result)
+ 		goto err;
+-	}
++	result = device_add(&kgsl_driver.virtdev);
++	if (result)
++		goto err;
++	kgsl_virtdev_added = true;
+ 
+ 	kgsl_driver.virtdev.dma_mask = &dma_mask;
+ 	kgsl_driver.virtdev.dma_parms = &dma_parms;
+@@ -5386,20 +5427,19 @@
+ 		kobject_create_and_add("proc",
+ 				       &kgsl_driver.virtdev.kobj);
+ 
++	if (!kgsl_driver.ptkobj || !kgsl_driver.prockobj) {
++		result = -ENOMEM;
++		goto err;
++	}
+ 	kgsl_core_debugfs_init();
+ 
+-	kgsl_sharedmem_init_sysfs();
++	result = kgsl_sharedmem_init_sysfs();
++	if (result)
++		goto err;
+ 
+ 	/* Initialize the memory pools */
+ 	kgsl_probe_page_pools();
+ 
+-	kgsl_register_shmem_callback();
+-
+-	INIT_LIST_HEAD(&kgsl_driver.process_list);
+-
+-	INIT_LIST_HEAD(&kgsl_driver.pagetable_list);
+-
+-	INIT_LIST_HEAD(&kgsl_driver.wp_list);
+ 
+ 	kgsl_driver.workqueue = alloc_workqueue("kgsl-workqueue",
+ 		WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_SYSFS, 0);
+@@ -5425,7 +5465,9 @@
+ 
+ 	kgsl_eventlog_init();
+ 
+-	kgsl_events_init();
++	result = kgsl_events_init();
++	if (result)
++		goto err;
+ 
+ 	result = kgsl_drawobjs_cache_init();
+ 	if (result)
+@@ -5434,7 +5476,12 @@
+ 	memfree.list = kcalloc(MEMFREE_ENTRIES, sizeof(struct memfree_entry),
+ 		GFP_KERNEL);
+ 
++	if (!memfree.list) {
++		result = -ENOMEM;
++		goto err;
++	}
+ 	sysstats_register_kgsl_stats_cb(kgsl_get_stats);
++	kgsl_sysstats_registered = true;
+ 
+ 	KGSL_BOOT_MARKER("KGSL Ready");
+ 
+--- a/qcom/opensource/graphics-kernel/kgsl.h
++++ b/qcom/opensource/graphics-kernel/kgsl.h
+@@ -14,6 +14,11 @@
+ #include <uapi/linux/msm_kgsl.h>
+ #include <linux/uaccess.h>
+ #include <linux/version.h>
++
++static inline struct page *kgsl_nth_page(struct page *page, unsigned long n)
++{
++	return pfn_to_page(page_to_pfn(page) + n);
++}
+ 
+ #include "kgsl_gmu_core.h"
+ #include "kgsl_pwrscale.h"
+@@ -171,7 +176,9 @@
+  * @workqueue: Pointer to a single threaded workqueue
+  */
+ struct kgsl_driver {
+-	struct cdev cdev;
++	/* Published only after all module initialization has succeeded. */
++	bool ready;
++	struct cdev *cdev;
+ 	dev_t major;
+ 	struct class *class;
+ 	struct device virtdev;
+--- a/qcom/opensource/graphics-kernel/kgsl_device.h
++++ b/qcom/opensource/graphics-kernel/kgsl_device.h
+@@ -724,7 +724,7 @@
+ 			bool gmu_fault);
+ void kgsl_device_snapshot_close(struct kgsl_device *device);
+ 
+-void kgsl_events_init(void);
++int __init kgsl_events_init(void);
+ void kgsl_events_exit(void);
+ 
+ /**
+--- a/qcom/opensource/graphics-kernel/kgsl_drawobj.c
++++ b/qcom/opensource/graphics-kernel/kgsl_drawobj.c
+@@ -19,6 +19,7 @@
+  * goes to zero indicating no more pending events.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <linux/slab.h>
+ #include <linux/dma-fence-array.h>
+ 
+@@ -251,7 +252,7 @@
+ 	 * for dispatch
+ 	 */
+ 	if (!kgsl_drawobj_events_pending(event->syncobj)) {
+-		del_timer(&syncobj->timer);
++		timer_delete(&syncobj->timer);
+ 
+ 		if (device->ftbl->drawctxt_sched)
+ 			device->ftbl->drawctxt_sched(device,
+@@ -344,7 +345,7 @@
+ 	unsigned int i;
+ 
+ 	/* Zap the canary timer */
+-	del_timer_sync(&syncobj->timer);
++	timer_delete_sync(&syncobj->timer);
+ 
+ 	/*
+ 	 * Clear all pending events - this will render any subsequent async
+@@ -1618,6 +1619,7 @@
+ void kgsl_drawobjs_cache_exit(void)
+ {
+ 	kmem_cache_destroy(memobjs_cache);
++	memobjs_cache = NULL;
+ }
+ 
+ int kgsl_drawobjs_cache_init(void)
+--- a/qcom/opensource/graphics-kernel/kgsl_eventlog.c
++++ b/qcom/opensource/graphics-kernel/kgsl_eventlog.c
+@@ -109,6 +109,8 @@
+ 
+ void kgsl_eventlog_exit(void)
+ {
++	if (!kgsl_eventlog)
++		return;
+ 	kgsl_remove_from_minidump("KGSL_EVENTLOG", (u64) kgsl_eventlog,
+ 				__pa(kgsl_eventlog), EVENTLOG_SIZE);
+ 
+--- a/qcom/opensource/graphics-kernel/kgsl_events.c
++++ b/qcom/opensource/graphics-kernel/kgsl_events.c
+@@ -426,12 +426,14 @@
+ void kgsl_events_exit(void)
+ {
+ 	kmem_cache_destroy(events_cache);
++	events_cache = NULL;
+ }
+ 
+ /**
+  * kgsl_events_init() - Create the event kmem cache on module start
+  */
+-void __init kgsl_events_init(void)
++int __init kgsl_events_init(void)
+ {
+ 	events_cache = KMEM_CACHE(kgsl_event, 0);
+-}
++	return events_cache ? 0 : -ENOMEM;
++}
+--- a/qcom/opensource/graphics-kernel/kgsl_gmu_core.c
++++ b/qcom/opensource/graphics-kernel/kgsl_gmu_core.c
+@@ -23,32 +23,32 @@
+ 	{},
+ };
+ 
+-void __init gmu_core_register(void)
++static struct platform_driver *registered_gmu_driver;
++
++int __init gmu_core_register(void)
+ {
+ 	const struct of_device_id *match;
+ 	struct device_node *node;
+-
+-	node = of_find_matching_node_and_match(NULL, gmu_match_table,
+-		&match);
++	struct platform_driver *driver;
++	int ret;
++
++	node = of_find_matching_node_and_match(NULL, gmu_match_table, &match);
+ 	if (!node)
+-		return;
+-
+-	platform_driver_register((struct platform_driver *) match->data);
++		return 0;
++	driver = (struct platform_driver *)match->data;
+ 	of_node_put(node);
++	ret = platform_driver_register(driver);
++	if (!ret)
++		registered_gmu_driver = driver;
++	return ret;
+ }
+ 
+ void gmu_core_unregister(void)
+ {
+-	const struct of_device_id *match;
+-	struct device_node *node;
+-
+-	node = of_find_matching_node_and_match(NULL, gmu_match_table,
+-		&match);
+-	if (!node)
+-		return;
+-
+-	platform_driver_unregister((struct platform_driver *) match->data);
+-	of_node_put(node);
++	if (registered_gmu_driver) {
++		platform_driver_unregister(registered_gmu_driver);
++		registered_gmu_driver = NULL;
++	}
+ }
+ 
+ bool gmu_core_isenabled(struct kgsl_device *device)
+@@ -240,10 +240,11 @@
+ 	struct device *gmu_pdev_dev = GMU_PDEV_DEV(device);
+ 	int ret;
+ 
+-	device->gmu_core.domain = iommu_domain_alloc(&platform_bus_type);
+-	if (!device->gmu_core.domain) {
+-		dev_err(gmu_pdev_dev, "Unable to allocate GMU IOMMU domain\n");
+-		return -ENODEV;
++	device->gmu_core.domain = iommu_paging_domain_alloc(gmu_pdev_dev);
++	if (IS_ERR(device->gmu_core.domain)) {
++		ret = PTR_ERR(device->gmu_core.domain);
++		device->gmu_core.domain = NULL;
++		return dev_err_probe(gmu_pdev_dev, ret, "Unable to allocate GMU IOMMU domain\n");
+ 	}
+ 
+ 	/*
+--- a/qcom/opensource/graphics-kernel/kgsl_gmu_core.h
++++ b/qcom/opensource/graphics-kernel/kgsl_gmu_core.h
+@@ -459,7 +459,7 @@
+ 
+ /* GMU core functions */
+ 
+-void __init gmu_core_register(void);
++int __init gmu_core_register(void);
+ void gmu_core_unregister(void);
+ 
+ bool gmu_core_gpmu_isenabled(struct kgsl_device *device);
+--- a/qcom/opensource/graphics-kernel/kgsl_iommu.c
++++ b/qcom/opensource/graphics-kernel/kgsl_iommu.c
+@@ -1683,17 +1683,19 @@
+ 
+ static void kgsl_iommu_detach_context(struct kgsl_iommu_context *context)
+ {
+-	if (!context->domain)
+-		return;
+-
+-	iommu_detach_device(context->domain, &context->pdev->dev);
+-	iommu_domain_free(context->domain);
+-
+-	context->domain = NULL;
+-
+-	platform_device_put(context->pdev);
+-
+-	context->pdev = NULL;
++	if (context->domain) {
++		iommu_detach_device(context->domain, &context->pdev->dev);
++		iommu_domain_free(context->domain);
++		context->domain = NULL;
++	}
++
++	if (context->pdev) {
++		if (dev_get_drvdata(&context->pdev->dev) == &context->adreno_smmu)
++			dev_set_drvdata(&context->pdev->dev, NULL);
++		put_device(&context->pdev->dev);
++		context->pdev = NULL;
++	}
++	context->cb_num = -1;
+ }
+ 
+ static void kgsl_iommu_close(struct kgsl_mmu *mmu)
+@@ -2517,71 +2519,76 @@
+ 	return false;
+ }
+ 
++static int kgsl_iommu_get_context_device(struct device_node *parent,
++		struct kgsl_iommu_context *context, const char *name)
++{
++	struct device_node *node = of_get_child_by_name(parent, name);
++	struct platform_device *pdev;
++	int ret;
++
++	if (!node)
++		return -ENOENT;
++
++	pdev = of_find_device_by_node(node);
++	if (!pdev) {
++		of_node_put(node);
++		return -EPROBE_DEFER;
++	}
++	ret = of_dma_configure(&pdev->dev, node, true);
++	of_node_put(node);
++	if (ret) {
++		put_device(&pdev->dev);
++		return ret;
++	}
++	context->pdev = pdev;
++	context->name = name;
++	context->cb_num = -1;
++	ratelimit_default_init(&context->ratelimit);
++	return 0;
++}
++
+ static int kgsl_iommu_setup_context(struct kgsl_mmu *mmu,
+ 		struct device_node *parent,
+ 		struct kgsl_iommu_context *context, const char *name,
+ 		iommu_fault_handler_t handler)
+ {
+-	struct device_node *node = of_find_node_by_name(parent, name);
+-	struct platform_device *pdev;
+ 	struct kgsl_device *device = KGSL_MMU_DEVICE(mmu);
+ 	int ret;
+ 
+-	if (!node)
+-		return -ENOENT;
+-
+-	pdev = of_find_device_by_node(node);
+-	ret = of_dma_configure(&pdev->dev, node, true);
+-	of_node_put(node);
+-
++	ret = kgsl_iommu_get_context_device(parent, context, name);
+ 	if (ret)
+ 		return ret;
+ 
+-	context->cb_num = -1;
+-	context->name = name;
+ 	context->kgsldev = device;
+-	context->pdev = pdev;
+-	ratelimit_default_init(&context->ratelimit);
+-
+-	/* Set the adreno_smmu priv data for the device */
+-	dev_set_drvdata(&pdev->dev, &context->adreno_smmu);
+-
+-	/* Create a new context */
+-	context->domain = iommu_domain_alloc(&platform_bus_type);
+-	if (!context->domain) {
+-		/*FIXME: Put back the pdev here? */
+-		return -ENODEV;
++	dev_set_drvdata(&context->pdev->dev, &context->adreno_smmu);
++	context->domain = iommu_paging_domain_alloc(&context->pdev->dev);
++	if (IS_ERR(context->domain)) {
++		ret = PTR_ERR(context->domain);
++		context->domain = NULL;
++		goto put_device;
+ 	}
+ 
+ 	qcom_iommu_set_fault_model(context->domain, QCOM_IOMMU_FAULT_MODEL_NON_FATAL);
+-
+ 	_enable_gpuhtw_llc(mmu, context->domain);
+-
+ 	ret = iommu_attach_device(context->domain, &context->pdev->dev);
+-	if (ret) {
+-		/* FIXME: put back the device here? */
+-		iommu_domain_free(context->domain);
+-		context->domain = NULL;
+-		return ret;
+-	}
++	if (ret)
++		goto free_domain;
+ 
+ 	iommu_set_fault_handler(context->domain, handler, mmu);
+-
+ 	context->cb_num = qcom_iommu_get_context_bank_nr(context->domain);
+-
+ 	if (context->cb_num >= 0)
+ 		return 0;
+ 
++	ret = context->cb_num;
+ 	dev_err(&device->pdev->dev, "Couldn't get the context bank for %s: %d\n",
+-		context->name, context->cb_num);
+-
++		context->name, ret);
+ 	iommu_detach_device(context->domain, &context->pdev->dev);
++free_domain:
+ 	iommu_domain_free(context->domain);
+-
+-	/* FIXME: put back the device here? */
+ 	context->domain = NULL;
+-
+-	return context->cb_num;
++put_device:
++	kgsl_iommu_detach_context(context);
++	return ret;
+ }
+ 
+ static int iommu_probe_user_context(struct kgsl_device *device,
+@@ -2663,78 +2670,56 @@
+ static int iommu_probe_secure_context(struct kgsl_device *device,
+ 		struct device_node *parent)
+ {
+-	struct device_node *node;
+-	struct platform_device *pdev;
+-	int ret;
+ 	struct kgsl_iommu *iommu = KGSL_IOMMU(device);
+ 	struct kgsl_mmu *mmu = &device->mmu;
+ 	struct kgsl_iommu_context *context = &iommu->secure_context;
+-	int secure_vmid = VMID_CP_PIXEL;
++	int ret;
+ 
+ 	if (!mmu->secured)
+ 		return -EPERM;
+ 
+-	node = of_find_node_by_name(parent, "gfx3d_secure");
+-	if (!node)
+-		return -ENOENT;
+-
+-	pdev = of_find_device_by_node(node);
+-	ret = of_dma_configure(&pdev->dev, node, true);
+-	of_node_put(node);
+-
++	ret = kgsl_iommu_get_context_device(parent, context, "gfx3d_secure");
+ 	if (ret)
+ 		return ret;
+-
+-	context->cb_num = -1;
+-	context->name = "gfx3d_secure";
+ 	context->kgsldev = device;
+-	context->pdev = pdev;
+-	ratelimit_default_init(&context->ratelimit);
+-
+-	context->domain = iommu_domain_alloc(&platform_bus_type);
+-	if (!context->domain) {
+-		/* FIXME: put away the device */
+-		return -ENODEV;
+-	}
+-
+-	ret = qcom_iommu_set_secure_vmid(context->domain, secure_vmid);
++	context->domain = iommu_paging_domain_alloc(&context->pdev->dev);
++	if (IS_ERR(context->domain)) {
++		ret = PTR_ERR(context->domain);
++		context->domain = NULL;
++		goto put_device;
++	}
++
++	ret = qcom_iommu_set_secure_vmid(context->domain, VMID_CP_PIXEL);
+ 	if (ret) {
+ 		dev_err(&device->pdev->dev, "Unable to set the secure VMID: %d\n", ret);
+-		iommu_domain_free(context->domain);
+-		context->domain = NULL;
+-
+-		/* FIXME: put away the device */
+-		return ret;
+-	}
+-
++		goto free_domain;
++	}
+ 	_enable_gpuhtw_llc(mmu, context->domain);
+-
+ 	ret = iommu_attach_device(context->domain, &context->pdev->dev);
+-	if (ret) {
+-		iommu_domain_free(context->domain);
+-		/* FIXME: Put way the device */
+-		context->domain = NULL;
+-		return ret;
+-	}
+-
+-	iommu_set_fault_handler(context->domain,
+-		kgsl_iommu_secure_fault_handler, mmu);
+-
++	if (ret)
++		goto free_domain;
++
++	iommu_set_fault_handler(context->domain, kgsl_iommu_secure_fault_handler, mmu);
+ 	context->cb_num = qcom_iommu_get_context_bank_nr(context->domain);
+-
+ 	if (context->cb_num < 0) {
+-		iommu_detach_device(context->domain, &context->pdev->dev);
+-		iommu_domain_free(context->domain);
+-		context->domain = NULL;
+-		return context->cb_num;
++		ret = context->cb_num;
++		goto detach_domain;
+ 	}
+ 
+ 	mmu->securepagetable = kgsl_iommu_secure_pagetable(mmu);
+-
+-	if (IS_ERR(mmu->securepagetable))
+-		mmu->secured = false;
+-
+-	return 0;
++	if (!IS_ERR(mmu->securepagetable))
++		return 0;
++	ret = PTR_ERR(mmu->securepagetable);
++	mmu->securepagetable = NULL;
++	mmu->secured = false;
++detach_domain:
++	iommu_detach_device(context->domain, &context->pdev->dev);
++free_domain:
++	iommu_domain_free(context->domain);
++	context->domain = NULL;
++put_device:
++	kgsl_iommu_detach_context(context);
++	return ret;
+ }
+ 
+ static const char * const kgsl_iommu_clocks[] = {
+@@ -2758,7 +2743,7 @@
+ static void kgsl_iommu_check_config(struct kgsl_mmu *mmu,
+ 		struct device_node *parent)
+ {
+-	struct device_node *node = of_find_node_by_name(parent, "gfx3d_user");
++	struct device_node *node = of_get_child_by_name(parent, "gfx3d_user");
+ 	struct device_node *phandle;
+ 
+ 	if (!node)
+--- a/qcom/opensource/graphics-kernel/kgsl_iommu.h
++++ b/qcom/opensource/graphics-kernel/kgsl_iommu.h
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/adreno-smmu-priv.h>
+ #include <linux/io-pgtable.h>
++#include <linux/qcom-io-pgtable.h>
+ #include <linux/qcom-iommu-util.h>
+ /*
+  * These defines control the address range for allocations that
+--- a/qcom/opensource/graphics-kernel/kgsl_mmu.c
++++ b/qcom/opensource/graphics-kernel/kgsl_mmu.c
+@@ -699,18 +699,18 @@
+ 	return component_add(&pdev->dev, &kgsl_mmu_component_ops);
+ }
+ 
+-static int kgsl_mmu_dev_remove(struct platform_device *pdev)
++static void kgsl_mmu_dev_remove(struct platform_device *pdev)
+ {
+ 	if (of_device_is_compatible(pdev->dev.of_node,
+ 				"qcom,smmu-kgsl-cb")) {
+ 		component_del(&pdev->dev, &kgsl_mmu_cb_component_ops);
+-		return 0;
++		return;
+ 	}
+ 
+ 	component_del(&pdev->dev, &kgsl_mmu_component_ops);
+ 
+ 	of_platform_depopulate(&pdev->dev);
+-	return 0;
++	return;
+ }
+ 
+ static const struct of_device_id mmu_match_table[] = {
+@@ -724,6 +724,7 @@
+ 	.remove = kgsl_mmu_dev_remove,
+ 	.driver = {
+ 		.name = "kgsl-iommu",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = mmu_match_table,
+ 	}
+ };
+--- a/qcom/opensource/graphics-kernel/kgsl_pool.c
++++ b/qcom/opensource/graphics-kernel/kgsl_pool.c
+@@ -561,7 +561,7 @@
+ 	kgsl_zero_page(page, order, dev);
+ 
+ 	for (j = 0; j < (*page_size >> PAGE_SHIFT); j++) {
+-		p = nth_page(page, j);
++		p = kgsl_nth_page(page, j);
+ 		pages[pcount] = p;
+ 		pcount++;
+ 	}
+--- a/qcom/opensource/graphics-kernel/kgsl_pwrctrl.c
++++ b/qcom/opensource/graphics-kernel/kgsl_pwrctrl.c
+@@ -1333,7 +1333,7 @@
+ 	}
+ }
+ 
+-int kgsl_regulator_disable_wait(struct regulator *reg, u32 timeout)
++static int kgsl_regulator_disable_wait(struct regulator *reg, u32 timeout)
+ {
+ 	ktime_t tout = ktime_add_us(ktime_get(), timeout * USEC_PER_MSEC);
+ 	int ret;
+@@ -2206,7 +2206,7 @@
+ 	switch (device->state) {
+ 	case KGSL_STATE_ACTIVE:
+ 		kgsl_pwrctrl_irq(device, false);
+-		del_timer_sync(&device->idle_timer);
++		timer_delete_sync(&device->idle_timer);
+ 		device->ftbl->stop(device);
+ 		fallthrough;
+ 	case KGSL_STATE_AWARE:
+@@ -2308,7 +2308,7 @@
+ 		break;
+ 	case KGSL_STATE_ACTIVE:
+ 		kgsl_pwrctrl_irq(device, false);
+-		del_timer_sync(&device->idle_timer);
++		timer_delete_sync(&device->idle_timer);
+ 		break;
+ 	case KGSL_STATE_SLUMBER:
+ 		status = kgsl_pwrctrl_enable(device);
+@@ -2334,7 +2334,7 @@
+ 			kgsl_pwrctrl_request_state(device, KGSL_STATE_NONE);
+ 			return -EBUSY;
+ 		}
+-		del_timer_sync(&device->idle_timer);
++		timer_delete_sync(&device->idle_timer);
+ 		kgsl_pwrctrl_irq(device, false);
+ 		/* make sure power is on to stop the device*/
+ 		status = kgsl_pwrctrl_enable(device);
+--- a/qcom/opensource/graphics-kernel/kgsl_reclaim.c
++++ b/qcom/opensource/graphics-kernel/kgsl_reclaim.c
+@@ -27,7 +27,8 @@
+ /* Setting this to 0 means we reclaim pages as specified in shrinker call */
+ static u32 kgsl_nr_to_scan;
+ 
+-struct work_struct reclaim_work;
++static void kgsl_reclaim_background_work(struct work_struct *work);
++static DECLARE_WORK(reclaim_work, kgsl_reclaim_background_work);
+ 
+ static atomic_t kgsl_nr_to_reclaim;
+ 
+@@ -434,6 +435,12 @@
+ 	}
+ }
+ 
++/* The limit may be lowered while a process still owns reclaimed pages. */
++static u32 kgsl_reclaim_remaining(u32 limit, int unpinned)
++{
++	return unpinned < 0 || (u32)unpinned >= limit ? 0 : limit - unpinned;
++}
++
+ /* Shrinker callback functions */
+ static unsigned long
+ kgsl_reclaim_shrink_scan_objects(struct shrinker *shrinker,
+@@ -443,7 +450,8 @@
+ 		return 0;
+ 
+ 	atomic_set(&kgsl_nr_to_reclaim, kgsl_nr_to_scan ?
+-					kgsl_nr_to_scan : sc->nr_to_scan);
++					min_t(unsigned long, kgsl_nr_to_scan, INT_MAX) :
++					min_t(unsigned long, sc->nr_to_scan, INT_MAX));
+ 	kgsl_schedule_work(&reclaim_work);
+ 
+ 	return atomic_read(&kgsl_nr_to_reclaim);
+@@ -462,8 +470,9 @@
+ 	read_lock(&kgsl_driver.proclist_lock);
+ 	list_for_each_entry(process, &kgsl_driver.process_list, list) {
+ 		if (!test_bit(KGSL_PROC_STATE, &process->state))
+-			count_reclaimable += kgsl_reclaim_max_page_limit -
+-				atomic_read(&process->unpinned_page_count);
++			count_reclaimable += kgsl_reclaim_remaining(
++				READ_ONCE(kgsl_reclaim_max_page_limit),
++				atomic_read(&process->unpinned_page_count));
+ 	}
+ 	read_unlock(&kgsl_driver.proclist_lock);
+ 
+@@ -482,6 +491,9 @@
+ #if (KERNEL_VERSION(6, 7, 0) <= LINUX_VERSION_CODE)
+ static int kgsl_reclaim_shrinker_init(void)
+ {
++	if (kgsl_driver.reclaim_shrinker)
++		return 0;
++
+ 	kgsl_driver.reclaim_shrinker = shrinker_alloc(0, "kgsl_reclaim_shrinker");
+ 
+ 	if (!kgsl_driver.reclaim_shrinker)
+@@ -548,7 +560,6 @@
+ 		return ret;
+ 	}
+ 
+-	INIT_WORK(&reclaim_work, kgsl_reclaim_background_work);
+ 
+ 	return 0;
+ }
+--- a/qcom/opensource/graphics-kernel/kgsl_sharedmem.c
++++ b/qcom/opensource/graphics-kernel/kgsl_sharedmem.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <asm/cacheflush.h>
+ #include <linux/of_platform.h>
+ #include <linux/highmem.h>
+@@ -1091,11 +1092,11 @@
+ }
+ 
+ static void kgsl_shmem_fill_page(void *ptr,
+-	struct shmem_inode_info *inode, struct folio **folio)
++	struct shmem_inode_info *inode, struct folio **folio, int order)
+ {
+ 	struct kgsl_memdesc *memdesc = (struct kgsl_memdesc *)inode->android_vendor_data1;
+ 
+-	if (IS_ERR_OR_NULL(memdesc))
++	if (IS_ERR_OR_NULL(memdesc) || order)
+ 		return;
+ 
+ 	mutex_lock(&memdesc->lock);
+@@ -1115,9 +1116,14 @@
+ 	mutex_unlock(&memdesc->lock);
+ }
+ 
+-void kgsl_register_shmem_callback(void)
+-{
+-	register_trace_android_rvh_shmem_get_folio(kgsl_shmem_fill_page, NULL);
++int __init kgsl_register_shmem_callback(void)
++{
++	int ret = register_trace_android_rvh_shmem_get_folio(kgsl_shmem_fill_page, NULL);
++
++	/* Restricted hooks cannot unregister; keep the callback text resident. */
++	if (!ret)
++		__module_get(THIS_MODULE);
++	return ret;
+ }
+ 
+ static int kgsl_alloc_secure(int *page_size, struct page **pages,
+@@ -1142,7 +1148,7 @@
+ 	kgsl_zero_page(page, order, dev);
+ 
+ 	for (j = 0; j < (*page_size >> PAGE_SHIFT); j++) {
+-		pages[pcount] = nth_page(page, j);
++		pages[pcount] = kgsl_nth_page(page, j);
+ 		pcount++;
+ 	}
+ 
+@@ -1281,7 +1287,7 @@
+ 	fput(memdesc->shmem_filp);
+ }
+ #else
+-void kgsl_register_shmem_callback(void) { }
++int __init kgsl_register_shmem_callback(void) { return 0; }
+ 
+ static int kgsl_alloc_page(struct kgsl_memdesc *memdesc, int *page_size,
+ 			struct page **pages, unsigned int pages_len,
+@@ -1355,7 +1361,7 @@
+ 	int i;
+ 
+ 	for (i = 0; i < (1 << order); i++) {
+-		struct page *page = nth_page(p, i);
++		struct page *page = kgsl_nth_page(p, i);
+ 
+ 		clear_highpage(page);
+ 	}
+@@ -1540,7 +1546,7 @@
+ 
+ 		while (j < (sg->length/PAGE_SIZE)) {
+ 			count = 1 << compound_order(p);
+-			next = nth_page(p, count);
++			next = kgsl_nth_page(p, count);
+ 			kgsl_free_page(memdesc, p);
+ 
+ 			p = next;
+--- a/qcom/opensource/graphics-kernel/kgsl_sharedmem.h
++++ b/qcom/opensource/graphics-kernel/kgsl_sharedmem.h
+@@ -493,5 +493,5 @@
+  * kgsl_register_shmem_callback - Register vendor hook callback with SHMEM
+  * driver
+  */
+-void kgsl_register_shmem_callback(void);
++int __init kgsl_register_shmem_callback(void);
+ #endif /* __KGSL_SHAREDMEM_H */
+--- a/qcom/opensource/graphics-kernel/kgsl_snapshot.c
++++ b/qcom/opensource/graphics-kernel/kgsl_snapshot.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <linux/of.h>
+ #include <linux/panic_notifier.h>
+ #include <linux/slab.h>
+@@ -800,7 +801,7 @@
+ 
+ /* Dump the sysfs binary data to the user */
+ static ssize_t snapshot_show(struct file *filep, struct kobject *kobj,
+-	struct bin_attribute *attr, char *buf, loff_t off,
++	const struct bin_attribute *attr, char *buf, loff_t off,
+ 	size_t count)
+ {
+ 	struct kgsl_device *device = kobj_to_device(kobj);
+--- a/qcom/opensource/graphics-kernel/kgsl_sync.c
++++ b/qcom/opensource/graphics-kernel/kgsl_sync.c
+@@ -575,13 +575,7 @@
+ 	kgsl_sync_timeline_put(ktimeline);
+ }
+ 
+-static void kgsl_sync_fence_value_str(struct dma_fence *fence,
+-					char *str, int size)
+-{
+-	struct kgsl_sync_fence *kfence = (struct kgsl_sync_fence *)fence;
+-
+-	snprintf(str, size, "%u", kfence->timestamp);
+-}
++
+ 
+ static const char *kgsl_sync_fence_driver_name(struct dma_fence *fence)
+ {
+@@ -693,8 +687,6 @@
+ 	.wait = dma_fence_default_wait,
+ 	.release = kgsl_sync_fence_release,
+ 
+-	.fence_value_str = kgsl_sync_fence_value_str,
+-	.timeline_value_str = kgsl_sync_timeline_value_str,
+ };
+ 
+ static void kgsl_sync_fence_callback(struct dma_fence *fence,
+@@ -747,14 +739,16 @@
+ 
+ void kgsl_get_fence_name(struct dma_fence *f, char *name, u32 max_size)
+ {
+-	int len = scnprintf(name, max_size, "%s %s", f->ops->get_driver_name(f),
+-			f->ops->get_timeline_name(f));
+-
+-	if (f->ops->fence_value_str) {
+-		len += scnprintf(name + len, max_size - len, ": ");
+-		f->ops->fence_value_str(f, name + len, max_size - len);
+-	}
+-
++	scnprintf(name, max_size, "%s %s: %llu", f->ops->get_driver_name(f),
++		f->ops->get_timeline_name(f), f->seqno);
++}
++
++void kgsl_get_fence_value(struct dma_fence *f, char *value, u32 size)
++{
++	if (f->ops == &kgsl_sync_fence_ops)
++		kgsl_sync_timeline_value_str(f, value, size);
++	else
++		scnprintf(value, size, "status:%d", dma_fence_get_status(f));
+ }
+ void kgsl_get_fence_info(struct kgsl_drawobj_sync_event *event)
+ {
+@@ -1184,15 +1178,7 @@
+ 	return "kgsl-syncsource-timeline";
+ }
+ 
+-static void kgsl_syncsource_fence_value_str(struct dma_fence *fence,
+-						char *str, int size)
+-{
+-	/*
+-	 * Each fence is independent of the others on the same timeline.
+-	 * We use a different context for each of them.
+-	 */
+-	snprintf(str, size, "%llu", fence->context);
+-}
++
+ 
+ static const struct dma_fence_ops kgsl_syncsource_fence_ops = {
+ 	.get_driver_name = kgsl_syncsource_driver_name,
+@@ -1201,6 +1187,5 @@
+ 	.wait = dma_fence_default_wait,
+ 	.release = kgsl_syncsource_fence_release,
+ 
+-	.fence_value_str = kgsl_syncsource_fence_value_str,
+ };
+ 
+--- a/qcom/opensource/graphics-kernel/kgsl_sync.h
++++ b/qcom/opensource/graphics-kernel/kgsl_sync.h
+@@ -280,4 +280,6 @@
+ 
+ #endif /* CONFIG_SYNC_FILE */
+ 
++void kgsl_get_fence_value(struct dma_fence *f, char *value, u32 size);
++
+ #endif /* __KGSL_SYNC_H */
+--- a/qcom/opensource/graphics-kernel/kgsl_timeline.c
++++ b/qcom/opensource/graphics-kernel/kgsl_timeline.c
+@@ -195,8 +195,7 @@
+ {
+ 	struct kgsl_timeline_fence *f = to_timeline_fence(fence);
+ 
+-	return !__dma_fence_is_later(fence->seqno, f->timeline->value,
+-		fence->ops);
++	return !__dma_fence_is_later(fence, fence->seqno, f->timeline->value);
+ }
+ 
+ static bool timeline_fence_enable_signaling(struct dma_fence *fence)
+@@ -221,13 +220,7 @@
+ 	return f->timeline->name;
+ }
+ 
+-static void timeline_get_value_str(struct dma_fence *fence,
+-		char *str, int size)
+-{
+-	struct kgsl_timeline_fence *f = to_timeline_fence(fence);
+-
+-	snprintf(str, size, "%lld", f->timeline->value);
+-}
++
+ 
+ static const struct dma_fence_ops timeline_fence_ops = {
+ 	.get_driver_name = timeline_get_driver_name,
+@@ -235,8 +228,6 @@
+ 	.signaled = timeline_fence_signaled,
+ 	.release = timeline_fence_release,
+ 	.enable_signaling = timeline_fence_enable_signaling,
+-	.timeline_value_str = timeline_get_value_str,
+-	.use_64bit_seqno = true,
+ };
+ 
+ static void kgsl_timeline_add_fence(struct kgsl_timeline *timeline,
+@@ -336,7 +327,7 @@
+ 		return ERR_PTR(-ENOENT);
+ 	}
+ 
+-	dma_fence_init(&fence->base, &timeline_fence_ops,
++	dma_fence_init64(&fence->base, &timeline_fence_ops,
+ 		&timeline->lock, timeline->context, seqno);
+ 
+ 	INIT_LIST_HEAD(&fence->node);
+--- a/qcom/opensource/graphics-kernel/kgsl_trace.h
++++ b/qcom/opensource/graphics-kernel/kgsl_trace.h
+@@ -69,7 +69,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->drawctxt_id = drawctxt_id;
+ 		__entry->numibs = numibs;
+ 		__entry->timestamp = timestamp;
+@@ -111,7 +111,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->context_id = context_id;
+ 		__entry->type = type;
+ 		__entry->timestamp = timestamp;
+@@ -148,7 +148,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->context_id = context_id;
+ 		__entry->curr_ts = curr_ts;
+ 		__entry->wait_ts = wait_ts;
+@@ -182,7 +182,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->curr_ts = curr_ts;
+ 		__entry->result = result;
+ 	),
+@@ -206,7 +206,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->on = on;
+ 	),
+ 
+@@ -246,7 +246,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->on = on;
+ 		__entry->freq = freq;
+ 	),
+@@ -302,7 +302,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->pwrlevel = pwrlevel;
+ 		__entry->freq = freq;
+ 		__entry->prev_pwrlevel = prev_pwrlevel;
+@@ -354,7 +354,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->pwrlevel = pwrlevel;
+ 		__entry->bus = bus;
+ 		__entry->avg_bw = avg_bw;
+@@ -382,7 +382,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->busy = busy;
+ 		__entry->elapsed = elapsed;
+ 	),
+@@ -411,7 +411,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->total_time = time;
+ 		__entry->busy_time = pstats->busy_time;
+ 		__entry->ram_time = pstats->ram_time;
+@@ -437,7 +437,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->state = state;
+ 	),
+ 
+@@ -756,7 +756,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->gpuaddr = mem_entry->memdesc.gpuaddr;
+ 		__entry->size = mem_entry->memdesc.size;
+ 		kgsl_get_memory_usage(__entry->usage, sizeof(__entry->usage),
+@@ -810,7 +810,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->id = context->id;
+ 		__entry->flags = flags & ~(KGSL_CONTEXT_PRIORITY_MASK |
+ 						KGSL_CONTEXT_TYPE_MASK);
+@@ -844,7 +844,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->id = context->id;
+ 	),
+ 
+@@ -866,7 +866,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->id = context->id;
+ 	),
+ 
+@@ -891,7 +891,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->id = id;
+ 		__entry->type = type;
+ 		__entry->sub_type = sub_type;
+@@ -922,7 +922,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->type = type;
+ 		__entry->value = value;
+ 		__entry->on = on;
+@@ -953,11 +953,11 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->page = page;
+ 		__entry->pt = pt;
+-		__assign_str(name, name);
+-		__assign_str(op, op);
++		__assign_str(name);
++		__assign_str(op);
+ 	),
+ 
+ 	TP_printk(
+@@ -980,7 +980,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, "kgsl-3d0");
++		__assign_str(device_name);
+ 		__entry->offset = offset;
+ 		__entry->value = value;
+ 	),
+@@ -1049,7 +1049,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(device_name, device->name);
++		__assign_str(device_name);
+ 		__entry->count = atomic_read(&device->active_cnt);
+ 		__entry->ip = ip;
+ 	),
+@@ -1117,7 +1117,7 @@
+ 	),
+ 	TP_fast_assign(
+ 		__entry->syncobj_context_id = syncobj->base.context->id;
+-		__assign_str(fence_name, name);
++		__assign_str(fence_name);
+ 	),
+ 	TP_printk("ctx=%u fence=%s",
+ 		__entry->syncobj_context_id, __get_str(fence_name))
+@@ -1140,7 +1140,7 @@
+ 		__string(msg, msg)
+ 	),
+ 	TP_fast_assign(
+-		__assign_str(msg, msg);
++		__assign_str(msg);
+ 	),
+ 	TP_printk(
+ 		"%s", __get_str(msg)
+--- a/qcom/opensource/graphics-kernel/kgsl_util.h
++++ b/qcom/opensource/graphics-kernel/kgsl_util.h
+@@ -260,6 +260,6 @@
+ #if (KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE)
+ #define kgsl_timer_container_of timer_container_of
+ #else
+-#define kgsl_timer_container_of from_timer
+-#endif
+-#endif
++#define kgsl_timer_container_of timer_container_of
++#endif
++#endif
+--- a/qcom/opensource/graphics-kernel/kgsl_vbo.c
++++ b/qcom/opensource/graphics-kernel/kgsl_vbo.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <linux/file.h>
+ #include <linux/interval_tree.h>
+ #include <linux/seq_file.h>
+--- a/qcom/opensource/synx-kernel/msm/synx/ipclite.c
++++ b/qcom/opensource/synx-kernel/msm/synx/ipclite.c
+@@ -19,13 +19,16 @@
+ #include <linux/hwspinlock.h>
+ 
+ #include <linux/sysfs.h>
++#include <linux/completion.h>
+ 
+ #include "ipclite_client.h"
+ #include "ipclite.h"
+ 
+ static struct ipclite_info *ipclite;
++static bool ipclite_ready;
+ static struct ipclite_client synx_client;
+ static struct ipclite_client test_client;
++static DEFINE_MUTEX(ipclite_client_lock);
+ static struct ipclite_debug_info *ipclite_dbg_info;
+ static struct ipclite_debug_struct *ipclite_dbg_struct;
+ static struct ipclite_debug_inmem_buf *ipclite_dbg_inmem;
+@@ -177,6 +180,7 @@
+ 
+ int ipclite_hw_mutex_acquire(void)
+ {
++	unsigned long flags;
+ 	int ret;
+ 
+ 	if (unlikely(!ipclite)) {
+@@ -184,11 +188,12 @@
+ 		return -ENOMEM;
+ 	}
+ 	ret = hwspin_lock_timeout_irqsave(ipclite->hwlock,
+-					HWSPINLOCK_TIMEOUT, &ipclite->hw_mutex_flags);
++					HWSPINLOCK_TIMEOUT, &flags);
+ 	if (ret) {
+ 		pr_err("Hw mutex lock acquire failed\n");
+ 		return ret;
+ 	}
++	ipclite->hw_mutex_flags = flags;
+ 	ipclite->ipcmem.toc_data.host_info->hwlock_owner = IPCMEM_APPS;
+ 	return ret;
+ }
+@@ -196,6 +201,8 @@
+ 
+ int ipclite_hw_mutex_release(void)
+ {
++	unsigned long flags;
++
+ 	if (unlikely(!ipclite)) {
+ 		pr_err("IPCLite not initialized\n");
+ 		return -ENOMEM;
+@@ -204,7 +211,8 @@
+ 		return -EINVAL;
+ 
+ 	ipclite->ipcmem.toc_data.host_info->hwlock_owner = IPCMEM_INVALID_HOST;
+-	hwspin_unlock_irqrestore(ipclite->hwlock, &ipclite->hw_mutex_flags);
++	flags = ipclite->hw_mutex_flags;
++	hwspin_unlock_irqrestore(ipclite->hwlock, &flags);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(ipclite_hw_mutex_release);
+@@ -284,7 +292,11 @@
+ 
+ uint32_t ipclite_global_test_and_set_bit(uint32_t nr, ipclite_atomic_uint32_t *addr)
+ {
+-	uint32_t ret = 0, mask = (1 << nr);
++	uint32_t ret = 0, mask;
++
++	if (WARN_ON_ONCE(nr >= 32))
++		return 0;
++	mask = BIT(nr);
+ 
+ 	BUG_ON(addr == NULL);
+ 
+@@ -300,7 +312,11 @@
+ 
+ uint32_t ipclite_global_test_and_clear_bit(uint32_t nr, ipclite_atomic_uint32_t *addr)
+ {
+-	uint32_t ret = 0, mask = (1 << nr);
++	uint32_t ret = 0, mask;
++
++	if (WARN_ON_ONCE(nr >= 32))
++		return 0;
++	mask = BIT(nr);
+ 
+ 	BUG_ON(addr == NULL);
+ 
+@@ -354,6 +370,9 @@
+ 
+ 	head = le32_to_cpu(*rx_fifo->head);
+ 	tail = le32_to_cpu(*rx_fifo->tail);
++	if (head >= rx_fifo->length || tail >= rx_fifo->length)
++		return 0;
++
+ 
+ 	IPCLITE_OS_LOG(IPCLITE_DBG, "head=%d, tail=%d\n", head, tail);
+ 
+@@ -378,7 +397,7 @@
+ 
+ 	tail = le32_to_cpu(*rx_fifo->tail);
+ 
+-	if (WARN_ON_ONCE(tail > rx_fifo->length))
++	if (WARN_ON_ONCE(tail >= rx_fifo->length || count > rx_fifo->length))
+ 		return;
+ 
+ 	if (tail >= rx_fifo->length)
+@@ -399,6 +418,8 @@
+ 
+ 	tail = le32_to_cpu(*rx_fifo->tail);
+ 
++	if (WARN_ON_ONCE(tail >= rx_fifo->length || count > rx_fifo->length))
++		return;
+ 	tail += count;
+ 	if (tail >= rx_fifo->length)
+ 		tail %= rx_fifo->length;
+@@ -430,6 +451,9 @@
+ 
+ 	head = le32_to_cpu(*tx_fifo->head);
+ 	tail = le32_to_cpu(*tx_fifo->tail);
++	if (head >= tx_fifo->length || tail >= tx_fifo->length)
++		return 0;
++
+ 
+ 	if (tail <= head)
+ 		avail = tx_fifo->length - head + tail;
+@@ -453,7 +477,7 @@
+ {
+ 	size_t len = 0;
+ 
+-	if (WARN_ON_ONCE(head > tx_fifo->length))
++	if (WARN_ON_ONCE(head >= tx_fifo->length || count > tx_fifo->length))
+ 		return head;
+ 
+ 	len = min_t(size_t, count, tx_fifo->length - head);
+@@ -534,10 +558,10 @@
+ }
+ 
+ static void ipclite_tx_write(struct ipclite_channel *channel,
+-				const void *data, size_t dlen)
++				const void *data, size_t dlen, u32 signal_id)
+ {
+ 	channel->tx_fifo->write(channel->tx_fifo, data, dlen, channel->remote_pid,
+-								channel->irq_info->signal_id);
++								signal_id);
+ }
+ 
+ static int ipclite_rx_data(struct ipclite_channel *channel, size_t avail)
+@@ -553,7 +577,8 @@
+ 
+ 	ipclite_rx_peak(channel, &data, sizeof(data));
+ 
+-	if (synx_client.reg_complete == 1) {
++	/* Pair with client publication so callback and private data are coherent. */
++	if (smp_load_acquire(&synx_client.reg_complete)) {
+ 		if (synx_client.callback)
+ 			synx_client.callback(channel->remote_pid, data,
+ 								synx_client.priv_data);
+@@ -575,7 +600,8 @@
+ 
+ 	ipclite_rx_peak(channel, &data, sizeof(data));
+ 
+-	if (test_client.reg_complete == 1) {
++	/* Pair with client publication so callback and private data are coherent. */
++	if (smp_load_acquire(&test_client.reg_complete)) {
+ 		if (test_client.callback)
+ 			test_client.callback(channel->remote_pid, data,
+ 								test_client.priv_data);
+@@ -639,6 +665,10 @@
+ 	int ret = 0;
+ 	unsigned long flags;
+ 
++	if (ipclite_signal >= MAX_CHANNEL_SIGNALS ||
++		IS_ERR_OR_NULL(channel->irq_info[ipclite_signal].mbox_chan))
++		return -ENODEV;
++
+ 	if (channel->status != ACTIVE) {
+ 		if (channel->status == IN_PROGRESS && *channel->gstatus_ptr == ACTIVE) {
+ 			channel->status = ACTIVE;
+@@ -654,8 +684,7 @@
+ 		ret = -EAGAIN;
+ 		return ret;
+ 	}
+-	channel->irq_info->signal_id = ipclite_signal;
+-	ipclite_tx_write(channel, &data, dlen);
++	ipclite_tx_write(channel, &data, dlen, ipclite_signal);
+ 
+ 	mbox_send_message(channel->irq_info[ipclite_signal].mbox_chan, NULL);
+ 	mbox_client_txdone(channel->irq_info[ipclite_signal].mbox_chan, 0);
+@@ -719,6 +748,9 @@
+ 	if (ret)
+ 		return ret;
+ 
++	if (resource_size(&r) > U32_MAX || resource_size(&r) <
++		IPCMEM_TOC_SIZE + GLOBAL_PARTITION_SIZE + DEBUG_PARTITION_SIZE)
++		return -EINVAL;
+ 	ipclite->ipcmem.mem.aux_base = (u64)r.start;
+ 	ipclite->ipcmem.mem.size = resource_size(&r);
+ 	ipclite->ipcmem.mem.virt_base = devm_ioremap_wc(dev, r.start,
+@@ -747,6 +779,8 @@
+ 	for (int i = 1; i < size; i++)
+ 		block[0] ^= block[i];
+ 
++	/* init_done is published after the checksum and all other header fields. */
++	block[0] ^= IPCMEM_INIT_COMPLETED;
+ 	block[0] = ~block[0];
+ }
+ 
+@@ -841,6 +875,12 @@
+ 		for (host1 = host0; host1 < IPCMEM_NUM_HOSTS; host1++) {
+ 			if (!is_host_enabled(host1) || is_loopback_except_apps(host0, host1))
+ 				continue;
++			if (base_offset > ipcmem->mem.size - DEBUG_PARTITION_SIZE ||
++				ipcmem->mem.size - DEBUG_PARTITION_SIZE - base_offset <
++				DEFAULT_PARTITION_SIZE ||
++				(num_entry + 1) * sizeof(struct ipcmem_partition_entry) >
++				IPCMEM_TOC_SIZE - ipcmem->toc->offsets.partition_entry)
++				return -EINVAL;
+ 			ipcmem->toc_data.partition_entry[num_entry].base_offset = base_offset;
+ 			ipcmem->toc_data.partition_entry[num_entry].size = DEFAULT_PARTITION_SIZE;
+ 			ipcmem->toc_data.partition_entry[num_entry].flags = DEFAULT_PARTITION_FLAGS;
+@@ -876,8 +916,13 @@
+ 	uint32_t remote_pid = 0, host_count = 0, gmem_offset = 0;
+ 	struct device_node *cn;
+ 
++	enabled_hosts = 0;
+ 	for_each_available_child_of_node(pn, cn) {
+-		of_property_read_u32(cn, "qcom,remote-pid", &remote_pid);
++		if (of_property_read_u32(cn, "qcom,remote-pid", &remote_pid) ||
++			remote_pid >= IPCMEM_NUM_HOSTS || (enabled_hosts & BIT(remote_pid))) {
++			of_node_put(cn);
++			return -EINVAL;
++		}
+ 		if (remote_pid < IPCMEM_NUM_HOSTS) {
+ 			enabled_hosts |= BIT_MASK(remote_pid);
+ 			host_count++;
+@@ -912,16 +957,81 @@
+ 	/*Making sure all writes for ipcmem configurations are completed*/
+ 	wmb();
+ 
+-	ipcmem->toc->hdr.init_done = IPCMEM_INIT_COMPLETED;
++	/* Publish init_done only after channels and debug memory are ready. */
+ 	IPCLITE_OS_LOG(IPCLITE_DBG, "Ipcmem init completed\n");
+ 
+ 	return 0;
+ }
+ 
++struct ipclite_child_device {
++	struct device dev;
++	struct completion released;
++};
++
+ static void ipclite_device_release(struct device *dev)
+ {
+-	IPCLITE_OS_LOG(IPCLITE_INFO, "Releasing ipclite device\n");
+-	kfree(dev);
++	struct ipclite_child_device *child = container_of(dev, struct ipclite_child_device, dev);
++
++	of_node_put(dev->of_node);
++	complete(&child->released);
++}
++
++static void ipclite_child_unregister(struct device *dev)
++{
++	struct ipclite_child_device *child;
++
++	if (!dev)
++		return;
++	child = container_of(dev, struct ipclite_child_device, dev);
++	device_unregister(dev);
++	wait_for_completion(&child->released);
++	kfree(child);
++}
++
++static struct device *ipclite_child_register(struct device *parent, struct device_node *node)
++{
++	struct ipclite_child_device *child;
++	struct device *dev;
++	int ret;
++
++	child = kzalloc(sizeof(*child), GFP_KERNEL);
++	if (!child)
++		return ERR_PTR(-ENOMEM);
++	init_completion(&child->released);
++	dev = &child->dev;
++	device_initialize(dev);
++	dev->parent = parent;
++	dev->of_node = of_node_get(node);
++	dev->release = ipclite_device_release;
++	ret = dev_set_name(dev, "%s:%pOFn", dev_name(parent->parent), node);
++	if (!ret)
++		ret = device_add(dev);
++	if (ret) {
++		put_device(dev);
++		wait_for_completion(&child->released);
++		kfree(child);
++		return ERR_PTR(ret);
++	}
++	return dev;
++}
++
++static void ipclite_channel_close(struct ipclite_channel *channel)
++{
++	int i;
++
++	for (i = 0; i < MAX_CHANNEL_SIGNALS; i++) {
++		struct ipclite_irq_info *info = &channel->irq_info[i];
++		struct device *dev = info->mbox_client.dev;
++
++		if (info->irq_requested)
++			devm_free_irq(dev, info->irq, info);
++		if (!IS_ERR_OR_NULL(info->mbox_chan))
++			mbox_free_channel(info->mbox_chan);
++		ipclite_child_unregister(dev);
++		memset(info, 0, sizeof(*info));
++	}
++	ipclite_child_unregister(channel->dev);
++	memset(channel, 0, sizeof(*channel));
+ }
+ 
+ static int ipclite_channel_irq_init(struct device *parent, struct device_node *node,
+@@ -934,21 +1044,9 @@
+ 	char strs[MAX_CHANNEL_SIGNALS][IPCLITE_SIGNAL_LABEL_SIZE] = {
+ 			"msg", "mem-init", "version", "test", "ssr", "debug"};
+ 
+-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+-	if (!dev)
+-		return -ENOMEM;
+-
+-	dev->parent = parent;
+-	dev->of_node = node;
+-	dev->release = ipclite_device_release;
+-	dev_set_name(dev, "%s:%pOFn", dev_name(parent->parent), node);
+-	IPCLITE_OS_LOG(IPCLITE_DBG, "Registering %s device\n", dev_name(parent->parent));
+-	ret = device_register(dev);
+-	if (ret) {
+-		IPCLITE_OS_LOG(IPCLITE_ERR, "failed to register ipclite child node\n");
+-		put_device(dev);
+-		return ret;
+-	}
++	dev = ipclite_child_register(parent, node);
++	if (IS_ERR(dev))
++		return PTR_ERR(dev);
+ 
+ 	ret = of_property_read_u32(dev->of_node, "index", &index);
+ 	if (ret) {
+@@ -956,6 +1054,10 @@
+ 		goto err_dev;
+ 	}
+ 
++	if (index >= MAX_CHANNEL_SIGNALS || channel->irq_info[index].mbox_client.dev) {
++		ret = -EINVAL;
++		goto err_dev;
++	}
+ 	irq_info = &channel->irq_info[index];
+ 	IPCLITE_OS_LOG(IPCLITE_DBG, "irq_info[%d]=%p\n", index, irq_info);
+ 
+@@ -975,6 +1077,10 @@
+ 	snprintf(irq_info->irqname, 32, "ipclite-signal-%s", strs[index]);
+ 	irq_info->irq = of_irq_get(dev->of_node, 0);
+ 	IPCLITE_OS_LOG(IPCLITE_DBG, "irq[%d] = %d\n", index, irq_info->irq);
++	if (irq_info->irq <= 0) {
++		ret = irq_info->irq ? irq_info->irq : -EINVAL;
++		goto err_mbox;
++	}
+ 	irq_info->signal_id = index;
+ 	ret = devm_request_irq(dev, irq_info->irq,
+ 			       ipclite_intr,
+@@ -982,14 +1088,19 @@
+ 			       irq_info->irqname, irq_info);
+ 	if (ret) {
+ 		IPCLITE_OS_LOG(IPCLITE_ERR, "failed to request IRQ\n");
+-		goto err_dev;
+-	}
++		goto err_mbox;
++	}
++	irq_info->irq_requested = true;
+ 	IPCLITE_OS_LOG(IPCLITE_DBG, "Interrupt init completed, ret = %d\n", ret);
+ 
+ 	return ret;
+ 
++err_mbox:
++	mbox_free_channel(irq_info->mbox_chan);
+ err_dev:
+-	device_unregister(dev);
++	if (index < MAX_CHANNEL_SIGNALS && channel->irq_info[index].mbox_client.dev == dev)
++		memset(&channel->irq_info[index], 0, sizeof(channel->irq_info[index]));
++	ipclite_child_unregister(dev);
+ 	return ret;
+ }
+ 
+@@ -1029,22 +1140,9 @@
+ 	struct device_node *child;
+ 	struct ipcmem_partition_header *partition_hdr;
+ 
+-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+-	if (!dev)
+-		return -ENOMEM;
+-
+-	dev->parent = parent;
+-	dev->of_node = node;
+-	dev->release = ipclite_device_release;
+-	dev_set_name(dev, "%s:%pOFn", dev_name(parent->parent), node);
+-	IPCLITE_OS_LOG(IPCLITE_DBG, "Registering %s device\n", dev_name(parent->parent));
+-	ret = device_register(dev);
+-	if (ret) {
+-		IPCLITE_OS_LOG(IPCLITE_ERR, "failed to register ipclite device\n");
+-		put_device(dev);
+-		kfree(dev);
+-		return ret;
+-	}
++	dev = ipclite_child_register(parent, node);
++	if (IS_ERR(dev))
++		return PTR_ERR(dev);
+ 
+ 	local_pid = LOCAL_HOST;
+ 
+@@ -1054,6 +1152,11 @@
+ 		dev_err(dev, "failed to parse qcom,remote-pid\n");
+ 		goto err_put_dev;
+ 	}
++	if (remote_pid >= IPCMEM_NUM_HOSTS || ipclite->channel[remote_pid].dev) {
++		ret = -EINVAL;
++		goto err_put_dev;
++	}
++	ipclite->channel[remote_pid].dev = dev;
+ 	IPCLITE_OS_LOG(IPCLITE_DBG, "remote_pid = %d, local_pid=%d\n", remote_pid, local_pid);
+ 
+ 	rx_fifo = devm_kzalloc(dev, sizeof(*rx_fifo), GFP_KERNEL);
+@@ -1127,6 +1230,7 @@
+ 				&ipclite->channel[remote_pid]);
+ 		if (ret) {
+ 			IPCLITE_OS_LOG(IPCLITE_ERR, "irq setup for ipclite channel failed\n");
++			of_node_put(child);
+ 			goto err_put_dev;
+ 		}
+ 	}
+@@ -1143,8 +1247,10 @@
+ 	return ret;
+ 
+ err_put_dev:
+-	ipclite->channel[remote_pid].status = INACTIVE;
+-	device_unregister(dev);
++	if (remote_pid < IPCMEM_NUM_HOSTS && ipclite->channel[remote_pid].dev == dev)
++		ipclite_channel_close(&ipclite->channel[remote_pid]);
++	else
++		ipclite_child_unregister(dev);
+ 	return ret;
+ }
+ 
+@@ -1324,27 +1430,13 @@
+ 
+ static int ipclite_debug_setup(void)
+ {
+-	int ret = 0;
+-
+-	/* Set up sysfs for debug */
+-	ret = ipclite_debug_sysfs_setup();
+-	if (ret != 0) {
+-		IPCLITE_OS_LOG(IPCLITE_ERR, "Failed to Set up IPCLite Debug Sysfs\n");
++	int ret = ipclite_debug_mem_setup();
++
++	if (ret)
+ 		return ret;
+-	}
+-
+-	/* Mapping Debug Memory */
+-	ret = ipclite_debug_mem_setup();
+-	if (ret != 0) {
+-		IPCLITE_OS_LOG(IPCLITE_ERR, "Failed to Set up IPCLite Debug Structures\n");
+-		return ret;
+-	}
+-
+-	/* Update the Global Debug variable for FW cores */
+ 	ipclite_dbg_info->debug_level = ipclite_debug_level;
+ 	ipclite_dbg_info->debug_control = ipclite_debug_control;
+-
+-	return ret;
++	return ipclite_debug_sysfs_setup();
+ }
+ /* IPCLite Debug related functions end */
+ 
+@@ -1441,59 +1533,66 @@
+ 		goto release;
+ 	}
+ 
++	/* Debug Setup */
++	ret = ipclite_debug_setup();
++	if (ret != 0) {
++		IPCLITE_OS_LOG(IPCLITE_ERR, "IPCLite Debug Setup Failed\n");
++		goto release;
++	}
++
++	/* Features Setup */
++	ret = ipclite_feature_setup(pn);
++	if (ret != 0) {
++		IPCLITE_OS_LOG(IPCLITE_ERR, "IPCLite Features Setup Failed\n");
++		goto release;
++	}
++
+ 	/* Setup Channel for each Remote Subsystem */
+ 	for_each_available_child_of_node(pn, cn) {
+ 		ret = ipclite_channel_init(&pdev->dev, cn);
+-		if (ret == -EPROBE_DEFER)
++		if (ret) {
++			of_node_put(cn);
+ 			goto release;
+-	}
+-
++		}
++	}
++
++	/* Update TOC with version entries for FW */
++	ipclite->ipcmem.toc->hdr.major_version = major_ver;
++	ipclite->ipcmem.toc->hdr.minor_version = minor_ver;
++
++	/* Should be called after all Global TOC related init is done */
++	insert_magic_number();
++
++	/* Firmware has no live memory-revocation handshake. */
++	__module_get(THIS_MODULE);
++	/* Publish all partition contents and the final header checksum first. */
++	wmb();
++	ipclite->ipcmem.toc->hdr.init_done = IPCMEM_INIT_COMPLETED;
+ 	/* Broadcast init_done signal to all subsystems once mbox channels are set up */
+ 	if (ipclite->channel[IPCMEM_APPS].status == ACTIVE) {
+ 		broadcast = ipclite->channel[IPCMEM_APPS];
+ 		ret = mbox_send_message(broadcast.irq_info[IPCLITE_MEM_INIT_SIGNAL].mbox_chan, NULL);
+ 		if (ret < 0)
+-			goto mem_release;
+-
+-		mbox_client_txdone(broadcast.irq_info[IPCLITE_MEM_INIT_SIGNAL].mbox_chan, 0);
+-	}
+-
+-	/* Debug Setup */
+-	ret = ipclite_debug_setup();
+-	if (ret != 0) {
+-		IPCLITE_OS_LOG(IPCLITE_ERR, "IPCLite Debug Setup Failed\n");
+-		goto release;
+-	}
+-
+-	/* Features Setup */
+-	ret = ipclite_feature_setup(pn);
+-	if (ret != 0) {
+-		IPCLITE_OS_LOG(IPCLITE_ERR, "IPCLite Features Setup Failed\n");
+-		goto release;
+-	}
+-
+-	/* Update TOC with version entries for FW */
+-	ipclite->ipcmem.toc->hdr.major_version = major_ver;
+-	ipclite->ipcmem.toc->hdr.minor_version = minor_ver;
+-
+-	/* Should be called after all Global TOC related init is done */
+-	insert_magic_number();
++			dev_warn(&pdev->dev, "IPCLite init notification failed: %d\n", ret);
++		else
++			mbox_client_txdone(
++				broadcast.irq_info[IPCLITE_MEM_INIT_SIGNAL].mbox_chan, 0);
++	}
++
+ 
+ 	IPCLITE_OS_LOG(IPCLITE_INFO, "IPCLite Version : %d.%d Feature Mask : 0x%llx\n",
+ 						major_ver, minor_ver, feature_mask);
+ 
+ 	IPCLITE_OS_LOG(IPCLITE_INFO, "IPCLite Probe Completed Successfully\n");
+ 
+-	return ret;
+-
+-mem_release:
+-	/* If the remote subsystem has already completed the init and actively
+-	 * using IPCMEM, re-assigning IPCMEM memory back to HLOS can lead to crash
+-	 * Solution: Either we don't take back the memory or make sure APPS completes
+-	 * init before any other subsystem initializes IPCLite (we won't have to send
+-	 * braodcast)
+-	 */
++	return 0;
++
+ release:
++	kobject_put(sysfs_kobj);
++	sysfs_kobj = NULL;
++	for (int i = 0; i < IPCMEM_NUM_HOSTS; i++)
++		ipclite_channel_close(&ipclite->channel[i]);
++	kfree(ipclite->ipcmem.partition);
+ 	hwspin_lock_free(ipclite->hwlock);
+ free_ipclite:
+ 	kfree(ipclite);
+@@ -1503,34 +1602,40 @@
+ 
+ static int ipclite_register_client_v0(IPCLite_Client cb_func_ptr, void *priv)
+ {
+-	if (!cb_func_ptr) {
+-		IPCLITE_OS_LOG(IPCLITE_ERR, "Invalid callback pointer\n");
++	int ret = 0;
++
++	if (!cb_func_ptr)
+ 		return -EINVAL;
+-	}
+-
+-	synx_client.callback = cb_func_ptr;
+-	synx_client.priv_data = priv;
+-	synx_client.reg_complete = 1;
+-
+-	IPCLITE_OS_LOG(IPCLITE_DBG, "Client Registration completed\n");
+-
+-	return 0;
++	mutex_lock(&ipclite_client_lock);
++	if (synx_client.reg_complete) {
++		ret = -EBUSY;
++	} else {
++		synx_client.callback = cb_func_ptr;
++		synx_client.priv_data = priv;
++		/* Make the complete callback/private-data pair visible to IRQ readers. */
++		smp_store_release(&synx_client.reg_complete, 1);
++	}
++	mutex_unlock(&ipclite_client_lock);
++	return ret;
+ }
+ 
+ static int ipclite_register_test_client_v0(IPCLite_Client cb_func_ptr, void *priv)
+ {
+-	if (!cb_func_ptr) {
+-		IPCLITE_OS_LOG(IPCLITE_ERR, "Invalid callback pointer\n");
++	int ret = 0;
++
++	if (!cb_func_ptr)
+ 		return -EINVAL;
+-	}
+-
+-	test_client.callback = cb_func_ptr;
+-	test_client.priv_data = priv;
+-	test_client.reg_complete = 1;
+-
+-	IPCLITE_OS_LOG(IPCLITE_DBG, "Test Client Registration Completed\n");
+-
+-	return 0;
++	mutex_lock(&ipclite_client_lock);
++	if (test_client.reg_complete) {
++		ret = -EBUSY;
++	} else {
++		test_client.callback = cb_func_ptr;
++		test_client.priv_data = priv;
++		/* Make the complete callback/private-data pair visible to IRQ readers. */
++		smp_store_release(&test_client.reg_complete, 1);
++	}
++	mutex_unlock(&ipclite_client_lock);
++	return ret;
+ }
+ 
+ static int ipclite_msg_send_v0(int32_t proc_id, uint64_t data)
+@@ -1592,6 +1697,10 @@
+ 		return -EINVAL;
+ 
+ 	global_partition = ipclite->ipcmem.global_partition;
++	if (global_partition->hdr.region_offset > GLOBAL_PARTITION_SIZE ||
++		global_partition->hdr.region_size >
++		GLOBAL_PARTITION_SIZE - global_partition->hdr.region_offset)
++		return -EINVAL;
+ 	global_ipcmem->virt_base = (void *)((char *)global_partition +
+ 							global_partition->hdr.region_offset);
+ 	global_ipcmem->size = (size_t)(global_partition->hdr.region_size);
+@@ -1668,7 +1777,7 @@
+ /* API Definition End - Minor Version 0*/
+ 
+ /* Versioned Functions Start */
+-int ipclite_init(struct platform_device *pdev)
++static int ipclite_init(struct platform_device *pdev)
+ {
+ 	if (api_list_t.init == NULL) {
+ 		IPCLITE_OS_LOG(IPCLITE_ERR, "Unassigned function : %s", __func__);
+@@ -1680,6 +1789,10 @@
+ 
+ int ipclite_register_client(IPCLite_Client cb_func_ptr, void *priv)
+ {
++	/* Pair with probe publication before touching provider state. */
++	if (!smp_load_acquire(&ipclite_ready))
++		return -EPROBE_DEFER;
++
+ 	if (api_list_t.register_client == NULL) {
+ 		IPCLITE_OS_LOG(IPCLITE_ERR, "Unassigned function : %s", __func__);
+ 		return -EINVAL;
+@@ -1691,6 +1804,10 @@
+ 
+ int ipclite_register_test_client(IPCLite_Client cb_func_ptr, void *priv)
+ {
++	/* Pair with probe publication before touching provider state. */
++	if (!smp_load_acquire(&ipclite_ready))
++		return -EPROBE_DEFER;
++
+ 	if (api_list_t.register_test_client == NULL) {
+ 		IPCLITE_OS_LOG(IPCLITE_ERR, "Unassigned function : %s", __func__);
+ 		return -EINVAL;
+@@ -1702,6 +1819,10 @@
+ 
+ int ipclite_msg_send(int32_t proc_id, uint64_t data)
+ {
++	/* Pair with probe publication before touching provider state. */
++	if (!smp_load_acquire(&ipclite_ready))
++		return -EPROBE_DEFER;
++
+ 	if (api_list_t.msg_send == NULL) {
+ 		IPCLITE_OS_LOG(IPCLITE_ERR, "Unassigned function : %s", __func__);
+ 		return -EINVAL;
+@@ -1713,6 +1834,10 @@
+ 
+ int ipclite_test_msg_send(int32_t proc_id, uint64_t data)
+ {
++	/* Pair with probe publication before touching provider state. */
++	if (!smp_load_acquire(&ipclite_ready))
++		return -EPROBE_DEFER;
++
+ 	if (api_list_t.test_msg_send == NULL) {
+ 		IPCLITE_OS_LOG(IPCLITE_ERR, "Unassigned function : %s", __func__);
+ 		return -EINVAL;
+@@ -1724,6 +1849,11 @@
+ 
+ void ipclite_recover(enum ipcmem_host_type core_id)
+ {
++	/* Pair with probe publication before touching provider state. */
++	if (!smp_load_acquire(&ipclite_ready) || core_id >= IPCMEM_NUM_HOSTS ||
++		!ipclite->channel[core_id].tx_fifo)
++		return;
++
+ 	if (api_list_t.recover == NULL) {
+ 		IPCLITE_OS_LOG(IPCLITE_ERR, "Unassigned function : %s", __func__);
+ 		return;
+@@ -1735,6 +1865,10 @@
+ 
+ int32_t get_global_partition_info(struct global_region_info *global_ipcmem)
+ {
++	/* Pair with probe publication before touching provider state. */
++	if (!smp_load_acquire(&ipclite_ready))
++		return -EPROBE_DEFER;
++
+ 	if (api_list_t.partition_info == NULL) {
+ 		IPCLITE_OS_LOG(IPCLITE_ERR, "Unassigned function : %s", __func__);
+ 		return -EINVAL;
+@@ -1820,7 +1954,8 @@
+ 	}
+ 
+ 	/* Verify IPCLite Version - if version does not match crash the system */
+-	BUG_ON(major_ver != MAJOR_VERSION || minor_ver > MINOR_VERSION);
++	if (major_ver != MAJOR_VERSION || minor_ver > MINOR_VERSION)
++		return -EPROTONOSUPPORT;
+ 
+ 	return ret;
+ }
+@@ -1830,6 +1965,9 @@
+ static int ipclite_probe(struct platform_device *pdev)
+ {
+ 	int ret = 0;
++
++	if (ipclite)
++		return -EBUSY;
+ 
+ 	/* Version Setup */
+ 	ret = ipclite_version_setup(pdev->dev.of_node);
+@@ -1852,6 +1990,8 @@
+ 		goto error;
+ 	}
+ 
++	/* Publish the completed provider setup to exported API callers. */
++	smp_store_release(&ipclite_ready, true);
+ 	return ret;
+ 
+ error:
+@@ -1869,6 +2009,7 @@
+ 	.probe = ipclite_probe,
+ 	.driver = {
+ 		.name = "ipclite",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = ipclite_of_match,
+ 	},
+ };
+--- a/qcom/opensource/synx-kernel/msm/synx/ipclite.h
++++ b/qcom/opensource/synx-kernel/msm/synx/ipclite.h
+@@ -339,6 +339,7 @@
+ };
+ 
+ struct ipclite_irq_info {
++	bool irq_requested;
+ 	struct mbox_client mbox_client;
+ 	struct mbox_chan *mbox_chan;
+ 	int irq;
+@@ -353,6 +354,7 @@
+ };
+ 
+ struct ipclite_channel {
++	struct device *dev;
+ 	uint32_t remote_pid;
+ 
+ 	struct ipclite_fifo *tx_fifo;
+--- a/qcom/opensource/synx-kernel/msm/synx/synx.c
++++ b/qcom/opensource/synx-kernel/msm/synx/synx.c
+@@ -27,6 +27,7 @@
+ struct synx_hwfence_interops synx_shared_ops = { NULL };
+ 
+ struct synx_device *synx_dev;
++static bool synx_ready;
+ static atomic64_t synx_counter = ATOMIC64_INIT(1);
+ 
+ DEFINE_RATELIMIT_STATE(synx_ratelimit_state, 1 * HZ, DEFAULT_RATELIMIT_BURST);
+@@ -59,12 +60,12 @@
+ }
+ EXPORT_SYMBOL(synx_external_callback);
+ 
+-bool synx_fence_enable_signaling(struct dma_fence *fence)
++static bool synx_fence_enable_signaling(struct dma_fence *fence)
+ {
+ 	return true;
+ }
+ 
+-const char *synx_fence_driver_name(struct dma_fence *fence)
++static const char *synx_fence_driver_name(struct dma_fence *fence)
+ {
+ 	return "Global Synx driver";
+ }
+@@ -328,7 +329,7 @@
+ 	return rc;
+ }
+ 
+-int synx_native_signal_core(struct synx_coredata *synx_obj,
++static int synx_native_signal_core(struct synx_coredata *synx_obj,
+ 	u32 status,
+ 	bool cb_signal,
+ 	u64 ext_sync_id)
+@@ -508,7 +509,7 @@
+ 	return rc;
+ }
+ 
+-int synx_native_signal_merged_fence(struct synx_coredata *synx_obj, u32 status)
++static int synx_native_signal_merged_fence(struct synx_coredata *synx_obj, u32 status)
+ {
+ 	int rc = SYNX_SUCCESS;
+ 	unsigned long flags;
+@@ -546,7 +547,7 @@
+ 	return rc;
+ }
+ 
+-u32 synx_get_child_status(struct synx_coredata *synx_obj)
++static u32 synx_get_child_status(struct synx_coredata *synx_obj)
+ {
+ 	u32 h_child = 0, i = 0;
+ 	u32 status = SYNX_DMA_FENCE_STATE_MAX - 1, child_status = SYNX_STATE_ACTIVE;
+@@ -595,7 +596,7 @@
+ 	return status;
+ }
+ 
+-u32 synx_custom_get_status(struct synx_coredata *synx_obj, u32 status)
++static u32 synx_custom_get_status(struct synx_coredata *synx_obj, u32 status)
+ {
+ 	u32 custom_status = status;
+ 	u32 parent_global_status =
+@@ -894,7 +895,7 @@
+  * This function checks if the callback still exist in the reg_cbs_list
+  * and queues the callback to kernel payload for dispatching it to client.
+  */
+-void synx_timer_handler(struct work_struct *cb_dispatch)
++static void synx_timer_handler(struct work_struct *cb_dispatch)
+ {
+ 	struct synx_timer_cb_data *synx_timer_cb =
+ 		container_of(cb_dispatch, struct synx_timer_cb_data, cb_dispatch);
+@@ -929,7 +930,7 @@
+ 		if (cur == synx_cb) {
+ 			dprintk(SYNX_VERB, "Deleting timer synx_cb %pK\n", synx_cb);
+ 			synx_cb->status = SYNX_STATE_TIMEOUT;
+-			del_timer(&synx_cb->synx_timer);
++			timer_delete(&synx_cb->synx_timer);
+ 			list_del_init(&synx_cb->node);
+ 			queue_work(synx_dev->wq_cb, &synx_cb->cb_dispatch);
+ 			break;
+@@ -946,7 +947,7 @@
+ 
+ 
+ /* Timer Callback function. This will be called when timer expires */
+-void synx_timer_cb(struct timer_list *data)
++static void synx_timer_cb(struct timer_list *data)
+ {
+ 	struct synx_cb_data *synx_cb =
+ 		container_of(data, struct synx_cb_data, synx_timer);
+@@ -1166,7 +1167,7 @@
+ 			dprintk(SYNX_VERB,
+ 				"Deleting timer synx_cb %p, timeout 0x%llx\n",
+ 				synx_cb, synx_cb->timeout);
+-			del_timer_sync(&synx_cb->synx_timer);
++			timer_delete_sync(&synx_cb->synx_timer);
+ 		}
+ 		switch (ret) {
+ 		case 1:
+@@ -2873,6 +2874,10 @@
+ {
+ 	int rc = 0;
+ 
++	/* Consume only fully initialized native and interop state. */
++	if (!smp_load_acquire(&synx_ready))
++		return -ENODEV;
++
+ 	dprintk(SYNX_VERB, "Enter pid: %d\n", current->pid);
+ 	filep->private_data = NULL;
+ 
+@@ -2942,7 +2947,7 @@
+ {
+ 	struct synx_registered_ops *client_ops;
+ 
+-	if (IS_ERR_OR_NULL(params) || params->name ||
++	if (!synx_dev || IS_ERR_OR_NULL(params) || !params->name ||
+ 		!synx_util_is_valid_bind_type(params->type)) {
+ 		dprintk(SYNX_ERR, "invalid params\n");
+ 		return -SYNX_INVALID;
+@@ -2959,7 +2964,7 @@
+ }
+ EXPORT_SYMBOL(synx_deregister_ops);
+ 
+-void synx_ipc_handler(struct work_struct *cb_dispatch)
++static void synx_ipc_handler(struct work_struct *cb_dispatch)
+ {
+ 	struct synx_signal_cb *signal_cb =
+ 		container_of(cb_dispatch, struct synx_signal_cb, cb_dispatch);
+@@ -2988,6 +2993,10 @@
+ 	struct synx_signal_cb *signal_cb;
+ 	u32 status = (u32)data;
+ 	u32 handle = (u32)(data >> 32);
++
++	/* Consume only fully initialized native and interop state. */
++	if (!smp_load_acquire(&synx_ready))
++		return -SYNX_EAGAIN;
+ 
+ 	signal_cb = kzalloc(sizeof(*signal_cb), GFP_ATOMIC);
+ 	if (IS_ERR_OR_NULL(signal_cb))
+@@ -3110,107 +3119,109 @@
+ 
+ static int __init synx_init(void)
+ {
++	struct device *device;
+ 	int rc;
+ 
+-	dprintk(SYNX_INFO, "device initialization start\n");
+-
+ 	synx_dev = kzalloc(sizeof(*synx_dev), GFP_KERNEL);
+-	if (IS_ERR_OR_NULL(synx_dev))
+-		return -SYNX_NOMEM;
+-
+-	rc = alloc_chrdev_region(&synx_dev->dev, 0, 1, SYNX_DEVICE_NAME);
+-	if (rc < 0) {
+-		dprintk(SYNX_ERR, "region allocation failed\n");
+-		goto alloc_fail;
+-	}
+-
+-	cdev_init(&synx_dev->cdev, &synx_fops);
+-	synx_dev->cdev.owner = THIS_MODULE;
+-	rc = cdev_add(&synx_dev->cdev, synx_dev->dev, 1);
+-	if (rc < 0) {
+-		dprintk(SYNX_ERR, "device registation failed\n");
+-		goto reg_fail;
+-	}
+-
+-#if (KERNEL_VERSION(6, 4, 0) <= LINUX_VERSION_CODE)
+-	synx_dev->class = class_create("SYNX_DEVICE_NAME");
+-#else
+-	synx_dev->class = class_create(THIS_MODULE, "SYNX_DEVICE_NAME");
+-#endif
+-
+-	if (IS_ERR(synx_dev->class)) {
+-		rc = PTR_ERR(synx_dev->class);
+-		goto err_class_create;
+-	}
+-	device_create(synx_dev->class, NULL, synx_dev->dev,
+-		NULL, SYNX_DEVICE_NAME);
++	if (!synx_dev)
++		return -ENOMEM;
++	mutex_init(&synx_dev->vtbl_lock);
++	mutex_init(&synx_dev->error_lock);
++	INIT_LIST_HEAD(&synx_dev->error_list);
+ 
+ 	synx_dev->wq_cb = alloc_workqueue(SYNX_WQ_CB_NAME,
+ 		WQ_HIGHPRI | WQ_UNBOUND, SYNX_WQ_CB_THREADS);
+ 	synx_dev->wq_cleanup = alloc_workqueue(SYNX_WQ_CLEANUP_NAME,
+ 		WQ_HIGHPRI | WQ_UNBOUND, SYNX_WQ_CLEANUP_THREADS);
+ 	if (!synx_dev->wq_cb || !synx_dev->wq_cleanup) {
+-		dprintk(SYNX_ERR,
+-			"high priority work queue creation failed\n");
+-		rc = -SYNX_INVALID;
+-		goto fail;
+-	}
+-
++		rc = -ENOMEM;
++		goto free_state;
++	}
+ 	synx_dev->native = vzalloc(sizeof(*synx_dev->native));
+-	if (IS_ERR_OR_NULL(synx_dev->native))
+-		goto fail;
+-
+-	mutex_init(&synx_dev->vtbl_lock);
+-	mutex_init(&synx_dev->error_lock);
+-	INIT_LIST_HEAD(&synx_dev->error_list);
++	if (!synx_dev->native) {
++		rc = -ENOMEM;
++		goto free_state;
++	}
++	rc = synx_local_mem_init();
++	if (rc)
++		goto free_state;
++	rc = synx_global_mem_init();
++	if (rc)
++		goto free_state;
++
++	rc = alloc_chrdev_region(&synx_dev->dev, 0, 1, SYNX_DEVICE_NAME);
++	if (rc)
++		goto free_global;
++	synx_dev->cdev = cdev_alloc();
++	if (!synx_dev->cdev) {
++		rc = -ENOMEM;
++		goto free_region;
++	}
++	synx_dev->cdev->owner = THIS_MODULE;
++	synx_dev->cdev->ops = &synx_fops;
++	rc = cdev_add(synx_dev->cdev, synx_dev->dev, 1);
++	if (rc) {
++		kobject_put(&synx_dev->cdev->kobj);
++		goto free_region;
++	}
++	synx_dev->class = class_create("SYNX_DEVICE_NAME");
++	if (IS_ERR(synx_dev->class)) {
++		rc = PTR_ERR(synx_dev->class);
++		goto free_cdev;
++	}
++	device = device_create(synx_dev->class, NULL, synx_dev->dev,
++		NULL, SYNX_DEVICE_NAME);
++	if (IS_ERR(device)) {
++		rc = PTR_ERR(device);
++		goto free_class;
++	}
++
++	synx_dev->cdsp_ssr.nb.notifier_call = synx_cdsp_restart_notifier;
++	synx_dev->cdsp_ssr.handle =
++		qcom_register_ssr_notifier("cdsp", &synx_dev->cdsp_ssr.nb);
++	if (IS_ERR_OR_NULL(synx_dev->cdsp_ssr.handle)) {
++		rc = synx_dev->cdsp_ssr.handle ? PTR_ERR(synx_dev->cdsp_ssr.handle) : -ENODEV;
++		goto free_device;
++	}
++	rc = ipclite_register_client(synx_ipc_callback, NULL);
++	if (rc)
++		goto free_notifier;
++
++	/* IPCLite and firmware interop have no callback revocation protocol. */
++	__module_get(THIS_MODULE);
++	rc = synx_hwfence_init_ops(&synx_hwfence_ops);
++	if (rc)
++		dprintk(SYNX_DBG, "hwfence is not supported through synx api, err=%d\n", rc);
++	synx_shared_ops.share_handle_status = synx_internal_share_handle_status;
++	synx_shared_ops.get_fence = synx_internal_get_dma_fence;
++	rc = synx_hwfence_init_interops(&synx_shared_ops, &hwfence_shared_ops);
++	if (rc)
++		dprintk(SYNX_ERR, "Hw fence inter-op mapping failed, err %d\n", rc);
+ #if IS_ENABLED(CONFIG_DEBUG_FS)
+ 	synx_dev->debugfs_root = synx_init_debugfs_dir(synx_dev);
+ #endif
+-	rc = synx_global_mem_init();
+-	if (rc) {
+-		dprintk(SYNX_ERR, "shared mem init failed, err=%d\n", rc);
+-		goto err;
+-	}
+-
+-	synx_dev->cdsp_ssr.ssrcnt = 0;
+-	synx_dev->cdsp_ssr.nb.notifier_call = synx_cdsp_restart_notifier;
+-	synx_dev->cdsp_ssr.handle =
+-		qcom_register_ssr_notifier("cdsp", &synx_dev->cdsp_ssr.nb);
+-	if (synx_dev->cdsp_ssr.handle == NULL) {
+-		dprintk(SYNX_ERR, "SSR registration failed\n");
+-		goto err;
+-	}
+-	rc = synx_hwfence_init_ops(&synx_hwfence_ops);
+-	if (rc)
+-		dprintk(SYNX_DBG, "hwfence is not supported through synx api, err=%d\n", rc);
+-
+-	synx_shared_ops.share_handle_status = synx_internal_share_handle_status;
+-	synx_shared_ops.get_fence = synx_internal_get_dma_fence;
+-	synx_shared_ops.notify_recover = NULL;
+-	synx_shared_ops.signal_fence = NULL;
+-	synx_shared_ops.dma_add_cb_no_enable_sig = NULL;
+-	rc  = synx_hwfence_init_interops(&synx_shared_ops, &hwfence_shared_ops);
+-	if (rc) {
+-		dprintk(SYNX_ERR, "Hw fence inter-op mapping failed, err %d\n", rc);
+-	}
+-
+-	ipclite_register_client(synx_ipc_callback, NULL);
+-	synx_local_mem_init();
+-
+-	dprintk(SYNX_INFO, "device initialization success\n");
+-
++	/* Publish state to both userspace opens and IPC IRQ callbacks. */
++	smp_store_release(&synx_ready, true);
+ 	return 0;
+ 
+-err:
++free_notifier:
++	qcom_unregister_ssr_notifier(synx_dev->cdsp_ssr.handle, &synx_dev->cdsp_ssr.nb);
++free_device:
++	device_destroy(synx_dev->class, synx_dev->dev);
++free_class:
++	class_destroy(synx_dev->class);
++free_cdev:
++	cdev_del(synx_dev->cdev);
++free_region:
++	unregister_chrdev_region(synx_dev->dev, 1);
++free_global:
++	synx_global_mem_close();
++free_state:
++	if (synx_dev->wq_cb)
++		destroy_workqueue(synx_dev->wq_cb);
++	if (synx_dev->wq_cleanup)
++		destroy_workqueue(synx_dev->wq_cleanup);
+ 	vfree(synx_dev->native);
+-fail:
+-	device_destroy(synx_dev->class, synx_dev->dev);
+-	class_destroy(synx_dev->class);
+-err_class_create:
+-	cdev_del(&synx_dev->cdev);
+-reg_fail:
+-	unregister_chrdev_region(synx_dev->dev, 1);
+-alloc_fail:
+ 	kfree(synx_dev);
+ 	synx_dev = NULL;
+ 	return rc;
+@@ -3224,7 +3235,7 @@
+ 	flush_workqueue(synx_dev->wq_cleanup);
+ 	device_destroy(synx_dev->class, synx_dev->dev);
+ 	class_destroy(synx_dev->class);
+-	cdev_del(&synx_dev->cdev);
++	cdev_del(synx_dev->cdev);
+ 	unregister_chrdev_region(synx_dev->dev, 1);
+ 	synx_remove_debugfs_dir(synx_dev);
+ 	/* release uncleared error nodes */
+--- a/qcom/opensource/synx-kernel/msm/synx/synx_debugfs.c
++++ b/qcom/opensource/synx-kernel/msm/synx/synx_debugfs.c
+@@ -33,7 +33,7 @@
+ 	SYNX_INFO;
+ EXPORT_SYMBOL(synx_debug);
+ 
+-void populate_bound_rows(
++static void __maybe_unused populate_bound_rows(
+ 	struct synx_coredata *row, char *cur, char *end)
+ {
+ 	int j;
+--- a/qcom/opensource/synx-kernel/msm/synx/synx_global.c
++++ b/qcom/opensource/synx-kernel/msm/synx/synx_global.c
+@@ -423,7 +423,7 @@
+ 	return SYNX_SUCCESS;
+ }
+ 
+-u32 synx_global_get_parents_num(u32 idx)
++static u32 __maybe_unused synx_global_get_parents_num(u32 idx)
+ {
+ 	int rc;
+ 	unsigned long flags;
+@@ -943,6 +943,11 @@
+ 		return rc;
+ 	}
+ 
++	if (!mem_info.virt_base || mem_info.size <
++		(bitmap_size + 2) * sizeof(u32) +
++		SYNX_GLOBAL_MAX_OBJS * sizeof(struct synx_global_coredata))
++		return -SYNX_INVALID;
++
+ 	memset(mem_info.virt_base, 0, mem_info.size);
+ 	dprintk(SYNX_DBG, "global shared memory %pK size %u\n",
+ 		mem_info.virt_base, mem_info.size);
+@@ -956,3 +961,13 @@
+ 
+ 	return synx_gmem_init();
+ }
++
++/* Used only before publishing the client callbacks. */
++void synx_global_mem_close(void)
++{
++	if (synx_hwlock) {
++		hwspin_lock_free(synx_hwlock);
++		synx_hwlock = NULL;
++	}
++	memset(&synx_gmem, 0, sizeof(synx_gmem));
++}
+--- a/qcom/opensource/synx-kernel/msm/synx/synx_global.h
++++ b/qcom/opensource/synx-kernel/msm/synx/synx_global.h
+@@ -109,6 +109,7 @@
+  * @return Zero on success, negative error on failure.
+  */
+ int synx_global_mem_init(void);
++void synx_global_mem_close(void);
+ 
+ /**
+  * synx_global_map_core_id - Map Synx core ID to IPC Lite host
+--- a/qcom/opensource/synx-kernel/msm/synx/synx_private.h
++++ b/qcom/opensource/synx-kernel/msm/synx/synx_private.h
+@@ -224,7 +224,7 @@
+ };
+ 
+ struct synx_device {
+-	struct cdev cdev;
++	struct cdev *cdev;
+ 	dev_t dev;
+ 	struct class *class;
+ 	struct synx_native *native;
+--- a/qcom/opensource/synx-kernel/msm/synx/synx_util.c
++++ b/qcom/opensource/synx-kernel/msm/synx/synx_util.c
+@@ -281,7 +281,7 @@
+ 	kref_put(&synx_obj->refcount, synx_util_destroy_coredata);
+ }
+ 
+-int synx_util_cleanup_merged_fence(struct synx_coredata *synx_obj, int status)
++static int synx_util_cleanup_merged_fence(struct synx_coredata *synx_obj, int status)
+ {
+ 	struct dma_fence_array *array = NULL;
+ 	u32 i;
+@@ -335,7 +335,7 @@
+ 			dprintk(SYNX_VERB,
+ 				"Deleting timer synx_cb 0x%p, timeout 0x%llx\n",
+ 				synx_cb, synx_cb->timeout);
+-			del_timer_sync(&synx_cb->synx_timer);
++			timer_delete_sync(&synx_cb->synx_timer);
+ 		}
+ 
+ 		synx_cb->status = SYNX_STATE_SIGNALED_CANCEL;
+@@ -1221,7 +1221,7 @@
+ 			dprintk(SYNX_VERB,
+ 				"Deleting timer synx_cb %p, timeout 0x%llx\n",
+ 				synx_cb, synx_cb->timeout);
+-			del_timer_sync(&synx_cb->synx_timer);
++			timer_delete_sync(&synx_cb->synx_timer);
+ 		}
+ 		synx_cb->status = status;
+ 		list_del_init(&synx_cb->node);
+--- a/qcom/opensource/synx-kernel/msm/synx/synx_util.h
++++ b/qcom/opensource/synx-kernel/msm/synx/synx_util.h
+@@ -187,4 +187,8 @@
+ 
+ int synx_get_child_coredata(struct synx_coredata *synx_obj, struct synx_coredata ***child_synx_obj, int *num_fences);
+ 
++void synx_external_callback(s32 sync_obj, int status, void *data);
++
++void synx_fence_release(struct dma_fence *fence);
++
+ #endif /* __SYNX_UTIL_H__ */
+--- a/qcom/opensource/mm-drivers/hw_fence/include/hw_fence_drv_priv.h
++++ b/qcom/opensource/mm-drivers/hw_fence/include/hw_fence_drv_priv.h
+@@ -432,6 +432,11 @@
+ 
+ 	struct device *dev;
+ 	bool resources_ready;
++	bool rm_registered;
++	bool soccp_irq_requested;
++	int soccp_irq;
++	struct iommu_domain *soccp_domain;
++	u32 soccp_iova;
+ 
+ 	/* Table & Queues info */
+ 	u32 hw_fence_table_entries;
+--- a/qcom/opensource/mm-drivers/hw_fence/include/hw_fence_drv_utils.h
++++ b/qcom/opensource/mm-drivers/hw_fence/include/hw_fence_drv_utils.h
+@@ -89,6 +89,8 @@
+  *
+  * Returns zero if success, otherwise returns negative error code.
+  */
++int hw_fence_utils_share_mem(struct hw_fence_driver_data *drv_data);
++void hw_fence_utils_release(struct hw_fence_driver_data *drv_data);
+ int hw_fence_utils_alloc_mem(struct hw_fence_driver_data *hw_fence_drv_data);
+ 
+ /**
+--- a/qcom/opensource/mm-drivers/hw_fence/include/msm_hw_fence.h
++++ b/qcom/opensource/mm-drivers/hw_fence/include/msm_hw_fence.h
+@@ -710,4 +710,6 @@
+ }
+ #endif
+ 
++int msm_hw_fence_driver_doorbell_sim(u64 db_mask);
++
+ #endif
+--- a/qcom/opensource/mm-drivers/hw_fence/src/hw_fence_drv_debug.c
++++ b/qcom/opensource/mm-drivers/hw_fence/src/hw_fence_drv_debug.c
+@@ -219,7 +219,7 @@
+ 	.write = hw_fence_dbg_ipcc_write,
+ };
+ 
+-struct client_data *_get_client_node(struct hw_fence_driver_data *drv_data, u32 client_id)
++static struct client_data *_get_client_node(struct hw_fence_driver_data *drv_data, u32 client_id)
+ {
+ 	struct client_data *node = NULL;
+ 	bool found = false;
+--- a/qcom/opensource/mm-drivers/hw_fence/src/hw_fence_drv_priv.c
++++ b/qcom/opensource/mm-drivers/hw_fence/src/hw_fence_drv_priv.c
+@@ -768,12 +768,10 @@
+ 		goto exit;
+ 	}
+ 
+-	/* Init debugfs */
+-	ret = hw_fence_debug_debugfs_register(drv_data);
+-	if (ret) {
+-		HWFNC_ERR("debugfs init failed\n");
+-		goto exit;
+-	}
++	hw_fence_dma_fence_init_hash_table(drv_data);
++	mutex_init(&drv_data->soccp_props.rproc_lock);
++	refcount_set(&drv_data->soccp_props.usage_cnt, 1);
++	init_waitqueue_head(&drv_data->soccp_props.ssr_wait_queue);
+ 
+ 	/* Init irq from fctl */
+ 	if (drv_data->has_soccp)
+@@ -786,21 +784,19 @@
+ 		goto exit;
+ 	}
+ 
+-	if (drv_data->has_soccp) {
+-		ret = hw_fence_utils_register_soccp_ssr_notifier(drv_data);
+-		if (ret) {
+-			HWFNC_ERR("failed to register for soccp ssr notification\n");
+-			goto exit;
+-		}
+-	}
+-
+-	hw_fence_dma_fence_init_hash_table(drv_data);
+ 
+ 	mem = drv_data->io_mem_base;
+ 	HWFNC_DBG_H("memory ptr:0x%pK val:0x%x\n", mem, *mem);
+ 
+ 	HWFNC_DBG_INIT("HW Fences Table Initialized: 0x%pK cnt:%d\n",
+ 		drv_data->hw_fences_tbl, drv_data->hw_fences_tbl_cnt);
++
++	ret = hw_fence_utils_share_mem(drv_data);
++	if (!ret) {
++		/* Firmware mappings and fence callbacks have no live revoke handshake. */
++		__module_get(THIS_MODULE);
++		hw_fence_debug_debugfs_register(drv_data);
++	}
+ 
+ exit:
+ 	return ret;
+@@ -1202,7 +1198,7 @@
+ 	return 0;
+ }
+ 
+-struct msm_hw_fence *_hw_fence_lookup_and_create_range(struct hw_fence_driver_data *drv_data,
++static struct msm_hw_fence *_hw_fence_lookup_and_create_range(struct hw_fence_driver_data *drv_data,
+ 	u32 client_id, u64 hlos_key, u64 context, u64 seqno, u32 pending_child_cnt, u64 *hash,
+ 	u32 start_step, u32 end_step, u64 flags)
+ {
+@@ -1259,14 +1255,15 @@
+ 	return hw_fence;
+ }
+ 
+-struct msm_hw_fence *_hw_fence_lookup_and_create(struct hw_fence_driver_data *drv_data,
++static struct msm_hw_fence *_hw_fence_lookup_and_create(struct hw_fence_driver_data *drv_data,
+ 	u32 client_id, u64 hlos_key, u64 context, u64 seqno, u32 pending_child_cnt, u64 *hash)
+ {
+ 	return _hw_fence_lookup_and_create_range(drv_data, client_id, hlos_key, context, seqno,
+ 		pending_child_cnt, hash, 0, drv_data->hw_fences_tbl_cnt, 0);
+ }
+ 
+-struct msm_hw_fence *_hw_fence_lookup_and_process_range(struct hw_fence_driver_data *drv_data,
++static struct msm_hw_fence *
++_hw_fence_lookup_and_process_range(struct hw_fence_driver_data *drv_data,
+ 	u64 hlos_key, u64 context, u64 seqno, u64 *hash, u32 start_step, u32 end_step,
+ 	int (*process_fn)(struct hw_fence_driver_data *drv_data, struct msm_hw_fence *hfence,
+ 		u32 hash))
+@@ -1303,7 +1300,7 @@
+ 	return hw_fence;
+ }
+ 
+-struct msm_hw_fence *_hw_fence_lookup_and_process(struct hw_fence_driver_data *drv_data,
++static struct msm_hw_fence *_hw_fence_lookup_and_process(struct hw_fence_driver_data *drv_data,
+ 	u64 hlos_key, u64 context, u64 seqno, u64 *hash,
+ 	int (*process_fn)(struct hw_fence_driver_data *drv_data, struct msm_hw_fence *hfence,
+ 		u32 hash))
+@@ -1343,7 +1340,7 @@
+ 	return (struct dma_fence *)fence;
+ }
+ 
+-int hw_fence_dma_fence_table_add(struct hw_fence_driver_data *drv_data,
++static int hw_fence_dma_fence_table_add(struct hw_fence_driver_data *drv_data,
+ 	struct msm_hw_fence_client *hw_fence_client, struct dma_fence *fence, u64 hw_fence_hash)
+ {
+ 	struct hw_dma_fence *hw_dma_fence;
+@@ -1835,7 +1832,7 @@
+ }
+ 
+ /* update join fence for signaled child_fence and return if the join fence should be signaled */
+-bool _update_and_get_join_fence_signal_status(struct hw_fence_driver_data *drv_data,
++static bool _update_and_get_join_fence_signal_status(struct hw_fence_driver_data *drv_data,
+ 	struct msm_hw_fence *join_fence, u32 child_fence_error)
+ {
+ 	bool signal_join_fence, error = false;
+@@ -2211,7 +2208,7 @@
+ 		hw_fence_destroy_refcount(drv_data, hash, HW_FENCE_FCTL_REFCOUNT);
+ }
+ 
+-struct msm_hw_fence *_create_signaled_hw_fence(struct hw_fence_driver_data *drv_data,
++static struct msm_hw_fence *_create_signaled_hw_fence(struct hw_fence_driver_data *drv_data,
+ 	u32 client_id, struct dma_fence *fence, u64 *hash)
+ {
+ 	struct msm_hw_fence *hw_fence;
+--- a/qcom/opensource/mm-drivers/hw_fence/src/hw_fence_drv_utils.c
++++ b/qcom/opensource/mm-drivers/hw_fence/src/hw_fence_drv_utils.c
+@@ -9,6 +9,8 @@
+ #include <linux/iommu.h>
+ #include <linux/gunyah/gh_rm_drv.h>
+ #include <linux/gunyah/gh_dbl.h>
++#include <linux/debugfs.h>
++#include <linux/overflow.h>
+ #include <linux/version.h>
+ #if (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
+ #include <linux/firmware/qcom/qcom_scm.h>
+@@ -509,6 +511,16 @@
+ 	hw_fence_utils_process_signaled_clients_mask(drv_data, clear_flags);
+ }
+ 
++static struct device_node *hw_fence_find_child(struct device_node *parent, const char *compat)
++{
++	struct device_node *child;
++
++	for_each_available_child_of_node(parent, child)
++		if (of_device_is_compatible(child, compat))
++			return child;
++	return NULL;
++}
++
+ int hw_fence_utils_init_virq(struct hw_fence_driver_data *drv_data)
+ {
+ 	struct device_node *node = drv_data->dev->of_node;
+@@ -516,13 +528,14 @@
+ 	const char *compat = "qcom,msm-hw-fence-db";
+ 	int ret;
+ 
+-	node_compat = of_find_compatible_node(node, NULL, compat);
++	node_compat = hw_fence_find_child(node, compat);
+ 	if (!node_compat) {
+ 		HWFNC_ERR("Failed to find dev node with compat:%s\n", compat);
+ 		return -EINVAL;
+ 	}
+ 
+ 	ret = of_property_read_u32(node_compat, "gunyah-label", &drv_data->db_label);
++	of_node_put(node_compat);
+ 	if (ret) {
+ 		HWFNC_ERR("failed to find label info %d\n", ret);
+ 		return ret;
+@@ -531,7 +544,8 @@
+ 	HWFNC_DBG_IRQ("registering doorbell db_label:%d\n", drv_data->db_label);
+ 	drv_data->rx_dbl = gh_dbl_rx_register(drv_data->db_label, _hw_fence_cb, drv_data);
+ 	if (IS_ERR_OR_NULL(drv_data->rx_dbl)) {
+-		ret = PTR_ERR(drv_data->rx_dbl);
++		ret = drv_data->rx_dbl ? PTR_ERR(drv_data->rx_dbl) : -ENODEV;
++		drv_data->rx_dbl = NULL;
+ 		HWFNC_ERR("Failed to register doorbell\n");
+ 		return ret;
+ 	}
+@@ -556,9 +570,12 @@
+ 	struct hw_fence_driver_data *drv_data = (struct hw_fence_driver_data *)data;
+ 	u32 mask;
+ 
+-	while (drv_data->has_soccp) {
++	while (!kthread_should_stop()) {
+ 		wait_event(drv_data->soccp_wait_queue,
++			kthread_should_stop() ||
+ 			atomic_read(&drv_data->signaled_clients_mask) != 0);
++		if (kthread_should_stop())
++			break;
+ 		mask = atomic_xchg(&drv_data->signaled_clients_mask, 0);
+ 		if (mask)
+ 			hw_fence_utils_process_signaled_clients_mask(drv_data, mask);
+@@ -647,6 +664,8 @@
+ 		return ret;
+ 	}
+ 
++	drv_data->soccp_irq = irq;
++	drv_data->soccp_irq_requested = true;
+ 	thread = kthread_run(hw_fence_soccp_listener, (void *)drv_data,
+ 		"msm_hw_fence_soccp_listener");
+ 	if (IS_ERR(thread)) {
+@@ -821,9 +840,6 @@
+ 	}
+ 	soccp_props = &drv_data->soccp_props;
+ 
+-	mutex_init(&soccp_props->rproc_lock);
+-	refcount_set(&soccp_props->usage_cnt, 1);
+-	init_waitqueue_head(&soccp_props->ssr_wait_queue);
+ 	soccp_props->ssr_nb.priority = 1; /* higher value indicates higher priority */
+ 	soccp_props->ssr_nb.notifier_call = hw_fence_notify_ssr;
+ 	notifier = qcom_register_ssr_notifier("soccp", &soccp_props->ssr_nb);
+@@ -864,16 +880,6 @@
+ 	struct gh_sgl_desc *sgl;
+ 	int ret;
+ 
+-	srcvmids = BIT(src_vmlist[0].vmid);
+-	dstvmids = BIT(dst_vmlist[0].vmid) | BIT(dst_vmlist[1].vmid);
+-	ret = qcom_scm_assign_mem(drv_data->res.start, resource_size(&drv_data->res), &srcvmids,
+-		dst_vmlist, ARRAY_SIZE(dst_vmlist));
+-	if (ret) {
+-		HWFNC_ERR("%s: qcom_scm_assign_mem failed addr=0x%llx size=%lu err=%d\n",
+-			__func__, drv_data->res.start, drv_data->size, ret);
+-		return ret;
+-	}
+-
+ 	acl = kzalloc(offsetof(struct gh_acl_desc, acl_entries[2]), GFP_KERNEL);
+ 	if (!acl)
+ 		return -ENOMEM;
+@@ -882,6 +888,21 @@
+ 		kfree(acl);
+ 		return -ENOMEM;
+ 	}
++
++	if (self >= 64 || peer >= 64) {
++		ret = -EINVAL;
++		goto free_desc;
++	}
++	srcvmids = BIT_ULL(src_vmlist[0].vmid);
++	dstvmids = BIT_ULL(dst_vmlist[0].vmid) | BIT_ULL(dst_vmlist[1].vmid);
++	ret = qcom_scm_assign_mem(drv_data->res.start, resource_size(&drv_data->res), &srcvmids,
++		dst_vmlist, ARRAY_SIZE(dst_vmlist));
++	if (ret) {
++		HWFNC_ERR("%s: qcom_scm_assign_mem failed addr=0x%llx size=%lu err=%d\n",
++			__func__, drv_data->res.start, drv_data->size, ret);
++		goto free_desc;
++	}
++
+ 	acl->n_acl_entries = 2;
+ 	acl->acl_entries[0].vmid = (u16)self;
+ 	acl->acl_entries[0].perms = GH_RM_ACL_R | GH_RM_ACL_W;
+@@ -908,6 +929,7 @@
+ 		ret = -EPROBE_DEFER;
+ 	}
+ 
++free_desc:
+ 	kfree(acl);
+ 	kfree(sgl);
+ 
+@@ -1030,7 +1052,7 @@
+ static int _init_soccp_mem(struct hw_fence_driver_data *drv_data)
+ {
+ 	struct iommu_domain *domain;
+-	u32 shbuf_soccp_va;
++	u32 shbuf_soccp_va = 0;
+ 	int ret;
+ 
+ 	if (!drv_data) {
+@@ -1052,7 +1074,7 @@
+ 	domain = iommu_get_domain_for_dev(drv_data->dev);
+ 	if (IS_ERR_OR_NULL(domain)) {
+ 		HWFNC_ERR("failed to get iommu domain for device ret:%ld\n", PTR_ERR(domain));
+-		return PTR_ERR(domain);
++		return domain ? PTR_ERR(domain) : -EPROBE_DEFER;
+ 	}
+ 
+ #if (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
+@@ -1069,6 +1091,11 @@
+ 		HWFNC_DBG_INIT("mapped for soccp smmu phys_addr:0x%llx va:0x%x sz:%lx ret:%d\n",
+ 			drv_data->res.start, shbuf_soccp_va, drv_data->size, ret);
+ 
++	if (!ret) {
++		drv_data->soccp_domain = domain;
++		drv_data->soccp_iova = shbuf_soccp_va;
++	}
++
+ 	return ret;
+ }
+ 
+@@ -1111,7 +1138,7 @@
+ 	}
+ 
+ 	events_size = HW_FENCE_MAX_EVENTS * sizeof(struct msm_hw_fence_event);
+-	if (drv_data->used_mem_size >= U32_MAX - events_size) {
++	if (drv_data->used_mem_size > (U32_MAX & PAGE_MASK) - events_size) {
+ 		HWFNC_ERR("invalid used_mem_size:%u events_size:%u\n", drv_data->used_mem_size,
+ 			events_size);
+ 		return -EINVAL;
+@@ -1125,6 +1152,7 @@
+ 		return -ENOMEM;
+ 	}
+ 
++	drv_data->size = size;
+ 	drv_data->res.end = drv_data->res.start + size - 1;
+ 	drv_data->res.name = "hwfence_shbuf";
+ 	HWFNC_DBG_INIT("allocated memory start:0x%llx end:0x%llx size:0x%x\n", drv_data->res.start,
+@@ -1136,65 +1164,77 @@
+ /* Allocates carved-out mapped memory */
+ int hw_fence_utils_alloc_mem(struct hw_fence_driver_data *drv_data)
+ {
+-	struct device_node *node = drv_data->dev->of_node;
+ 	struct device_node *node_compat;
+-	const char *compat = "qcom,msm-hw-fence-mem";
+ 	int ret;
+ 
+-	node_compat = of_find_compatible_node(node, NULL, compat);
+-	if (!node_compat && !drv_data->has_soccp) {
+-		HWFNC_ERR("Failed to find dev node with compat:%s\n", compat);
+-		return -EINVAL;
+-	}
+-
+-	if (node_compat)
+-		ret = _alloc_mem_static(drv_data, node_compat);
+-	else
+-		ret = _alloc_mem_dynamic(drv_data);
+-
+-	if (ret) {
+-		HWFNC_ERR("failed to allocate static or dynamic memory ret:%d\n", ret);
++	node_compat = hw_fence_find_child(drv_data->dev->of_node, "qcom,msm-hw-fence-mem");
++	if (!node_compat && !drv_data->has_soccp)
++		return -EINVAL;
++	ret = node_compat ? _alloc_mem_static(drv_data, node_compat) : _alloc_mem_dynamic(drv_data);
++	of_node_put(node_compat);
++	if (ret)
+ 		return ret;
+-	}
+-
++	drv_data->size = resource_size(&drv_data->res);
++	if (!drv_data->size || drv_data->size > U32_MAX || drv_data->size < drv_data->used_mem_size)
++		return -EINVAL;
+ 	if (drv_data->has_soccp)
+-		drv_data->io_mem_base = memremap(drv_data->res.start, resource_size(&drv_data->res),
+-			MEMREMAP_WB);
++		drv_data->io_mem_base = memremap(drv_data->res.start, drv_data->size, MEMREMAP_WB);
+ 	else
+ 		drv_data->io_mem_base = devm_ioremap_wc(drv_data->dev, drv_data->res.start,
+-			resource_size(&drv_data->res));
+-
+-	if (!drv_data->io_mem_base) {
+-		HWFNC_ERR("ioremap failed!\n");
+-		return -ENXIO;
+-	}
+-	drv_data->size = resource_size(&drv_data->res);
+-	if (drv_data->size < drv_data->used_mem_size) {
+-		HWFNC_ERR("0x%lx size of carved-out memory region less than required size:0x%x\n",
+-			drv_data->size, drv_data->used_mem_size);
++			drv_data->size);
++	if (!drv_data->io_mem_base)
+ 		return -ENOMEM;
+-	}
+-
+-	memset_io(drv_data->io_mem_base, 0x0, drv_data->size);
+-
+-	HWFNC_DBG_INIT("va:0x%pK start:0x%llx sz:0x%lx name:%s cookie:0x%pK has_soccp:%s\n",
+-		drv_data->io_mem_base, drv_data->res.start, drv_data->size, drv_data->res.name,
+-		drv_data->cpu_addr_cookie, drv_data->has_soccp ? "true" : "false");
++	memset_io(drv_data->io_mem_base, 0, drv_data->size);
++	return drv_data->has_soccp ? _init_soccp_mem(drv_data) : 0;
++}
++
++int hw_fence_utils_share_mem(struct hw_fence_driver_data *drv_data)
++{
++	struct device_node *node;
++	int ret;
+ 
+ 	if (drv_data->has_soccp)
+-		ret = _init_soccp_mem(drv_data);
+-	else
+-		ret = _register_vm_mem_with_hyp(drv_data, node_compat);
+-
+-	if (ret)
+-		HWFNC_ERR("failed to share mem with %s cpu_va:0x%pK pa:0x%llx sz:0x%lx name:%s\n",
+-			drv_data->has_soccp ? "soccp" : "vm", drv_data->io_mem_base,
+-			drv_data->res.start, drv_data->size, drv_data->res.name);
+-
++		return hw_fence_utils_register_soccp_ssr_notifier(drv_data);
++	node = hw_fence_find_child(drv_data->dev->of_node, "qcom,msm-hw-fence-mem");
++	ret = _register_vm_mem_with_hyp(drv_data, node);
++	of_node_put(node);
++	if (!ret)
++		drv_data->rm_registered = true;
+ 	return ret;
+ }
+ 
+-char *_get_mem_reserve_type(enum hw_fence_mem_reserve type)
++/* Failure cleanup runs only before publishing resources to clients or firmware. */
++void hw_fence_utils_release(struct hw_fence_driver_data *drv_data)
++{
++	struct hw_fence_soccp *soccp = &drv_data->soccp_props;
++
++	if (drv_data->rm_registered)
++		gh_rm_unregister_notifier(&drv_data->rm_nb);
++	if (soccp->ssr_notifier)
++		qcom_unregister_ssr_notifier(soccp->ssr_notifier, &soccp->ssr_nb);
++	if (drv_data->soccp_irq_requested)
++		devm_free_irq(drv_data->dev, drv_data->soccp_irq, drv_data);
++	if (drv_data->soccp_listener_thread)
++		kthread_stop(drv_data->soccp_listener_thread);
++	if (!IS_ERR_OR_NULL(drv_data->rx_dbl))
++		gh_dbl_rx_unregister(drv_data->rx_dbl);
++	debugfs_remove_recursive(drv_data->debugfs_data.root);
++	if (!IS_ERR_OR_NULL(soccp->rproc))
++		rproc_put(soccp->rproc);
++	if (drv_data->soccp_domain)
++		iommu_unmap(drv_data->soccp_domain, drv_data->soccp_iova, drv_data->size);
++	if (drv_data->has_soccp && drv_data->io_mem_base)
++		memunmap(drv_data->io_mem_base);
++	if (drv_data->cpu_addr_cookie)
++		dma_free_attrs(drv_data->dev, drv_data->size, drv_data->cpu_addr_cookie,
++			drv_data->res.start, DMA_ATTR_NO_KERNEL_MAPPING);
++	kfree(drv_data->clients);
++	kfree(drv_data->hlos_key_tbl);
++	kfree(drv_data->ipc_clients_table);
++	kfree(drv_data->hw_fence_client_queue_size);
++}
++
++static char *_get_mem_reserve_type(enum hw_fence_mem_reserve type)
+ {
+ 	switch (type) {
+ 	case HW_FENCE_MEM_RESERVE_CTRL_QUEUE:
+@@ -1385,6 +1425,17 @@
+ 	return ret;
+ }
+ 
++static int hw_fence_checked_region_size(u32 header, u32 payload, u32 queues,
++	u32 start_padding, u32 end_padding, u32 *size)
++{
++	u64 total = (u64)header + (u64)payload * queues + start_padding + end_padding;
++
++	if (total > (U32_MAX & PAGE_MASK))
++		return -EOVERFLOW;
++	*size = PAGE_ALIGN(total);
++	return 0;
++}
++
+ static int _parse_client_queue_dt_props_indv(struct hw_fence_driver_data *drv_data,
+ 	struct hw_fence_client_type_desc *desc)
+ {
+@@ -1434,17 +1485,12 @@
+ 	}
+ 
+ 	queue_size = HW_FENCE_CLIENT_QUEUE_PAYLOAD * desc->queue_entries;
+-	if (queue_size >= ((U32_MAX & PAGE_MASK) -
+-			(HW_FENCE_HFI_CLIENT_HEADERS_SIZE(desc->queues_num, drv_data->has_soccp) +
+-			desc->start_padding + desc->end_padding)) / desc->queues_num) {
+-		HWFNC_ERR("%s client queue_sz:%u start_p:%u end_p:%u will overflow mem size\n",
+-			desc->name, queue_size, desc->start_padding, desc->end_padding);
+-		return -EINVAL;
+-	}
+-
+-	desc->mem_size = PAGE_ALIGN(HW_FENCE_HFI_CLIENT_HEADERS_SIZE(desc->queues_num,
+-		drv_data->has_soccp) + (queue_size * desc->queues_num) + desc->start_padding +
+-		desc->end_padding);
++	ret = hw_fence_checked_region_size(
++		HW_FENCE_HFI_CLIENT_HEADERS_SIZE(desc->queues_num, drv_data->has_soccp),
++		queue_size, desc->queues_num, desc->start_padding, desc->end_padding,
++		&desc->mem_size);
++	if (ret)
++		return ret;
+ 
+ 	if (desc->mem_size > MAX_CLIENT_QUEUE_MEM_SIZE) {
+ 		HWFNC_ERR("%s client queue mem_size:%u greater than max mem size:%d\n",
+@@ -1498,9 +1544,11 @@
+ 		return -ENOMEM;
+ 
+ 	/* initialize client queue size desc for each client */
+-	start_offset = PAGE_ALIGN(drv_data->hw_fence_mem_ctrl_queues_size +
+-		HW_FENCE_MEM_LOCKS_SIZE(drv_data->rxq_clients_num) +
+-		drv_data->hw_fence_mem_fences_table_size);
++	ret = hw_fence_checked_region_size(drv_data->hw_fence_mem_ctrl_queues_size,
++		HW_FENCE_MEM_LOCKS_SIZE(drv_data->rxq_clients_num), 1,
++		drv_data->hw_fence_mem_fences_table_size, 0, &start_offset);
++	if (ret)
++		return ret;
+ 	for (i = 0; i < HW_FENCE_MAX_CLIENT_TYPE; i++) {
+ 		desc = &hw_fence_client_types[i];
+ 		for (j = 0; j < desc->clients_num; j++) {
+@@ -1512,7 +1560,8 @@
+ 				(struct hw_fence_client_queue_desc){desc, start_offset};
+ 			HWFNC_DBG_INIT("%s client_id_ext:%u client_id:%u start_offset:%u\n",
+ 				desc->name, client_id_ext, client_id, start_offset);
+-			start_offset += desc->mem_size;
++			if (check_add_overflow(start_offset, desc->mem_size, &start_offset))
++				return -EOVERFLOW;
+ 		}
+ 	}
+ 	drv_data->used_mem_size = start_offset;
+@@ -1536,7 +1585,7 @@
+ 	ret = of_property_read_u32(drv_data->dev->of_node, "qcom,hw-fence-table-entries", &val);
+ 	if (ret || !val) {
+ 		HWFNC_ERR("missing hw fences table entry or invalid ret:%d val:%d\n", ret, val);
+-		return ret;
++		return ret ? ret : -EINVAL;
+ 	}
+ 	drv_data->hw_fence_table_entries = val;
+ 
+@@ -1551,7 +1600,7 @@
+ 	ret = of_property_read_u32(drv_data->dev->of_node, "qcom,hw-fence-queue-entries", &val);
+ 	if (ret || !val) {
+ 		HWFNC_ERR("missing queue entries table entry or invalid ret:%d val:%d\n", ret, val);
+-		return ret;
++		return ret ? ret : -EINVAL;
+ 	}
+ 	drv_data->hw_fence_queue_entries = val;
+ 
+--- a/qcom/opensource/mm-drivers/hw_fence/src/msm_hw_fence.c
++++ b/qcom/opensource/mm-drivers/hw_fence/src/msm_hw_fence.c
+@@ -798,12 +798,15 @@
+ 
+ 	HWFNC_DBG_H("+\n");
+ 
++	if (!IS_ERR_OR_NULL(hw_fence_drv_data))
++		return -EBUSY;
+ 	hw_fence_drv_data = kzalloc(sizeof(*hw_fence_drv_data), GFP_KERNEL);
+ 	if (!hw_fence_drv_data)
+ 		return -ENOMEM;
+ 
+ 	dev_set_drvdata(&pdev->dev, hw_fence_drv_data);
+ 	hw_fence_drv_data->dev = &pdev->dev;
++	mutex_init(&hw_fence_drv_data->clients_register_lock);
+ 
+ 	if (hw_fence_driver_enable) {
+ 		/* Initialize HW Fence Driver resources */
+@@ -811,7 +814,6 @@
+ 		if (rc)
+ 			goto error;
+ 
+-		mutex_init(&hw_fence_drv_data->clients_register_lock);
+ 
+ 		/* set ready value so clients can register */
+ 		hw_fence_drv_data->resources_ready = true;
+@@ -827,6 +829,13 @@
+ 			goto error;
+ 		}
+ 
++		if (!hw_fence_drv_data->has_soccp) {
++			rc = hw_fence_utils_share_mem(hw_fence_drv_data);
++			if (rc)
++				goto error;
++		}
++		__module_get(THIS_MODULE);
++
+ 		HWFNC_DBG_INFO("hw fence driver not enabled\n");
+ 	}
+ 
+@@ -836,12 +845,7 @@
+ 
+ error:
+ 	dev_set_drvdata(&pdev->dev, NULL);
+-	kfree(hw_fence_drv_data->ipc_clients_table);
+-	kfree(hw_fence_drv_data->hw_fence_client_queue_size);
+-	if (hw_fence_drv_data->cpu_addr_cookie)
+-		dma_free_attrs(hw_fence_drv_data->dev, hw_fence_drv_data->size,
+-			hw_fence_drv_data->cpu_addr_cookie, hw_fence_drv_data->res.start,
+-			DMA_ATTR_NO_KERNEL_MAPPING);
++	hw_fence_utils_release(hw_fence_drv_data);
+ 	kfree(hw_fence_drv_data);
+ 	hw_fence_drv_data = (void *) -EPROBE_DEFER;
+ 
+@@ -875,7 +879,7 @@
+ 	return rc;
+ }
+ 
+-static int msm_hw_fence_remove(struct platform_device *pdev)
++static void msm_hw_fence_remove(struct platform_device *pdev)
+ {
+ 	struct hw_fence_soccp *soccp_props;
+ 
+@@ -883,13 +887,13 @@
+ 
+ 	if (!pdev) {
+ 		HWFNC_ERR("null platform dev\n");
+-		return -EINVAL;
++		return;
+ 	}
+ 
+ 	hw_fence_drv_data = dev_get_drvdata(&pdev->dev);
+ 	if (!hw_fence_drv_data) {
+ 		HWFNC_ERR("null driver data\n");
+-		return -EINVAL;
++		return;
+ 	}
+ 	soccp_props = &hw_fence_drv_data->soccp_props;
+ 	if (soccp_props->ssr_notifier) {
+@@ -918,7 +922,7 @@
+ 
+ 	HWFNC_DBG_H("-\n");
+ 
+-	return 0;
++	return;
+ }
+ 
+ static const struct of_device_id msm_hw_fence_dt_match[] = {
+@@ -931,6 +935,7 @@
+ 	.remove = msm_hw_fence_remove,
+ 	.driver = {
+ 		.name = "msm-hw-fence",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = of_match_ptr(msm_hw_fence_dt_match),
+ 	},
+ };
+--- a/qcom/opensource/mm-drivers/hw_fence/src/msm_hw_fence_synx_translation.c
++++ b/qcom/opensource/mm-drivers/hw_fence/src/msm_hw_fence_synx_translation.c
+@@ -451,7 +451,7 @@
+ 	return SYNX_SUCCESS;
+ }
+ 
+-int synx_hwfence_import(struct synx_session *session, struct synx_import_params *params)
++static int synx_hwfence_import(struct synx_session *session, struct synx_import_params *params)
+ {
+ 	int ret;
+ 
+--- a/drivers/devfreq/governor_msm_adreno_tz.c
++++ b/drivers/devfreq/governor_msm_adreno_tz.c
+@@ -9,6 +9,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
+ #include <linux/math64.h>
++#include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/spinlock.h>
+ #include <linux/slab.h>
+@@ -61,7 +62,7 @@
+ /*
+  * Returns GPU suspend time in millisecond.
+  */
+-u64 suspend_time_ms(void)
++static u64 suspend_time_ms(void)
+ {
+ 	u64 suspend_sampling_time;
+ 	u64 time_diff = 0;
+@@ -161,7 +162,7 @@
+ 		NULL
+ };
+ 
+-void compute_work_load(struct devfreq_dev_status *stats,
++static void compute_work_load(struct devfreq_dev_status *stats,
+ 		struct devfreq_msm_adreno_tz_data *priv,
+ 		struct devfreq *devfreq)
+ {
+@@ -568,13 +569,13 @@
+ }
+ EXPORT_SYMBOL_GPL(msm_adreno_tz_reinit);
+ 
+-int msm_adreno_tz_init(void)
++static int msm_adreno_tz_init(void)
+ {
+ 	return devfreq_add_governor(&msm_adreno_tz);
+ }
+ subsys_initcall(msm_adreno_tz_init);
+ 
+-void msm_adreno_tz_exit(void)
++static void msm_adreno_tz_exit(void)
+ {
+ 	int ret = devfreq_remove_governor(&msm_adreno_tz);
+ 
+@@ -584,3 +585,5 @@
+ module_exit(msm_adreno_tz_exit);
+ 
+ MODULE_LICENSE("GPL");
++
++MODULE_DESCRIPTION("Qualcomm Adreno trusted-zone devfreq governor");
+--- a/drivers/devfreq/governor_gpubw_mon.c
++++ b/drivers/devfreq/governor_gpubw_mon.c
+@@ -325,13 +325,13 @@
+ 	.flags = DEVFREQ_GOV_FLAG_IMMUTABLE,
+ };
+ 
+-int devfreq_gpubw_init(void)
++static int devfreq_gpubw_init(void)
+ {
+ 	return devfreq_add_governor(&devfreq_gpubw);
+ }
+ subsys_initcall(devfreq_gpubw_init);
+ 
+-void devfreq_gpubw_exit(void)
++static void devfreq_gpubw_exit(void)
+ {
+ 	int ret;
+ 

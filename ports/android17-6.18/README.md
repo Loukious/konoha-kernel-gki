@@ -926,3 +926,23 @@ modpost warnings; device-tree checks pass with 1,084 existing vendor DTC warning
 remaining names and hashes of its ROM load-list inputs. This counts built names,
 including alternative hardware and modules with limitations above; it does not
 measure working hardware or overall ZIP completion. No flashable ZIP exists.
+
+
+The Onyx GPU and synchronization stack adds seven modules: KGSL, SYNX,
+IPCLite, hardware fence, software sync fence, and both Adreno governors.
+Linux 6.18 API changes preserve the ROM hardware tables, firmware structures
+and userspace ABI. Initialization and IOMMU failures unwind their resources;
+firmware/HFI buffers and shared-memory rings reject malformed sizes and offsets.
+The hardware-fence listener now exits when stopped while idle. The integrated
+[GPU helper checks](gpu-validation-20261031.json) pass 3,082,819 ASan/UBSan
+cases and 35 source contracts; the negative control reproduces the original
+listener shutdown hang. Active restricted hooks and firmware mappings retain
+module references because their interfaces have no live revocation protocol.
+IPCLite and hardware-fence sysfs unbind are disabled while those mappings exist.
+
+The combined 183-module build passes 8,924 imported-symbol CRC checks without
+compiler or modpost warnings. Device-tree compilation and overlay checks pass
+with the same 1,084 existing vendor DTC warnings. ROM module build coverage is
+182/466 (39.1%), leaving 284 names to assess or port. This includes alternative
+hardware and does not measure working hardware or ZIP completion. The combined
+artifact is `artifacts/20261031T111820072627Z`; no flashable 6.18 ZIP exists.
