@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 217 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 221 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 217 platform `.ko` files, their symbol tables and DDK configurations.
+- 221 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 11,592
-imported symbol CRCs across all 217 modules.
+used. The current [validation report](validation-20261031.json) checks 11,983
+imported symbol CRCs across all 221 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1260,3 +1260,39 @@ coverage is 215/466 (46.1%), leaving 251 names to assess or port, including
 alternative hardware. The main WLAN and remaining transport review, PCIe/MHI,
 audio, camera/video, other device interfaces and image/installer packaging are
 still in progress. There is no flashable 6.18 ZIP or phone validation yet.
+
+
+## PCIe/MHI providers and SPF audio commands
+
+The ROM-selected PCIe, PDC and MHI modules retain the native Tuna CESTA
+instructions, power maps, firmware structures and ITS topology. The port checks
+configuration access, register and ring bounds, image capacities and 64-bit RDDM
+sizes; initialization failures unwind acquired resources. Removal drains IRQs,
+work and child devices before releasing host/controller storage. Clients must
+still quiesce controller operations before unregistering. Public PCIe/MHI layouts
+remain unchanged. [Integrated PCIe/MHI tests](pcie-mhi-validation-20261031.json)
+pass ten ASan/UBSan groups covering bounds, allocation failures and teardown.
+[Pinned DT checks](pcie-mhi-dt-validation-20261031.json) verify register spans,
+CESTA tuples and the native PDC mapping. These checks use mocked kernel services
+and do not execute device firmware, physical PCIe links or WLAN.
+
+SPF requests use native GPR headers, nonzero tokens retained across service
+rebinds, and validated response sizes, opcodes and token identities. Provider
+withdrawal wakes command waiters and drains work, child devices and service
+references before cleanup. The clock manager records its own requested and
+enabled votes; reset preserves unrelated votes and permits retry after partial
+restoration. Clients must retain their clock handles through the last requested
+vote. [SPF tests](audio-spf-validation-20261031.json) and
+[clock ownership tests](audio-votes-validation-20261031.json) pass full-source
+ASan/UBSan response, failure, rebind and concurrent-operation cases. Five original
+SPF and four original clock groups reject their targeted negative controls;
+restoring per-service token reset also rejects the stale-reply regression.
+Live DSP firmware, scheduling, suspend/resume and hardware remain unverified.
+
+The combined 221-module archive `artifacts/20261031T134316988014Z` passes
+11,983 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
+and overlay checks pass with 1,084 existing vendor DTC warnings.
+Built ROM module coverage is 219/466 (47.0%), leaving 247 names to assess or
+port, including alternative hardware. Main WLAN/Bluetooth, remaining audio,
+camera/video and device interfaces, boot/DLKM images and the installer still need
+completion. No flashable 6.18 ZIP or phone validation exists yet.

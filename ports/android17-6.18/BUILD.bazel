@@ -2780,6 +2780,64 @@ ddk_module(
 )
 
 
+ddk_headers(
+    name = "pcie_mhi_headers",
+    hdrs = ["include/linux/msm_pcie.h", "include/linux/mhi.h", "include/linux/mhi_misc.h", "include/soc/qcom/pcie-pdc.h", "drivers/bus/mhi/common.h", "drivers/bus/mhi/host/internal.h", "drivers/bus/mhi/host/misc.h"],
+    linux_includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "pcie_pdc",
+    srcs = ["drivers/soc/qcom/pcie-pdc.c"],
+    out = "pcie-pdc.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":pcie_mhi_headers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "pci_msm_drv",
+    srcs = ["drivers/pci/controller/pci-msm.c", "drivers/pci/controller/pci-msm-msi.c"],
+    out = "pci-msm-drv.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":pcie_mhi_headers", ":pcie_pdc", ":platform_headers", ":regulator_headers", ":interconnect_headers", ":clock_headers", ":pinctrl_headers", ":remote_headers", ":qcom_ipc_logging", ":clk_qcom", ":crm_v2", ":pinctrl_msm", ":rproc_qcom_common"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mhi",
+    srcs = ["drivers/bus/mhi/host/init.c", "drivers/bus/mhi/host/main.c", "drivers/bus/mhi/host/pm.c", "drivers/bus/mhi/host/boot.c", "drivers/bus/mhi/host/misc.c"],
+    out = "mhi.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":pcie_mhi_headers", ":pci_msm_drv", ":platform_headers", ":qcom_ipc_logging"],
+    visibility = ["//visibility:public"],
+)
+
+
+ddk_headers(
+    name = "audio_spf_headers",
+    hdrs = ["qcom/opensource/audio-kernel/include/dsp/digital-cdc-rsc-mgr.h", "qcom/opensource/audio-kernel/include/dsp/spf-core.h"],
+    includes = ["qcom/opensource/audio-kernel/include"],
+)
+
+ddk_module(
+    name = "spf_core_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/dsp/digital-cdc-rsc-mgr.c", "qcom/opensource/audio-kernel/dsp/spf-core.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "spf_core_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_spf_headers", ":audio_gpr_headers", ":gpr_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -2987,6 +3045,10 @@ kernel_module_group(
         ":cnss_nl",
         ":mca_connector_antiburn",
         ":mca_lpd_detect",
+        ":pcie_pdc",
+        ":pci_msm_drv",
+        ":mhi",
+        ":spf_core_dlkm",
     ],
 )
 

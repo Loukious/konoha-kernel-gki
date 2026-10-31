@@ -1,0 +1,2776 @@
+--- a/drivers/pci/controller/pci-msm.c
++++ b/drivers/pci/controller/pci-msm.c
+@@ -53,8 +53,6 @@
+ #if IS_ENABLED(CONFIG_QCOM_PCIE_PDC)
+ #include <soc/qcom/pcie-pdc.h>
+ #endif /* CONFIG_QCOM_PCIE_PDC */
+-
+-#include "../pci.h"
+ 
+ #define PCIE_VENDOR_ID_QCOM (0x17cb)
+ 
+@@ -776,7 +774,7 @@
+ 
+ 	unsigned int status;		/* COR/UNCOR Error Status */
+ 	unsigned int mask;		/* COR/UNCOR Error Mask */
+-	struct aer_header_log_regs tlp;	/* TLP Header */
++	struct pcie_tlp_log tlp;	/* TLP Header */
+ 
+ 	u32 l1ss_ctl1;			/* PCI_L1SS_CTL1 reg value */
+ 	u16 lnksta;			/* PCI_EXP_LNKSTA reg value */
+@@ -788,7 +786,7 @@
+ };
+ 
+ /* AER stats for the device */
+-struct aer_stats {
++struct msm_pcie_aer_stats {
+ 
+ 	/*
+ 	 * Fields for all AER capable devices. They indicate the errors
+@@ -821,6 +819,12 @@
+ 	u64 rootport_total_cor_errs;
+ 	u64 rootport_total_fatal_errs;
+ 	u64 rootport_total_nonfatal_errs;
++};
++
++struct msm_pcie_aer_device {
++	struct list_head node;
++	struct pci_dev *dev;
++	struct msm_pcie_aer_stats stats;
+ };
+ 
+ #define AER_LOG_TLP_MASKS (PCI_ERR_UNC_POISON_TLP| \
+@@ -1148,7 +1152,6 @@
+ 
+ 	bool cfg_access;
+ 	spinlock_t cfg_lock;
+-	unsigned long irqsave_flags;
+ 	struct mutex enumerate_lock;
+ 	struct mutex setup_lock;
+ 
+@@ -1162,6 +1165,9 @@
+ 	struct pci_saved_state *saved_state;
+ 
+ 	struct wakeup_source *ws;
++	bool global_irq_requested;
++	bool wake_irq_requested;
++	bool wake_irq_enabled;
+ 	struct icc_path *icc_path;
+ 
+ 	/*
+@@ -1274,7 +1280,9 @@
+ 
+ 	bool aer_dump;
+ 	bool panic_on_aer;
+-	struct aer_stats *aer_stats;
++	struct msm_pcie_aer_stats *aer_stats;
++	struct list_head aer_devices;
++	spinlock_t aer_lock; /* Protects the private AER device list and counters. */
+ 	void (*rumi_init)(struct msm_pcie_dev_t *pcie_dev);
+ 
+ 	u32 phy_debug_reg_len;
+@@ -1314,6 +1322,7 @@
+ 
+ /* high prio WQ */
+ static struct workqueue_struct *mpcie_wq;
++static bool pcie_rpmsg_registered;
+ 
+ /* debugfs values */
+ static u32 rc_sel = BIT(0);
+@@ -1726,6 +1735,42 @@
+ 	msm_pcie_write_reg(pcie_dev->rumi, phy_ctrl_offs, val);
+ }
+ 
++static bool msm_pcie_span_valid(u64 span, u64 offset, u64 len)
++{
++	return IS_ALIGNED(offset, sizeof(u32)) && offset <= span &&
++	       len <= span - offset;
++}
++
++static bool msm_pcie_reg_valid(struct msm_pcie_dev_t *dev, unsigned int idx,
++			       u64 offset, u64 len)
++{
++	struct msm_pcie_res_info_t *res;
++
++	if (idx >= MSM_PCIE_MAX_RES)
++		return false;
++	res = &dev->res[idx];
++	return res->base && res->resource &&
++	       msm_pcie_span_valid(resource_size(res->resource), offset, len);
++}
++
++static int msm_pcie_validate_offsets(struct msm_pcie_dev_t *dev, unsigned int idx,
++				     const u32 *offsets, unsigned int count)
++{
++	unsigned int i;
++
++	for (i = 0; i < count; i++)
++		if (!msm_pcie_reg_valid(dev, idx, offsets[i], sizeof(u32)))
++			return -EINVAL;
++	return 0;
++}
++
++static bool msm_pcie_config_valid(int where, int size, u64 span)
++{
++	return (size == 1 || size == 2 || size == 4) && where >= 0 &&
++	       !(where & (size - 1)) && where <= PCI_CFG_SPACE_EXP_SIZE - size &&
++	       msm_pcie_span_valid(span, where & ~3, sizeof(u32));
++}
++
+ static void pcie_phy_dump(struct msm_pcie_dev_t *dev)
+ {
+ 	int i, size;
+@@ -1858,16 +1903,12 @@
+ static void pcie_sm_dump(struct msm_pcie_dev_t *dev)
+ {
+ 	int i;
+-	u32 size;
+-
+-	if (!dev->pcie_sm)
++	if (!dev->pcie_sm || !dev->sm_info)
+ 		return;
+ 
+ 	PCIE_DUMP(dev, "PCIe: RC%d State Manager reg dump\n", dev->rc_idx);
+ 
+-	size = resource_size(dev->res[MSM_PCIE_RES_SM].resource);
+-
+-	for (i = 0; i < dev->sm_info->reg_dump_len && i < size; i++) {
++	for (i = 0; i < dev->sm_info->reg_dump_len; i++) {
+ 		PCIE_DUMP(dev,
+ 			"RC%d: 0x%04x %08x\n",
+ 			dev->rc_idx, dev->sm_info->reg_dump[i],
+@@ -3560,7 +3601,7 @@
+ 	return false;
+ }
+ 
+-void msm_pcie_clk_dump(struct msm_pcie_dev_t *pcie_dev)
++static void msm_pcie_clk_dump(struct msm_pcie_dev_t *pcie_dev)
+ {
+ 	struct msm_pcie_clk_info_t *clk_info;
+ 	int i;
+@@ -3679,12 +3720,14 @@
+ static int msm_pcie_oper_conf(struct pci_bus *bus, u32 devfn, int oper,
+ 				     int where, int size, u32 *val)
+ {
++	unsigned long cfg_flags;
+ 	uint32_t word_offset, byte_offset, mask;
+ 	uint32_t rd_val, wr_val;
+ 	struct msm_pcie_dev_t *dev;
+ 	void __iomem *config_base;
+ 	bool rc = false;
+ 	u32 rc_idx;
++	struct msm_pcie_res_info_t *res;
+ 	int rv = 0;
+ 
+ 	dev = PCIE_BUS_PRIV_DATA(bus);
+@@ -3698,8 +3741,14 @@
+ 
+ 	rc_idx = dev->rc_idx;
+ 	rc = (bus->number == 0);
+-
+-	spin_lock_irqsave(&dev->cfg_lock, dev->irqsave_flags);
++	res = &dev->res[rc ? MSM_PCIE_RES_DM_CORE : MSM_PCIE_RES_CONF];
++	if (!res->base || !res->resource ||
++	    !msm_pcie_config_valid(where, size, resource_size(res->resource))) {
++		*val = ~0;
++		return PCIBIOS_BAD_REGISTER_NUMBER;
++	}
++
++	spin_lock_irqsave(&dev->cfg_lock, cfg_flags);
+ 
+ 	if (!dev->cfg_access) {
+ 		PCIE_DBG3(dev,
+@@ -3771,7 +3820,7 @@
+ 
+ 	if (rd_val == PCIE_LINK_DOWN &&
+ 	   (readl_relaxed(config_base) == PCIE_LINK_DOWN)) {
+-		if (dev->config_recovery) {
++		if (dev->driver_probed && dev->config_recovery) {
+ 			PCIE_ERR(dev,
+ 				 "RC%d link recovery schedule\n",
+ 				 rc_idx);
+@@ -3781,7 +3830,7 @@
+ 	}
+ 
+ unlock:
+-	spin_unlock_irqrestore(&dev->cfg_lock, dev->irqsave_flags);
++	spin_unlock_irqrestore(&dev->cfg_lock, cfg_flags);
+ out:
+ 	return rv;
+ }
+@@ -3849,7 +3898,8 @@
+ 	struct msm_pcie_sm_info *sm_info;
+ 
+ 	of_get_property(pdev->dev.of_node, "qcom,pcie-sm-seq", &size);
+-	if (!size) {
++	if (size <= 0 || size % sizeof(u32) ||
++	    !msm_pcie_reg_valid(dev, MSM_PCIE_RES_SM, 0, size)) {
+ 		PCIE_DBG(dev,
+ 			"PCIe: RC%d: state manager seq is not present in DT\n",
+ 			dev->rc_idx);
+@@ -3884,7 +3934,8 @@
+ 		return -EIO;
+ 
+ 	of_get_property(pdev->dev.of_node, "qcom,pcie-sm-branch-seq", &size);
+-	if (!size) {
++	if (size <= 0 || size % sizeof(u32) ||
++	    !msm_pcie_reg_valid(dev, MSM_PCIE_RES_SM, sm_info->branch_offset, size)) {
+ 		PCIE_DBG(dev,
+ 			"PCIe: RC%d: sm branch seq is not present in DT\n",
+ 			dev->rc_idx);
+@@ -3911,6 +3962,8 @@
+ 		goto out;
+ 	}
+ 
++	if (size < 0 || size % sizeof(u32))
++		return -EINVAL;
+ 	sm_info->reg_dump_len = size / sizeof(u32);
+ 	sm_info->reg_dump = devm_kzalloc(&pdev->dev, size, GFP_KERNEL);
+ 	if (!sm_info->reg_dump)
+@@ -3923,6 +3976,19 @@
+ 		sm_info->reg_dump_len = 0;
+ 
+ out:
++	if (!msm_pcie_reg_valid(dev, MSM_PCIE_RES_SM, sm_info->start_offset, 4) ||
++	    msm_pcie_validate_offsets(dev, MSM_PCIE_RES_SM, sm_info->reg_dump,
++				      sm_info->reg_dump_len) ||
++	    pcie_sm_regs[PCIE_SM_PWR_CTRL_OFFSET] < 0 ||
++	    pcie_sm_regs[PCIE_SM_PWR_MASK_OFFSET] < 0 ||
++	    pcie_sm_regs[PCIE_SM_PWR_INSTANCE_OFFSET] < 0 ||
++	    !msm_pcie_reg_valid(dev, MSM_PCIE_RES_SM,
++		(u64)pcie_sm_regs[PCIE_SM_PWR_CTRL_OFFSET] +
++		(u64)dev->rc_idx * pcie_sm_regs[PCIE_SM_PWR_INSTANCE_OFFSET], 4) ||
++	    !msm_pcie_reg_valid(dev, MSM_PCIE_RES_SM,
++		(u64)pcie_sm_regs[PCIE_SM_PWR_MASK_OFFSET] +
++		(u64)dev->rc_idx * pcie_sm_regs[PCIE_SM_PWR_INSTANCE_OFFSET], 4))
++		return -EINVAL;
+ 	dev->sm_info = sm_info;
+ 
+ 	return 0;
+@@ -3957,7 +4023,8 @@
+ }
+ 
+ /* Read the curr perf ol value from the cesta register */
+-static const char *const __maybe_unused msm_pcie_cesta_curr_perf_ol(struct msm_pcie_dev_t *dev)
++static const char *__maybe_unused
++msm_pcie_cesta_curr_perf_ol(struct msm_pcie_dev_t *dev)
+ {
+ 	u32 ret;
+ 	int res;
+@@ -5435,12 +5502,15 @@
+ 
+ 	of_get_property(pdev->dev.of_node, "qcom,bw-scale", &size);
+ 	if (size) {
++		if (size < 0 || size % sizeof(*pcie_dev->bw_scale))
++			return -EINVAL;
+ 		pcie_dev->bw_scale = devm_kzalloc(&pdev->dev, size, GFP_KERNEL);
+ 		if (!pcie_dev->bw_scale)
+ 			return -ENOMEM;
+ 
+-		of_property_read_u32_array(pdev->dev.of_node, "qcom,bw-scale",
+-				(u32 *)pcie_dev->bw_scale, size / sizeof(u32));
++		if (of_property_read_u32_array(pdev->dev.of_node, "qcom,bw-scale",
++					       (u32 *)pcie_dev->bw_scale, size / sizeof(u32)))
++			return -EINVAL;
+ 
+ 		pcie_dev->bw_gen_max = size / sizeof(*pcie_dev->bw_scale);
+ 	} else {
+@@ -5464,6 +5534,8 @@
+ 		return 0;
+ 	}
+ 
++	if (size < 0 || size % sizeof(*pcie_dev->phy_sequence))
++		return -EINVAL;
+ 	pcie_dev->phy_sequence = devm_kzalloc(&pdev->dev, size, GFP_KERNEL);
+ 	if (!pcie_dev->phy_sequence)
+ 		return -ENOMEM;
+@@ -5476,6 +5548,11 @@
+ 				size / sizeof(pcie_dev->phy_sequence->offset));
+ 	if (ret)
+ 		return -EINVAL;
++	for (ret = 0; ret < pcie_dev->phy_len; ret++)
++		if (!msm_pcie_reg_valid(pcie_dev, MSM_PCIE_RES_PHY,
++					pcie_dev->phy_sequence[ret].offset, 4) ||
++		    pcie_dev->phy_sequence[ret].delay == U32_MAX)
++			return -EINVAL;
+ 
+ 	return 0;
+ }
+@@ -5497,6 +5574,8 @@
+ 		return 0;
+ 	}
+ 
++	if (size < 0 || size % sizeof(u32))
++		return -EINVAL;
+ 	pcie_dev->phy_debug_reg = kmalloc(size, GFP_KERNEL);
+ 	if (!pcie_dev->phy_debug_reg)
+ 		return -ENOMEM;
+@@ -5507,6 +5586,10 @@
+ 				"qcom,phy-debug-reg",
+ 				(unsigned int *)pcie_dev->phy_debug_reg,
+ 				size / sizeof(*pcie_dev->phy_debug_reg));
++	if (!ret)
++		ret = msm_pcie_validate_offsets(pcie_dev, MSM_PCIE_RES_PHY,
++						pcie_dev->phy_debug_reg,
++						pcie_dev->phy_debug_reg_len);
+ 	if (ret) {
+ 		kfree(pcie_dev->phy_debug_reg);
+ 		pcie_dev->phy_debug_reg = NULL;
+@@ -5536,6 +5619,8 @@
+ 		return 0;
+ 	}
+ 
++	if (size < 0 || size % sizeof(u32))
++		return -EINVAL;
+ 	pcie_dev->parf_debug_reg = kmalloc(size, GFP_KERNEL);
+ 	if (!pcie_dev->parf_debug_reg)
+ 		return -ENOMEM;
+@@ -5546,6 +5631,10 @@
+ 				"qcom,parf-debug-reg",
+ 				(unsigned int *)pcie_dev->parf_debug_reg,
+ 				size / sizeof(u32));
++	if (!ret)
++		ret = msm_pcie_validate_offsets(pcie_dev, MSM_PCIE_RES_PARF,
++						pcie_dev->parf_debug_reg,
++						pcie_dev->parf_debug_reg_len);
+ 	if (ret) {
+ 		kfree(pcie_dev->parf_debug_reg);
+ 		pcie_dev->parf_debug_reg = NULL;
+@@ -5575,6 +5664,8 @@
+ 		return 0;
+ 	}
+ 
++	if (size < 0 || size % sizeof(u32))
++		return -EINVAL;
+ 	pcie_dev->dbi_debug_reg = kmalloc(size, GFP_KERNEL);
+ 	if (!pcie_dev->dbi_debug_reg)
+ 		return -ENOMEM;
+@@ -5585,6 +5676,10 @@
+ 				"qcom,dbi-debug-reg",
+ 				(unsigned int *)pcie_dev->dbi_debug_reg,
+ 				size / sizeof(u32));
++	if (!ret)
++		ret = msm_pcie_validate_offsets(pcie_dev, MSM_PCIE_RES_DM_CORE,
++						pcie_dev->dbi_debug_reg,
++						pcie_dev->dbi_debug_reg_len);
+ 	if (ret) {
+ 		kfree(pcie_dev->dbi_debug_reg);
+ 		pcie_dev->dbi_debug_reg = NULL;
+@@ -5675,6 +5770,8 @@
+ 	if (pcie_dev->gpio[MSM_PCIE_GPIO_WAKE].num)
+ 		pcie_dev->wake_n =
+ 			gpio_to_irq(pcie_dev->gpio[MSM_PCIE_GPIO_WAKE].num);
++	if ((int)pcie_dev->wake_n < 0)
++		return (int)pcie_dev->wake_n;
+ 
+ 	return 0;
+ }
+@@ -5710,6 +5807,10 @@
+ 			res_info->resource = res;
+ 		}
+ 	}
++
++	for (i = MSM_PCIE_RES_PARF; i <= MSM_PCIE_RES_CONF; i++)
++		if (!msm_pcie_reg_valid(pcie_dev, i, 0, sizeof(u32)))
++			return -ENODEV;
+ 
+ 	pcie_dev->parf = pcie_dev->res[MSM_PCIE_RES_PARF].base;
+ 	pcie_dev->phy = pcie_dev->res[MSM_PCIE_RES_PHY].base;
+@@ -5728,7 +5829,7 @@
+ static int msm_pcie_get_tcsr_values(struct msm_pcie_dev_t *dev,
+ 					struct platform_device *pdev)
+ {
+-	int size = 0, ret = 0;
++	int size = 0, ret = 0, i;
+ 
+ 	of_get_property(pdev->dev.of_node, "qcom,tcsr", &size);
+ 
+@@ -5738,6 +5839,8 @@
+ 		return 0;
+ 	}
+ 
++	if (size < 0 || size % sizeof(*dev->tcsr_config))
++		return -EINVAL;
+ 	dev->tcsr_config = devm_kzalloc(&pdev->dev, size, GFP_KERNEL);
+ 
+ 	if (!dev->tcsr_config)
+@@ -5745,12 +5848,17 @@
+ 
+ 	dev->tcsr_len = size / sizeof(*dev->tcsr_config);
+ 
+-	of_property_read_u32_array(pdev->dev.of_node,
+-		"qcom,tcsr",
+-		(unsigned int *)dev->tcsr_config,
+-		size / sizeof(dev->tcsr_config->offset));
+-
+-	return ret;
++	ret = of_property_read_u32_array(pdev->dev.of_node, "qcom,tcsr",
++					 (unsigned int *)dev->tcsr_config,
++					 size / sizeof(dev->tcsr_config->offset));
++	if (ret)
++		return ret;
++	for (i = 0; i < dev->tcsr_len; i++)
++		if (!msm_pcie_reg_valid(dev, MSM_PCIE_RES_TCSR,
++					dev->tcsr_config[i].offset, 4))
++			return -EINVAL;
++
++	return 0;
+ }
+ 
+ static int msm_pcie_get_resources(struct msm_pcie_dev_t *dev,
+@@ -5782,6 +5890,8 @@
+ 
+ 		num = platform_get_irq_byname(pdev, irq_info->name);
+ 
++		if (num == -EPROBE_DEFER)
++			return num;
+ 		if (num < 0) {
+ 			PCIE_DBG(dev,
+ 			"PCIe: RC%d: can't find IRQ # for %s. ret %d\n",
+@@ -5793,6 +5903,14 @@
+ 		}
+ 	}
+ 
++	if (dev->phy_status_bit >= 32 ||
++	    !msm_pcie_reg_valid(dev, MSM_PCIE_RES_PHY, dev->phy_status_offset, 4) ||
++	    !msm_pcie_reg_valid(dev, MSM_PCIE_RES_PHY, dev->phy_power_down_offset, 4) ||
++	    (dev->pcie_parf_cesta_config &&
++	     !msm_pcie_reg_valid(dev, MSM_PCIE_RES_PARF,
++				dev->pcie_parf_cesta_config, 4)))
++		return -EINVAL;
++
+ 	ret = msm_pcie_get_tcsr_values(dev, pdev);
+ 	if (ret)
+ 		return ret;
+@@ -5845,7 +5963,11 @@
+ static void msm_pcie_release_resources(struct msm_pcie_dev_t *dev)
+ {
+ 
++	if (!IS_ERR_OR_NULL(dev->icc_path))
++		icc_put(dev->icc_path);
++	dev->icc_path = NULL;
+ 	dev->parf = NULL;
++	dev->phy = NULL;
+ 	dev->elbi = NULL;
+ 	dev->iatu = NULL;
+ 	dev->dm_core = NULL;
+@@ -6740,6 +6862,8 @@
+ {
+ 	struct msm_pcie_dev_t *pcie_dev = (struct msm_pcie_dev_t *) pdev;
+ 	struct msm_pcie_device_info *dev_info;
++	struct msm_pcie_aer_device *aer_dev;
++	unsigned long flags;
+ 	int ret;
+ 
+ 	PCIE_DBG(pcie_dev,
+@@ -6768,8 +6892,16 @@
+ 	}
+ 
+ 	if (pcie_dev->aer_enable) {
++		aer_dev = devm_kzalloc(&pcie_dev->pdev->dev,
++				       sizeof(*aer_dev), GFP_KERNEL);
++		if (!aer_dev)
++			return -ENOMEM;
++		aer_dev->dev = pcidev;
++		spin_lock_irqsave(&pcie_dev->aer_lock, flags);
++		list_add_tail(&aer_dev->node, &pcie_dev->aer_devices);
+ 		if (pci_pcie_type(pcidev) == PCI_EXP_TYPE_ROOT_PORT)
+-			pcie_dev->aer_stats = pcidev->aer_stats;
++			pcie_dev->aer_stats = &aer_dev->stats;
++		spin_unlock_irqrestore(&pcie_dev->aer_lock, flags);
+ 
+ 		if (msm_pcie_enable_pcie_error_reporting(pcidev))
+ 			PCIE_ERR(pcie_dev,
+@@ -6857,13 +6989,16 @@
+ int msm_pcie_enumerate(u32 rc_idx)
+ {
+ 	int ret = 0;
+-	struct msm_pcie_dev_t *dev = &msm_pcie_dev[rc_idx];
++	struct msm_pcie_dev_t *dev;
+ 	struct pci_dev *pcidev = NULL;
+ 	struct pci_host_bridge *bridge;
+ 	bool found = false;
+ 	u32 ids, vendor_id, device_id;
+ 	LIST_HEAD(res);
+ 
++	if (rc_idx >= MAX_RC_NUM)
++		return -EINVAL;
++	dev = &msm_pcie_dev[rc_idx];
+ 	mutex_lock(&dev->enumerate_lock);
+ 
+ 	PCIE_DBG(dev, "Enumerate RC%d\n", rc_idx);
+@@ -6912,7 +7047,9 @@
+ 	bridge->sysdata = dev;
+ 	bridge->ops = &msm_pcie_ops;
+ 
+-	pci_host_probe(bridge);
++	ret = pci_host_probe(bridge);
++	if (ret)
++		goto out;
+ 
+ 	dev->bridge = bridge;
+ 
+@@ -7137,16 +7274,32 @@
+ }
+ 
+ /* AER error handling */
++/* The PCI core keeps its AER counters private in Linux 6.18. */
++static struct msm_pcie_aer_stats *
++msm_pcie_aer_stats_find(struct msm_pcie_dev_t *dev, struct pci_dev *pdev)
++{
++	struct msm_pcie_aer_device *entry;
++
++	list_for_each_entry(entry, &dev->aer_devices, node)
++		if (entry->dev == pdev)
++			return &entry->stats;
++	return NULL;
++}
++
+ static void msm_pci_dev_aer_stats_incr(struct pci_dev *pdev,
+ 				       struct msm_aer_err_info *info)
+ {
+ 	unsigned long status = info->status & ~info->mask;
+ 	int i, max = -1;
+ 	u64 *counter = NULL;
+-	struct aer_stats *aer_stats = pdev->aer_stats;
+-
++	struct msm_pcie_aer_stats *aer_stats;
++	struct msm_pcie_dev_t *dev = info->rdev;
++	unsigned long flags;
++
++	spin_lock_irqsave(&dev->aer_lock, flags);
++	aer_stats = msm_pcie_aer_stats_find(dev, pdev);
+ 	if (!aer_stats)
+-		return;
++		goto out;
+ 
+ 	switch (info->severity) {
+ 	case AER_CORRECTABLE:
+@@ -7164,19 +7317,27 @@
+ 		counter = &aer_stats->dev_fatal_errs[0];
+ 		max = AER_MAX_TYPEOF_UNCOR_ERRS;
+ 		break;
++	default:
++		goto out;
+ 	}
+ 
+ 	for_each_set_bit(i, &status, max)
+ 		counter[i]++;
++out:
++	spin_unlock_irqrestore(&dev->aer_lock, flags);
+ }
+ 
+ static void msm_pci_rootport_aer_stats_incr(struct pci_dev *pdev,
+ 					    struct aer_err_source *e_src)
+ {
+-	struct aer_stats *aer_stats = pdev->aer_stats;
+-
++	struct msm_pcie_aer_stats *aer_stats;
++	struct msm_pcie_dev_t *dev = PCIE_BUS_PRIV_DATA(pdev->bus);
++	unsigned long flags;
++
++	spin_lock_irqsave(&dev->aer_lock, flags);
++	aer_stats = msm_pcie_aer_stats_find(dev, pdev);
+ 	if (!aer_stats)
+-		return;
++		goto out;
+ 
+ 	if (e_src->status & PCI_ERR_ROOT_COR_RCV)
+ 		aer_stats->rootport_total_cor_errs++;
+@@ -7187,13 +7348,16 @@
+ 		else
+ 			aer_stats->rootport_total_nonfatal_errs++;
+ 	}
++out:
++	spin_unlock_irqrestore(&dev->aer_lock, flags);
+ }
+ 
+ static void msm_print_tlp_header(struct pci_dev *dev,
+ 				 struct msm_aer_err_info *info)
+ {
+ 	PCIE_DBG(info->rdev, "PCIe: RC%d: TLP Header: %08x %08x %08x %08x\n",
+-		info->rdev->rc_idx, info->tlp.dw0, info->tlp.dw1, info->tlp.dw2, info->tlp.dw3);
++		info->rdev->rc_idx, info->tlp.dw[0], info->tlp.dw[1],
++		info->tlp.dw[2], info->tlp.dw[3]);
+ }
+ 
+ static void msm_aer_print_error_stats(struct pci_dev *dev,
+@@ -7221,7 +7385,7 @@
+ 	msm_pci_dev_aer_stats_incr(dev, info);
+ }
+ 
+-void msm_aer_print_error(struct pci_dev *dev, struct msm_aer_err_info *info)
++static void msm_aer_print_error(struct pci_dev *dev, struct msm_aer_err_info *info)
+ {
+ 	int layer, agent;
+ 	int id = ((dev->bus->number << 8) | dev->devfn);
+@@ -7409,6 +7573,7 @@
+ static void msm_handle_error_source(struct pci_dev *dev,
+ 				    struct msm_aer_err_info *info)
+ {
++	unsigned long cfg_flags;
+ 	int aer = dev->aer_cap;
+ 	struct msm_pcie_dev_t *rdev = info->rdev;
+ 	u32 status, sev;
+@@ -7423,12 +7588,12 @@
+ 			goto skip;
+ 
+ 		/* Disable dumping PCIe registers when we are in DRV suspend */
+-		spin_lock_irqsave(&rdev->cfg_lock, rdev->irqsave_flags);
++		spin_lock_irqsave(&rdev->cfg_lock, cfg_flags);
+ 		if (!rdev->cfg_access) {
+ 			PCIE_DBG2(rdev,
+ 				"PCIe: RC%d is currently in drv suspend.\n",
+ 				rdev->rc_idx);
+-			spin_unlock_irqrestore(&rdev->cfg_lock, rdev->irqsave_flags);
++			spin_unlock_irqrestore(&rdev->cfg_lock, cfg_flags);
+ 			return;
+ 		}
+ 		pcie_parf_dump(rdev);
+@@ -7436,7 +7601,7 @@
+ 		pcie_phy_dump(rdev);
+ 		pcie_sm_dump(rdev);
+ 		pcie_crm_dump(rdev);
+-		spin_unlock_irqrestore(&rdev->cfg_lock, rdev->irqsave_flags);
++		spin_unlock_irqrestore(&rdev->cfg_lock, cfg_flags);
+ 
+ skip:
+ 		if (rdev->panic_on_aer)
+@@ -7549,13 +7714,13 @@
+ 		if (info->status & AER_LOG_TLP_MASKS) {
+ 			info->tlp_header_valid = 1;
+ 			pci_read_config_dword(dev,
+-				aer + PCI_ERR_HEADER_LOG, &info->tlp.dw0);
++				aer + PCI_ERR_HEADER_LOG, &info->tlp.dw[0]);
+ 			pci_read_config_dword(dev,
+-				aer + PCI_ERR_HEADER_LOG + 4, &info->tlp.dw1);
++				aer + PCI_ERR_HEADER_LOG + 4, &info->tlp.dw[1]);
+ 			pci_read_config_dword(dev,
+-				aer + PCI_ERR_HEADER_LOG + 8, &info->tlp.dw2);
++				aer + PCI_ERR_HEADER_LOG + 8, &info->tlp.dw[2]);
+ 			pci_read_config_dword(dev,
+-				aer + PCI_ERR_HEADER_LOG + 12, &info->tlp.dw3);
++				aer + PCI_ERR_HEADER_LOG + 12, &info->tlp.dw[3]);
+ 		}
+ 	}
+ 
+@@ -7906,73 +8071,65 @@
+ 	return ret;
+ }
+ 
++static void msm_pcie_irq_deinit(struct msm_pcie_dev_t *dev)
++{
++	struct device *pdev = &dev->pdev->dev;
++
++	if (dev->wake_irq_enabled) {
++		disable_irq_wake(dev->wake_n);
++		dev->wake_irq_enabled = false;
++	}
++	if (dev->wake_irq_requested) {
++		devm_free_irq(pdev, dev->wake_n, dev);
++		dev->wake_irq_requested = false;
++	}
++	if (dev->global_irq_requested) {
++		devm_free_irq(pdev, dev->irq[MSM_PCIE_INT_GLOBAL_INT].num, dev);
++		dev->global_irq_requested = false;
++	}
++	cancel_work_sync(&dev->handle_wake_work);
++	cancel_work_sync(&dev->handle_sbr_work);
++	cancel_work_sync(&dev->link_recover_wq);
++	cancel_work_sync(&dev->drv_disable_pc_work);
++	cancel_work_sync(&dev->drv_enable_pc_work);
++	wakeup_source_unregister(dev->ws);
++	dev->ws = NULL;
++}
++
+ static int32_t msm_pcie_irq_init(struct msm_pcie_dev_t *dev)
+ {
+ 	int rc;
+ 	struct device *pdev = &dev->pdev->dev;
+ 
+-	PCIE_DBG(dev, "RC%d\n", dev->rc_idx);
+-
+ 	dev->ws = wakeup_source_register(pdev, dev_name(pdev));
+-	if (!dev->ws) {
+-		PCIE_ERR(dev,
+-			"PCIe: RC%d: failed to register wakeup source\n",
+-			dev->rc_idx);
++	if (!dev->ws)
+ 		return -ENOMEM;
+-	}
+ 
+ 	if (dev->irq[MSM_PCIE_INT_GLOBAL_INT].num) {
+ 		rc = devm_request_threaded_irq(pdev,
+ 				dev->irq[MSM_PCIE_INT_GLOBAL_INT].num,
+-				handle_global_irq,
+-				handle_aer_irq,
++				handle_global_irq, handle_aer_irq,
+ 				IRQF_TRIGGER_RISING | IRQF_ONESHOT,
+-				dev->irq[MSM_PCIE_INT_GLOBAL_INT].name,
+-				dev);
+-		if (rc) {
+-			PCIE_ERR(dev,
+-				"PCIe: RC%d: Unable to request global_int interrupt: %d\n",
+-				dev->rc_idx,
+-				dev->irq[MSM_PCIE_INT_GLOBAL_INT].num);
+-			return rc;
+-		}
+-	}
+-
+-	/* register handler for PCIE_WAKE_N interrupt line */
++				dev->irq[MSM_PCIE_INT_GLOBAL_INT].name, dev);
++		if (rc)
++			goto err;
++		dev->global_irq_requested = true;
++	}
+ 	if (dev->wake_n) {
+-		rc = devm_request_irq(pdev,
+-				dev->wake_n, handle_wake_irq,
+-				IRQF_TRIGGER_FALLING, "msm_pcie_wake", dev);
+-		if (rc) {
+-			PCIE_ERR(dev,
+-				"PCIe: RC%d: Unable to request wake interrupt\n",
+-				dev->rc_idx);
+-			return rc;
+-		}
+-
+-		INIT_WORK(&dev->handle_wake_work, handle_wake_func);
+-		INIT_WORK(&dev->handle_sbr_work, handle_sbr_func);
+-
++		rc = devm_request_irq(pdev, dev->wake_n, handle_wake_irq,
++				      IRQF_TRIGGER_FALLING, "msm_pcie_wake", dev);
++		if (rc)
++			goto err;
++		dev->wake_irq_requested = true;
+ 		rc = enable_irq_wake(dev->wake_n);
+-		if (rc) {
+-			PCIE_ERR(dev,
+-				"PCIe: RC%d: Unable to enable wake interrupt\n",
+-				dev->rc_idx);
+-			return rc;
+-		}
+-	}
+-
++		if (rc)
++			goto err;
++		dev->wake_irq_enabled = true;
++	}
+ 	return 0;
+-}
+-
+-static void msm_pcie_irq_deinit(struct msm_pcie_dev_t *dev)
+-{
+-	PCIE_DBG(dev, "RC%d\n", dev->rc_idx);
+-
+-	wakeup_source_unregister(dev->ws);
+-
+-	if (dev->wake_n)
+-		disable_irq(dev->wake_n);
++err:
++	msm_pcie_irq_deinit(dev);
++	return rc;
+ }
+ 
+ static bool msm_pcie_check_l0s_support(struct pci_dev *pdev,
+@@ -8545,7 +8702,7 @@
+ 
+ 	for (i = 0; i < MAX_RC_NUM; i++, pcie_itr++) {
+ 
+-		if (!pcie_itr->pcie_sm)
++		if (!pcie_itr->driver_probed || !pcie_itr->pcie_sm)
+ 			continue;
+ 
+ 		msm_pcie_notify_client(pcie_itr,
+@@ -8875,7 +9032,7 @@
+ 		PCIE_DUMP(pcie_dev,
+ 			  "RC%d config space recovery enabled\n",
+ 			  pcie_dev->rc_idx);
+-		INIT_WORK(&pcie_dev->link_recover_wq, handle_link_recover);
++
+ 	}
+ 
+ 	of_property_read_u32(of_node, "qcom,l1ss-sleep-disable",
+@@ -8930,7 +9087,7 @@
+ 	if (IS_ERR(pcie_dev->crm_dev)) {
+ 		PCIE_ERR(pcie_dev, "PCIe: RC%d: fail to get crm_dev\n",
+ 				pcie_dev->rc_idx);
+-		return ret;
++		return PTR_ERR(pcie_dev->crm_dev);
+ 	}
+ 
+ 	msm_pcie_cesta_map_save(pcie_dev->bw_gen_max);
+@@ -8974,7 +9131,7 @@
+ static int msm_pcie_probe(struct platform_device *pdev)
+ {
+ 	int ret = 0;
+-	int rc_idx = -1;
++	u32 rc_idx = MAX_RC_NUM;
+ 	struct msm_pcie_dev_t *pcie_dev;
+ 	struct device_node *of_node;
+ 
+@@ -8991,8 +9148,14 @@
+ 		goto out;
+ 	}
+ 
+-	if (rc_idx >= MAX_RC_NUM)
++	if (rc_idx >= MAX_RC_NUM) {
++		ret = -EINVAL;
+ 		goto out;
++	}
++	if (msm_pcie_dev[rc_idx].pdev) {
++		ret = -EBUSY;
++		goto out;
++	}
+ 
+ 	msm_pcie_create_ipc_logs(rc_idx);
+ 
+@@ -9046,6 +9209,8 @@
+ 	/* SW DRV case */
+ 	if (!pcie_dev->pcie_sm && pcie_dev->drv_supported) {
+ 		ret = register_rpmsg_driver(&msm_pcie_drv_rpmsg_driver);
++		if (!ret)
++			pcie_rpmsg_registered = true;
+ 		if (ret && ret != -EBUSY) {
+ 			PCIE_ERR(pcie_dev,
+ 				"PCIe %d: DRV: rpmsg register fail: ret: %d\n",
+@@ -9062,6 +9227,7 @@
+ 		goto decrease_rc_num;
+ 	}
+ 
++	INIT_KFIFO(pcie_dev->aer_fifo);
+ 	ret = msm_pcie_irq_init(pcie_dev);
+ 	if (ret) {
+ 		msm_pcie_release_resources(pcie_dev);
+@@ -9069,7 +9235,6 @@
+ 		goto decrease_rc_num;
+ 	}
+ 
+-	INIT_KFIFO(pcie_dev->aer_fifo);
+ 
+ 	msm_pcie_sysfs_init(pcie_dev);
+ 
+@@ -9102,10 +9267,14 @@
+ 	PCIE_ERR(pcie_dev, "PCIe: RC%d: Driver probe failed. ret: %d\n",
+ 		pcie_dev->rc_idx, ret);
+ 
+-	msm_pcie_gdsc_genpd_detach(&msm_pcie_dev[rc_idx]);
++	msm_pcie_gdsc_genpd_detach(pcie_dev);
++	msm_pcie_release_resources(pcie_dev);
++	msm_pcie_destroy_ipc_logs(rc_idx);
++	pcie_dev->pdev = NULL;
++	platform_set_drvdata(pdev, NULL);
+ 
+ out:
+-	if (rc_idx < 0 || rc_idx >= MAX_RC_NUM)
++	if (rc_idx >= MAX_RC_NUM)
+ 		pr_err("PCIe: Invalid RC index %d. Driver probe failed\n",
+ 			rc_idx);
+ 
+@@ -9114,64 +9283,59 @@
+ 	return ret;
+ }
+ 
+-static int msm_pcie_remove(struct platform_device *pdev)
+-{
+-	int ret = 0;
+-	int rc_idx;
+-	struct msm_pcie_device_info *dev_info, *temp;
+-
++static void msm_pcie_remove(struct platform_device *pdev)
++{
++	struct msm_pcie_dev_t *dev = platform_get_drvdata(pdev);
++	struct msm_pcie_device_info *entry, *temp;
++
++	if (!dev)
++		return;
++	msm_pcie_sysfs_exit(dev);
+ 	mutex_lock(&pcie_drv.drv_lock);
+-
+-	ret = of_property_read_u32((&pdev->dev)->of_node,
+-				"cell-index", &rc_idx);
+-	if (ret) {
+-		pr_err("%s: Did not find RC index.\n", __func__);
+-		goto out;
+-	} else {
+-		pcie_drv.rc_num--;
+-		dev_info(&pdev->dev, "PCIe: RC%d: being removed\n", rc_idx);
+-	}
+-
+-	if (msm_pcie_dev[rc_idx].saved_state)
+-		pci_load_and_free_saved_state(msm_pcie_dev[rc_idx].dev,
+-				      &msm_pcie_dev[rc_idx].saved_state);
+-
+-	if (msm_pcie_dev[rc_idx].default_state)
+-		pci_load_and_free_saved_state(msm_pcie_dev[rc_idx].dev,
+-				      &msm_pcie_dev[rc_idx].default_state);
+-
+-	/* Use CESTA to turn off the resources */
+-	if (msm_pcie_dev[rc_idx].pcie_sm)
+-		msm_pcie_cesta_map_apply(&msm_pcie_dev[rc_idx], D3COLD_STATE);
+-
+-	msm_pcie_irq_deinit(&msm_pcie_dev[rc_idx]);
+-	msm_pcie_vreg_deinit(&msm_pcie_dev[rc_idx]);
+-	msm_pcie_clk_deinit(&msm_pcie_dev[rc_idx]);
+-	msm_pcie_gdsc_deinit(&msm_pcie_dev[rc_idx]);
+-	msm_pcie_gpio_deinit(&msm_pcie_dev[rc_idx]);
+-	msm_pcie_release_resources(&msm_pcie_dev[rc_idx]);
+-
+-	msm_pcie_gdsc_genpd_detach(&msm_pcie_dev[rc_idx]);
+-
+-	list_for_each_entry_safe(dev_info, temp,
+-				 &msm_pcie_dev[rc_idx].enum_ep_list,
+-				 pcidev_node) {
+-		list_del(&dev_info->pcidev_node);
+-		kfree(dev_info);
+-	}
+-
+-	list_for_each_entry_safe(dev_info, temp,
+-				 &msm_pcie_dev[rc_idx].susp_ep_list,
+-				 pcidev_node) {
+-		list_del(&dev_info->pcidev_node);
+-		kfree(dev_info);
+-	}
+-
+-	msm_pcie_destroy_ipc_logs(rc_idx);
+-out:
++	dev->driver_probed = false;
++	cancel_work_sync(&pcie_drv.drv_connect);
++	msm_pcie_irq_deinit(dev);
++
++	if (dev->bridge && dev->bridge->bus) {
++		pci_lock_rescan_remove();
++		pci_stop_root_bus(dev->bridge->bus);
++		pci_remove_root_bus(dev->bridge->bus);
++		pci_unlock_rescan_remove();
++	}
++	if (dev->saved_state)
++		pci_load_and_free_saved_state(dev->dev, &dev->saved_state);
++	if (dev->default_state)
++		pci_load_and_free_saved_state(dev->dev, &dev->default_state);
++	if (dev->pcie_sm)
++		msm_pcie_cesta_map_apply(dev, D3COLD_STATE);
++	if (dev->power_on) {
++		msm_pcie_vreg_deinit(dev);
++		msm_pcie_clk_deinit(dev);
++		msm_pcie_gdsc_deinit(dev);
++	}
++	msm_pcie_gpio_deinit(dev);
++	msm_pcie_gdsc_genpd_detach(dev);
++	msm_pcie_release_resources(dev);
++	list_for_each_entry_safe(entry, temp, &dev->enum_ep_list, pcidev_node) {
++		list_del(&entry->pcidev_node);
++		kfree(entry);
++	}
++	list_for_each_entry_safe(entry, temp, &dev->susp_ep_list, pcidev_node) {
++		list_del(&entry->pcidev_node);
++		kfree(entry);
++	}
++	INIT_LIST_HEAD(&dev->aer_devices);
++	dev->aer_stats = NULL;
++	dev->enumerated = false;
++	dev->power_on = false;
++	dev->bridge = NULL;
++	pci_dev_put(dev->dev);
++	dev->dev = NULL;
++	pcie_drv.rc_num--;
++	msm_pcie_destroy_ipc_logs(dev->rc_idx);
++	dev->pdev = NULL;
++	platform_set_drvdata(pdev, NULL);
+ 	mutex_unlock(&pcie_drv.drv_lock);
+-
+-	return ret;
+ }
+ 
+ static int msm_pcie_link_retrain(struct msm_pcie_dev_t *pcie_dev,
+@@ -9711,8 +9875,14 @@
+ 		  const struct pci_device_id *device_id)
+ {
+ 	int ret;
+-	struct msm_pcie_dev_t *pcie_dev = PCIE_BUS_PRIV_DATA(pci_dev->bus);
++	struct msm_pcie_dev_t *pcie_dev;
+ 	struct msm_root_dev_t *root_dev;
++
++	if (pci_dev->bus->ops != &msm_pcie_ops)
++		return -ENODEV;
++	pcie_dev = PCIE_BUS_PRIV_DATA(pci_dev->bus);
++	if (!pcie_dev)
++		return -ENODEV;
+ 
+ 	PCIE_DBG(pcie_dev, "PCIe: RC%d: PCI Probe\n", pcie_dev->rc_idx);
+ 
+@@ -9973,7 +10143,7 @@
+ 		struct msm_pcie_drv_info *drv_info = pcie_itr->drv_info;
+ 
+ 		/* does not support DRV or has not been probed yet */
+-		if (!drv_info || drv_info->ep_connected)
++		if (!pcie_itr->driver_probed || !drv_info || drv_info->ep_connected)
+ 			continue;
+ 
+ 		if (!msm_pcie_notify_client(pcie_itr,
+@@ -10015,7 +10185,8 @@
+ 
+ static int pcie_i2c_ctrl_probe(struct i2c_client *client)
+ {
+-	int rc_index = -EINVAL;
++	u32 rc_index;
++	int ret;
+ 	enum i2c_client_id client_id;
+ 	struct pcie_i2c_ctrl *i2c_ctrl;
+ 	const struct of_device_id *match;
+@@ -10026,7 +10197,9 @@
+ 		return -EIO;
+ 	}
+ 
+-	if (client->dev.of_node) {
++	if (!client->dev.of_node)
++		return -EINVAL;
++	{
+ 		match = of_match_device(of_match_ptr(of_i2c_id_table),
+ 					&client->dev);
+ 		if (!match) {
+@@ -10038,7 +10211,9 @@
+ 		client_id = data->client_id;
+ 	}
+ 
+-	of_property_read_u32(client->dev.of_node, "rc-index", &rc_index);
++	ret = of_property_read_u32(client->dev.of_node, "rc-index", &rc_index);
++	if (ret)
++		return ret;
+ 
+ 	dev_info(&client->dev, "%s: PCIe rc-index: 0x%X\n", __func__, rc_index);
+ 
+@@ -10084,6 +10259,9 @@
+ 	mutex_init(&pcie_drv.rpmsg_lock);
+ 
+ 	for (i = 0; i < MAX_RC_NUM; i++) {
++		INIT_WORK(&msm_pcie_dev[i].handle_wake_work, handle_wake_func);
++		INIT_WORK(&msm_pcie_dev[i].handle_sbr_work, handle_sbr_func);
++		INIT_WORK(&msm_pcie_dev[i].link_recover_wq, handle_link_recover);
+ 		spin_lock_init(&msm_pcie_dev[i].cfg_lock);
+ 		spin_lock_init(&msm_pcie_dev[i].evt_reg_list_lock);
+ 		msm_pcie_dev[i].cfg_access = true;
+@@ -10093,6 +10271,8 @@
+ 		mutex_init(&msm_pcie_dev[i].aspm_lock);
+ 		mutex_init(&msm_pcie_dev[i].drv_pc_lock);
+ 		spin_lock_init(&msm_pcie_dev[i].irq_lock);
++		spin_lock_init(&msm_pcie_dev[i].aer_lock);
++		INIT_LIST_HEAD(&msm_pcie_dev[i].aer_devices);
+ 		msm_pcie_dev[i].driver_probed = false;
+ 		msm_pcie_dev[i].l23_rdy_poll_timeout = L23_READY_POLL_TIMEOUT;
+ 		INIT_WORK(&msm_pcie_dev[i].drv_disable_pc_work,
+@@ -10106,8 +10286,8 @@
+ 
+ #if IS_ENABLED(CONFIG_I2C)
+ 	ret = i2c_add_driver(&pcie_i2c_ctrl_driver);
+-	if (ret != 0)
+-		pr_err("Failed to add i2c ctrl driver: %d\n", ret);
++	if (ret)
++		return ret;
+ #endif
+ 
+ 	crc8_populate_msb(msm_pcie_crc8_table, MSM_PCIE_CRC8_POLYNOMIAL);
+@@ -10115,20 +10295,37 @@
+ 	msm_pcie_debugfs_init();
+ 
+ 	if (count == MAX_PCIE_SM_REGS) {
++		for (i = 0; i < MAX_PCIE_SM_REGS; i++)
++			if (pcie_sm_regs[i] < 0) {
++				ret = -EINVAL;
++				goto err_debugfs;
++			}
++		if (pcie_sm_regs[PCIE_SM_NUM_INSTANCES] > MAX_RC_NUM) {
++			ret = -EINVAL;
++			goto err_debugfs;
++		}
+ 		for (i = 0; i < pcie_sm_regs[PCIE_SM_NUM_INSTANCES]; i++) {
+ 
+-			reg_addr = ioremap(pcie_sm_regs[PCIE_SM_BASE] +
++			reg_addr = ioremap((u64)pcie_sm_regs[PCIE_SM_BASE] +
+ 				pcie_sm_regs[PCIE_SM_PWR_CTRL_OFFSET] +
+-			(i * pcie_sm_regs[PCIE_SM_PWR_INSTANCE_OFFSET]), 4);
+-
++			((u64)i * pcie_sm_regs[PCIE_SM_PWR_INSTANCE_OFFSET]), 4);
++
++			if (!reg_addr) {
++				ret = -ENOMEM;
++				goto err_debugfs;
++			}
+ 			msm_pcie_write_reg(reg_addr, 0x0, 0x1);
+ 
+ 			iounmap(reg_addr);
+ 
+-			reg_addr = ioremap(pcie_sm_regs[PCIE_SM_BASE] +
++			reg_addr = ioremap((u64)pcie_sm_regs[PCIE_SM_BASE] +
+ 				pcie_sm_regs[PCIE_SM_PWR_MASK_OFFSET] +
+-			(i * pcie_sm_regs[PCIE_SM_PWR_INSTANCE_OFFSET]), 4);
+-
++			((u64)i * pcie_sm_regs[PCIE_SM_PWR_INSTANCE_OFFSET]), 4);
++
++			if (!reg_addr) {
++				ret = -ENOMEM;
++				goto err_debugfs;
++			}
+ 			msm_pcie_write_reg(reg_addr, 0x0, 0x1);
+ 
+ 			iounmap(reg_addr);
+@@ -10137,43 +10334,48 @@
+ 
+ 	ret = pci_register_driver(&msm_pci_driver);
+ 	if (ret)
+-		return ret;
++		goto err_debugfs;
+ 
+ 	mpcie_wq = alloc_ordered_workqueue("mpcie_wq",
+ 						WQ_MEM_RECLAIM | WQ_HIGHPRI);
+-	if (!mpcie_wq)
+-		return -ENOMEM;
++	if (!mpcie_wq) {
++		ret = -ENOMEM;
++		goto err_pci_driver;
++	}
+ 
+ 	pcie_drv.nb.notifier_call = msm_pcie_ssr_notifier;
+ 	INIT_WORK(&pcie_drv.drv_connect, msm_pcie_drv_connect_worker);
+ 	pcie_drv.msm_pcie_dev = msm_pcie_dev;
+ 
+ 	ret = platform_driver_register(&msm_pcie_driver);
+-	if (ret)
+-		destroy_workqueue(mpcie_wq);
+-
+-	return ret;
+-}
+-
+-static void __exit pcie_exit(void)
+-{
+-	int i;
+-
+-	pr_info("PCIe: %s\n", __func__);
+-
++	if (!ret)
++		return 0;
++	destroy_workqueue(mpcie_wq);
++err_pci_driver:
++	pci_unregister_driver(&msm_pci_driver);
++err_debugfs:
++	msm_pcie_debugfs_exit();
+ #if IS_ENABLED(CONFIG_I2C)
+ 	i2c_del_driver(&pcie_i2c_ctrl_driver);
+ #endif
+-
++	return ret;
++}
++
++static void __exit pcie_exit(void)
++{
++	msm_pcie_debugfs_exit();
++	if (pcie_rpmsg_registered)
++		unregister_rpmsg_driver(&msm_pcie_drv_rpmsg_driver);
++	if (pcie_drv.notifier)
++		qcom_unregister_early_ssr_notifier(pcie_drv.notifier, &pcie_drv.nb);
++	cancel_work_sync(&pcie_drv.drv_connect);
++	platform_driver_unregister(&msm_pcie_driver);
++	pci_unregister_driver(&msm_pci_driver);
+ 	if (mpcie_wq)
+ 		destroy_workqueue(mpcie_wq);
+-
+-	platform_driver_unregister(&msm_pcie_driver);
+-
+-	msm_pcie_debugfs_exit();
+-
+-	for (i = 0; i < MAX_RC_NUM; i++)
+-		msm_pcie_sysfs_exit(&msm_pcie_dev[i]);
++#if IS_ENABLED(CONFIG_I2C)
++	i2c_del_driver(&pcie_i2c_ctrl_driver);
++#endif
+ }
+ 
+ subsys_initcall_sync(pcie_init);
+@@ -10212,6 +10414,7 @@
+ static int msm_pcie_pm_suspend(struct pci_dev *dev,
+ 			void *user, void *data, u32 options)
+ {
++	unsigned long cfg_flags;
+ 	int ret = 0;
+ 	u32 val = 0;
+ 	int ret_l23;
+@@ -10276,10 +10479,10 @@
+ 	}
+ 
+ 	spin_lock_irqsave(&pcie_dev->cfg_lock,
+-				pcie_dev->irqsave_flags);
++				cfg_flags);
+ 	pcie_dev->cfg_access = false;
+ 	spin_unlock_irqrestore(&pcie_dev->cfg_lock,
+-				pcie_dev->irqsave_flags);
++				cfg_flags);
+ 
+ 	writel_relaxed(BIT(4), pcie_dev->elbi + PCIE20_ELBI_SYS_CTRL);
+ 	wmb(); /* ensure changes propagated to the hardware */
+@@ -10315,6 +10518,7 @@
+ 
+ static void msm_pcie_fixup_suspend(struct pci_dev *dev)
+ {
++	unsigned long cfg_flags;
+ 	int ret;
+ 	struct msm_pcie_dev_t *pcie_dev = PCIE_BUS_PRIV_DATA(dev->bus);
+ 
+@@ -10325,17 +10529,17 @@
+ 		return;
+ 
+ 	spin_lock_irqsave(&pcie_dev->cfg_lock,
+-				pcie_dev->irqsave_flags);
++				cfg_flags);
+ 	if (pcie_dev->disable_pc) {
+ 		PCIE_DBG(pcie_dev,
+ 			"RC%d: Skip suspend because of user request\n",
+ 			pcie_dev->rc_idx);
+ 		spin_unlock_irqrestore(&pcie_dev->cfg_lock,
+-				pcie_dev->irqsave_flags);
++				cfg_flags);
+ 		return;
+ 	}
+ 	spin_unlock_irqrestore(&pcie_dev->cfg_lock,
+-				pcie_dev->irqsave_flags);
++				cfg_flags);
+ 
+ 	mutex_lock(&pcie_dev->recovery_lock);
+ 
+@@ -10353,6 +10557,7 @@
+ static int msm_pcie_pm_resume(struct pci_dev *dev,
+ 			void *user, void *data, u32 options)
+ {
++	unsigned long cfg_flags;
+ 	int ret;
+ 	struct msm_pcie_dev_t *pcie_dev = PCIE_BUS_PRIV_DATA(dev->bus);
+ 
+@@ -10363,10 +10568,10 @@
+ 					pcie_dev->pins_default);
+ 
+ 	spin_lock_irqsave(&pcie_dev->cfg_lock,
+-				pcie_dev->irqsave_flags);
++				cfg_flags);
+ 	pcie_dev->cfg_access = true;
+ 	spin_unlock_irqrestore(&pcie_dev->cfg_lock,
+-				pcie_dev->irqsave_flags);
++				cfg_flags);
+ 
+ 	ret = msm_pcie_enable(pcie_dev);
+ 	if (ret) {
+@@ -11021,6 +11226,7 @@
+ int msm_pcie_pm_control(enum msm_pcie_pm_opt pm_opt, u32 busnr, void *user,
+ 			void *data, u32 options)
+ {
++	unsigned long cfg_flags;
+ 	struct msm_pcie_dev_t *pcie_dev;
+ 	unsigned long flags;
+ 	int ret;
+@@ -11074,7 +11280,7 @@
+ 		PCIE_DBG(pcie_dev,
+ 			 "User of RC%d requests to keep the link always alive.\n",
+ 			 pcie_dev->rc_idx);
+-		spin_lock_irqsave(&pcie_dev->cfg_lock, pcie_dev->irqsave_flags);
++		spin_lock_irqsave(&pcie_dev->cfg_lock, cfg_flags);
+ 		if (pcie_dev->suspending) {
+ 			PCIE_ERR(pcie_dev,
+ 				 "PCIe: RC%d Link has been suspended before request\n",
+@@ -11084,16 +11290,16 @@
+ 			pcie_dev->disable_pc = true;
+ 		}
+ 		spin_unlock_irqrestore(&pcie_dev->cfg_lock,
+-				       pcie_dev->irqsave_flags);
++				       cfg_flags);
+ 		break;
+ 	case MSM_PCIE_ENABLE_PC:
+ 		PCIE_DBG(pcie_dev,
+ 			 "User of RC%d cancels the request of alive link.\n",
+ 			 pcie_dev->rc_idx);
+-		spin_lock_irqsave(&pcie_dev->cfg_lock, pcie_dev->irqsave_flags);
++		spin_lock_irqsave(&pcie_dev->cfg_lock, cfg_flags);
+ 		pcie_dev->disable_pc = false;
+ 		spin_unlock_irqrestore(&pcie_dev->cfg_lock,
+-				       pcie_dev->irqsave_flags);
++				       cfg_flags);
+ 		break;
+ 	case MSM_PCIE_HANDLE_LINKDOWN:
+ 		PCIE_DBG(pcie_dev,
+--- a/drivers/pci/controller/pci-msm-msi.c
++++ b/drivers/pci/controller/pci-msm-msi.c
+@@ -226,11 +226,34 @@
+ 	.irq_unmask = msm_msi_unmask_irq,
+ };
+ 
++static void msm_msi_client_free(struct msm_msi_client *client)
++{
++	struct msm_msi *msi = client->msi;
++
++	if (msi->type == MSM_MSI_TYPE_QCOM)
++		dma_unmap_resource(client->dev, client->msi_addr,
++				   msi->msi_addr_size, DMA_FROM_DEVICE, 0);
++	list_del(&client->node);
++	kfree(client);
++}
++
+ static int msm_msi_domain_prepare(struct irq_domain *domain, struct device *dev,
+ 				int nvec, msi_alloc_info_t *arg)
+ {
+ 	struct msm_msi *msi = domain->parent->host_data;
+ 	struct msm_msi_client *client;
++
++	if (nvec <= 0 || nvec > msi->nr_virqs)
++		return -EINVAL;
++	mutex_lock(&msi->mutex);
++	list_for_each_entry(client, &msi->clients, node) {
++		if (client->dev == dev) {
++			mutex_unlock(&msi->mutex);
++			memset(arg, 0, sizeof(*arg));
++			return 0;
++		}
++	}
++	mutex_unlock(&msi->mutex);
+ 
+ 	client = kzalloc(sizeof(*client), GFP_KERNEL);
+ 	if (!client)
+@@ -282,7 +305,7 @@
+ {
+ 	struct irq_data *parent_data = irq_get_irq_data(irqd_to_hwirq(data));
+ 
+-	if (!parent_data)
++	if (!parent_data || !parent_data->chip)
+ 		return -ENODEV;
+ 
+ 	/* set affinity for MSM MSI HW IRQ */
+@@ -301,7 +324,7 @@
+ 	struct msm_msi_client *client = msi_irq->client;
+ 	struct msm_msi *msi = client->msi;
+ 
+-	if (!parent_data)
++	if (msi->type == MSM_MSI_TYPE_QCOM && !parent_data)
+ 		return;
+ 
+ 	msg->address_lo = lower_32_bits(client->msi_addr);
+@@ -341,13 +364,18 @@
+ 		goto out;
+ 	}
+ 
++	if (!nr_irqs || nr_irqs > msi->nr_virqs) {
++		ret = -ENOSPC;
++		goto free_unused;
++	}
+ 	pos = bitmap_find_next_zero_area(msi->bitmap, msi->nr_virqs, 0,
+ 					nr_irqs, nr_irqs - 1);
+-	if (pos < msi->nr_virqs) {
++	if (nr_irqs && pos <= msi->nr_virqs &&
++	    nr_irqs <= msi->nr_virqs - pos) {
+ 		bitmap_set(msi->bitmap, pos, nr_irqs);
+ 	} else {
+ 		ret = -ENOSPC;
+-		goto out;
++		goto free_unused;
+ 	}
+ 
+ 	for (i = 0; i < nr_irqs; i++) {
+@@ -364,7 +392,10 @@
+ 		client->nr_irqs++;
+ 		pos++;
+ 	}
+-
++	goto out;
++free_unused:
++	if (!client->nr_irqs)
++		msm_msi_client_free(client);
+ out:
+ 	mutex_unlock(&msi->mutex);
+ 	return ret;
+@@ -387,16 +418,16 @@
+ 
+ 	mutex_lock(&msi->mutex);
+ 
++	if (!nr_irqs || nr_irqs > client->nr_irqs || msi_irq->pos >= msi->nr_virqs ||
++	    nr_irqs > msi->nr_virqs - msi_irq->pos) {
++		mutex_unlock(&msi->mutex);
++		return;
++	}
+ 	bitmap_clear(msi->bitmap, msi_irq->pos, nr_irqs);
+ 	client->nr_irqs -= nr_irqs;
+ 
+-	if (!client->nr_irqs) {
+-		if (msi->type == MSM_MSI_TYPE_QCOM)
+-			dma_unmap_resource(client->dev, client->msi_addr,
+-					PAGE_SIZE, DMA_FROM_DEVICE, 0);
+-		list_del(&client->node);
+-		kfree(client);
+-	}
++	if (!client->nr_irqs)
++		msm_msi_client_free(client);
+ 
+ 	mutex_unlock(&msi->mutex);
+ 
+@@ -566,10 +597,36 @@
+ }
+ EXPORT_SYMBOL(msm_msi_config);
+ 
++static void msm_msi_cleanup(void *data)
++{
++	struct msm_msi *msi = data;
++	struct msm_msi_client *client, *tmp;
++	unsigned int i, grp, index, irq;
++
++	for (i = 0; i < msi->nr_hwirqs; i++) {
++		grp = msi->type == MSM_MSI_TYPE_SNPS ? i : i / MSI_IRQ_PER_GRP;
++		index = msi->type == MSM_MSI_TYPE_SNPS ? 0 : i % MSI_IRQ_PER_GRP;
++		irq = msi->grps[grp].irqs[index].hwirq;
++		irq_set_chained_handler_and_data(irq, NULL, NULL);
++		synchronize_irq(irq);
++		irq_dispose_mapping(irq);
++	}
++	irq_domain_remove(msi->msi_domain);
++	irq_domain_remove(msi->inner_domain);
++	list_for_each_entry_safe(client, tmp, &msi->clients, node)
++		msm_msi_client_free(client);
++	kfree(msi->bitmap);
++	kfree(msi->grps);
++	iounmap(msi->pcie_cfg);
++	of_node_put(msi->of_node);
++	kfree(msi);
++}
++
+ int msm_msi_init(struct device *dev)
+ {
+ 	int ret;
+ 	struct msm_msi *msi;
++	struct irq_domain *existing;
+ 	struct device_node *of_node;
+ 	struct resource msi_res;
+ 	struct of_phandle_args irq;
+@@ -599,6 +656,13 @@
+ 		goto err;
+ 	}
+ 
++	existing = irq_find_matching_host(of_node, DOMAIN_BUS_PCI_MSI);
++	if (existing && existing->parent &&
++	    existing->parent->ops == &msi_domain_ops) {
++		msi = existing->parent->host_data;
++		ret = msi->dev == dev ? 0 : -EBUSY;
++		goto err;
++	}
+ 	msi = kzalloc(sizeof(*msi), GFP_KERNEL);
+ 	if (!msi) {
+ 		ret = -ENOMEM;
+@@ -614,34 +678,43 @@
+ 	if (of_address_to_resource(msi->of_node, 0, &msi_res)) {
+ 		dev_err(msi->dev, "MSI: missing 'reg' devicetree\n");
+ 		ret = -EINVAL;
+-		goto err;
++		goto free_msi;
+ 	}
+ 
+ 	msi->msi_addr = msi_res.start;
+ 	if (!msi->msi_addr) {
+ 		dev_err(msi->dev, "MSI: failed to get MSI address\n");
+ 		ret = -EINVAL;
+-		goto err;
++		goto free_msi;
+ 	}
+ 
+ 	of_property_read_u32(of_node, "qcom,msi-addr-size-exp", &size_exp);
+ 
+ 	size_exp = (size_exp > PAGE_SHIFT) ? size_exp : PAGE_SHIFT;
+-
+-	msi->msi_addr_size = 1 << size_exp;
++	if (size_exp >= 32) {
++		ret = -EINVAL;
++		goto free_msi;
++	}
++	msi->msi_addr_size = 1U << size_exp;
+ 
+ 	msi->type = of_property_read_bool(msi->of_node, "qcom,snps") ?
+ 			MSM_MSI_TYPE_SNPS : MSM_MSI_TYPE_QCOM;
+ 	dev_info(msi->dev, "MSI: %s controller is present\n",
+ 		msi->type == MSM_MSI_TYPE_SNPS ? "synopsys" : "qgic");
+ 
+-	while (of_irq_parse_one(msi->of_node, msi->nr_hwirqs, &irq) == 0)
++	while (of_irq_parse_one(msi->of_node, msi->nr_hwirqs, &irq) == 0) {
++		of_node_put(irq.np);
++		if (msi->nr_hwirqs == INT_MAX / MSI_IRQ_PER_GRP) {
++			ret = -EOVERFLOW;
++			goto free_msi;
++		}
+ 		msi->nr_hwirqs++;
++	}
+ 
+ 	if (!msi->nr_hwirqs) {
+ 		dev_err(msi->dev, "MSI: found no MSI interrupts\n");
+ 		ret = -ENODEV;
+-		goto err;
++		goto free_msi;
+ 	}
+ 
+ 	if (msi->type == MSM_MSI_TYPE_SNPS) {
+@@ -651,9 +724,13 @@
+ 			dev_err(msi->dev,
+ 				"MSI: failed to get PCIe register base\n");
+ 			ret = -ENODEV;
+-			goto err;
+-		}
+-
++			goto free_msi;
++		}
++
++		if (resource_size(res) < PCIE_MSI_CTRL_INT_N_STATUS_OFFS(msi->nr_hwirqs - 1) + 4) {
++			ret = -EINVAL;
++			goto free_msi;
++		}
+ 		msi->pcie_cfg = ioremap(res->start, resource_size(res));
+ 		if (!msi->pcie_cfg) {
+ 			ret = -ENOMEM;
+@@ -667,7 +744,7 @@
+ 		msi_irq_setup = msm_msi_snps_irq_setup;
+ 	} else {
+ 		msi->nr_virqs = msi->nr_hwirqs;
+-		msi->nr_grps = 1;
++		msi->nr_grps = DIV_ROUND_UP(msi->nr_hwirqs, MSI_IRQ_PER_GRP);
+ 		msi->mask_irq = msm_msi_qgic_mask_irq;
+ 		msi->unmask_irq = msm_msi_qgic_unmask_irq;
+ 		msi_irq_setup = msm_msi_qgic_irq_setup;
+@@ -697,8 +774,7 @@
+ 		goto remove_domains;
+ 
+ 	msm_msi_config(msi->msi_domain);
+-
+-	return 0;
++	return devm_add_action_or_reset(dev, msm_msi_cleanup, msi);
+ 
+ remove_domains:
+ 	irq_domain_remove(msi->msi_domain);
+--- a/drivers/soc/qcom/pcie-pdc.c
++++ b/drivers/soc/qcom/pcie-pdc.c
+@@ -11,6 +11,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_device.h>
++#include <linux/platform_device.h>
+ #include <linux/spinlock.h>
+ #include <linux/types.h>
+ 
+@@ -51,7 +52,6 @@
+ static int pdc_cfg_irq(u32 irq, u32 mux, int mux_select, unsigned int type,
+ 		u32 irq_select_offset, bool enable)
+ {
+-	unsigned long flags;
+ 	u32 value;
+ 	enum pdc_irq_config_bits pdc_type;
+ 
+@@ -84,13 +84,9 @@
+ 		pdc_type &= ~IRQ_i_CFG_IRQ_ENABLE;
+ 	}
+ 
+-	raw_spin_lock_irqsave(&pdc_lock, flags);
+-
+ 	writel_relaxed(value, pcie_pdc_base + irq_select_offset +
+ 		       mux_select * IRQ_i_GP_IRQ_DISTANCE);
+ 	writel_relaxed(pdc_type, pcie_pdc_base + IRQ_i_CFG + irq * IRQ_i_CFG_DISTANCE);
+-
+-	raw_spin_unlock_irqrestore(&pdc_lock, flags);
+ 
+ 	return 0;
+ }
+@@ -109,32 +105,79 @@
+  */
+ int pcie_pdc_cfg_irq(u32 gpio, unsigned int type, bool enable)
+ {
+-	int i;
+-
+-	if (!d)
++	unsigned long flags;
++	int i, ret = -EINVAL;
++
++	raw_spin_lock_irqsave(&pdc_lock, flags);
++	if (!d || !pcie_pdc_base) {
++		ret = -ENODEV;
++		goto out;
++	}
++
++	for (i = 0; i < d->size; i++) {
++		if (gpio == d->map[i].gpio) {
++			ret = pdc_cfg_irq(d->map[i].irq, d->map[i].mux, i, type,
++					  d->irq_select_offset, enable);
++			break;
++		}
++	}
++
++out:
++	raw_spin_unlock_irqrestore(&pdc_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(pcie_pdc_cfg_irq);
++
++static int qcom_pcie_pdc_probe(struct platform_device *pdev)
++{
++	const struct pdc_match_data *match;
++	struct resource *res;
++	void __iomem *base;
++	unsigned long flags;
++	resource_size_t size;
++	int i, ret = 0;
++
++	match = of_device_get_match_data(&pdev->dev);
++	if (!match)
++		return -EINVAL;
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
+ 		return -ENODEV;
+-
+-	for (i = 0; i < d->size; i++) {
+-		if (gpio == d->map[i].gpio)
+-			return pdc_cfg_irq(d->map[i].irq, d->map[i].mux, i, type,
+-					d->irq_select_offset, enable);
+-	}
+-
+-	return -EINVAL;
+-}
+-EXPORT_SYMBOL_GPL(pcie_pdc_cfg_irq);
+-
+-static int qcom_pcie_pdc_probe(struct platform_device *pdev)
+-{
+-	pcie_pdc_base = devm_platform_ioremap_resource(pdev, 0);
+-	if (!pcie_pdc_base)
+-		return -ENXIO;
+-
+-	d = of_device_get_match_data(&pdev->dev);
+-	if (!d)
+-		return -EINVAL;
+-
+-	return 0;
++	size = resource_size(res);
++	for (i = 0; i < match->size; i++) {
++		u64 cfg = IRQ_i_CFG + (u64)match->map[i].irq * IRQ_i_CFG_DISTANCE;
++		u64 select = match->irq_select_offset + (u64)i * IRQ_i_GP_IRQ_DISTANCE;
++
++		if (size < sizeof(u32) || cfg > size - sizeof(u32) ||
++		    select > size - sizeof(u32))
++			return -EINVAL;
++	}
++	base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(base))
++		return PTR_ERR(base);
++
++	raw_spin_lock_irqsave(&pdc_lock, flags);
++	if (d) {
++		ret = -EBUSY;
++	} else {
++		pcie_pdc_base = base;
++		d = match;
++		platform_set_drvdata(pdev, base);
++	}
++	raw_spin_unlock_irqrestore(&pdc_lock, flags);
++	return ret;
++}
++
++static void qcom_pcie_pdc_remove(struct platform_device *pdev)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&pdc_lock, flags);
++	if (pcie_pdc_base == platform_get_drvdata(pdev)) {
++		d = NULL;
++		pcie_pdc_base = NULL;
++	}
++	raw_spin_unlock_irqrestore(&pdc_lock, flags);
+ }
+ 
+ static const struct irq_map sun_irq_map[] = {
+@@ -214,6 +257,7 @@
+ 
+ static struct platform_driver qcom_pcie_pdc_driver = {
+ 	.probe = qcom_pcie_pdc_probe,
++	.remove = qcom_pcie_pdc_remove,
+ 	.driver = {
+ 		.name = "qcom-pcie-pdc",
+ 		.of_match_table = qcom_pcie_pdc_match_table,
+--- a/drivers/bus/mhi/host/init.c
++++ b/drivers/bus/mhi/host/init.c
+@@ -135,13 +135,25 @@
+ 				  struct mhi_ring *ring,
+ 				  u64 len)
+ {
++	u64 remainder, adjustment;
++
++	if (!len || len > SIZE_MAX / 2)
++		return -EINVAL;
+ 	ring->alloc_size = len + (len - 1);
+ 	ring->pre_aligned = dma_alloc_coherent(mhi_cntrl->cntrl_dev, ring->alloc_size,
+ 					       &ring->dma_handle, GFP_KERNEL);
+ 	if (!ring->pre_aligned)
+ 		return -ENOMEM;
+ 
+-	ring->iommu_base = (ring->dma_handle + (len - 1)) & ~(len - 1);
++	remainder = ring->dma_handle % len;
++	adjustment = remainder ? len - remainder : 0;
++	if (ring->dma_handle > U64_MAX - adjustment) {
++		dma_free_coherent(mhi_cntrl->cntrl_dev, ring->alloc_size,
++				  ring->pre_aligned, ring->dma_handle);
++		ring->pre_aligned = NULL;
++		return -EOVERFLOW;
++	}
++	ring->iommu_base = ring->dma_handle + adjustment;
+ 	ring->base = ring->pre_aligned + (ring->iommu_base - ring->dma_handle);
+ 
+ 	return 0;
+@@ -158,8 +170,19 @@
+ 
+ 		free_irq(mhi_cntrl->irq[mhi_event->irq], mhi_event);
+ 	}
+-
+ 	free_irq(mhi_cntrl->irq[0], mhi_cntrl);
++	cancel_work_sync(&mhi_cntrl->st_worker);
++
++	mhi_event = mhi_cntrl->mhi_event;
++	for (i = 0; i < mhi_cntrl->total_ev_rings; i++, mhi_event++) {
++		if (mhi_event->offload_ev)
++			continue;
++		if (mhi_event->priority == MHI_ER_PRIORITY_HI_SLEEP)
++			cancel_work_sync(&mhi_event->work);
++		else
++			tasklet_kill(&mhi_event->task);
++	}
++
+ }
+ 
+ int mhi_init_irq_setup(struct mhi_controller *mhi_cntrl)
+@@ -214,7 +237,8 @@
+ 	return 0;
+ 
+ error_request:
+-	for (--i, --mhi_event; i >= 0; i--, mhi_event--) {
++	while (i > 0) {
++		mhi_event = &mhi_cntrl->mhi_event[--i];
+ 		if (mhi_event->offload_ev)
+ 			continue;
+ 
+@@ -518,9 +542,10 @@
+ 		return -EIO;
+ 	}
+ 
+-	if (val >= mhi_cntrl->reg_len - (8 * MHI_DEV_WAKE_DB)) {
++	if (!mhi_reg_range_valid(mhi_cntrl, base, val,
++				 8 * max_t(u32, mhi_cntrl->max_chan, MHI_DEV_WAKE_DB + 1))) {
+ 		dev_err(dev, "CHDB offset: 0x%x is out of range: 0x%zx\n",
+-			val, mhi_cntrl->reg_len - (8 * MHI_DEV_WAKE_DB));
++			val, mhi_cntrl->reg_len);
+ 		return -ERANGE;
+ 	}
+ 
+@@ -540,9 +565,10 @@
+ 		return -EIO;
+ 	}
+ 
+-	if (val >= mhi_cntrl->reg_len - (8 * mhi_cntrl->total_ev_rings)) {
++	if (!mhi_reg_range_valid(mhi_cntrl, base, val,
++				 8 * mhi_cntrl->total_ev_rings)) {
+ 		dev_err(dev, "ERDB offset: 0x%x is out of range: 0x%zx\n",
+-			val, mhi_cntrl->reg_len - (8 * mhi_cntrl->total_ev_rings));
++			val, mhi_cntrl->reg_len);
+ 		return -ERANGE;
+ 	}
+ 
+@@ -689,6 +715,14 @@
+ 		mhi_event->ring.elements = event_cfg->num_elements;
+ 		mhi_event->intmod = event_cfg->irq_moderation_ms;
+ 		mhi_event->irq = event_cfg->irq;
++		if (!event_cfg->offload_channel &&
++		    (event_cfg->num_elements < 2 ||
++		     event_cfg->num_elements > U32_MAX / sizeof(struct mhi_ring_element) ||
++		     event_cfg->irq >= mhi_cntrl->nr_irqs))
++			goto error_ev_cfg;
++		if (event_cfg->priority > MHI_ER_PRIORITY_HI_SLEEP ||
++		    (event_cfg->client_managed && event_cfg->channel == U32_MAX))
++			goto error_ev_cfg;
+ 
+ 		if (event_cfg->channel != U32_MAX) {
+ 			/* This event ring has a dedicated channel */
+@@ -701,6 +735,9 @@
+ 
+ 			mhi_event->mhi_chan =
+ 				&mhi_cntrl->mhi_chan[mhi_event->chan];
++			if (event_cfg->client_managed && !event_cfg->offload_channel &&
++			    !mhi_event->mhi_chan->configured)
++				goto error_ev_cfg;
+ 		}
+ 
+ 		mhi_event->priority = event_cfg->priority;
+@@ -750,6 +787,7 @@
+ error_ev_cfg:
+ 
+ 	kfree(mhi_cntrl->mhi_event);
++	mhi_cntrl->mhi_event = NULL;
+ 	return -EINVAL;
+ }
+ 
+@@ -788,11 +826,16 @@
+ 		}
+ 
+ 		mhi_chan = &mhi_cntrl->mhi_chan[chan];
++		if (mhi_chan->configured || !ch_cfg->name || !ch_cfg->name[0] ||
++		    ch_cfg->event_ring >= config->num_events)
++			goto error_chan_cfg;
+ 		mhi_chan->name = ch_cfg->name;
+ 		mhi_chan->chan = chan;
+ 
+ 		mhi_chan->tre_ring.elements = ch_cfg->num_elements;
+-		if (!mhi_chan->tre_ring.elements)
++		if (mhi_chan->tre_ring.elements < 2 ||
++		    mhi_chan->tre_ring.elements >
++		    U32_MAX / sizeof(struct mhi_ring_element))
+ 			goto error_chan_cfg;
+ 
+ 		/*
+@@ -805,8 +848,14 @@
+ 		mhi_chan->buf_ring.elements = ch_cfg->local_elements;
+ 		if (!mhi_chan->buf_ring.elements)
+ 			mhi_chan->buf_ring.elements = mhi_chan->tre_ring.elements;
++		if (mhi_chan->buf_ring.elements < mhi_chan->tre_ring.elements ||
++		    mhi_chan->buf_ring.elements > U32_MAX / sizeof(struct mhi_buf_info))
++			goto error_chan_cfg;
+ 		mhi_chan->er_index = ch_cfg->event_ring;
+ 		mhi_chan->dir = ch_cfg->dir;
++		if (ch_cfg->dir != DMA_BIDIRECTIONAL && ch_cfg->dir != DMA_TO_DEVICE &&
++		    ch_cfg->dir != DMA_FROM_DEVICE && ch_cfg->dir != DMA_NONE)
++			goto error_chan_cfg;
+ 
+ 		/*
+ 		 * For most channels, chtype is identical to channel directions.
+@@ -867,6 +916,7 @@
+ 
+ error_chan_cfg:
+ 	vfree(mhi_cntrl->mhi_chan);
++	mhi_cntrl->mhi_chan = NULL;
+ 
+ 	return -EINVAL;
+ }
+@@ -875,6 +925,17 @@
+ 			const struct mhi_controller_config *config)
+ {
+ 	int ret;
++
++	if (!config->max_channels || config->max_channels > 256 ||
++	    !config->num_channels || config->num_channels > config->max_channels ||
++	    !config->num_events || config->num_events > 256 ||
++	    !config->ch_cfg || !config->event_cfg ||
++	    (config->bhie_offset && (mhi_cntrl->reg_len < BHIE_RXVECSTATUS_OFFS + 4 ||
++	     config->bhie_offset > mhi_cntrl->reg_len - BHIE_RXVECSTATUS_OFFS - 4 ||
++	     !IS_ALIGNED(config->bhie_offset, sizeof(u32)))))
++		return -EINVAL;
++	mhi_cntrl->hw_ev_rings = 0;
++	mhi_cntrl->sw_ev_rings = 0;
+ 
+ 	/* Parse MHI channel configuration */
+ 	ret = parse_ch_cfg(mhi_cntrl, config);
+@@ -907,6 +968,7 @@
+ 
+ error_ev_cfg:
+ 	vfree(mhi_cntrl->mhi_chan);
++	mhi_cntrl->mhi_chan = NULL;
+ 
+ 	return ret;
+ }
+@@ -921,11 +983,12 @@
+ 	u32 soc_info;
+ 	int ret, i;
+ 
+-	if (!mhi_cntrl || !mhi_cntrl->cntrl_dev || !mhi_cntrl->regs ||
++	if (!mhi_cntrl || !config || mhi_cntrl->mhi_dev ||
++	    !mhi_cntrl->cntrl_dev || !mhi_cntrl->regs ||
+ 	    !mhi_cntrl->runtime_get || !mhi_cntrl->runtime_put ||
+ 	    !mhi_cntrl->status_cb || !mhi_cntrl->read_reg ||
+ 	    !mhi_cntrl->write_reg || !mhi_cntrl->nr_irqs ||
+-	    !mhi_cntrl->irq || !mhi_cntrl->reg_len)
++	    !mhi_cntrl->irq || mhi_cntrl->reg_len < SOC_HW_VERSION_OFFS + 4)
+ 		return -EINVAL;
+ 
+ 	/* Initialise BHI and BHIe Offsets*/
+@@ -934,7 +997,7 @@
+ 
+ 	ret = parse_config(mhi_cntrl, config);
+ 	if (ret)
+-		return -EINVAL;
++		return ret;
+ 
+ 	mhi_cntrl->mhi_cmd = kcalloc(NR_OF_CMD_RINGS,
+ 				     sizeof(*mhi_cntrl->mhi_cmd), GFP_KERNEL);
+@@ -1042,8 +1105,7 @@
+ 	if (ret) {
+ 		dev_err(mhi_cntrl->cntrl_dev,
+ 			"Could not enable miscellaneous features\n");
+-		mhi_cntrl->mhi_dev = NULL;
+-		goto err_ida_free;
++		goto error_setup_irq;
+ 	}
+ 
+ 	ret = device_add(&mhi_dev->dev);
+@@ -1064,6 +1126,11 @@
+ 	mhi_misc_unregister_controller(mhi_cntrl);
+ error_setup_irq:
+ 	mhi_deinit_free_irq(mhi_cntrl);
++	if (mhi_cntrl->mhi_dev) {
++		device_init_wakeup(&mhi_dev->dev, false);
++		put_device(&mhi_dev->dev);
++		mhi_cntrl->mhi_dev = NULL;
++	}
+ err_ida_free:
+ 	ida_free(&mhi_controller_ida, mhi_cntrl->index);
+ err_destroy_wq:
+@@ -1084,9 +1151,11 @@
+ 	struct mhi_chan *mhi_chan = mhi_cntrl->mhi_chan;
+ 	unsigned int i;
+ 
++	mhi_misc_sysfs_destroy(mhi_cntrl);
++	mhi_destroy_debugfs(mhi_cntrl);
+ 	mhi_deinit_free_irq(mhi_cntrl);
++	device_for_each_child(&mhi_dev->dev, NULL, mhi_destroy_device);
+ 	mhi_misc_unregister_controller(mhi_cntrl);
+-	mhi_misc_sysfs_destroy(mhi_cntrl);
+ 
+ 	/* Free the memory controller wanted to preserve for BHIe images */
+ 	if (mhi_cntrl->img_pre_alloc) {
+@@ -1096,10 +1165,11 @@
+ 		if (mhi_cntrl->rddm_image)
+ 			mhi_free_bhie_table(mhi_cntrl, &mhi_cntrl->rddm_image);
+ 	}
+-	mhi_destroy_debugfs(mhi_cntrl);
+ 	destroy_workqueue(mhi_cntrl->hiprio_wq);
+ 	kfree(mhi_cntrl->mhi_cmd);
+ 	kfree(mhi_cntrl->mhi_event);
++	mhi_cntrl->mhi_event = NULL;
++	mhi_cntrl->mhi_cmd = NULL;
+ 
+ 	/* Drop the references to MHI devices created for channels */
+ 	for (i = 0; i < mhi_cntrl->max_chan; i++, mhi_chan++) {
+@@ -1109,11 +1179,14 @@
+ 		put_device(&mhi_chan->mhi_dev->dev);
+ 	}
+ 	vfree(mhi_cntrl->mhi_chan);
++	mhi_cntrl->mhi_chan = NULL;
+ 
+ 	device_del(&mhi_dev->dev);
++	device_init_wakeup(&mhi_dev->dev, false);
+ 	put_device(&mhi_dev->dev);
+ 
+ 	ida_free(&mhi_controller_ida, mhi_cntrl->index);
++	mhi_cntrl->mhi_dev = NULL;
+ }
+ EXPORT_SYMBOL_GPL(mhi_unregister_controller);
+ 
+@@ -1151,7 +1224,8 @@
+ 		goto error_reg_offset;
+ 	}
+ 
+-	if (bhi_off >= mhi_cntrl->reg_len) {
++	if (!bhi_off || !mhi_reg_range_valid(mhi_cntrl, mhi_cntrl->regs,
++					     bhi_off, BHI_OEMPKHASH(15) + 4)) {
+ 		MHI_ERR(dev, "BHI offset: 0x%x is out of range: 0x%zx\n",
+ 			bhi_off, mhi_cntrl->reg_len);
+ 		ret = -ERANGE;
+@@ -1167,7 +1241,8 @@
+ 			goto error_reg_offset;
+ 		}
+ 
+-		if (bhie_off >= mhi_cntrl->reg_len) {
++		if (!bhie_off || !mhi_reg_range_valid(mhi_cntrl, mhi_cntrl->regs,
++						      bhie_off, BHIE_RXVECSTATUS_OFFS + 4)) {
+ 			MHI_ERR(dev,
+ 				"BHIe offset: 0x%x is out of range: 0x%zx\n",
+ 				bhie_off, mhi_cntrl->reg_len);
+@@ -1178,6 +1253,11 @@
+ 	}
+ 
+ 	if (mhi_cntrl->rddm_size) {
++		if (!mhi_reg_range_valid(mhi_cntrl, mhi_cntrl->bhie, 0,
++					 BHIE_RXVECSTATUS_OFFS + 4)) {
++			ret = -ERANGE;
++			goto error_reg_offset;
++		}
+ 		/*
+ 		 * This controller supports RDDM, so we need to manually clear
+ 		 * BHIE RX registers since POR values are undefined.
+@@ -1447,10 +1527,10 @@
+ 					mhi_dev->name);
+ }
+ 
+-static int mhi_match(struct device *dev, struct device_driver *drv)
++static int mhi_match(struct device *dev, const struct device_driver *drv)
+ {
+ 	struct mhi_device *mhi_dev = to_mhi_device(dev);
+-	struct mhi_driver *mhi_drv = to_mhi_driver(drv);
++	const struct mhi_driver *mhi_drv = to_mhi_driver(drv);
+ 	const struct mhi_device_id *id;
+ 
+ 	/*
+--- a/drivers/bus/mhi/host/main.c
++++ b/drivers/bus/mhi/host/main.c
+@@ -17,9 +17,27 @@
+ #include <linux/slab.h>
+ #include "internal.h"
+ 
++bool mhi_reg_range_valid(struct mhi_controller *mhi_cntrl,
++			 void __iomem *base, u32 offset, size_t len)
++{
++	unsigned long start = (unsigned long)mhi_cntrl->regs;
++	unsigned long addr = (unsigned long)base;
++	size_t displacement;
++
++	if (!start || !addr || addr < start || !IS_ALIGNED(addr, sizeof(u32)) ||
++	    !IS_ALIGNED(offset, sizeof(u32)))
++		return false;
++	displacement = addr - start;
++	return displacement <= mhi_cntrl->reg_len &&
++	       offset <= mhi_cntrl->reg_len - displacement &&
++	       len <= mhi_cntrl->reg_len - displacement - offset;
++}
++
+ int __must_check mhi_read_reg(struct mhi_controller *mhi_cntrl,
+ 			      void __iomem *base, u32 offset, u32 *out)
+ {
++	if (!out || !mhi_reg_range_valid(mhi_cntrl, base, offset, sizeof(u32)))
++		return -ERANGE;
+ 	return mhi_cntrl->read_reg(mhi_cntrl, base + offset, out);
+ }
+ 
+@@ -30,6 +48,8 @@
+ 	u32 tmp;
+ 	int ret;
+ 
++	if (!mask || !out)
++		return -EINVAL;
+ 	ret = mhi_read_reg(mhi_cntrl, base, offset, &tmp);
+ 	if (ret)
+ 		return ret;
+@@ -44,7 +64,12 @@
+ 				    u32 mask, u32 val, u32 delayus)
+ {
+ 	int ret;
+-	u32 out, retry = (mhi_cntrl->timeout_ms * 1000) / delayus;
++	u32 out;
++	u64 retry;
++
++	if (!delayus)
++		return -EINVAL;
++	retry = div_u64((u64)mhi_cntrl->timeout_ms * 1000, delayus);
+ 
+ 	while (retry--) {
+ 		ret = mhi_read_reg_field(mhi_cntrl, base, offset, mask, &out);
+@@ -63,7 +88,8 @@
+ void mhi_write_reg(struct mhi_controller *mhi_cntrl, void __iomem *base,
+ 		   u32 offset, u32 val)
+ {
+-	mhi_cntrl->write_reg(mhi_cntrl, base + offset, val);
++	if (mhi_reg_range_valid(mhi_cntrl, base, offset, sizeof(u32)))
++		mhi_cntrl->write_reg(mhi_cntrl, base + offset, val);
+ }
+ 
+ int __must_check mhi_write_reg_field(struct mhi_controller *mhi_cntrl,
+@@ -73,12 +99,14 @@
+ 	int ret;
+ 	u32 tmp;
+ 
++	if (!mask)
++		return -EINVAL;
+ 	ret = mhi_read_reg(mhi_cntrl, base, offset, &tmp);
+ 	if (ret)
+ 		return ret;
+ 
+ 	tmp &= ~mask;
+-	tmp |= (val << __ffs(mask));
++	tmp |= (val << __ffs(mask)) & mask;
+ 	mhi_write_reg(mhi_cntrl, base, offset, tmp);
+ 
+ 	return 0;
+@@ -281,53 +309,34 @@
+ 
+ 	if (dev->bus != &mhi_bus_type)
+ 		return 0;
+-
+ 	mhi_dev = to_mhi_device(dev);
+ 	mhi_cntrl = mhi_dev->mhi_cntrl;
+-
+-	/* Only destroy virtual devices thats attached to bus */
+ 	if (mhi_dev->dev_type == MHI_DEVICE_CONTROLLER)
+ 		return 0;
+-
+ 	ul_chan = mhi_dev->ul_chan;
+ 	dl_chan = mhi_dev->dl_chan;
+-
+-	/*
+-	 * If execution environment is specified, remove only those devices that
+-	 * started in them based on ee_mask for the channels as we move on to a
+-	 * different execution environment
+-	 */
+ 	if (data)
+ 		ee = *(enum mhi_ee_type *)data;
+-
+-	/*
+-	 * For the suspend and resume case, this function will get called
+-	 * without mhi_unregister_controller(). Hence, we need to drop the
+-	 * references to mhi_dev created for ul and dl channels. We can
+-	 * be sure that there will be no instances of mhi_dev left after
+-	 * this.
+-	 */
++	if (ee != MHI_EE_MAX &&
++	    ((ul_chan && !(ul_chan->ee_mask & BIT(ee))) ||
++	     (dl_chan && !(dl_chan->ee_mask & BIT(ee)))))
++		return 0;
++
++	MHI_VERB(dev, "destroy device for chan:%s\n", mhi_dev->name);
++	/* Client remove callbacks still need the channel storage. */
++	device_del(dev);
+ 	if (ul_chan) {
+-		if (ee != MHI_EE_MAX && !(ul_chan->ee_mask & BIT(ee)))
+-			return 0;
+-
+-		put_device(&ul_chan->mhi_dev->dev);
+-	}
+-
++		ul_chan->mhi_dev = NULL;
++		mhi_dev->ul_chan = NULL;
++		put_device(dev);
++	}
+ 	if (dl_chan) {
+-		if (ee != MHI_EE_MAX && !(dl_chan->ee_mask & BIT(ee)))
+-			return 0;
+-
+-		put_device(&dl_chan->mhi_dev->dev);
+-	}
+-
+-	MHI_VERB(dev, "destroy device for chan:%s\n",
+-		 mhi_dev->name);
+-
+-	/* Notify the client and remove the device from MHI bus */
+-	device_del(dev);
++		dl_chan->mhi_dev = NULL;
++		mhi_dev->dl_chan = NULL;
++		put_device(dev);
++	}
++	/* External device references may now outlive the channel arrays. */
+ 	put_device(dev);
+-
+ 	return 0;
+ }
+ 
+@@ -466,10 +475,14 @@
+ 	struct mhi_event *mhi_event = priv;
+ 	struct mhi_controller *mhi_cntrl = mhi_event->mhi_cntrl;
+ 	struct mhi_event_ctxt *er_ctxt;
+-	struct device *dev = &mhi_cntrl->mhi_dev->dev;
++	struct device *dev;
+ 	struct mhi_ring *ev_ring = &mhi_event->ring;
+ 	dma_addr_t ptr;
+ 	void *dev_rp;
++
++	if (!mhi_cntrl->mhi_dev)
++		return IRQ_NONE;
++	dev = &mhi_cntrl->mhi_dev->dev;
+ 
+ 	/*
+ 	 * If CONFIG_DEBUG_SHIRQ is set, the IRQ handler will get invoked during __free_irq()
+@@ -529,10 +542,14 @@
+ irqreturn_t mhi_intvec_threaded_handler(int irq_number, void *priv)
+ {
+ 	struct mhi_controller *mhi_cntrl = priv;
+-	struct device *dev = &mhi_cntrl->mhi_dev->dev;
++	struct device *dev;
+ 	enum mhi_state state;
+ 	enum mhi_pm_state pm_state = 0;
+ 	enum mhi_ee_type ee;
++
++	if (!mhi_cntrl->mhi_dev)
++		return IRQ_NONE;
++	dev = &mhi_cntrl->mhi_dev->dev;
+ 
+ 	write_lock_irq(&mhi_cntrl->pm_lock);
+ 	if (!MHI_REG_ACCESS_VALID(mhi_cntrl->pm_state)) {
+--- a/drivers/bus/mhi/host/boot.c
++++ b/drivers/bus/mhi/host/boot.c
+@@ -4,6 +4,7 @@
+  *
+  */
+ 
++#include <linux/overflow.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/dma-direction.h>
+@@ -321,10 +322,11 @@
+ 			 struct image_info **image_info)
+ {
+ 	int i;
+-	struct mhi_buf *mhi_buf = (*image_info)->mhi_buf;
+-
+-	if (mhi_cntrl->img_pre_alloc)
++	struct mhi_buf *mhi_buf;
++
++	if (!image_info || !*image_info || mhi_cntrl->img_pre_alloc)
+ 		return;
++	mhi_buf = (*image_info)->mhi_buf;
+ 
+ 	for (i = 0; i < (*image_info)->entries; i++, mhi_buf++)
+ 		dma_free_attrs(mhi_cntrl->cntrl_dev, mhi_buf->len, mhi_buf->buf,
+@@ -341,13 +343,35 @@
+ 			 size_t alloc_size)
+ {
+ 	size_t seg_size = mhi_cntrl->seg_len;
+-	int segments = DIV_ROUND_UP(alloc_size, seg_size) + 1;
++	size_t data_segments;
++	int segments;
+ 	int i;
+ 	struct image_info *img_info;
+ 	struct mhi_buf *mhi_buf;
+ 
+-	if (mhi_cntrl->img_pre_alloc)
++	if (!image_info || !alloc_size || !seg_size || seg_size > U32_MAX)
++		return -EINVAL;
++	data_segments = alloc_size / seg_size + !!(alloc_size % seg_size);
++	if (data_segments > INT_MAX - 1 ||
++	    data_segments > U32_MAX / sizeof(struct bhi_vec_entry))
++		return -EOVERFLOW;
++	segments = data_segments + 1;
++
++	if (mhi_cntrl->img_pre_alloc) {
++		img_info = *image_info;
++		if (!img_info || img_info->entries != segments || !img_info->mhi_buf ||
++		    !img_info->bhi_vec ||
++		    img_info->bhi_vec != img_info->mhi_buf[segments - 1].buf ||
++		    img_info->mhi_buf[segments - 1].len <
++		    data_segments * sizeof(struct bhi_vec_entry))
++			return -EINVAL;
++		for (i = 0; i < data_segments; i++)
++			if (!img_info->mhi_buf[i].buf || img_info->mhi_buf[i].len < seg_size)
++				return -EINVAL;
+ 		return 0;
++	}
++	if (*image_info)
++		return -EBUSY;
+ 
+ 	img_info = kzalloc(sizeof(*img_info), GFP_KERNEL);
+ 	if (!img_info)
+@@ -383,25 +407,50 @@
+ 	return 0;
+ 
+ error_alloc_segment:
+-	for (--i, --mhi_buf; i >= 0; i--, mhi_buf--)
++	while (i > 0) {
++		mhi_buf = &img_info->mhi_buf[--i];
+ 		dma_free_attrs(mhi_cntrl->cntrl_dev, mhi_buf->len, mhi_buf->buf,
+ 			       mhi_buf->dma_addr, DMA_ATTR_FORCE_CONTIGUOUS);
++	}
+ 
+ error_alloc_mhi_buf:
++	kfree(img_info->mhi_buf);
+ 	kfree(img_info);
+ 
+ 	return -ENOMEM;
+ }
+ 
+-static void mhi_firmware_copy(struct mhi_controller *mhi_cntrl,
+-			      const u8 *buf, size_t remainder,
+-			      struct image_info *img_info)
++static int mhi_firmware_copy(struct mhi_controller *mhi_cntrl,
++			     const u8 *buf, size_t remainder,
++			     struct image_info *img_info)
+ {
+ 	size_t to_cpy;
+-	struct mhi_buf *mhi_buf = img_info->mhi_buf;
+-	struct bhi_vec_entry *bhi_vec = img_info->bhi_vec;
+-
+-	while (remainder) {
++	struct mhi_buf *mhi_buf;
++	struct bhi_vec_entry *bhi_vec;
++	unsigned int i = 0, n;
++	size_t available = 0;
++
++	if (!buf || !remainder || !img_info || img_info->entries < 2 ||
++	    !img_info->bhi_vec || !img_info->mhi_buf)
++		return -EINVAL;
++	mhi_buf = img_info->mhi_buf;
++	bhi_vec = img_info->bhi_vec;
++	if (img_info->entries - 1 > U32_MAX / sizeof(*bhi_vec) ||
++	    mhi_buf[img_info->entries - 1].buf != bhi_vec ||
++	    mhi_buf[img_info->entries - 1].len < (img_info->entries - 1) * sizeof(*bhi_vec))
++		return -EINVAL;
++	for (n = 0; n < img_info->entries - 1; n++) {
++		if (!mhi_buf[n].buf || !mhi_buf[n].len ||
++		    check_add_overflow(available, mhi_buf[n].len, &available))
++			return -EINVAL;
++	}
++	if (remainder > available)
++		return -EOVERFLOW;
++	memset(bhi_vec, 0, (img_info->entries - 1) * sizeof(*bhi_vec));
++
++	while (remainder && i < img_info->entries - 1) {
++		if (!mhi_buf->buf || !mhi_buf->len)
++			return -EINVAL;
+ 		to_cpy = min(remainder, mhi_buf->len);
+ 		memcpy(mhi_buf->buf, buf, to_cpy);
+ 		bhi_vec->dma_addr = cpu_to_le64(mhi_buf->dma_addr);
+@@ -411,7 +460,9 @@
+ 		remainder -= to_cpy;
+ 		bhi_vec++;
+ 		mhi_buf++;
+-	}
++		i++;
++	}
++	return remainder ? -EOVERFLOW : 0;
+ }
+ 
+ void mhi_fw_load_handler(struct mhi_controller *mhi_cntrl)
+@@ -490,6 +541,11 @@
+ 	fw_sz = firmware->size;
+ 
+ skip_req_fw:
++	if (!size || size > fw_sz || size > U32_MAX ||
++	    (mhi_cntrl->tme_supported_image && mhi_cntrl->sbl_size >= fw_sz)) {
++		release_firmware(firmware);
++		goto error_fw_load;
++	}
+ 	buf = dma_alloc_coherent(mhi_cntrl->cntrl_dev, size, &dma_addr,
+ 				 GFP_KERNEL);
+ 	if (!buf) {
+@@ -538,7 +594,13 @@
+ 		}
+ 
+ 		/* Load the firmware into BHIE vec table */
+-		mhi_firmware_copy(mhi_cntrl, fw_data, fw_sz, mhi_cntrl->fbc_image);
++		ret = mhi_firmware_copy(mhi_cntrl, fw_data, fw_sz,
++					mhi_cntrl->fbc_image);
++		if (ret) {
++			release_firmware(firmware);
++			mhi_free_bhie_table(mhi_cntrl, &mhi_cntrl->fbc_image);
++			goto error_fw_load;
++		}
+ 	}
+ 
+ 	release_firmware(firmware);
+--- a/drivers/bus/mhi/host/misc.c
++++ b/drivers/bus/mhi/host/misc.c
+@@ -7,6 +7,7 @@
+ #include <linux/list.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
++#include <linux/overflow.h>
+ #include <linux/pci.h>
+ #include <linux/slab.h>
+ #include <linux/vmalloc.h>
+@@ -220,14 +221,14 @@
+ 	 smp_wmb();
+ }
+ 
+-void mhi_write_reg_offload(struct mhi_controller *mhi_cntrl,
+-		   void __iomem *base,
+-		   u32 offset,
+-		   u32 val)
++static void mhi_write_reg_offload(struct mhi_controller *mhi_cntrl,
++				  void __iomem *base, u32 offset, u32 val)
+ {
+ 	struct mhi_private *mhi_priv =
+ 				dev_get_drvdata(&mhi_cntrl->mhi_dev->dev);
+ 
++	if (!mhi_priv || !mhi_reg_range_valid(mhi_cntrl, base, offset, 4))
++		return;
+ 	mhi_reg_write_enqueue(mhi_priv, base + offset, val);
+ 	queue_work(mhi_priv->offload_wq, &mhi_priv->reg_write_work);
+ }
+@@ -240,7 +241,7 @@
+ 			      lower_32_bits(db_val));
+ }
+ 
+-void mhi_reg_write_work(struct work_struct *w)
++static void mhi_reg_write_work(struct work_struct *w)
+ {
+ 	struct mhi_private *mhi_priv = container_of(w,
+ 						struct mhi_private,
+@@ -294,6 +295,7 @@
+ 	ret = sysfs_create_group(&dev->kobj, &mhi_tsync_group);
+ 	if (ret) {
+ 		MHI_ERR(dev, "Failed to create time synchronization sysfs group\n");
++		sysfs_remove_group(&dev->kobj, &mhi_misc_group);
+ 		return ret;
+ 	}
+ 
+@@ -334,13 +336,6 @@
+ 	mhi_priv->log_buf = ipc_log_context_create(MHI_IPC_LOG_PAGES,
+ 						   mhi_dev->name, 0);
+ 	mhi_priv->mhi_cntrl = mhi_cntrl;
+-
+-	/* adding it to this list only for debug purpose */
+-	mutex_lock(&mhi_bus.lock);
+-	list_add_tail(&mhi_priv->node, &mhi_bus.controller_list);
+-	mutex_unlock(&mhi_bus.lock);
+-
+-	dev_set_drvdata(dev, mhi_priv);
+ 
+ 	mhi_priv->offload_wq = alloc_ordered_workqueue("mhi_offload_wq",
+ 						       WQ_HIGHPRI);
+@@ -362,6 +357,11 @@
+ 	}
+ 
+ 	atomic_set(&mhi_priv->write_idx, -1);
++	dev_set_drvdata(dev, mhi_priv);
++	/* Publish only after the queue and its storage are initialized. */
++	mutex_lock(&mhi_bus.lock);
++	list_add_tail(&mhi_priv->node, &mhi_bus.controller_list);
++	mutex_unlock(&mhi_bus.lock);
+ 
+ 	return 0;
+ 
+@@ -369,6 +369,7 @@
+ 	destroy_workqueue(mhi_priv->offload_wq);
+ ipc_ctx_cleanup:
+ 	ipc_log_context_destroy(mhi_priv->log_buf);
++	kfree(mhi_priv);
+ 
+ 	return ret;
+ }
+@@ -384,12 +385,16 @@
+ 	list_del(&mhi_priv->node);
+ 	mutex_unlock(&mhi_bus.lock);
+ 
++	cancel_work_sync(&mhi_priv->reg_write_work);
++	destroy_workqueue(mhi_priv->offload_wq);
++	dev_set_drvdata(&mhi_cntrl->mhi_dev->dev, NULL);
+ 	kfree(mhi_priv->reg_write_q);
+ 
+ 	if (mhi_priv->sfr_info)
+ 		kfree(mhi_priv->sfr_info->str);
+ 	kfree(mhi_priv->sfr_info);
+ 	kfree(mhi_priv->timesync);
++	ipc_log_context_destroy(mhi_priv->log_buf);
+ 	kfree(mhi_priv);
+ }
+ 
+@@ -503,9 +508,10 @@
+ 	write_unlock_irqrestore(&mhi_cntrl->pm_lock, flags);
+ 
+ 	/* copy subsystem failure reason string if supported */
+-	if (sfr_info && sfr_info->buf_addr) {
++	if (sfr_info && sfr_info->buf_addr && sfr_info->str && sfr_info->len) {
+ 		memcpy(sfr_info->str, sfr_info->buf_addr, sfr_info->len);
+-		MHI_ERR(dev, "mhi: %s sfr: %s\n", dev_name(dev), (char *) sfr_info->buf_addr);
++		sfr_info->str[sfr_info->len - 1] = '\0';
++		MHI_ERR(dev, "mhi: %s sfr: %s\n", dev_name(dev), sfr_info->str);
+ 	}
+ 
+ 	/* Notify fatal error to all client drivers to halt processing */
+@@ -804,45 +810,61 @@
+ static void mhi_process_sfr(struct mhi_controller *mhi_cntrl,
+ 			    struct file_info *info)
+ {
+-	struct mhi_buf *mhi_buf = mhi_cntrl->rddm_image->mhi_buf;
+-	struct device *dev = &mhi_cntrl->mhi_dev->dev;
+-	u8 *sfr_buf, *file_offset = info->file_offset;
+-	u32 file_size = info->file_size;
+-	u32 rem_seg_len = info->rem_seg_len;
++	struct image_info *image = mhi_cntrl->rddm_image;
++	struct mhi_buf *mhi_buf = image->mhi_buf;
++	struct device *dev = &mhi_cntrl->mhi_dev->dev;
++	u8 *sfr_buf, *cursor, *file_offset = info->file_offset;
++	u64 file_size = info->file_size;
++	size_t rem_seg_len = info->rem_seg_len;
+ 	u32 seg_idx = info->seg_idx;
+-
+-	sfr_buf = kzalloc(file_size + 1, GFP_KERNEL);
++	u64 available = rem_seg_len;
++	unsigned int i;
++
++	if (image->entries < 2 || seg_idx >= image->entries - 1 ||
++	    rem_seg_len > mhi_buf[seg_idx].len)
++		return;
++	if (!rem_seg_len) {
++		seg_idx++;
++		if (seg_idx >= image->entries - 1)
++			return;
++		file_offset = mhi_buf[seg_idx].buf;
++		rem_seg_len = mhi_buf[seg_idx].len;
++		available = rem_seg_len;
++	}
++	for (i = seg_idx + 1; i < image->entries - 1; i++) {
++		if (check_add_overflow(available, mhi_buf[i].len, &available))
++			return;
++	}
++	if (!file_size || file_size > SIZE_MAX - 1 || file_size > available)
++		return;
++	sfr_buf = kzalloc((size_t)file_size + 1, GFP_KERNEL);
+ 	if (!sfr_buf)
+ 		return;
++	cursor = sfr_buf;
+ 
+ 	while (file_size) {
+-		/* file offset starting from seg base */
++		size_t copy;
++
++		if (seg_idx >= image->entries - 1)
++			goto err;
+ 		if (!rem_seg_len) {
+ 			file_offset = mhi_buf[seg_idx].buf;
+-			if (file_size > mhi_buf[seg_idx].len)
+-				rem_seg_len = mhi_buf[seg_idx].len;
+-			else
+-				rem_seg_len = file_size;
++			rem_seg_len = mhi_buf[seg_idx].len;
+ 		}
+-
+-		if (file_size <= rem_seg_len) {
+-			memcpy(sfr_buf, file_offset, file_size);
+-			break;
+-		}
+-
+-		memcpy(sfr_buf, file_offset, rem_seg_len);
+-		sfr_buf += rem_seg_len;
+-		file_size -= rem_seg_len;
++		if (!file_offset || !rem_seg_len ||
++		    rem_seg_len > mhi_buf[seg_idx].len ||
++		    (unsigned long)file_offset < (unsigned long)mhi_buf[seg_idx].buf ||
++		    (unsigned long)file_offset - (unsigned long)mhi_buf[seg_idx].buf >
++		    mhi_buf[seg_idx].len - rem_seg_len)
++			goto err;
++		copy = min_t(u64, file_size, rem_seg_len);
++		memcpy(cursor, file_offset, copy);
++		cursor += copy;
++		file_size -= copy;
+ 		rem_seg_len = 0;
+ 		seg_idx++;
+-		if (seg_idx == mhi_cntrl->rddm_image->entries) {
+-			MHI_ERR(dev, "invalid size for SFR file\n");
+-			goto err;
+-		}
+ 	}
+ 	sfr_buf[info->file_size] = '\0';
+-
+-	/* force sfr string to log in kernel msg */
+ 	MHI_ERR(dev, "%s\n", sfr_buf);
+ err:
+ 	kfree(sfr_buf);
+@@ -866,9 +888,9 @@
+ 	/* iterate over segments until eof is reached */
+ 	while (info->file_size) {
+ 		info->seg_idx++;
+-		if (info->seg_idx == mhi_cntrl->rddm_image->entries) {
+-			MHI_ERR(dev, "invalid size for file %s\n",
+-				table_info->file_name);
++		if (info->seg_idx >= mhi_cntrl->rddm_image->entries - 1) {
++			MHI_ERR(dev, "invalid size for file %.*s\n",
++				(int)sizeof(table_info->file_name), table_info->file_name);
+ 			return -EINVAL;
+ 		}
+ 		if (info->file_size > mhi_buf[info->seg_idx].len) {
+@@ -887,18 +909,26 @@
+ 
+ void mhi_dump_sfr(struct mhi_controller *mhi_cntrl)
+ {
+-	struct mhi_buf *mhi_buf = mhi_cntrl->rddm_image->mhi_buf;
+-	struct rddm_header *rddm_header =
+-		(struct rddm_header *)mhi_buf->buf;
++	struct mhi_buf *mhi_buf;
++	struct rddm_header *rddm_header;
+ 	struct rddm_table_info *table_info;
+ 	struct file_info info;
+ 	struct device *dev = &mhi_cntrl->mhi_dev->dev;
+ 	u32 table_size, n;
+ 
++	if (!mhi_cntrl->rddm_image || mhi_cntrl->rddm_image->entries < 2 ||
++	    !mhi_cntrl->rddm_image->mhi_buf)
++		return;
++	mhi_buf = mhi_cntrl->rddm_image->mhi_buf;
++	if (!mhi_buf->buf || mhi_buf->len < 8)
++		return;
++	rddm_header = mhi_buf->buf;
+ 	memset(&info, 0, sizeof(info));
+ 
+ 	if (rddm_header->header_size > sizeof(*rddm_header) ||
+-			rddm_header->header_size < 8) {
++	    rddm_header->header_size < 8 ||
++	    rddm_header->header_size > mhi_buf->len ||
++	    (rddm_header->header_size - 8) % sizeof(*table_info)) {
+ 		MHI_ERR(dev, "invalid reported header size %u\n",
+ 			rddm_header->header_size);
+ 		return;
+@@ -915,7 +945,7 @@
+ 	for (n = 0; n < table_size; n++) {
+ 		table_info = &rddm_header->table_info[n];
+ 
+-		if (!strcmp(table_info->file_name, "Q6-SFR.bin")) {
++		if (!memcmp(table_info->file_name, "Q6-SFR.bin", sizeof("Q6-SFR.bin"))) {
+ 			info.file_size = table_info->size;
+ 			mhi_process_sfr(mhi_cntrl, &info);
+ 			return;
+@@ -959,7 +989,7 @@
+ 	enum mhi_state state;
+ 	enum mhi_ee_type ee;
+ 	int i, ret;
+-	u32 val;
++	u32 val = 0;
+ 	void __iomem *mhi_base = mhi_cntrl->regs;
+ 	void __iomem *bhi_base = mhi_cntrl->bhi;
+ 	void __iomem *bhie_base = mhi_cntrl->bhie;
+@@ -1074,6 +1104,7 @@
+ 				     u32 capability, u32 *offset)
+ {
+ 	u32 cur_cap, next_offset;
++	u32 attempts = min_t(size_t, mhi_cntrl->reg_len, MHI_REG_SIZE) / sizeof(u32);
+ 	int ret;
+ 
+ 	/* get the 1st supported capability offset */
+@@ -1081,8 +1112,10 @@
+ 				 MISC_CAP_MASK, offset);
+ 	if (ret)
+ 		return ret;
+-	do {
+-		if (*offset >= MHI_REG_SIZE)
++	while (*offset && attempts--) {
++		if (mhi_cntrl->reg_len < sizeof(u32) ||
++		    *offset > mhi_cntrl->reg_len - sizeof(u32) ||
++		    *offset >= MHI_REG_SIZE || !IS_ALIGNED(*offset, sizeof(u32)))
+ 			return -ENXIO;
+ 
+ 		ret = mhi_read_reg_field(mhi_cntrl, mhi_cntrl->regs, *offset,
+@@ -1099,7 +1132,7 @@
+ 			return ret;
+ 
+ 		*offset = next_offset;
+-	} while (next_offset);
++	}
+ 
+ 	return -ENXIO;
+ }
+@@ -1142,6 +1175,10 @@
+ 	if (er_index < 0)
+ 		return er_index;
+ 
++	if (er_index >= 32 || !mhi_reg_range_valid(mhi_cntrl, mhi_cntrl->regs,
++						   bw_cfg_offset, BW_SCALE_CFG_OFFSET + 4) ||
++	    !mhi_reg_range_valid(mhi_cntrl, bw_scale_db, 0, 8))
++		return -ERANGE;
+ 	bw_cfg_offset += BW_SCALE_CFG_OFFSET;
+ 
+ 	mhi_priv->bw_scale_db = bw_scale_db;
+@@ -1168,6 +1205,10 @@
+ 
+ 	if (!mhi_tsync)
+ 		return -ENOMEM;
++	if (!mhi_priv || mhi_priv->timesync || !time_get || !lpm_disable || !lpm_enable) {
++		kfree(mhi_tsync);
++		return -EINVAL;
++	}
+ 
+ 	mhi_tsync->time_get = time_get;
+ 	mhi_tsync->lpm_disable = lpm_disable;
+@@ -1196,6 +1237,11 @@
+ 	if (ret)
+ 		return ret;
+ 
++	if (!mhi_reg_range_valid(mhi_cntrl, mhi_cntrl->regs, time_offset,
++				 TIMESYNC_TIME_HIGH_OFFSET + 4) ||
++	    !mhi_reg_range_valid(mhi_cntrl, time_db, 0, 8))
++		return -ERANGE;
++
+ 	/* save time_offset for obtaining time via MMIO register reads */
+ 	mhi_tsync->time_reg = mhi_cntrl->regs + time_offset;
+ 
+@@ -1221,8 +1267,8 @@
+ 	return 0;
+ }
+ 
+-int mhi_init_host_notification(struct mhi_controller *mhi_cntrl,
+-							void __iomem *host_notify_db)
++static int mhi_init_host_notification(struct mhi_controller *mhi_cntrl,
++				      void __iomem *host_notify_db)
+ {
+ 	struct device *dev = &mhi_cntrl->mhi_dev->dev;
+ 	int ret;
+@@ -1233,6 +1279,10 @@
+ 	if (ret)
+ 		return ret;
+ 
++	if (!mhi_reg_range_valid(mhi_cntrl, mhi_cntrl->regs, host_notify_cfg_offset,
++				 MHI_HOST_NOTIFY_CFG_OFFSET + 4) ||
++	    !mhi_reg_range_valid(mhi_cntrl, host_notify_db, 0, 8))
++		return -ERANGE;
+ 	host_notify_cfg_offset += MHI_HOST_NOTIFY_CFG_OFFSET;
+ 	mhi_cntrl->host_notify_db = host_notify_db;
+ 
+@@ -1704,14 +1754,18 @@
+ 	struct mhi_private *mhi_priv = dev_get_drvdata(dev);
+ 	struct mhi_sfr_info *sfr_info;
+ 
++	if (!len || len > U32_MAX || !mhi_priv || mhi_priv->sfr_info)
++		return -EINVAL;
+ 	sfr_info = kzalloc(sizeof(*sfr_info), GFP_KERNEL);
+ 	if (!sfr_info)
+ 		return -ENOMEM;
+ 
+ 	sfr_info->len = len;
+ 	sfr_info->str = kzalloc(len, GFP_KERNEL);
+-	if (!sfr_info->str)
++	if (!sfr_info->str) {
++		kfree(sfr_info);
+ 		return -ENOMEM;
++	}
+ 
+ 	mhi_priv->sfr_info = sfr_info;
+ 
+--- a/include/linux/msm_pcie.h
++++ b/include/linux/msm_pcie.h
+@@ -187,6 +187,8 @@
+  *
+  * Return: 0 on success, negative value on error
+  */
++int msm_pcie_dsp_link_control(struct pci_dev *pci_dev, bool link_enable);
++
+ int msm_pcie_enumerate(u32 rc_idx);
+ 
+ /*
+--- a/include/linux/mhi.h
++++ b/include/linux/mhi.h
+@@ -791,6 +791,9 @@
+  * command to both channels. Channels can be started only if both host and
+  * device execution environments match and channels are in a DISABLED state.
+  */
++int mhi_stop_transfer(struct mhi_device *mhi_dev);
++int mhi_start_transfer(struct mhi_device *mhi_dev);
++
+ int mhi_prepare_for_transfer(struct mhi_device *mhi_dev);
+ 
+ /**
+--- a/drivers/bus/mhi/host/internal.h
++++ b/drivers/bus/mhi/host/internal.h
+@@ -315,8 +315,9 @@
+ 
+ static bool __maybe_unused is_valid_ring_ptr(struct mhi_ring *ring, dma_addr_t addr)
+ {
+-	return addr >= ring->iommu_base && addr < ring->iommu_base + ring->len &&
+-			!(addr & (sizeof(struct mhi_ring_element) - 1));
++	return addr >= ring->iommu_base &&
++		addr - ring->iommu_base < ring->len &&
++		!((addr - ring->iommu_base) & (sizeof(struct mhi_ring_element) - 1));
+ }
+ 
+ /* Register access methods */
+@@ -325,6 +326,8 @@
+ void mhi_db_brstmode_disable(struct mhi_controller *mhi_cntrl,
+ 			     struct db_cfg *db_mode, void __iomem *db_addr,
+ 			     dma_addr_t db_val);
++bool mhi_reg_range_valid(struct mhi_controller *mhi_cntrl,
++			 void __iomem *base, u32 offset, size_t len);
+ int __must_check mhi_read_reg(struct mhi_controller *mhi_cntrl,
+ 			      void __iomem *base, u32 offset, u32 *out);
+ int __must_check mhi_read_reg_field(struct mhi_controller *mhi_cntrl,
+--- a/drivers/bus/mhi/host/misc.h
++++ b/drivers/bus/mhi/host/misc.h
+@@ -167,9 +167,9 @@
+  */
+ struct file_info {
+ 	u8 *file_offset;
+-	u32 file_size;
++	u64 file_size;
+ 	u32 seg_idx;
+-	u32 rem_seg_len;
++	size_t rem_seg_len;
+ };
+ 
+ /**
