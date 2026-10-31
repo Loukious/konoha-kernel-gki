@@ -1379,6 +1379,26 @@ ddk_module(
     deps = [":scm_headers", ":memory_dump_headers", ":minidump", ":qcom_scm"],
 )
 
+ddk_module(
+    name = "miev",
+    srcs = ["drivers/misc/miev/midevice.c", "drivers/misc/miev/mievent.c", "drivers/misc/miev/midevice.h", "include/miev/mievent.h"],
+    out = "miev.ko",
+    linux_includes = ["include"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+)
+
+ddk_module(
+    name = "boottime",
+    srcs = ["drivers/xiaomi/boottime/boottime.c", "drivers/xiaomi/boottime/boottime.h"],
+    out = "boottime.ko",
+    linux_includes = ["include"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1471,6 +1491,8 @@ kernel_module_group(
         ":memory_dump_v2",
         ":dcc_v2",
         ":qcom_dload_mode",
+        ":miev",
+        ":boottime",
         ":nvmem_qfprom",
         ":qcom_cpufreq_thermal",
         ":qcom_cpufreq_hw",

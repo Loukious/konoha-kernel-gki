@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 105 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 107 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 105 platform `.ko` files, their symbol tables and DDK configurations.
+- 107 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 4569
-imported symbol CRCs across all 105 modules.
+used. The current [validation report](validation-20261031.json) checks 4647
+imported symbol CRCs across all 107 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -324,8 +324,8 @@ changes are captured for later porting; they are not in this initial group.
 
 ## Next implementation gates
 
-1. Complete the remaining first-stage dependencies, including Xiaomi boot diagnostics
-   and scheduler/thermal controls.
+1. Complete the remaining first-stage dependencies, including WALT scheduling
+   and CPU thermal controls.
    Test UFS/encryption, probe ordering, GPIO wakeups, SCM wait queues and
    shared-memory operations.
 2. Port the device trees and remaining first-stage list; produce matching
@@ -531,3 +531,29 @@ including allocation/copy failures and read/removal serialization. The
 and UndefinedBehaviorSanitizer on the actual helpers. Checkpatch and the full
 build pass without warnings. Firmware handoff, crash capture and PM behavior
 still need device tests.
+
+
+The Xiaomi diagnostics group adds `miev` and `boottime`, completing the four
+entries in the device-specific first-stage list. The event device retains its
+record-oriented userspace interface and oldest-record eviction policy using
+6.18's record FIFO helpers. Undersized reads return `EMSGSIZE` without consuming
+the record; user-copy failures preserve the queue. Initialization publishes
+file operations only after their resources exist, and file ownership pins
+module storage.
+
+Event formatting has no shared mutable length counter. Each event is bounded
+to 4096 output bytes, escapes JSON keys/strings, handles integer extremes, and
+propagates allocation or output failures while retaining unsubmitted payloads.
+Boot logging publishes complete immutable entries, bounds the 960-entry table,
+and retries failed block allocations without replacing existing storage. Proc
+removal and tracepoint synchronization precede buffer release. Trace registration
+errors unwind, and an explicit stop drains callbacks even after the log filled.
+
+`verify_xiaomi_diagnostics.py WORKSPACE/onyx` runs the actual event code and 6.18
+FIFO helpers, checks wrapped indices, whole-record eviction, short reads and
+copy failures, and decodes 127 escaped JSON key/value pairs. It also checks
+exact output limits, allocation failures and concurrent boot-log capacity under
+AddressSanitizer and UndefinedBehaviorSanitizer. The
+[recorded result](xiaomi-diagnostics-validation-20261031.json) covers host data
+paths; module lifecycle, tracepoints and phone operation remain untested. The
+patch passes checkpatch and the full platform build without warnings.
