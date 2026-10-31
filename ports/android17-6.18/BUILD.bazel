@@ -3044,6 +3044,48 @@ ddk_module(
     visibility = ["//visibility:public"],
 )
 
+genrule(
+    name = "cfg80211_regdb_certs",
+    srcs = ["net/wireless/certs/sforshee.hex", "net/wireless/certs/wens.hex"],
+    outs = ["net/wireless/shipped-certs.c"],
+    cmd = "{ printf '#include \"reg.h\"\\nconst u8 shipped_regdb_certs[] = {\\n\\n'; cat $(SRCS); printf '};\\nunsigned int shipped_regdb_certs_len = sizeof(shipped_regdb_certs);\\n'; } > $@",
+)
+
+ddk_headers(
+    name = "wireless_framework_headers",
+    hdrs = ["net/wireless/core.h", "net/wireless/sysfs.h", "net/wireless/reg.h", "net/wireless/nl80211.h", "net/wireless/debugfs.h", "net/wireless/wext-compat.h", "net/wireless/rdev-ops.h", "net/wireless/trace.h"],
+    includes = ["net/wireless"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "cfg80211",
+    srcs = ["net/wireless/core.c", "net/wireless/sysfs.c", "net/wireless/radiotap.c", "net/wireless/util.c", "net/wireless/reg.c", "net/wireless/scan.c", "net/wireless/nl80211.c", "net/wireless/mlme.c", "net/wireless/ibss.c", "net/wireless/sme.c", "net/wireless/chan.c", "net/wireless/ethtool.c", "net/wireless/mesh.c", "net/wireless/ap.c", "net/wireless/trace.c", "net/wireless/ocb.c", "net/wireless/pmsr.c", "net/wireless/of.c", ":net/wireless/shipped-certs.c"],
+    out = "cfg80211.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":wireless_framework_headers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_headers(
+    name = "audio_prm_headers",
+    hdrs = ["qcom/opensource/audio-kernel/include/dsp/audio_prm.h"],
+    includes = ["qcom/opensource/audio-kernel/include"],
+)
+
+ddk_module(
+    name = "audio_prm_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/dsp/audio_prm.c", "qcom/opensource/audio-kernel/include/dsp/audio_prm.h", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "audio_prm_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_prm_headers", ":audio_gpr_headers", ":audio_spf_headers", ":audio_notifier_headers", ":gpr_dlkm", ":spf_core_dlkm", ":q6_notifier_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3270,6 +3312,8 @@ kernel_module_group(
         ":wlan_firmware_service",
         ":audio_pkt_dlkm",
         ":aw8697_haptic",
+        ":cfg80211",
+        ":audio_prm_dlkm",
     ],
 )
 

@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 236 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 238 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 236 platform `.ko` files, their symbol tables and DDK configurations.
+- 238 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 12,796
-imported symbol CRCs across all 236 modules.
+used. The current [validation report](validation-20261031.json) checks 13,024
+imported symbol CRCs across all 238 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1426,3 +1426,32 @@ ROM module build coverage is 234/466 (50.2%), leaving 232 names to assess or
 port, including alternative hardware. Main WLAN/Bluetooth, remaining audio,
 camera/video, device interfaces and image/installer work remain. No flashable
 6.18 ZIP or phone validation exists yet.
+
+
+## Wireless framework and audio resource manager
+
+The cfg80211 framework uses thirty exact inputs from the pinned 6.18 common
+revision, matching its public kernel headers and all nineteen enabled native
+composite units. It carries forward Konoha's existing monitor-channel dispatch
+policy, including the new device argument and driver error propagation. All other
+wireless source remains unchanged. Signed regulatory database verification stays
+enabled; both shipped signing certificates match the generated source and the
+compiled module. [Framework checks](wireless-framework-validation-20261031.json)
+cover one hundred dispatch cases and reject the original policy as a regression
+control. Main CNSS2/WLAN driver adaptation and live monitor operation remain.
+
+The native audio resource manager retains its five public APIs and twelve native
+request/release frame layouts. Correlation tokens and service epochs reject stale
+DSP replies; readiness failures never become cached. Provider withdrawal wakes
+commands before draining them. [PRM checks](audio-prm-validation-20261031.json)
+pass fourteen full-source sanitizer groups; ten original-source controls and a
+token-reset mutation reject their targeted faults. The public API header remains
+byte-identical. DSP firmware, clock hardware and suspend/resume remain untested.
+
+The combined 238-module archive `artifacts/20261031T150648247040Z` passes
+13,024 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
+and overlay checks pass with 1,084 existing vendor DTC warnings.
+ROM module build coverage is 236/466 (50.6%), leaving 230 names to
+assess or port, including alternative hardware. Main WLAN/Bluetooth, remaining
+audio, camera/video, device interfaces and image/installer work remain. No
+flashable 6.18 ZIP or phone validation exists yet.
