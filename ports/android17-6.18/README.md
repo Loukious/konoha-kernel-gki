@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 15 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 31 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 15 platform `.ko` files, their symbol tables and DDK configurations.
+- 31 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes and imported-CRC checks.
 
@@ -69,8 +69,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 638
-imported symbol CRCs across all 15 modules.
+used. The current [validation report](validation-20261031.json) checks 1218
+imported symbol CRCs across all 31 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -83,6 +83,18 @@ the SPMI device lookup and unaligned access headers for 6.18. Private hwspinlock
 and regmap headers come from the pinned 6.18 common to match core layouts.
 Regmap debug writes remain disabled, and IPC minidump registration still uses
 the vendor header's optional fallback until the minidump provider is ported.
+
+The regulator group builds the vendor RPMh regulators plus debug/proxy-consumer
+libraries. Legacy proxy cleanup remains disabled, matching the Onyx baseline;
+proxy votes are released by the driver's sync-state callback.
+
+The clock group includes the vendor common composite (with GDSC), GDSC
+regulators, RPMh and dummy clock providers, and all nine Tuna controllers:
+GCC, TCSR, GPU, display, camera, camera BIST MCLK, video, EVA and debug.
+It retains the vendor PLL, RCG, voltage-voting and CRM behavior. Internal helpers
+are made static; trace strings and DT iterators use 6.18 interfaces. The critical
+clock walk now keeps node references alive through parent traversal, releases
+parsed clock references on every path, and skips failed phandle parses.
 
 `CONFIG_QCOM_SCM=m` and `CONFIG_QTEE_SHM_BRIDGE=y` are set in the DDK module
 configuration. Common Kconfig also selects `QCOM_TZMEM`; the vendor composite
@@ -116,7 +128,7 @@ changes are captured for later porting; they are not in this initial group.
 
 ## Next implementation gates
 
-1. Complete the Gunyah host/VM, clock, regulator, interconnect,
+1. Complete the Gunyah host/VM, interconnect,
    IOMMU and storage dependencies needed for Onyx early boot. Test probe
    ordering, GPIO wakeups, SCM wait queues and shared-memory operations.
 2. Port the device trees and remaining first-stage list; produce matching

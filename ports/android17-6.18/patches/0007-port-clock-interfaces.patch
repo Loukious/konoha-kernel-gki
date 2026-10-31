@@ -1,0 +1,236 @@
+diff --git a/drivers/clk/qcom/clk-alpha-pll.c b/drivers/clk/qcom/clk-alpha-pll.c
+index 1fb8b2f..a59b311 100644
+--- a/drivers/clk/qcom/clk-alpha-pll.c
++++ b/drivers/clk/qcom/clk-alpha-pll.c
+@@ -3356,7 +3356,7 @@ const struct clk_ops clk_alpha_pll_reset_lucid_evo_ops = {
+ };
+ EXPORT_SYMBOL_GPL(clk_alpha_pll_reset_lucid_evo_ops);
+ 
+-unsigned long lucid_evo_calc_pll(struct clk_hw *hw, u32 l, u64 a)
++static unsigned long lucid_evo_calc_pll(struct clk_hw *hw, u32 l, u64 a)
+ {
+ 	struct clk_hw *p;
+ 	unsigned long prate;
+@@ -3374,7 +3374,7 @@ static struct clk_regmap_ops clk_lucid_evo_pll_crm_regmap_ops = {
+ 	.calc_pll = lucid_evo_calc_pll,
+ };
+ 
+-unsigned long lucid_evo_calc_pll_out(struct clk_hw *hw, u32 l, u64 a)
++static unsigned long lucid_evo_calc_pll_out(struct clk_hw *hw, u32 l, u64 a)
+ {
+ 	struct clk_hw *p;
+ 	unsigned long parent_rate;
+diff --git a/drivers/clk/qcom/clk-dummy.c b/drivers/clk/qcom/clk-dummy.c
+index 7e68b7e..f4abc7d 100644
+--- a/drivers/clk/qcom/clk-dummy.c
++++ b/drivers/clk/qcom/clk-dummy.c
+@@ -140,11 +140,9 @@ static int dummy_clk_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
+-static int dummy_clk_remove(struct platform_device *pdev)
++static void dummy_clk_remove(struct platform_device *pdev)
+ {
+ 	of_clk_del_provider(pdev->dev.of_node);
+-
+-	return 0;
+ }
+ 
+ static const struct of_device_id dummy_clk_match_table[] = {
+diff --git a/drivers/clk/qcom/clk-rcg2.c b/drivers/clk/qcom/clk-rcg2.c
+index ed1bece..85e831a 100644
+--- a/drivers/clk/qcom/clk-rcg2.c
++++ b/drivers/clk/qcom/clk-rcg2.c
+@@ -1923,7 +1923,7 @@ static int clk_rcg2_crmc_populate_freq(struct clk_hw *hw, unsigned int l,
+ 	return 0;
+ }
+ 
+-int clk_rcg2_crmc_populate_freq_table(struct clk_rcg2 *rcg)
++static int clk_rcg2_crmc_populate_freq_table(struct clk_rcg2 *rcg)
+ {
+ 	struct freq_tbl *freq_tbl, *curr_freq_tbl;
+ 	struct clk_crm *crm = rcg->clkr.crm;
+@@ -2062,7 +2062,7 @@ static int clk_rcg2_crmc_set_rate(struct clk_hw *hw, unsigned long rate,
+  *
+  * Returns 0 on success, -EERROR otherwise.
+  */
+-int clk_rcg2_crmc_prepare(struct clk_hw *hw)
++static int clk_rcg2_crmc_prepare(struct clk_hw *hw)
+ {
+ 	struct clk_rcg2 *rcg = to_clk_rcg2(hw);
+ 
+@@ -2080,7 +2080,7 @@ int clk_rcg2_crmc_prepare(struct clk_hw *hw)
+  * Unprepare the clock by removing the outstanding perf_level vote.
+  *
+  */
+-void clk_rcg2_crmc_unprepare(struct clk_hw *hw)
++static void clk_rcg2_crmc_unprepare(struct clk_hw *hw)
+ {
+ 	int ret;
+ 
+@@ -2092,7 +2092,7 @@ void clk_rcg2_crmc_unprepare(struct clk_hw *hw)
+ 		pr_err("%s rcg name=%s ret=%d\n", __func__, qcom_clk_hw_get_name(hw), ret);
+ }
+ 
+-unsigned long clk_rcg2_crmc_hw_set_rate(struct clk_hw *hw,
++static unsigned long clk_rcg2_crmc_hw_set_rate(struct clk_hw *hw,
+ 					enum crm_drv_type client_type, u32 client_idx,
+ 					u32 pwr_st, unsigned long rate)
+ {
+@@ -2214,7 +2214,7 @@ static int clk_rcg2_vote_bw(struct clk_hw *hw, unsigned long rate)
+  *
+  * Returns 0 on success, -EERROR otherwise.
+  */
+-int clk_rcg2_crmb_prepare(struct clk_hw *hw)
++static int clk_rcg2_crmb_prepare(struct clk_hw *hw)
+ {
+ 	struct clk_rcg2 *rcg = to_clk_rcg2(hw);
+ 	struct clk_crm *crm = rcg->clkr.crm;
+@@ -2233,7 +2233,7 @@ int clk_rcg2_crmb_prepare(struct clk_hw *hw)
+  * Unprepare the clock by removing the outstanding perf_level vote.
+  *
+  */
+-void clk_rcg2_crmb_unprepare(struct clk_hw *hw)
++static void clk_rcg2_crmb_unprepare(struct clk_hw *hw)
+ {
+ 	struct clk_rcg2 *rcg = to_clk_rcg2(hw);
+ 	struct clk_crm *crm = rcg->clkr.crm;
+@@ -2274,7 +2274,7 @@ static int clk_rcg2_crmb_set_rate(struct clk_hw *hw, unsigned long rate,
+ 	return -EINVAL;
+ }
+ 
+-unsigned long clk_rcg2_crmb_set_crmb_rate(struct clk_hw *hw,
++static unsigned long clk_rcg2_crmb_set_crmb_rate(struct clk_hw *hw,
+ 					enum crm_drv_type client_type, u32 client_idx,
+ 					u32 nd_idx, u32 pwr_st, u32 ab_rate, u32 ib_rate)
+ {
+@@ -2307,7 +2307,7 @@ unsigned long clk_rcg2_crmb_set_crmb_rate(struct clk_hw *hw,
+ 	return ret;
+ }
+ 
+-unsigned long clk_rcg2_crmb_set_crm_rate(struct clk_hw *hw,
++static unsigned long clk_rcg2_crmb_set_crm_rate(struct clk_hw *hw,
+ 				       enum crm_drv_type client_type, u32 client_idx,
+ 				       u32 pwr_st, unsigned long rate)
+ {
+diff --git a/drivers/clk/qcom/common.c b/drivers/clk/qcom/common.c
+index aa87098..e56c965 100644
+--- a/drivers/clk/qcom/common.c
++++ b/drivers/clk/qcom/common.c
+@@ -294,11 +294,9 @@ EXPORT_SYMBOL_GPL(qcom_cc_register_sleep_clk);
+ static void qcom_cc_drop_protected(struct device *dev, struct qcom_cc *cc)
+ {
+ 	struct device_node *np = dev->of_node;
+-	struct property *prop;
+-	const __be32 *p;
+ 	u32 i;
+ 
+-	of_property_for_each_u32(np, "protected-clocks", prop, p, i) {
++	of_property_for_each_u32(np, "protected-clocks", i) {
+ 		if (i >= cc->num_rclks)
+ 			continue;
+ 
+@@ -311,43 +309,34 @@ static void qcom_cc_set_critical(struct device *dev, struct qcom_cc *cc)
+ {
+ 	struct of_phandle_args args;
+ 	struct device_node *np;
+-	struct property *prop;
+-	const __be32 *p;
+ 	u32 clock_idx;
+-	u32 i;
+-	int cnt;
++	u32 phandle;
++	int i, cnt;
+ 
+-	of_property_for_each_u32(dev->of_node, "qcom,critical-clocks", prop, p, i) {
+-		if (i >= cc->num_rclks)
++	of_property_for_each_u32(dev->of_node, "qcom,critical-clocks", clock_idx) {
++		if (clock_idx >= cc->num_rclks)
+ 			continue;
+ 
+-		if (cc->rclks[i])
+-			cc->rclks[i]->flags |= QCOM_CLK_IS_CRITICAL;
++		if (cc->rclks[clock_idx])
++			cc->rclks[clock_idx]->flags |= QCOM_CLK_IS_CRITICAL;
+ 	}
+ 
+-	of_property_for_each_u32(dev->of_node, "qcom,critical-devices", prop, p, i) {
+-		for (np = of_find_node_by_phandle(i); np; np = of_get_parent(np)) {
+-			if (!of_property_read_bool(np, "clocks")) {
+-				of_node_put(np);
+-				continue;
+-			}
+-
++	of_property_for_each_u32(dev->of_node, "qcom,critical-devices", phandle) {
++		for (np = of_find_node_by_phandle(phandle); np;
++		     np = of_get_next_parent(np)) {
+ 			cnt = of_count_phandle_with_args(np, "clocks", "#clock-cells");
+-
+ 			for (i = 0; i < cnt; i++) {
+-				of_parse_phandle_with_args(np, "clocks", "#clock-cells",
+-							   i, &args);
+-				clock_idx = args.args[0];
+-
+-				if (args.np != dev->of_node || clock_idx >= cc->num_rclks)
++				if (of_parse_phandle_with_args(np, "clocks", "#clock-cells",
++							      i, &args))
+ 					continue;
+ 
+-				if (cc->rclks[clock_idx])
+-					cc->rclks[clock_idx]->flags |= QCOM_CLK_IS_CRITICAL;
++				if (args.np == dev->of_node && args.args_count) {
++					clock_idx = args.args[0];
++					if (clock_idx < cc->num_rclks && cc->rclks[clock_idx])
++						cc->rclks[clock_idx]->flags |= QCOM_CLK_IS_CRITICAL;
++				}
+ 				of_node_put(args.np);
+ 			}
+-
+-			of_node_put(np);
+ 		}
+ 	}
+ }
+diff --git a/drivers/clk/qcom/trace-gdsc.h b/drivers/clk/qcom/trace-gdsc.h
+index b7a4f42..a24b330 100644
+--- a/drivers/clk/qcom/trace-gdsc.h
++++ b/drivers/clk/qcom/trace-gdsc.h
+@@ -25,7 +25,7 @@ TRACE_EVENT(gdsc_time,
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(name, name);
++		__assign_str(name);
+ 		__entry->enabling = enabling;
+ 		__entry->time_us = time_us;
+ 		__entry->timed_out = timed_out;
+diff --git a/drivers/clk/qcom/trace.h b/drivers/clk/qcom/trace.h
+index 90f7996..831d401 100644
+--- a/drivers/clk/qcom/trace.h
++++ b/drivers/clk/qcom/trace.h
+@@ -29,7 +29,7 @@ DECLARE_EVENT_CLASS(clk_state_dump,
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(name, name);
++		__assign_str(name);
+ 		__entry->prepare_count = prepare_count;
+ 		__entry->enable_count = enable_count;
+ 		__entry->rate = rate;
+@@ -61,7 +61,7 @@ DECLARE_EVENT_CLASS(clk_measure_support,
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(name, name);
++		__assign_str(name);
+ 		__entry->rate = rate;
+ 	),
+ 
+@@ -91,7 +91,7 @@ TRACE_EVENT(clk_reset,
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(dev, dev_name(rst->dev));
++		__assign_str(dev);
+ 		__entry->offset = rst->reset_map->reg;
+ 		__entry->reset_id = id;
+ 		__entry->assert = assert;

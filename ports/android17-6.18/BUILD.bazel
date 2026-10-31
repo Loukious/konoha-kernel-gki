@@ -201,6 +201,219 @@ ddk_module(
     deps = [":soc_headers", ":spmi_pmic_arb", ":qti_regmap_debugfs"],
 )
 
+ddk_headers(
+    name = "regulator_headers",
+    hdrs = [
+        "include/linux/regulator/debug-regulator.h",
+        "include/linux/regulator/proxy-consumer.h",
+        "include/dt-bindings/regulator/qcom,rpmh-regulator-levels.h",
+        "drivers/regulator/internal.h",
+    ],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "debug_regulator",
+    srcs = ["drivers/regulator/debug-regulator.c"],
+    out = "debug-regulator.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":regulator_headers"],
+)
+
+ddk_module(
+    name = "proxy_consumer",
+    srcs = ["drivers/regulator/proxy-consumer.c"],
+    out = "proxy-consumer.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":regulator_headers"],
+)
+
+ddk_module(
+    name = "rpmh_regulator",
+    srcs = ["drivers/regulator/rpmh-regulator.c"],
+    out = "rpmh-regulator.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":regulator_headers", ":platform_headers", ":debug_regulator", ":proxy_consumer", ":qcom_rpmh", ":qcom_ipc_logging", ":cmd_db"],
+)
+
+ddk_headers(
+    name = "clock_headers",
+    hdrs = glob([
+        "drivers/clk/qcom/*.h",
+        "include/dt-bindings/clock/*.h",
+    ]) + ["drivers/clk/clk.h", "include/linux/clk/qcom.h", "include/linux/mailbox/qmp.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "clk_qcom",
+    srcs = [
+        "drivers/clk/qcom/common.c",
+        "drivers/clk/qcom/vdd-class.c",
+        "drivers/clk/qcom/clk-regmap.c",
+        "drivers/clk/qcom/clk-alpha-pll.c",
+        "drivers/clk/qcom/clk-opp.c",
+        "drivers/clk/qcom/clk-pll.c",
+        "drivers/clk/qcom/clk-rcg.c",
+        "drivers/clk/qcom/clk-rcg2.c",
+        "drivers/clk/qcom/clk-branch.c",
+        "drivers/clk/qcom/clk-regmap-divider.c",
+        "drivers/clk/qcom/clk-regmap-mux.c",
+        "drivers/clk/qcom/clk-regmap-mux-div.c",
+        "drivers/clk/qcom/clk-regmap-phy-mux.c",
+        "drivers/clk/qcom/clk-hfpll.c",
+        "drivers/clk/qcom/reset.c",
+        "drivers/clk/qcom/clk-pm.c",
+        "drivers/clk/qcom/clk-debug.c",
+        "drivers/clk/qcom/gdsc.c",
+        "drivers/clk/qcom/gdsc-debug.c",
+    ],
+    includes = ["drivers/clk/qcom"],
+    out = "clk-qcom.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":clock_headers", ":platform_headers", ":regulator_headers", ":gdsc_regulator", ":crm_v2"],
+)
+
+ddk_module(
+    name = "clk_dummy",
+    srcs = ["drivers/clk/qcom/clk-dummy.c"],
+    includes = ["drivers/clk/qcom"],
+    out = "clk-dummy.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":clock_headers", ":platform_headers", ":regulator_headers", ":clk_qcom"],
+)
+
+ddk_module(
+    name = "gdsc_regulator",
+    srcs = ["drivers/clk/qcom/gdsc-regulator.c"],
+    includes = ["drivers/clk/qcom"],
+    out = "gdsc-regulator.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":clock_headers", ":platform_headers", ":regulator_headers", ":debug_regulator", ":proxy_consumer"],
+)
+
+ddk_module(
+    name = "clk_rpmh",
+    srcs = ["drivers/clk/qcom/clk-rpmh.c"],
+    includes = ["drivers/clk/qcom"],
+    out = "clk-rpmh.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":clock_headers", ":platform_headers", ":regulator_headers", ":clk_qcom", ":qcom_rpmh", ":cmd_db"],
+)
+
+ddk_module(
+    name = "dispcc_tuna",
+    srcs = ["drivers/clk/qcom/dispcc-tuna.c"],
+    includes = ["drivers/clk/qcom"],
+    out = "dispcc-tuna.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":clock_headers", ":platform_headers", ":regulator_headers", ":clk_qcom"],
+)
+
+ddk_module(
+    name = "cambistmclkcc_tuna",
+    srcs = ["drivers/clk/qcom/cambistmclkcc-tuna.c"],
+    includes = ["drivers/clk/qcom"],
+    out = "cambistmclkcc-tuna.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":clock_headers", ":platform_headers", ":regulator_headers", ":clk_qcom"],
+)
+
+ddk_module(
+    name = "videocc_tuna",
+    srcs = ["drivers/clk/qcom/videocc-tuna.c"],
+    includes = ["drivers/clk/qcom"],
+    out = "videocc-tuna.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":clock_headers", ":platform_headers", ":regulator_headers", ":clk_qcom"],
+)
+
+ddk_module(
+    name = "camcc_tuna",
+    srcs = ["drivers/clk/qcom/camcc-tuna.c"],
+    includes = ["drivers/clk/qcom"],
+    out = "camcc-tuna.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":clock_headers", ":platform_headers", ":regulator_headers", ":clk_qcom"],
+)
+
+ddk_module(
+    name = "gcc_tuna",
+    srcs = ["drivers/clk/qcom/gcc-tuna.c"],
+    includes = ["drivers/clk/qcom"],
+    out = "gcc-tuna.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":clock_headers", ":platform_headers", ":regulator_headers", ":clk_qcom"],
+)
+
+ddk_module(
+    name = "gpucc_tuna",
+    srcs = ["drivers/clk/qcom/gpucc-tuna.c"],
+    includes = ["drivers/clk/qcom"],
+    out = "gpucc-tuna.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":clock_headers", ":platform_headers", ":regulator_headers", ":clk_qcom"],
+)
+
+ddk_module(
+    name = "tcsrcc_tuna",
+    srcs = ["drivers/clk/qcom/tcsrcc-tuna.c"],
+    includes = ["drivers/clk/qcom"],
+    out = "tcsrcc-tuna.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":clock_headers", ":platform_headers", ":regulator_headers", ":clk_qcom"],
+)
+
+ddk_module(
+    name = "debugcc_tuna",
+    srcs = ["drivers/clk/qcom/debugcc-tuna.c"],
+    includes = ["drivers/clk/qcom"],
+    out = "debugcc-tuna.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":clock_headers", ":platform_headers", ":regulator_headers", ":clk_qcom", ":clk_dummy"],
+)
+
+ddk_module(
+    name = "evacc_tuna",
+    srcs = ["drivers/clk/qcom/evacc-tuna.c"],
+    includes = ["drivers/clk/qcom"],
+    out = "evacc-tuna.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":clock_headers", ":platform_headers", ":regulator_headers", ":clk_qcom"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -208,6 +421,20 @@ kernel_module_group(
         ":qcom_ipc_logging", ":qcom_pdc", ":cmd_db", ":crm_v2", ":qcom_rpmh",
         ":qcom_hwspinlock", ":smem", ":socinfo", ":spmi_pmic_arb",
         ":qti_regmap_debugfs", ":qcom_spmi_pmic",
+        ":debug_regulator", ":proxy_consumer", ":rpmh_regulator",
+        ":clk_qcom",
+        ":clk_dummy",
+        ":gdsc_regulator",
+        ":clk_rpmh",
+        ":dispcc_tuna",
+        ":cambistmclkcc_tuna",
+        ":videocc_tuna",
+        ":camcc_tuna",
+        ":gcc_tuna",
+        ":gpucc_tuna",
+        ":tcsrcc_tuna",
+        ":debugcc_tuna",
+        ":evacc_tuna",
     ],
 )
 
