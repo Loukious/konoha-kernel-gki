@@ -6,8 +6,8 @@
     "/home/loukious/Android/custom-rom/out/target/product/onyx/vendor_dlkm/lib/modules/modules.load": "71ddc08a21c19c67a0f5a12fac978ccae626b64adc10b244309764ca7afb24b8"
   },
   "vendor_names": 466,
-  "built_vendor_names": 258,
-  "percent": 55.4,
+  "built_vendor_names": 260,
+  "percent": 55.8,
   "built_extra_names": [
     "deferred-free-helper",
     "onyx_relay",
@@ -61,7 +61,6 @@
     "dmesg_dumper",
     "dynpf_scmi",
     "evacc-sun",
-    "frpc-adsprpc",
     "gcc-kera",
     "gcc-sun",
     "gh_panic_notifier",
@@ -118,7 +117,6 @@
     "msm_sharedmem",
     "msm_show_epoch",
     "msm_show_resume_irq",
-    "msm_video",
     "mtd",
     "mtd_blkdevs",
     "mtdblock",
@@ -241,6 +239,8 @@
     "LPASS BT parent requires consumers to release SoundWire references before controller/parent teardown. Type-C audio requires matching typec_analog_acc_exit before component/card destruction; LPASS CDC consumer integration remains pending. Clock forced teardown with exposed consumers or failed hardware release is quarantined, not claimed recoverable. No hardware audio/clock validation.",
     "SLIMbus/NGD/Bluetooth preserve ROM dependencies; saved Onyx DT disables NGD and WCN7750 uses SoundWire. Removal drains software references; logged hardware stream-cleanup failures may need firmware/bus reset. Host tests do not validate real DMA/IRQ/SSR/SLIM hardware.",
     "LPASS CDC now owns Type-C cleanup before component/card destruction. Macro/codec consumers must balance registration and drain callbacks before removal; native borrowed device getters require provider lifetime serialization. Host tests do not establish live DSP, audio or SSR behavior.",
-    "Camera flash provider preserves the native disabled QTI_BATTERY_CHARGER contract: battery-resistance queries can return EINVAL. Software tests cover publication, timer/work and register failures; physical current, timing and shutdown on bus failure remain unvalidated."
+    "Camera flash provider preserves the native disabled QTI_BATTERY_CHARGER contract: battery-resistance queries can return EINVAL. Software tests cover publication, timer/work and register failures; physical current, timing and shutdown on bus failure remain unvalidated.",
+    "Native video now drains files, instances, IRQ/work and synchronized context-bank callbacks before teardown. Retained files/references can delay removal indefinitely. Host tests do not establish firmware, codec output, DMA/IOMMU quiescence or real V4L2 concurrency.",
+    "FastRPC retains native kernel/UAPI contracts and firmware failure policy. Channel teardown waits for exported DMA fds; genpool clients must return allocations before provider removal. Host tests do not validate live DSP/secure ownership transitions or firmware timeout/reclaim recovery."
   ]
 }

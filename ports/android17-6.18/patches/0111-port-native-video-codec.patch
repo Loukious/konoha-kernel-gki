@@ -1,0 +1,1871 @@
+Subject: [PATCH] Port native video to Linux 6.18
+
+Preserve native media paths and control layouts. Adapt kernel APIs
+and balance file, instance, DMA buffer and context-bank lifetimes.
+Retain initialized resources until their users have drained.
+
+---
+--- a/qcom/opensource/video-driver/driver/platform/common/src/msm_vidc_platform.c
++++ b/qcom/opensource/video-driver/driver/platform/common/src/msm_vidc_platform.c
+@@ -120,7 +120,7 @@
+ 	.vidioc_dqbuf                   = msm_v4l2_dqbuf,
+ 	.vidioc_streamon                = msm_v4l2_streamon,
+ 	.vidioc_streamoff               = msm_v4l2_streamoff,
+-	.vidioc_queryctrl               = msm_v4l2_queryctrl,
++	/* QUERYCTRL uses the per-file V4L2 control handler. */
+ 	.vidioc_querymenu               = msm_v4l2_querymenu,
+ 	.vidioc_subscribe_event         = msm_v4l2_subscribe_event,
+ 	.vidioc_unsubscribe_event       = msm_v4l2_unsubscribe_event,
+@@ -162,7 +162,7 @@
+ 	.vidioc_dqbuf                   = msm_v4l2_dqbuf,
+ 	.vidioc_streamon                = msm_v4l2_streamon,
+ 	.vidioc_streamoff               = msm_v4l2_streamoff,
+-	.vidioc_queryctrl               = msm_v4l2_queryctrl,
++	/* QUERYCTRL uses the per-file V4L2 control handler. */
+ 	.vidioc_querymenu               = msm_v4l2_querymenu,
+ 	.vidioc_subscribe_event         = msm_v4l2_subscribe_event,
+ 	.vidioc_unsubscribe_event       = msm_v4l2_unsubscribe_event,
+@@ -2335,7 +2335,8 @@
+ 	return 0;
+ }
+ 
+-int msm_vidc_adjust_dec_lowlatency_mode(void *instance, struct v4l2_ctrl *ctrl)
++static __maybe_unused int msm_vidc_adjust_dec_lowlatency_mode(void *instance,
++							      struct v4l2_ctrl *ctrl)
+ {
+ 	s32 adjusted_value;
+ 	struct msm_vidc_inst *inst = (struct msm_vidc_inst *)instance;
+@@ -3651,8 +3652,8 @@
+ 	return rc;
+ }
+ 
+-int msm_vidc_set_s32(void *instance,
+-		     enum msm_vidc_inst_capability_type cap_id)
++static __maybe_unused int msm_vidc_set_s32(void *instance,
++					   enum msm_vidc_inst_capability_type cap_id)
+ {
+ 	int rc = 0;
+ 	struct msm_vidc_inst *inst = (struct msm_vidc_inst *)instance;
+--- a/qcom/opensource/video-driver/driver/platform/kera/src/msm_vidc_kera.c
++++ b/qcom/opensource/video-driver/driver/platform/kera/src/msm_vidc_kera.c
+@@ -4649,8 +4649,8 @@
+ 	.sku_version = SKU_VERSION_1,
+ };
+ 
+-int msm_vidc_kera_check_ddr_type(struct msm_vidc_platform_data *platform_data,
+-				 u32 hbb_override_val)
++static int msm_vidc_kera_check_ddr_type(struct msm_vidc_platform_data *platform_data,
++					u32 hbb_override_val)
+ {
+ 	u32 ddr_type = DDR_TYPE_LPDDR5;
+ 
+--- a/qcom/opensource/video-driver/driver/platform/sun/src/msm_vidc_sun.c
++++ b/qcom/opensource/video-driver/driver/platform/sun/src/msm_vidc_sun.c
+@@ -3072,7 +3072,7 @@
+ 	.msm_vidc_ssr_type_size = ARRAY_SIZE(sun_msm_vidc_ssr_type),
+ };
+ 
+-int msm_vidc_sun_check_ddr_type(void)
++static int msm_vidc_sun_check_ddr_type(void)
+ {
+ 	u32 ddr_type;
+ 
+--- a/qcom/opensource/video-driver/driver/platform/tuna/src/msm_vidc_tuna.c
++++ b/qcom/opensource/video-driver/driver/platform/tuna/src/msm_vidc_tuna.c
+@@ -4664,7 +4664,7 @@
+ 	.sku_version = SKU_VERSION_1,
+ };
+ 
+-int msm_vidc_tuna_check_ddr_type(void)
++static int msm_vidc_tuna_check_ddr_type(void)
+ {
+ 	u32 ddr_type;
+ 
+--- a/qcom/opensource/video-driver/driver/variant/iris33/src/msm_vidc_bus_iris33.c
++++ b/qcom/opensource/video-driver/driver/variant/iris33/src/msm_vidc_bus_iris33.c
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include "msm_vidc_power_iris33.h"
+ #include "perf_static_model.h"
+ #include "msm_vidc_debug.h"
+ 
+@@ -86,7 +87,7 @@
+ static u32 pineapple_en_writefactor[8] = {1000, 500, 500, 500, 1000, 0, 1000, 1000};
+ static u32 pineapple_en_frame_num_parallel = 1;
+ 
+-u32 calculate_number_lcus_iris33(u32 width, u32 height, u32 lcu_size)
++static u32 calculate_number_lcus_iris33(u32 width, u32 height, u32 lcu_size)
+ {
+ 	u32 mbs_width = (width % lcu_size) ?
+ 		(width / lcu_size + 1) : (width / lcu_size);
+@@ -96,8 +97,8 @@
+ 	return mbs_width * mbs_height;
+ }
+ 
+-u32 calculate_number_ubwctiles_iris33(
+-		u32 width, u32 height, u32 tile_w, u32 tile_h)
++static u32 calculate_number_ubwctiles_iris33(u32 width, u32 height,
++					     u32 tile_w, u32 tile_h)
+ {
+ 	u32 tiles_width = (width % tile_w) ?
+ 		(width / tile_w + 1) : (width / tile_w);
+@@ -116,8 +117,8 @@
+ 	u32 ipb_cr;
+ } compression_factor_iris33;
+ 
+-u32 get_compression_factors_iris33(struct compression_factors *compression_factor,
+-				   struct api_calculation_input codec_input)
++static u32 get_compression_factors_iris33(struct compression_factors *compression_factor,
++					  struct api_calculation_input codec_input)
+ {
+ 	u8 cr_index_entry, cr_index_y, cr_index_c, cr_index_uni;
+ 	u32 frame_width;
+--- a/qcom/opensource/video-driver/driver/variant/iris33/src/msm_vidc_clock_iris33.c
++++ b/qcom/opensource/video-driver/driver/variant/iris33/src/msm_vidc_clock_iris33.c
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include "msm_vidc_power_iris33.h"
+ #include "perf_static_model.h"
+ #include "msm_vidc_debug.h"
+ #include "msm_vidc_platform.h"
+@@ -292,7 +293,7 @@
+ 	return 0;
+ }
+ 
+-u32 get_bitrate_entry_iris33(u32 pixle_count)
++static u32 get_bitrate_entry_iris33(u32 pixle_count)
+ {
+ 	u32 bitrate_entry = 0;
+ 
+--- a/qcom/opensource/video-driver/driver/variant/iris33/src/msm_vidc_iris33.c
++++ b/qcom/opensource/video-driver/driver/variant/iris33/src/msm_vidc_iris33.c
+@@ -1431,7 +1431,7 @@
+ 	return 0;
+ }
+ 
+-int msm_vidc_decide_work_mode_iris33(struct msm_vidc_inst *inst)
++static int msm_vidc_decide_work_mode_iris33(struct msm_vidc_inst *inst)
+ {
+ 	u32 work_mode;
+ 	struct v4l2_format *inp_f;
+@@ -1488,7 +1488,7 @@
+ 	return 0;
+ }
+ 
+-int msm_vidc_decide_work_route_iris33(struct msm_vidc_inst *inst)
++static int msm_vidc_decide_work_route_iris33(struct msm_vidc_inst *inst)
+ {
+ 	u32 work_route;
+ 	struct msm_vidc_core *core;
+@@ -1524,7 +1524,7 @@
+ 	return 0;
+ }
+ 
+-int msm_vidc_decide_quality_mode_iris33(struct msm_vidc_inst *inst)
++static int msm_vidc_decide_quality_mode_iris33(struct msm_vidc_inst *inst)
+ {
+ 	struct msm_vidc_core *core;
+ 	u32 mbpf, mbps, max_hq_mbpf, max_hq_mbps;
+--- a/qcom/opensource/video-driver/driver/variant/iris35/src/msm_vidc_bus_iris35.c
++++ b/qcom/opensource/video-driver/driver/variant/iris35/src/msm_vidc_bus_iris35.c
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include "msm_vidc_power_iris35.h"
+ #include "perf_static_model.h"
+ #include "msm_vidc_debug.h"
+ 
+@@ -94,7 +95,7 @@
+ static u32 sun_P_en_search_windows_size_horizontal = 192;
+ static u32 sun_B_2REFP_en_search_windows_size_horizontal = 96;
+ 
+-u32 calculate_number_lcus_iris35(u32 width, u32 height, u32 lcu_size)
++static u32 calculate_number_lcus_iris35(u32 width, u32 height, u32 lcu_size)
+ {
+ 	u32 mbs_width = (width % lcu_size) ?
+ 		(width / lcu_size + 1) : (width / lcu_size);
+@@ -104,8 +105,8 @@
+ 	return mbs_width * mbs_height;
+ }
+ 
+-u32 calculate_number_ubwctiles_iris35(
+-		u32 width, u32 height, u32 tile_w, u32 tile_h)
++static u32 calculate_number_ubwctiles_iris35(u32 width, u32 height,
++					     u32 tile_w, u32 tile_h)
+ {
+ 	u32 tiles_width = (width % tile_w) ?
+ 		(width / tile_w + 1) : (width / tile_w);
+@@ -124,8 +125,8 @@
+ 	u32 ipb_cr;
+ } compression_factor_iris35;
+ 
+-u32 get_compression_factors_iris35(struct compression_factors *compression_factor,
+-				   struct api_calculation_input codec_input)
++static u32 get_compression_factors_iris35(struct compression_factors *compression_factor,
++					  struct api_calculation_input codec_input)
+ {
+ 	u8 cr_index_entry, cr_index_y, cr_index_c, cr_index_uni;
+ 	u32 frame_width;
+--- a/qcom/opensource/video-driver/driver/variant/iris35/src/msm_vidc_clock_iris35.c
++++ b/qcom/opensource/video-driver/driver/variant/iris35/src/msm_vidc_clock_iris35.c
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include "msm_vidc_power_iris35.h"
+ #include "perf_static_model.h"
+ #include "msm_vidc_debug.h"
+ 
+@@ -344,7 +345,7 @@
+ 	return 0;
+ }
+ 
+-u32 get_bitrate_entry_iris35(u32 pixle_count)
++static u32 get_bitrate_entry_iris35(u32 pixle_count)
+ {
+ 	u32 bitrate_entry = 0;
+ 
+--- a/qcom/opensource/video-driver/driver/variant/iris35/src/msm_vidc_iris35.c
++++ b/qcom/opensource/video-driver/driver/variant/iris35/src/msm_vidc_iris35.c
+@@ -995,7 +995,7 @@
+ 	return 0;
+ }
+ 
+-int msm_vidc_decide_work_mode_iris35(struct msm_vidc_inst *inst)
++static int msm_vidc_decide_work_mode_iris35(struct msm_vidc_inst *inst)
+ {
+ 	u32 work_mode;
+ 	struct v4l2_format *inp_f;
+@@ -1052,7 +1052,7 @@
+ 	return 0;
+ }
+ 
+-int msm_vidc_decide_work_route_iris35(struct msm_vidc_inst *inst)
++static int msm_vidc_decide_work_route_iris35(struct msm_vidc_inst *inst)
+ {
+ 	u32 work_route;
+ 	struct msm_vidc_core *core;
+@@ -1088,7 +1088,7 @@
+ 	return 0;
+ }
+ 
+-int msm_vidc_decide_quality_mode_iris35(struct msm_vidc_inst *inst)
++static int msm_vidc_decide_quality_mode_iris35(struct msm_vidc_inst *inst)
+ {
+ 	struct msm_vidc_core *core;
+ 	u32 mbpf, mbps, max_hq_mbpf, max_hq_mbps;
+--- a/qcom/opensource/video-driver/driver/vidc/inc/msm_vidc_core.h
++++ b/qcom/opensource/video-driver/driver/vidc/inc/msm_vidc_core.h
+@@ -57,6 +57,10 @@
+ 	enum msm_vidc_domain_type              type;
+ 	struct video_device                    vdev;
+ 	struct v4l2_m2m_dev                   *m2m_dev;
++	struct completion                     released;
++	bool                                  registered;
++	bool                                  unregistering;
++	bool                                  m2m_registered;
+ };
+ 
+ struct msm_vidc_core_power {
+@@ -68,6 +72,14 @@
+ struct msm_vidc_core {
+ 	struct platform_device                *pdev;
+ 	struct msm_video_device                vdev[2];
++	struct workqueue_struct               *release_workq;
++	atomic_t                               live_instances;
++	wait_queue_head_t                      instances_wait;
++	bool                                  ready;
++	bool                                  stopping;
++	bool                                  irq_requested;
++	bool                                  synx_registered;
++	bool                                  synx_queue_mapped;
+ 	struct v4l2_device                     v4l2_dev;
+ 	struct media_device                    media_dev;
+ 	struct list_head                       instances;
+--- a/qcom/opensource/video-driver/driver/vidc/inc/msm_vidc_driver.h
++++ b/qcom/opensource/video-driver/driver/vidc/inc/msm_vidc_driver.h
+@@ -537,6 +537,9 @@
+ struct msm_vidc_inst *get_inst(struct msm_vidc_core *core,
+ 		u32 session_id);
+ void put_inst(struct msm_vidc_inst *inst);
++void msm_vidc_init_inst_ref(struct msm_vidc_inst *inst);
++void msm_vidc_drain_inst_refs(struct msm_vidc_inst *inst);
++void msm_vidc_free_inst(struct msm_vidc_inst *inst);
+ bool msm_vidc_allow_metadata_delivery(struct msm_vidc_inst *inst,
+ 				      u32 cap_id, u32 port);
+ bool msm_vidc_allow_metadata_subscription(struct msm_vidc_inst *inst,
+--- a/qcom/opensource/video-driver/driver/vidc/inc/msm_vidc_inst.h
++++ b/qcom/opensource/video-driver/driver/vidc/inc/msm_vidc_inst.h
+@@ -79,6 +79,11 @@
+ 	enum msm_vidc_codec_type           codec;
+ 	void                              *core;
+ 	struct kref                        kref;
++	/* Serialize final put against deferred release and partial-open unwind. */
++	spinlock_t                         ref_lock;
++	wait_queue_head_t                  ref_wait;
++	struct work_struct                 release_work;
++	void                              *debugfs_data;
+ 	u32                                session_id;
+ 	u8                                 debug_str[24];
+ 	void                              *packet;
+--- a/qcom/opensource/video-driver/driver/vidc/inc/resources.h
++++ b/qcom/opensource/video-driver/driver/vidc/inc/resources.h
+@@ -87,6 +87,10 @@
+ 	bool                       dma_coherant;
+ 	struct device             *dev;
+ 	struct iommu_domain       *domain;
++	bool                       fault_registered;
++	bool                       dma_parms_owned;
++	unsigned int               saved_max_segment_size;
++	unsigned long              saved_segment_boundary_mask;
+ 	u32                        region;
+ 	u64                        dma_mask;
+ };
+--- a/qcom/opensource/video-driver/driver/vidc/inc/resources_ext.h
++++ b/qcom/opensource/video-driver/driver/vidc/inc/resources_ext.h
+@@ -6,6 +6,7 @@
+ #ifndef _RESOURCES_EXT_H_
+ #define _RESOURCES_EXT_H_
+ 
++struct msm_vidc_core;
+ struct msm_vidc_resources_ops;
+ 
+ const struct msm_vidc_resources_ops *get_res_ops_ext(struct msm_vidc_core *core);
+--- a/qcom/opensource/video-driver/driver/vidc/src/firmware.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/firmware.c
+@@ -2,6 +2,7 @@
+ /*
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
++#include <linux/vmalloc.h>
+ #include <linux/types.h>
+ #include <linux/list.h>
+ #include <linux/of_address.h>
+--- a/qcom/opensource/video-driver/driver/vidc/src/msm_vidc.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/msm_vidc.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2022-2025, Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <linux/types.h>
+ #include <linux/hash.h>
+ 
+@@ -730,28 +731,17 @@
+ 	inst->iframe = false;
+ 	inst->auto_framerate = DEFAULT_FPS << 16;
+ 	inst->initial_time_us = ktime_get_ns() / 1000;
+-	kref_init(&inst->kref);
++	msm_vidc_init_inst_ref(inst);
+ 	mutex_init(&inst->lock);
+ 	mutex_init(&inst->ctx_q_lock);
+ 	mutex_init(&inst->client_lock);
+ 	msm_vidc_update_debug_str(inst);
+ 	i_vpr_h(inst, "Opening video instance: %d\n", session_type);
+ 
+-	rc = msm_vidc_add_session(inst);
+-	if (rc) {
+-		i_vpr_e(inst, "%s: failed to add session\n", __func__);
+-		goto fail_add_session;
+-	}
+-
+-	rc = msm_vidc_set_crc(core);
+-	if (rc) {
+-		i_vpr_e(inst, "%s: failed to set crc\n", __func__);
+-		goto fail_set_crc;
+-	}
+-
+ 	rc = msm_vidc_pools_init(inst);
+ 	if (rc) {
+ 		i_vpr_e(inst, "%s: failed to init pool buffers\n", __func__);
++		msm_vidc_drain_inst_refs(inst);
+ 		goto fail_pools_init;
+ 	}
+ 	INIT_LIST_HEAD(&inst->caps_list);
+@@ -794,6 +784,7 @@
+ 	inst->workq = create_singlethread_workqueue("workq");
+ 	if (!inst->workq) {
+ 		i_vpr_e(inst, "%s: create workq failed\n", __func__);
++		msm_vidc_drain_inst_refs(inst);
+ 		goto fail_create_workq;
+ 	}
+ 
+@@ -801,23 +792,46 @@
+ 	INIT_WORK(&inst->stability_work, msm_vidc_stability_handler);
+ 
+ 	rc = msm_vidc_v4l2_fh_init(inst);
+-	if (rc)
++	if (rc) {
++		msm_vidc_drain_inst_refs(inst);
+ 		goto fail_eventq_init;
++	}
+ 
+ 	rc = msm_vidc_vb2_queue_init(inst);
+-	if (rc)
++	if (rc) {
++		msm_vidc_drain_inst_refs(inst);
+ 		goto fail_vb2q_init;
++	}
+ 
+ 	if (is_decode_session(inst))
+ 		rc = msm_vdec_inst_init(inst);
+ 	else if (is_encode_session(inst))
+ 		rc = msm_venc_inst_init(inst);
+-	if (rc)
+-		goto fail_inst_init;
++	if (rc) {
++		msm_vidc_drain_inst_refs(inst);
++		goto fail_fence_init;
++	}
+ 
+ 	rc = msm_vidc_fence_init(inst);
+-	if (rc)
++	if (rc) {
++		msm_vidc_drain_inst_refs(inst);
+ 		goto fail_fence_init;
++	}
++
++	/* Publish only after all state observed by fault/SSR readers is ready. */
++	rc = msm_vidc_add_session(inst);
++	if (rc) {
++		i_vpr_e(inst, "%s: failed to add session\n", __func__);
++		msm_vidc_drain_inst_refs(inst);
++		goto fail_session_open;
++	}
++
++	rc = msm_vidc_set_crc(core);
++	if (rc) {
++		i_vpr_e(inst, "%s: failed to set crc\n", __func__);
++		msm_vidc_drain_inst_refs(inst);
++		goto fail_session_open;
++	}
+ 
+ 	/* reset clock residency stats */
+ 	msm_vidc_reset_residency_stats(core);
+@@ -827,6 +841,7 @@
+ 	rc = msm_vidc_session_open(inst);
+ 	if (rc) {
+ 		msm_vidc_core_deinit(core, true);
++		msm_vidc_drain_inst_refs(inst);
+ 		goto fail_session_open;
+ 	}
+ 
+@@ -844,7 +859,6 @@
+ 		msm_vdec_inst_deinit(inst);
+ 	else if (is_encode_session(inst))
+ 		msm_venc_inst_deinit(inst);
+-fail_inst_init:
+ 	msm_vidc_vb2_queue_deinit(inst);
+ fail_vb2q_init:
+ 	msm_vidc_v4l2_fh_deinit(inst);
+@@ -852,15 +866,13 @@
+ 	destroy_workqueue(inst->workq);
+ fail_create_workq:
+ 	msm_vidc_pools_deinit(inst);
+-fail_set_crc:
+ fail_pools_init:
+ 	msm_vidc_remove_session(inst);
+ 	msm_vidc_remove_dangling_session(inst);
+-fail_add_session:
+ 	mutex_destroy(&inst->client_lock);
+ 	mutex_destroy(&inst->ctx_q_lock);
+ 	mutex_destroy(&inst->lock);
+-	vfree(inst);
++	msm_vidc_free_inst(inst);
+ 	return NULL;
+ }
+ 
+--- a/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_control.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_control.c
+@@ -4,6 +4,8 @@
+  * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include <linux/vmalloc.h>
++#include "msm_vidc_control.h"
+ #include "msm_vidc_internal.h"
+ #include "msm_vidc_driver.h"
+ #include "msm_venc.h"
+--- a/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_debug.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_debug.c
+@@ -5,6 +5,8 @@
+  */
+ 
+ #define CREATE_TRACE_POINTS
++#include <linux/vmalloc.h>
++#include <linux/module.h>
+ #include "msm_vidc_debug.h"
+ #include "msm_vidc_driver.h"
+ #include "msm_vidc.h"
+@@ -323,6 +325,7 @@
+ }
+ 
+ static const struct file_operations core_info_fops = {
++	.owner = THIS_MODULE,
+ 	.open = simple_open,
+ 	.read = core_info_read,
+ };
+@@ -384,6 +387,7 @@
+ }
+ 
+ static const struct file_operations stats_delay_fops = {
++	.owner = THIS_MODULE,
+ 	.open = simple_open,
+ 	.write = stats_delay_write_ms,
+ 	.read = stats_delay_read_ms,
+@@ -473,11 +477,13 @@
+ }
+ 
+ static const struct file_operations ssr_fops = {
++	.owner = THIS_MODULE,
+ 	.open = simple_open,
+ 	.write = trigger_ssr_write,
+ };
+ 
+ static const struct file_operations crc_fops = {
++	.owner = THIS_MODULE,
+ 	.open = simple_open,
+ 	.write = enable_crc_write,
+ };
+@@ -524,6 +530,7 @@
+ }
+ 
+ static const struct file_operations stability_fops = {
++	.owner = THIS_MODULE,
+ 	.open = simple_open,
+ 	.write = trigger_stability_write,
+ };
+@@ -678,7 +685,7 @@
+ 			"type: %s\n", i == INPUT_PORT ?
+ 			"Output" : "Capture");
+ 		cur += write_str(cur, end - cur, "count: %u\n",
+-				inst->bufq[i].vb2q->num_buffers);
++				vb2_get_num_buffers(inst->bufq[i].vb2q));
+ 
+ 		for (j = 0; j < f->fmt.pix_mp.num_planes; j++)
+ 			cur += write_str(cur, end - cur,
+@@ -715,6 +722,7 @@
+ }
+ 
+ static const struct file_operations inst_info_fops = {
++	.owner = THIS_MODULE,
+ 	.open = inst_info_open,
+ 	.read = inst_info_read,
+ 	.release = inst_info_release,
+@@ -754,7 +762,7 @@
+ 		goto failed_create_file;
+ 	}
+ 
+-	dir->d_inode->i_private = info->d_inode->i_private;
++	inst->debugfs_data = idata;
+ 	inst->debug.pdata[FRAME_PROCESSING].sampling = true;
+ 	return dir;
+ 
+@@ -769,20 +777,11 @@
+ 
+ void msm_vidc_debugfs_deinit_inst(struct msm_vidc_inst *inst)
+ {
+-	struct dentry *dentry = NULL;
+-
+-	if (!inst->debugfs_root)
+-		return;
+-
+-	dentry = inst->debugfs_root;
+-	if (dentry->d_inode) {
+-		i_vpr_l(inst, "%s: Destroy %pK\n",
+-			__func__, dentry->d_inode->i_private);
+-		vfree(dentry->d_inode->i_private);
+-		dentry->d_inode->i_private = NULL;
+-	}
+-	debugfs_remove_recursive(dentry);
++	/* Removal drains readers before their private data is released. */
++	debugfs_remove_recursive(inst->debugfs_root);
+ 	inst->debugfs_root = NULL;
++	vfree(inst->debugfs_data);
++	inst->debugfs_data = NULL;
+ }
+ 
+ void msm_vidc_debugfs_update(struct msm_vidc_inst *inst,
+--- a/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_driver.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_driver.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <linux/iommu.h>
+ #include <linux/workqueue.h>
+ #include "msm_media_info.h"
+@@ -401,8 +402,8 @@
+ 	return buffer_type;
+ }
+ 
+-u32 v4l2_type_from_driver(enum msm_vidc_buffer_type buffer_type,
+-	const char *func)
++static u32 v4l2_type_from_driver(enum msm_vidc_buffer_type buffer_type,
++				 const char *func)
+ {
+ 	u32 type = 0;
+ 
+@@ -1389,7 +1390,7 @@
+ 	return rc;
+ }
+ 
+-int msm_vidc_get_fence_fd(struct msm_vidc_inst *inst, int *fence_fd)
++static int msm_vidc_get_fence_fd(struct msm_vidc_inst *inst, int *fence_fd)
+ {
+ 	int rc = 0;
+ 	struct msm_vidc_fence *fence, *dummy_fence;
+@@ -1570,8 +1571,8 @@
+ 	return rc;
+ }
+ 
+-int msm_vidc_process_readonly_buffers(struct msm_vidc_inst *inst,
+-	struct msm_vidc_buffer *buf)
++static int msm_vidc_process_readonly_buffers(struct msm_vidc_inst *inst,
++					     struct msm_vidc_buffer *buf)
+ {
+ 	int rc = 0;
+ 	struct msm_vidc_buffer *ro_buf, *dummy;
+@@ -1732,7 +1733,7 @@
+ 	return 0;
+ }
+ 
+-int msm_vidc_flush_input_timer(struct msm_vidc_inst *inst)
++static int msm_vidc_flush_input_timer(struct msm_vidc_inst *inst)
+ {
+ 	struct msm_vidc_input_timer *input_timer, *dummy_timer;
+ 	struct msm_vidc_core *core;
+@@ -3090,7 +3091,6 @@
+ 
+ 	v4l2_fh_init(&inst->fh, &core->vdev[index].vdev);
+ 	inst->fh.ctrl_handler = &inst->ctrl_handler;
+-	v4l2_fh_add(&inst->fh);
+ 
+ 	return rc;
+ }
+@@ -3105,7 +3105,6 @@
+ 		return 0;
+ 	}
+ 
+-	v4l2_fh_del(&inst->fh);
+ 	inst->fh.ctrl_handler = NULL;
+ 	v4l2_fh_exit(&inst->fh);
+ 
+@@ -3316,7 +3315,7 @@
+ 
+ 	core_lock(core, __func__);
+ 	list_for_each_entry_safe(i, temp, &core->instances, list) {
+-		if (i->session_id == inst->session_id) {
++		if (i == inst) {
+ 			list_move_tail(&i->list, &core->dangling_instances);
+ 			i_vpr_h(inst, "%s: removed session %#x\n",
+ 				__func__, i->session_id);
+@@ -3340,7 +3339,7 @@
+ 
+ 	core_lock(core, __func__);
+ 	list_for_each_entry_safe(i, temp, &core->dangling_instances, list) {
+-		if (i->session_id == inst->session_id) {
++		if (i == inst) {
+ 			list_del_init(&i->list);
+ 			i_vpr_h(inst, "%s: removed dangling session %#x\n",
+ 				__func__, i->session_id);
+@@ -4681,12 +4680,16 @@
+ 	msm_vidc_pools_deinit(inst);
+ }
+ 
+-static void msm_vidc_close_helper(struct kref *kref)
+-{
+-	struct msm_vidc_inst *inst = container_of(kref,
+-		struct msm_vidc_inst, kref);
++static void msm_vidc_release_instance(struct work_struct *work)
++{
++	struct msm_vidc_inst *inst = container_of(work,
++		struct msm_vidc_inst, release_work);
+ 	struct msm_vidc_core *core;
+-
++	unsigned long flags;
++
++	/* Wait until the final put has finished accessing the instance. */
++	spin_lock_irqsave(&inst->ref_lock, flags);
++	spin_unlock_irqrestore(&inst->ref_lock, flags);
+ 	core = inst->core;
+ 
+ 	i_vpr_h(inst, "%s()\n", __func__);
+@@ -4713,12 +4716,60 @@
+ 	mutex_destroy(&inst->client_lock);
+ 	mutex_destroy(&inst->ctx_q_lock);
+ 	mutex_destroy(&inst->lock);
++	msm_vidc_free_inst(inst);
++}
++
++static void msm_vidc_close_helper(struct kref *kref)
++{
++	struct msm_vidc_inst *inst = container_of(kref,
++		struct msm_vidc_inst, kref);
++	struct msm_vidc_core *core = inst->core;
++
++	/* A debugfs read may release the last reference to this instance. */
++	queue_work(core->release_workq, &inst->release_work);
++}
++
++void msm_vidc_init_inst_ref(struct msm_vidc_inst *inst)
++{
++	struct msm_vidc_core *core = inst->core;
++
++	kref_init(&inst->kref);
++	spin_lock_init(&inst->ref_lock);
++	init_waitqueue_head(&inst->ref_wait);
++	INIT_WORK(&inst->release_work, msm_vidc_release_instance);
++	atomic_inc(&core->live_instances);
++}
++
++void msm_vidc_drain_inst_refs(struct msm_vidc_inst *inst)
++{
++	unsigned long flags;
++
++	/* Keep the opening caller's reference until its partial unwind ends. */
++	msm_vidc_remove_session(inst);
++	msm_vidc_remove_dangling_session(inst);
++	wait_event(inst->ref_wait, kref_read(&inst->kref) == 1);
++	spin_lock_irqsave(&inst->ref_lock, flags);
++	spin_unlock_irqrestore(&inst->ref_lock, flags);
++}
++
++void msm_vidc_free_inst(struct msm_vidc_inst *inst)
++{
++	struct msm_vidc_core *core = inst->core;
++
+ 	vfree(inst);
++	if (atomic_dec_and_test(&core->live_instances))
++		wake_up_all(&core->instances_wait);
+ }
+ 
+ struct msm_vidc_inst *get_inst_ref_locked(struct msm_vidc_inst *inst)
+ {
+-	return kref_get_unless_zero(&inst->kref) ? inst : NULL;
++	unsigned long flags;
++	bool live;
++
++	spin_lock_irqsave(&inst->ref_lock, flags);
++	live = kref_get_unless_zero(&inst->kref);
++	spin_unlock_irqrestore(&inst->ref_lock, flags);
++	return live ? inst : NULL;
+ }
+ 
+ struct msm_vidc_inst *get_inst_ref(struct msm_vidc_core *core,
+@@ -4759,7 +4810,12 @@
+ 
+ void put_inst(struct msm_vidc_inst *inst)
+ {
++	unsigned long flags;
++
++	spin_lock_irqsave(&inst->ref_lock, flags);
+ 	kref_put(&inst->kref, msm_vidc_close_helper);
++	wake_up_all(&inst->ref_wait);
++	spin_unlock_irqrestore(&inst->ref_lock, flags);
+ }
+ 
+ void core_lock(struct msm_vidc_core *core, const char *function)
+@@ -4915,6 +4971,9 @@
+ 
+ void msm_vidc_schedule_core_deinit(struct msm_vidc_core *core)
+ {
++	if (READ_ONCE(core->stopping))
++		return;
++
+ 	if (!core->capabilities[FW_UNLOAD].value)
+ 		return;
+ 
+--- a/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_fence.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_fence.c
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include "msm_vidc_fence.h"
+ #include "msm_vidc_driver.h"
+ #include "msm_vidc_debug.h"
+@@ -50,7 +51,7 @@
+ 	.release = msm_vidc_dma_fence_release,
+ };
+ 
+-struct msm_vidc_fence *msm_vidc_fence_create(struct msm_vidc_inst *inst)
++static struct msm_vidc_fence *msm_vidc_fence_create(struct msm_vidc_inst *inst)
+ {
+ 	struct msm_vidc_fence *fence = NULL;
+ 
+@@ -81,8 +82,8 @@
+ 	return fence;
+ }
+ 
+-int msm_vidc_dma_fence_create_fd(struct msm_vidc_inst *inst,
+-				 struct msm_vidc_fence *fence)
++static int msm_vidc_dma_fence_create_fd(struct msm_vidc_inst *inst,
++					struct msm_vidc_fence *fence)
+ {
+ 	int rc = 0;
+ 
+--- a/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_memory.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_memory.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <linux/dma-buf.h>
+ #include <linux/dma-heap.h>
+ #include <linux/dma-mapping.h>
+@@ -18,7 +19,7 @@
+ #include "venus_hfi.h"
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0))
+-	MODULE_IMPORT_NS(DMA_BUF);
++	MODULE_IMPORT_NS("DMA_BUF");
+ #endif
+ 
+ struct msm_vidc_type_size_name {
+--- a/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_memory_ext.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_memory_ext.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include "msm_vidc_memory_ext.h"
+ #include <linux/dma-buf.h>
+ #include <linux/dma-heap.h>
+ #include <linux/qcom-dma-mapping.h>
+@@ -119,7 +120,7 @@
+ static int msm_vidc_memory_alloc_ext(struct msm_vidc_core *core, struct msm_vidc_mem *mem)
+ {
+ 	int rc = 0;
+-	int size = 0;
++	size_t size;
+ 	struct dma_heap *heap;
+ 	char *heap_name = NULL;
+ 	struct mem_buf_lend_kernel_arg lend_arg;
+@@ -131,7 +132,9 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	size = ALIGN(mem->size, SZ_4K);
++	if (!mem->size || mem->dmabuf || mem->refcount)
++		return -EINVAL;
++	size = ALIGN((size_t)mem->size, SZ_4K);
+ 
+ 	if (mem->secure) {
+ 		switch (mem->region) {
+@@ -160,6 +163,7 @@
+ 		goto error;
+ 	}
+ 	mem->dmabuf = dma_heap_buffer_alloc(heap, size, 0, 0);
++	dma_heap_put(heap);
+ 	if (IS_ERR_OR_NULL(mem->dmabuf)) {
+ 		d_vpr_e("%s: dma heap %s alloc failed\n", __func__, heap_name);
+ 		mem->dmabuf = NULL;
+@@ -184,7 +188,9 @@
+ 	}
+ 
+ 	if (mem->map_kernel) {
+-		dma_buf_begin_cpu_access(mem->dmabuf, DMA_BIDIRECTIONAL);
++		rc = dma_buf_begin_cpu_access(mem->dmabuf, DMA_BIDIRECTIONAL);
++		if (rc)
++			goto error;
+ 
+ 	/*
+ 	 * Waipio uses Kernel version 5.10.x,
+@@ -197,22 +203,20 @@
+ 		if (!mem->kvaddr) {
+ 			d_vpr_e("%s: kernel map failed\n", __func__);
+ 			rc = -EIO;
+-			goto error;
++			goto end_cpu_access;
+ 		}
+ #elif (LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0))
+ 		rc = dma_buf_vmap(mem->dmabuf, &mem->dmabuf_map);
+ 		if (rc) {
+ 			d_vpr_e("%s: kernel map failed\n", __func__);
+-			rc = -EIO;
+-			goto error;
++			goto end_cpu_access;
+ 		}
+ 		mem->kvaddr = mem->dmabuf_map.vaddr;
+ #else
+ 		rc = dma_buf_vmap_unlocked(mem->dmabuf, &mem->dmabuf_map);
+ 		if (rc) {
+ 			d_vpr_e("%s: kernel map failed\n", __func__);
+-			rc = -EIO;
+-			goto error;
++			goto end_cpu_access;
+ 		}
+ 		mem->kvaddr = mem->dmabuf_map.vaddr;
+ #endif
+@@ -227,8 +231,11 @@
+ 
+ 	return 0;
+ 
++end_cpu_access:
++	dma_buf_end_cpu_access(mem->dmabuf, DMA_BIDIRECTIONAL);
+ error:
+-    msm_vidc_memory_free_ext(core, mem);
++	if (mem->dmabuf)
++		msm_vidc_memory_free_ext(core, mem);
+ 	return rc;
+ }
+ 
+@@ -438,13 +445,14 @@
+ 	rc = msm_vidc_memory_alloc_ext(core, mem);
+ 	if (rc) {
+ 		d_vpr_e("%s: memory_alloc failed\n", __func__);
+-		return -EINVAL;
++		return rc;
+ 	}
+ 
+ 	rc = msm_vidc_memory_map_ext(core, mem);
+ 	if (rc) {
+ 		d_vpr_e("%s: memory_map failed\n", __func__);
+-		return -EINVAL;
++		msm_vidc_memory_free_ext(core, mem);
++		return rc;
+ 	}
+ 
+ 	return rc;
+--- a/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_power.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_power.c
+@@ -331,7 +331,7 @@
+ 	return 0;
+ }
+ 
+-int msm_vidc_set_clocks(struct msm_vidc_inst *inst)
++static int msm_vidc_set_clocks(struct msm_vidc_inst *inst)
+ {
+ 	int rc = 0;
+ 	struct msm_vidc_core *core;
+@@ -623,7 +623,7 @@
+ 	return 0;
+ }
+ 
+-void msm_vidc_dcvs_data_reset(struct msm_vidc_inst *inst)
++static void msm_vidc_dcvs_data_reset(struct msm_vidc_inst *inst)
+ {
+ 	struct msm_vidc_power *dcvs;
+ 	u32 min_count, actual_count, max_count;
+--- a/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_probe.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_probe.c
+@@ -12,6 +12,7 @@
+ #include <linux/component.h>
+ #include <linux/interrupt.h>
+ #include <linux/iommu.h>
++#include <linux/qcom-iommu-util.h>
+ #include <linux/version.h>
+ #include <linux/stringify.h>
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0))
+@@ -34,6 +35,7 @@
+ #define BASE_DEVICE_NUMBER 32
+ 
+ struct msm_vidc_core *g_core;
++static DEFINE_MUTEX(msm_vidc_registration_lock);
+ 
+ static inline bool is_video_device(struct device *dev)
+ {
+@@ -137,15 +139,31 @@
+ 
+ static void msm_vidc_release_video_device(struct video_device *vdev)
+ {
+-	d_vpr_e("%s:\n", __func__);
++	struct msm_video_device *video = container_of(vdev,
++		struct msm_video_device, vdev);
++
++	complete_all(&video->released);
++}
++
++static void msm_vidc_unpublish_video_device(struct msm_video_device *video)
++{
++	if (video->registered && !video->unregistering) {
++		video->unregistering = true;
++		video_unregister_device(&video->vdev);
++	}
++}
++
++static void msm_vidc_wait_video_device(struct msm_video_device *video)
++{
++	if (video->registered)
++		wait_for_completion(&video->released);
+ }
+ 
+ static void msm_vidc_unregister_video_device(struct msm_vidc_core *core,
+ 		enum msm_vidc_domain_type type)
+ {
++	struct msm_video_device *video;
+ 	int index;
+-
+-	d_vpr_h("%s: domain %d\n", __func__, type);
+ 
+ 	if (type == MSM_VIDC_DECODER)
+ 		index = 0;
+@@ -153,16 +171,22 @@
+ 		index = 1;
+ 	else
+ 		return;
+-
+-
++	video = &core->vdev[index];
++	if (!video->registered)
++		return;
++
++	msm_vidc_unpublish_video_device(video);
++	msm_vidc_wait_video_device(video);
+ #ifdef CONFIG_MEDIA_CONTROLLER
+-	v4l2_m2m_unregister_media_controller(core->vdev[index].m2m_dev);
+-	v4l2_m2m_release(core->vdev[index].m2m_dev);
++	if (video->m2m_registered) {
++		v4l2_m2m_unregister_media_controller(video->m2m_dev);
++		v4l2_m2m_release(video->m2m_dev);
++		video->m2m_registered = false;
++		video->m2m_dev = NULL;
++	}
+ #endif
+-	//rc = device_create_file(&core->vdev[index].vdev.dev, &dev_attr_link_name);
+-	video_set_drvdata(&core->vdev[index].vdev, NULL);
+-	video_unregister_device(&core->vdev[index].vdev);
+-	//memset vdev to 0
++	video_set_drvdata(&video->vdev, NULL);
++	video->registered = false;
+ }
+ 
+ static int msm_vidc_register_video_device(struct msm_vidc_core *core,
+@@ -183,6 +207,8 @@
+ 		return -EINVAL;
+ 	}
+ 
++	memset(&core->vdev[index], 0, sizeof(core->vdev[index]));
++	init_completion(&core->vdev[index].released);
+ 	core->vdev[index].vdev.release =
+ 		msm_vidc_release_video_device;
+ 	core->vdev[index].vdev.fops = core->v4l2_file_ops;
+@@ -194,13 +220,14 @@
+ 	core->vdev[index].type = type;
+ 	core->vdev[index].vdev.v4l2_dev = &core->v4l2_dev;
+ 	core->vdev[index].vdev.device_caps = core->capabilities[DEVICE_CAPS].value;
++	video_set_drvdata(&core->vdev[index].vdev, core);
+ 	rc = video_register_device(&core->vdev[index].vdev,
+ 					VFL_TYPE_VIDEO, nr);
+ 	if (rc) {
+ 		d_vpr_e("Failed to register the video device\n");
+ 		return rc;
+ 	}
+-	video_set_drvdata(&core->vdev[index].vdev, core);
++	core->vdev[index].registered = true;
+ 	//rc = device_create_file(&core->vdev[index].vdev.dev, &dev_attr_link_name);
+ 	if (rc) {
+ 		d_vpr_e("Failed to create video device file\n");
+@@ -220,6 +247,7 @@
+ 			__func__, index);
+ 		goto m2m_mc_failed;
+ 	}
++	core->vdev[index].m2m_registered = true;
+ #endif
+ 
+ 	return 0;
+@@ -229,7 +257,10 @@
+ m2m_init_failed:
+ #endif
+ video_reg_failed:
+-	video_unregister_device(&core->vdev[index].vdev);
++	msm_vidc_unpublish_video_device(&core->vdev[index]);
++	msm_vidc_wait_video_device(&core->vdev[index]);
++	video_set_drvdata(&core->vdev[index].vdev, NULL);
++	core->vdev[index].registered = false;
+ 
+ 	return rc;
+ }
+@@ -241,7 +272,7 @@
+ 	rc = v4l2_device_register(&core->pdev->dev, &core->v4l2_dev);
+ 	if (rc) {
+ 		d_vpr_e("Failed to register v4l2 device\n");
+-		return -EINVAL;
++		return rc;
+ 	}
+ 
+ #ifdef CONFIG_MEDIA_CONTROLLER
+@@ -291,19 +322,21 @@
+ 
+ static int msm_vidc_deinitialize_media(struct msm_vidc_core *core)
+ {
+-	int rc = 0;
+-
+-#ifdef CONFIG_MEDIA_CONTROLLER
+-	media_device_unregister(&core->media_dev);
+-#endif
++	/* Keep all shared resources until files and delayed references drain. */
++	msm_vidc_unpublish_video_device(&core->vdev[0]);
++	msm_vidc_unpublish_video_device(&core->vdev[1]);
++	msm_vidc_wait_video_device(&core->vdev[0]);
++	msm_vidc_wait_video_device(&core->vdev[1]);
++	wait_event(core->instances_wait, !atomic_read(&core->live_instances));
++	flush_workqueue(core->release_workq);
+ 	msm_vidc_unregister_video_device(core, MSM_VIDC_ENCODER);
+ 	msm_vidc_unregister_video_device(core, MSM_VIDC_DECODER);
+ #ifdef CONFIG_MEDIA_CONTROLLER
++	media_device_unregister(&core->media_dev);
+ 	media_device_cleanup(&core->media_dev);
+ #endif
+ 	v4l2_device_unregister(&core->v4l2_dev);
+-
+-	return rc;
++	return 0;
+ }
+ 
+ #ifdef CONFIG_MSM_MMRM
+@@ -342,7 +375,6 @@
+ 	}
+ 	d_vpr_h("%s()\n", __func__);
+ 
+-	mutex_destroy(&core->lock);
+ 	msm_vidc_update_core_state(core, MSM_VIDC_CORE_DEINIT, __func__);
+ 
+ 	if (core->batch_workq)
+@@ -351,6 +383,10 @@
+ 	if (core->pm_workq)
+ 		destroy_workqueue(core->pm_workq);
+ 
++	if (core->release_workq)
++		destroy_workqueue(core->release_workq);
++	core->release_workq = NULL;
++	mutex_destroy(&core->lock);
+ 	core->batch_workq = NULL;
+ 	core->pm_workq = NULL;
+ 
+@@ -378,6 +414,14 @@
+ 		rc = -EINVAL;
+ 		goto exit;
+ 	}
++
++	core->release_workq = alloc_ordered_workqueue("vidc_release", WQ_MEM_RECLAIM);
++	if (!core->release_workq) {
++		rc = -ENOMEM;
++		goto exit;
++	}
++	atomic_set(&core->live_instances, 0);
++	init_waitqueue_head(&core->instances_wait);
+ 
+ 	core->packet_size = VIDC_IFACEQ_VAR_HUGE_PKT_SIZE;
+ 	core->packet = devm_kzalloc(&core->pdev->dev, core->packet_size, GFP_KERNEL);
+@@ -388,7 +432,7 @@
+ 	}
+ 
+ 	core->response_packet = devm_kzalloc(&core->pdev->dev, core->packet_size, GFP_KERNEL);
+-	if (!core->packet) {
++	if (!core->response_packet) {
+ 		d_vpr_e("%s: failed to alloc core response packet\n", __func__);
+ 		rc = -ENOMEM;
+ 		goto exit;
+@@ -404,6 +448,9 @@
+ 
+ 	return 0;
+ exit:
++	if (core->release_workq)
++		destroy_workqueue(core->release_workq);
++	core->release_workq = NULL;
+ 	if (core->batch_workq)
+ 		destroy_workqueue(core->batch_workq);
+ 	if (core->pm_workq)
+@@ -473,10 +520,33 @@
+ 	return parent;
+ }
+ 
++static void msm_vidc_release_context_bank(struct context_bank_info *cb)
++{
++	struct device *dev = cb->dev;
++
++	if (!dev)
++		return;
++	if (cb->fault_registered) {
++		/* The same provider locks dispatch and withdrawal, draining callbacks. */
++		qcom_iommu_set_fault_handler(cb->domain, NULL, NULL);
++		cb->fault_registered = false;
++	}
++	dev->dma_parms->max_segment_size = cb->saved_max_segment_size;
++	dev->dma_parms->segment_boundary_mask = cb->saved_segment_boundary_mask;
++	if (cb->dma_parms_owned) {
++		kfree(dev->dma_parms);
++		dev->dma_parms = NULL;
++		cb->dma_parms_owned = false;
++	}
++	cb->dev = NULL;
++	cb->domain = NULL;
++}
++
+ static int msm_vidc_setup_context_bank(struct msm_vidc_core *core,
+ 	struct device *dev)
+ {
+ 	struct context_bank_info *cb = NULL;
++	struct iommu_domain *domain;
+ 	int rc = 0;
+ 
+ 	cb = msm_vidc_get_context_bank_for_device(core, dev);
+@@ -486,16 +556,16 @@
+ 		return -EIO;
+ 	}
+ 
+-	/* populate dev & domain field */
+-	cb->dev = dev;
+-	cb->domain = iommu_get_domain_for_dev(cb->dev);
+-	if (!cb->domain) {
++	if (cb->dev)
++		return -EBUSY;
++	domain = iommu_get_domain_for_dev(dev);
++	if (!domain) {
+ 		d_vpr_e("%s: Failed to get iommu domain for %s\n", __func__, dev_name(dev));
+ 		return -EIO;
+ 	}
+ 
+ 	if (cb->dma_mask) {
+-		rc = dma_set_mask_and_coherent(cb->dev, cb->dma_mask);
++		rc = dma_set_mask_and_coherent(dev, cb->dma_mask);
+ 		if (rc) {
+ 			d_vpr_e("%s: dma_set_mask_and_coherent failed\n", __func__);
+ 			return rc;
+@@ -509,7 +579,7 @@
+ 
+ 	/* remove kernel version condition once below api is whitelisted in pineapple */
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0))
+-	iommu_dma_enable_best_fit_algo(cb->dev);
++	iommu_dma_enable_best_fit_algo(dev);
+ #endif
+ 
+ 	/*
+@@ -517,14 +587,24 @@
+ 	 * iommu mapping returns one mapping (which is required for partial
+ 	 * cache operations)
+ 	 */
+-	if (!dev->dma_parms)
+-		dev->dma_parms =
+-			devm_kzalloc(dev, sizeof(*dev->dma_parms), GFP_KERNEL);
++	if (!dev->dma_parms) {
++		dev->dma_parms = kzalloc(sizeof(*dev->dma_parms), GFP_KERNEL);
++		if (!dev->dma_parms)
++			return -ENOMEM;
++		cb->dma_parms_owned = true;
++	}
++	cb->saved_max_segment_size = dev->dma_parms->max_segment_size;
++	cb->saved_segment_boundary_mask = dev->dma_parms->segment_boundary_mask;
++	cb->dev = dev;
++	cb->domain = domain;
+ 	dma_set_max_seg_size(dev, (unsigned int)DMA_BIT_MASK(32));
+ 	dma_set_seg_boundary(dev, (unsigned long)DMA_BIT_MASK(64));
+ 
+-	iommu_set_fault_handler(cb->domain,
+-		msm_vidc_smmu_fault_handler, (void *)core);
++	/* Use the Qualcomm provider's synchronized registration on DMA domains. */
++	rc = qcom_iommu_set_fault_handler(domain, msm_vidc_smmu_fault_handler, core);
++	if (rc)
++		goto release;
++	cb->fault_registered = true;
+ 
+ 	d_vpr_h(
+ 		"%s: name %s addr start %x size %x secure %d dma_coherant %d "
+@@ -534,6 +614,10 @@
+ 		cb->region, dev_name(cb->dev), cb->domain, cb->dma_mask);
+ 
+ 	return rc;
++
++release:
++	msm_vidc_release_context_bank(cb);
++	return rc;
+ }
+ 
+ static int msm_vidc_component_compare_of(struct device *dev, void *data)
+@@ -581,7 +665,12 @@
+ static void msm_vidc_component_unbind(struct device *dev,
+ 	struct device *parent, void *data)
+ {
++	struct context_bank_info *cb;
++
+ 	d_vpr_h("%s(): %s\n", __func__, dev_name(dev));
++	cb = msm_vidc_get_context_bank_for_device(data, dev);
++	if (cb && cb->dev == dev)
++		msm_vidc_release_context_bank(cb);
+ }
+ 
+ static int msm_vidc_component_master_bind(struct device *dev)
+@@ -591,9 +680,11 @@
+ 
+ 	d_vpr_h("%s(): %s\n", __func__, dev_name(dev));
+ 
++	WRITE_ONCE(core->stopping, false);
+ 	rc = component_bind_all(dev, core);
+ 	if (rc) {
+ 		d_vpr_e("%s: sub-device bind failed. rc %d\n", __func__, rc);
++		WRITE_ONCE(core->stopping, true);
+ 		return rc;
+ 	}
+ 
+@@ -604,15 +695,16 @@
+ 			if (rc) {
+ 				d_vpr_e("%s: failed to register synx fence\n",
+ 					__func__);
+-				core->capabilities[SUPPORTS_SYNX_FENCE].value = 0;
+-				return rc;
++				goto unbind_components;
+ 			}
++			core->synx_registered = true;
+ 		} else {
+ 			/* override synx fence ops with dma fence ops */
+ 			core->fence_ops = get_dma_fence_ops();
+ 			if (!core->fence_ops) {
+ 				d_vpr_e("%s: invalid dma fence ops\n", __func__);
+-				return -EINVAL;
++				rc = -EINVAL;
++				goto unbind_components;
+ 			}
+ 			core->capabilities[SUPPORTS_SYNX_FENCE].value = 0;
+ 		}
+@@ -621,7 +713,7 @@
+ 	rc = msm_vidc_initialize_media(core);
+ 	if (rc) {
+ 		d_vpr_e("%s: media initialization failed\n", __func__);
+-		return rc;
++		goto deregister_fence;
+ 	}
+ 
+ 	rc = venus_hfi_queue_init(core);
+@@ -636,17 +728,34 @@
+ 		goto queues_deinit;
+ 	}
+ 
++ready:
++	core->debugfs_root = msm_vidc_debugfs_init_core(core);
++	/* Publish initialized core/media state before file opens acquire it. */
++	smp_store_release(&core->ready, true);
+ 	d_vpr_h("%s(): succssful\n", __func__);
+-
+ 	return 0;
+ 
+ queues_deinit:
++	/* Failed core init stops hardware; drain handlers before freeing queues. */
++	if (core->irq_requested)
++		synchronize_irq(core->irq);
++	cancel_delayed_work_sync(&core->pm_work);
+ 	venus_hfi_queue_deinit(core);
+ 	/**
+ 	 * queues and core can be inited again during session_open.
+ 	 * So don't declare as probe failure.
+ 	 */
+-	return 0;
++	goto ready;
++
++deregister_fence:
++	if (core->synx_registered) {
++		call_fence_op(core, fence_deregister, core);
++		core->synx_registered = false;
++	}
++unbind_components:
++	WRITE_ONCE(core->stopping, true);
++	component_unbind_all(dev, core);
++	return rc;
+ }
+ 
+ static void msm_vidc_component_master_unbind(struct device *dev)
+@@ -655,12 +764,24 @@
+ 
+ 	d_vpr_h("%s(): %s\n", __func__, dev_name(dev));
+ 
++	WRITE_ONCE(core->ready, false);
++	core_lock(core, __func__);
++	WRITE_ONCE(core->stopping, true);
++	core_unlock(core, __func__);
++	msm_vidc_deinitialize_media(core);
++	debugfs_remove_recursive(core->debugfs_root);
++	core->debugfs_root = NULL;
++	cancel_work_sync(&core->ssr_work);
++	cancel_delayed_work_sync(&core->fw_unload_work);
+ 	msm_vidc_core_deinit(core, true);
++	if (core->irq_requested)
++		synchronize_irq(core->irq);
++	cancel_delayed_work_sync(&core->pm_work);
+ 	venus_hfi_queue_deinit(core);
+-	msm_vidc_deinitialize_media(core);
+-	if (core->capabilities[SUPPORTS_SYNX_FENCE].value &&
+-	    msm_vidc_synx_fence_enable)
++	if (core->synx_registered) {
+ 		call_fence_op(core, fence_deregister, core);
++		core->synx_registered = false;
++	}
+ 	component_unbind_all(dev, core);
+ 
+ 	d_vpr_h("%s(): succssful\n", __func__);
+@@ -692,6 +813,10 @@
+ 	}
+ 
+ 	d_vpr_h("%s()\n", __func__);
++
++	mutex_lock(&msm_vidc_registration_lock);
++	WRITE_ONCE(core->ready, false);
++	WRITE_ONCE(core->stopping, true);
+ 
+ 	/* destroy component master and deallocate match data */
+ 	component_master_del(&pdev->dev, &msm_vidc_component_master_ops);
+@@ -708,6 +833,7 @@
+ 
+ 	dev_set_drvdata(&pdev->dev, NULL);
+ 	g_core = NULL;
++	mutex_unlock(&msm_vidc_registration_lock);
+ 	d_vpr_h("%s(): succssful\n", __func__);
+ 
+ 	return 0;
+@@ -722,21 +848,14 @@
+ 	return 0;
+ }
+ 
+-static int msm_vidc_remove(struct platform_device *pdev)
+-{
+-	/*
+-	 * Sub devices remove will be triggered by of_platform_depopulate()
+-	 * after core_deinit(). It return immediately after completing
+-	 * sub-device remove.
+-	 */
++static void msm_vidc_remove(struct platform_device *pdev)
++{
+ 	if (is_video_device(&pdev->dev))
+-		return msm_vidc_remove_video_device(pdev);
++		msm_vidc_remove_video_device(pdev);
+ 	else if (is_video_context_bank_device(&pdev->dev))
+-		return msm_vidc_remove_context_bank(pdev);
+-
+-	/* How did we end up here? */
+-	WARN_ON(1);
+-	return -EINVAL;
++		msm_vidc_remove_context_bank(pdev);
++	else
++		WARN_ON(1);
+ }
+ 
+ static int msm_vidc_probe_video_device(struct platform_device *pdev)
+@@ -749,11 +868,19 @@
+ 
+ 	d_vpr_h("%s: %s\n", __func__, dev_name(&pdev->dev));
+ 
++	mutex_lock(&msm_vidc_registration_lock);
++	if (g_core) {
++		mutex_unlock(&msm_vidc_registration_lock);
++		return -EBUSY;
++	}
++
+ 	core = devm_kzalloc(&pdev->dev, sizeof(struct msm_vidc_core), GFP_KERNEL);
+ 	if (!core) {
+ 		d_vpr_e("%s: failed to alloc memory for core\n", __func__);
++		mutex_unlock(&msm_vidc_registration_lock);
+ 		return -ENOMEM;
+ 	}
++	core->stopping = true;
+ 	g_core = core;
+ 
+ 	core->pdev = pdev;
+@@ -805,10 +932,6 @@
+ 		d_vpr_e("Failed to check MMRM scaling support\n");
+ 		rc = 0; /* Ignore error */
+ 	}
+-
+-	core->debugfs_root = msm_vidc_debugfs_init_core(core);
+-	if (!core->debugfs_root)
+-		d_vpr_h("Failed to init debugfs core\n");
+ 
+ 	/* registering sub-device with component model framework */
+ 	for_each_available_child_of_node(pdev->dev.of_node, child) {
+@@ -823,6 +946,8 @@
+ 		component_match_add_release(&pdev->dev, &match, msm_vidc_component_release_of,
+ 			msm_vidc_component_compare_of, child);
+ 		if (IS_ERR(match)) {
++			/* Neither the failed entry nor the iterator retains this node. */
++			of_node_put(child);
+ 			of_node_put(child);
+ 			rc = PTR_ERR(match) ? PTR_ERR(match) : -ENOMEM;
+ 			d_vpr_e("%s: component match add release failed\n", __func__);
+@@ -843,7 +968,7 @@
+ 			&pdev->dev);
+ 	if (rc) {
+ 		d_vpr_e("Failed to trigger probe for sub-devices\n");
+-		goto sub_dev_failed;
++		goto master_add_failed;
+ 	}
+ 
+ 	/**
+@@ -859,6 +984,7 @@
+ 
+ 	d_vpr_h("%s(): succssful\n", __func__);
+ 
++	mutex_unlock(&msm_vidc_registration_lock);
+ 	return rc;
+ 
+ master_add_failed:
+@@ -873,6 +999,7 @@
+ 	dev_set_drvdata(&pdev->dev, NULL);
+ 	g_core = NULL;
+ 
++	mutex_unlock(&msm_vidc_registration_lock);
+ 	return rc;
+ }
+ 
+@@ -1028,4 +1155,5 @@
+ module_exit(msm_vidc_exit);
+ 
+ MODULE_SOFTDEP("pre: subsys-pil-tz msm-mmrm");
++MODULE_DESCRIPTION("Qualcomm native video decoder and encoder");
+ MODULE_LICENSE("GPL v2");
+--- a/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_v4l2.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_v4l2.c
+@@ -55,6 +55,10 @@
+ 	struct msm_vidc_core *core = video_drvdata(filp);
+ 	struct msm_vidc_inst *inst;
+ 
++	/* Pair with successful bind publication before using core/media state. */
++	if (!core || !smp_load_acquire(&core->ready))
++		return -ENODEV;
++
+ 	trace_msm_v4l2_vidc_open("START", NULL);
+ 	inst = msm_vidc_open(core, vid_dev->type);
+ 	if (!inst) {
+@@ -63,7 +67,7 @@
+ 		trace_msm_v4l2_vidc_open("END", NULL);
+ 		return -ENOMEM;
+ 	}
+-	filp->private_data = &(inst->fh);
++	v4l2_fh_add(&inst->fh, filp);
+ 	trace_msm_v4l2_vidc_open("END", inst);
+ 	return 0;
+ }
+@@ -81,8 +85,8 @@
+ 
+ 	trace_msm_v4l2_vidc_close("START", inst);
+ 
++	v4l2_fh_del(&inst->fh, filp);
+ 	rc = msm_vidc_close(inst);
+-	filp->private_data = NULL;
+ 	trace_msm_v4l2_vidc_close("END", NULL);
+ 	return rc;
+ }
+--- a/qcom/opensource/video-driver/driver/vidc/src/resources.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/resources.c
+@@ -121,47 +121,35 @@
+ 	int rc = 0;
+ 
+ 	pd = dev_pm_domain_attach_by_name(dev, name);
+-	if (!pd) {
++	if (IS_ERR_OR_NULL(pd)) {
+ 		d_vpr_e("%s: pm domain attach failed %s\n", __func__, name);
+-		return NULL;
++		return pd ? pd : ERR_PTR(-ENODEV);
+ 	}
+ 
+ 	rc = devm_add_action_or_reset(dev, devm_pd_release, (void *)pd);
+ 	if (rc) {
+ 		d_vpr_e("%s: add action or reset failed %s\n", __func__, name);
+-		return NULL;
++		return ERR_PTR(rc);
+ 	}
+ 
+ 	return pd;
+ }
+ 
+-static void devm_opp_dl_release(void *res)
+-{
+-	struct device_link *link = (struct device_link *)res;
+-
+-	d_vpr_h("%s(): %s\n", __func__, dev_name(&link->link_dev));
+-	device_link_del(link);
+-}
+-
+-static int devm_opp_dl_get(struct device *dev, struct device *supplier)
+-{
+-	u32 flag = DL_FLAG_RPM_ACTIVE | DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS;
+-	struct device_link *link = NULL;
+-	int rc = 0;
+-
+-	link = device_link_add(dev, supplier, flag);
+-	if (!link) {
+-		d_vpr_e("%s: device link add failed\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	rc = devm_add_action_or_reset(dev, devm_opp_dl_release, (void *)link);
+-	if (rc) {
+-		d_vpr_e("%s: add action or reset failed\n", __func__);
+-		return rc;
+-	}
+-
+-	return rc;
++static int msm_vidc_attach_opp_domains(struct device *dev,
++				       const char * const *names, u32 count)
++{
++	struct dev_pm_domain_list *domains;
++	struct dev_pm_domain_attach_data data = {
++		.pd_names = names,
++		.num_pd_names = count,
++		.pd_flags = PD_FLAG_REQUIRED_OPP | PD_FLAG_DEV_LINK_ON,
++	};
++	int rc;
++
++	rc = devm_pm_domain_attach_list(dev, &data, &domains);
++	if (rc < 0)
++		return rc;
++	return rc == count ? 0 : -ENODEV;
+ }
+ 
+ static void devm_pm_runtime_put_sync(void *res)
+@@ -176,7 +164,7 @@
+ {
+ 	int rc = 0;
+ 
+-	rc = pm_runtime_get_sync(dev);
++	rc = pm_runtime_resume_and_get(dev);
+ 	if (rc < 0) {
+ 		d_vpr_e("%s: pm domain get sync failed\n", __func__);
+ 		return rc;
+@@ -239,30 +227,17 @@
+ 
+ static int __init_irq(struct msm_vidc_core *core)
+ {
+-#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0))
+-	struct resource *kres;
+-#endif
+-	int rc = 0;
+-
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0))
+-	core->irq = platform_get_irq(core->pdev, 0);
+-#else
+-	kres = platform_get_resource(core->pdev, IORESOURCE_IRQ, 0);
+-	core->irq = kres ? kres->start : -1;
+-#endif
+-	if (core->irq < 0)
+-		d_vpr_e("%s: get irq failed, %d\n", __func__, core->irq);
+-
+-	d_vpr_h("%s: irq %d\n", __func__, core->irq);
+-
+-	rc = devm_request_threaded_irq(&core->pdev->dev, core->irq, venus_hfi_isr,
+-			venus_hfi_isr_handler, IRQF_TRIGGER_HIGH, "msm-vidc", core);
+-	if (rc) {
+-		d_vpr_e("%s: Failed to allocate venus IRQ\n", __func__);
+-		return rc;
+-	}
+-	disable_irq_nosync(core->irq);
+-
++	int irq, rc;
++
++	irq = platform_get_irq(core->pdev, 0);
++	if (irq < 0)
++		return irq;
++	core->irq = irq;
++	rc = devm_request_threaded_irq(&core->pdev->dev, irq, venus_hfi_isr,
++				       venus_hfi_isr_handler, IRQF_TRIGGER_HIGH | IRQF_NO_AUTOEN,
++				       "msm-vidc", core);
++	if (!rc)
++		core->irq_requested = true;
+ 	return rc;
+ }
+ 
+@@ -332,7 +307,6 @@
+ {
+ 	struct power_domain_info *pdinfo = NULL;
+ 	const struct pd_table *pd_tbl;
+-	struct device **opp_vdevs = NULL;
+ 	const char * const *opp_tbl;
+ 	u32 pd_count = 0, opp_count = 0, cnt = 0;
+ 	int rc = 0;
+@@ -406,21 +380,10 @@
+ 	for (cnt = 0; cnt < opp_count; cnt++)
+ 		d_vpr_h("%s: opp name %s\n", __func__, opp_tbl[cnt]);
+ 
+-	/* populate opp power domains(for rails) */
+-	rc = devm_pm_opp_attach_genpd(&core->pdev->dev, opp_tbl, &opp_vdevs);
+-	rc = -EINVAL;
++	/* Attach rails, required OPPs and runtime-PM device links together. */
++	rc = msm_vidc_attach_opp_domains(&core->pdev->dev, opp_tbl, opp_count);
+ 	if (rc)
+ 		return rc;
+-
+-	/* create device_links b/w consumer(dev) and multiple suppliers(mx, mmcx) */
+-	for (cnt = 0; cnt < opp_count; cnt++) {
+-		rc = devm_opp_dl_get(&core->pdev->dev, opp_vdevs[cnt]);
+-		if (rc) {
+-			d_vpr_e("%s: failed to create dl: %s\n",
+-				__func__, dev_name(opp_vdevs[cnt]));
+-			return rc;
+-		}
+-	}
+ 
+ 	/* initialize opp table from device tree */
+ 	rc = devm_pm_opp_of_add_table(&core->pdev->dev);
+--- a/qcom/opensource/video-driver/driver/vidc/src/resources_ext.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/resources_ext.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include "resources_ext.h"
+ #include <linux/clk.h>
+ #include <linux/clk/qcom.h>
+ 
+--- a/qcom/opensource/video-driver/driver/vidc/src/venus_hfi.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/venus_hfi.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
++#include <linux/vmalloc.h>
+ #include <linux/iommu.h>
+ #include <linux/soc/qcom/smem.h>
+ #include <linux/irqreturn.h>
+@@ -89,6 +90,9 @@
+ 
+ static void __schedule_power_collapse_work(struct msm_vidc_core *core)
+ {
++	if (READ_ONCE(core->stopping))
++		return;
++
+ 	if (!core->capabilities[SW_PC].value) {
+ 		d_vpr_l("software power collapse not enabled\n");
+ 		return;
+@@ -588,7 +592,7 @@
+ 	return rc;
+ }
+ 
+-int __load_fw(struct msm_vidc_core *core)
++static int __load_fw(struct msm_vidc_core *core)
+ {
+ 	int rc = 0;
+ 
+@@ -625,7 +629,7 @@
+ 	return rc;
+ }
+ 
+-void __unload_fw(struct msm_vidc_core *core)
++static void __unload_fw(struct msm_vidc_core *core)
+ {
+ 	if (!core->fw_cookie)
+ 		return;
+--- a/qcom/opensource/video-driver/driver/vidc/src/venus_hfi_queue.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/venus_hfi_queue.c
+@@ -412,16 +412,22 @@
+ 		return;
+ 	}
+ 
+-	call_mem_op(core, memory_unmap_free, core, &core->iface_q_table.mem);
+-	call_mem_op(core, memory_unmap_free, core, &core->sfr.mem);
+-	call_mem_op(core, iommu_unmap, core, &core->aon_reg.mem);
+-	call_mem_op(core, iommu_unmap, core, &core->fence_reg.mem);
+-	call_mem_op(core, iommu_unmap, core, &core->qtimer_reg.mem);
+-	call_mem_op(core, memory_unmap_free, core, &core->mmap_buf.mem);
+-	if (core->capabilities[SUPPORTS_SYNX_FENCE].value) {
++	if (core->mmap_buf.mem.kvaddr)
++		call_mem_op(core, memory_unmap_free, core, &core->mmap_buf.mem);
++	if (core->qtimer_reg.mem.size)
++		call_mem_op(core, iommu_unmap, core, &core->qtimer_reg.mem);
++	if (core->fence_reg.mem.size)
++		call_mem_op(core, iommu_unmap, core, &core->fence_reg.mem);
++	if (core->aon_reg.mem.size)
++		call_mem_op(core, iommu_unmap, core, &core->aon_reg.mem);
++	if (core->synx_queue_mapped) {
+ 		call_mem_op(core, mem_dma_unmap_page, core,
+ 			    &core->synx_fence_data.queue);
+-	}
++		core->synx_queue_mapped = false;
++	}
++	if (core->sfr.mem.kvaddr)
++		call_mem_op(core, memory_unmap_free, core, &core->sfr.mem);
++	call_mem_op(core, memory_unmap_free, core, &core->iface_q_table.mem);
+ 
+ 	for (i = 0; i < VIDC_IFACEQ_NUMQ; i++) {
+ 		core->iface_queues[i].q_hdr = NULL;
+@@ -519,7 +525,7 @@
+ skip_mmap_buffer:
+ 	return 0;
+ fail_alloc_queue:
+-	return -ENOMEM;
++	return rc;
+ }
+ 
+ int venus_hfi_queue_init(struct msm_vidc_core *core)
+@@ -633,27 +639,28 @@
+ 			d_vpr_e("%s: synx fence queue buffer map failed\n", __func__);
+ 			goto fail_alloc_queue;
+ 		}
++		core->synx_queue_mapped = true;
+ 	}
+ 
+ 	/* map aon_reg registers */
+ 	rc = venus_hfi_iommu_map_registers(core, MSM_VIDC_AON,
+ 		MSM_VIDC_NON_SECURE, &core->aon_reg);
+ 	if (rc)
+-		return rc;
++		goto fail_alloc_queue;
+ 
+ 	/* map fence registers */
+ 	rc = venus_hfi_iommu_map_registers(core,
+ 		MSM_VIDC_PROTOCOL_FENCE_CLIENT_VPU,
+ 		MSM_VIDC_NON_SECURE, &core->fence_reg);
+ 	if (rc)
+-		return rc;
++		goto fail_alloc_queue;
+ 
+ 	/* map qtimer low registers */
+ 	rc = venus_hfi_iommu_map_registers(core,
+ 		MSM_VIDC_QTIMER,
+ 		MSM_VIDC_NON_SECURE, &core->qtimer_reg);
+ 	if (rc)
+-		return rc;
++		goto fail_alloc_queue;
+ 
+ 	/* allocate 4k buffer for HFI_MMAP_ADDR */
+ 	memset(&mem, 0, sizeof(mem));
+@@ -704,5 +711,7 @@
+ 	return 0;
+ 
+ fail_alloc_queue:
+-	return -ENOMEM;
+-}
++	/* No firmware can use a newly allocated queue until initialization succeeds. */
++	venus_hfi_queue_deinit(core);
++	return rc;
++}
+--- a/qcom/opensource/video-driver/driver/vidc/src/venus_hfi_response.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/venus_hfi_response.c
+@@ -41,8 +41,8 @@
+ 	int (*handle)(struct msm_vidc_inst *inst, struct hfi_packet *pkt);
+ };
+ 
+-void print_psc_properties(const char *str, struct msm_vidc_inst *inst,
+-	struct msm_vidc_subscription_params subsc_params)
++static void print_psc_properties(const char *str, struct msm_vidc_inst *inst,
++				 struct msm_vidc_subscription_params subsc_params)
+ {
+ 	i_vpr_h(inst,
+ 		"%s: width %d, height %d, crop offsets[0] %#x, crop offsets[1] %#x, bit depth %#x, coded frames %d fw min count %d, poc %d, color info %d, profile %d, level %d, tier %d, fg present %d, sb enabled %d, max_num_reorder_frames %d, max_dec_frame_buffering_count %d\n",
+@@ -81,8 +81,8 @@
+ 	}
+ }
+ 
+-u32 vidc_port_from_hfi(struct msm_vidc_inst *inst,
+-	enum hfi_packet_port_type hfi_port)
++static u32 vidc_port_from_hfi(struct msm_vidc_inst *inst,
++			      enum hfi_packet_port_type hfi_port)
+ {
+ 	enum msm_vidc_port_type port = MAX_PORT;
+ 
+@@ -126,8 +126,8 @@
+ 	return port;
+ }
+ 
+-bool is_valid_hfi_port(struct msm_vidc_inst *inst, u32 port,
+-	u32 buffer_type, const char *func)
++static bool is_valid_hfi_port(struct msm_vidc_inst *inst, u32 port,
++			      u32 buffer_type, const char *func)
+ {
+ 	if (port == HFI_PORT_NONE &&
+ 		buffer_type != HFI_BUFFER_ARP &&

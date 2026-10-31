@@ -1,0 +1,164 @@
+{
+  "status": "PASS",
+  "tests": {
+    "wire": {
+      "wire_length_alignment_cases": 2680,
+      "missing_and_stale_contexts": 2
+    },
+    "clients": {
+      "registry_fault_scenarios": 10,
+      "callback_unregister_races": 100,
+      "probe_release_races": 100,
+      "self_unregister": true
+    },
+    "cb": {
+      "context_bank_probe_fault_scenarios": 19,
+      "zero_dma_address": true,
+      "pooled_sibling_removal": true,
+      "managed_pool_release_order": true
+    },
+    "memory": {
+      "permission_export_failure_scenarios": 10,
+      "export_after_user_free": true,
+      "dma_mmap_offset_bounds": true
+    },
+    "transport": {
+      "transport_probe_failure_and_remove_scenarios": 23,
+      "session_close_before_export_drain_races": 100
+    },
+    "invokes": {
+      "kernel_dma_error_scenarios": 13,
+      "concurrent_dma_invocations": 100
+    },
+    "files": {
+      "file_open_failure_release_scenarios": 8,
+      "post_ssr_release_count": true
+    }
+  },
+  "negative_controls": [
+    {
+      "name": "wire_missing_minimum",
+      "rejected": true,
+      "returncode": 1
+    },
+    {
+      "name": "wire_missing_notification_bound",
+      "rejected": true,
+      "returncode": 1
+    },
+    {
+      "name": "wire_ignored_version",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "wire_stale_job",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "registry_missing_device_ref",
+      "rejected": true,
+      "returncode": 1
+    },
+    {
+      "name": "registry_missing_unregister_drain",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "registry_missing_probe_error_unwind",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "file_missing_id_rollback",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "file_post_ssr_count_underflow",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "cb_missing_rollback",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "cb_negative_mapping_as_size",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "cb_pool_bounds",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "cb_missing_mapping_release",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "permission_copy_leak",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "export_missing_channel_ref",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "export_mmap_allocation_bound",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "transport_partial_child_cleanup",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "transport_pdr_failure_cleanup",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "transport_missing_export_drain",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "invoke_unheld_mutex_release",
+      "rejected": true,
+      "returncode": -6
+    },
+    {
+      "name": "invoke_boolean_pending",
+      "rejected": true,
+      "returncode": -6
+    }
+  ],
+  "source_sha256": {
+    "qcom/opensource/dsp-kernel/dsp/fastrpc.c": "bb3c163a250ad30b27d8cd19d0d6138bb238a483995af62fb917be5920ad7417",
+    "qcom/opensource/dsp-kernel/dsp/fastrpc_rpmsg.c": "d270ba19983009f282e56cf9ea865187b711315f6b319c18d38b381a3566782c",
+    "qcom/opensource/dsp-kernel/dsp/fastrpc_shared.h": "5b408789fcad6717076ff7b6c91e44a1b99dd19426ecc0cdefc6aef3b5039b78",
+    "qcom/opensource/dsp-kernel/dsp/fastrpc_trace.h": "94b3da15bf51b5e2aba6fb910f2fe99eed0762a4b8eb339cfa146c4a94edd3df",
+    "qcom/opensource/dsp-kernel/include/linux/fastrpc.h": "c1685a2fd519954fad9b5e07d541b92e4b54dc18999b1c5777909de8f3ff02b1",
+    "qcom/opensource/dsp-kernel/include/uapi/misc/fastrpc.h": "fb14496c21c6bbc8cf7a665d0fdd971cba960aa00c127be7896f7bf04b1aa79b"
+  },
+  "harness_sha256": {
+    "fastrpc_cb.c": "b9f7faacda8543622c3b7ff2e2a3815da04c53d87b1e211058e6cd61df9e4fc2",
+    "fastrpc_clients.c": "64cc0148998bfc3f62136352489726db58e61f6687cbfbf6e51245adc5a19f39",
+    "fastrpc_files.c": "1dc7bb2bc209e310c8a61ff96eb52b683eae4e77cc6f3443320ef07b3f5b0bfc",
+    "fastrpc_invokes.c": "d4fecfc95be61a2c70ca3f97f81c4b2adb6c447a872abe00cc1d90de9126e035",
+    "fastrpc_memory.c": "e5fbdc04c623d48e57e52c01233dd81faffb9bdc6162f13e3f2ef9d9767a18db",
+    "fastrpc_services.h": "e9ad4b8ca30ad6e06863e637b730b7666381ba89efb1303c8732819d0d55bc17",
+    "fastrpc_transport.c": "ccd6c366ed21bbe4749bd4a6695bf5d125853f6603e1b7e8a8e352ffa344f26d",
+    "fastrpc_wire.c": "105732b7137e193509833d92aa29f169fa5879945819e1c2553008e34d7f0e00"
+  },
+  "limits": "Actual extracted functions with mocked kernel services; no DSP/firmware, kernel IRQ/VFS/devres/IOMMU runtime or hardware validation."
+}

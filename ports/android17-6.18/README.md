@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 261 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 263 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 261 platform `.ko` files, their symbol tables and DDK configurations.
+- 263 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 15,882
-imported symbol CRCs across all 261 modules.
+used. The current [validation report](validation-20261031.json) checks 16,319
+imported symbol CRCs across all 263 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1730,3 +1730,27 @@ pass with the existing vendor warnings. ROM module-name coverage is 258/466
 Remaining media, DSP, audio and peripheral drivers, KernelSU/NetHunter integration,
 boot/DLKM images and the installer are unfinished. No flashable ZIP or phone boot
 validation exists yet.
+
+
+## Native video codec and FastRPC provider
+
+The video codec retains 38 native compilation units, its Sun feature selection,
+four exports and 36 aliases. V4L2, PM and DMA ownership are adapted for 6.18;
+node/instance drains and synchronized IOMMU fault-callback withdrawal keep
+resources valid during failure and removal. Eight sanitizer groups pass 210
+cases and reject 70 deliberate regressions against integrated sources. The
+[video port record](video-port.md) documents retained-file waits and test limits.
+
+FastRPC retains both native units, the RPMsg transport, three kernel exports,
+two aliases and public/UAPI headers. Channel references outlive exported DMA
+buffers, registry callbacks drain safely and partial context-bank/transport
+initialization unwinds ownership. Seven sanitizer groups and 21 rejecting
+controls pass. The [FastRPC record](fastrpc-port.md) documents preserved native
+firmware-failure policy, DMA-fd teardown waits and genpool consumer obligations.
+
+Archive `artifacts/20261031T191655148755Z` contains 263 modules and passes 16,319
+imported-symbol CRC checks without compiler/modpost warnings. Device-tree and
+overlay checks pass with existing vendor warnings. ROM module-name coverage
+is 260/466 (55.8%). Main camera, EVA, remaining audio/peripherals, KernelSU and
+NetHunter integration, boot/DLKM images and ZIP packaging remain. No phone boot,
+live codec/DSP behavior or flashable ZIP is claimed.
