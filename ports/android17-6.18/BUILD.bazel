@@ -852,6 +852,76 @@ ddk_module(
     deps = [":smmu_headers", ":iommu_headers", ":scm_headers", ":qcom_iommu_util", ":qcom_scm", ":secure_buffer", ":iommu_logger"],
 )
 
+ddk_headers(
+    name = "cache_irq_headers",
+    hdrs = [
+        "include/linux/soc/qcom/llcc-qcom.h",
+        "include/linux/cpu_phys_log_map.h",
+        "include/soc/qcom/qcom_llcc_pmu.h",
+        "drivers/soc/qcom/llcc_perfmon.h",
+        "drivers/soc/qcom/llcc_events.h",
+        "kernel/irq/internals.h",
+        "kernel/irq/debug.h",
+        "kernel/irq/settings.h",
+    ],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "llcc_qcom",
+    srcs = ["drivers/soc/qcom/llcc-qcom.c"],
+    out = "llcc-qcom.ko",
+    includes = ["drivers/soc/qcom", "kernel/irq"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":cache_irq_headers"],
+)
+
+ddk_module(
+    name = "llcc_perfmon",
+    srcs = ["drivers/soc/qcom/llcc_perfmon.c"],
+    out = "llcc_perfmon.ko",
+    includes = ["drivers/soc/qcom", "kernel/irq"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":cache_irq_headers", ":llcc_qcom"],
+)
+
+ddk_module(
+    name = "cpu_phys_log_map",
+    srcs = ["drivers/soc/qcom/cpu_phys_log_map.c"],
+    out = "cpu_phys_log_map.ko",
+    includes = ["drivers/soc/qcom", "kernel/irq"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":cache_irq_headers"],
+)
+
+ddk_module(
+    name = "qcom_llcc_pmu",
+    srcs = ["drivers/perf/qcom_llcc_pmu.c"],
+    out = "qcom_llcc_pmu.ko",
+    includes = ["drivers/soc/qcom", "kernel/irq"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":cache_irq_headers", ":cpu_phys_log_map"],
+)
+
+ddk_module(
+    name = "gic_intr_routing",
+    srcs = ["drivers/soc/qcom/gic_intr_routing.c"],
+    out = "gic_intr_routing.ko",
+    includes = ["drivers/soc/qcom", "kernel/irq"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":cache_irq_headers"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -906,6 +976,11 @@ kernel_module_group(
         ":msm_dma_iommu_mapping",
         ":iommu_logger",
         ":arm_smmu",
+        ":llcc_qcom",
+        ":llcc_perfmon",
+        ":cpu_phys_log_map",
+        ":qcom_llcc_pmu",
+        ":gic_intr_routing",
     ],
 )
 

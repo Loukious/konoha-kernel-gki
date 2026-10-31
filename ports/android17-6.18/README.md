@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 64 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 69 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 64 platform `.ko` files, their symbol tables and DDK configurations.
+- 69 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 2767
-imported symbol CRCs across all 64 modules.
+used. The current [validation report](validation-20261031.json) checks 2918
+imported symbol CRCs across all 69 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -179,6 +179,22 @@ follows fallible initialization. The full build has no compiler or modpost
 warnings. Checkpatch has one advisory for the required `-ENOSYS` fault-handler
 return convention used by the IOMMU core. Hardware faults, memory isolation,
 GPU translation and suspend/resume remain untested.
+
+The cache and interrupt group adds `llcc-qcom`, `llcc_perfmon`,
+`cpu_phys_log_map`, `qcom_llcc_pmu` and `gic_intr_routing`. LLCC configuration
+and event tables retain the Onyx implementation. CPU mapping bounds-checks
+cluster/core indices and keeps DT nodes alive through traversal. LLCC PMU
+registration follows CPU-index and MMIO validation, with managed unregister
+on removal; perf events reject unsupported CPU and sampling requests. The
+perfmon timer uses `hrtimer_setup`, and sysfs is exposed after initialization
+and removed before timer teardown.
+
+Interrupt routing uses IRQ private headers from pinned 6.18 common and the
+exported IRQ-count accessor. Registration unwinds ordinary trace and CPU-hotplug
+hooks on failure, installs the permanent affinity hook last, and keeps the
+module resident. This group passes checkpatch without errors, warnings or
+style checks. Cache behavior, counter accuracy and IRQ balancing still require
+phone testing.
 
 ## Baseline inventory
 
