@@ -970,3 +970,25 @@ The combined 184-module archive `artifacts/20261031T113444670332Z` passes
 checks pass with 1,084 existing vendor DTC warnings. ROM module build coverage
 is 183/466 (39.3%), leaving 283 names to assess or port. No flashable 6.18 ZIP
 exists; display, audio, camera, wireless and matching images remain incomplete.
+
+
+USB CCID, serial CDEV, and FunctionFS IPC logging add three modules. CCID and
+CDEV retain character devices for open files, drain user-copy operations before
+freeing controller requests, and unwind partial allocation/endpoint setup. CDEV
+connection generations keep old requests out of a newly connected endpoint pool.
+CDC notifications serialize pending ownership and preserve modem bit operations.
+FunctionFS logging matches five private structures from the pinned 6.18 kernel;
+return probes retain stable log contexts through unregister and work draining.
+The 26 probe symbols exist in the built kernel; runtime probe admissibility
+requires device validation. Vendor USB descriptors and imported headers remain
+unchanged. [Integrated gadget host checks](gadget-validation-20261031.json) pass
+ASan/UBSan copy/disconnect, notification, ioctl, file-reference, allocation-fault,
+probe-registration and context-lifetime cases. QDSS/GSI and IPA remain outside
+this group. No live USB/configfs or phone checks have been performed.
+
+The combined 187-module archive `artifacts/20261031T114139294447Z` passes
+9,161 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
+checks pass with 1,084 existing vendor DTC warnings. ROM module build coverage
+is 186/466 (39.9%), leaving 280 names to assess or port. This is build coverage
+including alternative hardware, not working-device or ZIP completion. No
+flashable 6.18 ZIP exists.

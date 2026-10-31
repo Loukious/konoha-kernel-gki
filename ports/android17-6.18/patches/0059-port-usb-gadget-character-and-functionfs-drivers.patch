@@ -1,0 +1,3111 @@
+--- a/drivers/usb/gadget/function/f_ccid.c
++++ b/drivers/usb/gadget/function/f_ccid.c
+@@ -16,6 +16,7 @@
+ #include <linux/cdev.h>
+ #include <linux/uaccess.h>
+ #include <linux/compat.h>
++#include <linux/kref.h>
+ 
+ #include "f_ccid.h"
+ 
+@@ -39,18 +40,19 @@
+ 	unsigned char buf[CTRL_BUF_SIZE];
+ 	int tx_ctrl_done;
+ 	struct cdev cdev;
++	struct device dev;
+ };
+ 
+ struct ccid_bulk_dev {
+ 	atomic_t error;
+ 	atomic_t opened;
+-	atomic_t rx_req_busy;
+ 	wait_queue_head_t read_wq;
+ 	wait_queue_head_t write_wq;
+ 	struct usb_request *rx_req;
+ 	int rx_done;
+ 	struct list_head tx_idle;
+ 	struct cdev cdev;
++	struct device dev;
+ };
+ 
+ struct ccid_opts {
+@@ -60,6 +62,13 @@
+ 
+ struct f_ccid {
+ 	struct usb_function function;
++	struct kref ref;
++	struct mutex read_lock;
++	struct mutex ctrl_read_lock;
++	struct mutex write_lock;
++	struct mutex ioctl_lock;
++	atomic_t notify_busy;
++	atomic_t function_allocated;
+ 	int ifc_id;
+ 	spinlock_t lock;
+ 	atomic_t online;
+@@ -304,6 +313,9 @@
+ 
+ static void ccid_notify_complete(struct usb_ep *ep, struct usb_request *req)
+ {
++	struct f_ccid *ccid_dev = req->context;
++
++	atomic_set(&ccid_dev->notify_busy, 0);
+ 	switch (req->status) {
+ 	case -ECONNRESET:
+ 	case -ESHUTDOWN:
+@@ -334,7 +346,7 @@
+ 	if (req->status != 0)
+ 		atomic_set(&bulk_dev->error, 1);
+ 
+-	bulk_dev->rx_done = 1;
++	WRITE_ONCE(bulk_dev->rx_done, 1);
+ 	wake_up(&bulk_dev->read_wq);
+ }
+ 
+@@ -376,9 +388,12 @@
+ 	u16 w_index = le16_to_cpu(ctrl->wIndex);
+ 	u16 w_value = le16_to_cpu(ctrl->wValue);
+ 	u16 w_length = le16_to_cpu(ctrl->wLength);
++	unsigned long flags;
+ 
+ 	if (!atomic_read(&ccid_dev->online))
+ 		return -ENOTCONN;
++	if (w_index != ccid_dev->ifc_id)
++		goto invalid;
+ 
+ 	switch ((ctrl->bRequestType << 8) | ctrl->bRequest) {
+ 
+@@ -386,11 +401,13 @@
+ 			| CCIDGENERICREQ_ABORT:
+ 		if (w_length != 0)
+ 			goto invalid;
++		spin_lock_irqsave(&ccid_dev->lock, flags);
+ 		ctrl_dev->buf[0] = CCIDGENERICREQ_ABORT;
+ 		ctrl_dev->buf[1] = w_value & 0xFF;
+ 		ctrl_dev->buf[2] = (w_value >> 8) & 0xFF;
+ 		ctrl_dev->buf[3] = 0x00;
+ 		ctrl_dev->tx_ctrl_done = 1;
++		spin_unlock_irqrestore(&ccid_dev->lock, flags);
+ 		wake_up(&ctrl_dev->tx_wait_q);
+ 		ret = 0;
+ 		break;
+@@ -436,7 +453,14 @@
+ 	struct ccid_bulk_dev *bulk_dev = &ccid_dev->bulk_dev;
+ 	struct ccid_ctrl_dev *ctrl_dev = &ccid_dev->ctrl_dev;
+ 
+-	/* Disable endpoints */
++	unsigned long flags;
++
++	spin_lock_irqsave(&ccid_dev->lock, flags);
++	atomic_set(&ccid_dev->online, 0);
++	atomic_set(&bulk_dev->error, 1);
++	ccid_dev->dtr_state = 0;
++	spin_unlock_irqrestore(&ccid_dev->lock, flags);
++	/* Disable endpoints; completion callbacks finish before return. */
+ 	usb_ep_disable(ccid_dev->notify);
+ 	usb_ep_disable(ccid_dev->in);
+ 	usb_ep_disable(ccid_dev->out);
+@@ -457,6 +481,12 @@
+ 	struct f_ccid *ccid_dev = func_to_ccid(f);
+ 	struct usb_composite_dev *cdev = f->config->cdev;
+ 	int ret = 0;
++	unsigned long flags;
++
++	if (intf != ccid_dev->ifc_id || alt)
++		return -EINVAL;
++	if (atomic_read(&ccid_dev->online))
++		ccid_function_disable(f);
+ 
+ 	/* choose the descriptors and enable endpoints */
+ 	ret = config_ep_by_speed(cdev->gadget, f, ccid_dev->notify);
+@@ -501,8 +531,11 @@
+ 				__func__, ccid_dev->out->name, ret);
+ 		goto disable_ep_in;
+ 	}
++	spin_lock_irqsave(&ccid_dev->lock, flags);
+ 	ccid_dev->dtr_state = 1;
++	atomic_set(&ccid_dev->bulk_dev.error, 0);
+ 	atomic_set(&ccid_dev->online, 1);
++	spin_unlock_irqrestore(&ccid_dev->lock, flags);
+ 	return ret;
+ 
+ disable_ep_in:
+@@ -514,20 +547,28 @@
+ }
+ 
+ static void ccid_function_unbind(struct usb_configuration *c,
+-					struct usb_function *f)
++				 struct usb_function *f)
+ {
+ 	struct f_ccid *ccid_dev = func_to_ccid(f);
+ 	struct ccid_bulk_dev *bulk_dev = &ccid_dev->bulk_dev;
+ 	struct usb_request *req;
+ 
+-	/* Free endpoint related requests */
++	if (atomic_read(&ccid_dev->online))
++		ccid_function_disable(f);
++	/* Disable wakes blocked I/O; drain copies before releasing requests. */
++	mutex_lock(&ccid_dev->read_lock);
++	mutex_lock(&ccid_dev->write_lock);
++	mutex_lock(&ccid_dev->ioctl_lock);
+ 	ccid_request_free(ccid_dev->notify_req, ccid_dev->notify);
+-	if (!atomic_read(&bulk_dev->rx_req_busy))
+-		ccid_request_free(bulk_dev->rx_req, ccid_dev->out);
++	ccid_dev->notify_req = NULL;
++	ccid_request_free(bulk_dev->rx_req, ccid_dev->out);
++	bulk_dev->rx_req = NULL;
+ 	while ((req = ccid_req_get(ccid_dev, &bulk_dev->tx_idle)))
+ 		ccid_request_free(req, ccid_dev->in);
+-
+ 	usb_free_all_descriptors(f);
++	mutex_unlock(&ccid_dev->ioctl_lock);
++	mutex_unlock(&ccid_dev->write_lock);
++	mutex_unlock(&ccid_dev->read_lock);
+ }
+ 
+ static int ccid_function_bind(struct usb_configuration *c,
+@@ -605,6 +646,8 @@
+ 	if (IS_ERR(ccid_dev->notify_req)) {
+ 		pr_err("%s: unable to allocate memory for notify req\n",
+ 				__func__);
++		ret = PTR_ERR(ccid_dev->notify_req);
++		ccid_dev->notify_req = NULL;
+ 		goto notify_alloc_fail;
+ 	}
+ 	ccid_dev->notify_req->complete = ccid_notify_complete;
+@@ -640,9 +683,13 @@
+ 	return 0;
+ 
+ in_alloc_fail:
++	while ((req = ccid_req_get(ccid_dev, &bulk_dev->tx_idle)))
++		ccid_request_free(req, ccid_dev->in);
+ 	ccid_request_free(bulk_dev->rx_req, ccid_dev->out);
++	bulk_dev->rx_req = NULL;
+ out_alloc_fail:
+ 	ccid_request_free(ccid_dev->notify_req, ccid_dev->notify);
++	ccid_dev->notify_req = NULL;
+ notify_alloc_fail:
+ 	usb_free_all_descriptors(f);
+ assign_desc_fail:
+@@ -660,214 +707,142 @@
+ 
+ static int ccid_bulk_open(struct inode *inode, struct file *fp)
+ {
+-	struct ccid_bulk_dev *bulk_dev =  container_of(inode->i_cdev,
+-						struct ccid_bulk_dev, cdev);
+-	struct f_ccid *ccid_dev = bulk_dev_to_ccid(bulk_dev);
++	struct ccid_bulk_dev *d = container_of(inode->i_cdev,
++					       struct ccid_bulk_dev, cdev);
++	struct f_ccid *ccid_dev = bulk_dev_to_ccid(d);
++
++	get_device(&d->dev);
++	if (!atomic_read(&ccid_dev->online)) {
++		put_device(&d->dev);
++		return -ENODEV;
++	}
++	if (atomic_cmpxchg(&d->opened, 0, 1)) {
++		put_device(&d->dev);
++		return -EBUSY;
++	}
++	atomic_set(&d->error, 0);
++	fp->private_data = ccid_dev;
++	return 0;
++}
++
++static int ccid_bulk_release(struct inode *inode, struct file *fp)
++{
++	struct f_ccid *ccid_dev = fp->private_data;
++
++	atomic_set(&ccid_dev->bulk_dev.opened, 0);
++	put_device(&ccid_dev->bulk_dev.dev);
++	return 0;
++}
++
++static ssize_t ccid_bulk_read(struct file *fp, char __user *buf,
++			      size_t count, loff_t *pos)
++{
++	struct f_ccid *ccid_dev = fp->private_data;
++	struct ccid_bulk_dev *bulk = &ccid_dev->bulk_dev;
++	struct usb_request *req;
+ 	unsigned long flags;
+-
+-	if (!atomic_read(&ccid_dev->online)) {
+-		pr_debug("%s: USB cable not connected\n", __func__);
+-		return -ENODEV;
+-	}
+-
+-	if (atomic_read(&bulk_dev->opened)) {
+-		pr_debug("%s: bulk device is already opened\n", __func__);
+-		return -EBUSY;
+-	}
+-	atomic_set(&bulk_dev->opened, 1);
+-	/* clear the error latch */
+-	atomic_set(&bulk_dev->error, 0);
+-	spin_lock_irqsave(&ccid_dev->lock, flags);
+-	fp->private_data = ccid_dev;
+-	spin_unlock_irqrestore(&ccid_dev->lock, flags);
+-
+-	return 0;
+-}
+-
+-static int ccid_bulk_release(struct inode *ip, struct file *fp)
+-{
+-	struct f_ccid *ccid_dev =  fp->private_data;
+-	struct ccid_bulk_dev *bulk_dev = &ccid_dev->bulk_dev;
+-
+-	atomic_set(&bulk_dev->opened, 0);
+-	return 0;
+-}
+-
+-static ssize_t ccid_bulk_read(struct file *fp, char __user *buf,
+-				size_t count, loff_t *pos)
+-{
+-	struct f_ccid *ccid_dev =  fp->private_data;
+-	struct ccid_bulk_dev *bulk_dev = &ccid_dev->bulk_dev;
+-	struct usb_request *req;
+-	int r = count, xfer, len;
+-	int ret;
+-	unsigned long flags;
+-
+-	pr_debug("%s: %zu bytes\n", __func__, count);
+-
+-	if (count > BULK_OUT_BUFFER_SIZE) {
+-		pr_err("%s: max_buffer_size:%d given_pkt_size:%zu\n",
+-				__func__, BULK_OUT_BUFFER_SIZE, count);
++	ssize_t ret;
++	size_t size;
++
++	if (!count)
++		return 0;
++	if (count > BULK_OUT_BUFFER_SIZE)
+ 		return -ENOMEM;
+-	}
+-
+-	if (atomic_read(&bulk_dev->error)) {
+-		r = -EIO;
+-		pr_err("%s bulk_dev_error\n", __func__);
+-		goto done;
+-	}
+-
+-	len = ALIGN(count, ccid_dev->out->maxpacket);
+-requeue_req:
++	if (mutex_lock_interruptible(&ccid_dev->read_lock))
++		return -ERESTARTSYS;
++requeue:
+ 	spin_lock_irqsave(&ccid_dev->lock, flags);
+ 	if (!atomic_read(&ccid_dev->online)) {
+-		spin_unlock_irqrestore(&ccid_dev->lock, flags);
+-		pr_debug("%s: USB cable not connected\n", __func__);
+-		return -ENODEV;
+-	}
+-	/* queue a request */
+-	req = bulk_dev->rx_req;
+-	req->length = len;
+-	bulk_dev->rx_done = 0;
++		ret = -ENODEV;
++		goto unlock_state;
++	}
++	if (atomic_read(&bulk->error)) {
++		ret = -EIO;
++		goto unlock_state;
++	}
++	req = bulk->rx_req;
++	req->length = ALIGN(count, ccid_dev->out->maxpacket);
++	WRITE_ONCE(bulk->rx_done, 0);
++	ret = usb_ep_queue(ccid_dev->out, req, GFP_ATOMIC);
+ 	spin_unlock_irqrestore(&ccid_dev->lock, flags);
+-	ret = usb_ep_queue(ccid_dev->out, req, GFP_KERNEL);
+-	if (ret < 0) {
+-		r = -EIO;
+-		pr_err("%s usb ep queue failed\n", __func__);
+-		atomic_set(&bulk_dev->error, 1);
+-		goto done;
+-	}
+-	/* wait for a request to complete */
+-	ret = wait_event_interruptible(bulk_dev->read_wq, bulk_dev->rx_done ||
+-					atomic_read(&bulk_dev->error) ||
+-					!atomic_read(&ccid_dev->online));
+-	if (ret < 0) {
+-		atomic_set(&bulk_dev->error, 1);
+-		r = ret;
++	if (ret)
++		goto unlock;
++	ret = wait_event_interruptible(bulk->read_wq, READ_ONCE(bulk->rx_done));
++	if (ret) {
++		/* Dequeue may complete asynchronously: keep request ownership. */
+ 		usb_ep_dequeue(ccid_dev->out, req);
+-		goto done;
+-	}
+-	if (!atomic_read(&bulk_dev->error)) {
+-		spin_lock_irqsave(&ccid_dev->lock, flags);
+-		if (!atomic_read(&ccid_dev->online)) {
+-			spin_unlock_irqrestore(&ccid_dev->lock, flags);
+-			pr_debug("%s: USB cable not connected\n", __func__);
+-			r = -ENODEV;
+-			goto done;
++		wait_event(bulk->read_wq, READ_ONCE(bulk->rx_done));
++		goto unlock;
++	}
++	if (!atomic_read(&ccid_dev->online)) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	if (req->status) {
++		ret = req->status;
++		goto unlock;
++	}
++	if (!req->actual)
++		goto requeue;
++	size = min_t(size_t, req->actual, count);
++	ret = copy_to_user(buf, req->buf, size) ? -EFAULT : size;
++	goto unlock;
++unlock_state:
++	spin_unlock_irqrestore(&ccid_dev->lock, flags);
++unlock:
++	mutex_unlock(&ccid_dev->read_lock);
++	return ret;
++}
++
++static ssize_t ccid_bulk_write(struct file *fp, const char __user *buf,
++			       size_t count, loff_t *pos)
++{
++	struct f_ccid *ccid_dev = fp->private_data;
++	struct ccid_bulk_dev *bulk = &ccid_dev->bulk_dev;
++	struct usb_request *req = NULL;
++	unsigned long flags;
++	ssize_t ret;
++
++	if (!count)
++		return 0;
++	if (count > BULK_IN_BUFFER_SIZE)
++		return -ENOMEM;
++	if (mutex_lock_interruptible(&ccid_dev->write_lock))
++		return -ERESTARTSYS;
++	ret = wait_event_interruptible(bulk->write_wq,
++		!atomic_read(&ccid_dev->online) || atomic_read(&bulk->error) ||
++		(req = ccid_req_get(ccid_dev, &bulk->tx_idle)));
++	if (ret)
++		goto put;
++	if (!atomic_read(&ccid_dev->online)) {
++		ret = -ENODEV;
++		goto put;
++	}
++	if (!req || atomic_read(&bulk->error)) {
++		ret = -EIO;
++		goto put;
++	}
++	if (copy_from_user(req->buf, buf, count)) {
++		ret = -EFAULT;
++		goto put;
++	}
++	spin_lock_irqsave(&ccid_dev->lock, flags);
++	if (!atomic_read(&ccid_dev->online)) {
++		ret = -ENODEV;
++	} else {
++		req->length = count;
++		ret = usb_ep_queue(ccid_dev->in, req, GFP_ATOMIC);
++		if (!ret) {
++			req = NULL;
++			ret = count;
+ 		}
+-		/* If we got a 0-len packet, throw it back and try again. */
+-		if (req->actual == 0) {
+-			spin_unlock_irqrestore(&ccid_dev->lock, flags);
+-			goto requeue_req;
+-		}
+-		if (req->actual > count)
+-			pr_err("%s More data received(%d) than required(%zu)\n",
+-						__func__, req->actual, count);
+-		xfer = (req->actual < count) ? req->actual : count;
+-		atomic_set(&bulk_dev->rx_req_busy, 1);
+-		spin_unlock_irqrestore(&ccid_dev->lock, flags);
+-
+-		if (copy_to_user(buf, req->buf, xfer))
+-			r = -EFAULT;
+-
+-		spin_lock_irqsave(&ccid_dev->lock, flags);
+-		atomic_set(&bulk_dev->rx_req_busy, 0);
+-		if (!atomic_read(&ccid_dev->online)) {
+-			ccid_request_free(bulk_dev->rx_req, ccid_dev->out);
+-			spin_unlock_irqrestore(&ccid_dev->lock, flags);
+-			pr_debug("%s: USB cable not connected\n", __func__);
+-			r = -ENODEV;
+-			goto done;
+-		} else {
+-			r = xfer;
+-		}
+-		spin_unlock_irqrestore(&ccid_dev->lock, flags);
+-	} else {
+-		r = -EIO;
+-	}
+-done:
+-	pr_debug("%s returning %d\n", __func__, r);
+-	return r;
+-}
+-
+-static ssize_t ccid_bulk_write(struct file *fp, const char __user *buf,
+-				 size_t count, loff_t *pos)
+-{
+-	struct f_ccid *ccid_dev =  fp->private_data;
+-	struct ccid_bulk_dev *bulk_dev = &ccid_dev->bulk_dev;
+-	struct usb_request *req = 0;
+-	int r = count;
+-	int ret;
+-	unsigned long flags;
+-
+-	pr_debug("%s: %zu bytes\n", __func__, count);
+-
+-	if (!atomic_read(&ccid_dev->online)) {
+-		pr_debug("%s: USB cable not connected\n", __func__);
+-		return -ENODEV;
+-	}
+-
+-	if (!count) {
+-		pr_err("%s: zero length ctrl pkt\n", __func__);
+-		return -ENODEV;
+-	}
+-	if (count > BULK_IN_BUFFER_SIZE) {
+-		pr_err("%s: max_buffer_size:%zu given_pkt_size:%zu\n",
+-				__func__, BULK_IN_BUFFER_SIZE, count);
+-		return -ENOMEM;
+-	}
+-
+-
+-	/* get an idle tx request to use */
+-	ret = wait_event_interruptible(bulk_dev->write_wq,
+-		((req = ccid_req_get(ccid_dev, &bulk_dev->tx_idle)) ||
+-		 atomic_read(&bulk_dev->error)));
+-
+-	if (ret < 0) {
+-		r = ret;
+-		goto done;
+-	}
+-
+-	if (!req || atomic_read(&bulk_dev->error)) {
+-		pr_err(" %s dev->error\n", __func__);
+-		r = -EIO;
+-		goto done;
+-	}
+-	if (copy_from_user(req->buf, buf, count)) {
+-		if (!atomic_read(&ccid_dev->online)) {
+-			pr_debug("%s: USB cable not connected\n",
+-						__func__);
+-			ccid_request_free(req, ccid_dev->in);
+-			r = -ENODEV;
+-		} else {
+-			ccid_req_put(ccid_dev, &bulk_dev->tx_idle, req);
+-			r = -EFAULT;
+-		}
+-		goto done;
+-	}
+-	req->length = count;
+-	ret = usb_ep_queue(ccid_dev->in, req, GFP_KERNEL);
+-	if (ret < 0) {
+-		pr_debug("%s: xfer error %d\n", __func__, ret);
+-		atomic_set(&bulk_dev->error, 1);
+-		ccid_req_put(ccid_dev, &bulk_dev->tx_idle, req);
+-		r = -EIO;
+-		spin_lock_irqsave(&ccid_dev->lock, flags);
+-		if (!atomic_read(&ccid_dev->online)) {
+-			spin_unlock_irqrestore(&ccid_dev->lock, flags);
+-			pr_debug("%s: USB cable not connected\n",
+-							__func__);
+-			while ((req = ccid_req_get(ccid_dev,
+-						&bulk_dev->tx_idle)))
+-				ccid_request_free(req, ccid_dev->in);
+-			r = -ENODEV;
+-		}
+-		spin_unlock_irqrestore(&ccid_dev->lock, flags);
+-		goto done;
+-	}
+-done:
+-	pr_debug("%s returning %d\n", __func__, r);
+-	return r;
++	}
++	spin_unlock_irqrestore(&ccid_dev->lock, flags);
++put:
++	if (req)
++		ccid_req_put(ccid_dev, &bulk->tx_idle, req);
++	mutex_unlock(&ccid_dev->write_lock);
++	return ret;
+ }
+ 
+ static const struct file_operations ccid_bulk_fops = {
+@@ -880,103 +855,104 @@
+ 
+ static int ccid_ctrl_open(struct inode *inode, struct file *fp)
+ {
+-	struct ccid_ctrl_dev *ctrl_dev =  container_of(inode->i_cdev,
+-						struct ccid_ctrl_dev, cdev);
+-	struct f_ccid *ccid_dev = ctrl_dev_to_ccid(ctrl_dev);
++	struct ccid_ctrl_dev *d = container_of(inode->i_cdev,
++					       struct ccid_ctrl_dev, cdev);
++	struct f_ccid *ccid_dev = ctrl_dev_to_ccid(d);
++
++	get_device(&d->dev);
++	if (!atomic_read(&ccid_dev->online)) {
++		put_device(&d->dev);
++		return -ENODEV;
++	}
++	if (atomic_cmpxchg(&d->opened, 0, 1)) {
++		put_device(&d->dev);
++		return -EBUSY;
++	}
++
++	fp->private_data = ccid_dev;
++	return 0;
++}
++
++
++static int ccid_ctrl_release(struct inode *inode, struct file *fp)
++{
++	struct f_ccid *ccid_dev = fp->private_data;
++
++	atomic_set(&ccid_dev->ctrl_dev.opened, 0);
++	put_device(&ccid_dev->ctrl_dev.dev);
++	return 0;
++}
++
++static ssize_t ccid_ctrl_read(struct file *fp, char __user *buf,
++			      size_t count, loff_t *ppos)
++{
++	struct f_ccid *ccid = fp->private_data;
++	struct ccid_ctrl_dev *ctrl = &ccid->ctrl_dev;
++	u8 data[CTRL_BUF_SIZE];
+ 	unsigned long flags;
+-
++	ssize_t ret;
++
++	if (!count)
++		return 0;
++	count = min_t(size_t, count, sizeof(data));
++	if (mutex_lock_interruptible(&ccid->ctrl_read_lock))
++		return -ERESTARTSYS;
++	ret = wait_event_interruptible(ctrl->tx_wait_q,
++		READ_ONCE(ctrl->tx_ctrl_done) || !atomic_read(&ccid->online));
++	if (ret)
++		goto unlock;
++	spin_lock_irqsave(&ccid->lock, flags);
++	if (!atomic_read(&ccid->online)) {
++		ret = -ENODEV;
++	} else {
++		memcpy(data, ctrl->buf, count);
++		ctrl->tx_ctrl_done = 0;
++		ret = count;
++	}
++	spin_unlock_irqrestore(&ccid->lock, flags);
++	if (ret > 0 && copy_to_user(buf, data, count))
++		ret = -EFAULT;
++unlock:
++	mutex_unlock(&ccid->ctrl_read_lock);
++	return ret;
++}
++
++static long ccid_ctrl_ioctl(struct file *fp, unsigned int cmd, u_long arg)
++{
++	struct f_ccid *ccid_dev = fp->private_data;
++	struct usb_ccid_notification notification;
++	struct usb_request *req;
++	void __user *argp = (void __user *)arg;
++	unsigned long flags;
++	int ret, dtr, length;
++
++	if (cmd == CCID_READ_DTR) {
++		dtr = READ_ONCE(ccid_dev->dtr_state);
++		return copy_to_user(argp, &dtr, sizeof(dtr)) ? -EFAULT : 0;
++	}
++	if (cmd != CCID_NOTIFY_CARD && cmd != CCID_NOTIFY_HWERROR)
++		return -ENOTTY;
++	length = cmd == CCID_NOTIFY_CARD ? 2 : 4;
++	if (copy_from_user(&notification, argp, sizeof(notification)))
++		return -EFAULT;
++	if (mutex_lock_interruptible(&ccid_dev->ioctl_lock))
++		return -ERESTARTSYS;
++	spin_lock_irqsave(&ccid_dev->lock, flags);
+ 	if (!atomic_read(&ccid_dev->online)) {
+-		pr_debug("%s: USB cable not connected\n", __func__);
+-		return -ENODEV;
+-	}
+-	if (atomic_read(&ctrl_dev->opened)) {
+-		pr_debug("%s: ctrl device is already opened\n", __func__);
+-		return -EBUSY;
+-	}
+-	atomic_set(&ctrl_dev->opened, 1);
+-	spin_lock_irqsave(&ccid_dev->lock, flags);
+-	fp->private_data = ccid_dev;
++		ret = -ENODEV;
++	} else if (atomic_cmpxchg(&ccid_dev->notify_busy, 0, 1)) {
++		ret = -EBUSY;
++	} else {
++		req = ccid_dev->notify_req;
++		memcpy(req->buf, &notification, sizeof(notification));
++		req->length = length;
++		ret = usb_ep_queue(ccid_dev->notify, req, GFP_ATOMIC);
++		if (ret)
++			atomic_set(&ccid_dev->notify_busy, 0);
++	}
+ 	spin_unlock_irqrestore(&ccid_dev->lock, flags);
+-
+-	return 0;
+-}
+-
+-
+-static int ccid_ctrl_release(struct inode *inode, struct file *fp)
+-{
+-	struct f_ccid *ccid_dev = fp->private_data;
+-	struct ccid_ctrl_dev *ctrl_dev = &ccid_dev->ctrl_dev;
+-
+-	atomic_set(&ctrl_dev->opened, 0);
+-
+-	return 0;
+-}
+-
+-static ssize_t ccid_ctrl_read(struct file *fp, char __user *buf,
+-		      size_t count, loff_t *ppos)
+-{
+-	struct f_ccid *ccid_dev = fp->private_data;
+-	struct ccid_ctrl_dev *ctrl_dev = &ccid_dev->ctrl_dev;
+-	int ret = 0;
+-
+-	if (!atomic_read(&ccid_dev->online)) {
+-		pr_debug("%s: USB cable not connected\n", __func__);
+-		return -ENODEV;
+-	}
+-	if (count > CTRL_BUF_SIZE)
+-		count = CTRL_BUF_SIZE;
+-
+-	ret = wait_event_interruptible(ctrl_dev->tx_wait_q,
+-					 ctrl_dev->tx_ctrl_done ||
+-					!atomic_read(&ccid_dev->online));
+-	if (ret < 0)
+-		return ret;
+-	ctrl_dev->tx_ctrl_done = 0;
+-
+-	if (!atomic_read(&ccid_dev->online)) {
+-		pr_debug("%s: USB cable not connected\n", __func__);
+-		return -ENODEV;
+-	}
+-	ret = copy_to_user(buf, ctrl_dev->buf, count);
+-	if (ret)
+-		return -EFAULT;
+-
+-	return count;
+-}
+-
+-static long
+-ccid_ctrl_ioctl(struct file *fp, unsigned int cmd, u_long arg)
+-{
+-	struct f_ccid *ccid_dev = fp->private_data;
+-	struct usb_request              *req = ccid_dev->notify_req;
+-	struct usb_ccid_notification     *ccid_notify = req->buf;
+-	void __user *argp = (void __user *)arg;
+-	int ret = 0;
+-
+-	switch (cmd) {
+-	case CCID_NOTIFY_CARD:
+-		if (copy_from_user(ccid_notify, argp,
+-				sizeof(struct usb_ccid_notification)))
+-			return -EFAULT;
+-		req->length = 2;
+-		break;
+-	case CCID_NOTIFY_HWERROR:
+-		if (copy_from_user(ccid_notify, argp,
+-				sizeof(struct usb_ccid_notification)))
+-			return -EFAULT;
+-		req->length = 4;
+-		break;
+-	case CCID_READ_DTR:
+-		if (copy_to_user((int *)arg, &ccid_dev->dtr_state, sizeof(int)))
+-			return -EFAULT;
+-		return 0;
+-	}
+-	ret = usb_ep_queue(ccid_dev->notify, ccid_dev->notify_req, GFP_KERNEL);
+-	if (ret < 0) {
+-		pr_err("ccid notify ep enqueue error %d\n", ret);
+-		return ret;
+-	}
+-	return 0;
++	mutex_unlock(&ccid_dev->ioctl_lock);
++	return ret;
+ }
+ 
+ #ifdef CONFIG_COMPAT
+@@ -997,52 +973,63 @@
+ #endif
+ };
+ 
+-static int ccid_cdev_init(struct cdev *cdev, const struct file_operations *fops,
+-		const char *name)
+-{
+-	struct device *dev;
++static void ccid_release(struct kref *ref)
++{
++	struct f_ccid *ccid = container_of(ref, struct f_ccid, ref);
++
++	kfree(ccid);
++}
++
++static void ccid_device_release(struct device *dev)
++{
++	struct f_ccid *ccid = dev_get_drvdata(dev);
++
++	kref_put(&ccid->ref, ccid_release);
++}
++
++static int ccid_cdev_init(struct cdev *cdev, struct device *dev,
++			  const struct file_operations *fops,
++			  const char *name, struct f_ccid *ccid)
++{
+ 	int ret, minor;
+ 
+-	minor = ida_simple_get(&ccid_ida, 0, MAX_INSTANCES, GFP_KERNEL);
+-	if (minor < 0) {
+-		pr_err("%s: No more minor numbers left! rc:%d\n", __func__,
+-				minor);
++	minor = ida_alloc_range(&ccid_ida, 0, MAX_INSTANCES - 1, GFP_KERNEL);
++	if (minor < 0)
+ 		return minor;
+-	}
+-
++	device_initialize(dev);
++	kref_get(&ccid->ref);
++	dev->release = ccid_device_release;
++	dev->class = ccid_class;
++	dev->devt = MKDEV(major, minor);
++	dev_set_drvdata(dev, ccid);
++	ret = dev_set_name(dev, "%s", name);
++	if (ret)
++		goto put;
+ 	cdev_init(cdev, fops);
+-	ret = cdev_add(cdev, MKDEV(major, minor), 1);
+-	if (ret) {
+-		pr_err("Failed to add cdev for (%s)\n", name);
+-		goto err_cdev_add;
+-	}
+-
+-	dev = device_create(ccid_class, NULL, MKDEV(major, minor), NULL, name);
+-	if (IS_ERR(dev)) {
+-		ret = PTR_ERR(dev);
+-		goto err_create_dev;
+-	}
+-
+-	return 0;
+-
+-err_create_dev:
+-	cdev_del(cdev);
+-err_cdev_add:
+-	ida_simple_remove(&ccid_ida, minor);
++	cdev->owner = THIS_MODULE;
++	/* The exported helper pins dev from cdev, including racing opens. */
++	ret = cdev_device_add(cdev, dev);
++	if (!ret)
++		return 0;
++put:
++	ida_free(&ccid_ida, minor);
++	put_device(dev);
+ 	return ret;
+ }
+ 
+-static void ccid_cdev_free(struct cdev *cdev)
+-{
+-	int minor = MINOR(cdev->dev);
+-
+-	device_destroy(ccid_class, cdev->dev);
+-	cdev_del(cdev);
+-	ida_simple_remove(&ccid_ida, minor);
++static void ccid_cdev_free(struct cdev *cdev, struct device *dev)
++{
++	int minor = MINOR(dev->devt);
++
++	cdev_device_del(cdev, dev);
++	ida_free(&ccid_ida, minor);
++	put_device(dev);
+ }
+ 
+ static void ccid_free_func(struct usb_function *f)
+-{ }
++{
++	atomic_set(&func_to_ccid(f)->function_allocated, 0);
++}
+ 
+ static int ccid_bind_config(struct f_ccid *ccid_dev)
+ {
+@@ -1085,7 +1072,6 @@
+ 
+ static void ccid_free_chrdev_region(void)
+ {
+-	mutex_lock(&ccid_ida_lock);
+ 	if (ida_is_empty(&ccid_ida)) {
+ 		if (major) {
+ 			unregister_chrdev_region(MKDEV(major, 0),
+@@ -1098,7 +1084,6 @@
+ 			ccid_class = NULL;
+ 		}
+ 	}
+-	mutex_unlock(&ccid_ida_lock);
+ }
+ 
+ static struct f_ccid *ccid_setup(void)
+@@ -1112,6 +1097,11 @@
+ 		goto error;
+ 	}
+ 
++	kref_init(&ccid_dev->ref);
++	mutex_init(&ccid_dev->ctrl_read_lock);
++	mutex_init(&ccid_dev->read_lock);
++	mutex_init(&ccid_dev->write_lock);
++	mutex_init(&ccid_dev->ioctl_lock);
+ 	spin_lock_init(&ccid_dev->lock);
+ 	INIT_LIST_HEAD(&ccid_dev->ctrl_dev.tx_q);
+ 	init_waitqueue_head(&ccid_dev->ctrl_dev.tx_wait_q);
+@@ -1127,31 +1117,32 @@
+ 			goto err_chrdev;
+ 		}
+ 	}
+-	mutex_unlock(&ccid_ida_lock);
+-
+-	ret = ccid_cdev_init(&ccid_dev->ctrl_dev.cdev, &ccid_ctrl_fops,
+-			CCID_CTRL_DEV_NAME);
++
++	ret = ccid_cdev_init(&ccid_dev->ctrl_dev.cdev, &ccid_dev->ctrl_dev.dev, &ccid_ctrl_fops,
++			CCID_CTRL_DEV_NAME, ccid_dev);
+ 	if (ret) {
+ 		pr_err("%s: ccid_ctrl_device_init failed, err:%d\n",
+ 				__func__, ret);
+ 		goto err_ctrl_init;
+ 	}
+ 
+-	ret = ccid_cdev_init(&ccid_dev->bulk_dev.cdev, &ccid_bulk_fops,
+-			CCID_BULK_DEV_NAME);
++	ret = ccid_cdev_init(&ccid_dev->bulk_dev.cdev, &ccid_dev->bulk_dev.dev, &ccid_bulk_fops,
++			CCID_BULK_DEV_NAME, ccid_dev);
+ 	if (ret) {
+ 		pr_err("%s: ccid_bulk_device_init failed, err:%d\n",
+ 				__func__, ret);
+ 		goto err_bulk_init;
+ 	}
+ 
++	mutex_unlock(&ccid_ida_lock);
+ 	return ccid_dev;
+ err_bulk_init:
+-	ccid_cdev_free(&ccid_dev->ctrl_dev.cdev);
++	ccid_cdev_free(&ccid_dev->ctrl_dev.cdev, &ccid_dev->ctrl_dev.dev);
+ err_ctrl_init:
+ 	ccid_free_chrdev_region();
++	mutex_unlock(&ccid_ida_lock);
+ err_chrdev:
+-	kfree(ccid_dev);
++	kref_put(&ccid_dev->ref, ccid_release);
+ error:
+ 	pr_err("ccid gadget driver failed to initialize\n");
+ 	return ERR_PTR(ret);
+@@ -1190,6 +1181,8 @@
+ 	if (name_len > MAX_INST_NAME_LEN)
+ 		return -ENAMETOOLONG;
+ 
++	if (opts->ccid)
++		return -EBUSY;
+ 	ccid = ccid_setup();
+ 	if (IS_ERR(ccid))
+ 		return PTR_ERR(ccid);
+@@ -1203,14 +1196,14 @@
+ {
+ 	struct ccid_opts *opts = container_of(f, struct ccid_opts, func_inst);
+ 
+-	if (!opts->ccid)
+-		return;
+-
+-	ccid_cdev_free(&opts->ccid->ctrl_dev.cdev);
+-	ccid_cdev_free(&opts->ccid->bulk_dev.cdev);
+-	ccid_free_chrdev_region();
+-
+-	kfree(opts->ccid);
++	if (opts->ccid) {
++		mutex_lock(&ccid_ida_lock);
++		ccid_cdev_free(&opts->ccid->ctrl_dev.cdev, &opts->ccid->ctrl_dev.dev);
++		ccid_cdev_free(&opts->ccid->bulk_dev.cdev, &opts->ccid->bulk_dev.dev);
++		ccid_free_chrdev_region();
++		mutex_unlock(&ccid_ida_lock);
++		kref_put(&opts->ccid->ref, ccid_release);
++	}
+ 	kfree(opts);
+ }
+ 
+@@ -1238,6 +1231,10 @@
+ 
+ 	opts = container_of(fi, struct ccid_opts, func_inst);
+ 
++	if (!opts->ccid)
++		return ERR_PTR(-ENODEV);
++	if (atomic_cmpxchg(&opts->ccid->function_allocated, 0, 1))
++		return ERR_PTR(-EBUSY);
+ 	ret = ccid_bind_config(opts->ccid);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+--- a/drivers/usb/gadget/function/f_cdev.c
++++ b/drivers/usb/gadget/function/f_cdev.c
+@@ -89,7 +89,7 @@
+ 	struct cdev		fcdev_cdev;
+ 	struct device		dev;
+ 	unsigned int		port_num;
+-	char			name[sizeof(DEVICE_NAME) + 2];
++	char			name[sizeof(DEVICE_NAME) + 3];
+ 	int			minor;
+ 
+ 	spinlock_t		port_lock;
+@@ -124,7 +124,10 @@
+ 	unsigned int		cbits_to_modem;
+ 	bool			cbits_updated;
+ 
+-	struct workqueue_struct *fcdev_wq;
++	struct mutex io_lock;
++	atomic_t function_allocated;
++	bool dying;
++	unsigned long connection_id;
+ 	bool			is_connected;
+ 	bool			port_open;
+ 
+@@ -148,7 +151,7 @@
+ };
+ 
+ static int major, minors;
+-struct class *fcdev_classp;
++static struct class *fcdev_classp;
+ static DEFINE_IDA(chardev_ida);
+ static DEFINE_MUTEX(chardev_ida_lock);
+ 
+@@ -372,17 +375,16 @@
+ 		struct usb_request *req)
+ {
+ 	struct f_cdev            *port = ep->driver_data;
+-	struct usb_composite_dev *cdev = port->port_usb.func.config->cdev;
+ 
+ 	if (req->status != 0) {
+-		dev_dbg(&cdev->gadget->dev, "port(%s) completion, err %d\n",
++		pr_debug("port(%s) completion, err %d\n",
+ 				port->name, req->status);
+ 		return;
+ 	}
+ 
+ 	/* normal completion */
+ 	if (req->actual != sizeof(port->port_usb.port_line_coding)) {
+-		dev_dbg(&cdev->gadget->dev, "port(%s) short resp, len %d\n",
++		pr_debug("port(%s) short resp, len %d\n",
+ 			port->name, req->actual);
+ 		usb_ep_set_halt(ep);
+ 	} else {
+@@ -394,7 +396,7 @@
+ 
+ static void usb_cser_free_func(struct usb_function *f)
+ {
+-	/* Do nothing as cser_alloc() doesn't alloc anything. */
++	atomic_set(&func_to_port(f)->function_allocated, 0);
+ }
+ 
+ static int
+@@ -433,7 +435,7 @@
+ 			| USB_CDC_REQ_SET_CONTROL_LINE_STATE:
+ 
+ 		value = 0;
+-		port->port_usb.port_handshake_bits = w_value;
++		WRITE_ONCE(port->port_usb.port_handshake_bits, w_value);
+ 		pr_debug("USB_CDC_REQ_SET_CONTROL_LINE_STATE: DTR:%d RST:%d\n",
+ 			w_value & ACM_CTRL_DTR ? 1 : 0,
+ 			w_value & ACM_CTRL_RTS ? 1 : 0);
+@@ -510,11 +512,17 @@
+ 					port->port_usb.out)) {
+ 			port->port_usb.in->desc = NULL;
+ 			port->port_usb.out->desc = NULL;
++			usb_ep_disable(port->port_usb.notify);
++			port->port_usb.notify->driver_data = NULL;
+ 			return -EINVAL;
+ 		}
+ 	}
+ 
+-	usb_cser_connect(port);
++	rc = usb_cser_connect(port);
++	if (rc) {
++		usb_ep_disable(port->port_usb.notify);
++		port->port_usb.notify->driver_data = NULL;
++	}
+ 	return rc;
+ }
+ 
+@@ -554,116 +562,90 @@
+ 	port->port_usb.notify->driver_data = NULL;
+ }
+ 
+-static int usb_cser_notify(struct f_cdev *port, u8 type, u16 value,
+-		void *data, unsigned int length)
+-{
+-	struct usb_ep			*ep = port->port_usb.notify;
+-	struct usb_request		*req;
+-	struct usb_cdc_notification	*notify;
+-	const unsigned int		len = sizeof(*notify) + length;
+-	void				*buf;
+-	int				status;
+-	unsigned long			flags;
++/* port_lock serializes the notification buffer and pending ownership. */
++static int usb_cser_notify_locked(struct f_cdev *port)
++{
++	struct cserial *cser = &port->port_usb;
++	struct usb_request *req = cser->notify_req;
++	struct usb_cdc_notification *notify;
++	__le16 state;
++	int ret;
++
++	if (!port->is_connected || port->dying || !req)
++		return -ENODEV;
++	if (cser->pending) {
++		cser->q_again = true;
++		return 0;
++	}
++	cser->pending = true;
++	cser->q_again = false;
++	notify = req->buf;
++	notify->bmRequestType = USB_DIR_IN | USB_TYPE_CLASS |
++		USB_RECIP_INTERFACE;
++	notify->bNotificationType = USB_CDC_NOTIFY_SERIAL_STATE;
++	notify->wValue = 0;
++	notify->wIndex = cpu_to_le16(cser->data_id);
++	notify->wLength = cpu_to_le16(sizeof(state));
++	state = cpu_to_le16(cser->serial_state);
++	memcpy(notify + 1, &state, sizeof(state));
++	req->length = sizeof(*notify) + sizeof(state);
++	ret = usb_ep_queue(cser->notify, req, GFP_ATOMIC);
++	if (ret)
++		cser->pending = false;
++	return ret;
++}
++
++static int port_notify_serial_state(struct cserial *cser)
++{
++	struct f_cdev *port = cser_to_port(cser);
++	unsigned long flags;
++	int ret;
+ 
+ 	spin_lock_irqsave(&port->port_lock, flags);
+-	if (!port->is_connected) {
+-		spin_unlock_irqrestore(&port->port_lock, flags);
+-		pr_debug("%s: port disconnected\n", __func__);
+-		return -ENODEV;
+-	}
+-
+-	req = port->port_usb.notify_req;
+-
+-	req->length = len;
+-	notify = req->buf;
+-	buf = notify + 1;
+-
+-	notify->bmRequestType = USB_DIR_IN | USB_TYPE_CLASS
+-			| USB_RECIP_INTERFACE;
+-	notify->bNotificationType = type;
+-	notify->wValue = cpu_to_le16(value);
+-	notify->wIndex = cpu_to_le16(port->port_usb.data_id);
+-	notify->wLength = cpu_to_le16(length);
+-	/* 2 byte data copy */
+-	memcpy(buf, data, length);
++	ret = usb_cser_notify_locked(port);
+ 	spin_unlock_irqrestore(&port->port_lock, flags);
+-
+-	status = usb_ep_queue(ep, req, GFP_ATOMIC);
+-	if (status < 0) {
+-		pr_err("port %s can't notify serial state, %d\n",
+-				port->name, status);
+-		spin_lock_irqsave(&port->port_lock, flags);
+-		port->port_usb.pending = false;
+-		spin_unlock_irqrestore(&port->port_lock, flags);
+-	}
+-
+-	return status;
+-}
+-
+-static int port_notify_serial_state(struct cserial *cser)
+-{
+-	struct f_cdev *port = cser_to_port(cser);
+-	int status;
++	return ret;
++}
++
++static void usb_cser_notify_complete(struct usb_ep *ep, struct usb_request *req)
++{
++	struct f_cdev *port = req->context;
++	struct cserial *cser = &port->port_usb;
+ 	unsigned long flags;
+-	struct usb_composite_dev *cdev = port->port_usb.func.config->cdev;
++	bool again;
+ 
+ 	spin_lock_irqsave(&port->port_lock, flags);
+-	if (!port->port_usb.pending) {
+-		port->port_usb.pending = true;
+-		spin_unlock_irqrestore(&port->port_lock, flags);
+-		dev_dbg(&cdev->gadget->dev, "port %d serial state %04x\n",
+-				port->port_num, port->port_usb.serial_state);
+-		status = usb_cser_notify(port, USB_CDC_NOTIFY_SERIAL_STATE,
+-				0, &port->port_usb.serial_state,
+-				sizeof(port->port_usb.serial_state));
+-		spin_lock_irqsave(&port->port_lock, flags);
+-	} else {
+-		port->port_usb.q_again = true;
+-		status = 0;
+-	}
++	cser->pending = false;
++	again = cser->q_again;
++	cser->q_again = false;
++	if (req->status != -ESHUTDOWN && again)
++		usb_cser_notify_locked(port);
+ 	spin_unlock_irqrestore(&port->port_lock, flags);
+-
+-	return status;
+-}
+-
+-static void usb_cser_notify_complete(struct usb_ep *ep, struct usb_request *req)
+-{
+-	struct f_cdev *port = req->context;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&port->port_lock, flags);
+-	port->port_usb.pending = false;
+-	if (req->status != -ESHUTDOWN && port->port_usb.q_again) {
+-		port->port_usb.q_again = false;
+-		spin_unlock_irqrestore(&port->port_lock, flags);
+-		port_notify_serial_state(&port->port_usb);
+-		spin_lock_irqsave(&port->port_lock, flags);
+-	}
+-	spin_unlock_irqrestore(&port->port_lock, flags);
+-}
++}
++
+ static void dun_cser_connect(struct cserial *cser)
+ {
+ 	cser->serial_state |= ACM_CTRL_DSR | ACM_CTRL_DCD;
+ 	port_notify_serial_state(cser);
+ }
+ 
+-unsigned int dun_cser_get_dtr(struct cserial *cser)
+-{
+-	if (cser->port_handshake_bits & ACM_CTRL_DTR)
++static unsigned int dun_cser_get_dtr(struct cserial *cser)
++{
++	if (READ_ONCE(cser->port_handshake_bits) & ACM_CTRL_DTR)
+ 		return 1;
+ 	else
+ 		return 0;
+ }
+ 
+-unsigned int dun_cser_get_rts(struct cserial *cser)
+-{
+-	if (cser->port_handshake_bits & ACM_CTRL_RTS)
++static unsigned int dun_cser_get_rts(struct cserial *cser)
++{
++	if (READ_ONCE(cser->port_handshake_bits) & ACM_CTRL_RTS)
+ 		return 1;
+ 	else
+ 		return 0;
+ }
+ 
+-unsigned int dun_cser_send_carrier_detect(struct cserial *cser,
++static unsigned int dun_cser_send_carrier_detect(struct cserial *cser,
+ 				unsigned int yes)
+ {
+ 	u16 state;
+@@ -677,7 +659,7 @@
+ 	return port_notify_serial_state(cser);
+ }
+ 
+-unsigned int dun_cser_send_ring_indicator(struct cserial *cser,
++static unsigned int dun_cser_send_ring_indicator(struct cserial *cser,
+ 				unsigned int yes)
+ {
+ 	u16 state;
+@@ -839,6 +821,7 @@
+ 	if (port->port_usb.notify_req)
+ 		usb_cser_free_req(port->port_usb.notify,
+ 				port->port_usb.notify_req);
++	port->port_usb.notify_req = NULL;
+ 
+ 	if (port->port_usb.notify)
+ 		port->port_usb.notify->driver_data = NULL;
+@@ -853,20 +836,20 @@
+ 
+ static void cser_free_inst(struct usb_function_instance *fi)
+ {
+-	struct f_cdev_opts *opts;
+-
+-	opts = container_of(fi, struct f_cdev_opts, func_inst);
+-
+-	if (opts->port) {
+-		cdev_device_del(&opts->port->fcdev_cdev, &opts->port->dev);
+-		mutex_lock(&chardev_ida_lock);
+-		ida_simple_remove(&chardev_ida, opts->port->minor);
+-		mutex_unlock(&chardev_ida_lock);
+-		usb_cser_debugfs_exit(opts->port);
+-		put_device(&opts->port->dev);
+-	}
+-
+-	usb_cser_chardev_deinit();
++	struct f_cdev_opts *opts = container_of(fi, struct f_cdev_opts, func_inst);
++	struct f_cdev *port = opts->port;
++	unsigned long flags;
++
++	if (port) {
++		spin_lock_irqsave(&port->port_lock, flags);
++		port->dying = true;
++		spin_unlock_irqrestore(&port->port_lock, flags);
++		wake_up(&port->open_wq);
++		wake_up(&port->read_wq);
++		cdev_device_del(&port->fcdev_cdev, &port->dev);
++		usb_cser_debugfs_exit(port);
++		put_device(&port->dev);
++	}
+ 	kfree(opts->func_name);
+ 	kfree(opts);
+ }
+@@ -875,14 +858,14 @@
+ {
+ 	struct f_cdev *port = func_to_port(f);
+ 
+-	if (port->is_connected)
+-		usb_cser_disable(f);
+-
+-	/* Reset string id */
++	usb_cser_disable(f);
++	/* Drain detached user-copy requests before the controller may go away. */
++	mutex_lock(&port->io_lock);
+ 	cser_string_defs[0].id = 0;
+-
+ 	usb_free_all_descriptors(f);
+ 	usb_cser_free_req(port->port_usb.notify, port->port_usb.notify_req);
++	port->port_usb.notify_req = NULL;
++	mutex_unlock(&port->io_lock);
+ }
+ 
+ static int usb_cser_alloc_requests(struct usb_ep *ep, struct list_head *head,
+@@ -938,9 +921,7 @@
+ 		list_del_init(&req->list);
+ 		req->length = BRIDGE_RX_BUF_SIZE;
+ 		req->complete = usb_cser_read_complete;
+-		spin_unlock_irqrestore(&port->port_lock, flags);
+-		ret = usb_ep_queue(ep, req, GFP_KERNEL);
+-		spin_lock_irqsave(&port->port_lock, flags);
++		ret = usb_ep_queue(ep, req, GFP_ATOMIC);
+ 		if (ret) {
+ 			pr_err("port(%d):%pK usb ep(%s) queue failed\n",
+ 					port->port_num, port, ep->name);
+@@ -966,7 +947,7 @@
+ 	}
+ 
+ 	spin_lock_irqsave(&port->port_lock, flags);
+-	if (!port->port_open) {
++	if (!port->port_open || !port->is_connected) {
+ 		list_add_tail(&req->list, &port->read_pool);
+ 		spin_unlock_irqrestore(&port->port_lock, flags);
+ 		return;
+@@ -979,11 +960,11 @@
+ 		 */
+ 		if (req->status == -ECONNRESET ||
+ 		    req->status == -EPIPE) {
+-			spin_unlock_irqrestore(&port->port_lock, flags);
+-			ret = usb_ep_queue(ep, req, GFP_KERNEL);
+-			if (!ret)
++			ret = usb_ep_queue(ep, req, GFP_ATOMIC);
++			if (!ret) {
++				spin_unlock_irqrestore(&port->port_lock, flags);
+ 				return;
+-			spin_lock_irqsave(&port->port_lock, flags);
++			}
+ 		}
+ 
+ 		list_add_tail(&req->list, &port->read_pool);
+@@ -1031,7 +1012,7 @@
+ 	}
+ }
+ 
+-static void usb_cser_start_io(struct f_cdev *port)
++static int usb_cser_start_io(struct f_cdev *port)
+ {
+ 	int ret = -ENODEV;
+ 	unsigned long	flags;
+@@ -1068,9 +1049,10 @@
+ start_io_out:
+ 	spin_unlock_irqrestore(&port->port_lock, flags);
+ 	if (ret)
+-		return;
++		return ret;
+ 
+ 	usb_cser_start_rx(port);
++	return 0;
+ }
+ 
+ static void usb_cser_stop_io(struct f_cdev *port)
+@@ -1094,6 +1076,7 @@
+ 	if (port->current_rx_req != NULL) {
+ 		kfree(port->current_rx_req->buf);
+ 		usb_ep_free_request(out, port->current_rx_req);
++		port->current_rx_req = NULL;
+ 	}
+ 
+ 	port->pending_rx_bytes = 0;
+@@ -1104,41 +1087,39 @@
+ 	spin_unlock_irqrestore(&port->port_lock, flags);
+ }
+ 
+-int f_cdev_open(struct inode *inode, struct file *file)
+-{
++static int f_cdev_open(struct inode *inode, struct file *file)
++{
++	struct f_cdev *port = container_of(inode->i_cdev, struct f_cdev, fcdev_cdev);
++	unsigned long flags;
+ 	int ret;
+-	unsigned long flags;
+-	struct f_cdev *port;
+-
+-	port = container_of(inode->i_cdev, struct f_cdev, fcdev_cdev);
++
+ 	get_device(&port->dev);
+-	if (port->port_open) {
+-		pr_err("port is already opened.\n");
+-		put_device(&port->dev);
+-		return -EBUSY;
+-	}
+-
++	spin_lock_irqsave(&port->port_lock, flags);
++	ret = port->dying ? -ENODEV : port->port_open ? -EBUSY : 0;
++	if (!ret)
++		port->port_open = true;
++	spin_unlock_irqrestore(&port->port_lock, flags);
++	if (ret)
++		goto put;
++	ret = wait_event_interruptible(port->open_wq,
++		READ_ONCE(port->is_connected) || READ_ONCE(port->dying));
++	if (!ret && READ_ONCE(port->dying))
++		ret = -ENODEV;
++	if (ret) {
++		spin_lock_irqsave(&port->port_lock, flags);
++		port->port_open = false;
++		spin_unlock_irqrestore(&port->port_lock, flags);
++		goto put;
++	}
+ 	file->private_data = port;
+-	pr_debug("opening port(%s)(%pK)\n", port->name, port);
+-	ret = wait_event_interruptible(port->open_wq,
+-					port->is_connected);
+-	if (ret) {
+-		pr_debug("open interrupted.\n");
+-		put_device(&port->dev);
+-		return ret;
+-	}
+-
+-	spin_lock_irqsave(&port->port_lock, flags);
+-	port->port_open = true;
+-	spin_unlock_irqrestore(&port->port_lock, flags);
+ 	usb_cser_start_rx(port);
+-
+-	pr_debug("port(%s)(%pK) open is success\n", port->name, port);
+-
+ 	return 0;
+-}
+-
+-int f_cdev_release(struct inode *inode, struct file *file)
++put:
++	put_device(&port->dev);
++	return ret;
++}
++
++static int f_cdev_release(struct inode *inode, struct file *file)
+ {
+ 	unsigned long flags;
+ 	struct f_cdev *port;
+@@ -1154,210 +1135,146 @@
+ 	return 0;
+ }
+ 
+-ssize_t f_cdev_read(struct file *file,
+-		       char __user *buf,
+-		       size_t count,
+-		       loff_t *ppos)
+-{
+-	unsigned long flags;
+-	struct f_cdev *port;
++static ssize_t f_cdev_read(struct file *file, char __user *buf,
++			   size_t count, loff_t *ppos)
++{
++	struct f_cdev *port = file->private_data;
+ 	struct usb_request *req;
+-	struct list_head *pool;
+-	struct usb_request *current_rx_req;
+-	size_t pending_rx_bytes, bytes_copied = 0, size;
+-	u8 *current_rx_buf;
+-
+-	port = file->private_data;
+-	if (!port) {
+-		pr_err("port is NULL.\n");
+-		return -EINVAL;
+-	}
+-
+-	pr_debug("read on port(%s)(%pK) count:%zu\n", port->name, port, count);
++	struct usb_ep *out;
++	unsigned long flags, generation;
++	size_t copied = 0, size, done;
++	ssize_t ret;
++
++	if (!count)
++		return 0;
++	if (mutex_lock_interruptible(&port->io_lock))
++		return -ERESTARTSYS;
+ 	spin_lock_irqsave(&port->port_lock, flags);
+-	current_rx_req = port->current_rx_req;
+-	pending_rx_bytes = port->pending_rx_bytes;
+-	current_rx_buf = port->current_rx_buf;
+-	port->current_rx_req = NULL;
+-	port->current_rx_buf = NULL;
+-	port->pending_rx_bytes = 0;
+-	bytes_copied = 0;
+-
+-	if (list_empty(&port->read_queued) && !pending_rx_bytes) {
+-		spin_unlock_irqrestore(&port->port_lock, flags);
+-		pr_debug("%s(): read_queued list is empty.\n", __func__);
+-		goto start_rx;
+-	}
+-
+-	/*
+-	 * Consider below cases:
+-	 * 1. If available read buffer size (i.e. count value) is greater than
+-	 * available data as part of one USB OUT request buffer, then consider
+-	 * copying multiple USB OUT request buffers until read buffer is filled.
+-	 * 2. If available read buffer size (i.e. count value) is smaller than
+-	 * available data as part of one USB OUT request buffer, then copy this
+-	 * buffer data across multiple read() call until whole USB OUT request
+-	 * buffer is copied.
+-	 */
+-	while ((pending_rx_bytes || !list_empty(&port->read_queued)) && count) {
+-		if (pending_rx_bytes == 0) {
+-			pool = &port->read_queued;
+-			req = list_first_entry(pool, struct usb_request, list);
++	if (!port->is_connected) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	out = port->port_usb.out;
++	generation = port->connection_id;
++	while (copied < count) {
++		req = port->current_rx_req;
++		if (!req) {
++			if (list_empty(&port->read_queued))
++				break;
++			req = list_first_entry(&port->read_queued, struct usb_request, list);
+ 			list_del_init(&req->list);
+-			current_rx_req = req;
+-			pending_rx_bytes = req->actual;
+-			current_rx_buf = req->buf;
++			port->pending_rx_bytes = req->actual;
++			port->current_rx_buf = req->buf;
+ 		}
+-
+-		spin_unlock_irqrestore(&port->port_lock, flags);
+-		size = count;
+-		if (size > pending_rx_bytes)
+-			size = pending_rx_bytes;
+-
+-		pr_debug("pending_rx_bytes:%zu count:%zu size:%zu\n",
+-					pending_rx_bytes, count, size);
+-		size -= copy_to_user(buf, current_rx_buf, size);
+-		port->nbytes_to_port_bridge += size;
+-		bytes_copied += size;
+-		count -= size;
+-		buf += size;
+-
+-		spin_lock_irqsave(&port->port_lock, flags);
+-		if (!port->is_connected) {
+-			list_add_tail(&current_rx_req->list, &port->read_pool);
++		/* Detached ownership survives disable; unbind waits for io_lock. */
++		port->current_rx_req = NULL;
++		size = min(count - copied, port->pending_rx_bytes);
++		{
++			u8 *data = port->current_rx_buf;
++			size_t remaining = port->pending_rx_bytes;
++
++			port->current_rx_buf = NULL;
++			port->pending_rx_bytes = 0;
+ 			spin_unlock_irqrestore(&port->port_lock, flags);
+-			return -EAGAIN;
++			done = size - copy_to_user(buf + copied, data, size);
++			spin_lock_irqsave(&port->port_lock, flags);
++			copied += done;
++			port->nbytes_to_port_bridge += done;
++			if (!port->is_connected || generation != port->connection_id) {
++				usb_cser_free_req(out, req);
++				ret = copied ? copied : -ENODEV;
++				goto unlock;
++			}
++			if (remaining > done) {
++				port->current_rx_req = req;
++				port->current_rx_buf = data + done;
++				port->pending_rx_bytes = remaining - done;
++			} else {
++				list_add_tail(&req->list, &port->read_pool);
++			}
+ 		}
+-
+-		/*
+-		 * partial data available, then update pending_rx_bytes,
+-		 * otherwise add USB request back to read_pool for next data.
+-		 */
+-		if (size < pending_rx_bytes) {
+-			pending_rx_bytes -= size;
+-			current_rx_buf += size;
+-		} else {
+-			list_add_tail(&current_rx_req->list, &port->read_pool);
+-			pending_rx_bytes = 0;
+-			current_rx_req = NULL;
+-			current_rx_buf = NULL;
++		if (done != size) {
++			ret = copied ? copied : -EFAULT;
++			goto unlock;
+ 		}
+ 	}
+-
+-	port->pending_rx_bytes = pending_rx_bytes;
+-	port->current_rx_buf = current_rx_buf;
+-	port->current_rx_req = current_rx_req;
++	ret = copied;
++unlock:
+ 	spin_unlock_irqrestore(&port->port_lock, flags);
+-
+-start_rx:
+ 	usb_cser_start_rx(port);
+-	return bytes_copied;
+-}
+-
+-ssize_t f_cdev_write(struct file *file,
+-		       const char __user *buf,
+-		       size_t count,
+-		       loff_t *ppos)
+-{
+-	int ret;
+-	unsigned long flags;
+-	struct f_cdev *port;
++	mutex_unlock(&port->io_lock);
++	return ret;
++}
++
++static ssize_t f_cdev_write(struct file *file, const char __user *buf,
++			    size_t count, loff_t *ppos)
++{
++	struct f_cdev *port = file->private_data;
+ 	struct usb_request *req;
+-	struct list_head *pool;
+-	unsigned int xfer_size;
+ 	struct usb_ep *in;
+-
+-	port = file->private_data;
+-	if (!port) {
+-		pr_err("port is NULL.\n");
+-		return -EINVAL;
+-	}
+-
++	unsigned long flags, generation;
++	size_t size = min_t(size_t, count, BRIDGE_TX_BUF_SIZE);
++	ssize_t ret;
++
++	if (!count)
++		return 0;
++	if (mutex_lock_interruptible(&port->io_lock))
++		return -ERESTARTSYS;
+ 	spin_lock_irqsave(&port->port_lock, flags);
+-	pr_debug("write on port(%s)(%pK)\n", port->name, port);
+-
+ 	if (!port->is_connected) {
+-		spin_unlock_irqrestore(&port->port_lock, flags);
+-		pr_err("%s: cable is disconnected.\n", __func__);
+-		return -ENODEV;
+-	}
+-
++		ret = -ENODEV;
++		goto unlock;
++	}
+ 	if (list_empty(&port->write_pool)) {
+-		spin_unlock_irqrestore(&port->port_lock, flags);
+-		pr_debug("%s: Request list is empty.\n", __func__);
+-		return 0;
+-	}
+-
++		ret = 0;
++		goto unlock;
++	}
+ 	in = port->port_usb.in;
+-	pool = &port->write_pool;
+-	req = list_first_entry(pool, struct usb_request, list);
++	generation = port->connection_id;
++	req = list_first_entry(&port->write_pool, struct usb_request, list);
+ 	list_del_init(&req->list);
+ 	spin_unlock_irqrestore(&port->port_lock, flags);
+-
+-	pr_debug("%s: write buf size:%zu\n", __func__, count);
+-	if (count > BRIDGE_TX_BUF_SIZE)
+-		xfer_size = BRIDGE_TX_BUF_SIZE;
+-	else
+-		xfer_size = count;
+-
+-	ret = copy_from_user(req->buf, buf, xfer_size);
+-	if (ret) {
+-		pr_err("copy_from_user failed: err %d\n", ret);
+-		ret = -EFAULT;
+-	} else {
+-		req->length = xfer_size;
++	ret = copy_from_user(req->buf, buf, size) ? -EFAULT : 0;
++	spin_lock_irqsave(&port->port_lock, flags);
++	if (!port->is_connected || generation != port->connection_id) {
++		usb_cser_free_req(in, req);
++		ret = -ENODEV;
++		goto unlock;
++	}
++	if (!ret) {
++		req->length = size;
+ 		req->zero = 1;
+-		ret = usb_ep_queue(in, req, GFP_KERNEL);
+-		if (ret) {
+-			pr_err("EP QUEUE failed:%d\n", ret);
+-			ret = -EIO;
+-			goto err_exit;
+-		}
+-		spin_lock_irqsave(&port->port_lock, flags);
+-		port->nbytes_from_port_bridge += req->length;
+-		spin_unlock_irqrestore(&port->port_lock, flags);
+-	}
+-
+-err_exit:
+-	if (ret) {
+-		spin_lock_irqsave(&port->port_lock, flags);
+-		/* USB cable is connected, add it back otherwise free request */
+-		if (port->is_connected)
+-			list_add(&req->list, &port->write_pool);
+-		else
+-			usb_cser_free_req(in, req);
+-		spin_unlock_irqrestore(&port->port_lock, flags);
+-		return ret;
+-	}
+-
+-	return xfer_size;
+-}
+-
+-static unsigned int f_cdev_poll(struct file *file, poll_table *wait)
+-{
+-	unsigned int mask = 0;
+-	struct f_cdev *port;
++		ret = usb_ep_queue(in, req, GFP_ATOMIC);
++	}
++	if (ret)
++		list_add_tail(&req->list, &port->write_pool);
++	else {
++		port->nbytes_from_port_bridge += size;
++		ret = size;
++	}
++unlock:
++	spin_unlock_irqrestore(&port->port_lock, flags);
++	mutex_unlock(&port->io_lock);
++	return ret;
++}
++
++static __poll_t f_cdev_poll(struct file *file, poll_table *wait)
++{
++	struct f_cdev *port = file->private_data;
+ 	unsigned long flags;
+-
+-	port = file->private_data;
+-	if (port && port->is_connected) {
+-		poll_wait(file, &port->read_wq, wait);
+-		spin_lock_irqsave(&port->port_lock, flags);
+-		if (!list_empty(&port->read_queued)) {
+-			mask |= POLLIN | POLLRDNORM;
+-			pr_debug("sets POLLIN for %s\n", port->name);
+-		}
+-
+-		if (port->cbits_updated) {
+-			mask |= POLLPRI;
+-			pr_debug("sets POLLPRI for %s\n", port->name);
+-		}
+-		spin_unlock_irqrestore(&port->port_lock, flags);
+-	} else {
+-		pr_err("Failed due to NULL device or disconnected.\n");
+-		mask = POLLERR;
+-	}
+-
++	__poll_t mask = 0;
++
++	poll_wait(file, &port->read_wq, wait);
++	spin_lock_irqsave(&port->port_lock, flags);
++	if (!port->is_connected || port->dying)
++		mask = EPOLLERR | EPOLLHUP;
++	else {
++		if (!list_empty(&port->read_queued) || port->pending_rx_bytes)
++			mask |= EPOLLIN | EPOLLRDNORM;
++		if (port->cbits_updated)
++			mask |= EPOLLPRI;
++	}
++	spin_unlock_irqrestore(&port->port_lock, flags);
+ 	return mask;
+ }
+ 
+@@ -1365,6 +1282,7 @@
+ {
+ 	struct cserial	*cser;
+ 	unsigned int result = 0;
++	unsigned long flags;
+ 
+ 	if (!port) {
+ 		pr_err("port is NULL.\n");
+@@ -1372,17 +1290,24 @@
+ 	}
+ 
+ 	cser = &port->port_usb;
++	spin_lock_irqsave(&port->port_lock, flags);
++	if (!port->is_connected || port->dying) {
++		spin_unlock_irqrestore(&port->port_lock, flags);
++		return -ENODEV;
++	}
+ 	if (cser->get_dtr)
+ 		result |= (cser->get_dtr(cser) ? TIOCM_DTR : 0);
+ 
+ 	if (cser->get_rts)
+ 		result |= (cser->get_rts(cser) ? TIOCM_RTS : 0);
+ 
+-	if (cser->serial_state & TIOCM_CD)
++	if (cser->serial_state & ACM_CTRL_DCD)
+ 		result |= TIOCM_CD;
+ 
+-	if (cser->serial_state & TIOCM_RI)
++	if (cser->serial_state & ACM_CTRL_RI)
+ 		result |= TIOCM_RI;
++	port->cbits_updated = false;
++	spin_unlock_irqrestore(&port->port_lock, flags);
+ 	return result;
+ }
+ 
+@@ -1390,7 +1315,8 @@
+ 			unsigned int set, unsigned int clear)
+ {
+ 	struct cserial *cser;
+-	int status = 0;
++	unsigned long flags;
++	u16 state;
+ 
+ 	if (!port) {
+ 		pr_err("port is NULL.\n");
+@@ -1398,32 +1324,27 @@
+ 	}
+ 
+ 	cser = &port->port_usb;
+-	if (set & TIOCM_RI) {
+-		if (cser->send_ring_indicator) {
+-			cser->serial_state |= TIOCM_RI;
+-			status = cser->send_ring_indicator(cser, 1);
+-		}
+-	}
+-	if (clear & TIOCM_RI) {
+-		if (cser->send_ring_indicator) {
+-			cser->serial_state &= ~TIOCM_RI;
+-			status = cser->send_ring_indicator(cser, 0);
+-		}
+-	}
+-	if (set & TIOCM_CD) {
+-		if (cser->send_carrier_detect) {
+-			cser->serial_state |= TIOCM_CD;
+-			status = cser->send_carrier_detect(cser, 1);
+-		}
+-	}
+-	if (clear & TIOCM_CD) {
+-		if (cser->send_carrier_detect) {
+-			cser->serial_state &= ~TIOCM_CD;
+-			status = cser->send_carrier_detect(cser, 0);
+-		}
+-	}
+-
+-	return status;
++	spin_lock_irqsave(&port->port_lock, flags);
++	if (!port->is_connected || port->dying) {
++		spin_unlock_irqrestore(&port->port_lock, flags);
++		return -ENODEV;
++	}
++	state = cser->serial_state;
++	if (cser->send_ring_indicator) {
++		if (set & TIOCM_RI)
++			state |= ACM_CTRL_RI;
++		if (clear & TIOCM_RI)
++			state &= ~ACM_CTRL_RI;
++	}
++	if (cser->send_carrier_detect) {
++		if (set & TIOCM_CD)
++			state |= ACM_CTRL_DCD;
++		if (clear & TIOCM_CD)
++			state &= ~ACM_CTRL_DCD;
++	}
++	cser->serial_state = state;
++	spin_unlock_irqrestore(&port->port_lock, flags);
++	return port_notify_serial_state(cser);
+ }
+ 
+ static long f_cdev_ioctl(struct file *fp, unsigned int cmd,
+@@ -1450,14 +1371,22 @@
+ 			pr_err("Error getting TIOCMSET value\n");
+ 			return i;
+ 		}
+-		ret = f_cdev_tiocmset(port, val, ~val);
++		ret = f_cdev_tiocmset(port,
++			cmd == TIOCMBIC ? 0 : val,
++			cmd == TIOCMBIS ? 0 : cmd == TIOCMBIC ? val : ~val);
+ 		break;
+ 	case TIOCMGET:
+ 		pr_debug("TIOCMGET on port(%s)%pK\n", port->name, port);
+ 		ret = f_cdev_tiocmget(port);
+ 		if (ret >= 0) {
+ 			ret = put_user(ret, (uint32_t *)arg);
+-			port->cbits_updated = false;
++			if (ret) {
++				unsigned long flags;
++
++				spin_lock_irqsave(&port->port_lock, flags);
++				port->cbits_updated = true;
++				spin_unlock_irqrestore(&port->port_lock, flags);
++			}
+ 		}
+ 		break;
+ 	default:
+@@ -1473,6 +1402,7 @@
+ {
+ 	int temp;
+ 	struct f_cdev *port = fport;
++	unsigned long flags;
+ 
+ 	if (!port) {
+ 		pr_err("port is null\n");
+@@ -1483,11 +1413,15 @@
+ 
+ 	temp = convert_acm_sigs_to_uart(ctrl_bits);
+ 
+-	if (temp == port->cbits_to_modem)
++	spin_lock_irqsave(&port->port_lock, flags);
++	if (temp == port->cbits_to_modem) {
++		spin_unlock_irqrestore(&port->port_lock, flags);
+ 		return;
++	}
+ 
+ 	port->cbits_to_modem = temp;
+ 	port->cbits_updated = true;
++	spin_unlock_irqrestore(&port->port_lock, flags);
+ 
+ 	wake_up(&port->read_wq);
+ }
+@@ -1520,7 +1454,8 @@
+ 	if (ret) {
+ 		pr_err("usb_ep_enable failed eptype:OUT ep:%pK, err: %d\n",
+ 					cser->out, ret);
+-		cser->in->driver_data = 0;
++		usb_ep_disable(cser->in);
++		cser->in->driver_data = NULL;
+ 		return ret;
+ 	}
+ 	cser->out->driver_data = port;
+@@ -1531,25 +1466,30 @@
+ 	port->is_connected = true;
+ 	spin_unlock_irqrestore(&port->port_lock, flags);
+ 
+-	usb_cser_start_io(port);
++	ret = usb_cser_start_io(port);
++	if (ret) {
++		usb_cser_disconnect(port);
++		return ret;
++	}
+ 	wake_up(&port->open_wq);
+ 	return 0;
+ }
+ 
+-void usb_cser_disconnect(struct f_cdev *port)
++static void usb_cser_disconnect(struct f_cdev *port)
+ {
+ 	unsigned long flags;
+ 
++	spin_lock_irqsave(&port->port_lock, flags);
++	if (!port->is_connected) {
++		spin_unlock_irqrestore(&port->port_lock, flags);
++		return;
++	}
++	port->is_connected = false;
++	port->connection_id++;
++	spin_unlock_irqrestore(&port->port_lock, flags);
+ 	usb_cser_stop_io(port);
+-
+-	/* lower DTR to modem */
+ 	usb_cser_notify_modem(port, 0);
+-
+-	spin_lock_irqsave(&port->port_lock, flags);
+-	port->is_connected = false;
+-	port->nbytes_from_host = port->nbytes_to_host = 0;
+-	port->nbytes_to_port_bridge = 0;
+-	spin_unlock_irqrestore(&port->port_lock, flags);
++	wake_up(&port->read_wq);
+ }
+ 
+ static const struct file_operations f_cdev_fops = {
+@@ -1563,7 +1503,7 @@
+ 	.compat_ioctl = f_cdev_ioctl,
+ };
+ 
+-static ssize_t cser_rw_write(struct file *file, const char __user *ubuf,
++static ssize_t cser_rw_write_locked(struct file *file, const char __user *ubuf,
+ 				size_t count, loff_t *ppos)
+ {
+ 	struct seq_file *s = file->private_data;
+@@ -1636,6 +1576,19 @@
+ 	return count;
+ }
+ 
++static ssize_t cser_rw_write(struct file *file, const char __user *ubuf,
++			     size_t count, loff_t *ppos)
++{
++	struct seq_file *seq = file->private_data;
++	struct f_cdev *port = seq->private;
++	ssize_t ret;
++
++	mutex_lock(&port->io_lock);
++	ret = cser_rw_write_locked(file, ubuf, count, ppos);
++	mutex_unlock(&port->io_lock);
++	return ret;
++}
++
+ static int usb_cser_rw_show(struct seq_file *s, void *unused)
+ {
+ 	struct f_cdev *port = s->private;
+@@ -1652,7 +1605,24 @@
+ 
+ static int debug_cdev_rw_open(struct inode *inode, struct file *f)
+ {
+-	return single_open(f, usb_cser_rw_show, inode->i_private);
++	struct f_cdev *port = inode->i_private;
++	int ret;
++
++	get_device(&port->dev);
++	ret = single_open(f, usb_cser_rw_show, port);
++	if (ret)
++		put_device(&port->dev);
++	return ret;
++}
++
++static int debug_cdev_rw_release(struct inode *inode, struct file *f)
++{
++	struct seq_file *seq = f->private_data;
++	struct f_cdev *port = seq->private;
++	int ret = single_release(inode, f);
++
++	put_device(&port->dev);
++	return ret;
+ }
+ 
+ static const struct file_operations cser_rem_wakeup_fops = {
+@@ -1661,7 +1631,7 @@
+ 	.write = cser_rw_write,
+ 	.owner = THIS_MODULE,
+ 	.llseek = seq_lseek,
+-	.release = seq_release,
++	.release = debug_cdev_rw_release,
+ };
+ 
+ static void usb_cser_debugfs_init(struct f_cdev *port)
+@@ -1683,87 +1653,65 @@
+ {
+ 	struct f_cdev *port = container_of(dev, struct f_cdev, dev);
+ 
+-	pr_debug("Free cdev port(%d)\n", port->port_num);
++	mutex_lock(&chardev_ida_lock);
++	ida_free(&chardev_ida, port->minor);
++	usb_cser_chardev_deinit();
++	mutex_unlock(&chardev_ida_lock);
+ 	kfree(port);
+ }
+ 
+ static struct f_cdev *f_cdev_alloc(char *func_name, int portno)
+ {
++	struct f_cdev *port;
+ 	int ret;
+-	struct f_cdev *port;
+-
+-	port = kzalloc(sizeof(struct f_cdev), GFP_KERNEL);
+-	if (!port) {
+-		ret = -ENOMEM;
+-		return  ERR_PTR(ret);
+-	}
+-
++
++	port = kzalloc(sizeof(*port), GFP_KERNEL);
++	if (!port)
++		return ERR_PTR(-ENOMEM);
+ 	mutex_lock(&chardev_ida_lock);
+ 	if (ida_is_empty(&chardev_ida)) {
+ 		ret = usb_cser_alloc_chardev_region();
+-		if (ret) {
+-			mutex_unlock(&chardev_ida_lock);
+-			pr_err("alloc chardev failed\n");
+-			goto err_alloc_chardev;
+-		}
+-	}
+-
+-	ret = ida_simple_get(&chardev_ida, 0, 0, GFP_KERNEL);
+-	if (ret >= NUM_INSTANCE) {
+-		ida_simple_remove(&chardev_ida, ret);
+-		mutex_unlock(&chardev_ida_lock);
+-		ret = -ENODEV;
+-		goto err_get_ida;
+-	}
+-
++		if (ret)
++			goto unlock_free;
++	}
++	ret = ida_alloc_max(&chardev_ida, NUM_INSTANCE - 1, GFP_KERNEL);
++	if (ret < 0) {
++		usb_cser_chardev_deinit();
++		goto unlock_free;
++	}
++	port->minor = ret;
+ 	port->port_num = portno;
+-	port->minor = ret;
++	device_initialize(&port->dev);
++	port->dev.release = cdev_device_release;
++	port->dev.class = fcdev_classp;
++	port->dev.devt = MKDEV(major, port->minor);
+ 	mutex_unlock(&chardev_ida_lock);
+-
+-	snprintf(port->name, sizeof(port->name), "%s%d", DEVICE_NAME, portno);
+ 	spin_lock_init(&port->port_lock);
+-
++	mutex_init(&port->io_lock);
+ 	init_waitqueue_head(&port->open_wq);
+ 	init_waitqueue_head(&port->read_wq);
+ 	INIT_LIST_HEAD(&port->read_pool);
+ 	INIT_LIST_HEAD(&port->read_queued);
+ 	INIT_LIST_HEAD(&port->write_pool);
+-
+-	port->fcdev_wq = create_singlethread_workqueue(port->name);
+-	if (!port->fcdev_wq) {
+-		pr_err("Unable to create workqueue fcdev_wq for port:%s\n",
+-						port->name);
+-		ret = -ENOMEM;
+-		goto err_get_ida;
+-	}
+-
+-	/* create char device */
++	snprintf(port->name, sizeof(port->name), "%s%d", DEVICE_NAME, portno);
++	ret = dev_set_name(&port->dev, "%s", port->name);
++	if (ret)
++		goto put;
+ 	cdev_init(&port->fcdev_cdev, &f_cdev_fops);
+-	device_initialize(&port->dev);
+-	port->dev.class = fcdev_classp;
+-	port->dev.parent = NULL;
+-	port->dev.release = cdev_device_release;
+-	port->dev.devt = MKDEV(major, port->minor);
+-	dev_set_name(&port->dev, port->name);
++	port->fcdev_cdev.owner = THIS_MODULE;
+ 	ret = cdev_device_add(&port->fcdev_cdev, &port->dev);
+-	if (ret) {
+-		pr_err("Failed to add cdev for port(%s)\n", port->name);
+-		goto err_cdev_add;
+-	}
+-
++	if (ret)
++		goto put;
+ 	usb_cser_debugfs_init(port);
+-
+-	pr_info("port_name:%s (%pK) portno:(%d)\n",
+-			port->name, port, port->port_num);
+ 	return port;
+-
+-err_cdev_add:
+-	destroy_workqueue(port->fcdev_wq);
+-err_get_ida:
+-	usb_cser_chardev_deinit();
+-err_alloc_chardev:
++put:
++	WRITE_ONCE(port->dying, true);
++	wake_up(&port->open_wq);
++	put_device(&port->dev);
++	return ERR_PTR(ret);
++unlock_free:
++	mutex_unlock(&chardev_ida_lock);
+ 	kfree(port);
+-
+ 	return ERR_PTR(ret);
+ }
+ 
+@@ -1779,6 +1727,7 @@
+ 
+ 		if (!IS_ERR_OR_NULL(fcdev_classp))
+ 			class_destroy(fcdev_classp);
++		fcdev_classp = NULL;
+ 	}
+ }
+ 
+@@ -1802,7 +1751,11 @@
+ 	fcdev_classp = class_create(MODULE_NAME);
+ 	if (IS_ERR(fcdev_classp)) {
+ 		pr_err("class_create() failed ENOMEM\n");
+-		ret = -ENOMEM;
++		ret = PTR_ERR(fcdev_classp);
++		unregister_chrdev_region(MKDEV(major, 0), minors);
++		major = minors = 0;
++		fcdev_classp = NULL;
++		return ret;
+ 	}
+ 
+ 	return 0;
+@@ -1864,7 +1817,7 @@
+ 			(port->port_open ? "Opened" : "Closed"));
+ 	spin_unlock_irqrestore(&port->port_lock, flags);
+ 
+-	ret = scnprintf(page, temp, buf);
++	ret = scnprintf(page, PAGE_SIZE, "%s", buf);
+ 	kfree(buf);
+ 
+ 	return ret;
+@@ -1920,51 +1873,26 @@
+ 	if (name_len > MAX_CDEV_INST_NAME)
+ 		return -ENAMETOOLONG;
+ 
+-	/* expect name as cdev.<func>.<port_num> */
+-	str = strnchr(name, strlen(name), '.');
+-	if (!str) {
+-		pr_err("invalid input (%s)\n", name);
++	if (opts->port)
++		return -EBUSY;
++	str = strchr(name, '.');
++	if (!str || str == name || strchr(str + 1, '.'))
+ 		return -EINVAL;
+-	}
+-
+-	/* get function name */
+-	str_size = name_len - strlen(str);
+-	if (str_size > MAX_CDEV_FUNC_NAME)
++	str_size = str - name;
++	if (str_size >= MAX_CDEV_FUNC_NAME)
+ 		return -ENAMETOOLONG;
+-
+-	ptr = kstrndup(name, str_size - 1, GFP_KERNEL);
+-	if (!ptr) {
+-		pr_err("error:%ld\n", PTR_ERR(ptr));
++	ret = kstrtou8(str + 1, 0, &opts->port_num);
++	if (ret)
++		return ret;
++	ptr = kstrndup(name, str_size, GFP_KERNEL);
++	if (!ptr)
+ 		return -ENOMEM;
+-	}
+-
++	port = f_cdev_alloc(ptr, opts->port_num);
++	if (IS_ERR(port)) {
++		kfree(ptr);
++		return PTR_ERR(port);
++	}
+ 	opts->func_name = ptr;
+-
+-	/* get port number */
+-	str = strrchr(name, '.');
+-	if (!str) {
+-		pr_err("err: port number not found\n");
+-		return -EINVAL;
+-	}
+-	pr_debug("str:%s\n", str);
+-
+-	*str = '\0';
+-	str++;
+-
+-	ret = kstrtou8(str, 0, &opts->port_num);
+-	if (ret) {
+-		pr_err("erro: not able to get port number\n");
+-		return -EINVAL;
+-	}
+-
+-	pr_debug("gser: port_num:%d func_name:%s\n",
+-			opts->port_num, opts->func_name);
+-
+-	port = f_cdev_alloc(opts->func_name, opts->port_num);
+-	if (IS_ERR(port)) {
+-		pr_err("Failed to create cdev port(%d)\n", opts->port_num);
+-		return -ENOMEM;
+-	}
+ 
+ 	opts->port = port;
+ 
+@@ -2009,6 +1937,11 @@
+ 	struct f_cdev_opts *opts = to_fi_cdev_opts(fi);
+ 	struct f_cdev *port = opts->port;
+ 
++	if (!port)
++		return ERR_PTR(-ENODEV);
++	if (atomic_cmpxchg(&port->function_allocated, 0, 1))
++		return ERR_PTR(-EBUSY);
++
+ 	port->port_usb.func.name = "cser";
+ 	port->port_usb.func.strings = usb_cser_strings;
+ 	port->port_usb.func.bind = usb_cser_bind;
+--- a/drivers/usb/gadget/function/f_fs_ipc_log.c
++++ b/drivers/usb/gadget/function/f_fs_ipc_log.c
+@@ -39,22 +39,93 @@
+ 
+ /* Copied from f_fs.c */
+ struct ffs_epfile {
++	/* Protects ep->ep and ep->req. */
+ 	struct mutex			mutex;
++
+ 	struct ffs_data			*ffs;
+-	struct ffs_ep			*ep;	/* P: ffs->eps_lock */
++	struct ffs_ep			*ep;		/* P: ffs->eps_lock */
++	struct ffs_epfile		*epfile_in;	/* P: ffs->eps_lock */
++	struct ffs_epfile		*epfile_out;	/* P: ffs->eps_lock */
++
+ 	struct dentry			*dentry;
++
++	/*
++	 * Buffer for holding data from partial reads which may happen since
++	 * we’re rounding user read requests to a multiple of a max packet size.
++	 *
++	 * The pointer is initialised with NULL value and may be set by
++	 * __ffs_epfile_read_data function to point to a temporary buffer.
++	 *
++	 * In normal operation, calls to __ffs_epfile_read_buffered will consume
++	 * data from said buffer and eventually free it.  Importantly, while the
++	 * function is using the buffer, it sets the pointer to NULL.  This is
++	 * all right since __ffs_epfile_read_data and __ffs_epfile_read_buffered
++	 * can never run concurrently (they are synchronised by epfile->mutex)
++	 * so the latter will not assign a new value to the pointer.
++	 *
++	 * Meanwhile ffs_func_eps_disable frees the buffer (if the pointer is
++	 * valid) and sets the pointer to READ_BUFFER_DROP value.  This special
++	 * value is crux of the synchronisation between ffs_func_eps_disable and
++	 * __ffs_epfile_read_data.
++	 *
++	 * Once __ffs_epfile_read_data is about to finish it will try to set the
++	 * pointer back to its old value (as described above), but seeing as the
++	 * pointer is not-NULL (namely READ_BUFFER_DROP) it will instead free
++	 * the buffer.
++	 *
++	 * == State transitions ==
++	 *
++	 * • ptr == NULL:  (initial state)
++	 *   ◦ __ffs_epfile_read_buffer_free: go to ptr == DROP
++	 *   ◦ __ffs_epfile_read_buffered:    nop
++	 *   ◦ __ffs_epfile_read_data allocates temp buffer: go to ptr == buf
++	 *   ◦ reading finishes:              n/a, not in ‘and reading’ state
++	 * • ptr == DROP:
++	 *   ◦ __ffs_epfile_read_buffer_free: nop
++	 *   ◦ __ffs_epfile_read_buffered:    go to ptr == NULL
++	 *   ◦ __ffs_epfile_read_data allocates temp buffer: free buf, nop
++	 *   ◦ reading finishes:              n/a, not in ‘and reading’ state
++	 * • ptr == buf:
++	 *   ◦ __ffs_epfile_read_buffer_free: free buf, go to ptr == DROP
++	 *   ◦ __ffs_epfile_read_buffered:    go to ptr == NULL and reading
++	 *   ◦ __ffs_epfile_read_data:        n/a, __ffs_epfile_read_buffered
++	 *                                    is always called first
++	 *   ◦ reading finishes:              n/a, not in ‘and reading’ state
++	 * • ptr == NULL and reading:
++	 *   ◦ __ffs_epfile_read_buffer_free: go to ptr == DROP and reading
++	 *   ◦ __ffs_epfile_read_buffered:    n/a, mutex is held
++	 *   ◦ __ffs_epfile_read_data:        n/a, mutex is held
++	 *   ◦ reading finishes and …
++	 *     … all data read:               free buf, go to ptr == NULL
++	 *     … otherwise:                   go to ptr == buf and reading
++	 * • ptr == DROP and reading:
++	 *   ◦ __ffs_epfile_read_buffer_free: nop
++	 *   ◦ __ffs_epfile_read_buffered:    n/a, mutex is held
++	 *   ◦ __ffs_epfile_read_data:        n/a, mutex is held
++	 *   ◦ reading finishes:              free buf, go to ptr == DROP
++	 */
+ 	struct ffs_buffer		*read_buffer;
+ #define READ_BUFFER_DROP ((struct ffs_buffer *)ERR_PTR(-ESHUTDOWN))
+-	char				name[5];
++
++	char				name[8];
++
+ 	unsigned char			in;	/* P: ffs->eps_lock */
+ 	unsigned char			isoc;	/* P: ffs->eps_lock */
+-	unsigned char			_pad;
++
++	u8				zlp_enabled; /* P: ffs->eps_lock */
++	bool				is_rw_proxy;
++
++	/* Protects dmabufs */
++	struct mutex			dmabufs_mutex;
++	struct list_head		dmabufs; /* P: dmabufs_mutex */
++	atomic_t			seqno;
+ };
+ 
+ /* Copied from f_fs.c */
+ struct ffs_ep {
+ 	struct usb_ep			*ep;	/* P: ffs->eps_lock */
+ 	struct usb_request		*req;	/* P: epfile->mutex */
++
+ 	/* [0]: full speed, [1]: high speed, [2]: super speed */
+ 	struct usb_endpoint_descriptor	*descs[3];
+ 
+@@ -75,10 +146,13 @@
+ 	struct usb_configuration	*conf;
+ 	struct usb_gadget		*gadget;
+ 	struct ffs_data			*ffs;
++
+ 	struct ffs_ep			*eps;
+ 	u8				eps_revmap[16];
+ 	short				*interfaces_nums;
++
+ 	struct usb_function		function;
++	int				cur_alt[MAX_CONFIG_INTERFACES];
+ };
+ 
+ /* Copied from f_fs.c */
+@@ -94,6 +168,7 @@
+ 
+ /* per-probe private data */
+ struct kprobe_data {
++	void *context;
+ 	void *x0;
+ 	void *x1;
+ 	void *x2;
+@@ -103,14 +178,12 @@
+ 
+ struct ipc_log_work {
+ 	struct work_struct ctxt_work;
+-	struct ffs_data *ffs;
+ 	char dev_name[MAX_DEV_NAME_SIZE];
+ };
+ 
+ /* per-device IPC log data */
+ struct ipc_log {
+ 	void *context;
+-	struct ffs_data *ffs;
+ 	char dev_name[MAX_DEV_NAME_SIZE];
+ };
+ 
+@@ -119,16 +192,7 @@
+ 
+ /* Number of devices for f_fs driver */
+ static int num_devices;
+-
+-static int ipc_inst_exists(struct ffs_data *ffs)
+-{
+-	int i;
+-
+-	for (i = 0; i < num_devices; i++)
+-		if (ipc_log_s[i].ffs == ffs)
+-			return i;
+-	return -ENODEV;
+-}
++static DEFINE_SPINLOCK(ipc_lock);
+ 
+ static int ipc_inst_dev_exists(const char *dev_name)
+ {
+@@ -152,10 +216,10 @@
+ 	char ipcname[50] = "usb_ffs_";
+ 	void *ctx;
+ 	int i;
++	unsigned long flags;
+ 
+ 	i = ipc_inst_dev_exists(ipc_w->dev_name);
+ 	if (i >= 0) {
+-		ipc_log_s[i].ffs = ipc_w->ffs;
+ 		goto exit;
+ 	}
+ 
+@@ -172,16 +236,17 @@
+ 		goto exit;
+ 	}
+ 
++	spin_lock_irqsave(&ipc_lock, flags);
+ 	ipc_log_s[num_devices].context = ctx;
+-	ipc_log_s[num_devices].ffs = ipc_w->ffs;
+ 	strscpy(ipc_log_s[num_devices].dev_name, ipc_w->dev_name, MAX_DEV_NAME_SIZE);
+ 	num_devices++;
++	spin_unlock_irqrestore(&ipc_lock, flags);
+ 
+ exit:
+ 	kfree(ipc_w);
+ }
+ 
+-static void create_ipc_context(const char *dev_name, struct ffs_data *ffs)
++static void create_ipc_context(const char *dev_name)
+ {
+ 	struct ipc_log_work *ipc_w;
+ 
+@@ -190,21 +255,26 @@
+ 		return;
+ 
+ 	INIT_WORK(&ipc_w->ctxt_work, create_ipc_context_work);
+-	strscpy(ipc_w->dev_name, ffs->dev_name, MAX_DEV_NAME_SIZE);
+-	ipc_w->ffs = ffs;
++	strscpy(ipc_w->dev_name, dev_name, MAX_DEV_NAME_SIZE);
+ 
+ 	queue_work(ipc_wq, &ipc_w->ctxt_work);
+ }
+ 
++/* Contexts stay resident until all probes and creation work have drained. */
+ static void *get_ipc_context(struct ffs_data *ffs)
+ {
+-	int idx = 0;
+-
+-	idx = ipc_inst_exists(ffs);
++	void *context = NULL;
++	unsigned long flags;
++	int idx;
++
++	if (!ffs || !ffs->dev_name)
++		return NULL;
++	spin_lock_irqsave(&ipc_lock, flags);
++	idx = ipc_inst_dev_exists(ffs->dev_name);
+ 	if (idx >= 0)
+-		return ipc_log_s[idx].context;
+-
+-	return NULL;
++		context = ipc_log_s[idx].context;
++	spin_unlock_irqrestore(&ipc_lock, flags);
++	return context;
+ }
+ 
+ static int entry_ffs_user_copy_worker(struct kretprobe_instance *ri,
+@@ -220,35 +290,10 @@
+ 	data->x0 = work;
+ 	kprobe_log(context, "enter: ret %d for %s",
+ 		ret, io_data->read ? "read" : "write");
+-	return 0;
+-}
+-
+-static int entry_ffs_epfile_io(struct kretprobe_instance *ri, struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	struct file *file = (struct file *)regs->regs[0];
+-	struct ffs_io_data *io_data = (struct ffs_io_data *)regs->regs[1];
+-	struct ffs_epfile *epfile = file->private_data;
+-	void *context = get_ipc_context(epfile->ffs);
+-
+-	data->x0 = file;
+-	data->x1 = io_data;
+-	kprobe_log(context, "enter: %s about to queue %zd bytes",
+-		epfile->name, iov_iter_count(&io_data->data));
+-	return 0;
+-}
+-
+-static int exit_ffs_epfile_io(struct kretprobe_instance *ri, struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	struct file *file = data->x0;
+-	struct ffs_epfile *epfile = file->private_data;
+-	unsigned long ret = regs_return_value(regs);
+-	void *context = get_ipc_context(epfile->ffs);
+-
+-	kprobe_log(context, "exit: %s ret %zd", epfile->name, ret);
+-	return 0;
+-}
++	return 1;
++}
++
++
+ 
+ static int entry_ffs_epfile_async_io_complete(struct kretprobe_instance *ri,
+ 					      struct pt_regs *regs)
+@@ -258,7 +303,7 @@
+ 	void *context = get_ipc_context(io_data->ffs);
+ 
+ 	kprobe_log(context, "enter");
+-	return 0;
++	return 1;
+ }
+ 
+ static int entry_ffs_epfile_write_iter(struct kretprobe_instance *ri,
+@@ -270,21 +315,17 @@
+ 	void *context = get_ipc_context(epfile->ffs);
+ 
+ 	data->x0 = kiocb;
++	data->context = context;
+ 	kprobe_log(context, "enter");
+ 	return 0;
+ }
+ 
+ static int exit_ffs_epfile_write_iter(struct kretprobe_instance *ri,
+-				      struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	struct kiocb *kiocb = data->x0;
+-	struct ffs_epfile *epfile = kiocb->ki_filp->private_data;
+-	void *context = get_ipc_context(epfile->ffs);
+-	unsigned long ret = regs_return_value(regs);
+-
+-	if (ret != -ENOMEM && ret != -EIOCBQUEUED)
+-		kprobe_log(context, "exit: ret %zd", ret);
++				struct pt_regs *regs)
++{
++	struct kprobe_data *data = (struct kprobe_data *)ri->data;
++
++	kprobe_log(data->context, "exit: ret %ld", (long)regs_return_value(regs));
+ 	return 0;
+ }
+ 
+@@ -297,20 +338,17 @@
+ 	void *context = get_ipc_context(epfile->ffs);
+ 
+ 	data->x0 = kiocb;
++	data->context = context;
+ 	kprobe_log(context, "enter");
+ 	return 0;
+ }
+ 
+ static int exit_ffs_epfile_read_iter(struct kretprobe_instance *ri,
+-				     struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	struct kiocb *kiocb = data->x0;
+-	struct ffs_epfile *epfile = kiocb->ki_filp->private_data;
+-	void *context = get_ipc_context(epfile->ffs);
+-	unsigned long ret = regs_return_value(regs);
+-
+-	kprobe_log(context, "exit: ret %zd", ret);
++				struct pt_regs *regs)
++{
++	struct kprobe_data *data = (struct kprobe_data *)ri->data;
++
++	kprobe_log(data->context, "exit: ret %ld", (long)regs_return_value(regs));
+ 	return 0;
+ }
+ 
+@@ -323,7 +361,7 @@
+ 
+ 	kprobe_log(context, "ref %u", refcount);
+ 
+-	return 0;
++	return 1;
+ }
+ 
+ static int entry_ffs_sb_fill(struct kretprobe_instance *ri, struct pt_regs *regs)
+@@ -331,9 +369,9 @@
+ 	struct fs_context *fc = (struct fs_context *)regs->regs[1];
+ 	struct ffs_sb_fill_data *data = fc->fs_private;
+ 
+-	create_ipc_context(fc->source, data->ffs_data);
+-
+-	return 0;
++	create_ipc_context(data->ffs_data->dev_name);
++
++	return 1;
+ }
+ 
+ static int entry___ffs_ep0_queue_wait(struct kretprobe_instance *ri,
+@@ -344,20 +382,18 @@
+ 	void *context = get_ipc_context(ffs);
+ 
+ 	data->x0 = ffs;
++	data->context = context;
+ 	kprobe_log(context, "enter: state %d setup_state %d flags %lu",
+ 		ffs->state, ffs->setup_state, ffs->flags);
+ 	return 0;
+ }
+ 
+ static int exit___ffs_ep0_queue_wait(struct kretprobe_instance *ri,
+-				   struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	struct ffs_data *ffs = data->x0;
+-	void *context = get_ipc_context(ffs);
+-
+-	kprobe_log(context, "exit: state %d setup_state %d flags %lu",
+-		ffs->state, ffs->setup_state, ffs->flags);
++				struct pt_regs *regs)
++{
++	struct kprobe_data *data = (struct kprobe_data *)ri->data;
++
++	kprobe_log(data->context, "exit: ret %ld", (long)regs_return_value(regs));
+ 	return 0;
+ }
+ 
+@@ -371,26 +407,18 @@
+ 	void *context = get_ipc_context(ffs);
+ 
+ 	data->x0 = file;
++	data->context = context;
+ 	kprobe_log(context, "enter:len %u state %d setup_state %d flags %lu",
+ 		len, ffs->state, ffs->setup_state, ffs->flags);
+ 	return 0;
+ }
+ 
+ static int exit_ffs_ep0_write(struct kretprobe_instance *ri,
+-				   struct pt_regs *regs)
+-{
+-
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	struct file *file = data->x0;
+-	struct ffs_data *ffs = file->private_data;
+-	void *context = get_ipc_context(ffs);
+-	unsigned long ret = regs_return_value(regs);
+-
+-	if (ret != -EIDRM && ret != -EINVAL)
+-		kprobe_log(context,
+-			"exit:ret %zd state %d setup_state %d flags %lu",
+-			ret, ffs->state, ffs->setup_state, ffs->flags);
+-
++				struct pt_regs *regs)
++{
++	struct kprobe_data *data = (struct kprobe_data *)ri->data;
++
++	kprobe_log(data->context, "exit: ret %ld", (long)regs_return_value(regs));
+ 	return 0;
+ }
+ 
+@@ -406,22 +434,18 @@
+ 
+ 	data->x0 = file;
+ 	n = min((len / sizeof(struct usb_functionfs_event)), (size_t)ffs->ev.count);
++	data->context = context;
+ 	kprobe_log(context, "enter:len %zu state %d setup_state %d flags %lu n %zu",
+ 		len, ffs->state, ffs->setup_state, ffs->flags, n);
+ 	return 0;
+ }
+ 
+ static int exit_ffs_ep0_read(struct kretprobe_instance *ri,
+-				   struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	struct file *file = data->x0;
+-	struct ffs_data *ffs = file->private_data;
+-	void *context = get_ipc_context(ffs);
+-	unsigned long ret = regs_return_value(regs);
+-
+-	kprobe_log(context, "exit:ret %zu state %d setup_state %d flags %lu",
+-		ret, ffs->state, ffs->setup_state, ffs->flags);
++				struct pt_regs *regs)
++{
++	struct kprobe_data *data = (struct kprobe_data *)ri->data;
++
++	kprobe_log(data->context, "exit: ret %ld", (long)regs_return_value(regs));
+ 	return 0;
+ }
+ 
+@@ -435,7 +459,7 @@
+ 	kprobe_log(context, "state %d setup_state %d flags %lu opened %d",
+ 		ffs->state, ffs->setup_state, ffs->flags,
+ 		atomic_read(&ffs->opened));
+-	return 0;
++	return 1;
+ }
+ 
+ static int entry_ffs_ep0_release(struct kretprobe_instance *ri,
+@@ -448,7 +472,7 @@
+ 	kprobe_log(context, "state %d setup_state %d flags %lu opened %d",
+ 		ffs->state, ffs->setup_state, ffs->flags,
+ 		atomic_read(&ffs->opened));
+-	return 0;
++	return 1;
+ }
+ 
+ static int entry_ffs_ep0_ioctl(struct kretprobe_instance *ri,
+@@ -461,7 +485,7 @@
+ 	kprobe_log(context, "state %d setup_state %d flags %lu opened %d",
+ 		ffs->state, ffs->setup_state, ffs->flags,
+ 		atomic_read(&ffs->opened));
+-	return 0;
++	return 1;
+ }
+ 
+ static int entry_ffs_epfile_open(struct kretprobe_instance *ri,
+@@ -474,7 +498,7 @@
+ 	kprobe_log(context, "%s: state %d setup_state %d flag %lu opened %u",
+ 		epfile->name, epfile->ffs->state, epfile->ffs->setup_state,
+ 		epfile->ffs->flags, atomic_read(&epfile->ffs->opened));
+-	return 0;
++	return 1;
+ }
+ 
+ static int entry_ffs_aio_cancel(struct kretprobe_instance *ri,
+@@ -486,6 +510,7 @@
+ 	void *context = get_ipc_context(epfile->ffs);
+ 
+ 	data->x0 = kiocb;
++	data->context = context;
+ 	kprobe_log(context, "enter:state %d setup_state %d flag %lu",
+ 		epfile->ffs->state, epfile->ffs->setup_state,
+ 		epfile->ffs->flags);
+@@ -493,15 +518,11 @@
+ }
+ 
+ static int exit_ffs_aio_cancel(struct kretprobe_instance *ri,
+-				   struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	unsigned long ret = regs_return_value(regs);
+-	struct kiocb *kiocb = data->x0;
+-	struct ffs_epfile *epfile = kiocb->ki_filp->private_data;
+-	void *context = get_ipc_context(epfile->ffs);
+-
+-	kprobe_log(context, "exit: mask %lu", ret);
++				struct pt_regs *regs)
++{
++	struct kprobe_data *data = (struct kprobe_data *)ri->data;
++
++	kprobe_log(data->context, "exit: ret %ld", (long)regs_return_value(regs));
+ 	return 0;
+ }
+ 
+@@ -515,7 +536,7 @@
+ 	kprobe_log(context, "%s: state %d setup_state %d flag %lu opened %u",
+ 		epfile->name, epfile->ffs->state, epfile->ffs->setup_state,
+ 		epfile->ffs->flags, atomic_read(&epfile->ffs->opened));
+-	return 0;
++	return 1;
+ }
+ 
+ static int entry_ffs_epfile_ioctl(struct kretprobe_instance *ri,
+@@ -529,6 +550,7 @@
+ 	void *context = get_ipc_context(epfile->ffs);
+ 
+ 	data->x0 = file;
++	data->context = context;
+ 	kprobe_log(context,
+ 		"%s: code 0x%08x value %#lx state %d setup_state %d flag %lu",
+ 		epfile->name, code, value, epfile->ffs->state,
+@@ -537,30 +559,14 @@
+ }
+ 
+ static int exit_ffs_epfile_ioctl(struct kretprobe_instance *ri,
+-				   struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	unsigned long ret = regs_return_value(regs);
+-	struct file *file = data->x0;
+-	struct ffs_epfile *epfile = file->private_data;
+-	void *context = get_ipc_context(epfile->ffs);
+-
+-	kprobe_log(context, "exit: %s: ret %lu\n", epfile->name, ret);
+-	return 0;
+-}
+-
+-static int entry_ffs_data_opened(struct kretprobe_instance *ri,
+-				    struct pt_regs *regs)
+-{
+-	struct ffs_data *ffs = (struct ffs_data *)regs->regs[0];
+-	void *context = get_ipc_context(ffs);
+-
+-	kprobe_log(context,
+-		"enter: state %d setup_state %d flag %lu opened %d ref %d",
+-		ffs->state, ffs->setup_state, ffs->flags,
+-		atomic_read(&ffs->opened), refcount_read(&ffs->ref));
+-	return 0;
+-}
++				struct pt_regs *regs)
++{
++	struct kprobe_data *data = (struct kprobe_data *)ri->data;
++
++	kprobe_log(data->context, "exit: ret %ld", (long)regs_return_value(regs));
++	return 0;
++}
++
+ 
+ static int entry_ffs_data_closed(struct kretprobe_instance *ri,
+ 				    struct pt_regs *regs)
+@@ -571,7 +577,7 @@
+ 	kprobe_log(context, "state %d setup_state %d flag %lu opened %d",
+ 		ffs->state, ffs->setup_state, ffs->flags,
+ 		atomic_read(&ffs->opened));
+-	return 0;
++	return 1;
+ }
+ 
+ static int entry_ffs_data_clear(struct kretprobe_instance *ri,
+@@ -582,33 +588,10 @@
+ 
+ 	kprobe_log(context, "enter: state %d setup_state %d flag %lu",
+ 		ffs->state, ffs->setup_state, ffs->flags);
+-	return 0;
+-}
+-
+-static int entry_functionfs_bind(struct kretprobe_instance *ri,
+-				    struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	struct ffs_data *ffs = (struct ffs_data *)regs->regs[0];
+-	void *context = get_ipc_context(ffs);
+-
+-	data->x0 = ffs;
+-	kprobe_log(context, "enter: state %d setup_state %d flag %lu",
+-		ffs->state, ffs->setup_state, ffs->flags);
+-	return 0;
+-}
+-
+-static int exit_functionfs_bind(struct kretprobe_instance *ri,
+-				    struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	struct ffs_data *ffs = data->x0;
+-	void *context = get_ipc_context(ffs);
+-	unsigned long ret = regs_return_value(regs);
+-
+-	kprobe_log(context, "functionfs_bind returned %lu", ret);
+-	return 0;
+-}
++	return 1;
++}
++
++
+ 
+ static int entry_ffs_func_eps_disable(struct kretprobe_instance *ri,
+ 				    struct pt_regs *regs)
+@@ -618,46 +601,10 @@
+ 
+ 	kprobe_log(context, "enter: state %d setup_state %d flag %lu",
+ 		func->ffs->state, func->ffs->setup_state, func->ffs->flags);
+-	return 0;
+-}
+-
+-static int entry_ffs_func_bind(struct kretprobe_instance *ri,
+-				    struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	struct usb_function *f = (struct usb_function *)regs->regs[1];
+-	struct f_fs_opts *ffs_opts =
+-		container_of(f->fi, struct f_fs_opts, func_inst);
+-	/* func->ffs not set yet; get ffs_data via ffs_opts instead */
+-	struct ffs_data *ffs = ffs_opts->dev->ffs_data;
+-	void *context;
+-
+-	if (!ffs)
+-		return 0;
+-
+-	context = get_ipc_context(ffs);
+-	data->x0 = ffs;
+-	kprobe_log(context, "enter: state %d setup_state %d flag %lu",
+-		ffs->state, ffs->setup_state, ffs->flags);
+-	return 0;
+-}
+-
+-static int exit_ffs_func_bind(struct kretprobe_instance *ri,
+-				   struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	int ret = (int)regs_return_value(regs);
+-	struct ffs_data *ffs = data->x0;
+-	void *context;
+-
+-	if (!ffs)
+-		return 0;
+-
+-	context = get_ipc_context(ffs);
+-	if (ret < 0)
+-		kprobe_log(context, "exit: ret %d", ret);
+-	return 0;
+-}
++	return 1;
++}
++
++
+ 
+ static int entry_ffs_reset_work(struct kretprobe_instance *ri,
+ 				    struct pt_regs *regs)
+@@ -667,7 +614,7 @@
+ 	void *context = get_ipc_context(ffs);
+ 
+ 	kprobe_log(context, "enter");
+-	return 0;
++	return 1;
+ }
+ 
+ static int entry_ffs_func_set_alt(struct kretprobe_instance *ri,
+@@ -681,7 +628,7 @@
+ 
+ 	data->x0 = func;
+ 	kprobe_log(context, "enter: alt %d", (int)alt);
+-	return 0;
++	return 1;
+ }
+ 
+ static int entry_ffs_func_disable(struct kretprobe_instance *ri,
+@@ -692,7 +639,7 @@
+ 	void *context = get_ipc_context(func->ffs);
+ 
+ 	kprobe_log(context, "enter");
+-	return 0;
++	return 1;
+ }
+ 
+ static int entry_ffs_func_setup(struct kretprobe_instance *ri,
+@@ -709,7 +656,7 @@
+ 			ffs->state, creq->bRequestType, creq->bRequest,
+ 			le16_to_cpu(creq->wValue), le16_to_cpu(creq->wIndex),
+ 			le16_to_cpu(creq->wLength));
+-	return 0;
++	return 1;
+ }
+ 
+ static int entry_ffs_func_suspend(struct kretprobe_instance *ri,
+@@ -720,7 +667,7 @@
+ 	void *context = get_ipc_context(func->ffs);
+ 
+ 	kprobe_log(context, "enter");
+-	return 0;
++	return 1;
+ }
+ 
+ static int entry_ffs_func_resume(struct kretprobe_instance *ri,
+@@ -731,7 +678,7 @@
+ 	void *context = get_ipc_context(func->ffs);
+ 
+ 	kprobe_log(context, "enter");
+-	return 0;
++	return 1;
+ }
+ 
+ static int entry_ffs_func_unbind(struct kretprobe_instance *ri,
+@@ -746,51 +693,22 @@
+ 	void *context = get_ipc_context(ffs);
+ 
+ 	data->x1 = ffs;
++	data->context = context;
+ 	kprobe_log(context, "enter: state %d setup_state %d flag %lu refcnt %u",
+ 		ffs->state, ffs->setup_state, ffs->flags, opts->refcnt);
+ 	return 0;
+ }
+ 
+ static int exit_ffs_func_unbind(struct kretprobe_instance *ri,
+-				    struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	struct ffs_data *ffs = data->x1;
+-	void *context = get_ipc_context(ffs);
+-
+-	kprobe_log(context, "exit: state %d setup_state %d flag %lu",
+-		ffs->state, ffs->setup_state, ffs->flags);
+-	return 0;
+-}
+-
+-static int entry_ffs_closed(struct kretprobe_instance *ri,
+-				    struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	struct ffs_data *ffs = (struct ffs_data *)regs->regs[0];
+-	void *context = get_ipc_context(ffs);
+-
+-	data->x0 = ffs;
+-	kprobe_log(context, "enter");
+-	return 0;
+-}
+-
+-static int exit_ffs_closed(struct kretprobe_instance *ri,
+-				   struct pt_regs *regs)
+-{
+-	struct kprobe_data *data = (struct kprobe_data *)ri->data;
+-	struct ffs_data *ffs = data->x0;
+-	struct ffs_dev *ffs_obj = ffs->private_data;
+-	void *context = get_ipc_context(ffs);
+-
+-	if (test_bit(FFS_FL_BOUND, &ffs->flags))
+-		kprobe_log(context, "unreg gadget done");
+-	else if (!ffs_obj || !ffs_obj->opts || ffs_obj->opts->no_configfs ||
+-		 !ffs_obj->opts->func_inst.group.cg_item.ci_parent
+-		 || !kref_read(&ffs_obj->opts->func_inst.group.cg_item.ci_kref))
+-		kprobe_log(context, "exit error");
+-	return 0;
+-}
++				struct pt_regs *regs)
++{
++	struct kprobe_data *data = (struct kprobe_data *)ri->data;
++
++	kprobe_log(data->context, "exit: ret %ld", (long)regs_return_value(regs));
++	return 0;
++}
++
++
+ 
+ #define ENTRY_EXIT(name) {\
+ 	.handler = exit_##name,\
+@@ -809,7 +727,6 @@
+ 
+ static struct kretprobe ffsprobes[] = {
+ 	ENTRY(ffs_user_copy_worker),
+-	ENTRY_EXIT(ffs_epfile_io),
+ 	ENTRY(ffs_epfile_async_io_complete),
+ 	ENTRY_EXIT(ffs_epfile_write_iter),
+ 	ENTRY_EXIT(ffs_epfile_read_iter),
+@@ -825,12 +742,9 @@
+ 	ENTRY_EXIT(ffs_aio_cancel),
+ 	ENTRY(ffs_epfile_release),
+ 	ENTRY_EXIT(ffs_epfile_ioctl),
+-	ENTRY(ffs_data_opened),
+ 	ENTRY(ffs_data_closed),
+ 	ENTRY(ffs_data_clear),
+-	ENTRY_EXIT(functionfs_bind),
+ 	ENTRY(ffs_func_eps_disable),
+-	ENTRY_EXIT(ffs_func_bind),
+ 	ENTRY(ffs_reset_work),
+ 	ENTRY(ffs_func_set_alt),
+ 	ENTRY(ffs_func_disable),
+@@ -838,25 +752,26 @@
+ 	ENTRY(ffs_func_suspend),
+ 	ENTRY(ffs_func_resume),
+ 	ENTRY_EXIT(ffs_func_unbind),
+-	ENTRY_EXIT(ffs_closed)
+ };
+ 
+ static int __init kretprobe_init(void)
+ {
+-	int ret;
+-	int i;
+-
+-	ipc_wq = alloc_ordered_workqueue("ipc_wq", 0);
+-	if (!ipc_wq) {
+-		pr_err("%s: Unable to create workqueue ipc_wq\n", __func__);
++	int ret, i;
++
++	ipc_wq = alloc_ordered_workqueue("ffs_ipc_wq", 0);
++	if (!ipc_wq)
+ 		return -ENOMEM;
+-	}
+-
+ 	for (i = 0; i < ARRAY_SIZE(ffsprobes); i++) {
+ 		ret = register_kretprobe(&ffsprobes[i]);
+-		if (ret < 0) {
+-			pr_err("register_kretprobe failed at %s, returned %d\n",
+-				ffsprobes[i].kp.symbol_name, ret);
++		if (ret) {
++			pr_err("FunctionFS probe %s failed: %d\n",
++			       ffsprobes[i].kp.symbol_name, ret);
++			while (i--)
++				unregister_kretprobe(&ffsprobes[i]);
++			destroy_workqueue(ipc_wq);
++			for (i = 0; i < num_devices; i++)
++				ipc_log_context_destroy(ipc_log_s[i].context);
++			return ret;
+ 		}
+ 	}
+ 	return 0;
+@@ -866,25 +781,15 @@
+ {
+ 	int i;
+ 
++	/* Stop producers/readers before destroying their workqueue or contexts. */
++	for (i = 0; i < ARRAY_SIZE(ffsprobes); i++)
++		unregister_kretprobe(&ffsprobes[i]);
+ 	destroy_workqueue(ipc_wq);
+-	for (i = 0; i < num_devices; i++) {
+-		if (ipc_log_s[i].ffs) {
+-			ipc_log_context_destroy(ipc_log_s[i].context);
+-			ipc_log_s[i].context = NULL;
+-		}
+-	}
+-
+-	for (i = 0; i < ARRAY_SIZE(ffsprobes); i++) {
+-		unregister_kretprobe(&ffsprobes[i]);
+-
+-		/* nmissed > 0 suggests that maxactive was set too low. */
+-		if (ffsprobes[i].nmissed > 0)
+-			pr_info("Missed probing %d instances of %s\n",
+-				ffsprobes[i].nmissed,
+-				ffsprobes[i].kp.symbol_name);
+-	}
++	for (i = 0; i < num_devices; i++)
++		ipc_log_context_destroy(ipc_log_s[i].context);
+ }
+ 
+ module_init(kretprobe_init)
+ module_exit(kretprobe_exit)
+ MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("FunctionFS IPC diagnostics for pinned Android 17 Linux 6.18");

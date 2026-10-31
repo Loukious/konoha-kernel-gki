@@ -2350,6 +2350,19 @@ ddk_module(
     visibility = ["//visibility:public"],
 )
 
+ddk_module(
+    name = "usb_f_ccid", srcs = ["drivers/usb/gadget/function/f_ccid.c", "drivers/usb/gadget/function/f_ccid.h", "include/linux/usb/ccid_desc.h"], linux_includes = ["include"], out = "usb_f_ccid.ko",
+    kconfig = "Kconfig", defconfig = "platform_defconfig", kernel_build = "//common:kernel_aarch64", visibility = ["//visibility:public"],
+)
+ddk_module(
+    name = "usb_f_cdev", srcs = ["drivers/usb/gadget/function/f_cdev.c"], out = "usb_f_cdev.ko",
+    kconfig = "Kconfig", defconfig = "platform_defconfig", kernel_build = "//common:kernel_aarch64", visibility = ["//visibility:public"],
+)
+ddk_module(
+    name = "f_fs_ipc_log", srcs = ["drivers/usb/gadget/function/f_fs_ipc_log.c", "drivers/usb/gadget/function/u_fs.h"], out = "f_fs_ipc_log.ko",
+    kconfig = "Kconfig", defconfig = "platform_defconfig", kernel_build = "//common:kernel_aarch64", deps = [":platform_headers", ":qcom_ipc_logging"], visibility = ["//visibility:public"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -2524,6 +2537,9 @@ kernel_module_group(
         ":governor_msm_adreno_tz",
         ":governor_gpubw_mon",
         ":nxp_nci",
+        ":usb_f_ccid",
+        ":usb_f_cdev",
+        ":f_fs_ipc_log",
     ],
 )
 
