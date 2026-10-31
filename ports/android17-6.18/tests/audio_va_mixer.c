@@ -1,0 +1,9 @@
+/* SERVICES */
+static int power_updates,power_result;
+static struct snd_soc_dapm_widget *snd_soc_dapm_kcontrol_widget(struct snd_kcontrol*k){return k->widget;}
+static int snd_soc_dapm_mixer_update_power(struct snd_soc_dapm_context*d,struct snd_kcontrol*k,int en,void*u){power_updates++;struct lpass_cdc_va_macro_priv*p=macro_dev->data;assert(!!test_bit(((struct soc_mixer_control*)k->private_value)->shift,&p->active_ch_mask[k->widget->shift])==!!en);return power_result;}
+/* SOURCE */
+int main(void){struct device parent={0},d={.parent=&parent};macro_dev=&d;struct lpass_cdc_va_macro_priv p;struct snd_soc_component c={.dev=&parent};struct snd_soc_dapm_context dapm={.component=&c};struct snd_soc_dapm_widget w={.dapm=&dapm,.shift=1};struct soc_mixer_control m={.shift=2};struct snd_kcontrol k={.widget=&w,.private_value=(unsigned long)&m};struct snd_ctl_elem_value v={0};init_va(&p,&d);p.component=&c;int cases=0;
+assert(!lpass_cdc_va_macro_tx_mixer_put(&k,&v)&&!power_updates);v.value.integer.value[0]=1;assert(lpass_cdc_va_macro_tx_mixer_put(&k,&v)==1&&p.active_ch_mask[1]==4&&p.active_ch_cnt[1]==1);assert(!lpass_cdc_va_macro_tx_mixer_put(&k,&v)&&power_updates==1);cases+=3;
+v.value.integer.value[0]=0;power_result=-EIO;assert(lpass_cdc_va_macro_tx_mixer_put(&k,&v)==-EIO&&p.active_ch_mask[1]==4&&p.active_ch_cnt[1]==1);power_result=0;assert(lpass_cdc_va_macro_tx_mixer_put(&k,&v)==1&&!p.active_ch_mask[1]&&!p.active_ch_cnt[1]);cases+=2;
+v.value.integer.value[0]=1;power_result=-EIO;assert(lpass_cdc_va_macro_tx_mixer_put(&k,&v)==-EIO&&!p.active_ch_mask[1]&&!p.active_ch_cnt[1]);v.value.integer.value[0]=2;assert(lpass_cdc_va_macro_tx_mixer_put(&k,&v)==-EINVAL);v.value.integer.value[0]=1;w.shift=4;assert(lpass_cdc_va_macro_tx_mixer_put(&k,&v)==-EINVAL);w.shift=1;m.shift=4;assert(lpass_cdc_va_macro_tx_mixer_put(&k,&v)==-EINVAL);cases+=4;printf("{\"mixer\":%d}\n",cases);}

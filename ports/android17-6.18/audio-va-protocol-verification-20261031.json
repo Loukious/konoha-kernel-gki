@@ -1,0 +1,28 @@
+{
+  "native_exports": [],
+  "native_linked_units": [
+    "../sm8735-modules/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-va-macro.o"
+  ],
+  "native_dai_control_route_tables_exact": true,
+  "native_tables_sha256": "364b1a419eeb2f3102b1fb33c7a51f153df3a06bc21b0217309d1db900d7dcf4",
+  "native_constants_and_module_parameters_exact": true,
+  "native_platform_driver_pm_and_of_registration_exact": true,
+  "native_macro_ops_callback_assignments_exact": true,
+  "soundwire_platform_data": "Production VA layout is checked in every extracted-production test against the real frozen swr_ctrl_platform_data sizeof and all seven offsetof values, including native handle_irq/reg_irq mapping.",
+  "reused_provider_headers": {
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.h": "7b1fb6d34a4442f3e65fb5db2fda6758648c7ab247e69a33da2289ea6086dbbc",
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-registers.h": "b234711022f5644d64bec5c597041121bde836f7c51e89824394c006ad591469",
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-clk-rsc.h": "2fa8918c8a3aed99585be4b0aa2d73394872c746e8ba94d8239c554e938ad944",
+    "qcom/opensource/audio-kernel/include/asoc/msm-cdc-pinctrl.h": "5ed3b36ec782747347a8ead566af2c2f607f7ce9869dc8fbc0de37f139471bcb",
+    "qcom/opensource/audio-kernel/include/soc/swr-common.h": "5255dd2315331c183d0f0c2c762fa58ea7e650cf9e5739aebfbe7bad59e4ddc9",
+    "qcom/opensource/audio-kernel/include/soc/swr-wcd.h": "df656f95a549d13d4314668e8ac7b93c0abd03e859c8632a2a49827f931ff554",
+    "qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.h": "c7ff86c514d7318b666af281166a2ea02da5dd6e192f0b8683ef607a4ff292ec",
+    "qcom/opensource/audio-kernel/include/dsp/digital-cdc-rsc-mgr.h": "629f4c4a248503feba6744e6b156d59fd9b633967cbf391e8cde5014da58c7d3"
+  },
+  "child_limit": 3,
+  "lifetime": "Initialize all delayed work before macro/child publication. Child creation is synchronous, bounded and owns each OF reference. Notification admission closes and active notifications drain before controller unregister. Keep handle, PM and CDC callbacks live through controller unregister; never unregister from a callback being drained. Component exit cancels delayed work before clearing component. Physical removal drains children then removes macro before disabling PM.",
+  "ownership": "Core votes count successful PM acquisitions. MCLK count commits after successful clock request and regcache sync; failed rollback has explicit bare-clock ownership. SWR tracks temporary TX requests; failed release/rollback retains counts and logs. DAPM retains selected TX/VA source, DMIC retains selected input, SSR reset request is retriable. Micbias commits only after regulator setup.",
+  "error_limits": "Native FS request and AMIC TX-hold APIs remain void, and native ALSA component reads do not return read status; provider-side errors cannot be recovered as VA callback status. Hardware rollback failures are logged with retained bookkeeping; successful physical removal under persistent hardware errors is not claimed. Host tests use mocked hardware and cannot establish actual audio, runtime PM or SSR on hardware.",
+  "native_rates": "DAI advertises 8, 16, 32, 48, 96, 192 kHz unchanged; native hw_params 384 kHz branch retained and tested.",
+  "scope": "Exactly one native VA C input. No TX/RX/WSA/WSA2 unit imported in this handoff."
+}

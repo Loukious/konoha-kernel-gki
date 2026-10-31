@@ -3536,6 +3536,40 @@ ddk_module(
 )
 
 
+ddk_module(
+    name = "lpass_cdc_va_macro_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-va-macro.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "lpass_cdc_va_macro_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_lpasscdc_headers", ":audio_swrctrl_headers", ":audio_wcdcore_headers", ":audio_spf_headers", ":lpass_cdc_dlkm", ":wcd_core_dlkm", ":swr_ctrl_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "qcom_rng",
+    srcs = ["drivers/crypto/qcom-rng.c"],
+    out = "qcom-rng.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "qrng_dlkm",
+    srcs = ["qcom/opensource/securemsm-kernel/qrng/msm_rng.c"],
+    out = "qrng_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":secure_headers"],
+    visibility = ["//visibility:public"],
+)
+
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3791,6 +3825,9 @@ kernel_module_group(
         ":frpc_adsprpc",
         ":cameralog",
         ":cameramsger",
+        ":lpass_cdc_va_macro_dlkm",
+        ":qcom_rng",
+        ":qrng_dlkm",
     ],
 )
 

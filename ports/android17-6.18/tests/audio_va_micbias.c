@@ -1,0 +1,5 @@
+/* SERVICES */
+/* SOURCE */
+int main(void){struct device parent={0},d={.parent=&parent};macro_dev=&d;struct lpass_cdc_va_macro_priv p;struct regulator r={0};struct snd_soc_component c={.dev=&parent};struct snd_soc_dapm_context dapm={.component=&c};struct snd_soc_dapm_widget w={.dapm=&dapm};int cases=0;
+for(int f=1;f<=3;f++){init_va(&p,&d);p.component=&c;p.micb_supply=&r;p.micb_voltage=1800000;p.micb_current=1000;steps=0;fault=f;assert(lpass_cdc_va_macro_enable_micbias(&w,NULL,1)==-EIO);assert(!p.micb_users&&!r.enabled&&!r.voltage&&!r.load);cases++;}
+fault=0;assert(!lpass_cdc_va_macro_enable_micbias(&w,NULL,1));assert(!lpass_cdc_va_macro_enable_micbias(&w,NULL,1));assert(p.micb_users==2&&r.enabled==1);assert(!lpass_cdc_va_macro_enable_micbias(&w,NULL,8));fault=steps+1;assert(lpass_cdc_va_macro_enable_micbias(&w,NULL,8)==-EIO&&p.micb_users==1&&r.enabled==1);fault=0;assert(!lpass_cdc_va_macro_enable_micbias(&w,NULL,8));assert(!p.micb_users&&!r.enabled&&!r.voltage&&!r.load);assert(lpass_cdc_va_macro_enable_micbias(&w,NULL,8)==-EINVAL);cases+=6;printf("{\"micbias\":%d}\n",cases);}

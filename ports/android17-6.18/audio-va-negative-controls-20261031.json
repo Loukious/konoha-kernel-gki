@@ -1,0 +1,169 @@
+{
+  "tests": {
+    "work_duplicate_wake": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1844: main: Assertion `awake==1&&p.wlock_holders==1' failed.\n"
+    },
+    "wake_underflow": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1844: main: Assertion `lpass_cdc_va_macro_wake_enable(&p,false)==-EINVAL' failed.\n"
+    },
+    "wake_overflow": {
+      "rejected": true,
+      "diagnostic": "/tmp/onyx-va-test-4s3xqtlb/test.c:1808:30: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'\n"
+    },
+    "cancelled_wake_leak": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1844: main: Assertion `!awake&&!p.wlock_holders' failed.\n"
+    },
+    "notification_drain": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1900: main: Assertion `!atomic_load(&removed)' failed.\n"
+    },
+    "child_node_ownership": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1899: main: Assertion `!p.child_count&&!p.swr_ctrl_data&&!live&&node.refs==1' failed.\n"
+    },
+    "child_publication": {
+      "rejected": true,
+      "diagnostic": "=================================================================\n==1321036==ERROR: AddressSanitizer: attempting double-free on 0x72274d5e0010 in thread T0:\n    #0 0x76074f32a3ff in free ../../../../src/libsanitizer/asan/asan_malloc_linux.cpp:51\n    #1 0x5ffd359cc625 in kfree /tmp/onyx-va-test-4s3xqtlb/test.c:1482\n    #2 0x5ffd359ccc10 in lpass_cdc_va_macro_remove_children /tmp/onyx-va-test-4s3xqtlb/test.c:1833\n    #3 0x5ffd359cd5d0 in lpass_cdc_va_macro_add_child_devices /tmp/onyx-va-test-4s3xq"
+    },
+    "divisor_count": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1863: main: Assertion `lpass_cdc_va_macro_parse_divs(&p,\"x\",false)==-EINVAL' failed.\n"
+    },
+    "divisor_preflight": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1863: main: Assertion `lpass_cdc_va_macro_parse_divs(&p,\"x\",false)==-EINVAL&&p.dmic_clk_div[1]==0' failed.\n"
+    },
+    "component_publication": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1801: snd_soc_dapm_new_controls: Assertion `p->component' failed.\n"
+    },
+    "component_cancel": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1808: lpass_cdc_va_macro_release_clocks: Assertion `p->component&&!p->wlock_holders' failed.\n"
+    },
+    "pm_resume_error": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1908: main: Assertion `!p.va_mclk_users&&!p.core_vote_users&&!d.pm_refs&&!fs_refs&&!clock_refs[3]' failed.\n"
+    },
+    "pm_failed_vote_unwind": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1909: main: Assertion `lpass_cdc_va_macro_core_vote(&p,true)==-ENOTSYNC&&!d.pm_refs&&!p.core_vote_users' failed.\n"
+    },
+    "mclk_sync_error": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1908: main: Assertion `!p.va_mclk_users&&!p.core_vote_users&&!d.pm_refs&&!fs_refs&&!clock_refs[3]' failed.\n"
+    },
+    "mclk_rollback_ownership": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:2176: main: Assertion `p.failed_mclk_owned&&clock_refs[3]==1&&!fs_refs&&!p.va_mclk_users&&!d->pm_refs' failed.\n"
+    },
+    "ssr_timeout": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1949: main: Assertion `lpass_cdc_va_macro_event_handler(&c,LPASS_CDC_MACRO_EVT_WAIT_VA_CLK_RESET,0)==-ETIMEDOUT&&sleeps==500' failed.\n"
+    },
+    "ssr_reset_ownership": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1950: main: Assertion `p.reset_clock_owned&&clock_refs[3]==1' failed.\n"
+    },
+    "ssr_reset_id": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1951: main: Assertion `!lpass_cdc_va_macro_event_handler(&c,LPASS_CDC_MACRO_EVT_CLK_RESET,0)&&reset_id==3' failed.\n"
+    },
+    "dapm_source_ownership": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:2030: main: Assertion `!lpass_cdc_va_macro_mclk_event(&w,NULL,8)' failed.\n"
+    },
+    "swr_tx_rollback": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:2058: main: Assertion `!p.swr_clk_users&&!p.va_mclk_users&&!p.core_vote_users&&!d.pm_refs&&!fs_refs&&!clock_refs[0]&&!clock_refs[3]&&!pin_active' failed.\n"
+    },
+    "swr_pm_resume_error": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1527: pm_runtime_put_autosuspend: Assertion `d->pm_refs-->0' failed.\n"
+    },
+    "micbias_voltage_error": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1874: main: Assertion `lpass_cdc_va_macro_enable_micbias(&w,NULL,1)==-EIO' failed.\n"
+    },
+    "micbias_disable_ownership": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1875: main: Assertion `lpass_cdc_va_macro_enable_micbias(&w,NULL,8)==-EIO&&p.micb_users==1&&r.enabled==1' failed.\n"
+    },
+    "final_tx_callback": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:2173: main: Assertion `!p.dmic_owned[2]&&!dmic_refs[2]&&!p.swr_clk_users&&!p.va_mclk_users&&!p.dapm_mclk_active&&!tx_mclks&&!p.reset_clock_owned&&!p.failed_mclk_owned&&!p.temporary_tx_clock&&!p.dapm_tx_clk_status&&!p.micb_users&&!r.enabled&&!r.voltage&&!r.load&&!clock_refs[0]&&!clock_refs[3]&&!fs_refs' failed.\n"
+    },
+    "pm_final_suspend_error": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1803: pm_runtime_set_suspended: Assertion `pm_disabled&&!suspend_result' failed.\n"
+    },
+    "pm_before_child_remove": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1804: lpass_cdc_va_macro_remove_children: Assertion `p->removing&&!pm_disabled&&phase==0' failed.\n"
+    },
+    "mixer_rollback": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1868: main: Assertion `lpass_cdc_va_macro_tx_mixer_put(&k,&v)==-EIO&&p.active_ch_mask[1]==4&&p.active_ch_cnt[1]==1' failed.\n"
+    },
+    "mixer_change_report": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1867: main: Assertion `lpass_cdc_va_macro_tx_mixer_put(&k,&v)==1&&p.active_ch_mask[1]==4&&p.active_ch_cnt[1]==1' failed.\n"
+    },
+    "native_rate_mapping": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1972: main: Assertion `!lpass_cdc_va_macro_hw_params(NULL,&params,&dai)' failed.\n"
+    },
+    "channel_pointer_bounds": {
+      "rejected": true,
+      "diagnostic": "/tmp/onyx-va-test-4s3xqtlb/test.c:1907:11: runtime error: store to null pointer of type 'unsigned int'\n"
+    },
+    "delayed_write_errors": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:2273: main: Assertion `lpass_cdc_va_macro_enable_dec(&w,NULL,1)==-EIO' failed.\n"
+    },
+    "dmic_saved_source": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:1791: lpass_cdc_dmic_clk_enable: Assertion `dmic_refs[id]-->0' failed.\n"
+    },
+    "child_limit": {
+      "rejected": true,
+      "diagnostic": "/tmp/onyx-va-test-4s3xqtlb/test.c:1878:30: runtime error: index 3 out of bounds for type 'platform_device *[3]'\n"
+    },
+    "swr_failed_rollback_count": {
+      "rejected": true,
+      "diagnostic": "test: /tmp/onyx-va-test-4s3xqtlb/test.c:2178: main: Assertion `p.swr_clk_users==1&&p.va_mclk_users==1&&p.temporary_tx_clock&&clock_refs[0]==1&&clock_refs[3]==1&&pin_active' failed.\n"
+    }
+  },
+  "source_sha256": {
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-va-macro.c": "a17c16f1ad0c9b792c110716ba33bd6613050a32a02b3e9178f31bc60a0939e2"
+  },
+  "header_sha256": {
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.h": "7b1fb6d34a4442f3e65fb5db2fda6758648c7ab247e69a33da2289ea6086dbbc",
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-registers.h": "b234711022f5644d64bec5c597041121bde836f7c51e89824394c006ad591469"
+  },
+  "controller_header_sha256": "c7ff86c514d7318b666af281166a2ea02da5dd6e192f0b8683ef607a4ff292ec",
+  "harness_sha256": {
+    "audio_va_dapm.c": "4f9e07732f1a204796de770683aa382448a516d1296a2849a29bd018a1828575",
+    "audio_va_micbias.c": "944c35b0b8336c746c320ddb755127654b324026257b45e3ea47142af6862fc6",
+    "audio_va_children.c": "c725ff5749f4b95a38a315f5a9be3bef8f9bbb55220c9b0e8063bd0bc9fc48ea",
+    "audio_va_mixer.c": "839a7ab0cd914709646dfc2adbec0213f287468229c677a9f7f0370615f2885d",
+    "audio_va_rates.c": "15f18082db43ac1c49768ff3a81a8651effbfa2cfac23839c0749656c2690e52",
+    "audio_va_ssr.c": "41257896262e27dfcb34e494485e939c633f5ef06c4eba3ac29d801a8700cc25",
+    "audio_va_services.h": "727d972dc849dc0c412d8e671a4ed664002c83c8e7c86419c3e220cd1276e0e4",
+    "audio_va_teardown.c": "c49ef24378453cf1d8cbe59fa2bb25a29275a6b2b2a135a0737545d0663c611d",
+    "audio_va_divs.c": "54baec1d5ae22d905196790be50183f2e57c0e754dc2955d2281fe16963d1c32",
+    "audio_va_votes.c": "e916b0cf2835255e49d9fb9bc796d9e85b6f15f62c9be3a631ba1557a89b51f2",
+    "audio_va_work.c": "8d0eb2182bed93acc8a0c2842d8476527e2afcaccb906aa9dce9fccf4dd587cc",
+    "audio_va_swrclk.c": "18f46f81ae84b108453b6304c1eed7af5c5eebaa3ad8a21fba15b629e3f1e62b",
+    "audio_va_dec.c": "03101cbf3895cf5af445e6e569c3eaa033c777b986509a5cc34769a6f7e8d830",
+    "audio_va_component.c": "f6a8cd105b5692e6e19ca169448803216f72b0304aeb6f1598932d5279b97987"
+  },
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Extracted production source/layouts and frozen CDC headers with mocked ALSA, regmap, clock, PM, work, regulator and platform services. No live kernel/audio/SSR validation."
+}

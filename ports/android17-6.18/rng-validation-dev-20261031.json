@@ -1,0 +1,161 @@
+{
+  "tests": {
+    "qcom": {
+      "buffer_cases": 8208,
+      "removal_races": 100,
+      "probe_faults": 7,
+      "stale_transform_rebind": true,
+      "clock_poll_balance": true
+    },
+    "msm": {
+      "buffer_cases": 8208,
+      "removal_races": 100,
+      "probe_faults": 13,
+      "stale_file_rebind": true,
+      "suspend_clock_icc_balance": true
+    }
+  },
+  "negative_controls": {
+    "qcom_stopped_context_reads_hardware": {
+      "rejected": true,
+      "diagnostic": "qcom_stopped_context_reads_hardware: /tmp/rng-test-316bnsyb/qcom_stopped_context_reads_hardware.c:113: hwrng_unregister: Assertion `r->read(r,b,4,false)==-ENODEV' failed."
+    },
+    "qcom_zero_length_reads_register": {
+      "rejected": true,
+      "diagnostic": "qcom_zero_length_reads_register: /tmp/rng-test-316bnsyb/qcom_zero_length_reads_register.c:102: readl_relaxed: Assertion `active_map&&locks>0' failed."
+    },
+    "qcom_wait_ignored": {
+      "rejected": true,
+      "diagnostic": "qcom_wait_ignored: /tmp/rng-test-316bnsyb/qcom_wait_ignored.c:452: buffers: Assertion `qcom_hwrng_read(&r->hwrng,b,8,false)==0' failed."
+    },
+    "qcom_tail_overwrites": {
+      "rejected": true,
+      "diagnostic": "qcom_tail_overwrites: /tmp/rng-test-316bnsyb/qcom_tail_overwrites.c:448: buffers: Assertion `b[i]==0xa5' failed."
+    },
+    "qcom_native_zero_rejection_lost": {
+      "rejected": true,
+      "diagnostic": "qcom_native_zero_rejection_lost: /tmp/rng-test-316bnsyb/qcom_native_zero_rejection_lost.c:455: buffers: Assertion `qcom_hwrng_read(&r->hwrng,b,4,true)==-EINVAL' failed."
+    },
+    "qcom_read_clock_leak": {
+      "rejected": true,
+      "diagnostic": "qcom_read_clock_leak: /tmp/rng-test-316bnsyb/qcom_read_clock_leak.c:448: buffers: Assertion `!r->clk->enabled' failed."
+    },
+    "qcom_clock_failure_reads": {
+      "rejected": true,
+      "diagnostic": "qcom_clock_failure_reads: /tmp/rng-test-316bnsyb/qcom_clock_failure_reads.c:102: readl_relaxed: Assertion `active_clk->alive&&active_clk->enabled>0' failed."
+    },
+    "qcom_alg_retention_lost": {
+      "rejected": true,
+      "diagnostic": "qcom_alg_retention_lost: /tmp/rng-test-316bnsyb/qcom_alg_retention_lost.c:456: buffers: Assertion `allocations==frees+1' failed."
+    },
+    "qcom_double_destroy": {
+      "rejected": true,
+      "diagnostic": "==1151701==ERROR: AddressSanitizer: heap-use-after-free on address 0x7530c9be0590 at pc 0x000000403bde bp 0x7ffecb2f4380 sp 0x7ffecb2f4370"
+    },
+    "qcom_init_removal_gate_lost": {
+      "rejected": true,
+      "diagnostic": "qcom_init_removal_gate_lost: /tmp/rng-test-316bnsyb/qcom_init_removal_gate_lost.c:456: buffers: Assertion `qcom_rng_init(&tfm)==-ENODEV' failed."
+    },
+    "qcom_hwrng_unregister_lost": {
+      "rejected": true,
+      "diagnostic": "qcom_hwrng_unregister_lost: /tmp/rng-test-316bnsyb/qcom_hwrng_unregister_lost.c:133: clean: Assertion `!map_count&&!clk_count&&!icc_count&&!hwrng_count&&!chrdev_count&&!class_count&&!cdev_count&&!alg_count' failed."
+    },
+    "qcom_stop_drain_lost": {
+      "rejected": true,
+      "diagnostic": "qcom_stop_drain_lost: /tmp/rng-test-316bnsyb/qcom_stop_drain_lost.c:95: clk_put: Assertion `c->alive&&!c->enabled' failed."
+    },
+    "qcom_large_crypto_length": {
+      "rejected": true,
+      "diagnostic": "==1151727==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x6ccab59f0538 at pc 0x000000404d28 bp 0x7ffc25f2dd80 sp 0x7ffc25f2dd70"
+    },
+    "msm_suspend_gate_lost": {
+      "rejected": true,
+      "diagnostic": "msm_suspend_gate_lost: /tmp/rng-test-316bnsyb/msm_suspend_gate_lost.c:563: buffers: Assertion `msm_rng_read(&r->hwrng,b,4,true)==-EAGAIN' failed."
+    },
+    "msm_unaligned_word_write": {
+      "rejected": true,
+      "diagnostic": "/tmp/rng-test-316bnsyb/msm_unaligned_word_write.c:269:28: runtime error: store to misaligned address 0x6d00295f01e9 for type 'u32', which requires 4 byte alignment"
+    },
+    "msm_partial_word_overrun": {
+      "rejected": true,
+      "diagnostic": "msm_partial_word_overrun: /tmp/rng-test-316bnsyb/msm_partial_word_overrun.c:553: buffers: Assertion `msm_rng_read(&r->hwrng,b+8+off,len,true)==(int)n' failed."
+    },
+    "msm_wait_ignored": {
+      "rejected": true,
+      "diagnostic": "msm_wait_ignored: /tmp/rng-test-316bnsyb/msm_wait_ignored.c:557: buffers: Assertion `reads==1&&!delays' failed."
+    },
+    "msm_retry_budget_reset": {
+      "rejected": true,
+      "diagnostic": "msm_retry_budget_reset: /tmp/rng-test-316bnsyb/msm_retry_budget_reset.c:559: buffers: Assertion `delays==5' failed."
+    },
+    "msm_clock_failure_vote_leak": {
+      "rejected": true,
+      "diagnostic": "msm_clock_failure_vote_leak: /tmp/rng-test-316bnsyb/msm_clock_failure_vote_leak.c:554: buffers: Assertion `!reads&&!clock_disables&&high_votes==1&&low_votes==1' failed."
+    },
+    "msm_vote_failure_hidden": {
+      "rejected": true,
+      "diagnostic": "msm_vote_failure_hidden: /tmp/rng-test-316bnsyb/msm_vote_failure_hidden.c:554: buffers: Assertion `msm_rng_read(&r->hwrng,b,4,true)==-EIO' failed."
+    },
+    "msm_stale_ioctl_gate_lost": {
+      "rejected": true,
+      "diagnostic": "==1151775==ERROR: AddressSanitizer: heap-use-after-free on address 0x71f1711e0034 at pc 0x000000402dc6 bp 0x7ffd4e4b8f20 sp 0x7ffd4e4b8f10"
+    },
+    "msm_stale_open_rebind": {
+      "rejected": true,
+      "diagnostic": "msm_stale_open_rebind: /tmp/rng-test-316bnsyb/msm_stale_open_rebind.c:565: buffers: Assertion `msm_rng_open(&inode,&stale)==-ENODEV' failed."
+    },
+    "msm_open_reference_lost": {
+      "rejected": true,
+      "diagnostic": "==1151787==ERROR: AddressSanitizer: heap-use-after-free on address 0x7270319e00f8 at pc 0x000000403355 bp 0x7ffd45337b70 sp 0x7ffd45337b60"
+    },
+    "msm_open_before_module_commit": {
+      "rejected": true,
+      "diagnostic": "msm_open_before_module_commit: /tmp/rng-test-316bnsyb/msm_open_before_module_commit.c:588: platform_driver_register: Assertion `msm_rng_open(&inode,&file)==-ENODEV' failed."
+    },
+    "msm_module_owner_lost": {
+      "rejected": true,
+      "diagnostic": "msm_module_owner_lost: /tmp/rng-test-316bnsyb/msm_module_owner_lost.c:128: cdev_device_add: Assertion `c->owner==THIS_MODULE&&c->ops->owner==THIS_MODULE' failed."
+    },
+    "msm_probe_icc_handle_leak": {
+      "rejected": true,
+      "diagnostic": "msm_probe_icc_handle_leak: /tmp/rng-test-316bnsyb/msm_probe_icc_handle_leak.c:133: clean: Assertion `!map_count&&!clk_count&&!icc_count&&!hwrng_count&&!chrdev_count&&!class_count&&!cdev_count&&!alg_count' failed."
+    },
+    "msm_remove_registry_lost": {
+      "rejected": true,
+      "diagnostic": "msm_remove_registry_lost: /tmp/rng-test-316bnsyb/msm_remove_registry_lost.c:564: buffers: Assertion `msm_rng_open(&inode,&stale)==-ENODEV' failed."
+    },
+    "msm_duplicate_controller_allowed": {
+      "rejected": true,
+      "diagnostic": "msm_duplicate_controller_allowed: /tmp/rng-test-316bnsyb/msm_duplicate_controller_allowed.c:572: lifecycle: Assertion `msm_rng_probe(&duplicate)==-EBUSY' failed."
+    },
+    "msm_short_crypto_result_accepted": {
+      "rejected": true,
+      "diagnostic": "msm_short_crypto_result_accepted: /tmp/rng-test-316bnsyb/msm_short_crypto_result_accepted.c:561: buffers: Assertion `qrng_get_random(NULL,NULL,0,b,3)==-EFAULT' failed."
+    },
+    "msm_module_init_unwind_lost": {
+      "rejected": true,
+      "diagnostic": "msm_module_init_unwind_lost: /tmp/rng-test-316bnsyb/msm_module_init_unwind_lost.c:629: module_cases: Assertion `!module_registered' failed."
+    },
+    "msm_large_crypto_length": {
+      "rejected": true,
+      "diagnostic": "==1153068==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x7a49469f05f8 at pc 0x0000004047e5 bp 0x7ffdf651cf60 sp 0x7ffdf651cf50"
+    }
+  },
+  "source_sha256": {
+    "drivers/crypto/qcom-rng.c": "46142ed20f0f7a217d4016dd320db5f3f5d22237c17b5db836859e0a4c2df808",
+    "drivers/crypto/Kconfig": "cd66997e0fbc165a596cb5a041b7048dfcc96bf88da8cf8d3eef1b5250f41a05",
+    "drivers/crypto/Makefile": "20b272bcc244e67e7058aee779d5d27231224317b0de15c54ce38e1c45d86853",
+    "qcom/opensource/securemsm-kernel/qrng/msm_rng.c": "2415b52c432fbf648ccc8cca513cb67f9dc5fe0c246fe6280332090c53033cee",
+    "qcom/opensource/securemsm-kernel/Kbuild": "f94008d6a2233dcb6752cd26dfe2c45e712a1450625e9a698390f6a3fa4968d5",
+    "qcom/opensource/securemsm-kernel/Makefile": "e5324041a8defe06683d1545633a71022e8db40c63e7c5a5e3491b2bc519ad69",
+    "qcom/opensource/securemsm-kernel/config/sec-kernel_defconfig.conf": "2e0880a816966e39bddfdea26d22848391bf5103f5bbd701ee9ad946dd3b7eaf",
+    "qcom/opensource/securemsm-kernel/config/sec-kernel_defconfig_qrng.conf": "996224cfaba0b428a7dd8213168f362d19361f397d4cfb78f7b1b521969c6ddb"
+  },
+  "harness_sha256": {
+    "msm_cases.c": "8b3f1c3f849bca10f62ca813e71ff8dc2b9d88019b72b291aa1d2ae8afadd593",
+    "msm_module.c": "ac439fdde987275d3b6adffad6c22f1fca45b10f129f57f949cedae8315b0d3a",
+    "qcom_cases.c": "1378eafb4bef52aed50c0499cc150dfdf2dd36e5f4fb1f401b55a8a20d6179a0",
+    "rng_fake.h": "d962ca9459df3a87be9b0fef915cf236c621b7c7c6080676d8c32210cef72739"
+  },
+  "limits": "Extracted production source; mocked crypto/device/VFS reference accounting, register I/O, clocks, ICC and pthread mutexes. No entropy-quality, real device-core, PM or hardware validation."
+}

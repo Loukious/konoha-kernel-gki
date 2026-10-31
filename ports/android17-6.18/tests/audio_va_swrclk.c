@@ -1,0 +1,7 @@
+/* SERVICES */
+static int lpass_cdc_va_macro_core_vote(void*,bool);
+/* SOURCE */
+int main(void){struct device parent={0},d={.parent=&parent};static struct regmap map;parent.regmap=&map;struct lpass_cdc_va_macro_priv p;int cases=0;
+for(int f=1;f<=10;f++){init_va(&p,&d);memset(&map,0,sizeof(map));fault=f;steps=0;assert(lpass_cdc_va_macro_tx_va_mclk_enable(&p,&map,VA_MCLK,true)==-EIO);assert(!p.swr_clk_users&&!p.va_mclk_users&&!p.core_vote_users&&!d.pm_refs&&!fs_refs&&!clock_refs[0]&&!clock_refs[3]&&!pin_active);cases++;}
+init_va(&p,&d);fault=11;steps=0;assert(lpass_cdc_va_macro_tx_va_mclk_enable(&p,&map,VA_MCLK,true)==-EIO);assert(p.temporary_tx_clock&&clock_refs[0]==1&&!clock_refs[3]&&!fs_refs&&!p.swr_clk_users);fault=0;assert(!lpass_cdc_va_macro_tx_va_mclk_enable(&p,&map,VA_MCLK,true));assert(!p.temporary_tx_clock&&!clock_refs[0]&&clock_refs[3]==1&&p.swr_clk_users==1);assert(!lpass_cdc_va_macro_tx_va_mclk_enable(&p,&map,VA_MCLK,false));assert(!p.swr_clk_users&&!p.va_mclk_users&&!clock_refs[0]&&!clock_refs[3]&&!fs_refs&&!pin_active);cases+=3;
+assert(lpass_cdc_va_macro_swrm_clock(NULL,true)==-EINVAL);fault=steps+1;assert(lpass_cdc_va_macro_swrm_clock(&p,true)==-EIO&&!d.pm_refs);fault=0;assert(!lpass_cdc_va_macro_swrm_clock(&p,true));assert(!d.pm_refs&&p.swr_clk_users==1);assert(!lpass_cdc_va_macro_swrm_clock(&p,false));assert(!d.pm_refs&&!p.swr_clk_users);cases+=4;printf("{\"swrclk\":%d}\n",cases);}

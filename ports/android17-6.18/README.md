@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 265 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 268 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 265 platform `.ko` files, their symbol tables and DDK configurations.
+- 268 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 16,400
-imported symbol CRCs across all 265 modules.
+used. The current [validation report](validation-20261031.json) checks 16,595
+imported symbol CRCs across all 268 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1778,3 +1778,26 @@ tree/overlay checks with existing vendor warnings. ROM module-name coverage
 is 262/466 (56.2%). Main camera, EVA, remaining audio/peripherals, KernelSU and
 NetHunter integration and boot/DLKM/ZIP packaging remain unfinished. No phone
 boot or hardware camera operation is claimed.
+
+
+## Native VA audio macro and RNG drivers
+
+The VA macro retains its one native source, DAI/control/route tables and three
+provider dependencies. Work and notifications drain before teardown; clock,
+PM and selected-input ownership survive partial rollback failure. Thirteen
+sanitizer groups pass 159 cases and reject 34 deliberate regressions. The
+[VA record](audio-va-port.md) documents native void-provider and cleanup limits.
+
+The qcom and legacy RNG modules retain their native algorithms, read contracts,
+register masks and aliases. Reads serialize hardware access and removal; retained
+crypto transforms and character files remain tied to their original controller.
+Two sanitizer suites cover 16,416 size/alignment cases and 200 removal races and
+reject 31 deliberate regressions. The [RNG record](rng-port.md) distinguishes
+Onyx's selected qcom TRNG from the ROM-listed legacy module.
+
+Archive `artifacts/20261031T194558036771Z` contains 268 modules and passes 16,595
+imported-symbol CRC checks without compiler/modpost warnings. Device-tree and
+overlay checks pass with existing vendor warnings. ROM module-name coverage
+is 265/466 (56.9%). Main camera, EVA, remaining audio/peripherals, KernelSU and
+NetHunter integration and boot/DLKM/ZIP packaging remain. No flashable ZIP or
+phone/hardware validation is claimed.

@@ -1,0 +1,21 @@
+/* SERVICES */
+static int lpass_cdc_va_macro_core_vote(void*,bool);
+static int tx_mclks,phase,suspend_result;static bool pm_disabled,pm_suspended;
+static int lpass_cdc_tx_mclk_enable(struct snd_soc_component*c,bool en){assert(c);if(fail())return -EIO;if(en)tx_mclks++;else assert(tx_mclks-->0);return 0;}
+static void pm_runtime_disable(struct device*d){assert(!d->pm_refs);pm_disabled=true;}
+static bool pm_runtime_status_suspended(struct device*d){assert(pm_disabled);return pm_suspended;}
+static int lpass_cdc_runtime_suspend(struct device*d){assert(pm_disabled&&!pm_suspended);return suspend_result;}
+static void pm_runtime_set_suspended(struct device*d){assert(pm_disabled&&!suspend_result);pm_suspended=true;}
+static void lpass_cdc_va_macro_remove_children(struct lpass_cdc_va_macro_priv*p){assert(p->removing&&!pm_disabled&&phase==0);phase=1;}
+static void lpass_cdc_unregister_macro(struct device*d,int id){assert(phase==1&&!pm_disabled);struct lpass_cdc_va_macro_priv*p=d->data;p->component=NULL;phase=2;}
+static void lpass_cdc_va_macro_cancel_work(struct lpass_cdc_va_macro_priv*p){assert(phase==2&&!p->component&&!pm_disabled);phase=3;}
+/* SOURCE */
+int main(void){struct device parent={0};struct platform_device pd={.dev={.parent=&parent}};struct device*d=&pd.dev;static struct regmap map;parent.regmap=&map;struct lpass_cdc_va_macro_priv p;struct snd_soc_component c={.dev=&parent};struct regulator r={0};int cases=0;init_va(&p,d);p.component=&c;
+assert(!lpass_cdc_va_macro_tx_va_mclk_enable(&p,&map,VA_MCLK,true));p.dapm_mclk_active=true;p.dapm_uses_tx=true;tx_mclks=1;p.reset_clock_owned=true;p.failed_mclk_owned=true;clock_refs[3]+=2;p.temporary_tx_clock=true;p.dapm_tx_clk_status=2;clock_refs[0]+=3;p.dmic_owned[2]=true;p.dmic_id[2]=2;dmic_refs[2]=1;p.micb_users=2;p.micb_supply=&r;p.micb_voltage=1800000;r.enabled=1;r.voltage=1800000;r.load=1000;assert(!lpass_cdc_va_macro_release_clocks(&p));assert(!p.dmic_owned[2]&&!dmic_refs[2]&&!p.swr_clk_users&&!p.va_mclk_users&&!p.dapm_mclk_active&&!tx_mclks&&!p.reset_clock_owned&&!p.failed_mclk_owned&&!p.temporary_tx_clock&&!p.dapm_tx_clk_status&&!p.micb_users&&!r.enabled&&!r.voltage&&!r.load&&!clock_refs[0]&&!clock_refs[3]&&!fs_refs);cases++;
+p.dmic_owned[2]=true;dmic_refs[2]=1;fault=steps+1;assert(lpass_cdc_va_macro_release_clocks(&p)==-EIO&&p.dmic_owned[2]&&dmic_refs[2]==1);fault=0;assert(!lpass_cdc_va_macro_release_clocks(&p)&&!dmic_refs[2]);cases+=2;
+p.dapm_mclk_active=true;p.dapm_uses_tx=true;tx_mclks=1;fault=steps+1;assert(lpass_cdc_va_macro_release_clocks(&p)==-EIO&&p.dapm_mclk_active&&tx_mclks==1);fault=0;assert(!lpass_cdc_va_macro_release_clocks(&p)&&!tx_mclks);cases+=2;
+fault=steps+3;fault2=steps+4;assert(lpass_cdc_va_macro_mclk_enable(&p,true,true)==-EIO);assert(p.failed_mclk_owned&&clock_refs[3]==1&&!fs_refs&&!p.va_mclk_users&&!d->pm_refs);fault=fault2=0;assert(!lpass_cdc_va_macro_mclk_enable(&p,true,true));assert(!p.failed_mclk_owned&&p.va_mclk_users==1&&clock_refs[3]==1);assert(!lpass_cdc_va_macro_release_clocks(&p));cases+=3;
+assert(!lpass_cdc_va_macro_tx_va_mclk_enable(&p,&map,VA_MCLK,true));p.pre_dev_up=false;fault=steps+1;assert(lpass_cdc_va_macro_release_clocks(&p)==-EIO&&p.swr_clk_users==1&&p.va_mclk_users==1&&clock_refs[3]==1);fault=0;assert(!lpass_cdc_va_macro_release_clocks(&p)&&!p.swr_clk_users&&!p.va_mclk_users&&!clock_refs[3]);cases+=2;
+p.pre_dev_up=true;p.reset_swr=true;fault=steps+11;fault2=steps+13;assert(lpass_cdc_va_macro_tx_va_mclk_enable(&p,&map,VA_MCLK,true)==-EIO);assert(p.swr_clk_users==1&&p.va_mclk_users==1&&p.temporary_tx_clock&&clock_refs[0]==1&&clock_refs[3]==1&&pin_active);fault=fault2=0;assert(!lpass_cdc_va_macro_release_clocks(&p)&&!p.swr_clk_users&&!p.va_mclk_users&&!clock_refs[0]&&!clock_refs[3]);cases+=2;
+p.pre_dev_up=true;assert(!lpass_cdc_va_macro_core_vote(&p,true));assert(!lpass_cdc_va_macro_core_vote(&p,true));suspend_result=-EIO;lpass_cdc_va_macro_disable_pm(&p);assert(pm_disabled&&!pm_suspended&&!p.core_vote_users&&!d->pm_refs);pm_disabled=false;suspend_result=0;lpass_cdc_va_macro_disable_pm(&p);assert(pm_suspended);cases+=2;
+pm_disabled=pm_suspended=false;p.component=NULL;phase=0;assert(!lpass_cdc_va_macro_core_vote(&p,true));lpass_cdc_va_macro_remove(&pd);assert(phase==3&&pm_disabled&&pm_suspended&&!d->pm_refs);cases++;printf("{\"teardown\":%d}\n",cases);}
