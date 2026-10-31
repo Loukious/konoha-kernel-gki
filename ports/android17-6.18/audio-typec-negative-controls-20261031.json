@@ -1,0 +1,69 @@
+{
+  "tests": {
+    "lost_allocation_error": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "/tmp/onyx-typec-test-n0a8lo0_/typec.c:145:18: runtime error: member access within null pointer of type 'struct typec_analog_acc_priv'"
+    },
+    "overwritten_active_instance": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "typec: /tmp/onyx-typec-test-n0a8lo0_/typec.c:76: register_ucsi_glink_notifier: Assertion `!registered' failed."
+    },
+    "missing_module_pin": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "typec: /tmp/onyx-typec-test-n0a8lo0_/typec.c:205: lifecycle: Assertion `!typec_analog_acc_init(&component)&&module_refs==1&&reports==1&&acc_priv->typec_analog_jack.status==19' failed."
+    },
+    "missing_notifier_drain": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "typec: /tmp/onyx-typec-test-n0a8lo0_/typec.c:74: snd_device_free: Assertion `c&&j&&!registered&&jacks>0' failed."
+    },
+    "wrong_component_cleanup": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "typec: /tmp/onyx-typec-test-n0a8lo0_/typec.c:205: lifecycle: Assertion `registered' failed."
+    },
+    "lost_jack_cleanup": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "typec: /tmp/onyx-typec-test-n0a8lo0_/typec.c:202: clean: Assertion `!registered&&!acc_priv&&!live&&!module_refs&&!jacks' failed."
+    },
+    "unserialized_events": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "typec: /tmp/onyx-typec-test-n0a8lo0_/typec.c:210: duplicate: Assertion `reports==1' failed."
+    },
+    "missing_null_payload_check": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "/tmp/onyx-typec-test-n0a8lo0_/typec.c:108:6: runtime error: member access within null pointer of type 'struct ucsi_glink_constat_info'"
+    },
+    "wrong_native_report_mask": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "typec: /tmp/onyx-typec-test-n0a8lo0_/typec.c:73: snd_soc_card_jack_new: Assertion `c&&c->snd_card&&!strcmp(name,\"Typec_analog Jack\")&&mask==19' failed."
+    },
+    "notifier_before_jack": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "typec: /tmp/onyx-typec-test-n0a8lo0_/typec.c:75: snd_soc_jack_report: Assertion `j&&j->jack&&j->card&&mask==19&&(status==0||status==19)' failed."
+    }
+  },
+  "source_sha256": {
+    "qcom/opensource/audio-kernel/asoc/codecs/typec_analog_acc.c": "6c575bbc6b8eca5169c6ac592a62ad1859000dd45ae6fb3ded88671059b052ea",
+    "qcom/opensource/audio-kernel/asoc/codecs/typec_analog_acc.h": "8003aabe3f479e7f97b1a2e1529061f39b5a47335b3bb6045cc582499dd3b5a4"
+  },
+  "ucsi_header_sha256": {
+    "include/linux/usb/ucsi_glink.h": "9373eca2be8a2068f5ff6d5f28b32aedbdca6ab2420f99c02dcdbf9420a5040d"
+  },
+  "harness_sha256": {
+    "audio_typec_typec.c": "45b11b880487d791c1fc455f0e7dcd8b99c0b8aeea046a61f606fcf60d4c6f9a"
+  },
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Full production accessory source and actual frozen UCSI header; module/ALSA card/jack/notifier/allocation services mocked; pthread report serialization and callback drain. No actual ALSA/card unregister, UCSI hardware, USB accessory or sound report delivery claimed."
+}

@@ -3360,6 +3360,34 @@ ddk_module(
     copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
 )
 
+ddk_module(
+    name = "lpass_bt_swr_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/lpass-bt-swr.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "lpass_bt_swr_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_swrctrl_headers", ":audio_wcdcore_headers", ":audio_spf_headers", ":audio_foundation_headers", ":swr_ctrl_dlkm", ":wcd_core_dlkm", ":spf_core_dlkm", ":snd_event_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_headers(
+    name = "audio_typec_headers",
+    hdrs = ["qcom/opensource/audio-kernel/asoc/codecs/typec_analog_acc.h"],
+    includes = ["qcom/opensource/audio-kernel/asoc/codecs"],
+)
+
+ddk_module(
+    name = "typec_analog_acc_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/typec_analog_acc.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "typec_analog_acc_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_typec_headers", ":audio_foundation_headers", ":ucsi_glink_headers", ":ucsi_qti_glink"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3604,6 +3632,8 @@ kernel_module_group(
         ":onyx_relay",
         ":qca_cld3_wcn7750",
         ":wcd_core_dlkm",
+        ":lpass_bt_swr_dlkm",
+        ":typec_analog_acc_dlkm",
     ],
 )
 

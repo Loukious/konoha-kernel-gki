@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 254 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 256 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 254 platform `.ko` files, their symbol tables and DDK configurations.
+- 256 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 15,441
-imported symbol CRCs across all 254 modules.
+used. The current [validation report](validation-20261031.json) checks 15,510
+imported symbol CRCs across all 256 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1654,3 +1654,33 @@ pass with 1,084 existing vendor DTC warnings. ROM module-name coverage is
 251/466 (53.9%). LPASS/codec/machine consumers, remaining peripherals and
 boot/DLKM packaging are still in progress. No flashable ZIP or hardware test
 is claimed by this checkpoint.
+
+
+## Clock lifecycle and native audio parents
+
+The shared clock provider and eight Tuna modules now track probe, runtime,
+regulator and interconnect ownership, drain debug readers, and restore managed
+DFS templates after unregister. All 139 existing provider exports retain their
+CRCs; three managed lifecycle exports are added. The overlay preserves all 27
+native compilation units and the compiled Onyx clock selections. Four sanitizer
+groups and 13 rejecting controls pass. Exceptional forced teardown and hardware
+release limits are documented in [the clock record](clock-lifecycle-port.md).
+
+The native LPASS Bluetooth SoundWire parent now creates its child after parent
+state is ready and drains sound-event callbacks before child and parent cleanup.
+Its native soft dependency, two aliases and four module dependencies are retained.
+Eight sanitizer groups cover 44 cases, with 11 rejecting controls.
+
+The Type-C analog-audio provider initializes its jack before notifier publication
+and adds an instance-specific cleanup API that unregisters and drains callbacks.
+Five sanitizer groups cover 21 cases, with ten rejecting controls. LPASS CDC must
+call `typec_analog_acc_exit(component)` before its component or ALSA card is freed;
+that consumer remains in progress. See the [LPASS BT](audio-lpassbt-port.md) and
+[Type-C](audio-typec-port.md) records for integration contracts and test limits.
+
+Archive `artifacts/20261031T182835037507Z` contains 256 platform modules and
+passes 15,510 CRC checks without compiler/modpost warnings. Device-tree and overlay
+checks pass with 1,084 existing vendor DTC warnings. ROM module-name coverage is
+253/466 (54.3%). Remaining media, DSP, codec and peripheral drivers and boot/DLKM
+packaging are still in progress. This checkpoint is not a flashable ZIP or a
+hardware-tested port.

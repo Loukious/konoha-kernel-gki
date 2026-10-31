@@ -1,0 +1,1705 @@
+--- a/drivers/clk/qcom/cambistmclkcc-tuna.c
++++ b/drivers/clk/qcom/cambistmclkcc-tuna.c
+@@ -506,11 +506,7 @@
+ 	if (IS_ERR(regmap))
+ 		return PTR_ERR(regmap);
+ 
+-	ret = qcom_cc_runtime_init(pdev, &cam_bist_mclk_cc_tuna_desc);
+-	if (ret)
+-		return ret;
+-
+-	ret = pm_runtime_get_sync(&pdev->dev);
++	ret = qcom_cc_runtime_acquire(pdev, &cam_bist_mclk_cc_tuna_desc);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -520,7 +516,9 @@
+ 	 * Keep clocks always enabled:
+ 	 *	cam_bist_mclk_cc_sleep_clk
+ 	 */
+-	regmap_update_bits(regmap, 0x40f8, BIT(0), BIT(0));
++	ret = regmap_update_bits(regmap, 0x40f8, BIT(0), BIT(0));
++	if (ret)
++		return ret;
+ 
+ 	ret = qcom_cc_really_probe(pdev, &cam_bist_mclk_cc_tuna_desc, regmap);
+ 	if (ret) {
+@@ -528,10 +526,12 @@
+ 		return ret;
+ 	}
+ 
+-	pm_runtime_put_sync(&pdev->dev);
++	ret = qcom_cc_runtime_release(pdev);
++	if (ret < 0)
++		return dev_err_probe(&pdev->dev, ret, "Failed to release probe power\n");
+ 	dev_info(&pdev->dev, "Registered CAM BIST MCLK CC clocks\n");
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ static void cam_bist_mclk_cc_tuna_sync_state(struct device *dev)
+@@ -549,6 +549,7 @@
+ 	.probe = cam_bist_mclk_cc_tuna_probe,
+ 	.driver = {
+ 		.name = "cam_bist_mclk_cc-tuna",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = cam_bist_mclk_cc_tuna_match_table,
+ 		.sync_state = cam_bist_mclk_cc_tuna_sync_state,
+ 		.pm = &cam_bist_mclk_cc_tuna_pm_ops,
+--- a/drivers/clk/qcom/camcc-tuna.c
++++ b/drivers/clk/qcom/camcc-tuna.c
+@@ -3030,11 +3030,7 @@
+ 	if (IS_ERR(regmap))
+ 		return PTR_ERR(regmap);
+ 
+-	ret = qcom_cc_runtime_init(pdev, &cam_cc_tuna_desc);
+-	if (ret)
+-		return ret;
+-
+-	ret = pm_runtime_get_sync(&pdev->dev);
++	ret = qcom_cc_runtime_acquire(pdev, &cam_cc_tuna_desc);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -3053,10 +3049,18 @@
+ 	 *	cam_cc_gdsc_clk
+ 	 *	cam_cc_sleep_clk
+ 	 */
+-	regmap_update_bits(regmap, 0x113c4, BIT(0), BIT(0));
+-	regmap_update_bits(regmap, 0x113c0, BIT(0), BIT(0));
+-	regmap_update_bits(regmap, 0x1137c, BIT(0), BIT(0));
+-	regmap_update_bits(regmap, 0x11398, BIT(0), BIT(0));
++	ret = regmap_update_bits(regmap, 0x113c4, BIT(0), BIT(0));
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(regmap, 0x113c0, BIT(0), BIT(0));
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(regmap, 0x1137c, BIT(0), BIT(0));
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(regmap, 0x11398, BIT(0), BIT(0));
++	if (ret)
++		return ret;
+ 
+ 	ret = qcom_cc_really_probe(pdev, &cam_cc_tuna_desc, regmap);
+ 	if (ret) {
+@@ -3064,10 +3068,12 @@
+ 		return ret;
+ 	}
+ 
+-	pm_runtime_put_sync(&pdev->dev);
++	ret = qcom_cc_runtime_release(pdev);
++	if (ret < 0)
++		return dev_err_probe(&pdev->dev, ret, "Failed to release probe power\n");
+ 	dev_info(&pdev->dev, "Registered CAM CC clocks\n");
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ static void cam_cc_tuna_sync_state(struct device *dev)
+@@ -3085,6 +3091,7 @@
+ 	.probe = cam_cc_tuna_probe,
+ 	.driver = {
+ 		.name = "cam_cc-tuna",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = cam_cc_tuna_match_table,
+ 		.sync_state = cam_cc_tuna_sync_state,
+ 		.pm = &cam_cc_tuna_pm_ops,
+--- a/drivers/clk/qcom/clk-debug.c
++++ b/drivers/clk/qcom/clk-debug.c
+@@ -13,6 +13,7 @@
+ #include <linux/bitops.h>
+ #include <linux/clk/qcom.h>
+ #include <linux/mfd/syscon.h>
++#include <linux/srcu.h>
+ #include <trace/events/power.h>
+ 
+ #define CREATE_TRACE_POINTS
+@@ -30,6 +31,7 @@
+ static struct dentry *clk_debugfs_suspend_atomic;
+ 
+ struct hw_debug_clk {
++	bool			registered;
+ 	struct list_head	list;
+ 	struct clk_hw		*clk_hw;
+ 	struct device		*dev;
+@@ -37,6 +39,7 @@
+ 
+ static DEFINE_SPINLOCK(clk_reg_lock);
+ static DEFINE_MUTEX(clk_debug_lock);
++DEFINE_STATIC_SRCU(clk_debug_srcu);
+ static LIST_HEAD(clk_hw_debug_list);
+ static LIST_HEAD(clk_hw_debug_mux_list);
+ 
+@@ -903,17 +906,19 @@
+ {
+ 	struct hw_debug_clk *dclk;
+ 	int cnt = 0;
++	int idx;
+ 
+ 	clock_debug_output(s, "Enabled clocks:\n");
+-
+-	list_for_each_entry(dclk, &clk_hw_debug_list, list)
++	idx = srcu_read_lock(&clk_debug_srcu);
++	list_for_each_entry_rcu(dclk, &clk_hw_debug_list, list,
++			       srcu_read_lock_held(&clk_debug_srcu))
+ 		cnt += clock_debug_print_clock(dclk, s);
++	srcu_read_unlock(&clk_debug_srcu, idx);
+ 
+ 	if (cnt)
+ 		clock_debug_output(s, "Enabled clock count: %d\n", cnt);
+ 	else
+ 		clock_debug_output(s, "No clocks enabled.\n");
+-
+ }
+ 
+ static int enabled_clocks_show(struct seq_file *s, void *unused)
+@@ -1037,12 +1042,18 @@
+ DEFINE_DEBUGFS_ATTRIBUTE(clk_debug_suspend_atomic_enable_fops,
+ 	clk_debug_suspend_atomic_enable_get, clk_debug_suspend_atomic_enable_set, "%llu\n");
+ 
+-static void clk_hw_debug_remove(struct hw_debug_clk *dclk)
++static void clk_hw_debug_release(struct device *dev, void *res)
+ {
+-	if (dclk) {
+-		list_del(&dclk->list);
+-		kfree(dclk);
++	struct hw_debug_clk *dclk = res;
++
++	mutex_lock(&clk_debug_lock);
++	if (dclk->registered) {
++		list_del_rcu(&dclk->list);
++		dclk->registered = false;
+ 	}
++	mutex_unlock(&clk_debug_lock);
++	/* The suspend trace reader can run without the debug mutex. */
++	synchronize_srcu(&clk_debug_srcu);
+ }
+ 
+ static void clk_debug_unregister(void)
+@@ -1050,9 +1061,13 @@
+ 	struct hw_debug_clk *dclk, *temp;
+ 
+ 	mutex_lock(&clk_debug_lock);
+-	list_for_each_entry_safe(dclk, temp, &clk_hw_debug_list, list)
+-		clk_hw_debug_remove(dclk);
++	list_for_each_entry_safe(dclk, temp, &clk_hw_debug_list, list) {
++		list_del_rcu(&dclk->list);
++		dclk->registered = false;
++	}
+ 	mutex_unlock(&clk_debug_lock);
++	synchronize_srcu(&clk_debug_srcu);
++	/* Per-device devres owns the storage, including detached entries. */
+ }
+ 
+ /**
+@@ -1072,7 +1087,7 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	dclk = kzalloc(sizeof(*dclk), GFP_KERNEL);
++	dclk = devres_alloc(clk_hw_debug_release, sizeof(*dclk), GFP_KERNEL);
+ 	if (!dclk)
+ 		return -ENOMEM;
+ 
+@@ -1080,8 +1095,10 @@
+ 	dclk->clk_hw = clk_hw;
+ 
+ 	mutex_lock(&clk_debug_lock);
+-	list_add(&dclk->list, &clk_hw_debug_list);
++	list_add_rcu(&dclk->list, &clk_hw_debug_list);
++	dclk->registered = true;
+ 	mutex_unlock(&clk_debug_lock);
++	devres_add(dev, dclk);
+ 
+ 	return 0;
+ }
+@@ -1137,6 +1154,8 @@
+ 	if (debug_suspend)
+ 		unregister_trace_suspend_resume(
+ 				clk_debug_suspend_trace_probe, NULL);
++	/* Also drain a callback unregistered earlier through debugfs. */
++	tracepoint_synchronize_unregister();
+ 
+ 	clk_debug_unregister();
+ }
+--- a/drivers/clk/qcom/clk-rcg.h
++++ b/drivers/clk/qcom/clk-rcg.h
+@@ -204,6 +204,13 @@
+ #define DEFINE_RCG_DFS(r) \
+ 	{ .rcg = &r, .init = &r##_init }
+ 
++struct qcom_cc_desc;
++int qcom_cc_register_rcg_dfs_managed(struct device *dev,
++				   const struct qcom_cc_desc *desc,
++				   struct regmap *regmap,
++				   const struct clk_rcg_dfs_data *rcgs,
++				   size_t len);
++
+ extern int qcom_cc_register_rcg_dfs(struct regmap *regmap,
+ 				    const struct clk_rcg_dfs_data *rcgs,
+ 				    size_t len);
+--- a/drivers/clk/qcom/clk-rcg2.c
++++ b/drivers/clk/qcom/clk-rcg2.c
+@@ -1761,15 +1761,16 @@
+ 	freq_tbl = kcalloc(MAX_PERF_LEVEL + 1, sizeof(*freq_tbl), GFP_KERNEL);
+ 	if (!freq_tbl)
+ 		return -ENOMEM;
+-	rcg->freq_tbl = freq_tbl;
+-
+ 	for (i = 0; i < MAX_PERF_LEVEL; i++) {
+ 		ret =
+ 		clk_rcg2_dfs_populate_freq(&rcg->clkr.hw, i, freq_tbl + i);
+-		if (ret)
++		if (ret) {
++			kfree(freq_tbl);
+ 			return ret;
++		}
+ 	}
+-	return ret;
++	rcg->freq_tbl = freq_tbl;
++	return 0;
+ }
+ 
+ static int clk_rcg2_dfs_determine_rate(struct clk_hw *hw,
+@@ -1837,7 +1838,17 @@
+ 	return calc_rate(parent_rate, m, n, mode, pre_div);
+ }
+ 
++static void clk_rcg2_dfs_terminate(struct clk_hw *hw)
++{
++	struct clk_rcg2 *rcg = to_clk_rcg2(hw);
++
++	/* CCF has installed no-driver ops and serialized all clock operations. */
++	kfree(rcg->freq_tbl);
++	rcg->freq_tbl = NULL;
++}
++
+ static const struct clk_ops clk_rcg2_dfs_ops = {
++	.terminate = clk_rcg2_dfs_terminate,
+ 	.prepare = clk_prepare_regmap,
+ 	.unprepare = clk_unprepare_regmap,
+ 	.pre_rate_change = clk_pre_change_regmap,
+@@ -2357,7 +2368,7 @@
+ 
+ 	ret = regmap_read(regmap, rcg->cmd_rcgr + SE_CMD_DFSR_OFFSET, &val);
+ 	if (ret)
+-		return -EINVAL;
++		return ret;
+ 
+ 	if (!(val & SE_CMD_DFS_EN))
+ 		return 0;
+@@ -2389,6 +2400,67 @@
+ }
+ EXPORT_SYMBOL_GPL(qcom_cc_register_rcg_dfs);
+ 
++struct clk_rcg_dfs_saved {
++	const struct clk_rcg_dfs_data *data;
++	struct clk_init_data init;
++	const struct freq_tbl *freq_tbl;
++	unsigned long flags;
++};
++
++struct clk_rcg_dfs_owner {
++	struct device *dev;
++	size_t num;
++	struct clk_rcg_dfs_saved saved[];
++};
++
++static void clk_rcg_dfs_restore(void *data)
++{
++	struct clk_rcg_dfs_owner *owner = data;
++	struct clk_rcg_dfs_saved *saved;
++	size_t i;
++
++	if (!qcom_cc_can_restore(owner->dev))
++		return;
++	for (i = 0; i < owner->num; i++) {
++		saved = &owner->saved[i];
++		*saved->data->init = saved->init;
++		saved->data->rcg->freq_tbl = saved->freq_tbl;
++		saved->data->rcg->flags = saved->flags;
++	}
++}
++
++int qcom_cc_register_rcg_dfs_managed(struct device *dev,
++				   const struct qcom_cc_desc *desc,
++				   struct regmap *regmap,
++				   const struct clk_rcg_dfs_data *rcgs,
++				   size_t len)
++{
++	struct clk_rcg_dfs_owner *owner;
++	size_t i;
++	int ret;
++
++	ret = qcom_cc_prepare(dev, desc);
++	if (ret)
++		return ret;
++	owner = devm_kzalloc(dev, struct_size(owner, saved, len), GFP_KERNEL);
++	if (!owner)
++		return -ENOMEM;
++	owner->dev = dev;
++	owner->num = len;
++	for (i = 0; i < len; i++) {
++		owner->saved[i].data = &rcgs[i];
++		owner->saved[i].init = *rcgs[i].init;
++		owner->saved[i].freq_tbl = rcgs[i].rcg->freq_tbl;
++		owner->saved[i].flags = rcgs[i].rcg->flags;
++	}
++	/* CCF unregister/terminate runs before these static templates are restored. */
++	ret = devm_add_action_or_reset(dev, clk_rcg_dfs_restore, owner);
++	if (ret)
++		return ret;
++	return qcom_cc_register_rcg_dfs(regmap, rcgs, len);
++}
++EXPORT_SYMBOL_GPL(qcom_cc_register_rcg_dfs_managed);
++
+ static int clk_rcg2_dp_set_rate(struct clk_hw *hw, unsigned long rate,
+ 			unsigned long parent_rate)
+ {
+--- a/drivers/clk/qcom/clk-regmap.c
++++ b/drivers/clk/qcom/clk-regmap.c
+@@ -277,50 +277,108 @@
+  * and so that the clock is registered with the common clock framework.
+  * Also maintain clk-regmap clks list for providers use.
+  */
++struct clk_regmap_saved {
++	struct clk_regmap *rclk;
++	const struct clk_init_data *init;
++	struct device *dev;
++	struct regmap *regmap;
++	int vdd_level;
++};
++
++static void clk_regmap_restore(void *data)
++{
++	struct clk_regmap_saved *saved = data;
++	struct clk_regmap *rclk = saved->rclk;
++
++	/* Registered before CCF: devres runs this after CCF unregistration. */
++	if (!qcom_cc_can_restore(rclk->dev))
++		return;
++	rclk->hw.init = saved->init;
++	rclk->hw.core = NULL;
++	rclk->hw.clk = NULL;
++	rclk->dev = saved->dev;
++	rclk->regmap = saved->regmap;
++	rclk->vdd_data.vdd_level = saved->vdd_level;
++}
++
++static void clk_regmap_list_remove(void *data)
++{
++	struct clk_regmap *rclk = data;
++
++	spin_lock(&clk_regmap_lock);
++	list_del_init(&rclk->list_node);
++	spin_unlock(&clk_regmap_lock);
++}
++
++static int clk_regmap_list_add(struct device *dev, struct clk_regmap *rclk)
++{
++	spin_lock(&clk_regmap_lock);
++	list_add(&rclk->list_node, &clk_regmap_list);
++	spin_unlock(&clk_regmap_lock);
++
++	return devm_add_action_or_reset(dev, clk_regmap_list_remove, rclk);
++}
++
+ int devm_clk_register_regmap(struct device *dev, struct clk_regmap *rclk)
+ {
++	struct clk_regmap_saved *saved;
+ 	const struct clk_ops *ops;
+ 	int ret;
+ 
+-	rclk->dev = dev;
++	if (!rclk->hw.init)
++		return -EBUSY;
+ 
+-	if (dev && dev_get_regmap(dev, NULL))
++	saved = devm_kzalloc(dev, sizeof(*saved), GFP_KERNEL);
++	if (!saved)
++		return -ENOMEM;
++	saved->rclk = rclk;
++	saved->init = rclk->hw.init;
++	saved->dev = rclk->dev;
++	saved->regmap = rclk->regmap;
++	saved->vdd_level = rclk->vdd_data.vdd_level;
++	ret = devm_add_action_or_reset(dev, clk_regmap_restore, saved);
++	if (ret)
++		return ret;
++
++	rclk->dev = dev;
++	if (dev_get_regmap(dev, NULL))
+ 		rclk->regmap = dev_get_regmap(dev, NULL);
+-	else if (dev && dev->parent)
++	else if (dev->parent)
+ 		rclk->regmap = dev_get_regmap(dev->parent, NULL);
+ 
+-	if (rclk->flags & QCOM_CLK_IS_CRITICAL || rclk->flags & QCOM_CLK_BOOT_CRITICAL) {
++	if (rclk->flags & (QCOM_CLK_IS_CRITICAL | QCOM_CLK_BOOT_CRITICAL)) {
+ 		ops = rclk->hw.init->ops;
+-		if (ops && ops->enable)
+-			ops->enable(&rclk->hw);
+-
++		if (ops && ops->enable) {
++			ret = ops->enable(&rclk->hw);
++			if (ret)
++				return ret;
++		}
+ 		if (rclk->flags & QCOM_CLK_IS_CRITICAL)
+ 			return 0;
+ 	}
+ 
+ 	ret = devm_clk_hw_register(dev, &rclk->hw);
+-	if (!ret) {
+-		spin_lock(&clk_regmap_lock);
+-		list_add(&rclk->list_node, &clk_regmap_list);
+-		spin_unlock(&clk_regmap_lock);
++	if (ret)
++		return ret;
++	ret = clk_regmap_list_add(dev, rclk);
++	if (ret)
++		return ret;
+ 
+-		ret = clk_hw_debug_register(dev, &rclk->hw);
+-	}
+-
+-	return ret;
++	return clk_hw_debug_register(dev, &rclk->hw);
+ }
+ EXPORT_SYMBOL_GPL(devm_clk_register_regmap);
+ 
+ /**
+- * devm_clk_regmap_list_node - Add a clk-regmap clock list for providers
+- *
+- * @rclk: clk to operate on
++ * devm_clk_regmap_list_node - Add a managed clk-regmap list entry
++ * @dev: device owning the clock
++ * @rclk: clock to add
+  *
+- * Maintain clk-regmap clks list for providers use.
++ * The legacy void API cannot report allocation failure. In that case the
++ * action-or-reset helper removes the entry before returning to the caller.
+  */
+ void devm_clk_regmap_list_node(struct device *dev, struct clk_regmap *rclk)
+ {
+-	list_add(&rclk->list_node, &clk_regmap_list);
++	WARN_ON(clk_regmap_list_add(dev, rclk));
+ }
+ EXPORT_SYMBOL_GPL(devm_clk_regmap_list_node);
+ 
+@@ -330,15 +388,18 @@
+ 	struct device *parent_dev = rclk->dev->parent;
+ 
+ 	if (parent_dev && pm_runtime_enabled(parent_dev)) {
+-		ret = pm_runtime_get_sync(parent_dev);
++		ret = pm_runtime_resume_and_get(parent_dev);
+ 		if (ret < 0)
+ 			return ret;
+ 	}
+ 
+ 	if (pm_runtime_enabled(rclk->dev)) {
+-		ret = pm_runtime_get_sync(rclk->dev);
+-		if (ret < 0)
++		ret = pm_runtime_resume_and_get(rclk->dev);
++		if (ret < 0) {
++			if (parent_dev && pm_runtime_enabled(parent_dev))
++				pm_runtime_put_sync(parent_dev);
+ 			return ret;
++		}
+ 	}
+ 
+ 	return 0;
+--- a/drivers/clk/qcom/common.c
++++ b/drivers/clk/qcom/common.c
+@@ -28,6 +28,7 @@
+ #include "clk-debug.h"
+ 
+ struct qcom_cc {
++	struct qcom_cc_lifetime *life;
+ 	struct qcom_reset_controller reset;
+ 	struct clk_regmap **rclks;
+ 	size_t num_rclks;
+@@ -35,6 +36,374 @@
+ 	size_t num_clk_hws;
+ };
+ 
++/*
++ * This private devres owner deliberately leaves drvdata as qcom_cc_desc.
++ * clk-pm and clk_restore_critical_clocks share that established contract.
++ */
++struct qcom_cc_lifetime {
++	struct list_head node;
++	struct device *dev;
++	const struct qcom_cc_desc *desc;
++	struct qcom_cc_desc *runtime_desc;
++	struct clk *iface;
++	struct icc_path *path;
++	bool *runtime_votes;
++	bool *proxy_votes;
++	unsigned long *flags;
++	bool runtime_enabled;
++	bool probe_ref;
++	bool iface_enabled;
++	bool bw_voted;
++	bool exposed;
++	struct qcom_cc_quarantine *quarantine;
++};
++
++/* No descriptor/code pointers or callbacks survive a hardware-release fault. */
++struct qcom_cc_quarantine {
++	struct list_head node;
++	struct device *dev;
++	struct icc_path *path;
++	int error;
++	unsigned int num_regulators;
++	struct regulator *regulators[];
++};
++
++static LIST_HEAD(qcom_cc_quarantines);
++
++static LIST_HEAD(qcom_cc_lifetimes);
++static DEFINE_MUTEX(qcom_cc_lifetime_lock);
++
++static int qcom_cc_unvote(struct qcom_cc_lifetime *life, bool proxy)
++{
++	const struct qcom_cc_desc *desc = life->desc;
++	bool *votes = proxy ? life->proxy_votes : life->runtime_votes;
++	struct clk_vdd_class_data data = { };
++	int i, ret, first = 0;
++
++	for (i = desc->num_clk_regulators; i-- > 0;) {
++		if (!votes[i])
++			continue;
++		data.vdd_class = desc->clk_regulators[i];
++		ret = clk_unvote_vdd_level(&data,
++			proxy ? data.vdd_class->num_levels - 1 : 1);
++		if (!ret)
++			votes[i] = false;
++		else if (!first)
++			first = ret;
++	}
++	return first;
++}
++
++static int qcom_cc_vote(struct qcom_cc_lifetime *life, bool proxy)
++{
++	const struct qcom_cc_desc *desc = life->desc;
++	bool *votes = proxy ? life->proxy_votes : life->runtime_votes;
++	struct clk_vdd_class_data data = { };
++	int i, ret;
++
++	for (i = 0; i < desc->num_clk_regulators; i++) {
++		data.vdd_class = desc->clk_regulators[i];
++		if (!data.vdd_class || votes[i])
++			continue;
++		ret = clk_vote_vdd_level(&data,
++			proxy ? data.vdd_class->num_levels - 1 : 1);
++		if (ret)
++			return ret;
++		votes[i] = true;
++	}
++	return 0;
++}
++
++static int qcom_cc_runtime_resources_put(struct qcom_cc_lifetime *life)
++{
++	int ret, first = 0;
++
++	if (life->iface_enabled) {
++		clk_disable_unprepare(life->iface);
++		life->iface_enabled = false;
++	}
++	if (life->bw_voted) {
++		ret = icc_set_bw(life->path, 0, 0);
++		if (!ret)
++			life->bw_voted = false;
++		else
++			first = ret;
++	}
++	ret = qcom_cc_unvote(life, false);
++	return first ? first : ret;
++}
++
++static int qcom_cc_runtime_resources_get(struct qcom_cc_lifetime *life)
++{
++	int ret;
++
++	ret = qcom_cc_vote(life, false);
++	if (ret)
++		return ret;
++	if (life->path && !life->bw_voted) {
++		ret = icc_set_bw(life->path, 0, 1);
++		if (ret)
++			return ret;
++		life->bw_voted = true;
++	}
++	if (!life->iface_enabled) {
++		ret = clk_prepare_enable(life->iface);
++		if (ret)
++			return ret;
++		life->iface_enabled = true;
++	}
++	return 0;
++}
++
++static void qcom_cc_lifetime_release(struct device *dev, void *res);
++
++static struct qcom_cc_lifetime *qcom_cc_lifetime_find(struct device *dev)
++{
++	struct qcom_cc_lifetime *life, *found = NULL;
++
++	mutex_lock(&qcom_cc_lifetime_lock);
++	list_for_each_entry(life, &qcom_cc_lifetimes, node) {
++		if (life->dev == dev) {
++			found = life;
++			break;
++		}
++	}
++	mutex_unlock(&qcom_cc_lifetime_lock);
++	return found;
++}
++
++/*
++ * An OF handout may outlive forced device teardown. A normal module unload
++ * has already excluded module consumer references; other exposed instances
++ * keep their consumed hw metadata and are refused on a later probe.
++ */
++bool qcom_cc_can_restore(struct device *dev)
++{
++	struct qcom_cc_lifetime *life = qcom_cc_lifetime_find(dev);
++
++	if (!life)
++		return false;
++	if (!READ_ONCE(life->exposed))
++		return true;
++	return dev->driver && dev->driver->owner &&
++		!module_is_live(dev->driver->owner);
++}
++
++static struct qcom_cc_lifetime *
++qcom_cc_lifetime_get(struct device *dev, const struct qcom_cc_desc *desc)
++{
++	struct qcom_cc_lifetime *life, *other;
++	struct qcom_cc_quarantine *quarantine;
++	size_t num_regulators = 0;
++	int i, j, k, ret;
++
++	life = qcom_cc_lifetime_find(dev);
++	if (life)
++		return life->desc == desc ? life : ERR_PTR(-EBUSY);
++
++	life = devres_alloc(qcom_cc_lifetime_release, sizeof(*life), GFP_KERNEL);
++	if (!life)
++		return ERR_PTR(-ENOMEM);
++	life->dev = dev;
++	life->desc = desc;
++	life->runtime_votes = kcalloc(desc->num_clk_regulators, sizeof(bool), GFP_KERNEL);
++	life->proxy_votes = kcalloc(desc->num_clk_regulators, sizeof(bool), GFP_KERNEL);
++	life->flags = kcalloc(desc->num_clks, sizeof(*life->flags), GFP_KERNEL);
++	for (i = 0; i < desc->num_clk_regulators; i++)
++		num_regulators += desc->clk_regulators[i]->num_regulators;
++	life->quarantine = kzalloc(struct_size(life->quarantine, regulators,
++					      num_regulators), GFP_KERNEL);
++	if (!life->runtime_votes || !life->proxy_votes || !life->flags ||
++	    !life->quarantine) {
++		ret = -ENOMEM;
++		goto free;
++	}
++
++	mutex_lock(&qcom_cc_lifetime_lock);
++	list_for_each_entry(quarantine, &qcom_cc_quarantines, node) {
++		if (quarantine->dev == dev) {
++			ret = quarantine->error;
++			mutex_unlock(&qcom_cc_lifetime_lock);
++			goto free;
++		}
++	}
++	/* A quarantined static template must not be reused on another device. */
++	for (i = 0; i < desc->num_clks; i++) {
++		if (desc->clks[i] && !desc->clks[i]->hw.init) {
++			mutex_unlock(&qcom_cc_lifetime_lock);
++			ret = -EBUSY;
++			goto free;
++		}
++	}
++	for (i = 0; i < desc->num_clk_hws; i++) {
++		if (desc->clk_hws[i] && !desc->clk_hws[i]->init) {
++			mutex_unlock(&qcom_cc_lifetime_lock);
++			ret = -EBUSY;
++			goto free;
++		}
++	}
++	list_for_each_entry(other, &qcom_cc_lifetimes, node) {
++		if (other->desc == desc ||
++		    (desc->num_clks && other->desc->clks == desc->clks)) {
++			mutex_unlock(&qcom_cc_lifetime_lock);
++			ret = -EBUSY;
++			goto free;
++		}
++		for (j = 0; j < desc->num_clk_regulators; j++) {
++			for (k = 0; k < other->desc->num_clk_regulators; k++) {
++				if (desc->clk_regulators[j] != other->desc->clk_regulators[k])
++					continue;
++				mutex_unlock(&qcom_cc_lifetime_lock);
++				ret = -EBUSY;
++				goto free;
++			}
++		}
++	}
++	list_add(&life->node, &qcom_cc_lifetimes);
++	mutex_unlock(&qcom_cc_lifetime_lock);
++
++	for (i = 0; i < desc->num_clks; i++)
++		if (desc->clks[i])
++			life->flags[i] = desc->clks[i]->flags;
++
++	ret = clk_regulator_init(dev, desc);
++	if (ret) {
++		mutex_lock(&qcom_cc_lifetime_lock);
++		list_del(&life->node);
++		mutex_unlock(&qcom_cc_lifetime_lock);
++		goto free;
++	}
++	/* The owner releases explicit regulator handles after clock/PM users. */
++	devres_add(dev, life);
++	return life;
++free:
++	kfree(life->quarantine);
++	kfree(life->flags);
++	kfree(life->proxy_votes);
++	kfree(life->runtime_votes);
++	devres_free(life);
++	return ERR_PTR(ret);
++}
++
++int qcom_cc_prepare(struct device *dev, const struct qcom_cc_desc *desc)
++{
++	struct qcom_cc_lifetime *life = qcom_cc_lifetime_get(dev, desc);
++
++	return IS_ERR(life) ? PTR_ERR(life) : 0;
++}
++
++static void qcom_cc_lifetime_release(struct device *dev, void *res)
++{
++	struct qcom_cc_lifetime *life = res;
++	const struct qcom_cc_desc *desc = life->desc;
++	struct qcom_cc_quarantine *quarantine = life->quarantine;
++	int i, j, ret, error;
++
++	if (life->probe_ref) {
++		life->probe_ref = false;
++		pm_runtime_put_noidle(dev);
++	}
++	if (life->runtime_enabled)
++		pm_runtime_disable(dev);
++	error = qcom_cc_runtime_resources_put(life);
++	ret = qcom_cc_unvote(life, true);
++	if (!error)
++		error = ret;
++	if (!qcom_cc_can_restore(dev) && !error)
++		error = -EBUSY;
++	/* CCF boot holds are drained before unregister; do not lose other votes. */
++	for (i = 0; i < desc->num_clk_regulators; i++) {
++		if (desc->clk_regulators[i]->cur_level < 0 && !error)
++			error = -EIO;
++		for (j = 0; j < desc->clk_regulators[i]->num_levels; j++)
++			if (desc->clk_regulators[i]->level_votes[j] && !error)
++				error = -EBUSY;
++	}
++
++	if (error) {
++		/*
++		 * A void teardown cannot reject a final hardware-release fault.
++		 * Retain only framework handles and a device reference. Never keep
++		 * leaf metadata/code accessible, or permit a second owner here.
++		 */
++		/* Keep the refusal registry alive if all leaf modules are unloaded. */
++		__module_get(THIS_MODULE);
++		quarantine->dev = get_device(dev);
++		quarantine->path = life->path;
++		quarantine->error = error;
++		for (i = 0; i < desc->num_clk_regulators; i++)
++			for (j = 0; j < desc->clk_regulators[i]->num_regulators; j++)
++				quarantine->regulators[quarantine->num_regulators++] =
++					desc->clk_regulators[i]->regulator[j];
++		mutex_lock(&qcom_cc_lifetime_lock);
++		list_add(&quarantine->node, &qcom_cc_quarantines);
++		mutex_unlock(&qcom_cc_lifetime_lock);
++		dev_err(dev, "clock release failed (%d); resources retained, reprobe refused\n",
++			error);
++	} else {
++		icc_put(life->path);
++		kfree(quarantine);
++	}
++	clk_put(life->iface);
++	if (life->runtime_desc)
++		life->runtime_desc->path = NULL;
++	if (dev_get_drvdata(dev) == desc)
++		dev_set_drvdata(dev, NULL);
++	clk_regulator_deinit(desc, !error);
++	if (qcom_cc_can_restore(dev))
++		for (i = 0; i < desc->num_clks; i++)
++			if (desc->clks[i])
++				desc->clks[i]->flags = life->flags[i];
++	mutex_lock(&qcom_cc_lifetime_lock);
++	list_del(&life->node);
++	mutex_unlock(&qcom_cc_lifetime_lock);
++	kfree(life->flags);
++	kfree(life->proxy_votes);
++	kfree(life->runtime_votes);
++}
++
++static void qcom_cc_release_boot_holds(void *data)
++{
++	/* CCF owns registration-time boot holds; release them before unregister. */
++	clk_sync_state(data);
++}
++
++struct qcom_cc_hw_saved {
++	struct clk_hw *hw;
++	struct device *dev;
++	const struct clk_init_data *init;
++};
++
++static void qcom_cc_restore_hw(void *data)
++{
++	struct qcom_cc_hw_saved *saved = data;
++
++	if (!qcom_cc_can_restore(saved->dev))
++		return;
++	saved->hw->init = saved->init;
++	saved->hw->core = NULL;
++	saved->hw->clk = NULL;
++}
++
++static int qcom_cc_register_hw(struct device *dev, struct clk_hw *hw)
++{
++	struct qcom_cc_hw_saved *saved;
++	int ret;
++
++	if (!hw->init)
++		return -EBUSY;
++	saved = devm_kzalloc(dev, sizeof(*saved), GFP_KERNEL);
++	if (!saved)
++		return -ENOMEM;
++	saved->hw = hw;
++	saved->dev = dev;
++	saved->init = hw->init;
++	ret = devm_add_action_or_reset(dev, qcom_cc_restore_hw, saved);
++	if (ret)
++		return ret;
++	return devm_clk_hw_register(dev, hw);
++}
++
+ int qcom_clk_crm_init(struct device *dev, struct clk_crm *crm)
+ {
+ 	char prop_name[32];
+@@ -347,15 +716,20 @@
+ 	struct qcom_cc *cc = data;
+ 	unsigned int idx = clkspec->args[0];
+ 
+-	if (idx < cc->num_clk_hws && cc->clk_hws[idx])
++	if (idx < cc->num_clk_hws && cc->clk_hws[idx]) {
++		WRITE_ONCE(cc->life->exposed, true);
+ 		return cc->clk_hws[idx];
++	}
+ 
+ 	if (idx >= cc->num_rclks) {
+ 		pr_err("%s: invalid index %u\n", __func__, idx);
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+-	return cc->rclks[idx] ? &cc->rclks[idx]->hw : NULL;
++	if (!cc->rclks[idx])
++		return NULL;
++	WRITE_ONCE(cc->life->exposed, true);
++	return &cc->rclks[idx]->hw;
+ }
+ 
+ int qcom_cc_really_probe(struct platform_device *pdev,
+@@ -366,15 +740,26 @@
+ 	struct qcom_reset_controller *reset;
+ 	struct qcom_cc *cc;
+ 	struct gdsc_desc *scd;
++	struct qcom_cc_lifetime *life;
++	void *group;
+ 	size_t num_clks = desc->num_clks;
+ 	struct clk_regmap **rclks = desc->clks;
+ 	size_t num_clk_hws = desc->num_clk_hws;
+ 	struct clk_hw **clk_hws = desc->clk_hws;
+ 
+-	cc = devm_kzalloc(dev, sizeof(*cc), GFP_KERNEL);
+-	if (!cc)
++	life = qcom_cc_lifetime_get(dev, desc);
++	if (IS_ERR(life))
++		return PTR_ERR(life);
++	group = devres_open_group(dev, NULL, GFP_KERNEL);
++	if (!group)
+ 		return -ENOMEM;
++	cc = devm_kzalloc(dev, sizeof(*cc), GFP_KERNEL);
++	if (!cc) {
++		ret = -ENOMEM;
++		goto release_group;
++	}
+ 
++	cc->life = life;
+ 	reset = &cc->reset;
+ 	reset->dev = dev;
+ 	reset->rcdev.of_node = dev->of_node;
+@@ -384,39 +769,40 @@
+ 	reset->regmap = regmap;
+ 	reset->reset_map = desc->resets;
+ 
+-	ret = clk_regulator_init(&pdev->dev, desc);
+-	if (ret)
+-		return ret;
+-
+-	ret = clk_vdd_proxy_vote(&pdev->dev, desc);
++	ret = qcom_cc_vote(life, true);
+ 	if (ret)
+-		goto deinit_clk_regulator;
++		goto release_group;
+ 
+ 	if (desc->num_resets) {
+ 		ret = devm_reset_controller_register(dev, &reset->rcdev);
+ 		if (ret)
+-			goto proxy_unvote;
++			goto release_group;
+ 	}
+ 
+ 	if (desc->gdscs && desc->num_gdscs) {
+ 		scd = devm_kzalloc(dev, sizeof(*scd), GFP_KERNEL);
+ 		if (!scd) {
+ 			ret = -ENOMEM;
+-			goto proxy_unvote;
++			goto release_group;
+ 		}
+ 		scd->dev = dev;
+ 		scd->scs = desc->gdscs;
+ 		scd->num = desc->num_gdscs;
+ 		ret = gdsc_register(scd, &reset->rcdev, regmap);
+ 		if (ret)
+-			goto proxy_unvote;
++			goto release_group;
+ 		ret = devm_add_action_or_reset(dev, qcom_cc_gdsc_unregister,
+ 					       scd);
+ 		if (ret)
+-			goto proxy_unvote;
++			goto release_group;
+ 	}
+ 
+-	cc->rclks = rclks;
++	cc->rclks = devm_kmemdup(dev, rclks, sizeof(*rclks) * num_clks, GFP_KERNEL);
++	if (!cc->rclks && num_clks) {
++		ret = -ENOMEM;
++		goto release_group;
++	}
++	rclks = cc->rclks;
+ 	cc->num_rclks = num_clks;
+ 	cc->clk_hws = clk_hws;
+ 	cc->num_clk_hws = num_clk_hws;
+@@ -428,9 +814,9 @@
+ 		if (!clk_hws[i])
+ 			continue;
+ 
+-		ret = devm_clk_hw_register(dev, clk_hws[i]);
++		ret = qcom_cc_register_hw(dev, clk_hws[i]);
+ 		if (ret)
+-			goto proxy_unvote;
++			goto release_group;
+ 	}
+ 
+ 	for (i = 0; i < num_clks; i++) {
+@@ -439,7 +825,7 @@
+ 
+ 		ret = devm_clk_register_regmap(dev, rclks[i]);
+ 		if (ret)
+-			goto proxy_unvote;
++			goto release_group;
+ 
+ 		clk_hw_populate_clock_opp_table(dev->of_node, &rclks[i]->hw);
+ 
+@@ -452,16 +838,21 @@
+ 			rclks[i] = NULL;
+ 	}
+ 
++	ret = devm_add_action_or_reset(dev, qcom_cc_release_boot_holds, dev);
++	if (ret)
++		goto release_group;
+ 	ret = devm_of_clk_add_hw_provider(dev, qcom_cc_clk_hw_get, cc);
+ 	if (ret)
+-		goto proxy_unvote;
++		goto release_group;
+ 
++	devres_remove_group(dev, group);
+ 	return 0;
+ 
+-proxy_unvote:
+-	clk_vdd_proxy_unvote(dev, desc);
+-deinit_clk_regulator:
+-	clk_regulator_deinit(desc);
++release_group:
++	clk_sync_state(dev);
++	devres_release_group(dev, group);
++	if (qcom_cc_unvote(life, true))
++		dev_warn(dev, "clock proxy rollback requires retry\n");
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(qcom_cc_really_probe);
+@@ -498,10 +889,11 @@
+ 
+ void qcom_cc_sync_state(struct device *dev, const struct qcom_cc_desc *desc)
+ {
+-	dev_info(dev, "sync_state\n");
+-	clk_sync_state(dev);
++	struct qcom_cc_lifetime *life = qcom_cc_lifetime_find(dev);
+ 
+-	clk_vdd_proxy_unvote(dev, desc);
++	clk_sync_state(dev);
++	if (life && life->desc == desc && qcom_cc_unvote(life, true))
++		dev_warn(dev, "clock proxy release requires retry\n");
+ }
+ EXPORT_SYMBOL(qcom_cc_sync_state);
+ 
+@@ -609,121 +1001,92 @@
+ 			 struct qcom_cc_desc *desc)
+ {
+ 	struct device *dev = &pdev->dev;
+-	struct clk *clk;
+-	int ret;
++	struct qcom_cc_lifetime *life;
++	struct clk *iface;
++	struct icc_path *path;
++
++	life = qcom_cc_lifetime_get(dev, desc);
++	if (IS_ERR(life))
++		return PTR_ERR(life);
++	if (life->runtime_enabled)
++		return -EBUSY;
++	iface = clk_get_optional(dev, "iface");
++	if (IS_ERR(iface))
++		return PTR_ERR(iface);
++	path = of_icc_get(dev, NULL);
++	if (IS_ERR(path)) {
++		clk_put(iface);
++		return PTR_ERR(path);
++	}
++	life->iface = iface;
++	life->path = path;
++	life->runtime_desc = desc;
++	desc->path = path;
++	platform_set_drvdata(pdev, desc);
++	pm_runtime_enable(dev);
++	life->runtime_enabled = true;
++	return 0;
++}
++EXPORT_SYMBOL(qcom_cc_runtime_init);
+ 
+-	clk = clk_get_optional(dev, "iface");
+-	if (IS_ERR(clk)) {
+-		if (PTR_ERR(clk) != -EPROBE_DEFER)
+-			dev_err(dev, "unable to get iface clock\n");
+-		return PTR_ERR(clk);
+-	}
+-	clk_put(clk);
++int qcom_cc_runtime_acquire(struct platform_device *pdev,
++			    struct qcom_cc_desc *desc)
++{
++	struct qcom_cc_lifetime *life;
++	int ret;
+ 
+-	ret = clk_regulator_init(dev, desc);
++	ret = qcom_cc_runtime_init(pdev, desc);
+ 	if (ret)
+ 		return ret;
+-
+-	desc->path = of_icc_get(dev, NULL);
+-	if (IS_ERR(desc->path)) {
+-		if (PTR_ERR(desc->path) != -EPROBE_DEFER)
+-			dev_err(dev, "error getting path\n");
+-		ret = PTR_ERR(desc->path);
+-		goto deinit_clk_regulator;
+-	}
+-
+-	platform_set_drvdata(pdev, desc);
+-	pm_runtime_enable(dev);
+-
+-	ret = pm_clk_create(dev);
++	life = qcom_cc_lifetime_find(&pdev->dev);
++	ret = pm_runtime_resume_and_get(&pdev->dev);
+ 	if (ret)
+-		goto disable_pm_runtime;
+-
+-	ret = pm_clk_add(dev, "iface");
+-	if (ret < 0) {
+-		dev_err(dev, "failed to acquire iface clock\n");
+-		goto destroy_pm_clk;
+-	}
+-
++		return ret;
++	life->probe_ref = true;
+ 	return 0;
++}
++EXPORT_SYMBOL_GPL(qcom_cc_runtime_acquire);
+ 
+-destroy_pm_clk:
+-	pm_clk_destroy(dev);
+-
+-disable_pm_runtime:
+-	pm_runtime_disable(dev);
+-	icc_put(desc->path);
+-deinit_clk_regulator:
+-	clk_regulator_deinit(desc);
++int qcom_cc_runtime_release(struct platform_device *pdev)
++{
++	struct qcom_cc_lifetime *life = qcom_cc_lifetime_find(&pdev->dev);
+ 
+-	return ret;
++	if (!life)
++		return -EINVAL;
++	if (!life->probe_ref)
++		return 0;
++	/* put drops the usage count even if the suspend callback returns an error. */
++	life->probe_ref = false;
++	return pm_runtime_put_sync(&pdev->dev);
+ }
+-EXPORT_SYMBOL(qcom_cc_runtime_init);
++EXPORT_SYMBOL_GPL(qcom_cc_runtime_release);
+ 
+ int qcom_cc_runtime_resume(struct device *dev)
+ {
+-	struct qcom_cc_desc *desc = dev_get_drvdata(dev);
+-	struct clk_vdd_class_data vdd_data = {0};
++	struct qcom_cc_lifetime *life = qcom_cc_lifetime_find(dev);
+ 	int ret;
+-	int i;
+-
+-	for (i = 0; i < desc->num_clk_regulators; i++) {
+-		vdd_data.vdd_class = desc->clk_regulators[i];
+-		if (!vdd_data.vdd_class)
+-			continue;
+-
+-		ret = clk_vote_vdd_level(&vdd_data, 1);
+-		if (ret) {
+-			dev_warn(dev, "%s: failed to vote voltage\n", __func__);
+-			return ret;
+-		}
+-	}
+-
+-	if (desc->path) {
+-		ret = icc_set_bw(desc->path, 0, 1);
+-		if (ret) {
+-			dev_warn(dev, "%s: failed to vote bw\n", __func__);
+-			return ret;
+-		}
+-	}
+-
+-	ret = pm_clk_resume(dev);
+-	if (ret)
+-		dev_warn(dev, "%s: failed to enable clocks\n", __func__);
+ 
++	if (!life || !life->runtime_enabled)
++		return -EINVAL;
++	ret = qcom_cc_runtime_resources_get(life);
++	if (ret && qcom_cc_runtime_resources_put(life))
++		dev_warn(dev, "clock runtime resume rollback requires retry\n");
+ 	return ret;
+ }
+ EXPORT_SYMBOL(qcom_cc_runtime_resume);
+ 
+ int qcom_cc_runtime_suspend(struct device *dev)
+ {
+-	struct qcom_cc_desc *desc = dev_get_drvdata(dev);
+-	struct clk_vdd_class_data vdd_data = {0};
++	struct qcom_cc_lifetime *life = qcom_cc_lifetime_find(dev);
+ 	int ret;
+-	int i;
+-
+-	ret = pm_clk_suspend(dev);
+-	if (ret)
+-		dev_warn(dev, "%s: failed to disable clocks\n", __func__);
+-
+-	if (desc->path) {
+-		ret = icc_set_bw(desc->path, 0, 0);
+-		if (ret)
+-			dev_warn(dev, "%s: failed to unvote bw\n", __func__);
+-	}
+-
+-	for (i = 0; i < desc->num_clk_regulators; i++) {
+-		vdd_data.vdd_class = desc->clk_regulators[i];
+-		if (!vdd_data.vdd_class)
+-			continue;
+-
+-		ret = clk_unvote_vdd_level(&vdd_data, 1);
+-		if (ret)
+-			dev_warn(dev, "%s: failed to unvote voltage\n",
+-				 __func__);
+-	}
+ 
+-	return 0;
++	if (!life || !life->runtime_enabled)
++		return -EINVAL;
++	ret = qcom_cc_runtime_resources_put(life);
++	/* PM retains the active state after failure: restore released resources. */
++	if (ret && qcom_cc_runtime_resources_get(life))
++		dev_warn(dev, "clock runtime suspend rollback failed\n");
++	return ret;
+ }
+ EXPORT_SYMBOL(qcom_cc_runtime_suspend);
+ 
+--- a/drivers/clk/qcom/common.h
++++ b/drivers/clk/qcom/common.h
+@@ -124,6 +124,12 @@
+ 
+ int qcom_cc_runtime_init(struct platform_device *pdev,
+ 			 struct qcom_cc_desc *desc);
++int qcom_cc_runtime_acquire(struct platform_device *pdev,
++			    struct qcom_cc_desc *desc);
++int qcom_cc_runtime_release(struct platform_device *pdev);
++/* Internal to clk-qcom: static metadata is reusable only after safe teardown. */
++bool qcom_cc_can_restore(struct device *dev);
++int qcom_cc_prepare(struct device *dev, const struct qcom_cc_desc *desc);
+ int qcom_cc_runtime_suspend(struct device *dev);
+ int qcom_cc_runtime_resume(struct device *dev);
+ int qcom_clk_crm_init(struct device *dev, struct clk_crm *crm);
+--- a/drivers/clk/qcom/dispcc-tuna.c
++++ b/drivers/clk/qcom/dispcc-tuna.c
+@@ -2415,11 +2415,7 @@
+ 	if (IS_ERR(regmap))
+ 		return PTR_ERR(regmap);
+ 
+-	ret = qcom_cc_runtime_init(pdev, &disp_cc_tuna_desc);
+-	if (ret)
+-		return ret;
+-
+-	ret = pm_runtime_get_sync(&pdev->dev);
++	ret = qcom_cc_runtime_acquire(pdev, &disp_cc_tuna_desc);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2432,7 +2428,9 @@
+ 		return ret;
+ 
+ 	/* Enable clock gating for MDP clocks */
+-	regmap_update_bits(regmap, DISP_CC_MISC_CMD, 0x10, 0x10);
++	ret = regmap_update_bits(regmap, DISP_CC_MISC_CMD, 0x10, 0x10);
++	if (ret)
++		return ret;
+ 
+ 	/*
+ 	 * Keep clocks always enabled:
+@@ -2441,10 +2439,18 @@
+ 	 *	disp_cc_sleep_clk
+ 	 *	disp_cc_xo_clk
+ 	 */
+-	regmap_update_bits(regmap, 0xc00c, BIT(0), BIT(0));
+-	regmap_update_bits(regmap, 0xc008, BIT(0), BIT(0));
+-	regmap_update_bits(regmap, 0xe07c, BIT(0), BIT(0));
+-	regmap_update_bits(regmap, 0xe05c, BIT(0), BIT(0));
++	ret = regmap_update_bits(regmap, 0xc00c, BIT(0), BIT(0));
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(regmap, 0xc008, BIT(0), BIT(0));
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(regmap, 0xe07c, BIT(0), BIT(0));
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(regmap, 0xe05c, BIT(0), BIT(0));
++	if (ret)
++		return ret;
+ 
+ 	ret = qcom_cc_really_probe(pdev, &disp_cc_tuna_desc, regmap);
+ 	if (ret) {
+@@ -2452,10 +2458,12 @@
+ 		return ret;
+ 	}
+ 
+-	pm_runtime_put_sync(&pdev->dev);
++	ret = qcom_cc_runtime_release(pdev);
++	if (ret < 0)
++		return dev_err_probe(&pdev->dev, ret, "Failed to release probe power\n");
+ 	dev_info(&pdev->dev, "Registered DISP CC clocks\n");
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ static void disp_cc_tuna_sync_state(struct device *dev)
+@@ -2473,6 +2481,7 @@
+ 	.probe = disp_cc_tuna_probe,
+ 	.driver = {
+ 		.name = "disp_cc-tuna",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = disp_cc_tuna_match_table,
+ 		.sync_state = disp_cc_tuna_sync_state,
+ 		.pm = &disp_cc_tuna_pm_ops,
+--- a/drivers/clk/qcom/evacc-tuna.c
++++ b/drivers/clk/qcom/evacc-tuna.c
+@@ -422,30 +422,38 @@
+ 	if (IS_ERR(regmap))
+ 		return PTR_ERR(regmap);
+ 
+-	ret = qcom_cc_runtime_init(pdev, &eva_cc_tuna_desc);
+-	if (ret)
+-		return ret;
+-
+-	ret = pm_runtime_get_sync(&pdev->dev);
++	ret = qcom_cc_runtime_acquire(pdev, &eva_cc_tuna_desc);
+ 	if (ret)
+ 		return ret;
+ 
+ 	clk_lucid_ole_pll_configure(&eva_cc_pll0, regmap, &eva_cc_pll0_config);
+ 
+-	regmap_update_bits(regmap, 0x9f24, BIT(0), BIT(0));
++	ret = regmap_update_bits(regmap, 0x9f24, BIT(0), BIT(0));
++	if (ret)
++		return ret;
+ 	/*
+ 	 * Keep clocks always enabled:
+ 	 *	eva_cc_ahb_clk
+ 	 *	eva_cc_sleep_clk
+ 	 *	eva_cc_xo_clk
+ 	 */
+-	regmap_update_bits(regmap, 0x80a4, BIT(0), BIT(0));
+-	regmap_update_bits(regmap, 0x80f8, BIT(0), BIT(0));
+-	regmap_update_bits(regmap, 0x80d4, BIT(0), BIT(0));
++	ret = regmap_update_bits(regmap, 0x80a4, BIT(0), BIT(0));
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(regmap, 0x80f8, BIT(0), BIT(0));
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(regmap, 0x80d4, BIT(0), BIT(0));
++	if (ret)
++		return ret;
+ 
+ 	/* Change DLY_ACCU_RED_SHIFTER_DONE to d'13 for mvs0, mvs0c */
+-	regmap_update_bits(regmap, 0x8074, dly_accu_mask, dly_accu_val);
+-	regmap_update_bits(regmap, 0x8040, dly_accu_mask, dly_accu_val);
++	ret = regmap_update_bits(regmap, 0x8074, dly_accu_mask, dly_accu_val);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(regmap, 0x8040, dly_accu_mask, dly_accu_val);
++	if (ret)
++		return ret;
+ 
+ 	ret = qcom_cc_really_probe(pdev, &eva_cc_tuna_desc, regmap);
+ 	if (ret) {
+@@ -453,10 +461,12 @@
+ 		return ret;
+ 	}
+ 
+-	pm_runtime_put_sync(&pdev->dev);
++	ret = qcom_cc_runtime_release(pdev);
++	if (ret < 0)
++		return dev_err_probe(&pdev->dev, ret, "Failed to release probe power\n");
+ 	dev_info(&pdev->dev, "Registered EVA CC clocks\n");
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ static void eva_cc_tuna_sync_state(struct device *dev)
+@@ -474,6 +484,7 @@
+ 	.probe = eva_cc_tuna_probe,
+ 	.driver = {
+ 		.name = "eva_cc-tuna",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = eva_cc_tuna_match_table,
+ 		.sync_state = eva_cc_tuna_sync_state,
+ 		.pm = &eva_cc_tuna_pm_ops,
+--- a/drivers/clk/qcom/gcc-tuna.c
++++ b/drivers/clk/qcom/gcc-tuna.c
+@@ -3253,8 +3253,9 @@
+ 	if (IS_ERR(regmap))
+ 		return PTR_ERR(regmap);
+ 
+-	ret = qcom_cc_register_rcg_dfs(regmap, gcc_dfs_clocks,
+-				       ARRAY_SIZE(gcc_dfs_clocks));
++	ret = qcom_cc_register_rcg_dfs_managed(&pdev->dev, &gcc_tuna_desc,
++					     regmap, gcc_dfs_clocks,
++					     ARRAY_SIZE(gcc_dfs_clocks));
+ 	if (ret)
+ 		return ret;
+ 
+@@ -3308,6 +3309,7 @@
+ 	.probe = gcc_tuna_probe,
+ 	.driver = {
+ 		.name = "gcc-tuna",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = gcc_tuna_match_table,
+ 		.sync_state = gcc_tuna_sync_state,
+ 	},
+--- a/drivers/clk/qcom/gpucc-tuna.c
++++ b/drivers/clk/qcom/gpucc-tuna.c
+@@ -598,6 +598,7 @@
+ 	.probe = gpu_cc_tuna_probe,
+ 	.driver = {
+ 		.name = "gpu_cc-tuna",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = gpu_cc_tuna_match_table,
+ 		.sync_state = gpu_cc_tuna_sync_state,
+ 	},
+@@ -639,6 +640,7 @@
+ 	.probe = gx_clkctl_tuna_probe,
+ 	.driver = {
+ 		.name = "gx_clkctl-tuna",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = gx_clkctl_tuna_match_table,
+ 	},
+ };
+--- a/drivers/clk/qcom/tcsrcc-tuna.c
++++ b/drivers/clk/qcom/tcsrcc-tuna.c
+@@ -184,6 +184,7 @@
+ 	.probe = tcsr_cc_tuna_probe,
+ 	.driver = {
+ 		.name = "tcsr_cc-tuna",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = tcsr_cc_tuna_match_table,
+ 		.sync_state = tcsr_cc_tuna_sync_state,
+ 	},
+--- a/drivers/clk/qcom/vdd-class.c
++++ b/drivers/clk/qcom/vdd-class.c
+@@ -17,14 +17,19 @@
+ static int clk_aggregate_vdd(struct clk_vdd_class *vdd_class)
+ {
+ 	struct regulator **r = vdd_class->regulator;
+-	int level, ret, i, ignore;
++	int level, ret, i;
++	bool rollback_failed = false;
+ 	int *uv = vdd_class->vdd_uv;
+ 	int n_reg = vdd_class->num_regulators;
+ 	int cur_lvl = vdd_class->cur_level;
+ 	int max_lvl = vdd_class->num_levels - 1;
+-	int cur_base = cur_lvl * n_reg;
++	int cur_base = (cur_lvl < vdd_class->num_levels ? cur_lvl : 0) * n_reg;
++	bool was_enabled = cur_lvl > 0 && cur_lvl < vdd_class->num_levels;
+ 	int new_base;
+ 
++	if (cur_lvl < 0)
++		return -EIO;
++
+ 	/* aggregate votes */
+ 	for (level = max_lvl; level > 0; level--)
+ 		if (vdd_class->level_votes[level])
+@@ -41,9 +46,9 @@
+ 		if (ret)
+ 			goto set_voltage_fail;
+ 
+-		if (cur_lvl == 0 || cur_lvl == vdd_class->num_levels)
++		if (!was_enabled && level > 0)
+ 			ret = regulator_enable(r[i]);
+-		else if (level == 0)
++		else if (was_enabled && level == 0)
+ 			ret = regulator_disable(r[i]);
+ 		if (ret)
+ 			goto enable_disable_fail;
+@@ -54,15 +59,25 @@
+ 	return 0;
+ 
+ enable_disable_fail:
+-	regulator_set_voltage(r[i], uv[cur_base + i], INT_MAX);
++	if (regulator_set_voltage(r[i], uv[cur_base + i], INT_MAX))
++		rollback_failed = true;
+ 
+ set_voltage_fail:
+ 	for (i--; i >= 0; i--) {
+-		regulator_set_voltage(r[i], uv[cur_base + i], INT_MAX);
+-		if (cur_lvl == 0 || cur_lvl == vdd_class->num_levels)
+-			regulator_disable(r[i]);
+-		else if (level == 0)
+-			ignore = regulator_enable(r[i]);
++		if (regulator_set_voltage(r[i], uv[cur_base + i], INT_MAX))
++			rollback_failed = true;
++		if (!was_enabled && level > 0) {
++			if (regulator_disable(r[i]))
++				rollback_failed = true;
++		} else if (was_enabled && level == 0) {
++			if (regulator_enable(r[i]))
++				rollback_failed = true;
++		}
++	}
++	if (rollback_failed) {
++		/* Unknown hardware state: refuse new votes; owner retains handles. */
++		vdd_class->cur_level = -1;
++		pr_err("%s: regulator rollback failed\n", vdd_class->class_name);
+ 	}
+ 
+ 	return ret;
+@@ -72,7 +87,7 @@
+ {
+ 	int ret;
+ 
+-	if (level >= vdd_class->num_levels)
++	if (level < 0 || level >= vdd_class->num_levels)
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&vdd_lock);
+@@ -91,16 +106,16 @@
+ {
+ 	int ret;
+ 
+-	if (level >= vdd_class->num_levels)
++	if (level < 0 || level >= vdd_class->num_levels)
+ 		return -EINVAL;
+ 
++	mutex_lock(&vdd_lock);
+ 	if (WARN(!vdd_class->level_votes[level],
+ 		 "Reference counts are incorrect for %s level %d\n",
+ 		 vdd_class->class_name, level)) {
++		mutex_unlock(&vdd_lock);
+ 		return -EINVAL;
+ 	}
+-
+-	mutex_lock(&vdd_lock);
+ 	vdd_class->level_votes[level]--;
+ 
+ 	ret = clk_aggregate_vdd(vdd_class);
+@@ -269,7 +284,7 @@
+ 				continue;
+ 
+ 			name = vdd_class->regulator_names[cnt];
+-			regulator = devm_regulator_get(dev, name);
++			regulator = regulator_get(dev, name);
+ 			if (IS_ERR(regulator)) {
+ 				if (PTR_ERR(regulator) != -EPROBE_DEFER)
+ 					dev_err(dev, "%s error %s regulator\n",
+@@ -286,6 +301,9 @@
+ err_regulator_get:
+ 	while (i >= 0) {
+ 		vdd_class = desc->clk_regulators[i];
++		for (cnt = 0; cnt < vdd_class->num_regulators; cnt++)
++			if (vdd_class->regulator[cnt])
++				regulator_put(vdd_class->regulator[cnt]);
+ 		array_size = vdd_class->num_regulators * sizeof(*vdd_class->regulator);
+ 		memset(vdd_class->regulator, 0, array_size);
+ 		i--;
+@@ -294,34 +312,43 @@
+ 	return ret;
+ }
+ 
+-void clk_regulator_deinit(const struct qcom_cc_desc *desc)
++void clk_regulator_deinit(const struct qcom_cc_desc *desc, bool release)
+ {
+ 	struct clk_vdd_class *vdd_class;
+-	size_t array_size;
+-	int i;
++	int i, j;
+ 
++	/* Provider callbacks have been drained by the shared lifetime owner. */
+ 	for (i = 0; i < desc->num_clk_regulators; i++) {
+ 		vdd_class = desc->clk_regulators[i];
+-		array_size = vdd_class->num_regulators * sizeof(*vdd_class->regulator);
+-		memset(vdd_class->regulator, 0, array_size);
++		for (j = 0; j < vdd_class->num_regulators; j++) {
++			if (release && vdd_class->regulator[j])
++				regulator_put(vdd_class->regulator[j]);
++			vdd_class->regulator[j] = NULL;
++		}
++		memset(vdd_class->level_votes, 0,
++		       sizeof(*vdd_class->level_votes) * vdd_class->num_levels);
++		vdd_class->cur_level = vdd_class->num_levels;
+ 	}
+ }
+ 
+ int clk_vdd_proxy_vote(struct device *dev, const struct qcom_cc_desc *desc)
+ {
+ 	struct clk_vdd_class *vdd_class;
+-	u32 i;
+-	int ret = 0;
++	int i, ret;
+ 
+ 	for (i = 0; i < desc->num_clk_regulators; i++) {
+ 		vdd_class = desc->clk_regulators[i];
+-
+-		ret = clk_vote_vdd_class_level(vdd_class,
+-					       vdd_class->num_levels - 1);
++		ret = clk_vote_vdd_class_level(vdd_class, vdd_class->num_levels - 1);
+ 		if (ret)
+-			WARN(ret, "%s failed, ret=%d\n", __func__, ret);
++			goto rollback;
++	}
++	return 0;
++rollback:
++	while (i-- > 0) {
++		vdd_class = desc->clk_regulators[i];
++		if (clk_unvote_vdd_class_level(vdd_class, vdd_class->num_levels - 1))
++			dev_warn(dev, "clock legacy proxy rollback failed\n");
+ 	}
+-
+ 	return ret;
+ }
+ 
+--- a/drivers/clk/qcom/vdd-class.h
++++ b/drivers/clk/qcom/vdd-class.h
+@@ -76,7 +76,7 @@
+ int clk_unvote_vdd_level(struct clk_vdd_class_data *vdd_class, int level);
+ int clk_get_vdd_voltage(struct clk_vdd_class_data *vdd_data, int vdd_level);
+ int clk_regulator_init(struct device *dev, const struct qcom_cc_desc *desc);
+-void clk_regulator_deinit(const struct qcom_cc_desc *desc);
++void clk_regulator_deinit(const struct qcom_cc_desc *desc, bool release);
+ int clk_vdd_proxy_vote(struct device *dev, const struct qcom_cc_desc *desc);
+ int clk_vdd_proxy_unvote(struct device *dev, const struct qcom_cc_desc *desc);
+ #endif
+--- a/drivers/clk/qcom/videocc-tuna.c
++++ b/drivers/clk/qcom/videocc-tuna.c
+@@ -410,11 +410,7 @@
+ 	if (IS_ERR(regmap))
+ 		return PTR_ERR(regmap);
+ 
+-	ret = qcom_cc_runtime_init(pdev, &video_cc_tuna_desc);
+-	if (ret)
+-		return ret;
+-
+-	ret = pm_runtime_get_sync(&pdev->dev);
++	ret = qcom_cc_runtime_acquire(pdev, &video_cc_tuna_desc);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -426,9 +422,15 @@
+ 	 *	video_cc_sleep_clk
+ 	 *	video_cc_xo_clk
+ 	 */
+-	regmap_update_bits(regmap, 0x80dc, BIT(0), BIT(0));
+-	regmap_update_bits(regmap, 0x8128, BIT(0), BIT(0));
+-	regmap_update_bits(regmap, 0x810c, BIT(0), BIT(0));
++	ret = regmap_update_bits(regmap, 0x80dc, BIT(0), BIT(0));
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(regmap, 0x8128, BIT(0), BIT(0));
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(regmap, 0x810c, BIT(0), BIT(0));
++	if (ret)
++		return ret;
+ 
+ 	ret = qcom_cc_really_probe(pdev, &video_cc_tuna_desc, regmap);
+ 	if (ret) {
+@@ -436,10 +438,12 @@
+ 		return ret;
+ 	}
+ 
+-	pm_runtime_put_sync(&pdev->dev);
++	ret = qcom_cc_runtime_release(pdev);
++	if (ret < 0)
++		return dev_err_probe(&pdev->dev, ret, "Failed to release probe power\n");
+ 	dev_info(&pdev->dev, "Registered VIDEO CC clocks\n");
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ static void video_cc_tuna_sync_state(struct device *dev)
+@@ -457,6 +461,7 @@
+ 	.probe = video_cc_tuna_probe,
+ 	.driver = {
+ 		.name = "video_cc-tuna",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = video_cc_tuna_match_table,
+ 		.sync_state = video_cc_tuna_sync_state,
+ 		.pm = &video_cc_tuna_pm_ops,

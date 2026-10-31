@@ -1,0 +1,74 @@
+{
+  "tests": {
+    "unbounded_children": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "lpassbt: /tmp/onyx-lpassbt-test-9ymdf3vy/lpassbt.c:625: children: Assertion `lpass_bt_swr_probe(&parent)==-EINVAL&&!child_registered' failed."
+    },
+    "borrowed_child_node": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "lpassbt: /tmp/onyx-lpassbt-test-9ymdf3vy/lpassbt.c:69: of_node_put: Assertion `np->refs>0' failed."
+    },
+    "missing_child_unregister": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "lpassbt: /tmp/onyx-lpassbt-test-9ymdf3vy/lpassbt.c:625: children: Assertion `child_unregistered==1&&event_deregistrations==1&&!parent.dev.data' failed."
+    },
+    "missing_ssr_drain": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "lpassbt: /tmp/onyx-lpassbt-test-9ymdf3vy/lpassbt.c:619: platform_device_unregister: Assertion `p->registered&&!event_ops&&p->dev.parent->runtime_enabled' failed."
+    },
+    "early_parent_pm_teardown": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "lpassbt: /tmp/onyx-lpassbt-test-9ymdf3vy/lpassbt.c:133: pm_runtime_disable: Assertion `d->runtime_enabled' failed."
+    },
+    "missing_failed_vote_unwind": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "lpassbt: /tmp/onyx-lpassbt-test-9ymdf3vy/lpassbt.c:626: votes: Assertion `lpass_bt_swr_core_vote(p,true)==-EIO&&!parent.dev.pm_refs&&!clocks[0].refs&&!clocks[1].refs&&!p->core_hw_vote_count&&!p->core_audio_vote_count' failed."
+    },
+    "masked_runtime_resume_error": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "lpassbt: /tmp/onyx-lpassbt-test-9ymdf3vy/lpassbt.c:626: votes: Assertion `lpass_bt_swr_core_vote(p,true)==-EIO&&!parent.dev.pm_refs&&!clocks[0].refs&&!clocks[1].refs&&!p->core_hw_vote_count&&!p->core_audio_vote_count' failed."
+    },
+    "missing_pm_put": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "lpassbt: /tmp/onyx-lpassbt-test-9ymdf3vy/lpassbt.c:627: mclk: Assertion `lpass_bt_swrm_clock(p,true)==-EIO&&!p->swr_clk_users&&!p->mclk_enabled&&!clocks[2].refs&&!clocks[3].refs&&!parent.dev.pm_refs&&!pin_state' failed."
+    },
+    "leaked_first_mclk": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "lpassbt: /tmp/onyx-lpassbt-test-9ymdf3vy/lpassbt.c:627: mclk: Assertion `lpass_bt_swrm_clock(p,true)==-EIO&&!p->swr_clk_users&&!p->mclk_enabled&&!clocks[2].refs&&!clocks[3].refs&&!parent.dev.pm_refs&&!pin_state' failed."
+    },
+    "masked_ssr_restore_error": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "lpassbt: /tmp/onyx-lpassbt-test-9ymdf3vy/lpassbt.c:626: ssr: Assertion `lpass_bt_swr_ssr_enable(&parent.dev,p)==-EIO&&!p->dev_up&&!p->mclk_enabled&&notifications==1' failed."
+    },
+    "masked_module_init_error": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "lpassbt: /tmp/onyx-lpassbt-test-9ymdf3vy/lpassbt.c:634: module_init_test: Assertion `lpass_bt_swr_init()==-ENOMEM' failed."
+    }
+  },
+  "source_sha256": {
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-bt-swr.c": "bc30f56f395a9889ab9d3793a377ee14fdc95e5543411391aed9a5c9fe0080bf"
+  },
+  "controller_header_sha256": {
+    "qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.h": "c7ff86c514d7318b666af281166a2ea02da5dd6e192f0b8683ef607a4ff292ec"
+  },
+  "harness_sha256": {
+    "lpassbt_lpassbt.c": "153e08e351ed909c87db4849b4d37e1d81cd0a32aa233393ae8f62dacb9c1b6b",
+    "lpassbt_services.h": "901c8e8d09dd4f74c0e8957135a5ec2aa31260c645ef4f4f7f8ae47a26133f06"
+  },
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Full production parent source and actual frozen controller platform-data structure; DT/devres/PM/clock/pinctrl/platform/SSR event services mocked; pthread callback drain. No actual child driver probe, Linux runtime PM or snd_event framework scheduling, IRQ/SSR hardware, or Bluetooth audio operation claimed."
+}

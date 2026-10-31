@@ -6,8 +6,8 @@
     "/home/loukious/Android/custom-rom/out/target/product/onyx/vendor_dlkm/lib/modules/modules.load": "71ddc08a21c19c67a0f5a12fac978ccae626b64adc10b244309764ca7afb24b8"
   },
   "vendor_names": 466,
-  "built_vendor_names": 251,
-  "percent": 53.9,
+  "built_vendor_names": 253,
+  "percent": 54.3,
   "built_extra_names": [
     "deferred-free-helper",
     "onyx_relay",
@@ -88,7 +88,6 @@
     "leds-qcom-lpg",
     "leds-qti-flash",
     "llcc_heuristics",
-    "lpass_bt_swr_dlkm",
     "lpass_cdc_dlkm",
     "lpass_cdc_rx_macro_dlkm",
     "lpass_cdc_tx_macro_dlkm",
@@ -216,7 +215,6 @@
     "tcsrcc-sun",
     "thermal_config",
     "tmecom-intf",
-    "typec_analog_acc_dlkm",
     "tz_log_dlkm",
     "videocc-sun",
     "wcd9378_dlkm",
@@ -244,6 +242,7 @@
     "Bluetooth codec and SoundWire consumers preserve the native shared hw_params contract, which has no DAI identifier. Their host tests do not establish real ALSA/SoundWire concurrency, firmware behavior or DMA quiescence.",
     "Main WCN7750 WLAN now compiles with native ICNSS2/HIF_IPCI, monitor and management-frame injection paths preserved. Firmware boot, RF, monitor capture, injection and recovery remain unvalidated; arbitrary raw data/control injection is not established.",
     "Relay requires clients to quiesce producers before close and file-removal callbacks to withdraw and drain new opens. Host tests cover ownership and hotplug serialization but do not establish actual kernel CPU-hotplug or VFS behavior.",
-    "WCD core requires codec consumers to withdraw/drain borrowed IRQ-domain pointers and free nested handlers before wcd_irq_exit. Its supply helpers require caller serialization and balanced votes. Host tests do not establish hardware IRQ, regulator, DSP or playback behavior."
+    "WCD core requires codec consumers to withdraw/drain borrowed IRQ-domain pointers and free nested handlers before wcd_irq_exit. Its supply helpers require caller serialization and balanced votes. Host tests do not establish hardware IRQ, regulator, DSP or playback behavior.",
+    "LPASS BT parent requires consumers to release SoundWire references before controller/parent teardown. Type-C audio requires matching typec_analog_acc_exit before component/card destruction; LPASS CDC consumer integration remains pending. Clock forced teardown with exposed consumers or failed hardware release is quarantined, not claimed recoverable. No hardware audio/clock validation."
   ]
 }

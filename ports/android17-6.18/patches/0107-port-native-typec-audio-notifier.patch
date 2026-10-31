@@ -1,0 +1,224 @@
+Subject: Port native Type-C analog accessory notifier to 6.18
+
+Initialize the jack before notifier publication and drain before cleanup.
+Retain provider code while an accessory instance is registered.
+
+---
+
+--- a/qcom/opensource/audio-kernel/asoc/codecs/typec_analog_acc.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/typec_analog_acc.c
+@@ -5,111 +5,121 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/init.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/usb/ucsi_glink.h>
+ #include <linux/usb/typec.h>
+ #include <sound/jack.h>
+ #include <sound/soc.h>
+ #include "typec_analog_acc.h"
+ 
+-/**
+- * need match kernel define
+- * use SND_JACK_VIDEOOUT for unsupported bit
+- */
++/* Preserve the native unsupported-accessory bit in the jack report. */
+ #define JACK_TYPEC_ANALOG_MASK (SND_JACK_VIDEOOUT | SND_JACK_HEADSET)
+ 
+ struct typec_analog_acc_priv {
+ 	int current_jack_type;
+ 	struct notifier_block ucsi_nb;
+ 	struct snd_soc_jack typec_analog_jack;
++	struct snd_soc_component *component;
++	/* Serialize the cached accessory state and its jack reports. */
++	struct mutex jack_lock;
+ };
+ 
+-static struct typec_analog_acc_priv *acc_priv = NULL;
+-
+-static void typec_analog_acc_jack_report(struct snd_soc_jack *jack, int status,
+-					 int mask)
+-{
+-	pr_info("%s: enter, jack->status: %d, status: %d, mask: %d\n", __func__,
+-		jack->status, status, mask);
+-	snd_soc_jack_report(jack, status, mask);
+-}
++static DEFINE_MUTEX(acc_lock);
++static struct typec_analog_acc_priv *acc_priv;
+ 
+ static int typec_analog_acc_event_changed(struct notifier_block *nb,
+-					  unsigned long event, void *ptr)
++					unsigned long event, void *ptr)
+ {
+-	struct typec_analog_acc_priv *priv = NULL;
+-	enum typec_accessory acc = TYPEC_ACCESSORY_NONE;
++	struct typec_analog_acc_priv *priv;
++	enum typec_accessory acc;
+ 
+-	pr_info("%s: enter\n", __func__);
++	if (!ptr)
++		return NOTIFY_DONE;
++	priv = container_of(nb, struct typec_analog_acc_priv, ucsi_nb);
++	acc = ((struct ucsi_glink_constat_info *)ptr)->acc;
++	if (acc != TYPEC_ACCESSORY_AUDIO && acc != TYPEC_ACCESSORY_NONE)
++		return NOTIFY_DONE;
+ 
+-	priv = container_of(nb, struct typec_analog_acc_priv, ucsi_nb);
+-	if (!priv) {
+-		pr_err("%s: priv is NULL\n", __func__);
++	mutex_lock(&priv->jack_lock);
++	if (priv->current_jack_type != acc) {
++		snd_soc_jack_report(&priv->typec_analog_jack,
++				    acc == TYPEC_ACCESSORY_AUDIO ?
++				    JACK_TYPEC_ANALOG_MASK : 0,
++				    JACK_TYPEC_ANALOG_MASK);
++		priv->current_jack_type = acc;
+ 	}
+-
+-	acc = ((struct ucsi_glink_constat_info *)ptr)->acc;
+-
+-	pr_info("%s: acc = %d", __func__, acc);
+-
+-	switch (acc) {
+-	case TYPEC_ACCESSORY_AUDIO:
+-		if (priv->current_jack_type != TYPEC_ACCESSORY_AUDIO) {
+-			typec_analog_acc_jack_report(&priv->typec_analog_jack,
+-						     (SND_JACK_HEADSET |
+-						      SND_JACK_VIDEOOUT),
+-						     JACK_TYPEC_ANALOG_MASK);
+-			priv->current_jack_type = TYPEC_ACCESSORY_AUDIO;
+-		}
+-		break;
+-	case TYPEC_ACCESSORY_NONE:
+-		if (priv->current_jack_type != TYPEC_ACCESSORY_NONE) {
+-			typec_analog_acc_jack_report(&priv->typec_analog_jack,
+-						     0, JACK_TYPEC_ANALOG_MASK);
+-			priv->current_jack_type = TYPEC_ACCESSORY_NONE;
+-		}
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	pr_info("%s: exit\n", __func__);
+-	return 0;
++	mutex_unlock(&priv->jack_lock);
++	return NOTIFY_DONE;
+ }
+ 
+ int typec_analog_acc_init(struct snd_soc_component *component)
+ {
+-	int ret = 0;
++	struct typec_analog_acc_priv *priv;
++	int ret;
+ 
+-	pr_info("%s: enter\n", __func__);
+-
+-	acc_priv = kzalloc(sizeof(struct typec_analog_acc_priv), GFP_KERNEL);
+-	if (!acc_priv) {
+-		pr_err("%s: acc_priv is NULL\n", __func__);
++	if (!component || !component->card || !component->card->snd_card)
++		return -EINVAL;
++	mutex_lock(&acc_lock);
++	if (acc_priv) {
++		ret = -EBUSY;
++		goto unlock;
+ 	}
+-
+-	acc_priv->ucsi_nb.notifier_call = typec_analog_acc_event_changed;
+-	acc_priv->ucsi_nb.priority = 0;
+-	ret = register_ucsi_glink_notifier(&acc_priv->ucsi_nb);
+-	if (ret) {
+-		pr_err("%s: ucsi glink notifier registration failed: %d\n",
+-		       __func__, ret);
+-		goto err;
++	if (!try_module_get(THIS_MODULE)) {
++		ret = -ENODEV;
++		goto unlock;
+ 	}
+-
++	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
++	if (!priv) {
++		ret = -ENOMEM;
++		goto put_module;
++	}
++	priv->component = component;
++	mutex_init(&priv->jack_lock);
++	priv->ucsi_nb.notifier_call = typec_analog_acc_event_changed;
+ 	ret = snd_soc_card_jack_new(component->card, "Typec_analog Jack",
+ 				    JACK_TYPEC_ANALOG_MASK,
+-				    &acc_priv->typec_analog_jack);
++				    &priv->typec_analog_jack);
++	if (ret)
++		goto free_priv;
++	/* Registration can deliver events immediately; the jack is ready. */
++	ret = register_ucsi_glink_notifier(&priv->ucsi_nb);
+ 	if (ret) {
+-		pr_err("%s: Failed to create new jack Typec_analog Jack: %d\n",
+-		       __func__, ret);
+-		goto err;
++		snd_device_free(component->card->snd_card, priv->typec_analog_jack.jack);
++		goto free_priv;
+ 	}
++	acc_priv = priv;
++	mutex_unlock(&acc_lock);
++	return 0;
+ 
+-	pr_info("%s: exit\n", __func__);
+-
+-err:
++free_priv:
++	kfree(priv);
++put_module:
++	module_put(THIS_MODULE);
++unlock:
++	mutex_unlock(&acc_lock);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(typec_analog_acc_init);
++
++/* Call before the component/card is destroyed, outside notifier callbacks. */
++void typec_analog_acc_exit(struct snd_soc_component *component)
++{
++	struct typec_analog_acc_priv *priv;
++
++	mutex_lock(&acc_lock);
++	priv = acc_priv;
++	if (!priv || priv->component != component)
++		goto unlock;
++	unregister_ucsi_glink_notifier(&priv->ucsi_nb);
++	snd_device_free(component->card->snd_card, priv->typec_analog_jack.jack);
++	acc_priv = NULL;
++	kfree(priv);
++	module_put(THIS_MODULE);
++unlock:
++	mutex_unlock(&acc_lock);
++}
++EXPORT_SYMBOL(typec_analog_acc_exit);
+ 
+ static int __init analog_acc_init(void)
+ {
+@@ -118,7 +128,7 @@
+ 
+ static void __exit analog_acc_exit(void)
+ {
+-	kfree(acc_priv);
++	/* Every live notifier holds a module reference until component cleanup. */
+ }
+ 
+ module_init(analog_acc_init);
+--- a/qcom/opensource/audio-kernel/asoc/codecs/typec_analog_acc.h
++++ b/qcom/opensource/audio-kernel/asoc/codecs/typec_analog_acc.h
+@@ -6,6 +6,10 @@
+ #ifndef _TYPEC_ANALOG_ACC_H
+ #define _TYPEC_ANALOG_ACC_H
+ 
+-extern int typec_analog_acc_init(struct snd_soc_component *component);
++struct snd_soc_component;
++
++int typec_analog_acc_init(struct snd_soc_component *component);
++/* Must run before component/card teardown and outside jack callbacks. */
++void typec_analog_acc_exit(struct snd_soc_component *component);
+ 
+ #endif

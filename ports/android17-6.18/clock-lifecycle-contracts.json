@@ -1,0 +1,89 @@
+{
+  "layouts": {
+    "qcom_cc_desc": {
+      "file": "common.h",
+      "definition": "struct qcom_cc_desc {\n\tconst struct regmap_config *config;\n\tstruct clk_regmap **clks;\n\tstruct critical_clk_offset *critical_clk_en;\n\tsize_t num_critical_clk;\n\tsize_t num_clks;\n\tconst struct qcom_reset_map *resets;\n\tsize_t num_resets;\n\tstruct gdsc **gdscs;\n\tsize_t num_gdscs;\n\tstruct clk_hw **clk_hws;\n\tsize_t num_clk_hws;\n\tstruct clk_vdd_class **clk_regulators;\n\tsize_t num_clk_regulators;\n\tstruct icc_path *path;\n};"
+    },
+    "clk_regmap": {
+      "file": "clk-regmap.h",
+      "definition": "struct clk_regmap {\n\tstruct clk_hw hw;\n\tstruct regmap *regmap;\n\tunsigned int enable_reg;\n\tunsigned int enable_mask;\n\tbool enable_is_inverted;\n\tstruct clk_vdd_class_data vdd_data;\n\tstruct clk_regmap_ops *ops;\n\tstruct list_head list_node;\n\tstruct device *dev;\n\tstruct clk_crm *crm;\n\tu8 crm_vcd;\n\tu8 crm_base_node;\n\tu8 crm_num_node;\n#define QCOM_CLK_IS_CRITICAL BIT(0)\n#define QCOM_CLK_BOOT_CRITICAL BIT(1)\n\tunsigned long flags;\n};"
+    },
+    "clk_vdd_class": {
+      "file": "vdd-class.h",
+      "definition": "struct clk_vdd_class {\n\tconst char\t\t*class_name;\n\tstruct regulator\t**regulator;\n\tconst char\t\t**regulator_names;\n\tint\t\t\tnum_regulators;\n\tint\t\t\t*vdd_uv;\n\tint\t\t\t*level_votes;\n\tint\t\t\tnum_levels;\n\tint\t\t\tcur_level;\n};"
+    },
+    "clk_vdd_class_data": {
+      "file": "vdd-class.h",
+      "definition": "struct clk_vdd_class_data {\n\tstruct clk_vdd_class\t*vdd_class;\n\tstruct clk_vdd_class\t**vdd_classes;\n\tunsigned long\t\t*rate_max;\n\tint\t\t\tnum_rate_max;\n\tint\t\t\tvdd_level;\n\tint\t\t\tnum_vdd_classes;\n};"
+    },
+    "clk_rcg2": {
+      "file": "clk-rcg.h",
+      "definition": "struct clk_rcg2 {\n\tu32\t\t\tcmd_rcgr;\n\tu8\t\t\tmnd_width;\n\tu8\t\t\thid_width;\n\tu8\t\t\tsafe_src_index;\n\tconst struct parent_map\t*parent_map;\n\tconst struct freq_tbl\t*freq_tbl;\n\tunsigned long\t\tconfigured_freq;\n\tunsigned long\t\tcurrent_freq;\n\tbool\t\t\tenable_safe_config;\n\tstruct clk_regmap\tclkr;\n\tu8\t\t\tcfg_off;\n\tu32\t\t\tparked_cfg;\n\tu8\t\t\tflags;\n#define FORCE_ENABLE_RCG\tBIT(0)\n#define HW_CLK_CTRL_MODE\tBIT(1)\n#define DFS_SUPPORT\t\tBIT(2)\n\tbool\t\t\tfreq_populated;\n\tbool\t\t\thw_clk_ctrl;\n};"
+    }
+  },
+  "leaves": {
+    "cambistmclkcc-tuna": {
+      "pll_calls": [
+        "clk_rivian_ole_pll_configure(&cam_bist_mclk_cc_pll0, regmap, &cam_bist_mclk_cc_pll0_config)"
+      ],
+      "register_writes": [
+        "regmap_update_bits(regmap, 0x40f8, BIT(0), BIT(0))"
+      ]
+    },
+    "camcc-tuna": {
+      "pll_calls": [
+        "clk_lucid_ole_pll_configure(&cam_cc_pll0, regmap, &cam_cc_pll0_config)",
+        "clk_lucid_ole_pll_configure(&cam_cc_pll1, regmap, &cam_cc_pll1_config)",
+        "clk_lucid_ole_pll_configure(&cam_cc_pll2, regmap, &cam_cc_pll2_config)",
+        "clk_lucid_ole_pll_configure(&cam_cc_pll3, regmap, &cam_cc_pll3_config)",
+        "clk_lucid_ole_pll_configure(&cam_cc_pll4, regmap, &cam_cc_pll4_config)",
+        "clk_lucid_ole_pll_configure(&cam_cc_pll5, regmap, &cam_cc_pll5_config)",
+        "clk_lucid_ole_pll_configure(&cam_cc_pll6, regmap, &cam_cc_pll6_config)"
+      ],
+      "register_writes": [
+        "regmap_update_bits(regmap, 0x113c4, BIT(0), BIT(0))",
+        "regmap_update_bits(regmap, 0x113c0, BIT(0), BIT(0))",
+        "regmap_update_bits(regmap, 0x1137c, BIT(0), BIT(0))",
+        "regmap_update_bits(regmap, 0x11398, BIT(0), BIT(0))"
+      ]
+    },
+    "dispcc-tuna": {
+      "pll_calls": [
+        "clk_lucid_ole_pll_configure(&disp_cc_pll0, regmap, &disp_cc_pll0_config)",
+        "clk_lucid_ole_pll_configure(&disp_cc_pll1, regmap, &disp_cc_pll1_config)",
+        "clk_pongo_ole_pll_configure(&disp_cc_pll2, regmap, &disp_cc_pll2_config)"
+      ],
+      "register_writes": [
+        "regmap_update_bits(regmap, DISP_CC_MISC_CMD, 0x10, 0x10)",
+        "regmap_update_bits(regmap, 0xc00c, BIT(0), BIT(0))",
+        "regmap_update_bits(regmap, 0xc008, BIT(0), BIT(0))",
+        "regmap_update_bits(regmap, 0xe07c, BIT(0), BIT(0))",
+        "regmap_update_bits(regmap, 0xe05c, BIT(0), BIT(0))"
+      ]
+    },
+    "evacc-tuna": {
+      "pll_calls": [
+        "clk_lucid_ole_pll_configure(&eva_cc_pll0, regmap, &eva_cc_pll0_config)"
+      ],
+      "register_writes": [
+        "regmap_update_bits(regmap, 0x9f24, BIT(0), BIT(0))",
+        "regmap_update_bits(regmap, 0x80a4, BIT(0), BIT(0))",
+        "regmap_update_bits(regmap, 0x80f8, BIT(0), BIT(0))",
+        "regmap_update_bits(regmap, 0x80d4, BIT(0), BIT(0))",
+        "regmap_update_bits(regmap, 0x8074, dly_accu_mask, dly_accu_val)",
+        "regmap_update_bits(regmap, 0x8040, dly_accu_mask, dly_accu_val)"
+      ]
+    },
+    "videocc-tuna": {
+      "pll_calls": [
+        "clk_lucid_ole_pll_configure(&video_cc_pll0, regmap, &video_cc_pll0_config)"
+      ],
+      "register_writes": [
+        "regmap_update_bits(regmap, 0x80dc, BIT(0), BIT(0))",
+        "regmap_update_bits(regmap, 0x8128, BIT(0), BIT(0))",
+        "regmap_update_bits(regmap, 0x810c, BIT(0), BIT(0))"
+      ]
+    }
+  },
+  "clk_opp_sha256": "6170c5c583f1b5bc13aeca0e300743c712a7d0857e5b8f07fe0059ec19a84b10"
+}
