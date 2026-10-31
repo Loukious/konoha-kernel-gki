@@ -946,3 +946,27 @@ with the same 1,084 existing vendor DTC warnings. ROM module build coverage is
 182/466 (39.1%), leaving 284 names to assess or port. This includes alternative
 hardware and does not measure working hardware or ZIP completion. The combined
 artifact is `artifacts/20261031T111820072627Z`; no flashable 6.18 ZIP exists.
+
+
+NXP NFC adds `nxp-nci.ko` using the ROM non-secure peripheral configuration,
+SN controller GPIOs, and unchanged NFC/eSE userspace headers. Probe initializes
+locks, IRQ ownership and hardware before publishing the character device.
+Removal wakes blocked reads and cold-reset transactions, withdraws publication,
+and drains active SRCU operations; existing file descriptors retain memory until
+close and stale cdev identities cannot open a rebound instance. GPIO and regulator
+failures unwind owned resources. Power-off wakes readers and IRQ wake failures
+propagate. Zero-length I/O returns without waiting behind another operation.
+
+NCI metadata reads validate packet lengths before indexing. Cold reset publishes
+its pending state before transport submission, validates request envelopes and
+firmware status, bounds waits, and protects the command lifetime while a response
+races cleanup. [NFC host checks](nfc-validation-20261031.json) pass ASan/UBSan
+packet, reset and fault cases, 23 probe failure points, 20 regulator/power/wake
+cases, retained descriptor/rebind tests, and 14 source contracts. These simulated
+checks do not establish live kernel concurrency, firmware or phone operation.
+
+The combined 184-module archive `artifacts/20261031T113444670332Z` passes
+9,004 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
+checks pass with 1,084 existing vendor DTC warnings. ROM module build coverage
+is 183/466 (39.3%), leaving 283 names to assess or port. No flashable 6.18 ZIP
+exists; display, audio, camera, wireless and matching images remain incomplete.

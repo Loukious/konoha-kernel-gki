@@ -2332,6 +2332,24 @@ ddk_module(
 )
 
 
+ddk_headers(
+    name = "nfc_headers",
+    hdrs = ["nxp/opensource/driver/nfc/common.h", "nxp/opensource/driver/nfc/common_nxp.h", "nxp/opensource/driver/nfc/ese_cold_reset.h", "nxp/opensource/driver/nfc/i2c_drv.h", "nxp/opensource/driver/include/uapi/linux/nfc/nfcinfo.h", "nxp/opensource/driver/include/uapi/linux/nfc/sn_uapi.h"],
+    includes = ["nxp/opensource/driver/nfc", "nxp/opensource/driver/include/uapi/linux/nfc"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "nxp_nci",
+    srcs = ["nxp/opensource/driver/nfc/common.c", "nxp/opensource/driver/nfc/common.h", "nxp/opensource/driver/nfc/common_nxp.c", "nxp/opensource/driver/nfc/common_nxp.h", "nxp/opensource/driver/nfc/common_qcom.c", "nxp/opensource/driver/nfc/ese_cold_reset.c", "nxp/opensource/driver/nfc/ese_cold_reset.h", "nxp/opensource/driver/nfc/i2c_drv.c", "nxp/opensource/driver/nfc/i2c_drv.h", "nxp/opensource/driver/include/uapi/linux/nfc/nfcinfo.h", "nxp/opensource/driver/include/uapi/linux/nfc/sn_uapi.h"],
+    out = "nxp-nci.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":nfc_headers", ":platform_headers", ":qcom_ipc_logging", ":pinctrl_msm", ":pinctrl_headers"],
+    visibility = ["//visibility:public"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -2505,6 +2523,7 @@ kernel_module_group(
         ":sync_fence",
         ":governor_msm_adreno_tz",
         ":governor_gpubw_mon",
+        ":nxp_nci",
     ],
 )
 

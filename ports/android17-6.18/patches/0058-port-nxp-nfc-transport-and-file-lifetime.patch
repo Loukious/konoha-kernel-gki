@@ -1,0 +1,1856 @@
+--- a/nxp/opensource/driver/nfc/common.c
++++ b/nxp/opensource/driver/nfc/common.c
+@@ -26,7 +26,54 @@
+ #include <linux/delay.h>
+ #include <linux/pinctrl/qcom-pinctrl.h>
+ #include "common.h"
+-bool secure_peripheral_not_found = true;
++static bool secure_peripheral_not_found __maybe_unused = true;
++DEFINE_SRCU(nfc_io_srcu);
++static DEFINE_MUTEX(nfc_registry_lock);
++static struct nfc_dev *nfc_active;
++
++static void nfc_dev_release_ref(struct kref *ref)
++{
++	struct nfc_dev *dev = container_of(ref, struct nfc_dev, ref);
++
++	kfree(dev->read_kbuf);
++	kfree(dev->write_kbuf);
++	kfree(dev);
++}
++
++void nfc_dev_put(struct nfc_dev *dev)
++{
++	kref_put(&dev->ref, nfc_dev_release_ref);
++}
++
++int nfc_dev_publish(struct nfc_dev *dev)
++{
++	int ret = 0;
++
++	mutex_lock(&nfc_registry_lock);
++	if (nfc_active)
++		ret = -EBUSY;
++	else {
++		nfc_active = dev;
++		dev->published = true;
++	}
++	mutex_unlock(&nfc_registry_lock);
++	return ret;
++}
++
++void nfc_dev_unpublish(struct nfc_dev *dev)
++{
++	mutex_lock(&nfc_registry_lock);
++	if (nfc_active == dev)
++		nfc_active = NULL;
++	WRITE_ONCE(dev->removing, true);
++	mutex_unlock(&nfc_registry_lock);
++	WRITE_ONCE(dev->release_read, true);
++	wake_up_interruptible(&dev->read_wq);
++	wake_up_interruptible(&dev->cold_reset.read_wq);
++	/* Failed probes never had readers; do not wait for another device's I/O. */
++	if (dev->published)
++		synchronize_srcu(&nfc_io_srcu);
++}
+ 
+ 
+ int nfc_parse_dt(struct device *dev, struct platform_configs *nfc_configs,
+@@ -64,6 +111,8 @@
+ 	}
+ 	/* some products like sn220 does not required fw dwl pin */
+ 	nfc_gpio->dwl_req = of_get_named_gpio(np, DTS_FWDN_GPIO_STR, 0);
++	if ((int)nfc_gpio->dwl_req == -EPROBE_DEFER)
++		return -EPROBE_DEFER;
+         /* not returning failure for dwl gpio as it is optional for sn220 */
+ 	if ((!gpio_is_valid(nfc_gpio->dwl_req))) {
+ 		pr_warn("NxpDrv: %s: dwl_req gpio invalid %d\n", __func__,
+@@ -73,7 +122,7 @@
+ 	nfc_gpio->clkreq = of_get_named_gpio(np, DTS_CLKREQ_GPIO_STR, 0);
+ 	if (!gpio_is_valid(nfc_gpio->clkreq)) {
+ 		   dev_err(dev, "NxpDrv: clkreq gpio invalid %d\n", nfc_gpio->clkreq);
+-		   return -EINVAL;
++		return (int)nfc_gpio->clkreq < 0 ? (int)nfc_gpio->clkreq : -EINVAL;
+         }
+ 
+ #ifdef NFC_SECURE_PERIPHERAL_ENABLED
+@@ -119,7 +168,7 @@
+ 	}
+ }
+ 
+-int get_valid_gpio(int gpio)
++static int get_valid_gpio(int gpio)
+ {
+ 	int value = -EINVAL;
+ 
+@@ -204,102 +253,85 @@
+ 	return ret;
+ }
+ 
+-void gpio_free_all(struct nfc_dev *nfc_dev)
+-{
+-	struct platform_gpio *nfc_gpio = &nfc_dev->configs.gpio;
+-
+-	if (gpio_is_valid(nfc_gpio->clkreq))
+-		gpio_free(nfc_gpio->clkreq);
+-
+-	if (gpio_is_valid(nfc_gpio->dwl_req))
+-		gpio_free(nfc_gpio->dwl_req);
+-
+-	if (gpio_is_valid(nfc_gpio->irq))
+-		gpio_free(nfc_gpio->irq);
+-
+-	if (gpio_is_valid(nfc_gpio->ven))
+-		gpio_free(nfc_gpio->ven);
+-}
+-
+-void nfc_misc_unregister(struct nfc_dev *nfc_dev, int count)
+-{
+-	pr_debug("NxpDrv: %s: entry\n", __func__);
+-	kfree(nfc_dev->kbuf);
+-	device_destroy(nfc_dev->nfc_class, nfc_dev->devno);
+-	cdev_del(&nfc_dev->c_dev);
+-	class_destroy(nfc_dev->nfc_class);
+-	unregister_chrdev_region(nfc_dev->devno, count);
+-	if (nfc_dev->ipcl)
+-		ipc_log_context_destroy(nfc_dev->ipcl);
+-}
+-
+-#if (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
+-int nfc_misc_register(struct nfc_dev *nfc_dev,
+-                      const struct file_operations *nfc_fops, int count,
+-                      char *devname, const char *classname)
+-#else
+-int nfc_misc_register(struct nfc_dev *nfc_dev,
+-		      const struct file_operations *nfc_fops, int count,
++void gpio_free_all(struct nfc_dev *dev)
++{
++	if (dev->clkreq_wake_enabled) {
++		msm_gpio_mpm_wake_set(dev->clkreq_hwirq, false);
++		dev->clkreq_wake_enabled = false;
++	}
++	if (dev->gpio_owned & BIT(2))
++		gpio_free(dev->configs.gpio.dwl_req);
++	if (dev->gpio_owned & BIT(1))
++		gpio_free(dev->configs.gpio.ven);
++	if (dev->gpio_owned & BIT(0))
++		gpio_free(dev->configs.gpio.irq);
++	dev->gpio_owned = 0;
++}
++
++
++
++void nfc_misc_unregister(struct nfc_dev *dev, int count)
++{
++	if (dev->nfc_device) {
++		device_destroy(dev->nfc_class, dev->devno);
++		dev->nfc_device = NULL;
++	}
++	if (dev->c_dev) {
++		if (dev->cdev_added)
++			cdev_del(dev->c_dev);
++		else
++			kobject_put(&dev->c_dev->kobj);
++		dev->c_dev = NULL;
++		dev->cdev_added = false;
++	}
++	if (dev->nfc_class) {
++		class_destroy(dev->nfc_class);
++		dev->nfc_class = NULL;
++	}
++	if (dev->region_registered) {
++		unregister_chrdev_region(dev->devno, count);
++		dev->region_registered = false;
++	}
++}
++
++int nfc_misc_register(struct nfc_dev *dev,
++		      const struct file_operations *fops, int count,
+ 		      char *devname, const char *classname)
+-#endif
+-{
+-	int ret = 0;
+-
+-	ret = alloc_chrdev_region(&nfc_dev->devno, 0, count, devname);
+-	if (ret < 0) {
+-		pr_err("NxpDrv: %s: failed to alloc chrdev region ret %d\n", __func__,
+-		       ret);
++{
++	int ret;
++
++	ret = alloc_chrdev_region(&dev->devno, 0, count, devname);
++	if (ret)
+ 		return ret;
+-	}
+-        #if (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
+-        nfc_dev->nfc_class = class_create(classname);
+-        #else
+-        nfc_dev->nfc_class = class_create(THIS_MODULE, classname);
+-        #endif
+-	if (IS_ERR(nfc_dev->nfc_class)) {
+-		ret = PTR_ERR(nfc_dev->nfc_class);
+-		pr_err("NxpDrv: %s: failed to register device class ret %d\n", __func__,
+-		       ret);
+-		unregister_chrdev_region(nfc_dev->devno, count);
+-		return ret;
+-	}
+-	cdev_init(&nfc_dev->c_dev, nfc_fops);
+-	ret = cdev_add(&nfc_dev->c_dev, nfc_dev->devno, count);
+-	if (ret < 0) {
+-		pr_err("NxpDrv: %s: failed to add cdev ret %d\n", __func__, ret);
+-		class_destroy(nfc_dev->nfc_class);
+-		unregister_chrdev_region(nfc_dev->devno, count);
+-		return ret;
+-	}
+-	nfc_dev->nfc_device = device_create(nfc_dev->nfc_class, NULL,
+-					    nfc_dev->devno, nfc_dev, devname);
+-	if (IS_ERR(nfc_dev->nfc_device)) {
+-		ret = PTR_ERR(nfc_dev->nfc_device);
+-		pr_err("NxpDrv: %s: failed to create the device ret %d\n", __func__,
+-		       ret);
+-		cdev_del(&nfc_dev->c_dev);
+-		class_destroy(nfc_dev->nfc_class);
+-		unregister_chrdev_region(nfc_dev->devno, count);
+-		return ret;
+-	}
+-	nfc_dev->ipcl = ipc_log_context_create(NUM_OF_IPC_LOG_PAGES,
+-						dev_name(nfc_dev->nfc_device), 0);
+-
+-	nfc_dev->kbuflen = MAX_NCI_BUFFER_SIZE;
+-	nfc_dev->kbuf = kzalloc(MAX_NCI_BUFFER_SIZE, GFP_KERNEL | GFP_DMA);
+-	if (!nfc_dev->kbuf) {
+-		nfc_misc_unregister(nfc_dev, count);
+-		return -ENOMEM;
+-	}
+-
+-	nfc_dev->cold_reset.rsp_pending = false;
+-	nfc_dev->cold_reset.is_nfc_enabled = false;
+-	nfc_dev->cold_reset.is_crp_en = false;
+-	nfc_dev->cold_reset.last_src_ese_prot = ESE_COLD_RESET_ORIGIN_NONE;
+-
+-	init_waitqueue_head(&nfc_dev->cold_reset.read_wq);
+-
++	dev->region_registered = true;
++	dev->nfc_class = class_create(classname);
++	if (IS_ERR(dev->nfc_class)) {
++		ret = PTR_ERR(dev->nfc_class);
++		dev->nfc_class = NULL;
++		goto fail;
++	}
++	dev->c_dev = cdev_alloc();
++	if (!dev->c_dev) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++	dev->c_dev->owner = THIS_MODULE;
++	dev->c_dev->ops = fops;
++	ret = cdev_add(dev->c_dev, dev->devno, count);
++	if (ret)
++		goto fail;
++	dev->cdev_added = true;
++	dev->nfc_device = device_create(dev->nfc_class, &dev->i2c_dev.client->dev,
++					dev->devno, dev, devname);
++	if (IS_ERR(dev->nfc_device)) {
++		ret = PTR_ERR(dev->nfc_device);
++		dev->nfc_device = NULL;
++		goto fail;
++	}
+ 	return 0;
++fail:
++	nfc_misc_unregister(dev, count);
++	return ret;
+ }
+ 
+ /**
+@@ -335,7 +367,7 @@
+ 		gpios_status |= (value & GPIO_STATUS_MASK_BITS)<<(GPIO_POS_SHIFT_VAL*i);
+ 	}
+ 	ret = copy_to_user((uint32_t *) arg, &gpios_status, sizeof(value));
+-	if (ret < 0) {
++	if (ret) {
+ 		pr_err("NxpDrv: %s : Unable to copy data from kernel space to user space", __func__);
+ 		return -EFAULT;
+ 	}
+@@ -367,10 +399,13 @@
+ 		nfc_dev->nfc_disable_intr(nfc_dev);
+ 		set_valid_gpio(nfc_gpio->dwl_req, 0);
+ 		gpio_set_ven(nfc_dev, 0);
++		wake_up_interruptible(&nfc_dev->read_wq);
+ 		nfc_dev->nfc_ven_enabled = false;
+ 		nfc_dev->nfc_state = NFC_STATE_NCI;
+ 	} else if (arg == NFC_POWER_ON) {
+-		nfc_dev->nfc_enable_intr(nfc_dev);
++		ret = nfc_dev->nfc_enable_intr(nfc_dev);
++		if (ret)
++			return ret;
+ 		set_valid_gpio(nfc_gpio->dwl_req, 0);
+ 
+ 		gpio_set_ven(nfc_dev, 1);
+@@ -386,7 +421,7 @@
+ 		nfc_dev->nfc_state = NFC_STATE_FW_DWL;
+ 		gpio_set_ven(nfc_dev, 0);
+ 		gpio_set_ven(nfc_dev, 1);
+-		nfc_dev->nfc_enable_intr(nfc_dev);
++		ret = nfc_dev->nfc_enable_intr(nfc_dev);
+ 	} else if (arg == NFC_FW_DWL_HIGH) {
+ 		/*
+ 		 * Setting firmware download gpio to HIGH
+@@ -400,7 +435,7 @@
+ 		nfc_dev->nfc_disable_intr(nfc_dev);
+ 		gpio_set_ven(nfc_dev, 0);
+ 		gpio_set_ven(nfc_dev, 1);
+-		nfc_dev->nfc_enable_intr(nfc_dev);
++		ret = nfc_dev->nfc_enable_intr(nfc_dev);
+ 		pr_info("NxpDrv: %s VEN forced reset done\n", __func__);
+ 
+ 	} else if (arg == NFC_FW_DWL_LOW) {
+@@ -414,10 +449,10 @@
+ 
+ 	} else if (arg == NFC_ENABLE) {
+ 		/* Setting flag true when NFC is enabled */
+-		nfc_dev->cold_reset.is_nfc_enabled = true;
++		WRITE_ONCE(nfc_dev->cold_reset.is_nfc_enabled, true);
+ 	} else if (arg == NFC_DISABLE) {
+ 		/* Setting flag true when NFC is disabled */
+-		nfc_dev->cold_reset.is_nfc_enabled = false;
++		WRITE_ONCE(nfc_dev->cold_reset.is_nfc_enabled, false);
+ 	} else {
+ 		pr_err("NxpDrv: %s: bad arg %lu\n", __func__, arg);
+ 		ret = -ENOIOCTLCMD;
+@@ -459,73 +494,42 @@
+  *
+  * Return: 0 if Success(or no issue) and error ret code otherwise
+  */
+-int nfc_post_init(struct nfc_dev *nfc_dev)
+-{
+-	int ret=0;
++int nfc_post_init(struct nfc_dev *dev)
++{
++	struct platform_gpio *gpio = &dev->configs.gpio;
++	int ret;
++
++	if (dev->post_init_done)
++		return 0;
++	ret = configure_gpio(gpio->ven, GPIO_OUTPUT);
++	if (ret)
++		return ret;
++	dev->gpio_owned |= BIT(1);
++	if (gpio_is_valid(gpio->dwl_req)) {
++		ret = configure_gpio(gpio->dwl_req, GPIO_OUTPUT);
++		if (ret)
++			return ret;
++		dev->gpio_owned |= BIT(2);
++	}
+ #ifndef NFC_CLK_REQ_GPIO_WAKEUP
+-	unsigned int clkreq_gpio = 0;
++	ret = of_property_read_u32_index(dev->i2c_dev.client->dev.of_node,
++					DTS_CLKREQ_GPIO_STR, 1, &dev->clkreq_hwirq);
++	if (ret)
++		return ret;
++	ret = msm_gpio_mpm_wake_set(dev->clkreq_hwirq, true);
++	if (ret)
++		return ret;
++	dev->clkreq_wake_enabled = true;
+ #endif
+-	static int post_init_success;
+-	struct platform_configs nfc_configs;
+-	struct platform_gpio *nfc_gpio;
+-
+-	if(post_init_success)
+-		return 0;
+-	if (!nfc_dev)
++	ret = nfcc_hw_check(dev);
++	if (ret)
++		return ret;
++	if (dev->nfc_state == NFC_STATE_UNKNOWN)
+ 		return -ENODEV;
+-
+-	memcpy(&nfc_configs, &nfc_dev->configs, sizeof(struct platform_configs));
+-	nfc_gpio = &nfc_configs.gpio;
+-
+-	ret = configure_gpio(nfc_gpio->ven, GPIO_OUTPUT);
+-	if (ret) {
+-		pr_err("NxpDrv: %s: unable to request nfc reset gpio [%d]\n",
+-			__func__, nfc_gpio->ven);
+-		return ret;
+-	}
+-
+-	ret = configure_gpio(nfc_gpio->dwl_req, GPIO_OUTPUT);
+-	if (ret) {
+-		pr_err("NxpDrv: %s: unable to request nfc firm downl gpio [%d]\n",
+-			__func__, nfc_gpio->dwl_req);
+-	}
+-
+-#ifndef NFC_CLK_REQ_GPIO_WAKEUP
+-        /* Read clkreq GPIO number from device tree*/
+-        ret = of_property_read_u32_index(nfc_dev->i2c_dev.client->dev.of_node, DTS_CLKREQ_GPIO_STR, 1, &clkreq_gpio);
+-        if (ret < 0) {
+-            pr_err("NxpDrv: %s Failed to read clkreq gipo number, ret: %d\n", __func__, ret);
+-            return ret;
+-        }
+-        /* configure clkreq GPIO as wakeup capable */
+-        ret = msm_gpio_mpm_wake_set(clkreq_gpio, true);
+-        if (ret < 0) {
+-            pr_err("NxpDrv: %s Failed to setup clkreq gpio %d as wakeup capable, ret: %d\n", __func__, clkreq_gpio , ret);
+-            return ret;
+-        } else {
+-                pr_info("NxpDrv: %s clkreq gpio %d successfully setup for wakeup capable\n", __func__, clkreq_gpio);
+-        }
+-#endif
+-	ret = nfcc_hw_check(nfc_dev);
+-	if (ret || nfc_dev->nfc_state == NFC_STATE_UNKNOWN) {
+-		pr_err("NxpDrv: nfc hw check failed ret %d\n", ret);
+-		gpio_free(nfc_gpio->dwl_req);
+-		gpio_free(nfc_gpio->ven);
+-		return ret;
+-	}
+-
+-#ifdef NFC_SECURE_PERIPHERAL_ENABLED
+-	/*Initialising sempahore to disbale NFC Ven GPIO only after eSE is power off flag is set */
+-	if (nfc_dev->configs.CNSS_NFC_HW_SECURE_ENABLE == true) {
+-		sema_init(&sem_eSE_pwr_off,0);
+-	}
+-#endif
+-	post_init_success = 1;
+-	pr_info("NxpDrv: %s success\n", __func__);
++	dev->post_init_done = true;
+ 	return 0;
+-
+-
+-}
++}
++
+ 
+ #ifdef NFC_SECURE_PERIPHERAL_ENABLED
+ /**
+@@ -676,10 +680,11 @@
+  */
+ long nfc_dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
+ {
++	guard(srcu)(&nfc_io_srcu);
+ 	int ret = 0;
+ 	struct nfc_dev *nfc_dev = pfile->private_data;
+ 
+-	if (!nfc_dev)
++	if (!nfc_dev || READ_ONCE(nfc_dev->removing))
+ 		return -ENODEV;
+ 
+ #ifdef NFC_SECURE_PERIPHERAL_ENABLED
+@@ -739,56 +744,63 @@
+ 	return ret;
+ }
+ 
+-int nfc_dev_open(struct inode *inode, struct file *filp)
+-{
+-	struct nfc_dev *nfc_dev = NULL;
+-
+-	nfc_dev = container_of(inode->i_cdev, struct nfc_dev, c_dev);
+-
+-	if (!nfc_dev)
++int nfc_dev_open(struct inode *inode, struct file *file)
++{
++	guard(srcu)(&nfc_io_srcu);
++	struct nfc_dev *dev;
++	int ret;
++
++	mutex_lock(&nfc_registry_lock);
++	dev = nfc_active;
++	if (!dev || inode->i_cdev != dev->c_dev) {
++		mutex_unlock(&nfc_registry_lock);
+ 		return -ENODEV;
+-
+-	pr_debug("NxpDrv: %s: %d, %d\n", __func__, imajor(inode), iminor(inode));
+-
+-	/* Set flag to block freezer fake signal if not set already.
+-	 * Without this Signal being set, Driver is trying to do a read
+-	 * which is causing the delay in moving to Hibernate Mode.
+-	 */
+-	if (!(current->flags & PF_NOFREEZE)) {
+-		current->flags |= PF_NOFREEZE;
+-		pr_debug("NxpDrv: %s: current->flags 0x%x. \n", __func__, current->flags);
+-	}
+-
+-	mutex_lock(&nfc_dev->dev_ref_mutex);
+-
+-	filp->private_data = nfc_dev;
+-
+-	if (nfc_dev->dev_ref_count == 0) {
+-		set_valid_gpio(nfc_dev->configs.gpio.dwl_req, 0);
+-
+-		nfc_dev->nfc_enable_intr(nfc_dev);
+-	}
+-	nfc_dev->dev_ref_count = nfc_dev->dev_ref_count + 1;
+-	mutex_unlock(&nfc_dev->dev_ref_mutex);
+-	return 0;
+-}
++	}
++	kref_get(&dev->ref);
++	mutex_unlock(&nfc_registry_lock);
++	ret = nonseekable_open(inode, file);
++	if (ret)
++		goto put;
++	mutex_lock(&dev->dev_ref_mutex);
++	if (READ_ONCE(dev->removing)) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	if (!dev->dev_ref_count) {
++		set_valid_gpio(dev->configs.gpio.dwl_req, 0);
++		ret = dev->nfc_enable_intr(dev);
++		if (ret)
++			goto unlock;
++	}
++	dev->dev_ref_count++;
++	file->private_data = dev;
++unlock:
++	mutex_unlock(&dev->dev_ref_mutex);
++	if (!ret)
++		return 0;
++put:
++	nfc_dev_put(dev);
++	return ret;
++}
++
+ 
+ int nfc_dev_flush(struct file *pfile, fl_owner_t id)
+ {
++	guard(srcu)(&nfc_io_srcu);
+ 	struct nfc_dev *nfc_dev = pfile->private_data;
+ 
+-	if (!nfc_dev)
++	if (!nfc_dev || READ_ONCE(nfc_dev->removing))
+ 		return -ENODEV;
+ 	/*
+ 	 * release blocked user thread waiting for pending read during close
+ 	 */
+ 	if (!mutex_trylock(&nfc_dev->read_mutex)) {
+-		nfc_dev->release_read = true;
++		WRITE_ONCE(nfc_dev->release_read, true);
+ 		nfc_dev->nfc_disable_intr(nfc_dev);
+ 		wake_up(&nfc_dev->read_wq);
+ 		pr_debug("NxpDrv: %s: waiting for release of blocked read\n", __func__);
+ 		mutex_lock(&nfc_dev->read_mutex);
+-		nfc_dev->release_read = false;
++		WRITE_ONCE(nfc_dev->release_read, false);
+ 	} else {
+ 		pr_debug("NxpDrv: %s: read thread already released\n", __func__);
+ 	}
+@@ -796,36 +808,26 @@
+ 	return 0;
+ }
+ 
+-int nfc_dev_close(struct inode *inode, struct file *filp)
+-{
+-	struct nfc_dev *nfc_dev = NULL;
+-
+-	nfc_dev = container_of(inode->i_cdev, struct nfc_dev, c_dev);
+-
+-	if (!nfc_dev)
+-		return -ENODEV;
+-
+-	pr_debug("NxpDrv: %s: %d, %d\n", __func__, imajor(inode), iminor(inode));
+-
+-	/* unset the flag to restore to previous state */
+-	if (current->flags & PF_NOFREEZE) {
+-		current->flags &= ~PF_NOFREEZE;
+-		pr_debug("NxpDrv: %s: current->flags 0x%x. \n", __func__, current->flags);
+-	}
+-
+-	mutex_lock(&nfc_dev->dev_ref_mutex);
+-	if (nfc_dev->dev_ref_count == 1) {
+-		nfc_dev->nfc_disable_intr(nfc_dev);
+-		set_valid_gpio(nfc_dev->configs.gpio.dwl_req, 0);
+-	}
+-	if (nfc_dev->dev_ref_count > 0)
+-		nfc_dev->dev_ref_count = nfc_dev->dev_ref_count - 1;
+-
+-	filp->private_data = NULL;
+-
+-	mutex_unlock(&nfc_dev->dev_ref_mutex);
++int nfc_dev_close(struct inode *inode, struct file *file)
++{
++	guard(srcu)(&nfc_io_srcu);
++	struct nfc_dev *dev = file->private_data;
++
++	if (!dev)
++		return 0;
++	mutex_lock(&dev->dev_ref_mutex);
++	if (dev->dev_ref_count == 1 && !READ_ONCE(dev->removing)) {
++		dev->nfc_disable_intr(dev);
++		set_valid_gpio(dev->configs.gpio.dwl_req, 0);
++	}
++	if (dev->dev_ref_count)
++		dev->dev_ref_count--;
++	file->private_data = NULL;
++	mutex_unlock(&dev->dev_ref_mutex);
++	nfc_dev_put(dev);
+ 	return 0;
+ }
++
+ 
+ int validate_nfc_state_nci(struct nfc_dev *nfc_dev)
+ {
+--- a/nxp/opensource/driver/nfc/common.h
++++ b/nxp/opensource/driver/nfc/common.h
+@@ -25,6 +25,8 @@
+ 
+ #include <linux/version.h>
+ #include <linux/cdev.h>
++#include <linux/kref.h>
++#include <linux/srcu.h>
+ #include <linux/of_gpio.h>
+ #include <linux/delay.h>
+ #include <linux/ipc_logging.h>
+@@ -250,6 +252,8 @@
+ 
+ /* Device specific structure */
+ struct nfc_dev {
++	bool removing;
++	bool published;
+ 	wait_queue_head_t read_wq;
+ 	struct mutex read_mutex;
+ 	struct mutex write_mutex;
+@@ -259,7 +263,15 @@
+ 	unsigned int dev_ref_count;
+ 	struct class *nfc_class;
+ 	struct device *nfc_device;
+-	struct cdev c_dev;
++	struct cdev *c_dev;
++	struct kref ref;
++	bool region_registered;
++	bool cdev_added;
++	bool irq_requested;
++	unsigned int gpio_owned;
++	u32 clkreq_hwirq;
++	bool clkreq_wake_enabled;
++	bool post_init_done;
+ 	dev_t devno;
+ 	/* Interface flag */
+ 	uint8_t interface;
+@@ -298,6 +310,11 @@
+ 	int (*nfc_disable_intr)(struct nfc_dev *dev);
+ };
+ 
++extern struct srcu_struct nfc_io_srcu;
++void nfc_dev_put(struct nfc_dev *nfc_dev);
++void nfc_dev_unpublish(struct nfc_dev *nfc_dev);
++int nfc_dev_publish(struct nfc_dev *nfc_dev);
++
+ int nfc_dev_open(struct inode *inode, struct file *filp);
+ int nfc_dev_flush(struct file *pfile, fl_owner_t id);
+ int nfc_dev_close(struct inode *inode, struct file *filp);
+--- a/nxp/opensource/driver/nfc/common_nxp.c
++++ b/nxp/opensource/driver/nfc/common_nxp.c
+@@ -54,14 +54,14 @@
+ 	pr_debug("NxpDrv: %s:Sending GET_VERSION cmd of size = %d\n", __func__, DL_GET_VERSION_CMD_LEN);
+ 	ret = nfc_dev->nfc_write(nfc_dev, nfc_dev->write_kbuf, DL_GET_VERSION_CMD_LEN,
+ 									MAX_RETRY_COUNT);
+-	if (ret <= 0) {
++	if (ret != DL_GET_VERSION_CMD_LEN) {
+ 		pr_err("NxpDrv: %s: - nfc get version cmd error ret %d\n", __func__, ret);
+ 		goto err;
+ 	}
+ 	memset(rsp, 0x00, DL_GET_VERSION_RSP_LEN_2);
+ 	pr_debug("NxpDrv: %s:Reading response of GET_VERSION cmd\n", __func__);
+ 	ret = nfc_dev->nfc_read(nfc_dev, rsp, DL_GET_VERSION_RSP_LEN_2, NCI_CMD_RSP_TIMEOUT_MS);
+-	if (ret <= 0) {
++	if (ret != DL_GET_VERSION_RSP_LEN_2) {
+ 		pr_err("NxpDrv: %s: - nfc get version rsp error ret %d\n", __func__, ret);
+ 		goto err;
+ 	}
+@@ -103,7 +103,7 @@
+  *             NFC_STATE_FW_DWL if session closed
+  *             NFC_STATE_UNKNOWN in error cases.
+  */
+-enum nfc_state_flags get_nfcc_session_state_dl(struct nfc_dev *nfc_dev)
++static enum nfc_state_flags get_nfcc_session_state_dl(struct nfc_dev *nfc_dev)
+ {
+ 	int ret = 0;
+ 	uint8_t *cmd = nfc_dev->write_kbuf;
+@@ -123,14 +123,14 @@
+ 						DL_GET_SESSION_STATE_CMD_LEN);
+ 	ret = nfc_dev->nfc_write(nfc_dev, nfc_dev->write_kbuf, DL_GET_SESSION_STATE_CMD_LEN,
+ 						MAX_RETRY_COUNT);
+-	if (ret <= 0) {
++	if (ret != DL_GET_SESSION_STATE_CMD_LEN) {
+ 		pr_err("NxpDrv: %s: - nfc get session cmd error ret %d\n", __func__, ret);
+ 		goto err;
+ 	}
+ 	memset(rsp, 0x00, DL_GET_SESSION_STATE_RSP_LEN);
+ 	pr_debug("NxpDrv: %s:Reading response of GET_SESSION_STATE cmd\n", __func__);
+ 	ret = nfc_dev->nfc_read(nfc_dev, rsp, DL_GET_SESSION_STATE_RSP_LEN, NCI_CMD_RSP_TIMEOUT_MS);
+-	if (ret <= 0) {
++	if (ret != DL_GET_SESSION_STATE_RSP_LEN) {
+ 		pr_err("NxpDrv: %s: - nfc get session rsp error ret %d\n", __func__, ret);
+ 		goto err;
+ 	}
+@@ -162,6 +162,14 @@
+  * @Return:  enum chip_types value
+  *
+  */
++static bool nfc_reset_notification_valid(const u8 *buf, size_t len)
++{
++	return buf && len >= NCI_HDR_LEN && buf[0] == NCI_NTF &&
++		buf[1] == NCI_CORE_RESET_CMD_OID &&
++		buf[NCI_PAYLOAD_LEN_IDX] >= NFC_CHIP_TYPE_OFF &&
++		buf[NCI_PAYLOAD_LEN_IDX] <= len - NCI_HDR_LEN;
++}
++
+ static enum chip_types get_nfcc_chip_type(struct nfc_dev *nfc_dev)
+ {
+ 	int ret = 0;
+@@ -178,7 +186,7 @@
+ 
+ 	pr_debug("NxpDrv: %s:Sending NCI Core Reset cmd of size = %d\n", __func__, NCI_RESET_CMD_LEN);
+ 	ret = nfc_dev->nfc_write(nfc_dev, nfc_dev->write_kbuf, NCI_RESET_CMD_LEN, NO_RETRY);
+-	if (ret <= 0) {
++	if (ret != NCI_RESET_CMD_LEN) {
+ 		pr_err("NxpDrv: %s: - nfc nci core reset cmd error ret %d\n", __func__, ret);
+ 		goto err;
+ 	}
+@@ -190,14 +198,15 @@
+ 	memset(rsp, 0x00, NCI_RESET_RSP_LEN);
+ 	pr_debug("NxpDrv: %s:Reading NCI Core Reset rsp\n", __func__);
+ 	ret = nfc_dev->nfc_read(nfc_dev, rsp, NCI_RESET_RSP_LEN, NCI_CMD_RSP_TIMEOUT_MS);
+-	if (ret <= 0) {
++	if (ret != NCI_RESET_RSP_LEN) {
+ 		pr_err("NxpDrv: %s: - nfc nci core reset rsp error ret %d\n", __func__, ret);
+ 		goto err_disable_intr;
+ 	}
+ 
+ 	pr_debug("NxpDrv: %s: nci core reset response 0x%02x%02x%02x%02x\n",
+ 		__func__, rsp[0], rsp[1], rsp[2], rsp[3]);
+-	if (rsp[0] != NCI_RSP) {
++	if (rsp[0] != NCI_RSP || rsp[1] != NCI_CORE_RESET_CMD_OID ||
++	    rsp[2] != 1 || rsp[3] != 0) {
+ 		/* reset response failed response*/
+ 		pr_err("NxpDrv: %s invalid nci core reset response\n", __func__);
+ 		goto err_disable_intr;
+@@ -211,7 +220,7 @@
+ 		goto err_disable_intr;
+ 	}
+ 
+-	if (rsp[0] == NCI_NTF) {
++	if (nfc_reset_notification_valid(rsp, ret)) {
+ 		/* read version info from NCI Reset Notification */
+ 		rom_version = rsp[NCI_HDR_LEN + rsp[NCI_PAYLOAD_LEN_IDX] - 3];
+ 		major_version = rsp[NCI_HDR_LEN + rsp[NCI_PAYLOAD_LEN_IDX] - 2];
+@@ -266,8 +275,7 @@
+ 		status = gpio_is_valid(nfc_gpio->dwl_req);
+ 	} else if ((chip_type == CHIP_SN220) || (chip_type == CHIP_SN300)) {
+ 		/* gpio should not be configured for SN220, SN300 */
+-		nfc_gpio->dwl_req = -EINVAL;
+-		status = true;
++		status = !gpio_is_valid(nfc_gpio->dwl_req);
+ 	}
+ 	return status;
+ }
+--- a/nxp/opensource/driver/nfc/common_qcom.c
++++ b/nxp/opensource/driver/nfc/common_qcom.c
+@@ -43,10 +43,11 @@
+ {
+ 	int ret;
+ 
+-	nfc_dev->nfc_enable_intr(nfc_dev);
+-
++	ret = nfc_dev->nfc_enable_intr(nfc_dev);
++	if (ret)
++		return ret;
+ 	ret = wait_event_interruptible_timeout(nfc_dev->read_wq,
+-			!nfc_dev->i2c_dev.irq_enabled,
++			!READ_ONCE(nfc_dev->i2c_dev.irq_enabled) || READ_ONCE(nfc_dev->removing),
+ 			msecs_to_jiffies(MAX_IRQ_WAIT_TIME));
+ 	return ret;
+ }
+@@ -75,14 +76,18 @@
+ 	ret = regulator_set_load(nfc_dev->reg, nfc_dev->configs.ldo.max_current);
+ 	if (ret < 0) {
+ 		pr_err("NxpDrv: %s: set load failed\n", __func__);
++		regulator_set_voltage(nfc_dev->reg, 0, NFC_VDDIO_MAX);
+ 		return ret;
+ 	}
+ 
+ 	ret = regulator_enable(nfc_dev->reg);
+-	if (ret < 0)
++	if (ret < 0) {
+ 		pr_err("NxpDrv: %s: regulator_enable failed\n", __func__);
+-	else
++		regulator_set_load(nfc_dev->reg, 0);
++		regulator_set_voltage(nfc_dev->reg, 0, NFC_VDDIO_MAX);
++	} else {
+ 		nfc_dev->is_vreg_enabled = true;
++	}
+ 	return ret;
+ }
+ 
+@@ -122,6 +127,7 @@
+ 	if (ret < 0) {
+ 		pr_err("NxpDrv: %s: LDO voting failed, ret = %d\n", __func__, ret);
+ 		regulator_put(nfc_dev->reg);
++		nfc_dev->reg = NULL;
+ 	}
+ 	return ret;
+ }
+@@ -136,12 +142,10 @@
+  */
+ int nfc_ldo_unvote(struct nfc_dev *nfc_dev)
+ {
+-	int ret;
++	int ret, load_ret;
+ 
+-	if (!nfc_dev->is_vreg_enabled) {
+-		pr_err("NxpDrv: %s: regulator already disabled\n", __func__);
+-		return -EINVAL;
+-	}
++	if (!nfc_dev->is_vreg_enabled)
++		return 0;
+ 
+ 	ret = regulator_disable(nfc_dev->reg);
+ 	if (ret < 0) {
+@@ -150,15 +154,12 @@
+ 	}
+ 	nfc_dev->is_vreg_enabled = false;
+ 
+-	ret =  regulator_set_voltage(nfc_dev->reg, 0, NFC_VDDIO_MAX);
+-	if (ret < 0) {
++	ret = regulator_set_voltage(nfc_dev->reg, 0, NFC_VDDIO_MAX);
++	if (ret < 0)
+ 		pr_err("NxpDrv: %s: set voltage failed\n", __func__);
+-		return ret;
+-	}
+-
+-	ret = regulator_set_load(nfc_dev->reg, 0);
+-	if (ret < 0)
++	/* Drop the load vote even if releasing the voltage vote failed. */
++	load_ret = regulator_set_load(nfc_dev->reg, 0);
++	if (load_ret < 0)
+ 		pr_err("NxpDrv: %s: set load failed\n", __func__);
+-	return ret;
++	return ret < 0 ? ret : load_ret;
+ }
+-
+--- a/nxp/opensource/driver/nfc/ese_cold_reset.c
++++ b/nxp/opensource/driver/nfc/ese_cold_reset.c
+@@ -63,345 +63,173 @@
+ 	return ret;
+ }
+ 
+-/**
+- * send_ese_cmd() - Send eSE command to NFC controller.
+- * @nfc_dev: NFC device handle.
+- *
+- * Return: 0 on pass and negative value on failure.
+- */
+-static int send_ese_cmd(struct nfc_dev *nfc_dev)
+-{
++/* Caller holds cold_reset.lock and serializes physical reads with read_mutex. */
++static int read_cold_reset_rsp_locked(struct nfc_dev *nfc_dev,
++				     const u8 *header, size_t len)
++{
++	struct cold_reset *reset = &nfc_dev->cold_reset;
++	u8 response[COLD_RESET_RSP_LEN];
+ 	int ret;
+ 
+-	if (nfc_dev->nfc_state == NFC_STATE_FW_DWL) {
+-		dev_err(nfc_dev->nfc_device,
+-			"cannot send ese cmd as FW download is in-progress\n");
+-		return -EBUSY;
+-	}
+-	if (!gpio_get_value(nfc_dev->configs.gpio.ven)) {
+-		dev_err(nfc_dev->nfc_device,
+-				"cannot send ese cmd as NFCC powered off\n");
+-		return -ENODEV;
+-	}
+-	if (nfc_dev->cold_reset.cmd_buf == NULL)
++	if (!reset->cmd_buf || reset->rsp_len != sizeof(response))
++		return -EINVAL;
++	if (header) {
++		if (len < NCI_HDR_LEN)
++			return -EPROTO;
++		memcpy(response, header, NCI_HDR_LEN);
++	} else {
++		ret = i2c_master_recv(nfc_dev->i2c_dev.client, response, NCI_HDR_LEN);
++		if (ret != NCI_HDR_LEN)
++			return ret < 0 ? ret : -EIO;
++	}
++	if (response[0] != PROP_NCI_RSP_GID ||
++	    response[1] != reset->cmd_buf[1] || response[2] != 1)
++		return -EPROTO;
++	if (header && len >= sizeof(response)) {
++		response[NCI_PAYLOAD_IDX] = header[NCI_PAYLOAD_IDX];
++	} else {
++		ret = i2c_master_recv(nfc_dev->i2c_dev.client,
++				     &response[NCI_PAYLOAD_IDX], 1);
++		if (ret != 1)
++			return ret < 0 ? ret : -EIO;
++	}
++	return response[NCI_PAYLOAD_IDX];
++}
++
++/* Consume only the response of the active eSE transaction. */
++bool nfc_cold_reset_response(struct nfc_dev *nfc_dev, const u8 *data, size_t len)
++{
++	struct cold_reset *reset = &nfc_dev->cold_reset;
++	bool consumed = false;
++
++	mutex_lock(&reset->lock);
++	if (len >= NCI_HDR_LEN && reset->rsp_pending && reset->cmd_buf &&
++	    data[0] == PROP_NCI_RSP_GID && data[1] == reset->cmd_buf[1]) {
++		reset->status = read_cold_reset_rsp_locked(nfc_dev, data, len);
++		WRITE_ONCE(reset->rsp_pending, false);
++		consumed = true;
++	}
++	mutex_unlock(&reset->lock);
++	if (consumed)
++		wake_up_interruptible(&reset->read_wq);
++	return consumed;
++}
++
++int ese_cold_reset_ioctl(struct nfc_dev *nfc_dev, unsigned long arg)
++{
++	struct cold_reset *reset = &nfc_dev->cold_reset;
++	struct ese_cold_reset_arg request;
++	struct ese_ioctl_arg envelope;
++	u8 *command = NULL;
++	bool nfc_enabled;
++	int ret;
++
++	if (copy_from_user(&envelope, (void __user *)arg, sizeof(envelope)))
+ 		return -EFAULT;
+-
+-	ret = nfc_dev->nfc_write(nfc_dev, nfc_dev->cold_reset.cmd_buf,
+-						nfc_dev->cold_reset.cmd_len,
+-						MAX_RETRY_COUNT);
+-	if (ret <= 0)
+-		dev_err(nfc_dev->nfc_device,
+-				"%s: write failed after max retry, ret %d\n",
+-							__func__, ret);
+-
++	if (envelope.type != ESE_ARG_TYPE_COLD_RESET ||
++	    envelope.buf_size < sizeof(request) || envelope.buf_size > PAGE_SIZE)
++		return -EINVAL;
++	ret = copy_struct_from_user(&request, sizeof(request),
++				   u64_to_user_ptr(envelope.buf), envelope.buf_size);
++	if (ret)
++		return ret;
++	if (request.rfu || request.sub_cmd > ESE_COLD_RESET_PROTECT_DIS ||
++	    (request.src != ESE_COLD_RESET_ORIGIN_ESE &&
++	     request.src != ESE_COLD_RESET_ORIGIN_NFC &&
++	     request.src != ESE_COLD_RESET_ORIGIN_OTHER))
++		return -EINVAL;
++	mutex_lock(&nfc_dev->write_mutex);
++	mutex_lock(&reset->lock);
++	if (reset->is_crp_en && request.src != reset->last_src_ese_prot) {
++		ret = -EACCES;
++		goto unlock;
++	}
++	if (request.sub_cmd == ESE_COLD_RESET_PROTECT_EN && reset->is_crp_en) {
++		ret = 0;
++		goto unlock;
++	}
++	ret = validate_nfc_state_nci(nfc_dev);
++	if (ret)
++		goto unlock;
++	command = kzalloc(COLD_RESET_PROT_CMD_LEN, GFP_DMA | GFP_KERNEL);
++	if (!command) {
++		ret = -ENOMEM;
++		goto unlock;
++	}
++	command[0] = PROP_NCI_CMD_GID;
++	if (request.sub_cmd == ESE_COLD_RESET_DO) {
++		command[1] = COLD_RESET_OID;
++		command[2] = COLD_RESET_CMD_PL_LEN;
++		reset->cmd_len = COLD_RESET_CMD_LEN;
++	} else {
++		command[1] = COLD_RESET_PROT_OID;
++		command[2] = COLD_RESET_PROT_CMD_PL_LEN;
++		command[3] = request.sub_cmd == ESE_COLD_RESET_PROTECT_EN;
++		reset->cmd_len = COLD_RESET_PROT_CMD_LEN;
++	}
++	reset->cmd_buf = command;
++	reset->rsp_len = COLD_RESET_RSP_LEN;
++	reset->status = -EINPROGRESS;
++	nfc_enabled = READ_ONCE(reset->is_nfc_enabled);
++	/* A response may arrive as soon as the transport submits the command. */
++	WRITE_ONCE(reset->rsp_pending, true);
++	mutex_unlock(&reset->lock);
++	ret = nfc_dev->nfc_write(nfc_dev, command, reset->cmd_len, MAX_RETRY_COUNT);
++	if (ret != reset->cmd_len) {
++		ret = ret < 0 ? ret : -EIO;
++		goto finish;
++	}
++	/*
++	 * A blocked HAL reader can own read_mutex even while NFC is disabled.
++	 * Let that reader consume the response without waiting for its lock.
++	 */
++	if (!nfc_enabled && mutex_trylock(&nfc_dev->read_mutex)) {
++		if (!READ_ONCE(reset->rsp_pending)) {
++			ret = 0;
++		} else {
++			ret = is_nfc_data_available_for_read(nfc_dev);
++			if (!ret)
++				ret = -ETIMEDOUT;
++		}
++		if (ret > 0 && !READ_ONCE(nfc_dev->removing)) {
++			mutex_lock(&reset->lock);
++			reset->status = read_cold_reset_rsp_locked(nfc_dev, NULL, 0);
++			WRITE_ONCE(reset->rsp_pending, false);
++			mutex_unlock(&reset->lock);
++			ret = 0;
++		} else if (READ_ONCE(nfc_dev->removing)) {
++			ret = -ENODEV;
++		}
++		nfc_dev->nfc_disable_intr(nfc_dev);
++		mutex_unlock(&nfc_dev->read_mutex);
++	} else {
++		ret = wait_event_interruptible_timeout(reset->read_wq,
++			!READ_ONCE(reset->rsp_pending) || READ_ONCE(nfc_dev->removing),
++			msecs_to_jiffies(NCI_CMD_RSP_TIMEOUT_MS));
++		if (ret <= 0) {
++			ret = ret ? ret : -ETIMEDOUT;
++			goto finish;
++		}
++		ret = READ_ONCE(nfc_dev->removing) ? -ENODEV : 0;
++	}
++finish:
++	mutex_lock(&reset->lock);
++	if (!ret)
++		ret = reset->status;
++	WRITE_ONCE(reset->rsp_pending, false);
++	reset->cmd_buf = NULL;
++	if (!ret) {
++		if (request.sub_cmd == ESE_COLD_RESET_PROTECT_EN) {
++			reset->is_crp_en = true;
++			reset->last_src_ese_prot = request.src;
++		} else if (request.sub_cmd == ESE_COLD_RESET_PROTECT_DIS) {
++			reset->is_crp_en = false;
++			reset->last_src_ese_prot = ESE_COLD_RESET_ORIGIN_NONE;
++		}
++	}
++unlock:
++	mutex_unlock(&reset->lock);
++	kfree(command);
++	mutex_unlock(&nfc_dev->write_mutex);
+ 	return ret;
+ }
+-
+-/**
+- * read_cold_reset_rsp() - Read response of the cold reset command.
+- * @nfc_dev: NFC device handle.
+- * @header:  Pointer to NCI header if it is already read.
+- *
+- * Return: 0 on pass and negative value on failure.
+- */
+-int read_cold_reset_rsp(struct nfc_dev *nfc_dev, char *header)
+-{
+-	int ret = -EPERM;
+-	struct cold_reset *cold_rst = &nfc_dev->cold_reset;
+-	char *rsp_buf = NULL;
+-
+-	if (cold_rst->rsp_len < COLD_RESET_RSP_LEN) {
+-		dev_err(nfc_dev->nfc_device,
+-				"%s: received cold reset rsp buffer length is invalid \n",
+-				__func__);
+-		return -EINVAL;
+-        }
+-
+-	rsp_buf = kzalloc(cold_rst->rsp_len, GFP_DMA | GFP_KERNEL);
+-	if (!rsp_buf)
+-		return -ENOMEM;
+-
+-	/*
+-	 * read header if NFC is disabled
+-	 * for enable case, header is read by nfc read thread(for i2c)
+-	 */
+-	if ((!cold_rst->is_nfc_enabled) &&
+-			(nfc_dev->interface == PLATFORM_IF_I2C)) {
+-		ret = i2c_master_recv(nfc_dev->i2c_dev.client, rsp_buf, NCI_HDR_LEN);
+-		if (ret <= 0) {
+-			dev_err(nfc_dev->nfc_device,
+-				"%s: failure to read cold reset rsp header\n",
+-				 __func__);
+-			ret = -EIO;
+-			goto error;
+-		}
+-		/*
+-		 * return failure, if packet is not a response packet or
+-		 * if response's OID doesn't match with the CMD's OID
+-		 */
+-		if (!(rsp_buf[0] & NCI_RSP_PKT_TYPE) ||
+-			(!cold_rst->cmd_buf) ||
+-			(rsp_buf[1] != cold_rst->cmd_buf[1])) {
+-
+-			dev_err(nfc_dev->nfc_device,
+-				"%s: - invalid cold reset response 0x%x 0x%x\n",
+-					__func__, rsp_buf[0], rsp_buf[1]);
+-			ret = -EINVAL;
+-			goto error;
+-		}
+-	} else if (header) {
+-		memcpy(rsp_buf, header, NCI_HDR_LEN);
+-	} else {
+-		dev_err(nfc_dev->nfc_device,
+-				"%s: - invalid or NULL header\n", __func__);
+-		ret = -EINVAL;
+-		goto error;
+-	}
+-
+-	if ((NCI_HDR_LEN + rsp_buf[NCI_PAYLOAD_LEN_IDX]) >
+-						cold_rst->rsp_len) {
+-		dev_err(nfc_dev->nfc_device,
+-			"%s: - no space for cold_reset resp\n", __func__);
+-		ret = -ENOMEM;
+-		goto error;
+-	}
+-
+-	if (nfc_dev->interface == PLATFORM_IF_I2C) {
+-		ret = nfc_dev->nfc_read(nfc_dev,
+-			     &rsp_buf[NCI_PAYLOAD_IDX],
+-			     rsp_buf[NCI_PAYLOAD_LEN_IDX],
+-			     NCI_CMD_RSP_TIMEOUT_MS);
+-
+-		if (ret <= 0) {
+-			dev_err(nfc_dev->nfc_device,
+-				"%s: failure to read cold reset rsp payload\n",
+-				__func__);
+-			ret = -EIO;
+-			goto error;
+-		}
+-		ret = cold_rst->status = rsp_buf[NCI_PAYLOAD_IDX];
+-
+-		pr_debug("nfc ese rsp hdr 0x%x 0x%x 0x%x, payload byte0 0x%x\n",
+-				rsp_buf[0], rsp_buf[1], rsp_buf[2], rsp_buf[3]);
+-	}
+-
+-error:
+-	kfree(rsp_buf);
+-
+-	return ret;
+-}
+-
+-
+-/**
+- * ese_cold_reset_ioctl() - This function handles the eSE cold reset ioctls.
+- * @nfc_dev: NFC device handle.
+- * @arg: ioctl argument.
+- *
+- * Return: 0 on pass and negative value on failure.
+- */
+-
+-int ese_cold_reset_ioctl(struct nfc_dev *nfc_dev, unsigned long arg)
+-{
+-	int ret;
+-	struct ese_ioctl_arg ioctl_arg;
+-	struct ese_cold_reset_arg *cold_reset_arg = NULL;
+-
+-	if (!arg) {
+-		dev_err(nfc_dev->nfc_device, "arg is invalid\n");
+-		return -EINVAL;
+-	}
+-
+-	ret = copy_from_user((void *)&ioctl_arg, (const void *)arg,
+-						sizeof(ioctl_arg));
+-	if (ret) {
+-		dev_err(nfc_dev->nfc_device,
+-				"ese ioctl arg copy from user failed\n");
+-		return -EFAULT;
+-	}
+-
+-	cold_reset_arg = kzalloc(sizeof(struct ese_cold_reset_arg), GFP_KERNEL);
+-	if (!cold_reset_arg)
+-		return -ENOMEM;
+-
+-	mutex_lock(&nfc_dev->write_mutex);
+-	ret = copy_struct_from_user(cold_reset_arg,
+-				sizeof(struct ese_cold_reset_arg),
+-				u64_to_user_ptr(ioctl_arg.buf),
+-				sizeof(struct ese_cold_reset_arg));
+-	if (ret) {
+-		dev_err(nfc_dev->nfc_device,
+-			"ese ioctl arg buffer copy from user failed\n");
+-
+-		ret = -EFAULT;
+-		goto err;
+-	}
+-
+-	switch (cold_reset_arg->sub_cmd) {
+-
+-	case ESE_COLD_RESET_DO:
+-
+-		/*
+-		 * cold reset allowed during protection enable, only if the
+-		 * source is same as the one which enabled protection.
+-		 */
+-		if (nfc_dev->cold_reset.is_crp_en &&
+-			(cold_reset_arg->src !=
+-				nfc_dev->cold_reset.last_src_ese_prot)) {
+-			dev_err(nfc_dev->nfc_device,
+-				"cold reset from %d denied, protection is on\n",
+-				cold_reset_arg->src);
+-			ret = -EACCES;
+-			goto err;
+-		}
+-
+-		nfc_dev->cold_reset.cmd_buf = kzalloc(COLD_RESET_CMD_LEN,
+-							GFP_DMA | GFP_KERNEL);
+-		if (!nfc_dev->cold_reset.cmd_buf) {
+-			ret = -ENOMEM;
+-			goto err;
+-		}
+-
+-		nfc_dev->cold_reset.cmd_buf[0] = PROP_NCI_CMD_GID;
+-		nfc_dev->cold_reset.cmd_buf[1] = COLD_RESET_OID;
+-		nfc_dev->cold_reset.cmd_buf[2] = COLD_RESET_CMD_PL_LEN;
+-		nfc_dev->cold_reset.cmd_len = NCI_HDR_LEN +
+-						COLD_RESET_CMD_PL_LEN;
+-		nfc_dev->cold_reset.rsp_len = COLD_RESET_RSP_LEN;
+-		break;
+-
+-	case ESE_COLD_RESET_PROTECT_EN:
+-
+-		if (nfc_dev->cold_reset.is_crp_en) {
+-			if (cold_reset_arg->src !=
+-				nfc_dev->cold_reset.last_src_ese_prot) {
+-				dev_err(nfc_dev->nfc_device,
+-					"ese protection enable denied\n");
+-				ret = -EACCES;
+-				goto err;
+-			}
+-			pr_warn("ese protection already enabled\n");
+-
+-			ret = 0;
+-			/* free buffers and exit with pass */
+-			goto err;
+-		}
+-		fallthrough;
+-
+-	case ESE_COLD_RESET_PROTECT_DIS:
+-
+-		if (nfc_dev->cold_reset.is_crp_en &&
+-			cold_reset_arg->src !=
+-				nfc_dev->cold_reset.last_src_ese_prot) {
+-			pr_err("ese cold reset protection disable denied\n");
+-			ret = -EACCES;
+-			goto err;
+-		}
+-		nfc_dev->cold_reset.cmd_buf = kzalloc(COLD_RESET_PROT_CMD_LEN,
+-							GFP_DMA | GFP_KERNEL);
+-		if (!nfc_dev->cold_reset.cmd_buf) {
+-			ret = -ENOMEM;
+-			goto err;
+-		}
+-
+-		nfc_dev->cold_reset.cmd_buf[0] = PROP_NCI_CMD_GID;
+-		nfc_dev->cold_reset.cmd_buf[1] = COLD_RESET_PROT_OID;
+-		nfc_dev->cold_reset.cmd_buf[2] = COLD_RESET_PROT_CMD_PL_LEN;
+-		nfc_dev->cold_reset.cmd_len = NCI_HDR_LEN +
+-						COLD_RESET_PROT_CMD_PL_LEN;
+-		nfc_dev->cold_reset.rsp_len = COLD_RESET_PROT_RSP_LEN;
+-		if (cold_reset_arg->sub_cmd == ESE_COLD_RESET_PROTECT_EN)
+-			nfc_dev->cold_reset.cmd_buf[3] = 0x1;
+-		else
+-			nfc_dev->cold_reset.cmd_buf[3] = 0x0;
+-
+-		break;
+-
+-	default:
+-		pr_err("%s invalid ese ioctl sub cmd %d\n", __func__,
+-					cold_reset_arg->sub_cmd);
+-		ret = -ENOIOCTLCMD;
+-		goto err;
+-	}
+-
+-	pr_debug("nfc ese cmd hdr 0x%x 0x%x 0x%x\n",
+-				nfc_dev->cold_reset.cmd_buf[0],
+-				nfc_dev->cold_reset.cmd_buf[1],
+-				nfc_dev->cold_reset.cmd_buf[2]);
+-
+-	ret = send_ese_cmd(nfc_dev);
+-	if (ret <= 0) {
+-		pr_err("failed to send ese command\n");
+-		goto err;
+-	}
+-
+-	nfc_dev->cold_reset.rsp_pending = true;
+-
+-	/* check if NFC is enabled */
+-	if (nfc_dev->cold_reset.is_nfc_enabled) {
+-		/*
+-		 * nfc_read thread will initiate cold reset response
+-		 * and it will signal for data available
+-		 */
+-		wait_event_interruptible(nfc_dev->cold_reset.read_wq,
+-			!nfc_dev->cold_reset.rsp_pending);
+-	} else {
+-
+-		/*
+-		 * Read data as NFC read thread is not active
+-		 */
+-
+-		if (nfc_dev->interface == PLATFORM_IF_I2C) {
+-			ret =  is_nfc_data_available_for_read(nfc_dev);
+-			if (ret <= 0) {
+-				nfc_dev->nfc_disable_intr(nfc_dev);
+-				nfc_dev->cold_reset.rsp_pending = false;
+-				goto err;
+-			}
+-
+-			ret = read_cold_reset_rsp(nfc_dev, NULL);
+-			nfc_dev->cold_reset.rsp_pending = false;
+-			if (ret < 0) {
+-				pr_err("%s rsp read err\n", __func__);
+-				goto err;
+-			}
+-		} else {
+-			/*
+-			 * Enable intr as it is disabled when NFC is in disable
+-			 * state
+-			 */
+-			nfc_dev->nfc_enable_intr(nfc_dev);
+-
+-			wait_event_interruptible(
+-				nfc_dev->cold_reset.read_wq,
+-				!nfc_dev->cold_reset.rsp_pending);
+-		}
+-
+-		nfc_dev->nfc_disable_intr(nfc_dev);
+-	}
+-
+-	if (cold_reset_arg->sub_cmd == ESE_COLD_RESET_PROTECT_EN) {
+-		nfc_dev->cold_reset.is_crp_en = true;
+-		nfc_dev->cold_reset.last_src_ese_prot = cold_reset_arg->src;
+-	} else if (cold_reset_arg->sub_cmd == ESE_COLD_RESET_PROTECT_DIS) {
+-		nfc_dev->cold_reset.is_crp_en = false;
+-		nfc_dev->cold_reset.last_src_ese_prot =
+-						ESE_COLD_RESET_ORIGIN_NONE;
+-	} else
+-		pr_debug("ese cmd is %d\n", cold_reset_arg->sub_cmd);
+-
+-	ret = nfc_dev->cold_reset.status;
+-
+-err:
+-	if (nfc_dev->cold_reset.cmd_buf != NULL) {
+-		kfree(nfc_dev->cold_reset.cmd_buf);
+-		nfc_dev->cold_reset.cmd_buf = NULL;
+-	}
+-	if (cold_reset_arg != NULL) {
+-		kfree(cold_reset_arg);
+-		cold_reset_arg = NULL;
+-	}
+-
+-	mutex_unlock(&nfc_dev->write_mutex);
+-
+-	return ret;
+-}
+--- a/nxp/opensource/driver/nfc/ese_cold_reset.h
++++ b/nxp/opensource/driver/nfc/ese_cold_reset.h
+@@ -59,13 +59,14 @@
+ 
+ /* Features specific Parameters */
+ struct cold_reset {
++	struct mutex lock;
+ 	wait_queue_head_t read_wq;
+ 	char *cmd_buf;
+ 	uint16_t cmd_len;
+ 	uint16_t rsp_len;
+ 	/* Source of last ese protection command */
+ 	uint8_t last_src_ese_prot;
+-	uint8_t status;
++	int status;
+ 	/* Is cold reset protection enabled */
+ 	bool is_crp_en;
+ 	bool rsp_pending;
+@@ -76,6 +77,6 @@
+ 
+ struct nfc_dev;
+ int ese_cold_reset_ioctl(struct nfc_dev *nfc_dev, unsigned long arg);
+-int read_cold_reset_rsp(struct nfc_dev *nfc_dev, char *header);
++bool nfc_cold_reset_response(struct nfc_dev *nfc_dev, const u8 *data, size_t len);
+ 
+ #endif
+--- a/nxp/opensource/driver/nfc/i2c_drv.c
++++ b/nxp/opensource/driver/nfc/i2c_drv.c
+@@ -84,6 +84,10 @@
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&dev->i2c_dev.irq_enabled_lock, flags);
++	if (!dev->irq_requested || READ_ONCE(dev->removing)) {
++		spin_unlock_irqrestore(&dev->i2c_dev.irq_enabled_lock, flags);
++		return -ENODEV;
++	}
+ 	if (!dev->i2c_dev.irq_enabled) {
+ 		dev->i2c_dev.irq_enabled = true;
+ 		enable_irq(dev->i2c_dev.client->irq);
+@@ -117,6 +121,12 @@
+ 
+ 	pr_debug("NxpDrv: %s: reading %zu bytes.\n", __func__, count);
+ 
++	if (READ_ONCE(nfc_dev->removing))
++		return -ENODEV;
++	if (!count)
++		return 0;
++	if (timeout < 0)
++		return -EINVAL;
+ 	if (timeout > NCI_CMD_RSP_TIMEOUT_MS)
+ 		timeout = NCI_CMD_RSP_TIMEOUT_MS;
+ 
+@@ -126,17 +136,19 @@
+ 	if (!gpio_get_value(nfc_gpio->irq)) {
+ 		while (1) {
+ 			ret = 0;
+-			if (!i2c_dev->irq_enabled) {
+-				i2c_dev->irq_enabled = true;
+-				enable_irq(i2c_dev->client->irq);
+-			}
++			ret = i2c_enable_irq(nfc_dev);
++			if (ret)
++				return ret;
+ 			if (!gpio_get_value(nfc_gpio->irq)) {
+ 				if (timeout) {
+ 					ret = wait_event_interruptible_timeout(
+ 						nfc_dev->read_wq,
+-						!i2c_dev->irq_enabled,
++						!READ_ONCE(i2c_dev->irq_enabled) ||
++						READ_ONCE(nfc_dev->release_read) ||
++						READ_ONCE(nfc_dev->removing),
+ 						msecs_to_jiffies(timeout));
+ 					if (ret <= 0) {
++						ret = ret ? ret : -ETIMEDOUT;
+ 						pr_err("NxpDrv: %s: timeout error\n",
+ 						       __func__);
+ 						goto err;
+@@ -144,7 +156,9 @@
+ 				} else {
+ 					ret = wait_event_interruptible(
+ 						nfc_dev->read_wq,
+-						!i2c_dev->irq_enabled);
++						!READ_ONCE(i2c_dev->irq_enabled) ||
++						READ_ONCE(nfc_dev->release_read) ||
++						READ_ONCE(nfc_dev->removing));
+ 					if (ret) {
+ 						pr_err("NxpDrv: %s: err wakeup of wq\n",
+ 						       __func__);
+@@ -153,6 +167,10 @@
+ 				}
+ 			}
+ 			i2c_disable_irq(nfc_dev);
++			if (READ_ONCE(nfc_dev->removing))
++				return -ENODEV;
++			if (READ_ONCE(nfc_dev->release_read))
++				return 0;
+ 
+ 			if (gpio_get_value(nfc_gpio->irq))
+ 				break;
+@@ -189,26 +207,11 @@
+ 		goto err;
+ 	}
+ 
+-	for (i = 0; i < disp_len; i++)
++	for (i = 0; i < min_t(int, disp_len, ret); i++)
+ 		NFCLOG_IPC(nfc_dev, false, " %02x", buf[i]);
+ 
+-	/* check if it's response of cold reset command
+-	 * NFC HAL process shouldn't receive this data as
+-	 * command was sent by esepowermanager
+-	 */
+-	if (nfc_dev->cold_reset.rsp_pending && nfc_dev->cold_reset.cmd_buf
+-		&& (buf[0] == PROP_NCI_RSP_GID)
+-		&& (buf[1] == nfc_dev->cold_reset.cmd_buf[1])) {
+-		read_cold_reset_rsp(nfc_dev, buf);
+-		nfc_dev->cold_reset.rsp_pending = false;
+-		wake_up_interruptible(&nfc_dev->cold_reset.read_wq);
+-		/*
+-		 * NFC process doesn't know about cold reset command
+-		 * being sent as it was initiated by eSE process
+-		 * we shouldn't return any data to NFC process
+-		 */
++	if (nfc_cold_reset_response(nfc_dev, buf, ret))
+ 		return 0;
+-	}
+ 
+ err:
+ 	return ret;
+@@ -267,22 +270,27 @@
+ 	return ret;
+ }
+ 
+-ssize_t nfc_i2c_dev_read(struct file *filp, char __user *buf, size_t count,
++static ssize_t nfc_i2c_dev_read(struct file *filp, char __user *buf, size_t count,
+ 			 loff_t *offset)
+ {
++	guard(srcu)(&nfc_io_srcu);
+ 	int ret;
+ 	struct nfc_dev *nfc_dev = (struct nfc_dev *)filp->private_data;
+ 
+-	if (!nfc_dev) {
++	if (!nfc_dev || READ_ONCE(nfc_dev->removing)) {
+ 		pr_err("NxpDrv: %s: device doesn't exist anymore\n", __func__);
+ 		return -ENODEV;
+ 	}
++	if (!count)
++		return 0;
+ 	mutex_lock(&nfc_dev->read_mutex);
+ 	if (count > MAX_NCI_BUFFER_SIZE)
+ 		count = MAX_NCI_BUFFER_SIZE;
+ 
+ 	if (filp->f_flags & O_NONBLOCK) {
+ 		ret = i2c_master_recv(nfc_dev->i2c_dev.client, nfc_dev->read_kbuf, count);
++		if (ret > 0 && nfc_cold_reset_response(nfc_dev, nfc_dev->read_kbuf, ret))
++			ret = 0;
+ 		pr_debug("NxpDrv: %s: NONBLOCK read ret = %d\n", __func__, ret);
+ 	} else {
+ 		ret = i2c_read(nfc_dev, nfc_dev->read_kbuf, count, 0);
+@@ -297,19 +305,22 @@
+ 	return ret;
+ }
+ 
+-ssize_t nfc_i2c_dev_write(struct file *filp, const char __user *buf,
++static ssize_t nfc_i2c_dev_write(struct file *filp, const char __user *buf,
+ 			  size_t count, loff_t *offset)
+ {
++	guard(srcu)(&nfc_io_srcu);
+ 	int ret;
+ 	struct nfc_dev *nfc_dev = (struct nfc_dev *)filp->private_data;
+ 
+ 	if (count > MAX_DL_BUFFER_SIZE)
+ 		count = MAX_DL_BUFFER_SIZE;
+ 
+-	if (!nfc_dev) {
++	if (!nfc_dev || READ_ONCE(nfc_dev->removing)) {
+ 		pr_err("NxpDrv: %s: device doesn't exist anymore\n", __func__);
+ 		return -ENODEV;
+ 	}
++	if (!count)
++		return 0;
+ 
+ 	mutex_lock(&nfc_dev->write_mutex);
+ 	if (copy_from_user(nfc_dev->write_kbuf, buf, count)) {
+@@ -324,7 +335,6 @@
+ 
+ static const struct file_operations nfc_i2c_dev_fops = {
+ 	.owner = THIS_MODULE,
+-	.llseek = no_llseek,
+ 	.read = nfc_i2c_dev_read,
+ 	.write = nfc_i2c_dev_write,
+ 	.open = nfc_dev_open,
+@@ -336,182 +346,119 @@
+ #endif
+ };
+ 
+-#if  (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
++
++static void nfc_i2c_cleanup(struct nfc_dev *dev)
++{
++	struct i2c_client *client = dev->i2c_dev.client;
++
++	nfc_dev_unpublish(dev);
++	nfc_misc_unregister(dev, DEV_COUNT);
++	if (dev->irq_requested) {
++		if (dev->i2c_dev.irq_wake_up)
++			disable_irq_wake(client->irq);
++		free_irq(client->irq, dev);
++		dev->irq_requested = false;
++	}
++	device_init_wakeup(&client->dev, false);
++	if (dev->gpio_owned & BIT(1))
++		set_valid_gpio(dev->configs.gpio.ven, 0);
++	if (dev->reg) {
++		nfc_ldo_unvote(dev);
++		regulator_put(dev->reg);
++		dev->reg = NULL;
++	}
++	gpio_free_all(dev);
++	if (dev->ipcl) {
++		ipc_log_context_destroy(dev->ipcl);
++		dev->ipcl = NULL;
++	}
++	i2c_set_clientdata(client, NULL);
++}
++
+ int nfc_i2c_dev_probe(struct i2c_client *client)
+-#else
+-int nfc_i2c_dev_probe(struct i2c_client *client, const struct i2c_device_id *id)
++{
++	struct nfc_dev *dev;
++	int ret;
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
++		return -ENODEV;
++	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
++	if (!dev)
++		return -ENOMEM;
++	kref_init(&dev->ref);
++	dev->i2c_dev.client = client;
++	dev->interface = PLATFORM_IF_I2C;
++	dev->nfc_state = NFC_STATE_UNKNOWN;
++	dev->nfc_read = i2c_read;
++	dev->nfc_write = i2c_write;
++	dev->nfc_enable_intr = i2c_enable_irq;
++	dev->nfc_disable_intr = i2c_disable_irq;
++	mutex_init(&dev->read_mutex);
++	mutex_init(&dev->write_mutex);
++	mutex_init(&dev->dev_ref_mutex);
++	mutex_init(&dev->cold_reset.lock);
++	init_waitqueue_head(&dev->read_wq);
++	init_waitqueue_head(&dev->cold_reset.read_wq);
++	spin_lock_init(&dev->i2c_dev.irq_enabled_lock);
++	dev->cold_reset.last_src_ese_prot = ESE_COLD_RESET_ORIGIN_NONE;
++	ret = nfc_parse_dt(&client->dev, &dev->configs, PLATFORM_IF_I2C);
++	if (ret)
++		goto fail;
++	dev->read_kbuf = kzalloc(MAX_NCI_BUFFER_SIZE, GFP_DMA | GFP_KERNEL);
++	dev->write_kbuf = kzalloc(MAX_DL_BUFFER_SIZE, GFP_DMA | GFP_KERNEL);
++	if (!dev->read_kbuf || !dev->write_kbuf) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++	dev->ipcl = ipc_log_context_create(NUM_OF_IPC_LOG_PAGES, NFC_CHAR_DEV_NAME, 0);
++	ret = configure_gpio(dev->configs.gpio.irq, GPIO_IRQ);
++	if (ret < 0)
++		goto fail;
++	dev->gpio_owned |= BIT(0);
++	client->irq = ret;
++	ret = request_irq(client->irq, i2c_irq_handler,
++			  IRQF_TRIGGER_HIGH | IRQF_NO_AUTOEN, client->name, dev);
++	if (ret)
++		goto fail;
++	dev->irq_requested = true;
++	ret = nfc_ldo_config(&client->dev, dev);
++	if (ret)
++		goto fail;
++#ifdef NFC_SECURE_PERIPHERAL_ENABLED
++	if (dev->configs.CNSS_NFC_HW_SECURE_ENABLE)
++		dev->secure_zone = nfc_hw_secure_check();
+ #endif
+-{
+-	int ret = 0;
+-	struct nfc_dev *nfc_dev = NULL;
+-	struct i2c_dev *i2c_dev = NULL;
+-	struct platform_configs *nfc_configs = NULL;
+-	struct platform_gpio *nfc_gpio = NULL;
+-	pr_debug("NxpDrv: %s: enter\n", __func__);
+-	nfc_dev = kzalloc(sizeof(struct nfc_dev), GFP_KERNEL);
+-	if (nfc_dev == NULL) {
+-		ret = -ENOMEM;
+-		goto err;
+-	}
+-	nfc_configs = &nfc_dev->configs;
+-	nfc_gpio = &nfc_configs->gpio;
+-	/* retrieve details of gpios from dt */
+-	ret = nfc_parse_dt(&client->dev,nfc_configs, PLATFORM_IF_I2C);
+-	if (ret) {
+-		pr_err("NxpDrv: %s: failed to parse dt\n", __func__);
+-		goto err_free_nfc_dev;
+-	}
+-	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
+-		pr_err("NxpDrv: %s: need I2C_FUNC_I2C\n", __func__);
+-		ret = -ENODEV;
+-		goto err_free_nfc_dev;
+-	}
+-	nfc_dev->read_kbuf = kzalloc(MAX_NCI_BUFFER_SIZE, GFP_DMA | GFP_KERNEL);
+-	if (!nfc_dev->read_kbuf) {
+-		ret = -ENOMEM;
+-		goto err_free_nfc_dev;
+-	}
+-	nfc_dev->write_kbuf = kzalloc(MAX_DL_BUFFER_SIZE, GFP_DMA | GFP_KERNEL);
+-	if (!nfc_dev->write_kbuf) {
+-		ret = -ENOMEM;
+-		goto err_free_read_kbuf;
+-	}
+-	nfc_dev->interface = PLATFORM_IF_I2C;
+-	nfc_dev->nfc_state = NFC_STATE_NCI;
+-	nfc_dev->i2c_dev.client = client;
+-	i2c_dev = &nfc_dev->i2c_dev;
+-	nfc_dev->nfc_read = i2c_read;
+-	nfc_dev->nfc_write = i2c_write;
+-	nfc_dev->nfc_enable_intr = i2c_enable_irq;
+-	nfc_dev->nfc_disable_intr = i2c_disable_irq;
+-
+-	ret = configure_gpio(nfc_gpio->irq, GPIO_IRQ);
+-	if (ret <= 0) {
+-		pr_err("NxpDrv: %s: unable to request nfc irq gpio [%d]\n", __func__,
+-		       nfc_gpio->irq);
+-		goto err_free_gpio;
+-	}
+-	client->irq = ret;
+-
+-	/* init mutex and queues */
+-	init_waitqueue_head(&nfc_dev->read_wq);
+-	mutex_init(&nfc_dev->read_mutex);
+-	mutex_init(&nfc_dev->write_mutex);
+-	mutex_init(&nfc_dev->dev_ref_mutex);
+-	spin_lock_init(&i2c_dev->irq_enabled_lock);
+-	ret = nfc_misc_register(nfc_dev, &nfc_i2c_dev_fops, DEV_COUNT,
++	if (!dev->secure_zone) {
++		ret = nfc_post_init(dev);
++		if (ret)
++			goto fail;
++	}
++	ret = device_init_wakeup(&client->dev, true);
++	if (ret)
++		goto fail;
++	i2c_set_clientdata(client, dev);
++	ret = nfc_misc_register(dev, &nfc_i2c_dev_fops, DEV_COUNT,
+ 				NFC_CHAR_DEV_NAME, CLASS_NAME);
+-	if (ret) {
+-		pr_err("NxpDrv: %s: nfc_misc_register failed\n", __func__);
+-		goto err_mutex_destroy;
+-	}
+-	/* interrupt initializations */
+-	pr_info("NxpDrv: %s: requesting IRQ %d\n", __func__, client->irq);
+-	i2c_dev->irq_enabled = true;
+-	ret = request_irq(client->irq, i2c_irq_handler, IRQF_TRIGGER_HIGH,
+-			  client->name, nfc_dev);
+-	if (ret) {
+-		pr_err("NxpDrv: %s: request_irq failed\n", __func__);
+-		goto err_nfc_misc_unregister;
+-	}
+-	i2c_disable_irq(nfc_dev);
+-
+-	ret = nfc_ldo_config(&client->dev, nfc_dev);
+-	if (ret) {
+-		pr_err("NxpDrv: LDO config failed\n");
+-		goto err_ldo_config_failed;
+-	}
+-#ifdef NFC_SECURE_PERIPHERAL_ENABLED
+-	if( nfc_dev->configs.CNSS_NFC_HW_SECURE_ENABLE == true) {
+-	    /*Check NFC Secure Zone status*/
+-	    if(!nfc_hw_secure_check()) {
+-		   nfc_post_init(nfc_dev);
+-		   nfc_dev->secure_zone = false;
+-	    }
+-	    else {
+-		   nfc_dev->secure_zone = true;
+-            }
+-	    pr_info("NxpDrv: %s:nfc secure_zone = %s", __func__, nfc_dev->secure_zone ? "true" : "false");
+-	}else {
+-		nfc_post_init(nfc_dev);
+-	}
+-#else
+-	nfc_dev->secure_zone = false;
+-	nfc_post_init(nfc_dev);
+-#endif
+-	device_init_wakeup(&client->dev, true);
+-	i2c_set_clientdata(client, nfc_dev);
+-	i2c_dev->irq_wake_up = false;
+-	nfc_dev->is_ese_session_active = false;
+-
+-	pr_info("NxpDrv: %s: probing nfc i2c success\n", __func__);
++	if (ret)
++		goto fail;
++	ret = nfc_dev_publish(dev);
++	if (ret)
++		goto fail;
+ 	return 0;
+-
+-
+-err_ldo_config_failed:
+-	free_irq(client->irq, nfc_dev);
+-err_nfc_misc_unregister:
+-	nfc_misc_unregister(nfc_dev, DEV_COUNT);
+-err_mutex_destroy:
+-	mutex_destroy(&nfc_dev->dev_ref_mutex);
+-	mutex_destroy(&nfc_dev->read_mutex);
+-	mutex_destroy(&nfc_dev->write_mutex);
+-err_free_gpio:
+-	gpio_free_all(nfc_dev);
+-	kfree(nfc_dev->write_kbuf);
+-err_free_read_kbuf:
+-	kfree(nfc_dev->read_kbuf);
+-err_free_nfc_dev:
+-	kfree(nfc_dev);
+-err:
+-	pr_err("NxpDrv: %s: probing not successful, check hardware\n", __func__);
++fail:
++	nfc_i2c_cleanup(dev);
++	nfc_dev_put(dev);
+ 	return ret;
+ }
+ 
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
+ void nfc_i2c_dev_remove(struct i2c_client *client)
+-#else
+-int nfc_i2c_dev_remove(struct i2c_client *client)
+-#endif
+-{
+-	struct nfc_dev *nfc_dev = NULL;
+-
+-	pr_info("NxpDrv: %s: remove device\n", __func__);
+-	nfc_dev = i2c_get_clientdata(client);
+-	if (!nfc_dev) {
+-		pr_err("NxpDrv: %s: device doesn't exist anymore\n", __func__);
+-#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+-		return -ENODEV;
+-#endif
+-	}
+-	if (nfc_dev->dev_ref_count > 0) {
+-		pr_err("NxpDrv: %s: device already in use\n", __func__);
+-#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+-		return -EBUSY;
+-#endif
+-	}
+-
+-	gpio_set_value(nfc_dev->configs.gpio.ven, 0);
+-	// HW dependent delay before LDO goes into LPM mode
+-	usleep_range(10000, 10100);
+-	if (nfc_dev->reg) {
+-		nfc_ldo_unvote(nfc_dev);
+-		regulator_put(nfc_dev->reg);
+-	}
+-
+-	device_init_wakeup(&client->dev, false);
+-	free_irq(client->irq, nfc_dev);
+-	nfc_misc_unregister(nfc_dev, DEV_COUNT);
+-	mutex_destroy(&nfc_dev->dev_ref_mutex);
+-	mutex_destroy(&nfc_dev->read_mutex);
+-	mutex_destroy(&nfc_dev->write_mutex);
+-	gpio_free_all(nfc_dev);
+-	kfree(nfc_dev->read_kbuf);
+-	kfree(nfc_dev->write_kbuf);
+-	kfree(nfc_dev);
+-#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+-	return 0;
+-#endif
++{
++	struct nfc_dev *dev = i2c_get_clientdata(client);
++
++	if (!dev)
++		return;
++	nfc_i2c_cleanup(dev);
++	nfc_dev_put(dev);
+ }
+ 
+ int nfc_i2c_dev_suspend(struct device *device)
+@@ -528,9 +475,13 @@
+ 	NFCLOG_IPC(nfc_dev, false, "%s: irq_enabled = %d", __func__,
+ 							i2c_dev->irq_enabled);
+ 
+-	if (device_may_wakeup(&client->dev) && i2c_dev->irq_enabled) {
+-		if (!enable_irq_wake(client->irq))
+-			i2c_dev->irq_wake_up = true;
++	if (device_may_wakeup(&client->dev) && READ_ONCE(i2c_dev->irq_enabled) &&
++	    !i2c_dev->irq_wake_up) {
++		int ret = enable_irq_wake(client->irq);
++
++		if (ret)
++			return ret;
++		i2c_dev->irq_wake_up = true;
+ 	}
+ 	pr_debug("NxpDrv: %s: irq_wake_up = %d", __func__, i2c_dev->irq_wake_up);
+ 	return 0;
+@@ -550,9 +501,12 @@
+ 	NFCLOG_IPC(nfc_dev, false, "%s: irq_wake_up = %d", __func__,
+ 							i2c_dev->irq_wake_up);
+ 
+-	if (device_may_wakeup(&client->dev) && i2c_dev->irq_wake_up) {
+-		if (!disable_irq_wake(client->irq))
+-			i2c_dev->irq_wake_up = false;
++	if (i2c_dev->irq_wake_up) {
++		int ret = disable_irq_wake(client->irq);
++
++		if (ret)
++			return ret;
++		i2c_dev->irq_wake_up = false;
+ 	}
+ 	pr_debug("NxpDrv: %s: irq_wake_up = %d", __func__, i2c_dev->irq_wake_up);
+ 	return 0;

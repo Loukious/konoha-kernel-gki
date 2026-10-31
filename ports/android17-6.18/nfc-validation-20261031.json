@@ -1,0 +1,61 @@
+{
+  "nfc_wire": {
+    "notification_bounds_cases": 8448,
+    "reset_exchange_cases": 11340,
+    "session_cases": 200,
+    "version_cases": 22,
+    "sanitizers": [
+      "AddressSanitizer",
+      "UndefinedBehaviorSanitizer"
+    ]
+  },
+  "nfc_reset": {
+    "early_response_firmware_status_cases": 1536,
+    "transport_and_request_fault_cases": 1304,
+    "wait_and_lifetime_scenarios": 9
+  },
+  "nfc_lifetime": {
+    "probe_failure_points": 23,
+    "open_failure_paths": 2,
+    "retained_fd_and_stale_cdev": true,
+    "failed_probe_avoids_global_srcu_wait": true
+  },
+  "nfc_power": {
+    "regulator_power_and_wake_fault_cases": 20,
+    "power_off_wakes_reader": true
+  },
+  "source_sha256": {
+    "nxp/opensource/driver/nfc/common.c": "04b964e2d450c369c52a383352e5a1cc80edc873e2f194feeaee09e72537383d",
+    "nxp/opensource/driver/nfc/common.h": "909f33d6d5f7cb29e84925ce0bf75657474b8ff14d0efe299165e0db1f837f48",
+    "nxp/opensource/driver/nfc/common_nxp.c": "b8f636b7d0186f88c8c70e35973f123b0368ff44445005d966f893ff7d6ae598",
+    "nxp/opensource/driver/nfc/common_nxp.h": "ecc3e6f83f6f3512c046f951b273adb729b1d49dd37966b2eccabde87d7d2115",
+    "nxp/opensource/driver/nfc/common_qcom.c": "748862251990779f6a480ee072af6d5c4ccf0fd8decfb669681a3728132ad5cd",
+    "nxp/opensource/driver/nfc/ese_cold_reset.c": "59f2afa643fc7a5e380ec72da631eca65af4b4551fd94e8ffb5f9a4be43f246b",
+    "nxp/opensource/driver/nfc/ese_cold_reset.h": "785fc9e4acf70b66ac0837751b1c1c213ce61a3c71fa291b38d84359d0f661bc",
+    "nxp/opensource/driver/nfc/i2c_drv.c": "ce35904377a18b9d5be1edecc85012dfc16cff47d50c88eb4b1ad46dba0d7fd4",
+    "nxp/opensource/driver/nfc/i2c_drv.h": "fe8374248d39d09d230a0b019d07dd9bd62c46adc31c95e12e7ee97b47236360"
+  },
+  "harness_sha256": {
+    "nfc_lifetime.c": "cbc836780081b06300183a244e27c6f4481a88936ed597d5412228f4cdeb25fe",
+    "nfc_reset.c": "b7f22a46a11c1ec7e6e4561783bbc4774c08e1ff898adc86b8fe8f0300b1d742",
+    "nfc_wire.c": "bdbcceb981ad092b175c070590d3a7ffd0c7258028694958d33c3abf98e5961e",
+    "nfc_power.c": "c2c0d4d1fc72c7699797490b951c86a553880569f83ceafd4ab2ba6611106c09"
+  },
+  "source_contracts": [
+    "nfc_dev_open holds SRCU through hardware access",
+    "nfc_dev_close holds SRCU through hardware access",
+    "nfc_dev_ioctl holds SRCU through hardware access",
+    "nfc_dev_flush holds SRCU through hardware access",
+    "nfc_i2c_dev_read holds SRCU through hardware access",
+    "nfc_i2c_dev_write holds SRCU through hardware access",
+    "remove withdraws and drains file operations before IRQ, GPIO and regulator teardown",
+    "remove wakes both reader and reset waiters before SRCU drain",
+    "probe initializes locks and controller before userspace publication",
+    "IRQ starts disabled until a ready controller enables it",
+    "nfc_i2c_dev_read handles zero length without waiting for another operation",
+    "nfc_i2c_dev_write handles zero length without waiting for another operation",
+    "pinned NFC userspace ABI unchanged: nfcinfo.h",
+    "pinned NFC userspace ABI unchanged: sn_uapi.h"
+  ],
+  "limits": "Extracted driver functions with mocked kernel, user-copy, I2C and pthread locking; does not validate live VFS/SRCU/IRQ semantics, NFC firmware, secure peripheral mode, electrical behavior or phone operation."
+}
