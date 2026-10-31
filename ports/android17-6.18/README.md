@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 276 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 277 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 276 platform `.ko` files, their symbol tables and DDK configurations.
+- 277 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 17,555
-imported symbol CRCs across all 276 modules.
+used. The current [validation report](validation-20261031.json) checks 17,656
+imported symbol CRCs across all 277 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1863,3 +1863,20 @@ with the existing vendor warnings. ROM module-name build coverage is 273/466
 (58.6%). Remaining audio/data/peripheral modules, KernelSU/NetHunter and
 boot/DLKM/ZIP packaging are unfinished. Camera HAL, hardware and phone boot have
 not been validated; there is no flashable ZIP yet.
+
+
+## Native RX audio macro
+
+RX preserves the native DAI, rate, mixer and route tables, FIR byte formats and
+three provider dependencies. Child notifications drain before removal; PM and
+clock errors retain balanced or explicitly pending ownership. Repeated FIR
+enable requests are idempotent, coefficient programming preserves the prior
+filter state, and component failures unwind owned resources. Four production
+source sanitizer suites pass and reject 32 compiled deliberate regressions.
+The [RX record](audio-rx-port.md) states the tested paths and provider limits.
+
+Archive `artifacts/20261031T224530972654Z` contains 277 modules and passes 17,656 imported-symbol
+CRC checks without compiler/modpost warnings. Device-tree and overlay checks pass
+with existing vendor warnings. ROM module-name coverage is 274/466 (58.8%).
+Codec/speaker and remaining data/peripheral drivers, KernelSU/NetHunter and
+boot/DLKM/ZIP packaging remain. No flashable ZIP or phone/audio validation exists.

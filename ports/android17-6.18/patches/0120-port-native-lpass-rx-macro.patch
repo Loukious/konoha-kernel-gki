@@ -1,0 +1,2003 @@
+Subject: Port native LPASS RX macro to 6.18
+
+Retain native audio routes with bounded callback and resource ownership.
+
+---
+
+--- a/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-rx-macro.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-rx-macro.c
+@@ -9,6 +9,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/clk.h>
+ #include <linux/pm_runtime.h>
++#include <linux/wait.h>
+ #include <sound/soc.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+@@ -420,8 +421,8 @@
+ static int lpass_cdc_rx_macro_hw_params(struct snd_pcm_substream *substream,
+ 			       struct snd_pcm_hw_params *params,
+ 			       struct snd_soc_dai *dai);
+-static int lpass_cdc_rx_macro_get_channel_map(struct snd_soc_dai *dai,
+-				unsigned int *tx_num, unsigned int *tx_slot,
++static int lpass_cdc_rx_macro_get_channel_map(const struct snd_soc_dai *dai,
++					      unsigned int *tx_num, unsigned int *tx_slot,
+ 				unsigned int *rx_num, unsigned int *rx_slot);
+ static int lpass_cdc_rx_macro_int_dem_inp_mux_put(struct snd_kcontrol *kcontrol,
+ 				     struct snd_ctl_elem_value *ucontrol);
+@@ -478,7 +479,7 @@
+  * @swr_clk_lock: to lock swr master clock operations
+  * @swr_ctrl_data: SoundWire data structure
+  * @swr_plat_data: Soundwire platform data
+- * @lpass_cdc_rx_macro_add_child_devices_work: work for adding child devices
++ * @swr_ctrl_lock: retain SoundWire notification targets through withdrawal
+  * @rx_swr_gpio_p: used by pinctrl API
+  * @component: codec handle
+  */
+@@ -493,6 +494,11 @@
+ 	int rx_mclk_users;
+ 	int swr_clk_users;
+ 	bool dapm_mclk_enable;
++	bool failed_clock_owned;
++	bool ssr_clock_owned;
++	bool swr_mclk_owned;
++	bool swr_pins_owned;
++	bool swr_enabled;
+ 	bool reset_swr;
+ 	int clsh_users;
+ 	int rx_mclk_cnt;
+@@ -500,6 +506,10 @@
+ 	bool is_native_on;
+ 	bool is_ear_mode_on;
+ 	bool is_fir_filter_on;
++	bool fir_clock_owned;
++	bool fir_mclk_owned;
++	/* Serializes FIR controls, programming and teardown. */
++	struct mutex fir_lock;
+ 	bool is_fir_coeff_written[FIR_PATH_MAX][GRP_MAX];
+ 	bool is_fir_capable;
+ 	bool dev_up;
+@@ -510,7 +520,10 @@
+ 	struct mutex swr_clk_lock;
+ 	struct rx_swr_ctrl_data *swr_ctrl_data;
+ 	struct rx_swr_ctrl_platform_data swr_plat_data;
+-	struct work_struct lpass_cdc_rx_macro_add_child_devices_work;
++	/* Protect published SoundWire children against notification/removal races. */
++	struct mutex swr_ctrl_lock;
++	wait_queue_head_t swr_ctrl_wait;
++	unsigned int swr_ctrl_users;
+ 	struct device_node *rx_swr_gpio_p;
+ 	struct snd_soc_component *component;
+ 	unsigned long active_ch_mask[LPASS_CDC_RX_MACRO_MAX_DAIS];
+@@ -915,6 +928,8 @@
+ 			       struct lpass_cdc_rx_macro_priv **rx_priv,
+ 			       const char *func_name)
+ {
++	if (!component)
++		return false;
+ 	*rx_dev = lpass_cdc_get_device_ptr(component->dev, RX_MACRO);
+ 
+ 	if (!(*rx_dev)) {
+@@ -939,6 +954,33 @@
+ 	return true;
+ }
+ 
++static int lpass_cdc_rx_macro_notify_swr(struct lpass_cdc_rx_macro_priv *rx_priv,
++					 u32 event, void *data)
++{
++	struct platform_device *target;
++	int ret;
++
++	mutex_lock(&rx_priv->swr_ctrl_lock);
++	if (!rx_priv->swr_ctrl_data) {
++		mutex_unlock(&rx_priv->swr_ctrl_lock);
++		return 0;
++	}
++	if (rx_priv->swr_ctrl_users == UINT_MAX) {
++		mutex_unlock(&rx_priv->swr_ctrl_lock);
++		return -EOVERFLOW;
++	}
++	target = rx_priv->swr_ctrl_data[0].rx_swr_pdev;
++	rx_priv->swr_ctrl_users++;
++	mutex_unlock(&rx_priv->swr_ctrl_lock);
++	/* SoundWire can call back into the macro while handling a notification. */
++	ret = swrm_wcd_notify(target, event, data);
++	mutex_lock(&rx_priv->swr_ctrl_lock);
++	if (!--rx_priv->swr_ctrl_users)
++		wake_up_all(&rx_priv->swr_ctrl_wait);
++	mutex_unlock(&rx_priv->swr_ctrl_lock);
++	return ret;
++}
++
+ static int lpass_cdc_rx_macro_set_port_map(struct snd_soc_component *component,
+ 				u32 usecase, u32 size, void *data)
+ {
+@@ -955,10 +997,7 @@
+ 	port_cfg.size = size;
+ 	port_cfg.params = data;
+ 
+-	if (rx_priv->swr_ctrl_data)
+-		ret = swrm_wcd_notify(
+-			rx_priv->swr_ctrl_data[0].rx_swr_pdev,
+-			SWR_SET_PORT_MAP, &port_cfg);
++	ret = lpass_cdc_rx_macro_notify_swr(rx_priv, SWR_SET_PORT_MAP, &port_cfg);
+ 
+ 	return ret;
+ }
+@@ -1194,8 +1233,8 @@
+ 	return 0;
+ }
+ 
+-static int lpass_cdc_rx_macro_get_channel_map(struct snd_soc_dai *dai,
+-				unsigned int *tx_num, unsigned int *tx_slot,
++static int lpass_cdc_rx_macro_get_channel_map(const struct snd_soc_dai *dai,
++					      unsigned int *tx_num, unsigned int *tx_slot,
+ 				unsigned int *rx_num, unsigned int *rx_slot)
+ {
+ 	struct snd_soc_component *component = dai->component;
+@@ -1282,101 +1321,125 @@
+ 
+ static int lpass_cdc_rx_macro_mclk_enable(
+ 				struct lpass_cdc_rx_macro_priv *rx_priv,
+-				bool mclk_enable, bool dapm)
++				bool enable, bool dapm)
+ {
+ 	struct regmap *regmap = dev_get_regmap(rx_priv->dev->parent, NULL);
+-	int ret = 0;
+-
+-	if (regmap == NULL) {
+-		dev_err_ratelimited(rx_priv->dev, "%s: regmap is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	dev_dbg(rx_priv->dev, "%s: mclk_enable = %u, dapm = %d clk_users= %d\n",
+-		__func__, mclk_enable, dapm, rx_priv->rx_mclk_users);
+-
++	unsigned int old_mclk, old_fs;
++	bool voted = false;
++	int ret = 0, cleanup;
++
++	if (!regmap)
++		return -ENODEV;
+ 	mutex_lock(&rx_priv->mclk_lock);
+-	if (mclk_enable) {
+-		if (rx_priv->rx_mclk_users == 0) {
+-			if (rx_priv->is_native_on)
+-				rx_priv->clk_id = RX_CORE_CLK;
+-			ret = lpass_cdc_rx_macro_core_vote(rx_priv, true);
+-			if (ret < 0) {
+-				dev_err_ratelimited(rx_priv->dev,
+-					"%s: rx request core vote failed\n",
+-					__func__);
+-				goto exit;
+-			}
+-			ret = lpass_cdc_clk_rsc_request_clock(rx_priv->dev,
+-							   rx_priv->default_clk_id,
+-							   rx_priv->clk_id,
+-							   true);
+-			lpass_cdc_rx_macro_core_vote(rx_priv, false);
+-			if (ret < 0) {
+-				dev_err_ratelimited(rx_priv->dev,
+-					"%s: rx request clock enable failed\n",
+-					__func__);
+-				goto exit;
+-			}
+-			lpass_cdc_clk_rsc_fs_gen_request(rx_priv->dev,
+-							true);
+-			regcache_mark_dirty(regmap);
+-			regcache_sync_region(regmap,
+-					RX_START_OFFSET,
+-					RX_MAX_OFFSET);
+-			regmap_update_bits(regmap,
+-				LPASS_CDC_RX_CLK_RST_CTRL_MCLK_CONTROL,
+-				0x01, 0x01);
+-			regmap_update_bits(regmap,
+-				LPASS_CDC_RX_CLK_RST_CTRL_MCLK_CONTROL,
+-				0x02, 0x02);
+-			regmap_update_bits(regmap,
+-				LPASS_CDC_RX_CLK_RST_CTRL_FS_CNT_CONTROL,
+-				0x02, 0x00);
+-			regmap_update_bits(regmap,
+-				LPASS_CDC_RX_CLK_RST_CTRL_FS_CNT_CONTROL,
+-				0x01, 0x01);
++	if ((enable && rx_priv->rx_mclk_users == INT_MAX) ||
++	    (!enable && !rx_priv->rx_mclk_users)) {
++		ret = enable ? -EOVERFLOW : -EINVAL;
++		goto out;
++	}
++	if ((enable && rx_priv->rx_mclk_users) ||
++	    (!enable && rx_priv->rx_mclk_users > 1)) {
++		rx_priv->rx_mclk_users += enable ? 1 : -1;
++		goto out;
++	}
++	if (enable || READ_ONCE(rx_priv->pre_dev_up)) {
++		ret = lpass_cdc_rx_macro_core_vote(rx_priv, true);
++		if (ret)
++			goto out;
++		voted = true;
++	}
++	/* A failed rollback retains its exact requested clock until released. */
++	if (rx_priv->failed_clock_owned) {
++		ret = lpass_cdc_clk_rsc_request_clock(rx_priv->dev,
++						      rx_priv->default_clk_id,
++						      rx_priv->clk_id, false);
++		if (ret)
++			goto vote;
++		rx_priv->failed_clock_owned = false;
++	}
++	if (enable) {
++		rx_priv->clk_id = rx_priv->is_native_on ? RX_CORE_CLK :
++			rx_priv->default_clk_id;
++		ret = lpass_cdc_clk_rsc_request_clock(rx_priv->dev,
++						      rx_priv->default_clk_id,
++						      rx_priv->clk_id, true);
++		if (ret)
++			goto vote;
++		lpass_cdc_clk_rsc_fs_gen_request(rx_priv->dev, true);
++		regcache_mark_dirty(regmap);
++		ret = regcache_sync_region(regmap, RX_START_OFFSET, RX_MAX_OFFSET);
++		if (ret)
++			goto rollback_clock;
++	}
++	ret = regmap_read(regmap, LPASS_CDC_RX_CLK_RST_CTRL_MCLK_CONTROL, &old_mclk);
++	if (ret)
++		goto rollback_clock;
++	ret = regmap_read(regmap, LPASS_CDC_RX_CLK_RST_CTRL_FS_CNT_CONTROL, &old_fs);
++	if (ret)
++		goto rollback_clock;
++	if (enable) {
++		ret = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_MCLK_CONTROL,
++					 1, 1);
++		if (!ret)
++			ret = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_MCLK_CONTROL,
++						 2, 2);
++		if (!ret)
++			ret = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_FS_CNT_CONTROL,
++						 2, 0);
++		if (!ret)
++			ret = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_FS_CNT_CONTROL,
++						 1, 1);
++	} else {
++		ret = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_FS_CNT_CONTROL,
++					 1, 0);
++		if (!ret)
++			ret = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_FS_CNT_CONTROL,
++						 2, 2);
++		if (!ret)
++			ret = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_MCLK_CONTROL,
++						 2, 0);
++		if (!ret)
++			ret = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_MCLK_CONTROL,
++						 1, 0);
++	}
++	if (ret)
++		goto rollback_regs;
++	if (!enable) {
++		lpass_cdc_clk_rsc_fs_gen_request(rx_priv->dev, false);
++		ret = lpass_cdc_clk_rsc_request_clock(rx_priv->dev,
++						      rx_priv->default_clk_id,
++						      rx_priv->clk_id, false);
++		if (ret) {
++			lpass_cdc_clk_rsc_fs_gen_request(rx_priv->dev, true);
++			goto rollback_regs;
+ 		}
+-		rx_priv->rx_mclk_users++;
+-	} else {
+-		if (rx_priv->rx_mclk_users <= 0) {
+-			dev_err_ratelimited(rx_priv->dev, "%s: clock already disabled\n",
+-				__func__);
+-			rx_priv->rx_mclk_users = 0;
+-			goto exit;
++		rx_priv->clk_id = rx_priv->default_clk_id;
++	}
++	rx_priv->rx_mclk_users = enable ? 1 : 0;
++	goto vote;
++rollback_regs:
++	cleanup = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_MCLK_CONTROL,
++				     3, old_mclk);
++	if (cleanup)
++		dev_err(rx_priv->dev, "RX MCLK rollback failed: %d\n", cleanup);
++	cleanup = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_FS_CNT_CONTROL,
++				     3, old_fs);
++	if (cleanup)
++		dev_err(rx_priv->dev, "RX FS rollback failed: %d\n", cleanup);
++rollback_clock:
++	if (enable) {
++		lpass_cdc_clk_rsc_fs_gen_request(rx_priv->dev, false);
++		cleanup = lpass_cdc_clk_rsc_request_clock(rx_priv->dev,
++							  rx_priv->default_clk_id,
++							  rx_priv->clk_id, false);
++		if (cleanup) {
++			rx_priv->failed_clock_owned = true;
++			dev_err(rx_priv->dev, "RX clock rollback failed: %d\n", cleanup);
+ 		}
+-		rx_priv->rx_mclk_users--;
+-		if (rx_priv->rx_mclk_users == 0) {
+-			regmap_update_bits(regmap,
+-				LPASS_CDC_RX_CLK_RST_CTRL_FS_CNT_CONTROL,
+-				0x01, 0x00);
+-			regmap_update_bits(regmap,
+-				LPASS_CDC_RX_CLK_RST_CTRL_FS_CNT_CONTROL,
+-				0x02, 0x02);
+-			regmap_update_bits(regmap,
+-				LPASS_CDC_RX_CLK_RST_CTRL_MCLK_CONTROL,
+-				0x02, 0x00);
+-			regmap_update_bits(regmap,
+-				LPASS_CDC_RX_CLK_RST_CTRL_MCLK_CONTROL,
+-				0x01, 0x00);
+-			lpass_cdc_clk_rsc_fs_gen_request(rx_priv->dev,
+-			   false);
+-			ret = lpass_cdc_rx_macro_core_vote(rx_priv, true);
+-			if (ret < 0) {
+-				dev_err_ratelimited(rx_priv->dev,
+-					"%s: rx request core vote failed\n",
+-					__func__);
+-			}
+-			lpass_cdc_clk_rsc_request_clock(rx_priv->dev,
+-						 rx_priv->default_clk_id,
+-						 rx_priv->clk_id,
+-						 false);
+-			if (!ret)
+-				lpass_cdc_rx_macro_core_vote(rx_priv, false);
+-			rx_priv->clk_id = rx_priv->default_clk_id;
+-		}
+-	}
+-exit:
++	}
++vote:
++	if (voted)
++		lpass_cdc_rx_macro_core_vote(rx_priv, false);
++out:
+ 	mutex_unlock(&rx_priv->mclk_lock);
+ 	return ret;
+ }
+@@ -1384,40 +1447,61 @@
+ static int lpass_cdc_rx_macro_mclk_event(struct snd_soc_dapm_widget *w,
+ 			       struct snd_kcontrol *kcontrol, int event)
+ {
+-	struct snd_soc_component *component =
+-				snd_soc_dapm_to_component(w->dapm);
+-	int ret = 0;
++	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
+ 	struct device *rx_dev = NULL;
+ 	struct lpass_cdc_rx_macro_priv *rx_priv = NULL;
+-	int mclk_freq = MCLK_FREQ;
++	int mclk_freq, ret = 0;
+ 
+ 	if (!lpass_cdc_rx_macro_get_data(component, &rx_dev, &rx_priv, __func__))
+ 		return -EINVAL;
+-
+-	dev_dbg(rx_dev, "%s: event = %d\n", __func__, event);
+ 	switch (event) {
+ 	case SND_SOC_DAPM_PRE_PMU:
+-		if (rx_priv->is_native_on)
+-			mclk_freq = MCLK_FREQ_NATIVE;
+-		if (rx_priv->swr_ctrl_data)
+-			swrm_wcd_notify(
+-				rx_priv->swr_ctrl_data[0].rx_swr_pdev,
+-				SWR_CLK_FREQ, &mclk_freq);
+-		ret = lpass_cdc_rx_macro_mclk_enable(rx_priv, 1, true);
++		if (rx_priv->dapm_mclk_enable)
++			break;
++		mclk_freq = rx_priv->is_native_on ? MCLK_FREQ_NATIVE : MCLK_FREQ;
++		ret = lpass_cdc_rx_macro_notify_swr(rx_priv, SWR_CLK_FREQ, &mclk_freq);
+ 		if (ret)
+-			rx_priv->dapm_mclk_enable = false;
+-		else
++			break;
++		ret = lpass_cdc_rx_macro_mclk_enable(rx_priv, true, true);
++		if (!ret)
+ 			rx_priv->dapm_mclk_enable = true;
+ 		break;
+ 	case SND_SOC_DAPM_POST_PMD:
+-		if (rx_priv->dapm_mclk_enable)
+-			ret = lpass_cdc_rx_macro_mclk_enable(rx_priv, 0, true);
++		if (!rx_priv->dapm_mclk_enable)
++			break;
++		ret = lpass_cdc_rx_macro_mclk_enable(rx_priv, false, true);
++		if (!ret)
++			rx_priv->dapm_mclk_enable = false;
+ 		break;
+ 	default:
+-		dev_err_ratelimited(rx_priv->dev,
+-			"%s: invalid DAPM event %d\n", __func__, event);
+ 		ret = -EINVAL;
+ 	}
++	return ret;
++}
++
++static int lpass_cdc_rx_macro_reset_clock(struct lpass_cdc_rx_macro_priv *rx_priv)
++{
++	int ret;
++
++	mutex_lock(&rx_priv->mclk_lock);
++	ret = lpass_cdc_rx_macro_core_vote(rx_priv, true);
++	if (ret)
++		goto out;
++	if (!rx_priv->ssr_clock_owned) {
++		ret = lpass_cdc_clk_rsc_request_clock(rx_priv->dev,
++						      rx_priv->default_clk_id, RX_CORE_CLK, true);
++		if (ret)
++			goto vote;
++		rx_priv->ssr_clock_owned = true;
++	}
++	ret = lpass_cdc_clk_rsc_request_clock(rx_priv->dev,
++					      rx_priv->default_clk_id, RX_CORE_CLK, false);
++	if (!ret)
++		rx_priv->ssr_clock_owned = false;
++vote:
++	lpass_cdc_rx_macro_core_vote(rx_priv, false);
++out:
++	mutex_unlock(&rx_priv->mclk_lock);
+ 	return ret;
+ }
+ 
+@@ -1464,11 +1548,7 @@
+ 	case LPASS_CDC_MACRO_EVT_SSR_DOWN:
+ 		rx_priv->pre_dev_up = false;
+ 		rx_priv->dev_up = false;
+-		if (rx_priv->swr_ctrl_data) {
+-			swrm_wcd_notify(
+-				rx_priv->swr_ctrl_data[0].rx_swr_pdev,
+-				SWR_DEVICE_SSR_DOWN, NULL);
+-		}
++		lpass_cdc_rx_macro_notify_swr(rx_priv, SWR_DEVICE_SSR_DOWN, NULL);
+ 		if ((!pm_runtime_enabled(rx_dev) ||
+ 		     !pm_runtime_suspended(rx_dev))) {
+ 			ret = lpass_cdc_runtime_suspend(rx_dev);
+@@ -1481,36 +1561,17 @@
+ 		break;
+ 	case LPASS_CDC_MACRO_EVT_PRE_SSR_UP:
+ 		rx_priv->pre_dev_up = true;
+-		ret = lpass_cdc_rx_macro_core_vote(rx_priv, true);
+-		if (ret < 0) {
+-			dev_err_ratelimited(rx_priv->dev,
+-				"%s: rx request core vote failed\n",
+-				__func__);
+-			break;
+-		}
+-		/* enable&disable RX_CORE_CLK to reset GFMUX reg */
+-		ret = lpass_cdc_clk_rsc_request_clock(rx_priv->dev,
+-						rx_priv->default_clk_id,
+-						RX_CORE_CLK, true);
+-		if (ret < 0)
+-			dev_err_ratelimited(rx_priv->dev,
+-				"%s, failed to enable clk, ret:%d\n",
+-				__func__, ret);
+-		else
+-			lpass_cdc_clk_rsc_request_clock(rx_priv->dev,
+-						rx_priv->default_clk_id,
+-						RX_CORE_CLK, false);
+-		lpass_cdc_rx_macro_core_vote(rx_priv, false);
++		/* Retain the temporary GFMUX request if its release fails. */
++		ret = lpass_cdc_rx_macro_reset_clock(rx_priv);
++		if (ret)
++			rx_priv->pre_dev_up = false;
+ 		break;
+ 	case LPASS_CDC_MACRO_EVT_SSR_UP:
+ 		rx_priv->dev_up = true;
+ 		/* reset swr after ssr/pdr */
+ 		rx_priv->reset_swr = true;
+ 
+-		if (rx_priv->swr_ctrl_data)
+-			swrm_wcd_notify(
+-				rx_priv->swr_ctrl_data[0].rx_swr_pdev,
+-				SWR_DEVICE_SSR_UP, NULL);
++		lpass_cdc_rx_macro_notify_swr(rx_priv, SWR_DEVICE_SSR_UP, NULL);
+ 		break;
+ 	case LPASS_CDC_MACRO_EVT_CLK_RESET:
+ 		lpass_cdc_rsc_clk_reset(rx_dev, RX_CORE_CLK);
+@@ -3228,88 +3289,93 @@
+ 	if (!lpass_cdc_rx_macro_get_data(component, &rx_dev, &rx_priv, __func__))
+ 		return -EINVAL;
+ 
++	mutex_lock(&rx_priv->fir_lock);
+ 	ucontrol->value.bytes.data[0] = (unsigned char)rx_priv->is_fir_filter_on;
++	mutex_unlock(&rx_priv->fir_lock);
++	return 0;
++}
++
++/* Caller serializes FIR controls and teardown with fir_lock. */
++static int lpass_cdc_rx_macro_fir_set_enabled(struct snd_soc_component *component,
++					      struct lpass_cdc_rx_macro_priv *rx_priv, bool enable)
++{
++	struct lpass_cdc_rx_macro_reg_mask_val start[] = {
++		{LPASS_CDC_RX_RX0_RX_FIR_CFG, 0xff, rx_priv->fir_total_coeff_num[RX0_PATH]},
++		{LPASS_CDC_RX_RX1_RX_FIR_CFG, 0xff, rx_priv->fir_total_coeff_num[RX1_PATH]},
++		{LPASS_CDC_RX_TOP_TOP_CFG1, 1, 1},
++		{LPASS_CDC_RX_RX0_RX_PATH_CTL, 0x80, 0x80},
++		{LPASS_CDC_RX_RX1_RX_PATH_CTL, 0x80, 0x80},
++		{LPASS_CDC_RX_RX0_RX_FIR_CTL, 0x0d, 5},
++		{LPASS_CDC_RX_RX1_RX_FIR_CTL, 0x0d, 5},
++	};
++	static const struct lpass_cdc_rx_macro_reg_mask_val stop[] = {
++		{LPASS_CDC_RX_RX0_RX_FIR_CTL, 0x0d, 0},
++		{LPASS_CDC_RX_RX1_RX_FIR_CTL, 0x0d, 0},
++		{LPASS_CDC_RX_RX0_RX_PATH_CTL, 0x80, 0},
++		{LPASS_CDC_RX_RX1_RX_PATH_CTL, 0x80, 0},
++		{LPASS_CDC_RX_TOP_TOP_CFG1, 1, 0},
++	};
++	const struct lpass_cdc_rx_macro_reg_mask_val *seq;
++	unsigned int i, count;
++	int ret, status = 0;
++
++	if (enable && (!rx_priv->hifi_fir_clk || !rx_priv->is_fir_capable))
++		return 0;
++	if (enable && rx_priv->is_fir_filter_on)
++		return 0;
++	if (!enable && !rx_priv->fir_clock_owned)
++		return 0;
++	if (enable && rx_priv->fir_clock_owned) {
++		ret = lpass_cdc_rx_macro_fir_set_enabled(component, rx_priv, false);
++		if (ret)
++			return ret;
++	}
++	if (enable) {
++		ret = clk_prepare_enable(rx_priv->hifi_fir_clk);
++		if (ret)
++			return ret;
++		rx_priv->fir_clock_owned = true;
++	}
++	seq = enable ? start : stop;
++	count = enable ? ARRAY_SIZE(start) : ARRAY_SIZE(stop);
++	for (i = 0; i < count; i++) {
++		ret = snd_soc_component_update_bits(component, seq[i].reg, seq[i].mask, seq[i].val);
++		if (ret < 0) {
++			if (!status)
++				status = ret;
++			if (enable)
++				break;
++		}
++	}
++	if (status) {
++		rx_priv->is_fir_filter_on = false;
++		if (enable && lpass_cdc_rx_macro_fir_set_enabled(component, rx_priv, false))
++			dev_err(rx_priv->dev, "RX FIR rollback retains its clock\n");
++		return status;
++	}
++	if (!enable) {
++		clk_disable_unprepare(rx_priv->hifi_fir_clk);
++		rx_priv->fir_clock_owned = false;
++	}
++	rx_priv->is_fir_filter_on = enable;
+ 	return 0;
+ }
+ 
+ static int lpass_cdc_rx_macro_fir_filter_enable_put(struct snd_kcontrol *kcontrol,
+ 			struct snd_ctl_elem_value *ucontrol)
+ {
+-	struct snd_soc_component *component =
+-				snd_soc_kcontrol_component(kcontrol);
++	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+ 	struct device *rx_dev = NULL;
+ 	struct lpass_cdc_rx_macro_priv *rx_priv = NULL;
+-	int ret = 0;
+-
+-	if (!component) {
+-		pr_err_ratelimited("%s: component is NULL\n", __func__);
+-		return -EINVAL;
+-	}
++	int ret;
+ 
+ 	if (!lpass_cdc_rx_macro_get_data(component, &rx_dev, &rx_priv, __func__))
+ 		return -EINVAL;
+-
+-	if (!rx_priv->hifi_fir_clk) {
+-		dev_dbg(rx_priv->dev, "%s: Undefined HIFI FIR Clock.\n",
+-				__func__);
+-		return 0;
+-	}
+-
+-	if (!rx_priv->is_fir_capable) {
+-		dev_dbg(rx_priv->dev, "%s: HIFI FIR is not supported.\n",
+-				__func__);
+-		return 0;
+-	}
+-
+-	rx_priv->is_fir_filter_on =
+-			(!ucontrol->value.bytes.data[0] ? false : true);
+-
+-	dev_dbg(rx_priv->dev, "%s:is_fir_filter_on=%d\n",
+-				__func__, rx_priv->is_fir_filter_on);
+-
+-	if (rx_priv->is_fir_filter_on) {
+-		ret = clk_prepare_enable(rx_priv->hifi_fir_clk);
+-		if (ret < 0) {
+-			dev_err_ratelimited(rx_priv->dev, "%s:hifi_fir_clk enable failed\n",
+-						__func__);
+-			return ret;
+-		}
+-
+-		snd_soc_component_write(component, LPASS_CDC_RX_RX0_RX_FIR_CFG,
+-					rx_priv->fir_total_coeff_num[RX0_PATH]);
+-		dev_dbg(component->dev, "%s: HIFI FIR Path:%d total coefficients"
+-				" number written: %d.\n",
+-				__func__, RX0_PATH,
+-				rx_priv->fir_total_coeff_num[RX0_PATH]);
+-		snd_soc_component_write(component, LPASS_CDC_RX_RX1_RX_FIR_CFG,
+-					rx_priv->fir_total_coeff_num[RX1_PATH]);
+-		dev_dbg(component->dev, "%s: HIFI FIR Path:%d total coefficients"
+-				" number written: %d.\n",
+-				__func__, RX1_PATH,
+-				rx_priv->fir_total_coeff_num[RX1_PATH]);
+-
+-		/* Enable HIFI_FEAT_EN bit */
+-		snd_soc_component_update_bits(component, LPASS_CDC_RX_TOP_TOP_CFG1, 0x01, 0x01);
+-		/* Enable FIR_CLK_EN */
+-		snd_soc_component_update_bits(component, LPASS_CDC_RX_RX0_RX_PATH_CTL, 0x80, 0x80);
+-		snd_soc_component_update_bits(component, LPASS_CDC_RX_RX1_RX_PATH_CTL, 0x80, 0x80);
+-		/* Start the FIR filter */
+-		snd_soc_component_update_bits(component, LPASS_CDC_RX_RX0_RX_FIR_CTL, 0x0D, 0x05);
+-		snd_soc_component_update_bits(component, LPASS_CDC_RX_RX1_RX_FIR_CTL, 0x0D, 0x05);
+-	} else {
+-		/* Stop the FIR filter */
+-		snd_soc_component_update_bits(component, LPASS_CDC_RX_RX0_RX_FIR_CTL, 0x0D, 0x00);
+-		snd_soc_component_update_bits(component, LPASS_CDC_RX_RX1_RX_FIR_CTL, 0x0D, 0x00);
+-		/* Disable FIR_CLK_EN */
+-		snd_soc_component_update_bits(component, LPASS_CDC_RX_RX0_RX_PATH_CTL, 0x80, 0x00);
+-		snd_soc_component_update_bits(component, LPASS_CDC_RX_RX1_RX_PATH_CTL, 0x80, 0x00);
+-		/* Disable HIFI_FEAT_EN bit */
+-		snd_soc_component_update_bits(component, LPASS_CDC_RX_TOP_TOP_CFG1, 0x01, 0x00);
+-
+-		clk_disable_unprepare(rx_priv->hifi_fir_clk);
+-	}
+-
+-	return 0;
++	mutex_lock(&rx_priv->fir_lock);
++	ret = lpass_cdc_rx_macro_fir_set_enabled(component, rx_priv,
++						 !!ucontrol->value.bytes.data[0]);
++	mutex_unlock(&rx_priv->fir_lock);
++	return ret;
+ }
+ 
+ static int lpass_cdc_rx_macro_fir_filter_info(struct snd_kcontrol *kcontrol,
+@@ -3327,313 +3393,199 @@
+ static int lpass_cdc_rx_macro_fir_audio_mixer_get(struct snd_kcontrol *kcontrol,
+ 					struct snd_ctl_elem_value *ucontrol)
+ {
+-	struct snd_soc_component *component =
+-				snd_soc_kcontrol_component(kcontrol);
++	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+ 	struct lpass_cdc_rx_macro_fir_filter_ctl *ctl =
+ 		(struct lpass_cdc_rx_macro_fir_filter_ctl *)kcontrol->private_value;
+-	unsigned int path_idx = ctl->path_idx;
+-	unsigned int grp_idx = ctl->grp_idx;
+-	u32 num_coeff_grp = 0;
+-	u32 readArray[LPASS_CDC_RX_MACRO_FIR_COEFF_ARRAY_MAX];
+-
+-	unsigned int coeff_idx = 0, array_idx = 0;
+-	unsigned int copy_size;
+ 	struct device *rx_dev = NULL;
+ 	struct lpass_cdc_rx_macro_priv *rx_priv = NULL;
+-
+-	if (!component) {
+-		pr_err_ratelimited("%s: component is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if (!lpass_cdc_rx_macro_get_data(component, &rx_dev, &rx_priv, __func__))
+-		return -EINVAL;
+-
+-	if (path_idx >= FIR_PATH_MAX) {
+-		dev_err_ratelimited(rx_priv->dev, "%s: path_idx:%d is invalid\n",
+-			__func__, path_idx);
+-		return -EINVAL;
+-	}
+-
+-	if (grp_idx >= GRP_MAX) {
+-		dev_err_ratelimited(rx_priv->dev, "%s: grp_idx:%d is invalid\n",
+-			__func__, grp_idx);
+-		return -EINVAL;
+-	}
+-
+-	num_coeff_grp = rx_priv->num_fir_coeff[path_idx][grp_idx];
+-	readArray[array_idx++] = num_coeff_grp;
+-
+-	for (coeff_idx = 0; coeff_idx < num_coeff_grp; coeff_idx++) {
+-		readArray[array_idx++] =
+-				rx_priv->fir_coeff_array[path_idx][grp_idx][coeff_idx];
+-	}
+-	copy_size = array_idx;
+-
+-	memcpy(ucontrol->value.bytes.data, &readArray[0], sizeof(readArray[0]) * copy_size);
+-
++	u32 values[LPASS_CDC_RX_MACRO_FIR_COEFF_ARRAY_MAX] = {0};
++	unsigned int count;
++
++	if (!lpass_cdc_rx_macro_get_data(component, &rx_dev, &rx_priv, __func__) ||
++	    ctl->path_idx >= FIR_PATH_MAX || ctl->grp_idx >= GRP_MAX)
++		return -EINVAL;
++	mutex_lock(&rx_priv->fir_lock);
++	count = rx_priv->num_fir_coeff[ctl->path_idx][ctl->grp_idx];
++	if (count > LPASS_CDC_RX_MACRO_FIR_COEFF_MAX) {
++		mutex_unlock(&rx_priv->fir_lock);
++		return -EINVAL;
++	}
++	values[0] = count;
++	memcpy(values + 1, rx_priv->fir_coeff_array[ctl->path_idx][ctl->grp_idx],
++	       count * sizeof(values[0]));
++	mutex_unlock(&rx_priv->fir_lock);
++	memcpy(ucontrol->value.bytes.data, values, sizeof(values));
+ 	return 0;
+ }
+ 
++static int lpass_cdc_rx_macro_write_fir_pair(struct snd_soc_component *component,
++					     unsigned int data_reg,
++					     unsigned int address_reg,
++					     unsigned int ctl_reg,
++					     unsigned int address, u32 first, u32 second)
++{
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < 8; i++) {
++		ret = snd_soc_component_write(component, data_reg + 4 * i,
++					      ((i < 4 ? first : second) >> (8 * (i % 4))) & 0xff);
++		if (ret < 0)
++			return ret;
++	}
++	ret = snd_soc_component_write(component, address_reg, address);
++	if (ret < 0)
++		return ret;
++	ret = snd_soc_component_update_bits(component, ctl_reg, 2, 2);
++	if (ret < 0)
++		return ret;
++	usleep_range(13, 15);
++	ret = snd_soc_component_update_bits(component, ctl_reg, 2, 0);
++	return ret < 0 ? ret : 0;
++}
++
++/* fir_lock protects the cache, programming and retained temporary clock vote. */
+ static int set_fir_filter_coeff(struct snd_soc_component *component,
+ 				struct lpass_cdc_rx_macro_priv *rx_priv,
+ 				unsigned int path_idx)
+ {
+-	int grp_idx = 0, coeff_idx = 0;
+-	unsigned int ret = 0;
+-	unsigned int max_coeff_num, num_coeff_grp;
+-	unsigned int path_ctl_addr = 0, wdata0_addr = 0, coeff_addr = 0;
+-	unsigned int fir_ctl_addr = 0;
+-	bool all_coeff_written = true;
+-
+-	switch (path_idx) {
+-	case RX0_PATH:
+-		path_ctl_addr = LPASS_CDC_RX_RX0_RX_PATH_CTL;
+-		wdata0_addr = LPASS_CDC_RX_RX0_RX_FIR_COEFF_WDATA0;
+-		coeff_addr = LPASS_CDC_RX_RX0_RX_FIR_COEFF_ADDR;
+-		fir_ctl_addr = LPASS_CDC_RX_RX0_RX_FIR_CTL;
+-		break;
+-	case RX1_PATH:
+-		path_ctl_addr = LPASS_CDC_RX_RX1_RX_PATH_CTL;
+-		wdata0_addr = LPASS_CDC_RX_RX1_RX_FIR_COEFF_WDATA0;
+-		coeff_addr = LPASS_CDC_RX_RX1_RX_FIR_COEFF_ADDR;
+-		fir_ctl_addr = LPASS_CDC_RX_RX1_RX_FIR_CTL;
+-		break;
+-	default:
+-		dev_err_ratelimited(rx_priv->dev,
+-			"%s: inavlid FIR ID: %d\n", __func__, path_idx);
+-		ret = -EINVAL;
+-		goto exit;
+-	}
+-
+-	max_coeff_num = LPASS_CDC_RX_MACRO_FIR_COEFF_MAX;
+-
+-	for (grp_idx = 0; grp_idx < GRP_MAX; grp_idx++)
+-		all_coeff_written = all_coeff_written &&
+-				rx_priv->is_fir_coeff_written[path_idx][grp_idx];
+-
+-	if (all_coeff_written)
+-		goto exit;
+-
+-	ret = lpass_cdc_rx_macro_mclk_enable(rx_priv, 1, false);
+-	if (ret < 0) {
+-		dev_err_ratelimited(rx_priv->dev, "%s:rx_macro_mclk enable failed\n",
+-					__func__);
+-		goto exit;
+-	}
+-
++	struct regmap *regmap = dev_get_regmap(rx_priv->dev->parent, NULL);
++	unsigned int path_reg, data_reg, address_reg, ctl_reg;
++	unsigned int old_top, old_path, old_ctl, group, i, count;
++	bool all_written = true;
++	int ret, cleanup;
++
++	if (path_idx >= FIR_PATH_MAX || !regmap)
++		return -EINVAL;
++	if (!rx_priv->hifi_fir_clk || !rx_priv->is_fir_capable)
++		return 0;
++	if (rx_priv->fir_mclk_owned) {
++		ret = lpass_cdc_rx_macro_mclk_enable(rx_priv, false, false);
++		if (ret)
++			return ret;
++		rx_priv->fir_mclk_owned = false;
++	}
++	for (group = 0; group < GRP_MAX; group++) {
++		if (rx_priv->num_fir_coeff[path_idx][group] > LPASS_CDC_RX_MACRO_FIR_COEFF_MAX)
++			return -EINVAL;
++		all_written &= rx_priv->is_fir_coeff_written[path_idx][group];
++	}
++	if (all_written)
++		return 0;
++	if (path_idx == RX0_PATH) {
++		path_reg = LPASS_CDC_RX_RX0_RX_PATH_CTL;
++		data_reg = LPASS_CDC_RX_RX0_RX_FIR_COEFF_WDATA0;
++		address_reg = LPASS_CDC_RX_RX0_RX_FIR_COEFF_ADDR;
++		ctl_reg = LPASS_CDC_RX_RX0_RX_FIR_CTL;
++	} else {
++		path_reg = LPASS_CDC_RX_RX1_RX_PATH_CTL;
++		data_reg = LPASS_CDC_RX_RX1_RX_FIR_COEFF_WDATA0;
++		address_reg = LPASS_CDC_RX_RX1_RX_FIR_COEFF_ADDR;
++		ctl_reg = LPASS_CDC_RX_RX1_RX_FIR_CTL;
++	}
++	ret = lpass_cdc_rx_macro_mclk_enable(rx_priv, true, false);
++	if (ret)
++		return ret;
++	rx_priv->fir_mclk_owned = true;
+ 	ret = clk_prepare_enable(rx_priv->hifi_fir_clk);
+-	if (ret < 0) {
+-		dev_err_ratelimited(rx_priv->dev, "%s:hifi_fir_clk enable failed\n",
+-					__func__);
+-		goto disable_mclk_block;
+-	}
+-
+-	/* Enable HIFI_FEAT_EN bit */
+-	snd_soc_component_update_bits(component, LPASS_CDC_RX_TOP_TOP_CFG1, 0x01, 0x01);
+-	/* Enable FIR_CLK_EN, datapath reset */
+-	snd_soc_component_update_bits(component, path_ctl_addr, 0xC0, 0xC0);
+-	/* Enable FIR_CLK_EN, Release Reset */
+-	snd_soc_component_update_bits(component, path_ctl_addr, 0xC0, 0x80);
+-
+-	/* wait for data ram initialization after enabling clock  */
++	if (ret)
++		goto disable_mclk;
++	ret = regmap_read(regmap, LPASS_CDC_RX_TOP_TOP_CFG1, &old_top);
++	if (ret)
++		goto disable_hifi;
++	ret = regmap_read(regmap, path_reg, &old_path);
++	if (ret)
++		goto disable_hifi;
++	ret = regmap_read(regmap, ctl_reg, &old_ctl);
++	if (ret)
++		goto disable_hifi;
++	/* Reset can invalidate every group, including previously programmed ones. */
++	memset(rx_priv->is_fir_coeff_written[path_idx], 0,
++	       sizeof(rx_priv->is_fir_coeff_written[path_idx]));
++	ret = snd_soc_component_update_bits(component, LPASS_CDC_RX_TOP_TOP_CFG1, 1, 1);
++	if (ret < 0)
++		goto restore;
++	ret = snd_soc_component_update_bits(component, path_reg, 0xc0, 0xc0);
++	if (ret < 0)
++		goto restore;
++	ret = snd_soc_component_update_bits(component, path_reg, 0xc0, 0x80);
++	if (ret < 0)
++		goto restore;
+ 	usleep_range(10, 11);
+-
+-	for (grp_idx = 0; grp_idx < GRP_MAX; grp_idx++) {
+-		unsigned int coeff_idx_start = 0, array_idx = 0;
+-
+-		/* Skip if this group is written and no futher update */
+-		if (rx_priv->is_fir_coeff_written[path_idx][grp_idx])
+-			continue;
+-
+-		num_coeff_grp = rx_priv->num_fir_coeff[path_idx][grp_idx];
+-		if (num_coeff_grp > max_coeff_num) {
+-			dev_err_ratelimited(rx_priv->dev,
+-				"%s: inavlid number of RX_FIR coefficients:%d"
+-				" in path:%d, group:%d\n",
+-				__func__, num_coeff_grp, path_idx, grp_idx);
+-			ret = -EINVAL;
+-			goto disable_FIR;
++	for (group = 0; group < GRP_MAX; group++) {
++		u32 *coefficients = rx_priv->fir_coeff_array[path_idx][group];
++
++		count = rx_priv->num_fir_coeff[path_idx][group];
++		for (i = 0; i < count; i += 2) {
++			unsigned int address = (group * LPASS_CDC_RX_MACRO_FIR_COEFF_MAX + i) / 2;
++			u32 second = i + 1 < count ? coefficients[i + 1] : 0;
++
++			ret = lpass_cdc_rx_macro_write_fir_pair(component, data_reg,
++								address_reg, ctl_reg,
++								address, coefficients[i],
++								second);
++			if (ret)
++				goto restore;
+ 		}
+-		coeff_idx_start = grp_idx * max_coeff_num;
+-
+-		for (coeff_idx = coeff_idx_start;
+-			coeff_idx < coeff_idx_start + num_coeff_grp / 2 * 2;
+-			coeff_idx += 2) {
+-
+-			unsigned int addr_offset = coeff_idx / 2;
+-
+-			/* First coefficient in pair */
+-			u32 value = rx_priv->fir_coeff_array[path_idx][grp_idx][array_idx++];
+-			dev_dbg(rx_priv->dev, "%s: val of coeff_idx:%d, COEFF:0x%x\n",
+-						__func__, coeff_idx, value);
+-			snd_soc_component_write(component, wdata0_addr,
+-					value & 0xFF);
+-			snd_soc_component_write(component, wdata0_addr + 0x4,
+-					(value >> 8) & 0xFF);
+-			snd_soc_component_write(component, wdata0_addr + 0x8,
+-					(value >> 16) & 0xFF);
+-			snd_soc_component_write(component, wdata0_addr + 0xC,
+-					(value >> 24) & 0xFF);
+-
+-			/* Second coefficient in pair */
+-			value = rx_priv->fir_coeff_array[path_idx][grp_idx][array_idx++];
+-			dev_dbg(rx_priv->dev, "%s: val of coeff_idx:%d, COEFF:0x%x\n",
+-						__func__, coeff_idx, value);
+-			snd_soc_component_write(component, wdata0_addr + 0x10,
+-					value & 0xFF);
+-			snd_soc_component_write(component, wdata0_addr + 0x14,
+-					(value >> 8) & 0xFF);
+-			snd_soc_component_write(component, wdata0_addr + 0x18,
+-					(value >> 16) & 0xFF);
+-			snd_soc_component_write(component, wdata0_addr + 0x1C,
+-					(value >> 24) & 0xFF);
+-
+-			snd_soc_component_write(component, coeff_addr, addr_offset);
+-			snd_soc_component_update_bits(component, fir_ctl_addr, 0x02, 0x02);
+-			usleep_range(13, 15);
+-			snd_soc_component_update_bits(component, fir_ctl_addr, 0x02, 0x00);
+-		}
+-
+-		/* odd number of coefficients in this group, handle last one */
+-		if (num_coeff_grp % 2 != 0) {
+-			int addr_offset = coeff_idx / 2;
+-
+-			/* First coefficient in pair */
+-			u32 value = rx_priv->fir_coeff_array[path_idx][grp_idx][array_idx++];
+-			dev_dbg(rx_priv->dev, "%s: val of coeff_idx:%d, COEFF:0x%x\n",
+-						__func__, coeff_idx, value);
+-			snd_soc_component_write(component, wdata0_addr,
+-					value & 0xFF);
+-			snd_soc_component_write(component, wdata0_addr + 0x4,
+-					(value >> 8) & 0xFF);
+-			snd_soc_component_write(component, wdata0_addr + 0x8,
+-					(value >> 16) & 0xFF);
+-			snd_soc_component_write(component, wdata0_addr + 0xC,
+-					(value >> 24) & 0xFF);
+-
+-			/* Second coefficient in pair */
+-			dev_dbg(rx_priv->dev, "%s: val of coeff_idx:%d, COEFF:0x%x\n",
+-						__func__, coeff_idx, 0x0);
+-			snd_soc_component_write(component, wdata0_addr + 0x10, 0x0);
+-			snd_soc_component_write(component, wdata0_addr + 0x14, 0x0);
+-			snd_soc_component_write(component, wdata0_addr + 0x18, 0x0);
+-			snd_soc_component_write(component, wdata0_addr + 0x1C, 0x0);
+-
+-			snd_soc_component_write(component, coeff_addr, addr_offset);
+-			snd_soc_component_update_bits(component, fir_ctl_addr, 0x02, 0x02);
+-			usleep_range(13, 15);
+-			snd_soc_component_update_bits(component, fir_ctl_addr, 0x02, 0x00);
+-		}
+-
+-		rx_priv->is_fir_coeff_written[path_idx][grp_idx] = true;
+-		dev_dbg(component->dev, "%s: HIFI FIR Path:%d Group:%d coefficients"
+-					" updated.\n",
+-					__func__, path_idx, grp_idx);
+-	}
+-
+-disable_FIR:
+-	/* disable FIR_CLK_EN */
+-	snd_soc_component_update_bits(component, path_ctl_addr, 0x80, 0x00);
+-
+-	/* Disable HIFI_FEAT_EN bit */
+-	snd_soc_component_update_bits(component, LPASS_CDC_RX_TOP_TOP_CFG1, 0x01, 0x00);
+-
++	}
++	ret = 0;
++restore:
++	cleanup = regmap_update_bits(regmap, ctl_reg, 2, old_ctl);
++	if (cleanup && !ret)
++		ret = cleanup;
++	cleanup = regmap_update_bits(regmap, path_reg, 0xc0, old_path);
++	if (cleanup && !ret)
++		ret = cleanup;
++	cleanup = regmap_update_bits(regmap, LPASS_CDC_RX_TOP_TOP_CFG1, 1, old_top);
++	if (cleanup && !ret)
++		ret = cleanup;
++disable_hifi:
+ 	clk_disable_unprepare(rx_priv->hifi_fir_clk);
+-
+-disable_mclk_block:
+-	lpass_cdc_rx_macro_mclk_enable(rx_priv, 0, false);
+-
+-exit:
++disable_mclk:
++	cleanup = lpass_cdc_rx_macro_mclk_enable(rx_priv, false, false);
++	if (!cleanup)
++		rx_priv->fir_mclk_owned = false;
++	else if (!ret)
++		ret = cleanup;
++	if (!ret)
++		for (group = 0; group < GRP_MAX; group++)
++			rx_priv->is_fir_coeff_written[path_idx][group] = true;
+ 	return ret;
+ }
+ 
+ static int lpass_cdc_rx_macro_fir_audio_mixer_put(struct snd_kcontrol *kcontrol,
+ 					struct snd_ctl_elem_value *ucontrol)
+ {
+-	struct snd_soc_component *component =
+-				snd_soc_kcontrol_component(kcontrol);
++	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+ 	struct lpass_cdc_rx_macro_fir_filter_ctl *ctl =
+ 		(struct lpass_cdc_rx_macro_fir_filter_ctl *)kcontrol->private_value;
+-	unsigned int path_idx = ctl->path_idx;
+-	unsigned int grp_idx = ctl->grp_idx;
+-	u32 ele_size = 0, num_coeff_grp = 0;
+-	u32 coeff[LPASS_CDC_RX_MACRO_FIR_COEFF_ARRAY_MAX];
+-
+-	int ret = 0;
+-	unsigned int stored_total_num = 0;
+-	unsigned int grp_iidx = 0, coeff_idx = 0, array_idx = 0;
+ 	struct device *rx_dev = NULL;
+ 	struct lpass_cdc_rx_macro_priv *rx_priv = NULL;
+-
+-	if (!component) {
+-		pr_err_ratelimited("%s: component is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if (!lpass_cdc_rx_macro_get_data(component, &rx_dev, &rx_priv, __func__))
+-		return -EINVAL;
+-
+-	if (path_idx >= FIR_PATH_MAX) {
+-		dev_err_ratelimited(rx_priv->dev, "%s: path_idx:%d is invalid\n",
+-			__func__, path_idx);
+-		return -EINVAL;
+-	}
+-
+-	if (grp_idx >= GRP_MAX) {
+-		dev_err_ratelimited(rx_priv->dev, "%s: grp_idx:%d is invalid\n",
+-			__func__, grp_idx);
+-		return -EINVAL;
+-	}
+-
+-	if (!rx_priv->hifi_fir_clk) {
+-		dev_dbg(rx_priv->dev, "%s: Undefined HIFI FIR Clock.\n",
+-				__func__);
+-		return 0;
+-	}
+-
+-	if (!rx_priv->is_fir_capable) {
+-		dev_dbg(rx_priv->dev, "%s: HIFI FIR is not supported.\n",
+-				__func__);
+-		return 0;
+-	}
+-
+-	ele_size = sizeof(coeff[0]);
+-	memcpy(&coeff[0], ucontrol->value.bytes.data, ele_size);
+-	num_coeff_grp = coeff[0];
+-
+-	dev_dbg(rx_priv->dev, "%s: bytes.data: path:%d, grp:%d, num_coeff_grp:%d\n",
+-		__func__, path_idx, grp_idx, num_coeff_grp);
+-
+-	if (num_coeff_grp > LPASS_CDC_RX_MACRO_FIR_COEFF_MAX) {
+-		dev_err_ratelimited(rx_priv->dev,
+-			"%s: inavlid number of RX_FIR coefficients:%d in path:%d, group:%d\n",
+-				 __func__, num_coeff_grp, path_idx, grp_idx);
+-		rx_priv->num_fir_coeff[path_idx][grp_idx] = 0;
+-		return -EINVAL;
+-	} else {
+-		rx_priv->num_fir_coeff[path_idx][grp_idx] = num_coeff_grp;
+-	}
+-
+-	memcpy(&coeff[1], &(ucontrol->value.bytes.data[ele_size]), ele_size * num_coeff_grp);
+-
+-	/* Store the coefficients in FIR coeff array */
+-	array_idx = 1;
+-	for (coeff_idx = 0; coeff_idx < num_coeff_grp; coeff_idx++)
+-		rx_priv->fir_coeff_array[path_idx][grp_idx][coeff_idx] = coeff[array_idx++];
+-
+-	/* Clear the written flag so this group is ready to be written */
+-	rx_priv->is_fir_coeff_written[path_idx][grp_idx] = false;
+-
+-	stored_total_num = 0;
+-	for (grp_iidx = 0; grp_iidx < GRP_MAX; grp_iidx++) {
+-		stored_total_num += rx_priv->num_fir_coeff[path_idx][grp_iidx];
+-	}
+-
+-	/* Only write coeffs if total num matches, otherwise delay the write */
+-	if (rx_priv->fir_total_coeff_num[path_idx] == stored_total_num)
+-		ret = set_fir_filter_coeff(component, rx_priv, path_idx);
+-
++	u32 count;
++	unsigned int group, total = 0;
++	int ret = 0;
++
++	if (!lpass_cdc_rx_macro_get_data(component, &rx_dev, &rx_priv, __func__) ||
++	    ctl->path_idx >= FIR_PATH_MAX || ctl->grp_idx >= GRP_MAX)
++		return -EINVAL;
++	mutex_lock(&rx_priv->fir_lock);
++	if (!rx_priv->hifi_fir_clk || !rx_priv->is_fir_capable)
++		goto out;
++	memcpy(&count, ucontrol->value.bytes.data, sizeof(count));
++	if (count > LPASS_CDC_RX_MACRO_FIR_COEFF_MAX) {
++		ret = -EINVAL;
++		goto out;
++	}
++	memcpy(rx_priv->fir_coeff_array[ctl->path_idx][ctl->grp_idx],
++	       ucontrol->value.bytes.data + sizeof(count), count * sizeof(count));
++	rx_priv->num_fir_coeff[ctl->path_idx][ctl->grp_idx] = count;
++	rx_priv->is_fir_coeff_written[ctl->path_idx][ctl->grp_idx] = false;
++	for (group = 0; group < GRP_MAX; group++)
++		total += rx_priv->num_fir_coeff[ctl->path_idx][group];
++	if (rx_priv->fir_total_coeff_num[ctl->path_idx] == total)
++		ret = set_fir_filter_coeff(component, rx_priv, ctl->path_idx);
++out:
++	mutex_unlock(&rx_priv->fir_lock);
+ 	return ret;
+ }
+ 
+@@ -3661,7 +3613,9 @@
+ 		return -EINVAL;
+ 	}
+ 
++	mutex_lock(&rx_priv->fir_lock);
+ 	ucontrol->value.bytes.data[0] = rx_priv->fir_total_coeff_num[path_idx];
++	mutex_unlock(&rx_priv->fir_lock);
+ 
+ 	return 0;
+ }
+@@ -3669,46 +3623,24 @@
+ static int lpass_cdc_rx_macro_fir_coeff_num_put(struct snd_kcontrol *kcontrol,
+ 			       struct snd_ctl_elem_value *ucontrol)
+ {
+-	struct snd_soc_component *component =
+-				snd_soc_kcontrol_component(kcontrol);
+-	unsigned int path_idx = ((struct soc_mixer_control *)
+-				kcontrol->private_value)->shift;
+-	u8 fir_total_coeff_num = ucontrol->value.bytes.data[0];
++	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
++	unsigned int path_idx = ((struct soc_mixer_control *)kcontrol->private_value)->shift;
++	u8 count = ucontrol->value.bytes.data[0];
+ 	struct device *rx_dev = NULL;
+ 	struct lpass_cdc_rx_macro_priv *rx_priv = NULL;
+-	unsigned int ret = 0;
+-	unsigned int grp_idx, stored_total_num;
+-
+-	if (!component) {
+-		pr_err_ratelimited("%s: component is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if (!lpass_cdc_rx_macro_get_data(component, &rx_dev, &rx_priv, __func__))
+-		return -EINVAL;
+-
+-	if (fir_total_coeff_num > LPASS_CDC_RX_MACRO_FIR_COEFF_MAX * GRP_MAX) {
+-		dev_err_ratelimited(rx_priv->dev,
+-			"%s: inavlid total number of RX_FIR coefficients:%d"
+-			" in path:%d\n",
+-			__func__, fir_total_coeff_num, path_idx);
+-		rx_priv->fir_total_coeff_num[path_idx] = 0;
+-		return -EINVAL;
+-	} else {
+-		rx_priv->fir_total_coeff_num[path_idx] = fir_total_coeff_num;
+-	}
+-
+-	dev_dbg(component->dev, "%s: HIFI FIR Path:%d total coefficients"
+-				" number updated in private data: %d.\n",
+-				__func__, path_idx, fir_total_coeff_num);
+-
+-	stored_total_num = 0;
+-	for (grp_idx = 0; grp_idx < GRP_MAX; grp_idx++)
+-		stored_total_num += rx_priv->num_fir_coeff[path_idx][grp_idx];
+-
+-	if (fir_total_coeff_num == stored_total_num)
++	unsigned int group, total = 0;
++	int ret = 0;
++
++	if (!lpass_cdc_rx_macro_get_data(component, &rx_dev, &rx_priv, __func__) ||
++	    path_idx >= FIR_PATH_MAX || count > LPASS_CDC_RX_MACRO_FIR_COEFF_MAX * GRP_MAX)
++		return -EINVAL;
++	mutex_lock(&rx_priv->fir_lock);
++	rx_priv->fir_total_coeff_num[path_idx] = count;
++	for (group = 0; group < GRP_MAX; group++)
++		total += rx_priv->num_fir_coeff[path_idx][group];
++	if (count == total)
+ 		ret = set_fir_filter_coeff(component, rx_priv, path_idx);
+-
++	mutex_unlock(&rx_priv->fir_lock);
+ 	return ret;
+ }
+ 
+@@ -4365,114 +4297,139 @@
+ 
+ static int lpass_cdc_rx_macro_core_vote(void *handle, bool enable)
+ {
+-	int rc = 0;
+-	struct lpass_cdc_rx_macro_priv *rx_priv = (struct lpass_cdc_rx_macro_priv *) handle;
+-
+-	if (rx_priv == NULL) {
+-		pr_err_ratelimited("%s: rx priv data is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if (!rx_priv->pre_dev_up && enable) {
+-		pr_debug("%s: adsp is not up\n", __func__);
+-		return -EINVAL;
+-	}
+-
++	struct lpass_cdc_rx_macro_priv *rx_priv = handle;
++	int ret;
++
++	if (!rx_priv)
++		return -EINVAL;
+ 	if (enable) {
+-		pm_runtime_get_sync(rx_priv->dev);
++		if (!READ_ONCE(rx_priv->pre_dev_up))
++			return -ENOTSYNC;
++		ret = pm_runtime_resume_and_get(rx_priv->dev);
++		if (ret < 0)
++			return ret;
+ 		if (lpass_cdc_check_core_votes(rx_priv->dev))
+-			rc = 0;
+-		else
+-			rc = -ENOTSYNC;
++			return 0;
++		ret = -ENOTSYNC;
+ 	} else {
+-		pm_runtime_put_autosuspend(rx_priv->dev);
+-		pm_runtime_mark_last_busy(rx_priv->dev);
+-	}
+-	return rc;
++		ret = 0;
++	}
++	pm_runtime_mark_last_busy(rx_priv->dev);
++	pm_runtime_put_autosuspend(rx_priv->dev);
++	return ret;
+ }
+ 
+ static int rx_swrm_clock(void *handle, bool enable)
+ {
+-	struct lpass_cdc_rx_macro_priv *rx_priv = (struct lpass_cdc_rx_macro_priv *) handle;
+-	struct regmap *regmap = dev_get_regmap(rx_priv->dev->parent, NULL);
+-	int ret = 0;
+-
+-	if (regmap == NULL) {
+-		dev_err_ratelimited(rx_priv->dev, "%s: regmap is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
++	struct lpass_cdc_rx_macro_priv *rx_priv = handle;
++	struct regmap *regmap;
++	unsigned int old_control;
++	bool voted = false;
++	int ret = 0, cleanup;
++
++	if (!rx_priv)
++		return -EINVAL;
++	regmap = dev_get_regmap(rx_priv->dev->parent, NULL);
++	if (!regmap)
++		return -ENODEV;
+ 	mutex_lock(&rx_priv->swr_clk_lock);
+-
+-	dev_dbg(rx_priv->dev, "%s: swrm clock %s\n",
+-		__func__, (enable ? "enable" : "disable"));
+-	if (enable) {
+-		pm_runtime_get_sync(rx_priv->dev);
+-		if (rx_priv->swr_clk_users == 0) {
+-			ret = msm_cdc_pinctrl_select_active_state(
+-						rx_priv->rx_swr_gpio_p);
+-			if (ret < 0) {
+-				dev_err_ratelimited(rx_priv->dev,
+-					"%s: rx swr pinctrl enable failed\n",
+-					__func__);
+-				pm_runtime_mark_last_busy(rx_priv->dev);
+-				pm_runtime_put_autosuspend(rx_priv->dev);
+-				goto exit;
+-			}
+-			ret = lpass_cdc_rx_macro_mclk_enable(rx_priv, 1, true);
+-			if (ret < 0) {
+-				msm_cdc_pinctrl_select_sleep_state(
+-						rx_priv->rx_swr_gpio_p);
+-				dev_err_ratelimited(rx_priv->dev,
+-					"%s: rx request clock enable failed\n",
+-					__func__);
+-				pm_runtime_mark_last_busy(rx_priv->dev);
+-				pm_runtime_put_autosuspend(rx_priv->dev);
+-				goto exit;
+-			}
+-			if (rx_priv->reset_swr)
+-				regmap_update_bits(regmap,
+-					LPASS_CDC_RX_CLK_RST_CTRL_SWR_CONTROL,
+-					0x02, 0x02);
+-			regmap_update_bits(regmap,
+-				LPASS_CDC_RX_CLK_RST_CTRL_SWR_CONTROL,
+-				0x01, 0x01);
+-			if (rx_priv->reset_swr)
+-				regmap_update_bits(regmap,
+-					LPASS_CDC_RX_CLK_RST_CTRL_SWR_CONTROL,
+-					0x02, 0x00);
+-			rx_priv->reset_swr = false;
++	if (enable && rx_priv->swr_clk_users == INT_MAX) {
++		ret = -EOVERFLOW;
++		goto out;
++	}
++	if (enable && rx_priv->swr_clk_users && rx_priv->swr_enabled &&
++	    rx_priv->swr_mclk_owned && rx_priv->swr_pins_owned) {
++		rx_priv->swr_clk_users++;
++		goto out;
++	}
++	if (!enable && rx_priv->swr_clk_users > 1) {
++		rx_priv->swr_clk_users--;
++		goto out;
++	}
++	if (!enable && !rx_priv->swr_clk_users && !rx_priv->swr_enabled &&
++	    !rx_priv->swr_mclk_owned && !rx_priv->swr_pins_owned)
++		goto out;
++	if (enable || READ_ONCE(rx_priv->pre_dev_up)) {
++		ret = lpass_cdc_rx_macro_core_vote(rx_priv, true);
++		if (ret)
++			goto out;
++		voted = true;
++	}
++	if (!enable)
++		goto release;
++	if (!rx_priv->swr_pins_owned) {
++		ret = msm_cdc_pinctrl_select_active_state(rx_priv->rx_swr_gpio_p);
++		if (ret)
++			goto vote;
++		rx_priv->swr_pins_owned = true;
++	}
++	if (!rx_priv->swr_mclk_owned) {
++		ret = lpass_cdc_rx_macro_mclk_enable(rx_priv, true, true);
++		if (ret)
++			goto rollback;
++		rx_priv->swr_mclk_owned = true;
++	}
++	ret = regmap_read(regmap, LPASS_CDC_RX_CLK_RST_CTRL_SWR_CONTROL, &old_control);
++	if (ret)
++		goto rollback;
++	if (rx_priv->reset_swr)
++		ret = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_SWR_CONTROL, 2, 2);
++	if (!ret)
++		ret = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_SWR_CONTROL, 1, 1);
++	if (!ret && rx_priv->reset_swr)
++		ret = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_SWR_CONTROL, 2, 0);
++	if (ret) {
++		cleanup = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_SWR_CONTROL,
++					     3, old_control);
++		if (cleanup) {
++			rx_priv->swr_enabled = true;
++			dev_err(rx_priv->dev, "RX SWR register rollback failed: %d\n", cleanup);
+ 		}
+-		pm_runtime_mark_last_busy(rx_priv->dev);
+-		pm_runtime_put_autosuspend(rx_priv->dev);
+-		rx_priv->swr_clk_users++;
+-	} else {
+-		if (rx_priv->swr_clk_users <= 0) {
+-			dev_err_ratelimited(rx_priv->dev,
+-				"%s: rx swrm clock users already reset\n",
+-				__func__);
+-			rx_priv->swr_clk_users = 0;
+-			goto exit;
++		goto rollback;
++	}
++	rx_priv->swr_enabled = true;
++	rx_priv->reset_swr = false;
++	rx_priv->swr_clk_users++;
++	goto vote;
++rollback:
++	/* Failed first setup owns any resource whose release also failed. */
++	if (rx_priv->swr_clk_users)
++		goto vote;
++release:
++	if (rx_priv->swr_enabled) {
++		cleanup = regmap_update_bits(regmap, LPASS_CDC_RX_CLK_RST_CTRL_SWR_CONTROL,
++					     1, 0);
++		if (cleanup) {
++			if (!ret)
++				ret = cleanup;
++			goto vote;
+ 		}
++		rx_priv->swr_enabled = false;
++	}
++	if (rx_priv->swr_mclk_owned) {
++		cleanup = lpass_cdc_rx_macro_mclk_enable(rx_priv, false, true);
++		if (cleanup) {
++			if (!ret)
++				ret = cleanup;
++			goto vote;
++		}
++		rx_priv->swr_mclk_owned = false;
++	}
++	if (rx_priv->swr_pins_owned) {
++		cleanup = msm_cdc_pinctrl_select_sleep_state(rx_priv->rx_swr_gpio_p);
++		if (cleanup) {
++			if (!ret)
++				ret = cleanup;
++			goto vote;
++		}
++		rx_priv->swr_pins_owned = false;
++	}
++	if (!enable && rx_priv->swr_clk_users)
+ 		rx_priv->swr_clk_users--;
+-		if (rx_priv->swr_clk_users == 0) {
+-			regmap_update_bits(regmap,
+-				LPASS_CDC_RX_CLK_RST_CTRL_SWR_CONTROL,
+-				0x01, 0x00);
+-			lpass_cdc_rx_macro_mclk_enable(rx_priv, 0, true);
+-			ret = msm_cdc_pinctrl_select_sleep_state(
+-						rx_priv->rx_swr_gpio_p);
+-			if (ret < 0) {
+-				dev_err_ratelimited(rx_priv->dev,
+-					"%s: rx swr pinctrl disable failed\n",
+-					__func__);
+-				goto exit;
+-			}
+-		}
+-	}
+-	dev_dbg(rx_priv->dev, "%s: swrm clock users %d\n",
+-		__func__, rx_priv->swr_clk_users);
+-exit:
++vote:
++	if (voted)
++		lpass_cdc_rx_macro_core_vote(rx_priv, false);
++out:
+ 	mutex_unlock(&rx_priv->swr_clk_lock);
+ 	return ret;
+ }
+@@ -4489,18 +4446,17 @@
+ {
+ 	struct device *rx_dev = NULL;
+ 	struct lpass_cdc_rx_macro_priv *rx_priv = NULL;
+-
+-	if (!component) {
+-		pr_err_ratelimited("%s: component is NULL\n", __func__);
+-		return -EINVAL;
+-	}
++	int ret = 0;
+ 
+ 	if (!lpass_cdc_rx_macro_get_data(component, &rx_dev, &rx_priv, __func__))
+ 		return -EINVAL;
+-
+-	rx_priv->is_fir_capable = capable;
+-
+-	return 0;
++	mutex_lock(&rx_priv->fir_lock);
++	if (!capable)
++		ret = lpass_cdc_rx_macro_fir_set_enabled(component, rx_priv, false);
++	if (!ret)
++		rx_priv->is_fir_capable = capable;
++	mutex_unlock(&rx_priv->fir_lock);
++	return ret;
+ }
+ EXPORT_SYMBOL(lpass_cdc_rx_set_fir_capability);
+ 
+@@ -4514,6 +4470,35 @@
+ 	{LPASS_CDC_RX_RX2_RX_PATH_CFG3, 0x03, 0x02},
+ };
+ 
++static int lpass_cdc_rx_macro_component_cleanup(struct lpass_cdc_rx_macro_priv *rx_priv)
++{
++	int ret, status = 0;
++
++	mutex_lock(&rx_priv->fir_lock);
++	if (rx_priv->component) {
++		ret = lpass_cdc_rx_macro_fir_set_enabled(rx_priv->component, rx_priv, false);
++		if (ret)
++			status = ret;
++	}
++	if (rx_priv->fir_mclk_owned) {
++		ret = lpass_cdc_rx_macro_mclk_enable(rx_priv, false, false);
++		if (ret)
++			status = ret;
++		else
++			rx_priv->fir_mclk_owned = false;
++	}
++	memset(rx_priv->is_fir_coeff_written, 0, sizeof(rx_priv->is_fir_coeff_written));
++	mutex_unlock(&rx_priv->fir_lock);
++	if (rx_priv->dapm_mclk_enable) {
++		ret = lpass_cdc_rx_macro_mclk_enable(rx_priv, false, true);
++		if (ret)
++			status = ret;
++		else
++			rx_priv->dapm_mclk_enable = false;
++	}
++	return status;
++}
++
+ static int lpass_cdc_rx_macro_init(struct snd_soc_component *component)
+ {
+ 	struct snd_soc_dapm_context *dapm =
+@@ -4521,7 +4506,7 @@
+ 	int ret = 0;
+ 	struct device *rx_dev = NULL;
+ 	struct lpass_cdc_rx_macro_priv *rx_priv = NULL;
+-	int i;
++	unsigned int i;
+ 
+ 	rx_dev = lpass_cdc_get_device_ptr(component->dev, RX_MACRO);
+ 	if (!rx_dev) {
+@@ -4536,28 +4521,29 @@
+ 		return -EINVAL;
+ 	}
+ 
++	rx_priv->component = component;
+ 	ret = snd_soc_dapm_new_controls(dapm, lpass_cdc_rx_macro_dapm_widgets,
+ 					ARRAY_SIZE(lpass_cdc_rx_macro_dapm_widgets));
+ 	if (ret < 0) {
+ 		dev_err(rx_dev, "%s: failed to add controls\n", __func__);
+-		return ret;
++		goto cleanup;
+ 	}
+ 	ret = snd_soc_dapm_add_routes(dapm, rx_audio_map,
+ 					ARRAY_SIZE(rx_audio_map));
+ 	if (ret < 0) {
+ 		dev_err(rx_dev, "%s: failed to add routes\n", __func__);
+-		return ret;
++		goto cleanup;
+ 	}
+ 	ret = snd_soc_dapm_new_widgets(dapm->card);
+ 	if (ret < 0) {
+ 		dev_err(rx_dev, "%s: failed to add widgets\n", __func__);
+-		return ret;
++		goto cleanup;
+ 	}
+ 	ret = snd_soc_add_component_controls(component, lpass_cdc_rx_macro_snd_controls,
+ 				   ARRAY_SIZE(lpass_cdc_rx_macro_snd_controls));
+ 	if (ret < 0) {
+ 		dev_err(rx_dev, "%s: failed to add snd_ctls\n", __func__);
+-		return ret;
++		goto cleanup;
+ 	}
+ 	rx_priv->dev_up = true;
+ 	rx_priv->rx0_gain_val = 0;
+@@ -4576,136 +4562,129 @@
+ 	snd_soc_dapm_ignore_suspend(dapm, "RX_TX DEC1_INP");
+ 	snd_soc_dapm_ignore_suspend(dapm, "RX_TX DEC2_INP");
+ 	snd_soc_dapm_ignore_suspend(dapm, "RX_TX DEC3_INP");
+-	snd_soc_dapm_sync(dapm);
+-
+-	for (i = 0; i < ARRAY_SIZE(lpass_cdc_rx_macro_reg_init); i++)
+-		snd_soc_component_update_bits(component,
+-				lpass_cdc_rx_macro_reg_init[i].reg,
++	ret = snd_soc_dapm_sync(dapm);
++	if (ret < 0)
++		goto cleanup;
++
++	for (i = 0; i < ARRAY_SIZE(lpass_cdc_rx_macro_reg_init); i++) {
++		ret = snd_soc_component_update_bits(component,
++						    lpass_cdc_rx_macro_reg_init[i].reg,
+ 				lpass_cdc_rx_macro_reg_init[i].mask,
+ 				lpass_cdc_rx_macro_reg_init[i].val);
+-
+-	rx_priv->component = component;
+-
++		if (ret < 0)
++			goto cleanup;
++	}
+ 	return 0;
++cleanup:
++	if (lpass_cdc_rx_macro_component_cleanup(rx_priv))
++		dev_err(rx_dev, "RX component rollback retains clock resources\n");
++	rx_priv->component = NULL;
++	return ret;
+ }
+ 
+ static int lpass_cdc_rx_macro_deinit(struct snd_soc_component *component)
+ {
+ 	struct device *rx_dev = NULL;
+ 	struct lpass_cdc_rx_macro_priv *rx_priv = NULL;
++	int ret;
+ 
+ 	if (!lpass_cdc_rx_macro_get_data(component, &rx_dev, &rx_priv, __func__))
+ 		return -EINVAL;
+-
++	ret = lpass_cdc_rx_macro_component_cleanup(rx_priv);
+ 	rx_priv->component = NULL;
+-
+-	return 0;
+-}
+-
+-static void lpass_cdc_rx_macro_add_child_devices(struct work_struct *work)
+-{
+-	struct lpass_cdc_rx_macro_priv *rx_priv = NULL;
+-	struct platform_device *pdev = NULL;
+-	struct device_node *node = NULL;
+-	struct rx_swr_ctrl_data *swr_ctrl_data = NULL, *temp = NULL;
+-	int ret = 0;
+-	u16 count = 0, ctrl_num = 0;
+-	struct rx_swr_ctrl_platform_data *platdata = NULL;
+-	char plat_dev_name[RX_SWR_STRING_LEN] = "";
+-	bool rx_swr_master_node = false;
+-
+-	rx_priv = container_of(work, struct lpass_cdc_rx_macro_priv,
+-			     lpass_cdc_rx_macro_add_child_devices_work);
+-	if (!rx_priv) {
+-		pr_err("%s: Memory for rx_priv does not exist\n",
+-			__func__);
+-		return;
+-	}
+-
+-	if (!rx_priv->dev) {
+-		pr_err("%s: RX device does not exist\n", __func__);
+-		return;
+-	}
+-
+-	if(!rx_priv->dev->of_node) {
+-		dev_err(rx_priv->dev,
+-			"%s: DT node for RX dev does not exist\n", __func__);
+-		return;
+-	}
+-
+-	platdata = &rx_priv->swr_plat_data;
+-	rx_priv->child_count = 0;
++	if (ret)
++		dev_err(rx_dev, "RX component cleanup retains clock resources: %d\n", ret);
++	return ret;
++}
++
++static void lpass_cdc_rx_macro_remove_child_devices(struct lpass_cdc_rx_macro_priv *rx_priv)
++{
++	struct rx_swr_ctrl_data *controllers;
++	struct platform_device *child;
++
++	/* Drain notifications before unregistering any of their targets. */
++	mutex_lock(&rx_priv->swr_ctrl_lock);
++	controllers = rx_priv->swr_ctrl_data;
++	rx_priv->swr_ctrl_data = NULL;
++	mutex_unlock(&rx_priv->swr_ctrl_lock);
++	wait_event(rx_priv->swr_ctrl_wait, !READ_ONCE(rx_priv->swr_ctrl_users));
++	/* Include the final notifier's counter-update and unlock tail. */
++	mutex_lock(&rx_priv->swr_ctrl_lock);
++	mutex_unlock(&rx_priv->swr_ctrl_lock);
++	while (rx_priv->child_count) {
++		child = rx_priv->pdev_child_devices[--rx_priv->child_count];
++		rx_priv->pdev_child_devices[rx_priv->child_count] = NULL;
++		platform_device_unregister(child);
++	}
++	kfree(controllers);
++}
++
++static int lpass_cdc_rx_macro_add_child_devices(struct lpass_cdc_rx_macro_priv *rx_priv)
++{
++	struct rx_swr_ctrl_data *controllers;
++	struct platform_device *pdev;
++	struct device_node *node;
++	unsigned int count, ctrl_num = 0;
++	char name[RX_SWR_STRING_LEN];
++	bool swr_master;
++	int ret;
++
++	if (!rx_priv->dev->of_node)
++		return -EINVAL;
++	count = of_get_available_child_count(rx_priv->dev->of_node);
++	if (!count)
++		return 0;
++	if (count > LPASS_CDC_RX_MACRO_CHILD_DEVICES_MAX)
++		return -EOVERFLOW;
++	controllers = kcalloc(LPASS_CDC_RX_MACRO_CHILD_DEVICES_MAX,
++			      sizeof(*controllers), GFP_KERNEL);
++	if (!controllers)
++		return -ENOMEM;
+ 
+ 	for_each_available_child_of_node(rx_priv->dev->of_node, node) {
+-		rx_swr_master_node = false;
+-		if (strnstr(node->name, "rx_swr_master",
+-				strlen("rx_swr_master")) != NULL)
+-			rx_swr_master_node = true;
+-
+-		if(rx_swr_master_node)
+-			strscpy(plat_dev_name, "rx_swr_ctrl",
+-				(RX_SWR_STRING_LEN - 1));
+-		else
+-			strscpy(plat_dev_name, node->name,
+-				(RX_SWR_STRING_LEN - 1));
+-
+-		pdev = platform_device_alloc(plat_dev_name, -1);
++		if (rx_priv->child_count >= LPASS_CDC_RX_MACRO_CHILD_DEVICES_MAX) {
++			ret = -EOVERFLOW;
++			goto rollback;
++		}
++		swr_master = strnstr(node->name, "rx_swr_master", strlen("rx_swr_master"));
++		strscpy(name, swr_master ? "rx_swr_ctrl" : node->name,
++			RX_SWR_STRING_LEN - 1);
++		pdev = platform_device_alloc(name, -1);
+ 		if (!pdev) {
+-			dev_err(rx_priv->dev, "%s: pdev memory alloc failed\n",
+-				__func__);
+ 			ret = -ENOMEM;
+-			goto err;
++			goto rollback;
+ 		}
+ 		pdev->dev.parent = rx_priv->dev;
+-		pdev->dev.of_node = node;
+-
+-		if (rx_swr_master_node) {
+-			ret = platform_device_add_data(pdev, platdata,
+-						       sizeof(*platdata));
+-			if (ret) {
+-				dev_err(&pdev->dev,
+-					"%s: cannot add plat data ctrl:%d\n",
+-					__func__, ctrl_num);
+-				goto fail_pdev_add;
+-			}
+-
+-			temp = krealloc(swr_ctrl_data,
+-					(ctrl_num + 1) * sizeof(
+-					struct rx_swr_ctrl_data),
+-					GFP_KERNEL);
+-			if (!temp) {
+-				ret = -ENOMEM;
+-				goto fail_pdev_add;
+-			}
+-			swr_ctrl_data = temp;
+-			swr_ctrl_data[ctrl_num].rx_swr_pdev = pdev;
+-			ctrl_num++;
+-			dev_dbg(&pdev->dev,
+-				"%s: Adding soundwire ctrl device(s)\n",
+-				__func__);
+-			rx_priv->swr_ctrl_data = swr_ctrl_data;
++		pdev->dev.of_node = of_node_get(node);
++		if (swr_master) {
++			ret = platform_device_add_data(pdev, &rx_priv->swr_plat_data,
++						       sizeof(rx_priv->swr_plat_data));
++			if (ret)
++				goto put_device;
+ 		}
+-
+ 		ret = platform_device_add(pdev);
+-		if (ret) {
+-			dev_err(&pdev->dev,
+-				"%s: Cannot add platform device\n",
+-				__func__);
+-			goto fail_pdev_add;
+-		}
+-
+-		if (rx_priv->child_count < LPASS_CDC_RX_MACRO_CHILD_DEVICES_MAX)
+-			rx_priv->pdev_child_devices[
+-					rx_priv->child_count++] = pdev;
+-		else
+-			goto err;
+-	}
+-	return;
+-fail_pdev_add:
+-	for (count = 0; count < rx_priv->child_count; count++)
+-		platform_device_put(rx_priv->pdev_child_devices[count]);
+-err:
+-	return;
++		if (ret)
++			goto put_device;
++		rx_priv->pdev_child_devices[rx_priv->child_count++] = pdev;
++		if (swr_master)
++			controllers[ctrl_num++].rx_swr_pdev = pdev;
++	}
++	if (ctrl_num) {
++		mutex_lock(&rx_priv->swr_ctrl_lock);
++		rx_priv->swr_ctrl_data = controllers;
++		mutex_unlock(&rx_priv->swr_ctrl_lock);
++	} else {
++		kfree(controllers);
++	}
++	return 0;
++
++put_device:
++	platform_device_put(pdev);
++rollback:
++	of_node_put(node);
++	lpass_cdc_rx_macro_remove_child_devices(rx_priv);
++	kfree(controllers);
++	return ret;
+ }
+ 
+ static void lpass_cdc_rx_macro_init_ops(struct macro_ops *ops, char __iomem *rx_io_base)
+@@ -4718,6 +4697,88 @@
+ 	ops->num_dais = ARRAY_SIZE(lpass_cdc_rx_macro_dai);
+ 	ops->event_handler = lpass_cdc_rx_macro_event_handler;
+ 	ops->set_port_map = lpass_cdc_rx_macro_set_port_map;
++}
++
++static void lpass_cdc_rx_macro_put_gpio_node(void *data)
++{
++	of_node_put(data);
++}
++
++/* Called only after children and component callbacks have drained. */
++static void lpass_cdc_rx_macro_release_clocks(struct lpass_cdc_rx_macro_priv *rx_priv)
++{
++	int ret;
++	bool voted = false;
++
++	while (rx_priv->swr_clk_users || rx_priv->swr_mclk_owned ||
++	       rx_priv->swr_pins_owned || rx_priv->swr_enabled) {
++		ret = rx_swrm_clock(rx_priv, false);
++		if (ret) {
++			dev_err(rx_priv->dev, "RX SWR cleanup failed: %d\n", ret);
++			break;
++		}
++	}
++	/* FIR cleanup already attempted its stop sequence while ALSA was live. */
++	if (rx_priv->fir_clock_owned) {
++		dev_err(rx_priv->dev, "RX FIR stop failed; releasing its final clock vote\n");
++		clk_disable_unprepare(rx_priv->hifi_fir_clk);
++		rx_priv->fir_clock_owned = false;
++	}
++	if (!rx_priv->swr_mclk_owned) {
++		while (rx_priv->rx_mclk_users) {
++			ret = lpass_cdc_rx_macro_mclk_enable(rx_priv, false, false);
++			if (ret) {
++				dev_err(rx_priv->dev, "RX MCLK cleanup failed: %d\n", ret);
++				break;
++			}
++		}
++	}
++	mutex_lock(&rx_priv->mclk_lock);
++	if (!rx_priv->failed_clock_owned && !rx_priv->ssr_clock_owned)
++		goto out;
++	if (READ_ONCE(rx_priv->pre_dev_up)) {
++		ret = lpass_cdc_rx_macro_core_vote(rx_priv, true);
++		if (ret) {
++			dev_err(rx_priv->dev, "RX final core vote failed: %d\n", ret);
++			goto out;
++		}
++		voted = true;
++	}
++	if (rx_priv->failed_clock_owned) {
++		ret = lpass_cdc_clk_rsc_request_clock(rx_priv->dev,
++						      rx_priv->default_clk_id,
++						      rx_priv->clk_id, false);
++		if (!ret)
++			rx_priv->failed_clock_owned = false;
++		else
++			dev_err(rx_priv->dev, "RX final clock rollback failed: %d\n", ret);
++	}
++	if (rx_priv->ssr_clock_owned) {
++		ret = lpass_cdc_clk_rsc_request_clock(rx_priv->dev,
++						      rx_priv->default_clk_id, RX_CORE_CLK, false);
++		if (!ret)
++			rx_priv->ssr_clock_owned = false;
++		else
++			dev_err(rx_priv->dev, "RX final SSR clock release failed: %d\n", ret);
++	}
++	if (voted)
++		lpass_cdc_rx_macro_core_vote(rx_priv, false);
++out:
++	mutex_unlock(&rx_priv->mclk_lock);
++}
++
++static void lpass_cdc_rx_macro_disable_pm(struct lpass_cdc_rx_macro_priv *rx_priv)
++{
++	int ret;
++
++	pm_runtime_disable(rx_priv->dev);
++	if (!pm_runtime_status_suspended(rx_priv->dev)) {
++		ret = lpass_cdc_runtime_suspend(rx_priv->dev);
++		if (!ret)
++			pm_runtime_set_suspended(rx_priv->dev);
++		else
++			dev_err(rx_priv->dev, "RX final suspend failed: %d\n", ret);
++	}
+ }
+ 
+ static int lpass_cdc_rx_macro_probe(struct platform_device *pdev)
+@@ -4766,6 +4827,8 @@
+ 			__func__, "qcom,default-clk-id");
+ 		default_clk_id = RX_CORE_CLK;
+ 	}
++	if (default_clk_id >= MAX_CLK)
++		return -EINVAL;
+ 	if (of_find_property(pdev->dev.of_node, is_used_rx_swr_gpio_dt,
+ 			     NULL)) {
+ 		ret = of_property_read_u32(pdev->dev.of_node,
+@@ -4784,6 +4847,10 @@
+ 			__func__);
+ 		return -EINVAL;
+ 	}
++	ret = devm_add_action_or_reset(&pdev->dev, lpass_cdc_rx_macro_put_gpio_node,
++				       rx_priv->rx_swr_gpio_p);
++	if (ret)
++		return ret;
+ 	if (msm_cdc_pinctrl_get_state(rx_priv->rx_swr_gpio_p) < 0 &&
+ 		is_used_rx_swr_gpio) {
+ 		dev_err(&pdev->dev, "%s: failed to get swr pin state\n",
+@@ -4808,8 +4875,6 @@
+ 	}
+ 	rx_priv->rx_mclk_mode_muxsel = muxsel_io;
+ 	rx_priv->reset_swr = true;
+-	INIT_WORK(&rx_priv->lpass_cdc_rx_macro_add_child_devices_work,
+-		  lpass_cdc_rx_macro_add_child_devices);
+ 	rx_priv->swr_plat_data.handle = (void *) rx_priv;
+ 	rx_priv->swr_plat_data.read = NULL;
+ 	rx_priv->swr_plat_data.write = NULL;
+@@ -4826,6 +4891,8 @@
+ 	hifi_fir_clk = devm_clk_get(&pdev->dev, "rx_mclk2_2x_clk");
+ 	if (IS_ERR(hifi_fir_clk)) {
+ 		ret = PTR_ERR(hifi_fir_clk);
++		if (ret == -EPROBE_DEFER)
++			return ret;
+ 		dev_dbg(&pdev->dev, "%s: clk get %s failed %d\n",
+ 			__func__, "rx_mclk2_2x_clk", ret);
+ 		hifi_fir_clk = NULL;
+@@ -4835,51 +4902,61 @@
+ 	rx_priv->is_aux_hpf_on = 1;
+ 
+ 	dev_set_drvdata(&pdev->dev, rx_priv);
++	mutex_init(&rx_priv->fir_lock);
+ 	mutex_init(&rx_priv->mclk_lock);
+ 	mutex_init(&rx_priv->swr_clk_lock);
++	mutex_init(&rx_priv->swr_ctrl_lock);
++	init_waitqueue_head(&rx_priv->swr_ctrl_wait);
+ 	lpass_cdc_rx_macro_init_ops(&ops, rx_io_base);
+ 
++	pm_runtime_set_autosuspend_delay(&pdev->dev, AUTO_SUSPEND_DELAY);
++	pm_runtime_use_autosuspend(&pdev->dev);
++	ret = pm_runtime_set_suspended(&pdev->dev);
++	if (ret)
++		goto destroy_locks;
++	pm_suspend_ignore_children(&pdev->dev, true);
++	pm_runtime_enable(&pdev->dev);
+ 	ret = lpass_cdc_register_macro(&pdev->dev, RX_MACRO, &ops);
+ 	if (ret) {
+ 		dev_err(&pdev->dev,
+ 			"%s: register macro failed\n", __func__);
+-		goto err_reg_macro;
+-	}
+-	pm_runtime_set_autosuspend_delay(&pdev->dev, AUTO_SUSPEND_DELAY);
+-	pm_runtime_use_autosuspend(&pdev->dev);
+-	pm_runtime_set_suspended(&pdev->dev);
+-	pm_suspend_ignore_children(&pdev->dev, true);
+-	pm_runtime_enable(&pdev->dev);
+-	schedule_work(&rx_priv->lpass_cdc_rx_macro_add_child_devices_work);
++		goto disable_pm;
++	}
++	ret = lpass_cdc_rx_macro_add_child_devices(rx_priv);
++	if (ret) {
++		lpass_cdc_unregister_macro(&pdev->dev, RX_MACRO);
++		goto disable_pm;
++	}
+ 	return 0;
+ 
+-err_reg_macro:
++disable_pm:
++	lpass_cdc_rx_macro_release_clocks(rx_priv);
++	lpass_cdc_rx_macro_disable_pm(rx_priv);
++destroy_locks:
++	dev_set_drvdata(&pdev->dev, NULL);
++	mutex_destroy(&rx_priv->swr_ctrl_lock);
++	mutex_destroy(&rx_priv->fir_lock);
+ 	mutex_destroy(&rx_priv->mclk_lock);
+ 	mutex_destroy(&rx_priv->swr_clk_lock);
+ 	return ret;
+ }
+ 
+-static int lpass_cdc_rx_macro_remove(struct platform_device *pdev)
+-{
+-	struct lpass_cdc_rx_macro_priv *rx_priv = NULL;
+-	u16 count = 0;
+-
+-	rx_priv = dev_get_drvdata(&pdev->dev);
++static void lpass_cdc_rx_macro_remove(struct platform_device *pdev)
++{
++	struct lpass_cdc_rx_macro_priv *rx_priv = dev_get_drvdata(&pdev->dev);
+ 
+ 	if (!rx_priv)
+-		return -EINVAL;
+-
+-	for (count = 0; count < rx_priv->child_count &&
+-		count < LPASS_CDC_RX_MACRO_CHILD_DEVICES_MAX; count++)
+-		platform_device_unregister(rx_priv->pdev_child_devices[count]);
+-
+-	pm_runtime_disable(&pdev->dev);
+-	pm_runtime_set_suspended(&pdev->dev);
++		return;
++	lpass_cdc_rx_macro_remove_child_devices(rx_priv);
++	/* ALSA/macro cleanup can still use the live PM, clock and IO state. */
+ 	lpass_cdc_unregister_macro(&pdev->dev, RX_MACRO);
++	lpass_cdc_rx_macro_release_clocks(rx_priv);
++	lpass_cdc_rx_macro_disable_pm(rx_priv);
++	dev_set_drvdata(&pdev->dev, NULL);
++	mutex_destroy(&rx_priv->swr_ctrl_lock);
++	mutex_destroy(&rx_priv->fir_lock);
+ 	mutex_destroy(&rx_priv->mclk_lock);
+ 	mutex_destroy(&rx_priv->swr_clk_lock);
+-	kfree(rx_priv->swr_ctrl_data);
+-	return 0;
+ }
+ 
+ static const struct of_device_id lpass_cdc_rx_macro_dt_match[] = {

@@ -3682,6 +3682,17 @@ ddk_module(
     visibility = ["//visibility:public"],
 )
 
+ddk_module(
+    name = "lpass_cdc_rx_macro_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-rx-macro.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "lpass_cdc_rx_macro_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_lpasscdc_headers", ":audio_swrctrl_headers", ":audio_wcdcore_headers", ":audio_spf_headers", ":lpass_cdc_dlkm", ":wcd_core_dlkm", ":swr_ctrl_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3948,6 +3959,7 @@ kernel_module_group(
         ":qti_qmi_cdev",
         ":qti_qmi_sensor_v2",
         ":camera",
+        ":lpass_cdc_rx_macro_dlkm",
     ],
 )
 

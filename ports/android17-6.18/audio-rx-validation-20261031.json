@@ -1,0 +1,301 @@
+{
+  "status": "PASS",
+  "suites": {
+    "children": {
+      "status": "PASS",
+      "tests": {
+        "children": {
+          "setup_failure_sites": 8,
+          "child_count_cases": 5,
+          "non_swr_children": 1,
+          "notification_reentry": 1,
+          "notification_overflow": 1,
+          "withdrawal_reentry_races": 100
+        }
+      },
+      "negative_controls": [
+        {
+          "name": "registered_child_put",
+          "rejected": true,
+          "returncode": -6
+        },
+        {
+          "name": "missing_node_reference",
+          "rejected": true,
+          "returncode": -6
+        },
+        {
+          "name": "failed_device_leaked",
+          "rejected": true,
+          "returncode": -6
+        },
+        {
+          "name": "iterator_reference_leaked",
+          "rejected": true,
+          "returncode": -6
+        },
+        {
+          "name": "child_rollback_removed",
+          "rejected": true,
+          "returncode": -6
+        },
+        {
+          "name": "failed_controller_storage_leaked",
+          "rejected": true,
+          "returncode": -6
+        },
+        {
+          "name": "notification_error_lost",
+          "rejected": true,
+          "returncode": -6
+        },
+        {
+          "name": "notification_count_overflow",
+          "rejected": true,
+          "returncode": -6
+        },
+        {
+          "name": "target_withdrawal_missing",
+          "rejected": true,
+          "returncode": -6
+        },
+        {
+          "name": "notifications_not_drained",
+          "rejected": true,
+          "returncode": -6
+        }
+      ],
+      "source_sha256": {
+        "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-rx-macro.c": "532407e4c07634c9cbcba5377b8af4bea36fe035a87b21e3433f74f5f8ddd12c"
+      },
+      "harness_sha256": {
+        "audio_rx_children.c": "308a7070065571c854ce6302fd2cfdd6fa30fa9396f73989f84082602b1bf5c2"
+      },
+      "limits": "Actual child setup, cleanup and notification functions with pthread gates and mocked platform/OF/SoundWire services. Relevant private fields are modeled; full probe, ALSA, PM/clock, kernel and hardware behavior are not exercised by this suite."
+    },
+    "resources": {
+      "status": "PASS",
+      "tests": {
+        "cases": 63,
+        "mclk_enable_faults": 10,
+        "mclk_disable_faults": 9,
+        "swr_enable_faults": 17,
+        "swr_disable_faults": 13,
+        "concurrent_mclk_cycles": 800
+      },
+      "negative_controls": [
+        {
+          "name": "PM_failure_ignored",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_resources.c:71: lpass_cdc_check_core_votes: Assertion `d == &child && pm_refs > 0' failed.\n"
+        },
+        {
+          "name": "failed_core_vote_leaked",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_resources.c:201: main: Assertion `lpass_cdc_rx_macro_core_vote(&rx, true) < 0 && !pm_refs' failed.\n"
+        },
+        {
+          "name": "MCLK_count_overflow",
+          "rejected": true,
+          "diagnostic": "/tmp/rx-resources-_lsk1ysa/rx_resource_functions.inc:73:26: runtime error: signed integer overflow: 1 + 2147483647 cannot be represented in type 'int'\n"
+        },
+        {
+          "name": "MCLK_rollback_owner_lost",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_resources.c:236: main: Assertion `rx.failed_clock_owned && !rx.rx_mclk_users && total_clocks() == 1 && !fs_refs' failed.\n"
+        },
+        {
+          "name": "DAPM_duplicate_vote",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_resources.c:260: main: Assertion `rx.rx_mclk_users == 1 && notifications == 2' failed.\n"
+        },
+        {
+          "name": "SWR_vote_error_lost",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_resources.c:73: pm_runtime_mark_last_busy: Assertion `d == &child && pm_refs > 0' failed.\n"
+        },
+        {
+          "name": "SWR_count_overflow",
+          "rejected": true,
+          "diagnostic": "/tmp/rx-resources-_lsk1ysa/rx_resource_functions.inc:282:24: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'\n"
+        },
+        {
+          "name": "SWR_incomplete_disable_published",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_resources.c:281: main: Assertion `rx_swrm_clock(&rx, false) < 0 && !pm_refs && rx.swr_clk_users == 1' failed.\n"
+        }
+      ],
+      "source_sha256": {
+        "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-rx-macro.c": "532407e4c07634c9cbcba5377b8af4bea36fe035a87b21e3433f74f5f8ddd12c"
+      },
+      "header_sha256": {
+        "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-registers.h": "b234711022f5644d64bec5c597041121bde836f7c51e89824394c006ad591469",
+        "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.h": "7b1fb6d34a4442f3e65fb5db2fda6758648c7ab247e69a33da2289ea6086dbbc",
+        "qcom/opensource/audio-kernel/include/bindings/qcom,lpass-cdc-clk-rsc.h": "fd840453cf95e725cc130f59a9bc3cc1359cea1247f13d80fd0ab4a36dc28574"
+      },
+      "harness_sha256": {
+        "audio_rx_resources.c": "677c1afc0fea4232c44c4c54819ca77e109beb0eb29f92cf78a1eb4a9c939239"
+      },
+      "verifier_sha256": {
+        "verify_rx_resources.py": "9e74fbf6ebbfd9696dfe9355d513f94045fad58d07e08ef492681bf913a34d59"
+      },
+      "limits": "Actual core-vote, MCLK, DAPM and SWR clock functions and private layout; real source/provider constants, mocked PM/clock/pinctrl/regmap/ALSA services. Register failures can occur after a write. FS provider has a native void interface. No hardware, kernel PM or full ALSA/SSR validation."
+    },
+    "fir": {
+      "status": "PASS",
+      "tests": {
+        "cases": 183,
+        "enable_faults": 8,
+        "disable_faults": 5,
+        "coefficient_faults": 62,
+        "coefficient_count_cases": 202,
+        "ABI": "native 404-byte group, native one-byte total"
+      },
+      "negative_controls": [
+        {
+          "name": "repeated_enable_reprograms_filter",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_fir.c:40: main: Assertion `step == enable_steps' failed.\n"
+        },
+        {
+          "name": "FIR_clock_error_hidden",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_fir.c:48: main: Assertion `lpass_cdc_rx_macro_fir_filter_enable_put(&control, &value) < 0' failed.\n"
+        },
+        {
+          "name": "FIR_signed_error_hidden",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_fir.c:78: main: Assertion `rx.rx_mclk_users == (rx.fir_mclk_owned ? 1 : 0)' failed.\n"
+        },
+        {
+          "name": "group_bound_missing",
+          "rejected": true,
+          "diagnostic": "=================================================================\n==3934631==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x76a7a04f11f4 at pc 0x7aa7a3328d2d bp 0x7ffe182639b0 sp 0x7ffe18263158\nWRITE of size 404 at 0x76a7a04f11f4 thread T0\n    #0 0x7aa7a3328d2c in memcpy ../../../../src/libsanitizer/sanitizer_common/sanitizer_common_interceptors_memintrinsics.inc:117\n    #1 0x00000040b142 in lpass_cdc_rx_macro_fir_audio_mixer_get /tmp/rx-fir-ff7vo97z/rx_resource_functions.inc:559\n  "
+        },
+        {
+          "name": "temporary_clock_owner_lost",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_fir.c:78: main: Assertion `rx.rx_mclk_users == (rx.fir_mclk_owned ? 1 : 0)' failed.\n"
+        },
+        {
+          "name": "odd_coefficient_not_padded",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_fir.c:28: check_ram: Assertion `fir_ram[p][group * LPASS_CDC_RX_MACRO_FIR_COEFF_MAX + i] == rx.fir_coeff_array[p][group][i]' failed.\n"
+        },
+        {
+          "name": "reset_loses_prior_group",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_fir.c:28: check_ram: Assertion `fir_ram[p][group * LPASS_CDC_RX_MACRO_FIR_COEFF_MAX + i] == rx.fir_coeff_array[p][group][i]' failed.\n"
+        },
+        {
+          "name": "running_filter_not_restored",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_fir.c:91: main: Assertion `path == map.regs[LPASS_CDC_RX_RX1_RX_PATH_CTL / 4]' failed.\n"
+        }
+      ],
+      "source_sha256": {
+        "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-rx-macro.c": "532407e4c07634c9cbcba5377b8af4bea36fe035a87b21e3433f74f5f8ddd12c"
+      },
+      "header_sha256": {
+        "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-registers.h": "b234711022f5644d64bec5c597041121bde836f7c51e89824394c006ad591469",
+        "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.h": "7b1fb6d34a4442f3e65fb5db2fda6758648c7ab247e69a33da2289ea6086dbbc",
+        "qcom/opensource/audio-kernel/include/bindings/qcom,lpass-cdc-clk-rsc.h": "fd840453cf95e725cc130f59a9bc3cc1359cea1247f13d80fd0ab4a36dc28574"
+      },
+      "harness_sha256": {
+        "audio_rx_resources.c": "677c1afc0fea4232c44c4c54819ca77e109beb0eb29f92cf78a1eb4a9c939239",
+        "audio_rx_fir.c": "84f92c4292f13ee8609fa1ae51150addd7b59d6459852e3446c74f5081363de8"
+      },
+      "verifier_sha256": {
+        "verify_rx_fir.py": "9ab2d1a14ea457e51ce866b84595fdf94dea5d55d111925240e1f280be083b1e"
+      },
+      "limits": "Actual FIR controls/programming, PM and clock functions and private layout; real source/provider constants, mocked PM/clock/pinctrl/regmap/ALSA services. FIR RAM/pair writes are modeled and not hardware proof. Register failures may follow writes. FS has a void interface. No hardware, kernel PM or full ALSA/SSR validation."
+    },
+    "cleanup": {
+      "status": "PASS",
+      "tests": {
+        "cases": 40,
+        "init_failure_sites": 29,
+        "SSR_reset_failure_sites": 4
+      },
+      "negative_controls": [
+        {
+          "name": "component_publication_too_late",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_cleanup_services.h:11: snd_soc_dapm_new_controls: Assertion `rx.component == &component && pm_enabled' failed.\n"
+        },
+        {
+          "name": "initialization_error_not_unwound",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_cleanup.c:19: main: Assertion `!rx.component && !rx.dapm_mclk_enable && !rx.is_fir_filter_on' failed.\n"
+        },
+        {
+          "name": "FIR_vote_not_cleaned",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_resources.c:180: clean: Assertion `!pm_refs && !fs_refs && !total_clocks() && !pin_refs && !hifi_refs' failed.\n"
+        },
+        {
+          "name": "DAPM_vote_not_cleaned",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_resources.c:180: clean: Assertion `!pm_refs && !fs_refs && !total_clocks() && !pin_refs && !hifi_refs' failed.\n"
+        },
+        {
+          "name": "SSR_failed_release_owner_lost",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_cleanup.c:41: main: Assertion `rx.ssr_clock_owned == (i == 4)' failed.\n"
+        },
+        {
+          "name": "final_PM_state_faked",
+          "rejected": true,
+          "diagnostic": "resources: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/tests/audio_rx_cleanup.c:52: main: Assertion `!pm_enabled && !pm_suspended' failed.\n"
+        }
+      ],
+      "source_sha256": {
+        "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-rx-macro.c": "532407e4c07634c9cbcba5377b8af4bea36fe035a87b21e3433f74f5f8ddd12c"
+      },
+      "header_sha256": {
+        "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-registers.h": "b234711022f5644d64bec5c597041121bde836f7c51e89824394c006ad591469",
+        "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.h": "7b1fb6d34a4442f3e65fb5db2fda6758648c7ab247e69a33da2289ea6086dbbc",
+        "qcom/opensource/audio-kernel/include/bindings/qcom,lpass-cdc-clk-rsc.h": "fd840453cf95e725cc130f59a9bc3cc1359cea1247f13d80fd0ab4a36dc28574"
+      },
+      "harness_sha256": {
+        "audio_rx_resources.c": "677c1afc0fea4232c44c4c54819ca77e109beb0eb29f92cf78a1eb4a9c939239",
+        "audio_rx_cleanup_services.h": "3a85958360fd1b8df59d23497c9fb8ba46ffd875a4c6830052c33ab1bbb44b3a",
+        "audio_rx_cleanup.c": "eac7fdf86a7e4804bd81cbfc09cb411a4efa07f6003beab56560d4b216865d7c"
+      },
+      "verifier_sha256": {
+        "verify_rx_cleanup.py": "62d5f5b3a80f8b502fb793656ea26f32ec170a568379e44f9853b7628c3d672d"
+      },
+      "limits": "Actual component init/cleanup, clock/SSR teardown and final PM functions and private layout; real source/provider constants, mocked PM/clock/pinctrl/regmap/ALSA services. FIR RAM/pair writes are modeled and not hardware proof. Register failures may follow writes. FS has a void interface. ALSA init invokes modeled power callbacks; route tables are not executed. No hardware, kernel PM or full ALSA/SSR validation."
+    }
+  },
+  "negative_controls": 32,
+  "source_sha256": {
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-rx-macro.c": "532407e4c07634c9cbcba5377b8af4bea36fe035a87b21e3433f74f5f8ddd12c"
+  },
+  "provider_sha256": {
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-registers.h": "b234711022f5644d64bec5c597041121bde836f7c51e89824394c006ad591469",
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.h": "7b1fb6d34a4442f3e65fb5db2fda6758648c7ab247e69a33da2289ea6086dbbc",
+    "qcom/opensource/audio-kernel/include/bindings/qcom,lpass-cdc-clk-rsc.h": "fd840453cf95e725cc130f59a9bc3cc1359cea1247f13d80fd0ab4a36dc28574",
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-clk-rsc.h": "2fa8918c8a3aed99585be4b0aa2d73394872c746e8ba94d8239c554e938ad944",
+    "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-comp.h": "54f2ec5691f7b0844263c30d935cfbda263c8537d0c834ea41698ed2d426598f",
+    "qcom/opensource/audio-kernel/config/sunautoconf.h": "6c912bb500bfade92fbfdf9fc8ea28f9b58b304b5cefba1f12978f3566dbae0d",
+    "qcom/opensource/audio-kernel/include/asoc/msm-cdc-pinctrl.h": "5ed3b36ec782747347a8ead566af2c2f607f7ce9869dc8fbc0de37f139471bcb",
+    "qcom/opensource/audio-kernel/include/soc/swr-common.h": "5255dd2315331c183d0f0c2c762fa58ea7e650cf9e5739aebfbe7bad59e4ddc9",
+    "qcom/opensource/audio-kernel/include/soc/swr-wcd.h": "df656f95a549d13d4314668e8ac7b93c0abd03e859c8632a2a49827f931ff554"
+  },
+  "verifier_sha256": {
+    "verify_rx_fir.py": "9ab2d1a14ea457e51ce866b84595fdf94dea5d55d111925240e1f280be083b1e",
+    "verify_rx.py": "e15e79b8473ee45451f643dfe6e5df7ceef934b038e163a56c59de778a39c0b2",
+    "verify_rx_cleanup.py": "62d5f5b3a80f8b502fb793656ea26f32ec170a568379e44f9853b7628c3d672d",
+    "verify_rx_resources.py": "9e74fbf6ebbfd9696dfe9355d513f94045fad58d07e08ef492681bf913a34d59",
+    "verify_rx_all.py": "e750971b70f9d30628ceb0eb120faaf702ed36bde7ce5fd1eb99004da3287b6b"
+  },
+  "harness_sha256": {
+    "audio_rx_resources.c": "677c1afc0fea4232c44c4c54819ca77e109beb0eb29f92cf78a1eb4a9c939239",
+    "audio_rx_cleanup_services.h": "3a85958360fd1b8df59d23497c9fb8ba46ffd875a4c6830052c33ab1bbb44b3a",
+    "audio_rx_fir.c": "84f92c4292f13ee8609fa1ae51150addd7b59d6459852e3446c74f5081363de8",
+    "audio_rx_children.c": "308a7070065571c854ce6302fd2cfdd6fa30fa9396f73989f84082602b1bf5c2",
+    "audio_rx_cleanup.c": "eac7fdf86a7e4804bd81cbfc09cb411a4efa07f6003beab56560d4b216865d7c"
+  },
+  "limits": "Production functions and layouts with mocked services; no live kernel, firmware, audio or phone validation."
+}
