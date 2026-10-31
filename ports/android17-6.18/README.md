@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 211 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 213 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 211 platform `.ko` files, their symbol tables and DDK configurations.
+- 213 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 11,287
-imported symbol CRCs across all 211 modules.
+used. The current [validation report](validation-20261031.json) checks 11,459
+imported symbol CRCs across all 213 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1178,3 +1178,46 @@ and overlay checks pass with 1,084 existing vendor DTC warnings. ROM module buil
 coverage is 209/466 (44.8%), leaving 257 names to assess or port. This includes
 alternative hardware and measures built names. No flashable 6.18 ZIP or phone
 validation exists yet.
+
+
+## GPR transport and buck charging policy
+
+The native GPR module uses per-transport notifier ownership, referenced service
+lookups and complete 32-bit service IDs. Packet version, optional header and
+payload bounds are validated while the wire structures and export names remain
+unchanged. Removal withdraws transport access, drains callbacks and unregisters
+owned services; failed setup unwinds only acquired resources. The
+[integrated validator](audio-gpr-validation-20261031.json) passes seven
+ASan/UBSan groups with 149,548 cases. Seven original-source negative controls
+fail their targeted cases. DSP firmware and live kernel callbacks remain untested.
+
+The native buck policy creates its eleven voters and nine delayed works before
+publishing access. Failure and stop paths withdraw callbacks, drain queued work,
+release owned voters and quiesce charging. A bounded event FIFO keeps buck work
+outside the wired policy lock; controls preserve hardware errors and validate
+currents, booleans, battery readings and device-tree dimensions. The
+[integrated tests](buckstrategy-validation-20261031.json) cover 24 probe faults,
+3,554 current-bound cases, FIFO overflow/wrap, 200 lock cycles and 4,000 concurrent
+producer attempts, using the actual 35-property Onyx profile. Wireless-reverse
+coordination remains disabled until its real provider is ported. These tests use
+mocked hardware, providers and workqueues and do not establish charging safety
+or operation on the phone.
+
+The combined 213-module archive `artifacts/20261031T131938959744Z` passes
+11,459 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
+and overlay checks pass with 1,084 existing vendor DTC warnings. Built ROM module
+coverage is 211/466 (45.3%), leaving 255 names to assess or port, including
+alternative hardware. There is no flashable 6.18 ZIP or phone validation yet.
+
+## WLAN source selection
+
+The source pin is `6cc986b6e08783b8a14b155c1531c86959a1398a` from
+`Loukious/vendor_qcom_opensource_wlan`, with manifest upstream
+`onyx-v-oss-monitor-direct-konoha-abi`. It matches the ROM checkout and preserves
+the wide-channel/CFR selections and build compatibility changes. The
+[branch comparison](wlan-source-comparison-20261031.json) checks the user-selected
+`onyx-v-oss-monitor-direct` head `fa5f0aa8bb5a1353bcb767cd0c5e4716a59b69f9`:
+all seventeen imported WLAN support C/header files and ten core monitor/direct
+injection source files are identical. Other differences include configuration,
+regulatory source, build files and userspace Sigma tools. The main Wi-Fi driver
+and its monitor/injection operation on 6.18 remain separate pending work.

@@ -1,0 +1,2349 @@
+--- a/drivers/power/supply/mca/mca_strategy/strategy_charger/mca_strategy_buckchg.c
++++ b/drivers/power/supply/mca/mca_strategy/strategy_charger/mca_strategy_buckchg.c
+@@ -25,6 +25,8 @@
+ #include <linux/kernel.h>
+ #include <linux/device.h>
+ #include <linux/mutex.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
+ #include <linux/notifier.h>
+ #include <linux/platform_device.h>
+ #include <linux/of.h>
+@@ -61,6 +63,17 @@
+ #define MCA_LOG_TAG "mca_strategy_buckchg"
+ #endif
+ 
++static void strategy_buckchg_monitor_workfunc(struct work_struct *work);
++static void strategy_buckchg_sw_cv_workfunc(struct work_struct *work);
++static void strategy_buckchg_base_flip_sw_cv_workfunc(struct work_struct *work);
++static void strategy_wls_revchg_monitor_workfunc(struct work_struct *work);
++static void strategy_csd_pulse_process_workfunc(struct work_struct *work);
++static void strategy_source_status_monitor_workfunc(struct work_struct *work);
++static void strategy_buckchg_check_pdsecret_workfunc(struct work_struct *work);
++static void strategy_rerun_handle_pd_auth_workfunc(struct work_struct *work);
++static void
++strategy_buckchg_soc_limit_stepper_workfunc(struct work_struct *work);
++
+ #define CHECK_VBUS_9V_HIGH_TH 7600
+ #define CHECK_VBUS_5V_LOW_TH 6000
+ #define DEFAULT_PD_CURRENT_MA 500
+@@ -102,8 +115,9 @@
+ strategy_buckchg_check_charger_change(struct strategy_buckchg_dev *info);
+ static void strategy_buckchg_sw_cv_start(struct strategy_buckchg_dev *info);
+ static void strategy_buckchg_sw_cv_stop(struct strategy_buckchg_dev *info);
+-
+-static struct strategy_buckchg_dev *g_buckchg_info;
++static void
++strategy_buckchg_process_soc_limit_change(int value,
++					  struct strategy_buckchg_dev *info);
+ 
+ static int
+ strategy_class_buckchg_ops_set_input_volt(struct strategy_buckchg_dev *info,
+@@ -265,10 +279,10 @@
+ 		info->dev->of_node, "support-pmic-vterm-dynamics-adjust");
+ 	info->support_reverse_quick_charge = of_property_read_bool(
+ 		info->dev->of_node, "support_reverse_quick_charge");
+-	info->need_cp_to_pmic = of_property_read_bool(info->dev->of_node,
+-						      "need-cp-to-pmic");
+-	info->support_base_flip = of_property_read_bool(info->dev->of_node,
+-							"support-base-flip");
++	info->need_cp_to_pmic =
++		of_property_read_bool(info->dev->of_node, "need-cp-to-pmic");
++	info->support_base_flip =
++		of_property_read_bool(info->dev->of_node, "support-base-flip");
+ 	info->support_revchg_screenon = of_property_read_bool(
+ 		info->dev->of_node, "support_revchg_screenon");
+ 	info->support_charge_more = of_property_read_bool(
+@@ -329,7 +343,9 @@
+ 	struct strategy_buckchg_dev *info = data;
+ 
+ 	if (!data)
+-		return -1;
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
+ 	mca_log_err("%d\n", effective_result);
+ 	if (effective_result)
+ 		return strategy_class_buckchg_ops_set_chg(info, true);
+@@ -343,14 +359,12 @@
+ {
+ 	struct strategy_buckchg_dev *info = data;
+ 
+-	if (!data)
+-		return -1;
+-	mca_log_err("%d\n", effective_result);
+-	if (effective_result)
+-		mca_vote(info->input_limit_voter, "input_suspend", true, 0);
+-	else
+-		mca_vote(info->input_limit_voter, "input_suspend", false, 0);
+-	return 0;
++	if (!info)
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
++	return mca_vote(info->input_limit_voter, "input_suspend",
++			effective_result != 0, 0);
+ }
+ 
+ static int strategy_buckchg_input_voltage(struct mca_votable *votable,
+@@ -358,34 +372,32 @@
+ 					  const char *effective_client)
+ {
+ 	struct strategy_buckchg_dev *info = data;
+-
+-	if (!data)
+-		return -1;
+-
+-	info->hvdcp_allow_flag = effective_result;
+-
+-	if (info->hvdcp_allow_flag) {
+-		info->proc_data.voltage = STATEGY_CHARGE_VBUS_9V;
+-		mca_vote(info->input_limit_voter, "volt_limit",
+-			 info->buck_9v_in, info->buck_9v_in);
+-		mca_vote(info->charge_limit_voter, "volt_thermal_limit",
+-			 info->buck_9v_ich, info->buck_9v_ich);
+-	} else {
+-		info->proc_data.voltage = STATEGY_CHARGE_VBUS_5V;
+-		mca_vote(info->input_limit_voter, "volt_limit",
+-			 info->buck_5v_in, info->buck_5v_in);
+-		mca_vote(info->charge_limit_voter, "volt_thermal_limit",
+-			 info->buck_5v_ich, info->buck_5v_ich);
+-	}
+-
+-	return 0;
++	int input, current_value, ret, current_ret;
++
++	if (!info)
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
++	WRITE_ONCE(info->hvdcp_allow_flag, effective_result);
++	WRITE_ONCE(info->proc_data.voltage, effective_result ?
++						    STATEGY_CHARGE_VBUS_9V :
++						    STATEGY_CHARGE_VBUS_5V);
++	input = effective_result ? READ_ONCE(info->buck_9v_in) :
++				   READ_ONCE(info->buck_5v_in);
++	current_value = effective_result ? READ_ONCE(info->buck_9v_ich) :
++					   READ_ONCE(info->buck_5v_ich);
++	ret = mca_vote(info->input_limit_voter, "volt_limit", input != 0,
++		       input);
++	current_ret = mca_vote(info->charge_limit_voter, "volt_thermal_limit",
++			       current_value != 0, current_value);
++	return ret ? ret : current_ret;
+ }
+ 
+ static int
+ strategy_buckchg_process_multi_input_limit(struct strategy_buckchg_dev *info,
+ 					   int result)
+ {
+-	return 0;
++	return -EOPNOTSUPP;
+ }
+ 
+ static int strategy_buckchg_input_limit(struct mca_votable *votable, void *data,
+@@ -398,7 +410,11 @@
+ 	int result = effective_result;
+ 
+ 	if (!data)
+-		return -1;
++		return -EINVAL;
++	if (effective_result < 0 || effective_result > 30000)
++		return -ERANGE;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
+ 
+ 	ktime_get_boottime_ts64(&ts);
+ 	if ((u64)ts.tv_sec < 60) {
+@@ -425,7 +441,7 @@
+ strategy_buckchg_process_multi_charge_limit(struct strategy_buckchg_dev *info,
+ 					    int result)
+ {
+-	return 0;
++	return -EOPNOTSUPP;
+ }
+ 
+ static int strategy_buckchg_charge_limit(struct mca_votable *votable,
+@@ -435,7 +451,11 @@
+ 	struct strategy_buckchg_dev *info = data;
+ 
+ 	if (!data)
+-		return -1;
++		return -EINVAL;
++	if (effective_result < 0 || effective_result > 30000)
++		return -ERANGE;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
+ 
+ 	mca_log_err("set chg current %d\n", effective_result);
+ 
+@@ -451,7 +471,7 @@
+ strategy_buckchg_process_multi_vterm(struct strategy_buckchg_dev *info,
+ 				     int result)
+ {
+-	return 0;
++	return -EOPNOTSUPP;
+ }
+ 
+ #define BASE_FLIP_VTERM_TEMP_HOT_LOW 48
+@@ -474,11 +494,18 @@
+ 	int vterm = 0;
+ 	int batt_temp = 0;
+ 	int compensation;
++	int ret;
+ 
+ 	if (!data)
+-		return -1;
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
+ 
+ 	info = data;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
++	if (effective_result < 2000 || effective_result > 6000)
++		return -ERANGE;
+ 
+ 	if (info->support_base_flip) {
+ 		if (!strategy_class_fg_get_fastcharge())
+@@ -490,7 +517,9 @@
+ 				info->pmic_wls_fv_compensation;
+ 	}
+ 
+-	strategy_class_fg_ops_get_temperature(&batt_temp);
++	ret = strategy_class_fg_ops_get_temperature(&batt_temp);
++	if (ret)
++		return ret;
+ 	batt_temp = batt_temp / 10;
+ 
+ 	if (batt_temp < info->bat_temp_fv_comp_cold_th &&
+@@ -510,7 +539,9 @@
+ 		if (!strategy_class_fg_get_fastcharge()) {
+ 			vterm = effective_result;
+ 		} else {
+-			(void)strategy_class_fg_ops_get_temperature(&raw_temp);
++			ret = strategy_class_fg_ops_get_temperature(&raw_temp);
++			if (ret)
++				return ret;
+ 			if (raw_temp >= VTERM_DYN_TEMP_WARM &&
+ 			    raw_temp < VTERM_DYN_TEMP_MIDDLE)
+ 				vterm = info->pmic_fv_compensation +
+@@ -527,10 +558,11 @@
+ 
+ 	if (info->base_flip_same) {
+ 		if (!strategy_class_fg_get_fastcharge())
+-			compensation = (batt_temp >= BASE_FLIP_VTERM_TEMP_HOT_LOW &&
+-					batt_temp < BASE_FLIP_VTERM_TEMP_HOT_HIGH) ?
+-					       BASE_FLIP_VTERM_COMP_HOT :
+-					       0;
++			compensation =
++				(batt_temp >= BASE_FLIP_VTERM_TEMP_HOT_LOW &&
++				 batt_temp < BASE_FLIP_VTERM_TEMP_HOT_HIGH) ?
++					BASE_FLIP_VTERM_COMP_HOT :
++					0;
+ 		else if (batt_temp < BASE_FLIP_VTERM_TEMP_FFC_TH)
+ 			compensation = BASE_FLIP_VTERM_COMP_FFC;
+ 		else
+@@ -551,7 +583,7 @@
+ strategy_buckchg_process_multi_iterm(struct strategy_buckchg_dev *info,
+ 				     int result)
+ {
+-	return 0;
++	return -EOPNOTSUPP;
+ }
+ 
+ #define BASE_FLIP_PACK_ITERM_HIGH 1046
+@@ -617,7 +649,11 @@
+ 	struct strategy_buckchg_dev *info = data;
+ 
+ 	if (!data)
+-		return -1;
++		return -EINVAL;
++	if (effective_result < 0 || effective_result > 30000)
++		return -ERANGE;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
+ 
+ 	if (info->support_base_flip)
+ 		info->pmic_iterm_compensation =
+@@ -643,22 +679,15 @@
+ {
+ 	struct strategy_buckchg_dev *info = data;
+ 
+-	if (!data)
+-		return -1;
+-
+-	info->buck_5v_in = effective_result;
+-
+-	if (info->proc_data.voltage != STATEGY_CHARGE_VBUS_5V)
++	if (!info || effective_result < 0 || effective_result > 30000)
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
++	WRITE_ONCE(info->buck_5v_in, effective_result);
++	if (READ_ONCE(info->proc_data.voltage) != STATEGY_CHARGE_VBUS_5V)
+ 		return 0;
+-
+-	if (info->buck_5v_in)
+-		mca_vote(info->input_limit_voter, "volt_limit", true,
+-			 effective_result);
+-	else
+-		mca_vote(info->input_limit_voter, "volt_limit", false,
+-			 effective_result);
+-
+-	return 0;
++	return mca_vote(info->input_limit_voter, "volt_limit",
++			effective_result != 0, effective_result);
+ }
+ 
+ static int strategy_buckchg_set_5v_ichg(struct mca_votable *votable, void *data,
+@@ -667,22 +696,15 @@
+ {
+ 	struct strategy_buckchg_dev *info = data;
+ 
+-	if (!data)
+-		return -1;
+-
+-	info->buck_5v_ich = effective_result;
+-
+-	if (info->proc_data.voltage != STATEGY_CHARGE_VBUS_5V)
++	if (!info || effective_result < 0 || effective_result > 30000)
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
++	WRITE_ONCE(info->buck_5v_ich, effective_result);
++	if (READ_ONCE(info->proc_data.voltage) != STATEGY_CHARGE_VBUS_5V)
+ 		return 0;
+-
+-	if (info->buck_5v_ich)
+-		mca_vote(info->charge_limit_voter, "volt_thermal_limit", true,
+-			 effective_result);
+-	else
+-		mca_vote(info->charge_limit_voter, "volt_thermal_limit", false,
+-			 effective_result);
+-
+-	return 0;
++	return mca_vote(info->charge_limit_voter, "volt_thermal_limit",
++			effective_result != 0, effective_result);
+ }
+ 
+ static int strategy_buckchg_set_9v_input(struct mca_votable *votable,
+@@ -691,22 +713,15 @@
+ {
+ 	struct strategy_buckchg_dev *info = data;
+ 
+-	if (!data)
+-		return -1;
+-
+-	info->buck_9v_in = effective_result;
+-
+-	if (info->proc_data.voltage != STATEGY_CHARGE_VBUS_9V)
++	if (!info || effective_result < 0 || effective_result > 30000)
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
++	WRITE_ONCE(info->buck_9v_in, effective_result);
++	if (READ_ONCE(info->proc_data.voltage) != STATEGY_CHARGE_VBUS_9V)
+ 		return 0;
+-
+-	if (info->buck_9v_in)
+-		mca_vote(info->input_limit_voter, "volt_limit", true,
+-			 effective_result);
+-	else
+-		mca_vote(info->input_limit_voter, "volt_limit", false,
+-			 effective_result);
+-
+-	return 0;
++	return mca_vote(info->input_limit_voter, "volt_limit",
++			effective_result != 0, effective_result);
+ }
+ 
+ static int strategy_buckchg_set_9v_ichg(struct mca_votable *votable, void *data,
+@@ -715,104 +730,163 @@
+ {
+ 	struct strategy_buckchg_dev *info = data;
+ 
+-	if (!data)
+-		return -1;
+-
+-	info->buck_9v_ich = effective_result;
+-
+-	if (info->proc_data.voltage != STATEGY_CHARGE_VBUS_9V)
++	if (!info || effective_result < 0 || effective_result > 30000)
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
++	WRITE_ONCE(info->buck_9v_ich, effective_result);
++	if (READ_ONCE(info->proc_data.voltage) != STATEGY_CHARGE_VBUS_9V)
+ 		return 0;
+-
+-	if (info->buck_9v_ich)
+-		mca_vote(info->charge_limit_voter, "volt_thermal_limit", true,
+-			 effective_result);
+-	else
+-		mca_vote(info->charge_limit_voter, "volt_thermal_limit", false,
+-			 effective_result);
+-
+-	return 0;
++	return mca_vote(info->charge_limit_voter, "volt_thermal_limit",
++			effective_result != 0, effective_result);
++}
++
++static void strategy_buckchg_destroy_voters(struct strategy_buckchg_dev *info)
++{
++	if (!IS_ERR_OR_NULL(info->buck_9v_ich_voter))
++		mca_destroy_votable(info->buck_9v_ich_voter);
++	info->buck_9v_ich_voter = NULL;
++	if (!IS_ERR_OR_NULL(info->buck_9v_in_voter))
++		mca_destroy_votable(info->buck_9v_in_voter);
++	info->buck_9v_in_voter = NULL;
++	if (!IS_ERR_OR_NULL(info->buck_5v_ich_voter))
++		mca_destroy_votable(info->buck_5v_ich_voter);
++	info->buck_5v_ich_voter = NULL;
++	if (!IS_ERR_OR_NULL(info->buck_5v_in_voter))
++		mca_destroy_votable(info->buck_5v_in_voter);
++	info->buck_5v_in_voter = NULL;
++	if (!IS_ERR_OR_NULL(info->input_voltage_voter))
++		mca_destroy_votable(info->input_voltage_voter);
++	info->input_voltage_voter = NULL;
++	if (!IS_ERR_OR_NULL(info->input_suppend_voter))
++		mca_destroy_votable(info->input_suppend_voter);
++	info->input_suppend_voter = NULL;
++	if (!IS_ERR_OR_NULL(info->vterm_voter))
++		mca_destroy_votable(info->vterm_voter);
++	info->vterm_voter = NULL;
++	if (!IS_ERR_OR_NULL(info->iterm_voter))
++		mca_destroy_votable(info->iterm_voter);
++	info->iterm_voter = NULL;
++	if (!IS_ERR_OR_NULL(info->chg_enable_voter))
++		mca_destroy_votable(info->chg_enable_voter);
++	info->chg_enable_voter = NULL;
++	if (!IS_ERR_OR_NULL(info->charge_limit_voter))
++		mca_destroy_votable(info->charge_limit_voter);
++	info->charge_limit_voter = NULL;
++	if (!IS_ERR_OR_NULL(info->input_limit_voter))
++		mca_destroy_votable(info->input_limit_voter);
++	info->input_limit_voter = NULL;
+ }
+ 
+ static int strategy_buckchg_init_voter(struct strategy_buckchg_dev *info)
+ {
+-	/* buck charge */
++	int ret;
++
++	info->input_limit_voter = mca_create_votable(
++		"buck_input", MCA_VOTE_MIN, strategy_buckchg_input_limit,
++		STATEGY_INPUT_DEFAULT_VALUE, info);
++	if (IS_ERR(info->input_limit_voter)) {
++		ret = PTR_ERR(info->input_limit_voter);
++		info->input_limit_voter = NULL;
++		goto fail;
++	}
++	info->charge_limit_voter = mca_create_votable(
++		"buck_charge_curr", MCA_VOTE_MIN, strategy_buckchg_charge_limit,
++		STATEGY_CHARGE_CURRENT_DEFAULT_VALUE, info);
++	if (IS_ERR(info->charge_limit_voter)) {
++		ret = PTR_ERR(info->charge_limit_voter);
++		info->charge_limit_voter = NULL;
++		goto fail;
++	}
+ 	info->chg_enable_voter = mca_create_votable("chg_enable", MCA_VOTE_AND,
+ 						    strategy_buckchg_enable,
+ 						    STATEGY_CHARGE_DISENABLE,
+ 						    info);
+-	if (IS_ERR(info->chg_enable_voter))
+-		return -1;
+-	info->input_suppend_voter = mca_create_votable(
+-		"input_suspend", MCA_VOTE_OR, strategy_buckchg_input_suspend,
+-		STATEGY_CHARGE_INPUT_SUSPEND, info);
+-	if (IS_ERR(info->input_suppend_voter))
+-		return -1;
+-	info->input_limit_voter = mca_create_votable(
+-		"buck_input", MCA_VOTE_MIN, strategy_buckchg_input_limit,
+-		STATEGY_INPUT_DEFAULT_VALUE, info);
+-	if (IS_ERR(info->input_limit_voter))
+-		return -1;
+-	info->charge_limit_voter = mca_create_votable(
+-		"buck_charge_curr", MCA_VOTE_MIN, strategy_buckchg_charge_limit,
+-		STATEGY_CHARGE_CURRENT_DEFAULT_VALUE, info);
+-	if (IS_ERR(info->charge_limit_voter))
+-		return -1;
+-
+-	if (0)
+-		info->iterm_voter = mca_create_votable(
+-			"term_curr", MCA_VOTE_MIN, strategy_buckchg_set_iterm,
+-			STATEGY_ITERM_DEFAULT_VALUE, info);
+-	else
+-		info->iterm_voter = mca_create_votable(
+-			"term_curr", MCA_VOTE_MAX, strategy_buckchg_set_iterm,
+-			STATEGY_ITERM_DEFAULT_VALUE, info);
+-	if (IS_ERR(info->iterm_voter))
+-		return -1;
+-
++	if (IS_ERR(info->chg_enable_voter)) {
++		ret = PTR_ERR(info->chg_enable_voter);
++		info->chg_enable_voter = NULL;
++		goto fail;
++	}
++	info->iterm_voter = mca_create_votable("term_curr", MCA_VOTE_MAX,
++					       strategy_buckchg_set_iterm,
++					       STATEGY_ITERM_DEFAULT_VALUE,
++					       info);
++	if (IS_ERR(info->iterm_voter)) {
++		ret = PTR_ERR(info->iterm_voter);
++		info->iterm_voter = NULL;
++		goto fail;
++	}
+ 	info->vterm_voter = mca_create_votable("term_volt", MCA_VOTE_MIN,
+ 					       strategy_buckchg_set_vterm,
+ 					       STATEGY_VTERM_DEFAULT_VALUE,
+ 					       info);
+-	if (IS_ERR(info->vterm_voter))
+-		return -1;
+-
+-	/* wire voter */
++	if (IS_ERR(info->vterm_voter)) {
++		ret = PTR_ERR(info->vterm_voter);
++		info->vterm_voter = NULL;
++		goto fail;
++	}
++	info->input_suppend_voter = mca_create_votable(
++		"input_suspend", MCA_VOTE_OR, strategy_buckchg_input_suspend,
++		STATEGY_CHARGE_INPUT_SUSPEND, info);
++	if (IS_ERR(info->input_suppend_voter)) {
++		ret = PTR_ERR(info->input_suppend_voter);
++		info->input_suppend_voter = NULL;
++		goto fail;
++	}
+ 	info->input_voltage_voter =
+ 		mca_create_votable("input_voltage", MCA_VOTE_AND,
+ 				   strategy_buckchg_input_voltage, 1, info);
+-	if (IS_ERR(info->input_voltage_voter))
+-		return -1;
++	if (IS_ERR(info->input_voltage_voter)) {
++		ret = PTR_ERR(info->input_voltage_voter);
++		info->input_voltage_voter = NULL;
++		goto fail;
++	}
+ 	info->buck_5v_in_voter = mca_create_votable(
+ 		"buck_5v_in", MCA_VOTE_MIN, strategy_buckchg_set_5v_input,
+ 		STATEGY_INPUT_5V_DEFAULT_VALUE, info);
+-	if (IS_ERR(info->buck_5v_in_voter))
+-		return -1;
++	if (IS_ERR(info->buck_5v_in_voter)) {
++		ret = PTR_ERR(info->buck_5v_in_voter);
++		info->buck_5v_in_voter = NULL;
++		goto fail;
++	}
+ 	info->buck_5v_ich_voter = mca_create_votable(
+ 		"buck_5v_ich", MCA_VOTE_MIN, strategy_buckchg_set_5v_ichg,
+ 		STATEGY_CHARGE_CURRENT_DEFAULT_VALUE, info);
+-	if (IS_ERR(info->buck_5v_ich_voter))
+-		return -1;
++	if (IS_ERR(info->buck_5v_ich_voter)) {
++		ret = PTR_ERR(info->buck_5v_ich_voter);
++		info->buck_5v_ich_voter = NULL;
++		goto fail;
++	}
+ 	info->buck_9v_in_voter = mca_create_votable(
+ 		"buck_9v_in", MCA_VOTE_MIN, strategy_buckchg_set_9v_input,
+ 		STATEGY_INPUT_9V_DEFAULT_VALUE, info);
+-	if (IS_ERR(info->buck_9v_in_voter))
+-		return -1;
++	if (IS_ERR(info->buck_9v_in_voter)) {
++		ret = PTR_ERR(info->buck_9v_in_voter);
++		info->buck_9v_in_voter = NULL;
++		goto fail;
++	}
+ 	info->buck_9v_ich_voter = mca_create_votable(
+ 		"buck_9v_ich", MCA_VOTE_MIN, strategy_buckchg_set_9v_ichg,
+ 		STATEGY_CHARGE_CURRENT_DEFAULT_VALUE, info);
+-	if (IS_ERR(info->buck_9v_ich_voter))
+-		return -1;
+-
++	if (IS_ERR(info->buck_9v_ich_voter)) {
++		ret = PTR_ERR(info->buck_9v_ich_voter);
++		info->buck_9v_ich_voter = NULL;
++		goto fail;
++	}
+ 	return 0;
++fail:
++	strategy_buckchg_destroy_voters(info);
++	return ret;
+ }
+ 
+ static void strategy_buckchg_start_charging(struct strategy_buckchg_dev *info)
+ {
+ 	mca_log_info("start charging\n");
++	info->monitor_active = true;
+ 	strategy_buck_update_req_volt(info);
+-	cancel_delayed_work_sync(&info->monitor_work);
++	cancel_delayed_work(&info->monitor_work);
+ 	strategy_class_buckchg_ops_adc_enable(info, true);
+-	schedule_delayed_work(&info->monitor_work, 0);
++	queue_delayed_work(info->wq, &info->monitor_work, 0);
+ }
+ 
+ static void
+@@ -824,6 +898,10 @@
+ 	info->is_non_compliant_qc = false;
+ 	info->non_compliant_run_once = false;
+ 	info->vbat_ov_count = 0;
++	info->non_compliant_count = 0;
++	info->vbat_drop_count = 0;
++	info->last_jeita_vterm = 0;
++	info->soc_step = 0;
+ 	mca_vote(info->input_voltage_voter, "non_compliant_qc", false, 0);
+ 	mca_vote(info->input_limit_voter, "non_compliant_qc", false, 0);
+ 
+@@ -850,7 +928,7 @@
+ 	mca_vote(info->chg_enable_voter, "vbat_ovp", false,
+ 		 STATEGY_CHARGE_ENABLE);
+ 	mca_vote(info->input_voltage_voter, "lpd", false, 0);
+-	cancel_delayed_work_sync(&info->csd_pulse_process_work);
++	cancel_delayed_work(&info->csd_pulse_process_work);
+ 	mca_vote(info->charge_limit_voter, "csd_pulse", false, 0);
+ 	mca_vote(info->charge_limit_voter, "qc_done", false, 0);
+ 	mca_vote(info->chg_enable_voter, "csd_pulse", false,
+@@ -872,9 +950,10 @@
+ static void strategy_buckchg_stop_charging(struct strategy_buckchg_dev *info)
+ {
+ 	mca_log_info("stop charging\n");
+-	cancel_delayed_work_sync(&info->monitor_work);
+-	cancel_delayed_work_sync(&info->wls_revchg_monitor_work);
+-	cancel_delayed_work_sync(&info->check_pd_secret_work);
++	info->monitor_active = false;
++	cancel_delayed_work(&info->monitor_work);
++	cancel_delayed_work(&info->wls_revchg_monitor_work);
++	cancel_delayed_work(&info->check_pd_secret_work);
+ 	cancel_delayed_work(&info->sw_cv_work);
+ 	cancel_delayed_work(&info->base_flip_sw_cv_work);
+ 	strategy_buckchg_sw_cv_stop(info);
+@@ -911,7 +990,8 @@
+ 
+ 			platform_fg_ops_get_error_state(FG_IC_MASTER,
+ 							&master_err);
+-			platform_fg_ops_get_error_state(FG_IC_SLAVE, &slave_err);
++			platform_fg_ops_get_error_state(FG_IC_SLAVE,
++							&slave_err);
+ 			if (!master_err || slave_err)
+ 				platform_class_loadsw_set_lowpower_mode(
+ 					LOADSW_ROLE_MASTER, false);
+@@ -951,8 +1031,11 @@
+ 				       MCA_EVENT_USB_STS_CHANGE, NULL);
+ 	info->pdo_nums = info->pwr_cap.nums;
+ 
+-	if (info->pwr_cap.nums == 0) {
+-		mca_log_info(" pwr_cap.nums is null\n");
++	if (info->pwr_cap.nums <= 0 ||
++	    info->pwr_cap.nums > ARRAY_SIZE(info->pwr_cap.cap)) {
++		info->proc_data.is_pd_9v = false;
++		info->proc_data.curr_pd_pos = 0;
++		mca_log_info("invalid pwr_cap.nums\n");
+ 		return;
+ 	}
+ 
+@@ -1008,7 +1091,7 @@
+ 	}
+ 	stategy_buckchg_is_pdo_9v(info);
+ 	strategy_buck_update_req_volt(info);
+-	mod_delayed_work(system_wq, &info->monitor_work, 0);
++	mod_delayed_work(info->wq, &info->monitor_work, 0);
+ 
+ 	ktime_get_boottime_ts64(&ts);
+ 	mca_log_info("verify_process_end: %d\n", info->verify_process_end);
+@@ -1016,8 +1099,9 @@
+ 		if (!info->verify_process_end && (u64)ts.tv_sec > 60) {
+ 			mca_vote(info->input_limit_voter, "icl_limit", true,
+ 				 STATEGY_INPUT_DEFAULT_VALUE);
+-			schedule_delayed_work(&info->check_pd_secret_work,
+-					      msecs_to_jiffies(10000));
++			queue_delayed_work(info->wq,
++					   &info->check_pd_secret_work,
++					   msecs_to_jiffies(10000));
+ 		}
+ 	} else {
+ 		mca_vote(info->input_limit_voter, "icl_limit", false,
+@@ -1058,44 +1142,49 @@
+ 	}
+ }
+ 
+-static void
+-strategy_buckchg_process_soc_limit_change_more(int enable,
+-					       struct strategy_buckchg_dev *info)
+-{
+-	static u8 cur_step;
+-
++static void strategy_buckchg_process_soc_limit_change_more(
++	int enable, struct strategy_buckchg_dev *info)
++{
+ 	if (!enable) {
+-		cur_step = 0;
++		info->soc_step = 0;
+ 		mca_log_info("SOC limit released\n");
+ 		mca_vote(info->charge_limit_voter, "soc_limit", false, 0);
+ 		mca_vote(info->input_limit_voter, "soc_limit", false, 0);
+ 		mca_vote(info->chg_enable_voter, "soc_limit", false, 0);
+ 	} else {
+ 		mca_log_info("SOC limit triggered\n");
+-		if (cur_step < 10)
+-			cur_step++;
++		if (info->soc_step < 10)
++			info->soc_step++;
+ 		mca_vote(info->charge_limit_voter, "soc_limit", true,
+-			 soc_limit_stepper_table[cur_step].fcc_value);
++			 soc_limit_stepper_table[info->soc_step].fcc_value);
+ 		mca_vote(info->input_limit_voter, "soc_limit", true,
+-			 soc_limit_stepper_table[cur_step].icl_value);
+-		if (cur_step != 10) {
++			 soc_limit_stepper_table[info->soc_step].icl_value);
++		if (info->soc_step != 10) {
+ 			mca_vote(info->chg_enable_voter, "soc_limit", false, 0);
+-			schedule_delayed_work(&info->soc_limit_stepper_work,
+-					      msecs_to_jiffies(1000));
++			queue_delayed_work(info->wq,
++					   &info->soc_limit_stepper_work,
++					   msecs_to_jiffies(1000));
+ 		} else {
+ 			mca_vote(info->chg_enable_voter, "soc_limit", true, 0);
+ 		}
+ 	}
+-	mca_log_info("cur_step = %d\n", cur_step);
+-}
+-
+-static void strategy_buckchg_soc_limit_stepper_workfunc(struct work_struct *work)
++	mca_log_info("cur_step = %d\n", info->soc_step);
++}
++
++static void
++strategy_buckchg_soc_limit_stepper_workfunc_locked(struct work_struct *work)
+ {
+ 	struct strategy_buckchg_dev *info = container_of(
+ 		work, struct strategy_buckchg_dev, soc_limit_stepper_work.work);
+ 
+-	strategy_buckchg_process_soc_limit_change_more(info->soc_limit_more_enable,
+-						       info);
++	int enable = READ_ONCE(info->soc_limit_more_enable);
++
++	if (!info->proc_data.online)
++		enable = 0;
++	if (info->support_charge_more)
++		strategy_buckchg_process_soc_limit_change_more(enable, info);
++	else
++		strategy_buckchg_process_soc_limit_change(enable, info);
+ }
+ 
+ static void
+@@ -1115,7 +1204,7 @@
+ 		mca_vote(info->input_voltage_voter, "soc_limit", false, 0);
+ 		mca_log_info("SOC limit released, starting charge\n");
+ 		if (info->proc_data.online)
+-			mod_delayed_work(system_wq, &info->monitor_work, 0);
++			mod_delayed_work(info->wq, &info->monitor_work, 0);
+ 	}
+ }
+ 
+@@ -1133,7 +1222,7 @@
+ 
+ 	stategy_buckchg_is_pdo_9v(info);
+ 	strategy_buck_update_req_volt(info);
+-	mod_delayed_work(system_wq, &info->monitor_work, 0);
++	mod_delayed_work(info->wq, &info->monitor_work, 0);
+ }
+ 
+ static void
+@@ -1150,12 +1239,12 @@
+ 	if (value == 1 || value == 2) {
+ 		mca_vote(info->charge_limit_voter, "csd_pulse", true, 1500);
+ 		info->csd_flag = true;
+-		schedule_delayed_work(&info->csd_pulse_process_work,
+-				      msecs_to_jiffies(75000));
++		queue_delayed_work(info->wq, &info->csd_pulse_process_work,
++				   msecs_to_jiffies(75000));
+ 	} else if (value == 3) {
+ 		mca_vote(info->charge_limit_voter, "csd_pulse", true, 1500);
+ 	} else if (value == 0) {
+-		cancel_delayed_work_sync(&info->csd_pulse_process_work);
++		cancel_delayed_work(&info->csd_pulse_process_work);
+ 		mca_vote(info->charge_limit_voter, "csd_pulse", false, 0);
+ 		mca_vote(info->chg_enable_voter, "csd_pulse", false,
+ 			 STATEGY_CHARGE_DISENABLE);
+@@ -1177,8 +1266,8 @@
+ 	batt_temp /= 10;
+ 	protocol_class_pd_get_otg_plugin_status(TYPEC_PORT_0, &otg);
+ 	mca_log_info(
+-		"otg_present = %d, batt_temp = %d, thermal_board_temp =%d\n", otg,
+-		batt_temp, info->thermal_board_temp);
++		"otg_present = %d, batt_temp = %d, thermal_board_temp =%d\n",
++		otg, batt_temp, info->thermal_board_temp);
+ 	if (otg && !info->reverse_qc_gate0 && !info->reverse_qc_gate1 &&
+ 	    batt_temp >= 0 && info->thermal_board_temp <= 400) {
+ 		int soc_th = info->reverse_auth ? 29 : 69;
+@@ -1193,9 +1282,6 @@
+ strategy_buckchg_cp_revert_handler(int auth_pos,
+ 				   struct strategy_buckchg_dev *info)
+ {
+-	static int last_otg_present = 0;
+-	static int last_pos = 1;
+-	static int bq_revchg_switch_flag;
+ 	bool otg_present = false;
+ 	int otg_boost_disable;
+ 	int otg_enable;
+@@ -1231,25 +1317,25 @@
+ 	}
+ 
+ 	mca_log_err("otg_present: %d, last_otg_present: %d\n", otg_present,
+-		    last_otg_present);
++		    info->last_otg_present);
+ 	mca_log_err("cp_revert_auth: %d, pos: %d, last_pos: %d\n",
+-		    info->cp_revert_auth, pos, last_pos);
+-
+-	if (otg_present && last_pos == pos) {
++		    info->cp_revert_auth, pos, info->last_pos);
++
++	if (otg_present && info->last_pos == pos) {
+ 		mca_log_err("same handler, ignore...");
+ 		platform_class_cp_dump_register(CP_ROLE_MASTER);
+ 		return;
+ 	}
+ 
+-	if ((last_otg_present != otg_present) && otg_present)
+-		schedule_delayed_work(
+-			&info->source_status_monitor_work,
++	if ((info->last_otg_present != otg_present) && otg_present)
++		queue_delayed_work(
++			info->wq, &info->source_status_monitor_work,
+ 			msecs_to_jiffies(SOURCE_STATUS_MONITOR_INTERVAL));
+-	else if ((last_otg_present != otg_present) && !otg_present)
+-		cancel_delayed_work_sync(&info->source_status_monitor_work);
+-
+-	last_otg_present = otg_present;
+-	last_pos = pos;
++	else if ((info->last_otg_present != otg_present) && !otg_present)
++		cancel_delayed_work(&info->source_status_monitor_work);
++
++	info->last_otg_present = otg_present;
++	info->last_pos = pos;
+ 
+ 	if (otg_present) {
+ 		(void)platform_class_cp_get_chip_vendor(CP_ROLE_MASTER,
+@@ -1277,11 +1363,12 @@
+ 			mca_log_err("start revert 1_2 cp");
+ 
+ 			if (info->cp_chip_vendor == CP_CHIP_VENDOR_BQ25960 &&
+-			    !bq_revchg_switch_flag) {
+-				mca_log_err("entry bq25960 1_2 cp reverse mode");
++			    !info->bq_revchg_switch_flag) {
++				mca_log_err(
++					"entry bq25960 1_2 cp reverse mode");
+ 				platform_class_cp_set_cp_reverse_mode(
+ 					CP_ROLE_MASTER, true);
+-				bq_revchg_switch_flag = 1;
++				info->bq_revchg_switch_flag = 1;
+ 			} else {
+ 				// enable revert cp boost
+ 				platform_class_cp_enable_acdrv_manual(
+@@ -1325,11 +1412,11 @@
+ 					CP_ROLE_MASTER, false);
+ 			}
+ 			if (info->cp_chip_vendor == CP_CHIP_VENDOR_BQ25960 &&
+-			    bq_revchg_switch_flag == 1) {
++			    info->bq_revchg_switch_flag == 1) {
+ 				mca_log_err("exit bq25960 1_2 cp reverse mode");
+ 				platform_class_cp_set_cp_reverse_mode(
+ 					CP_ROLE_MASTER, false);
+-				bq_revchg_switch_flag = 0;
++				info->bq_revchg_switch_flag = 0;
+ 			}
+ 		} else {
+ 			platform_class_cp_set_charging_enable(CP_ROLE_MASTER,
+@@ -1349,14 +1436,15 @@
+ 							    otg_enable);
+ 
+ 		platform_class_cp_set_adjustadble_timeout(CP_ROLE_MASTER, 40);
+-		last_otg_present = false;
+-		last_pos = 1;
++		info->last_otg_present = false;
++		info->last_pos = 1;
+ 		info->source_boost_status = 0;
+ 	}
+ 	platform_class_cp_dump_register(CP_ROLE_MASTER);
+ }
+ 
+-static void strategy_buckchg_process_pmic_init_done(struct strategy_buckchg_dev *info)
++static void
++strategy_buckchg_process_pmic_init_done(struct strategy_buckchg_dev *info)
+ {
+ 	mca_log_info("deal with pmic_init_done\n");
+ 	mca_rerun_election(info->chg_enable_voter);
+@@ -1366,7 +1454,7 @@
+ 	mca_rerun_election(info->vterm_voter);
+ }
+ 
+-static int strategy_buckchg_process_event(int event, int value, void *data)
++static int strategy_buckchg_handle_event(int event, int value, void *data)
+ {
+ 	struct strategy_buckchg_dev *info = data;
+ 
+@@ -1401,7 +1489,7 @@
+ 		mca_vote(info->charge_limit_voter, "batt_auth", false,
+ 			 info->chg_batt_auth_failed);
+ 		if (info->proc_data.online)
+-			mod_delayed_work(system_wq, &info->monitor_work, 0);
++			mod_delayed_work(info->wq, &info->monitor_work, 0);
+ 		break;
+ 	case MCA_EVENT_CHARGE_ABNORMAL:
+ 		strategy_buckchg_stop_charging(info);
+@@ -1426,11 +1514,10 @@
+ 		mca_log_info("wireless revchg event %d\n", value);
+ 		info->wls_revchg_en = value;
+ 		if (value)
+-			strategy_wls_revchg_monitor_workfunc(
+-				&info->wls_revchg_monitor_work.work);
++			mod_delayed_work(info->wq,
++					 &info->wls_revchg_monitor_work, 0);
+ 		else {
+-			cancel_delayed_work_sync(
+-				&info->wls_revchg_monitor_work);
++			cancel_delayed_work(&info->wls_revchg_monitor_work);
+ 			strategy_buckchg_exit_wireless_revchg(info);
+ 		}
+ 		break;
+@@ -1527,36 +1614,36 @@
+ 
+ static int strategy_buckchg_get_status(int status, void *value, void *data)
+ {
+-	struct strategy_buckchg_dev *info = (struct strategy_buckchg_dev *)data;
+-	int *cur_val = (int *)value;
++	struct strategy_buckchg_dev *info = data;
++	int *cur_val = value;
+ 
+ 	if (!info || !value)
+-		return -1;
+-
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
++	/* Wired policy calls this while holding its own mutex. */
+ 	switch (status) {
+ 	case STRATEGY_STATUS_TYPE_ONLINE:
+-		platform_class_buckchg_ops_get_online(MAIN_BUCK_CHARGER,
+-						      cur_val);
+-		break;
++		return platform_class_buckchg_ops_get_online(MAIN_BUCK_CHARGER,
++							     cur_val);
+ 	case STRATEGY_STATUS_TYPE_CHARGING:
+-		*cur_val = info->strategy_init_done;
++		*cur_val = READ_ONCE(info->strategy_init_done);
+ 		break;
+ 	case STRATEGY_STATUS_TYPE_QC_TYPE:
+-		*cur_val = info->proc_data.qc_type;
++		*cur_val = READ_ONCE(info->proc_data.qc_type);
+ 		break;
+ 	case STRATEGY_STATUS_TYPE_ENABLE:
+ 		*cur_val = mca_get_effective_result(info->chg_enable_voter);
+ 		break;
+ 	case STRATEGY_STATUS_TYPE_VBUS:
+-		*cur_val = info->proc_data.vbus;
++		*cur_val = READ_ONCE(info->proc_data.vbus);
+ 		break;
+ 	case STRATEGY_STATUS_TYPE_IBUS:
+-		*cur_val = info->proc_data.ibus;
++		*cur_val = READ_ONCE(info->proc_data.ibus);
+ 		break;
+ 	default:
+-		return -1;
+-	}
+-
++		return -EINVAL;
++	}
+ 	return 0;
+ }
+ 
+@@ -1567,14 +1654,13 @@
+ #ifdef CONFIG_FACTORY_BUILD
+ 	return 0;
+ #endif
+-	static bool sdp_vote_completed = false;
+ 	int charge_boot_mode = mca_log_get_charge_boot_mode();
+ 
+ 	/* Release USB related vote if USB detach has been detected */
+ 	if (info->proc_data.real_type == XM_CHARGER_TYPE_UNKNOW) {
+ 		mca_vote(info->input_limit_voter, "usbicl", false, 0);
+ 		mca_vote(info->input_limit_voter, "sdpicl", false, 0);
+-		sdp_vote_completed = false;
++		info->sdp_vote_completed = false;
+ 		mca_log_info("charger have been removed reset vote");
+ 		return 0;
+ 	}
+@@ -1587,18 +1673,18 @@
+ 	}
+ 
+ 	if (info->proc_data.real_type == XM_CHARGER_TYPE_SDP &&
+-	    !sdp_vote_completed) {
++	    !info->sdp_vote_completed) {
+ 		mca_vote(info->input_limit_voter, "sdpicl", true,
+ 			 USB_ICL_UNENUMERATED);
+-		sdp_vote_completed = true;
++		info->sdp_vote_completed = true;
+ 		mca_log_info("sdp charger unenumerated");
+ 	}
+ 
+ 	if (info->proc_data.real_type != XM_CHARGER_TYPE_SDP &&
+-	    sdp_vote_completed) {
++	    info->sdp_vote_completed) {
+ 		mca_vote(info->input_limit_voter, "sdpicl", false, 0);
+ 		mca_vote(info->input_limit_voter, "usbicl", false, 0);
+-		sdp_vote_completed = false;
++		info->sdp_vote_completed = false;
+ 		mca_log_info("sdp charger error detected reset vote%d\n",
+ 			     info->proc_data.real_type);
+ 	}
+@@ -1616,7 +1702,6 @@
+ 	return 0;
+ #endif
+ 	int icl_ma = value / 1000; //ua switch ma;
+-	static bool usb_suspend = false;
+ 	int charge_boot_mode = mca_log_get_charge_boot_mode();
+ 
+ 	if (charge_boot_mode || !info->is_eu_model) {
+@@ -1661,17 +1746,18 @@
+ 	if (icl_ma == USB_SUSPEND_ICL_DEFAULT) {
+ 		mca_log_info("USB Input Suspended");
+ 		mca_vote(info->input_limit_voter, "usbicl", true, 0);
+-		usb_suspend = true;
++		info->usb_suspend = true;
+ 		mca_event_block_notify(MCA_EVENT_TYPE_CHARGER_CONNECT,
+-				       MCA_EVENT_USB_SUSPEND, &usb_suspend);
++				       MCA_EVENT_USB_SUSPEND,
++				       &info->usb_suspend);
+ 	} else if (icl_ma == USB_UNSUSPEND_ICL) {
+ 		mca_log_info("USB Input UnSuspended");
+ 		mca_vote(info->input_limit_voter, "usbicl", false, 0);
+-		if (usb_suspend) {
+-			usb_suspend = false;
++		if (info->usb_suspend) {
++			info->usb_suspend = false;
+ 			mca_event_block_notify(MCA_EVENT_TYPE_CHARGER_CONNECT,
+ 					       MCA_EVENT_USB_SUSPEND,
+-					       &usb_suspend);
++					       &info->usb_suspend);
+ 		}
+ 	} else {
+ 		if (info->proc_data.real_type == XM_CHARGER_TYPE_SDP &&
+@@ -1687,11 +1773,11 @@
+ 				     icl_ma);
+ 		}
+ 
+-		if (usb_suspend) {
+-			usb_suspend = false;
++		if (info->usb_suspend) {
++			info->usb_suspend = false;
+ 			mca_event_block_notify(MCA_EVENT_TYPE_CHARGER_CONNECT,
+ 					       MCA_EVENT_USB_SUSPEND,
+-					       &usb_suspend);
++					       &info->usb_suspend);
+ 		}
+ 	}
+ 
+@@ -1699,19 +1785,15 @@
+ }
+ static int strategy_buckchg_set_config(int config, int value, void *data)
+ {
+-	struct strategy_buckchg_dev *info = (struct strategy_buckchg_dev *)data;
+-
+-	if (!info)
+-		return -1;
+-
+-	switch (config) {
+-	case STRATEGY_CONFIG_INPUT_CURRENT_LIMIT:
+-		stategy_buckchg_set_usb_icl(value, info);
+-		break;
+-	default:
+-		break;
+-	}
+-	return 0;
++	struct strategy_buckchg_dev *info = data;
++
++	if (!info || config != STRATEGY_CONFIG_INPUT_CURRENT_LIMIT ||
++	    value < -1000 || value > 30000000)
++		return -EINVAL;
++	guard(mutex)(&info->policy_lock);
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
++	return stategy_buckchg_set_usb_icl(value, info);
+ }
+ 
+ static void strategy_buckchg_update_aicl_cfg(struct strategy_buckchg_dev *info)
+@@ -1811,7 +1893,7 @@
+ 		ibat_limit = info->chg_float;
+ 		break;
+ 	case XM_CHARGER_TYPE_DCP:
+-		if (info->smartchg_data.pwr_boost_state) {
++		if (READ_ONCE(info->smartchg_data.pwr_boost_state)) {
+ 			ibus_limit = CHARGE_DCP_INPUT_BOOST;
+ 			ibat_limit = CHARGE_DCP_CHARGE_BOOST;
+ 		} else {
+@@ -1861,7 +1943,8 @@
+ 
+ 				in_limit = info->in_pps;
+ 				if (batt_temp > PPS_FFC_BOOST_TEMP_THR ||
+-				    (batt_temp > PPS_FFC_BOOST_TEMP_OFFSET_THR &&
++				    (batt_temp >
++					     PPS_FFC_BOOST_TEMP_OFFSET_THR &&
+ 				     temp_offset_flag)) {
+ 					chg_limit = info->chg_pps;
+ 					if (info->proc_data.vbat >=
+@@ -2085,7 +2168,6 @@
+ {
+ 	int target_volt = info->proc_data.voltage;
+ 	int vbus = 0, ibus = 0;
+-	static int count;
+ 
+ 	if (target_volt == STATEGY_CHARGE_VBUS_5V || info->is_non_compliant_qc)
+ 		return;
+@@ -2102,20 +2184,24 @@
+ 		return;
+ 	}
+ 
+-	platform_class_buckchg_ops_get_bus_volt(MAIN_BUCK_CHARGER, &vbus);
++	if (platform_class_buckchg_ops_get_bus_volt(MAIN_BUCK_CHARGER, &vbus))
++		return;
+ 	vbus /= 1000;
+-	(void)platform_class_buckchg_ops_get_bus_curr(MAIN_BUCK_CHARGER,
+-						      &info->proc_data.ibus);
++	if (platform_class_buckchg_ops_get_bus_curr(MAIN_BUCK_CHARGER,
++						    &info->proc_data.ibus))
++		return;
+ 	ibus = info->proc_data.ibus / 1000;
+ 	if (target_volt == STATEGY_CHARGE_VBUS_9V &&
+ 	    vbus < VBUS_QC_VOL_THRESHOLD_LOW &&
+ 	    ibus < NON_COMPLIANT_QC_IBUS_THR_LOW) {
+ 		mca_log_info("target_volt: %d, vbus: %d\n", target_volt, vbus);
+-		count++;
+-	}
+-	if (count >= 3 && !info->is_non_compliant_qc) {
++		info->non_compliant_count++;
++	} else {
++		info->non_compliant_count = 0;
++	}
++	if (info->non_compliant_count >= 3 && !info->is_non_compliant_qc) {
+ 		info->is_non_compliant_qc = true;
+-		count = 0;
++		info->non_compliant_count = 0;
+ 		mca_log_err("qc is non-compliant, set request vol to 5V\n");
+ 		mca_vote(info->input_voltage_voter, "non_compliant_qc", true,
+ 			 0);
+@@ -2192,9 +2278,8 @@
+ 
+ #define FFC_START_BATT_SOC_THR 95
+ 
+-static void
+-strategy_buckchg_ffc_pps_boost(struct strategy_buckchg_dev *info, int iin,
+-			       int ichg)
++static void strategy_buckchg_ffc_pps_boost(struct strategy_buckchg_dev *info,
++					   int iin, int ichg)
+ {
+ 	struct mca_votable *ichg_voter;
+ 
+@@ -2240,7 +2325,8 @@
+ 					&info->proc_data.vbat);
+ 				if (iterm >= fcc &&
+ 				    (batt_temp > PPS_FFC_BOOST_TEMP_THR ||
+-				     (batt_temp > PPS_FFC_BOOST_TEMP_OFFSET_THR &&
++				     (batt_temp >
++					      PPS_FFC_BOOST_TEMP_OFFSET_THR &&
+ 				      temp_offset_flag))) {
+ 					in_limit = info->in_pps;
+ 					if (info->proc_data.vbat >=
+@@ -2290,8 +2376,9 @@
+ 			}
+ 
+ 			strategy_class_fg_set_fastcharge(false);
+-			mca_strategy_func_process(STRATEGY_FUNC_TYPE_QUICK_CHARGE,
+-						  MCA_EVENT_FCC_TOO_LOW, 0);
++			mca_strategy_func_process(
++				STRATEGY_FUNC_TYPE_QUICK_CHARGE,
++				MCA_EVENT_FCC_TOO_LOW, 0);
+ 			mca_log_info(
+ 				"buck charger disable fast charge mode by fcc too low\n");
+ 		}
+@@ -2374,7 +2461,6 @@
+ static void
+ strategy_buckchg_cp_to_pmic_decrease_vterm(struct strategy_buckchg_dev *info)
+ {
+-	static int last_jeita_vterm;
+ 	int first_termination = 0;
+ 	int taper_cp_to_pmic = 0;
+ 	int target_vterm = 0;
+@@ -2386,20 +2472,20 @@
+ 		return;
+ 
+ 	strategy_class_fg_get_first_termination(&first_termination);
+-	mca_strategy_func_get_status(STRATEGY_FUNC_TYPE_QUICK_CHARGE,
+-				     STRATEGY_STATUS_TYPE_QC_TAPER_DONE_NO_RETRY,
+-				     &taper_cp_to_pmic);
++	mca_strategy_func_get_status(
++		STRATEGY_FUNC_TYPE_QUICK_CHARGE,
++		STRATEGY_STATUS_TYPE_QC_TAPER_DONE_NO_RETRY, &taper_cp_to_pmic);
+ 
+ 	if (first_termination) {
+ 		mca_vote(info->vterm_voter, "cp_to_pmic", false,
+ 			 CP_TO_PMIC_DEFAULT_VTERM);
+ 	} else {
+ 		jeita_vterm = mca_get_client_vote(info->vterm_voter, "jeita");
+-		if (taper_cp_to_pmic && jeita_vterm != last_jeita_vterm) {
++		if (taper_cp_to_pmic && jeita_vterm != info->last_jeita_vterm) {
+ 			target_vterm = jeita_vterm - CP_TO_PMIC_VTERM_STEP;
+ 			mca_vote(info->vterm_voter, "cp_to_pmic", true,
+ 				 target_vterm);
+-			last_jeita_vterm = jeita_vterm;
++			info->last_jeita_vterm = jeita_vterm;
+ 		}
+ 	}
+ 
+@@ -2494,7 +2580,29 @@
+ 				  MCA_EVENT_DEBUG_CTRL_SOC_LIMIT, en);
+ }
+ 
+-static void strategy_buckchg_monitor_workfunc(struct work_struct *work)
++static int strategy_buckchg_read_battery(struct strategy_buckchg_dev *info)
++{
++	int voltage, current_value, temperature, ret;
++
++	ret = strategy_class_fg_ops_get_voltage(&voltage);
++	if (ret)
++		return ret;
++	ret = strategy_class_fg_ops_get_current(&current_value);
++	if (ret)
++		return ret;
++	ret = strategy_class_fg_ops_get_temperature(&temperature);
++	if (ret)
++		return ret;
++	if (voltage < 2000 || voltage > 10000 || current_value < -50000000 ||
++	    current_value > 50000000 || temperature < -500 ||
++	    temperature > 1000)
++		return -ERANGE;
++	info->proc_data.vbat = voltage;
++	info->proc_data.ibat = current_value;
++	return 0;
++}
++
++static void strategy_buckchg_monitor_workfunc_locked(struct work_struct *work)
+ {
+ 	struct strategy_buckchg_dev *info = container_of(
+ 		work, struct strategy_buckchg_dev, monitor_work.work);
+@@ -2505,9 +2613,14 @@
+ 	int vterm = 0;
+ 	int jeita_hot_result = 1;
+ 	bool vbat_drop_exit_flag = false;
+-	static int vbat_drop_cnt = 0;
+ 
+ 	system_soc = strategy_class_fg_ops_get_soc();
++	if (system_soc < 0 || system_soc > 100 ||
++	    strategy_buckchg_read_battery(info)) {
++		mca_vote(info->chg_enable_voter, "sensor_error", true, 0);
++		goto out;
++	}
++	mca_vote(info->chg_enable_voter, "sensor_error", false, 0);
+ 	strategy_buckchg_debug_soc_limit(info, system_soc);
+ 	strategy_buckchg_check_cp_i2c_err(info);
+ 	if (system_soc <= ALLOW_QUICK_CHG_SOC_THR) {
+@@ -2615,11 +2728,13 @@
+ 	strategy_buckchg_charge_abnormal_cold_or_hot_zone(info);
+ 
+ 	if (info->proc_data.vbat <= vterm - 20) {
+-		vbat_drop_cnt++;
+-	}
+-	vbat_drop_exit_flag = vbat_drop_cnt >= VBAT_DROP_COUNT_TH ? true :
+-								    false;
+-	vbat_drop_cnt = vbat_drop_exit_flag ? 0 : vbat_drop_cnt;
++		info->vbat_drop_count++;
++	} else {
++		info->vbat_drop_count = 0;
++	}
++	vbat_drop_exit_flag =
++		info->vbat_drop_count >= VBAT_DROP_COUNT_TH ? true : false;
++	info->vbat_drop_count = vbat_drop_exit_flag ? 0 : info->vbat_drop_count;
+ 
+ 	if (info->proc_data.chg_status == MCA_BUCK_CHG_STS_CHARGING &&
+ 	    !info->sw_cv_running && vterm >= STATEGY_CHARGE_VTERM_LOW_TH &&
+@@ -2638,14 +2753,16 @@
+ 		interval = CHARGE_MONITOR_WORK_FAST_INTERVAL;
+ 
+ out:
+-	schedule_delayed_work(&info->monitor_work, msecs_to_jiffies(interval));
+-}
+-
+-static void strategy_buckchg_base_flip_sw_cv_workfunc(struct work_struct *work)
++	queue_delayed_work(info->wq, &info->monitor_work,
++			   msecs_to_jiffies(interval));
++}
++
++static void
++strategy_buckchg_base_flip_sw_cv_workfunc_locked(struct work_struct *work)
+ {
+ 	struct strategy_buckchg_dev *info = container_of(
+ 		work, struct strategy_buckchg_dev, base_flip_sw_cv_work.work);
+-	static int sw_cv_volt_delta_map[][2] = { { 1000, 7 }, { 0, 2 } };
++	static const int sw_cv_volt_delta_map[][2] = { { 1000, 7 }, { 0, 2 } };
+ 	int interval = CHARGE_SW_CV_WORK_NORMAL_INTERVAL;
+ 	int vterm = mca_get_client_vote(info->vterm_voter, "jeita");
+ 	int iterm = info->parallel_iterm;
+@@ -2656,8 +2773,11 @@
+ 	bool fastcharge;
+ 	int i;
+ 
+-	strategy_class_fg_ops_get_voltage(&info->proc_data.vbat);
+-	strategy_class_fg_ops_get_current(&info->proc_data.ibat);
++	if (strategy_buckchg_read_battery(info)) {
++		queue_delayed_work(info->wq, &info->base_flip_sw_cv_work,
++			msecs_to_jiffies(CHARGE_SW_CV_WORK_NORMAL_INTERVAL));
++		return;
++	}
+ 	fastcharge = strategy_class_fg_get_fastcharge();
+ 	vbat = info->proc_data.vbat;
+ 	ibat_ua = -info->proc_data.ibat;
+@@ -2704,8 +2824,7 @@
+ 			else if (info->base_flip_same && !first_termination &&
+ 				 ibat - iterm > BASE_FLIP_SW_CV_ITERM_DELTA)
+ 				mca_vote(info->charge_limit_voter, "sw_cv",
+-					 true,
+-					 fcc - BASE_FLIP_SW_CV_FCC_STEP);
++					 true, fcc - BASE_FLIP_SW_CV_FCC_STEP);
+ 		}
+ 	}
+ 
+@@ -2720,8 +2839,8 @@
+ 			MAIN_BUCK_CHARGER, actual_vterm - steps * fv_step);
+ 	}
+ 
+-	mca_queue_delayed_work(&info->base_flip_sw_cv_work,
+-			       msecs_to_jiffies(interval));
++	queue_delayed_work(info->wq, &info->base_flip_sw_cv_work,
++			   msecs_to_jiffies(interval));
+ }
+ 
+ static void strategy_buckchg_sw_cv_start(struct strategy_buckchg_dev *info)
+@@ -2729,19 +2848,19 @@
+ 	info->sw_cv_running = true;
+ 	mca_vote(info->charge_limit_voter, "sw_cv", false, 0);
+ 	/* a base-flip pack runs the base-flip variant of the work */
+-	mca_queue_delayed_work(
+-		(info->support_base_flip || info->base_flip_same) ?
+-			&info->base_flip_sw_cv_work :
+-			&info->sw_cv_work,
+-		msecs_to_jiffies(CHARGE_SW_CV_WORK_FAST_INTERVAL));
++	queue_delayed_work(info->wq,
++			   (info->support_base_flip || info->base_flip_same) ?
++				   &info->base_flip_sw_cv_work :
++				   &info->sw_cv_work,
++			   msecs_to_jiffies(CHARGE_SW_CV_WORK_FAST_INTERVAL));
+ }
+ 
+ static void strategy_buckchg_sw_cv_stop(struct strategy_buckchg_dev *info)
+ {
+ 	mca_log_err("chg_status: %d, stop sw_cv_work\n",
+ 		    info->proc_data.chg_status);
+-	cancel_delayed_work_sync(&info->sw_cv_work);
+-	cancel_delayed_work_sync(&info->base_flip_sw_cv_work);
++	cancel_delayed_work(&info->sw_cv_work);
++	cancel_delayed_work(&info->base_flip_sw_cv_work);
+ 	mca_vote(info->charge_limit_voter, "sw_cv", false, 0);
+ 	info->sw_cv_running = false;
+ 	info->vbat_ov_count = 0;
+@@ -2768,11 +2887,11 @@
+ 	return 0;
+ }
+ 
+-static void strategy_buckchg_sw_cv_workfunc(struct work_struct *work)
++static void strategy_buckchg_sw_cv_workfunc_locked(struct work_struct *work)
+ {
+ 	struct strategy_buckchg_dev *info = container_of(
+ 		work, struct strategy_buckchg_dev, sw_cv_work.work);
+-	static int sw_cv_volt_delta_map[][2] = { { 1000, 4 }, { 0, 2 } };
++	static const int sw_cv_volt_delta_map[][2] = { { 1000, 4 }, { 0, 2 } };
+ 	int interval = CHARGE_SW_CV_WORK_NORMAL_INTERVAL;
+ 	int vbat, ibat;
+ 	int vterm = mca_get_effective_result(info->vterm_voter);
+@@ -2780,8 +2899,11 @@
+ 	int fcc = mca_get_effective_result(info->charge_limit_voter);
+ 	int volt_delta = sw_cv_volt_delta_map[0][1];
+ 
+-	strategy_class_fg_ops_get_voltage(&info->proc_data.vbat);
+-	strategy_class_fg_ops_get_current(&info->proc_data.ibat);
++	if (strategy_buckchg_read_battery(info)) {
++		queue_delayed_work(info->wq, &info->sw_cv_work,
++			msecs_to_jiffies(CHARGE_SW_CV_WORK_NORMAL_INTERVAL));
++		return;
++	}
+ 	vbat = info->proc_data.vbat;
+ 	ibat = -info->proc_data.ibat / 1000;
+ 	mca_log_info("vbat: %d, ibat: %d, vterm: %d, iterm: %d, fcc: %d\n",
+@@ -2833,9 +2955,11 @@
+ 				vterm + fv_comp - 2 * info->sw_cv_fv_step);
+ 	}
+ 
+-	mca_queue_delayed_work(&info->sw_cv_work, msecs_to_jiffies(interval));
+-}
+-
++	queue_delayed_work(info->wq, &info->sw_cv_work,
++			   msecs_to_jiffies(interval));
++}
++
++#if IS_ENABLED(CONFIG_MCA_BUCK_WLS_REV_COORDINATION)
+ static int
+ strategy_buckchg_wireless_revchg_msleep(int ms,
+ 					struct strategy_buckchg_dev *info)
+@@ -2856,6 +2980,8 @@
+ 	return 0;
+ }
+ 
++#endif
++
+ static void
+ strategy_buckchg_exit_wireless_revchg(struct strategy_buckchg_dev *info)
+ {
+@@ -2864,6 +2990,7 @@
+ 	info->rev_icl_for_qc2 = false;
+ }
+ 
++#if IS_ENABLED(CONFIG_MCA_BUCK_WLS_REV_COORDINATION)
+ static int
+ strategy_buckchg_process_wireless_revchg(struct strategy_buckchg_dev *info)
+ {
+@@ -2931,7 +3058,10 @@
+ 	return ret;
+ }
+ 
+-static void strategy_wls_revchg_monitor_workfunc(struct work_struct *work)
++#endif
++
++static void
++strategy_wls_revchg_monitor_workfunc_locked(struct work_struct *work)
+ {
+ 	struct strategy_buckchg_dev *info =
+ 		container_of(work, struct strategy_buckchg_dev,
+@@ -2939,8 +3069,13 @@
+ 	int ret = 0;
+ 	int interval = CHARGE_MONITOR_WORK_NORMAL_INTERVAL;
+ 
+-	if (!info->proc_data.wls_revchg_init_done)
++	if (!info->proc_data.wls_revchg_init_done) {
++#if IS_ENABLED(CONFIG_MCA_BUCK_WLS_REV_COORDINATION)
+ 		ret = strategy_buckchg_process_wireless_revchg(info);
++#else
++		ret = -EOPNOTSUPP;
++#endif
++	}
+ 	if (ret || !info->wls_revchg_en)
+ 		goto err_out;
+ 	else {
+@@ -2950,8 +3085,8 @@
+ 				 true, CHARGE_WLS_REVCHG_INPUT_QC2);
+ 			info->rev_icl_for_qc2 = true;
+ 		}
+-		schedule_delayed_work(&info->wls_revchg_monitor_work,
+-				      msecs_to_jiffies(interval));
++		queue_delayed_work(info->wq, &info->wls_revchg_monitor_work,
++				   msecs_to_jiffies(interval));
+ 		return;
+ 	}
+ 
+@@ -2959,7 +3094,7 @@
+ 	strategy_buckchg_exit_wireless_revchg(info);
+ }
+ 
+-static void strategy_csd_pulse_process_workfunc(struct work_struct *work)
++static void strategy_csd_pulse_process_workfunc_locked(struct work_struct *work)
+ {
+ 	struct strategy_buckchg_dev *info = container_of(
+ 		work, struct strategy_buckchg_dev, csd_pulse_process_work.work);
+@@ -2969,8 +3104,8 @@
+ 		mca_vote(info->chg_enable_voter, "csd_pulse", true,
+ 			 STATEGY_CHARGE_DISENABLE);
+ 		info->csd_flag = false;
+-		schedule_delayed_work(&info->csd_pulse_process_work,
+-				      msecs_to_jiffies(75000));
++		queue_delayed_work(info->wq, &info->csd_pulse_process_work,
++				   msecs_to_jiffies(75000));
+ 		mca_log_info("vote fcc and discharge logic\n");
+ 	} else {
+ 		mca_vote(info->chg_enable_voter, "csd_pulse", false,
+@@ -2981,7 +3116,8 @@
+ 	}
+ }
+ 
+-static void strategy_source_status_monitor_workfunc(struct work_struct *work)
++static void
++strategy_source_status_monitor_workfunc_locked(struct work_struct *work)
+ {
+ 	struct strategy_buckchg_dev *info =
+ 		container_of(work, struct strategy_buckchg_dev,
+@@ -3050,20 +3186,23 @@
+ 		} while (--retry);
+ 
+ 		n.event_len = snprintf(buf, sizeof(buf),
+-				       "POWER_SUPPLY_REVERSE_QUICK_CHARGE=%d", 2);
++				       "POWER_SUPPLY_REVERSE_QUICK_CHARGE=%d",
++				       2);
+ 		n.event = buf;
+ 		mca_event_report_uevent(&n);
+ 	}
+ 	info->source_boost_status = eligible;
+ 
+ reschedule:
+-	schedule_delayed_work(
+-		&info->source_status_monitor_work,
++	queue_delayed_work(
++		info->wq, &info->source_status_monitor_work,
+ 		msecs_to_jiffies((info->support_revchg_screenon && eligible) ?
+-					 250 : 1250));
+-}
+-
+-static void strategy_buckchg_check_pdsecret_workfunc(struct work_struct *work)
++					 250 :
++					 1250));
++}
++
++static void
++strategy_buckchg_check_pdsecret_workfunc_locked(struct work_struct *work)
+ {
+ 	struct strategy_buckchg_dev *info = container_of(
+ 		work, struct strategy_buckchg_dev, check_pd_secret_work.work);
+@@ -3084,9 +3223,12 @@
+ 	struct strategy_buckchg_dev *info =
+ 		container_of(nb, struct strategy_buckchg_dev, thermal_board_nb);
+ 
++	if (!val || READ_ONCE(info->stopping))
++		return NOTIFY_DONE;
+ 	switch (event) {
+ 	case MCA_EVENT_THERMAL_BOARD_TEMP_CHANGE:
+-		info->thermal_board_temp = *(int *)val / NTC_SCALE_BOARDTEMP;
++		WRITE_ONCE(info->thermal_board_temp,
++			   *(int *)val / NTC_SCALE_BOARDTEMP);
+ 		break;
+ 	default:
+ 		break;
+@@ -3101,43 +3243,49 @@
+ 		container_of(nb, struct strategy_buckchg_dev, panel_nb);
+ 	int screen_state;
+ 
+-	if (event != MCA_EVENT_PANEL_SCREEN_STATE_CHANGE)
++	if (!data || READ_ONCE(info->stopping) ||
++	    event != MCA_EVENT_PANEL_SCREEN_STATE_CHANGE)
+ 		return NOTIFY_DONE;
+ 
+ 	screen_state = *(int *)data;
+ 	mca_log_info("panel screen state: %d, last: %d\n", screen_state,
+ 		     info->screen_on);
+-	info->screen_on = (screen_state != 0);
++	WRITE_ONCE(info->screen_on, screen_state != 0);
+ 	return NOTIFY_DONE;
+ }
+ 
+ static void
+-strategy_rerun_handle_pd_auth_workfunc(struct work_struct *work)
++strategy_rerun_handle_pd_auth_workfunc_locked(struct work_struct *work)
+ {
+ 	mca_event_block_notify(MCA_EVENT_CHARGE_STATUS,
+ 			       MCA_EVENT_USB_STS_CHANGE, NULL);
+ 	mca_log_info("rerun handle pd auth\n");
+ }
+ 
++static int strategy_buckchg_check_user(struct strategy_buckchg_dev *info,
++				       const char *user)
++{
++	if (!info || !user || !*user || strnlen(user, 64) == 64)
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
++	return 0;
++}
++
+ static int strategy_buckchg_if_set_chg_cur(const char *user, char *value,
+ 					   void *data)
+ {
+-	int temp_value = 0;
+ 	struct strategy_buckchg_dev *info = data;
+-
+-	if (!user || !value || !data)
+-		return -1;
+-
+-	if (kstrtoint(value, 0, &temp_value))
+-		return -1;
+-
+-	if (temp_value)
+-		(void)mca_vote(info->charge_limit_voter, user, true,
+-			       temp_value);
+-	else
+-		(void)mca_vote(info->charge_limit_voter, user, false, 0);
+-
+-	return 0;
++	int current_value;
++	int ret = strategy_buckchg_check_user(info, user);
++
++	if (ret)
++		return ret;
++	if (!value || kstrtoint(value, 0, &current_value) ||
++	    current_value < 0 || current_value > 30000)
++		return -EINVAL;
++	return mca_vote(info->charge_limit_voter, user, current_value != 0,
++			current_value);
+ }
+ 
+ static int strategy_buckchg_if_get_chg_cur(char *buf, void *data)
+@@ -3147,7 +3295,9 @@
+ 	struct strategy_buckchg_dev *info = data;
+ 
+ 	if (!buf || !data)
+-		return -1;
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
+ 
+ 	client_str = mca_get_effective_client(info->charge_limit_voter);
+ 	if (!client_str)
+@@ -3167,39 +3317,27 @@
+ static int strategy_buckchg_if_set_input_cur(const char *user, char *value,
+ 					     void *data)
+ {
+-	int temp_value = 0;
+ 	struct strategy_buckchg_dev *info = data;
+-
+-	if (!user || !value || !data)
+-		return -1;
+-
+-	if (kstrtoint(value, 0, &temp_value))
+-		return -1;
+-
+-	if (strstr(user, MTBF_ACTIVE_TEST_CLIENT_SUBSTR) != NULL) {
+-		if (temp_value > MTBF_TEST_MAX_CURRENT_MA)
+-			temp_value = MTBF_TEST_MAX_CURRENT_MA;
+-	}
+-
+-	if (temp_value) {
+-		if (strstr(user, MTBF_CLIENT_SUBSTR_UPPER) != NULL ||
+-		    strstr(user, MTBF_CLIENT_SUBSTR_LOW) != NULL ||
+-		    strstr(user, MTBF_ACTIVE_TEST_CLIENT_SUBSTR) != NULL)
+-			mca_vote_override(info->input_limit_voter, user, true,
+-					  temp_value);
+-		else
+-			(void)mca_vote(info->input_limit_voter, user, true,
+-				       temp_value);
+-	} else {
+-		if (strstr(user, MTBF_CLIENT_SUBSTR_UPPER) != NULL ||
+-		    strstr(user, MTBF_CLIENT_SUBSTR_LOW) != NULL)
+-			mca_vote_override(info->input_limit_voter, user, false,
+-					  0);
+-		else
+-			(void)mca_vote(info->input_limit_voter, user, false, 0);
+-	}
+-
+-	return 0;
++	int current_value;
++	bool override;
++	int ret = strategy_buckchg_check_user(info, user);
++
++	if (ret)
++		return ret;
++	if (!value || kstrtoint(value, 0, &current_value) ||
++	    current_value < 0 || current_value > 30000)
++		return -EINVAL;
++	override = strstr(user, MTBF_CLIENT_SUBSTR_UPPER) ||
++		   strstr(user, MTBF_CLIENT_SUBSTR_LOW) ||
++		   strstr(user, MTBF_ACTIVE_TEST_CLIENT_SUBSTR);
++	if (strstr(user, MTBF_ACTIVE_TEST_CLIENT_SUBSTR))
++		current_value = min(current_value, MTBF_TEST_MAX_CURRENT_MA);
++	/* Releasing a shell vote must release the same override it enabled. */
++	if (override)
++		return mca_vote_override(info->input_limit_voter, user,
++					 current_value != 0, current_value);
++	return mca_vote(info->input_limit_voter, user, current_value != 0,
++			current_value);
+ }
+ 
+ static int strategy_buckchg_if_get_input_cur(char *buf, void *data)
+@@ -3209,7 +3347,9 @@
+ 	struct strategy_buckchg_dev *info = data;
+ 
+ 	if (!buf || !data)
+-		return -1;
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
+ 
+ 	client_str = mca_get_effective_client(info->input_limit_voter);
+ 	if (!client_str)
+@@ -3226,19 +3366,15 @@
+ 					  void *data)
+ {
+ 	struct strategy_buckchg_dev *info = data;
+-
+-	if (!user || !data)
+-		return -1;
+-
+-	if (value) {
++	int ret = strategy_buckchg_check_user(info, user);
++
++	if (ret)
++		return ret;
++	if (value > 1)
++		return -EINVAL;
++	if (value)
+ 		strategy_buckchg_clear_pmic_temp_term(info);
+-		(void)mca_vote(info->chg_enable_voter, user, true,
+-			       STATEGY_CHARGE_ENABLE);
+-	} else
+-		(void)mca_vote(info->chg_enable_voter, user, true,
+-			       STATEGY_CHARGE_DISENABLE);
+-
+-	return 0;
++	return mca_vote(info->chg_enable_voter, user, true, value);
+ }
+ 
+ static int strategy_buckchg_if_get_chg_en(char *buf, void *data)
+@@ -3248,7 +3384,9 @@
+ 	struct strategy_buckchg_dev *info = data;
+ 
+ 	if (!buf || !data)
+-		return -1;
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
+ 
+ 	client_str = mca_get_effective_client(info->chg_enable_voter);
+ 	if (!client_str)
+@@ -3268,7 +3406,9 @@
+ 	struct strategy_buckchg_dev *info = data;
+ 
+ 	if (!buf || !data)
+-		return -1;
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
+ 
+ 	client_str = mca_get_effective_client(info->input_suppend_voter);
+ 	if (!client_str)
+@@ -3284,41 +3424,43 @@
+ static int strategy_buckchg_if_set_input_suspend(const char *user, char *value,
+ 						 void *data)
+ {
+-	int temp_value = 0;
+ 	struct strategy_buckchg_dev *info = data;
+-
+-	if (!user || !value || !data)
+-		return -1;
+-
+-	if (kstrtoint(value, 0, &temp_value))
+-		return -1;
+-
+-	mca_log_err("set_input_suspend: %d\n", temp_value);
+-	if (temp_value)
+-		(void)mca_vote(info->input_suppend_voter, user, true, 1);
+-	else
+-		(void)mca_vote(info->input_suppend_voter, user, true, 0);
+-
+-	strategy_buckchg_clear_pmic_temp_term(info);
+-
+-	return 0;
++	int suspend;
++	int ret = strategy_buckchg_check_user(info, user);
++
++	if (ret)
++		return ret;
++	if (!value || kstrtoint(value, 0, &suspend) || suspend < 0 ||
++	    suspend > 1)
++		return -EINVAL;
++	ret = mca_vote(info->input_suppend_voter, user, true, suspend);
++	if (!ret)
++		strategy_buckchg_clear_pmic_temp_term(info);
++	return ret;
+ }
+ 
+ static int strategy_buckchg_if_set_ship_mode(const char *user, unsigned int val,
+ 					     void *data)
+ {
++	struct strategy_buckchg_dev *info = data;
++	int ret = strategy_buckchg_check_user(info, user);
++
++	if (ret)
++		return ret;
++	if (val > 1)
++		return -EINVAL;
++	return platform_class_buckchg_ops_set_ship_mode(MAIN_BUCK_CHARGER, val);
++}
++
++static int strategy_buckchg_if_get_ship_mode(bool *val, void *data)
++{
++	struct strategy_buckchg_dev *info = data;
+ 	int rc;
+ 
+-	rc = platform_class_buckchg_ops_set_ship_mode(0, !!val);
+-	if (rc < 0)
+-		return rc;
+-
+-	return 0;
+-}
+-
+-static int strategy_buckchg_if_get_ship_mode(bool *val, void *data)
+-{
+-	int rc;
++	if (!info || !val)
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
+ 
+ 	rc = platform_class_buckchg_ops_get_ship_mode(0, val);
+ 	if (rc < 0)
+@@ -3327,7 +3469,7 @@
+ 	return 0;
+ }
+ 
+-static struct mca_charge_if_ops g_strategy_buckchg_if_ops = {
++static const struct mca_charge_if_ops g_strategy_buckchg_if_ops = {
+ 	.type_name = "buck",
+ 	.set_input_suspend = strategy_buckchg_if_set_input_suspend,
+ 	.get_input_suspend = strategy_buckchg_if_get_input_suspend,
+@@ -3344,56 +3486,42 @@
+ static int strategy_buckchg_soc_limit_sts_callback(void *data,
+ 						   int effective_result)
+ {
+-	struct strategy_buckchg_dev *info = (struct strategy_buckchg_dev *)data;
+-
+-	if (!data)
+-		return -1;
+-
+-	info->soc_limit_more_enable = effective_result;
+-	mca_log_info("effective_result: %d\n", effective_result);
+-
+-	if (info->support_charge_more) {
+-		if (!effective_result || !info->proc_data.online) {
+-			cancel_delayed_work_sync(&info->soc_limit_stepper_work);
+-			effective_result = 0;
+-		}
+-		strategy_buckchg_process_soc_limit_change_more(effective_result,
+-							      info);
+-	} else if (info->proc_data.online) {
+-		strategy_buckchg_process_soc_limit_change(effective_result,
+-							  info);
+-	} else {
+-		strategy_buckchg_process_soc_limit_change(0, info);
+-	}
+-
++	struct strategy_buckchg_dev *info = data;
++
++	if (!info || effective_result < 0 || effective_result > 1)
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
++	WRITE_ONCE(info->soc_limit_more_enable, effective_result);
++	/* Smart-charge holds its state mutex during this callback. */
++	mod_delayed_work(info->wq, &info->soc_limit_stepper_work, 0);
+ 	return 0;
+ }
+ 
+ static int mca_charger_buckchg_pwr_boost_sts_callback(void *data, int enable)
+ {
+-	struct strategy_buckchg_dev *info = (struct strategy_buckchg_dev *)data;
+-
+-	if (!data)
+-		return -1;
+-
+-	info->smartchg_data.pwr_boost_state = enable;
+-
++	struct strategy_buckchg_dev *info = data;
++
++	if (!info || enable < 0 || enable > 1)
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
++	WRITE_ONCE(info->smartchg_data.pwr_boost_state, enable);
+ 	return 0;
+ }
+ 
+ static int strategy_buckchg_smartchg_set_fcc_callback(void *data, int val)
+ {
+-	struct strategy_buckchg_dev *info = (struct strategy_buckchg_dev *)data;
+-
+-	if (!data)
+-		return -1;
+-
+-	mca_vote(info->charge_limit_voter, "smartchg", val != 0, val);
+-
+-	return 0;
+-}
+-
+-static struct mca_smartchg_if_ops g_buck_smartchg_if_ops = {
++	struct strategy_buckchg_dev *info = data;
++
++	if (!info || val < 0 || val > 30000)
++		return -EINVAL;
++	if (READ_ONCE(info->stopping))
++		return -ENODEV;
++	return mca_vote(info->charge_limit_voter, "smartchg", val != 0, val);
++}
++
++static const struct mca_smartchg_if_ops g_buck_smartchg_if_ops = {
+ 	.type = MCA_SMARTCHG_IF_CHG_TYPE_BUCK,
+ 	.data = NULL,
+ 	.set_soc_limit_sts = strategy_buckchg_soc_limit_sts_callback,
+@@ -3401,30 +3529,299 @@
+ 	.set_fcc = strategy_buckchg_smartchg_set_fcc_callback,
+ };
+ 
++static void strategy_buckchg_monitor_workfunc(struct work_struct *work)
++{
++	struct strategy_buckchg_dev *info = container_of(
++		work, struct strategy_buckchg_dev, monitor_work.work);
++
++	guard(mutex)(&info->policy_lock);
++	if (READ_ONCE(info->stopping) || !info->monitor_active)
++		return;
++	strategy_buckchg_monitor_workfunc_locked(work);
++}
++
++static void strategy_buckchg_sw_cv_workfunc(struct work_struct *work)
++{
++	struct strategy_buckchg_dev *info = container_of(
++		work, struct strategy_buckchg_dev, sw_cv_work.work);
++
++	guard(mutex)(&info->policy_lock);
++	if (READ_ONCE(info->stopping) || !info->sw_cv_running ||
++	    !info->monitor_active)
++		return;
++	strategy_buckchg_sw_cv_workfunc_locked(work);
++}
++
++static void strategy_buckchg_base_flip_sw_cv_workfunc(struct work_struct *work)
++{
++	struct strategy_buckchg_dev *info = container_of(
++		work, struct strategy_buckchg_dev, base_flip_sw_cv_work.work);
++
++	guard(mutex)(&info->policy_lock);
++	if (READ_ONCE(info->stopping) || !info->sw_cv_running ||
++	    !info->monitor_active)
++		return;
++	strategy_buckchg_base_flip_sw_cv_workfunc_locked(work);
++}
++
++static void strategy_wls_revchg_monitor_workfunc(struct work_struct *work)
++{
++	struct strategy_buckchg_dev *info =
++		container_of(work, struct strategy_buckchg_dev,
++			     wls_revchg_monitor_work.work);
++
++	guard(mutex)(&info->policy_lock);
++	if (READ_ONCE(info->stopping) || !info->wls_revchg_en)
++		return;
++	strategy_wls_revchg_monitor_workfunc_locked(work);
++}
++
++static void strategy_csd_pulse_process_workfunc(struct work_struct *work)
++{
++	struct strategy_buckchg_dev *info = container_of(
++		work, struct strategy_buckchg_dev, csd_pulse_process_work.work);
++
++	guard(mutex)(&info->policy_lock);
++	if (READ_ONCE(info->stopping) || !info->proc_data.online)
++		return;
++	strategy_csd_pulse_process_workfunc_locked(work);
++}
++
++static void strategy_source_status_monitor_workfunc(struct work_struct *work)
++{
++	struct strategy_buckchg_dev *info =
++		container_of(work, struct strategy_buckchg_dev,
++			     source_status_monitor_work.work);
++
++	guard(mutex)(&info->policy_lock);
++	if (READ_ONCE(info->stopping) || !info->last_otg_present)
++		return;
++	strategy_source_status_monitor_workfunc_locked(work);
++}
++
++static void strategy_buckchg_check_pdsecret_workfunc(struct work_struct *work)
++{
++	struct strategy_buckchg_dev *info = container_of(
++		work, struct strategy_buckchg_dev, check_pd_secret_work.work);
++
++	guard(mutex)(&info->policy_lock);
++	if (READ_ONCE(info->stopping) || !info->proc_data.online)
++		return;
++	strategy_buckchg_check_pdsecret_workfunc_locked(work);
++}
++
++static void strategy_rerun_handle_pd_auth_workfunc(struct work_struct *work)
++{
++	struct strategy_buckchg_dev *info =
++		container_of(work, struct strategy_buckchg_dev,
++			     rerun_handle_pd_auth_work.work);
++
++	guard(mutex)(&info->policy_lock);
++	if (READ_ONCE(info->stopping))
++		return;
++	strategy_rerun_handle_pd_auth_workfunc_locked(work);
++}
++
++static void
++strategy_buckchg_soc_limit_stepper_workfunc(struct work_struct *work)
++{
++	struct strategy_buckchg_dev *info = container_of(
++		work, struct strategy_buckchg_dev, soc_limit_stepper_work.work);
++
++	guard(mutex)(&info->policy_lock);
++	if (READ_ONCE(info->stopping))
++		return;
++	strategy_buckchg_soc_limit_stepper_workfunc_locked(work);
++}
++
++static int strategy_buckchg_process_event(int event, int value, void *data)
++{
++	struct strategy_buckchg_dev *info = data;
++	unsigned long flags;
++	unsigned int tail;
++	int ret = 0;
++
++	if (!info)
++		return -EINVAL;
++	if (event == MCA_EVENT_WIRELESS_REVCHG &&
++	    !IS_ENABLED(CONFIG_MCA_BUCK_WLS_REV_COORDINATION))
++		return -EOPNOTSUPP;
++	spin_lock_irqsave(&info->event_lock, flags);
++	if (READ_ONCE(info->stopping)) {
++		ret = -ENODEV;
++	} else if (info->event_count == BUCK_EVENT_QUEUE_SIZE) {
++		ret = -ENOSPC;
++	} else {
++		tail = (info->event_head + info->event_count) %
++		       BUCK_EVENT_QUEUE_SIZE;
++		info->events[tail] =
++			(struct strategy_buckchg_event){ event, value };
++		info->event_count++;
++		queue_work(info->wq, &info->event_work);
++	}
++	spin_unlock_irqrestore(&info->event_lock, flags);
++	return ret;
++}
++
++static void strategy_buckchg_event_workfunc(struct work_struct *work)
++{
++	struct strategy_buckchg_dev *info =
++		container_of(work, struct strategy_buckchg_dev, event_work);
++	struct strategy_buckchg_event event;
++	unsigned long flags;
++
++	for (;;) {
++		spin_lock_irqsave(&info->event_lock, flags);
++		if (!info->event_count || READ_ONCE(info->stopping)) {
++			spin_unlock_irqrestore(&info->event_lock, flags);
++			return;
++		}
++		event = info->events[info->event_head];
++		info->event_head =
++			(info->event_head + 1) % BUCK_EVENT_QUEUE_SIZE;
++		info->event_count--;
++		spin_unlock_irqrestore(&info->event_lock, flags);
++		mutex_lock(&info->policy_lock);
++		if (!READ_ONCE(info->stopping))
++			strategy_buckchg_handle_event(event.event, event.value,
++						      info);
++		mutex_unlock(&info->policy_lock);
++	}
++}
++
++static void strategy_buckchg_stop(struct strategy_buckchg_dev *info)
++{
++	unsigned long flags;
++
++	if (!info || !info->wq)
++		return;
++	spin_lock_irqsave(&info->event_lock, flags);
++	WRITE_ONCE(info->stopping, true);
++	info->event_count = 0;
++	spin_unlock_irqrestore(&info->event_lock, flags);
++	if (info->panel_registered)
++		mca_event_block_notify_unregister(MCA_EVENT_TYPE_PANEL,
++						  &info->panel_nb);
++	if (info->thermal_registered)
++		mca_event_block_notify_unregister(MCA_EVENT_TYPE_THERMAL_TEMP,
++						  &info->thermal_board_nb);
++	if (info->smart_registered)
++		mca_smartchg_if_ops_unregister(MCA_SMARTCHG_IF_CHG_TYPE_BUCK,
++					       info);
++	if (info->interface_registered)
++		mca_charge_if_ops_unregister("buck", info);
++	if (info->strategy_registered)
++		mca_strategy_ops_unregister(STRATEGY_FUNC_TYPE_BUCK_CHARGE,
++					    info);
++	disable_delayed_work_sync(&info->monitor_work);
++	disable_delayed_work_sync(&info->sw_cv_work);
++	disable_delayed_work_sync(&info->base_flip_sw_cv_work);
++	disable_delayed_work_sync(&info->wls_revchg_monitor_work);
++	disable_delayed_work_sync(&info->csd_pulse_process_work);
++	disable_delayed_work_sync(&info->source_status_monitor_work);
++	disable_delayed_work_sync(&info->check_pd_secret_work);
++	disable_delayed_work_sync(&info->rerun_handle_pd_auth_work);
++	disable_delayed_work_sync(&info->soc_limit_stepper_work);
++	cancel_work_sync(&info->event_work);
++	destroy_workqueue(info->wq);
++	info->wq = NULL;
++	/* Hardware is quiesced after every work and named-voter reader drains. */
++	strategy_buckchg_destroy_voters(info);
++	strategy_class_buckchg_ops_set_chg(info, false);
++	strategy_class_buckchg_ops_adc_enable(info, false);
++	info->strategy_init_done = 0;
++}
++
++static int strategy_buckchg_validate_config(struct strategy_buckchg_dev *info)
++{
++	const unsigned int currents[] = {
++		info->in_dcp,
++		info->in_pd,
++		info->in_pps,
++		info->in_hvdcp,
++		info->in_hvdcp3,
++		info->in_hvdcp3p5,
++		info->in_cdp,
++		info->in_sdp,
++		info->in_float,
++		info->chg_dcp,
++		info->chg_pd,
++		info->chg_pps,
++		info->chg_hvdcp,
++		info->chg_hvdcp3,
++		info->chg_hvdcp3p5,
++		info->chg_cdp,
++		info->chg_sdp,
++		info->chg_float,
++		info->chg_batt_auth_failed,
++	};
++	const int compensation[] = {
++		info->pmic_fv_compensation,
++		info->pmic_fv_compensation_cold,
++		info->pmic_fv_compensation_hot,
++		info->pmic_middle_fv_compensation,
++		info->pmic_high_fv_compensation,
++		info->pmic_wls_fv_compensation,
++		info->pmic_iterm_compensation,
++		info->curr_terminate_compensation,
++	};
++	unsigned int i;
++
++	if (info->support_multi_buck)
++		return -EOPNOTSUPP;
++	for (i = 0; i < ARRAY_SIZE(currents); i++)
++		if (currents[i] > 30000)
++			return -ERANGE;
++	for (i = 0; i < ARRAY_SIZE(compensation); i++)
++		if (compensation[i] < 0 || compensation[i] > 1000)
++			return -ERANGE;
++	if (info->sw_cv_fcc_step <= 0 || info->sw_cv_fcc_step > 1000 ||
++	    info->sw_cv_fv_step < 0 || info->sw_cv_fv_step > 100 ||
++	    info->sw_cv_fcc_limit_buffer < 0 ||
++	    info->sw_cv_fcc_limit_buffer > 30000 ||
++	    info->ffc_temp_low >= info->ffc_temp_high ||
++	    info->ffc_temp_high > 80 ||
++	    info->allow_start_ffc_batt_soc_thr < 0 ||
++	    info->allow_start_ffc_batt_soc_thr > 100)
++		return -ERANGE;
++	for (i = 0; i < REV_USBIN_TYPE_MAX; i++)
++		if (info->rev_vadp_valid_l[i] < 5000 ||
++		    info->rev_vadp_valid_h[i] > 20000 ||
++		    info->rev_vadp_valid_l[i] > info->rev_req_vadp[i] ||
++		    info->rev_req_vadp[i] > info->rev_vadp_valid_h[i])
++			return -ERANGE;
++	return 0;
++}
++
+ static int strategy_buckchg_class_probe(struct platform_device *pdev)
+ {
+ 	struct strategy_buckchg_dev *info;
+-	int online;
++	struct mca_charge_if_ops charge_ops = g_strategy_buckchg_if_ops;
++	struct mca_smartchg_if_ops smart_ops = g_buck_smartchg_if_ops;
++	int online = 0;
+ 	int ret;
+ 
+ 	info = devm_kzalloc(&pdev->dev, sizeof(*info), GFP_KERNEL);
+ 	if (!info)
+ 		return -ENOMEM;
+-
+ 	info->dev = &pdev->dev;
++	mutex_init(&info->policy_lock);
++	spin_lock_init(&info->event_lock);
++	info->last_pos = 1;
++	info->proc_data.voltage = STATEGY_CHARGE_VBUS_5V;
++	info->buck_5v_in = STATEGY_INPUT_5V_DEFAULT_VALUE;
++	info->buck_9v_in = STATEGY_INPUT_9V_DEFAULT_VALUE;
++	info->buck_5v_ich = STATEGY_CHARGE_CURRENT_DEFAULT_VALUE;
++	info->buck_9v_ich = STATEGY_CHARGE_CURRENT_DEFAULT_VALUE;
+ 	strategy_buckchg_parse_dt(info);
+-	ret = strategy_buckchg_init_voter(info);
+-	if (ret) {
+-		mca_log_err("init voter err\n");
+-		return -1;
+-	}
+-
+-	mca_vote(info->input_voltage_voter, "batt_auth", true, 0);
+-	mca_vote(info->charge_limit_voter, "batt_auth", true,
+-		 info->chg_batt_auth_failed);
+-	info->proc_data.voltage = STATEGY_CHARGE_VBUS_5V;
+-	info->hvdcp_allow_flag = 0;
+-	info->vbat_ov_count = 0;
++	ret = strategy_buckchg_validate_config(info);
++	if (ret)
++		return ret;
++	/* The class uses -1 when no hardware provider has registered yet. */
++	ret = platform_class_buckchg_ops_get_online(MAIN_BUCK_CHARGER, &online);
++	if (ret)
++		return ret == -1 || ret == -ENODEV ? -EPROBE_DEFER : ret;
++	INIT_WORK(&info->event_work, strategy_buckchg_event_workfunc);
+ 	INIT_DELAYED_WORK(&info->monitor_work,
+ 			  strategy_buckchg_monitor_workfunc);
+ 	INIT_DELAYED_WORK(&info->sw_cv_work, strategy_buckchg_sw_cv_workfunc);
+@@ -3442,49 +3839,81 @@
+ 			  strategy_rerun_handle_pd_auth_workfunc);
+ 	INIT_DELAYED_WORK(&info->soc_limit_stepper_work,
+ 			  strategy_buckchg_soc_limit_stepper_workfunc);
+-	(void)mca_strategy_ops_register(STRATEGY_FUNC_TYPE_BUCK_CHARGE,
++	info->wq = alloc_ordered_workqueue("mca_buck_policy", WQ_MEM_RECLAIM);
++	if (!info->wq)
++		return -ENOMEM;
++	ret = strategy_buckchg_init_voter(info);
++	if (ret)
++		goto fail;
++	ret = mca_vote(info->input_voltage_voter, "batt_auth", true, 0);
++	if (ret)
++		goto fail;
++	ret = mca_vote(info->charge_limit_voter, "batt_auth", true,
++		       info->chg_batt_auth_failed);
++	if (ret)
++		goto fail;
++	info->strategy_init_done = 1;
++	platform_set_drvdata(pdev, info);
++	ret = mca_strategy_ops_register(STRATEGY_FUNC_TYPE_BUCK_CHARGE,
+ 					strategy_buckchg_process_event,
+ 					strategy_buckchg_get_status,
+ 					strategy_buckchg_set_config, info);
+-	g_strategy_buckchg_if_ops.data = info;
+-	(void)mca_charge_if_ops_register(&g_strategy_buckchg_if_ops);
+-	g_buck_smartchg_if_ops.data = info;
+-	(void)mca_smartchg_if_ops_register(&g_buck_smartchg_if_ops);
++	if (ret)
++		goto fail;
++	info->strategy_registered = true;
++	charge_ops.data = info;
++	ret = mca_charge_if_ops_register(&charge_ops);
++	if (ret)
++		goto fail;
++	info->interface_registered = true;
++	smart_ops.data = info;
++	ret = mca_smartchg_if_ops_register(&smart_ops);
++	if (ret)
++		goto fail;
++	info->smart_registered = true;
+ 	info->thermal_board_nb.notifier_call =
+ 		strategy_buckchg_thermal_notifier_cb;
+-	mca_event_block_notify_register(MCA_EVENT_TYPE_THERMAL_TEMP,
+-					&info->thermal_board_nb);
++	ret = mca_event_block_notify_register(MCA_EVENT_TYPE_THERMAL_TEMP,
++					      &info->thermal_board_nb);
++	if (ret)
++		goto fail;
++	info->thermal_registered = true;
+ 	info->panel_nb.notifier_call = strategy_buckchg_panel_notifier_cb;
+-	mca_event_block_notify_register(MCA_EVENT_TYPE_PANEL, &info->panel_nb);
+-
+-	platform_class_buckchg_ops_get_online(MAIN_BUCK_CHARGER, &online);
+-	if (online) {
+-		mca_log_info("avoid missing first usb connect event\n");
++	ret = mca_event_block_notify_register(MCA_EVENT_TYPE_PANEL,
++					      &info->panel_nb);
++	if (ret)
++		goto fail;
++	info->panel_registered = true;
++	ret = platform_class_buckchg_ops_get_online(MAIN_BUCK_CHARGER, &online);
++	if (ret)
++		goto fail;
++	if (online)
+ 		mca_event_block_notify(MCA_EVENT_TYPE_CHARGER_CONNECT,
+ 				       MCA_EVENT_USB_CONNECT, NULL);
+-	}
+-
+-	g_buckchg_info = info;
+-	mca_log_err("androidboot.mode=%d\n", mca_log_get_charge_boot_mode());
+-
+-	info->strategy_init_done = 1;
+-	mca_log_err("probe success\n");
+ 	return 0;
+-}
+-
+-static int strategy_buckchg_class_remove(struct platform_device *pdev)
+-{
+-	return 0;
++fail:
++	strategy_buckchg_stop(info);
++	platform_set_drvdata(pdev, NULL);
++	return ret;
++}
++
++static void strategy_buckchg_class_remove(struct platform_device *pdev)
++{
++	strategy_buckchg_stop(platform_get_drvdata(pdev));
++	platform_set_drvdata(pdev, NULL);
+ }
+ 
+ static void strategy_buckchg_class_shutdown(struct platform_device *pdev)
+ {
++	strategy_buckchg_stop(platform_get_drvdata(pdev));
+ }
+ 
+ static const struct of_device_id match_table[] = {
+ 	{ .compatible = "mca,strategy_buckchg" },
+ 	{},
+ };
++
++MODULE_DEVICE_TABLE(of, match_table);
+ 
+ static struct platform_driver strategy_buckchg_class_driver = {
+ 	.driver	= {
+--- a/drivers/power/supply/mca/mca_strategy/strategy_charger/inc/mca_strategy_buckchg.h
++++ b/drivers/power/supply/mca/mca_strategy/strategy_charger/inc/mca_strategy_buckchg.h
+@@ -124,7 +124,37 @@
+ 	int pwr_boost_state;
+ };
+ 
++#define BUCK_EVENT_QUEUE_SIZE 64
++
++struct strategy_buckchg_event {
++	int event;
++	int value;
++};
++
+ struct strategy_buckchg_dev {
++	struct mutex policy_lock;
++	spinlock_t event_lock;
++	struct workqueue_struct *wq;
++	struct work_struct event_work;
++	struct strategy_buckchg_event events[BUCK_EVENT_QUEUE_SIZE];
++	unsigned int event_head;
++	unsigned int event_count;
++	bool stopping;
++	bool monitor_active;
++	bool strategy_registered;
++	bool interface_registered;
++	bool smart_registered;
++	bool thermal_registered;
++	bool panel_registered;
++	u8 soc_step;
++	bool last_otg_present;
++	int last_pos;
++	int bq_revchg_switch_flag;
++	bool sdp_vote_completed;
++	bool usb_suspend;
++	int non_compliant_count;
++	int last_jeita_vterm;
++	int vbat_drop_count;
+ 	struct device *dev;
+ 	int strategy_init_done;
+ 	/* dt config */

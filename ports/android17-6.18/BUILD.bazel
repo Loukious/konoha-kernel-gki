@@ -2694,6 +2694,40 @@ ddk_module(
 )
 
 
+ddk_headers(
+    name = "audio_gpr_headers",
+    hdrs = ["qcom/opensource/audio-kernel/include/bindings/qcom,gpr.h", "qcom/opensource/audio-kernel/include/ipc/gpr-lite.h", "qcom/opensource/audio-kernel/include/soc/audio_mod_devicetable.h"],
+    includes = ["qcom/opensource/audio-kernel/include"],
+)
+
+ddk_module(
+    name = "gpr_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/ipc/gpr-lite.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "gpr_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_gpr_headers", ":audio_foundation_headers", ":audio_notifier_headers", ":snd_event_dlkm", ":q6_notifier_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_headers(
+    name = "buckstrategy_headers",
+    hdrs = ["drivers/power/supply/mca/mca_strategy/strategy_charger/inc/mca_strategy_buckchg.h"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_strategy_buckchg",
+    srcs = ["drivers/power/supply/mca/mca_strategy/strategy_charger/mca_strategy_buckchg.c"],
+    out = "mca_strategy_buckchg.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":buckstrategy_headers", ":smartcharge_headers", ":chargebusiness_headers", ":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_common", ":mca_sysfs", ":mca_hwid", ":mca_workqueue", ":mca_qcom_smem", ":mca_charge_interface", ":mca_smart_charge", ":mca_charge_mievent", ":mca_strategy_fg_class", ":mca_strategy_class", ":mca_platform_fg_ic_ops", ":mca_platform_buckchg_class", ":mca_platform_loadsw_class", ":mca_platform_cp_class", ":mca_platform_wireless_class", ":mca_protocol_pd_class", ":mca_protocol_qc_class", ":mca_protocol_class", ":charger_partition", ":mca_qcom_panel"],
+    visibility = ["//visibility:public"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -2895,6 +2929,8 @@ kernel_module_group(
         ":q6_notifier_dlkm",
         ":xiaomi_touch",
         ":nt36532_touch",
+        ":gpr_dlkm",
+        ":mca_strategy_buckchg",
     ],
 )
 
