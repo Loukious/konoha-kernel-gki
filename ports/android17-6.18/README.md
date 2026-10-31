@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 82 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 83 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 82 platform `.ko` files, their symbol tables and DDK configurations.
+- 83 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 3598
-imported symbol CRCs across all 82 modules.
+used. The current [validation report](validation-20261031.json) checks 3666
+imported symbol CRCs across all 83 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -230,7 +230,7 @@ wake, receive threads stop, and queued memory work drains before descriptors
 are freed. The deferred-free worker also supports stop and drain. Unknown queue
 names fail cleanly, and receiver allocation/thread failures unwind registration.
 These adaptations pass checkpatch with no errors, warnings or style checks;
-the full build passes 3598 imported-symbol CRC checks without compiler/modpost
+the full build passes 3666 imported-symbol CRC checks without compiler/modpost
 warnings. Cross-VM sharing, secure-display allocation and memory pressure still
 require device testing. `ZONE_DEVICE` and reserved-IPA support remain disabled,
 matching the Onyx HLOS baseline; guest-only mapping paths are not validated.
@@ -264,6 +264,18 @@ Per-CPU votes update the per-CPU frequency cache. RPMh fast votes use MMIO and
 bounded busy waits, so the RCU-protected call path does not sleep. This group
 passes the full build, CRC verification and checkpatch without warnings;
 frequency transitions and workload response still need hardware testing.
+
+The PMU group adds `qcom-pmu-lib`, preserving Onyx's AMU/perf counters,
+LLCC reads and optional CPUCP counter cache. CPU indices and event tables are
+validated before use. Counter setup and hotplug are synchronized; idle/PM
+callbacks and active readers drain before perf events are freed. The service
+and its sysfs interface remain resident, and idle-client removal waits for
+RCU readers. GKI's exported CPU-hotplug wrapper handles state removal outside
+the caller's CPU lock. Tuna's five configured events and eight-CPU mask are
+retained; its DT has no CPUCP PMU shared-memory region. Counter accuracy,
+hotplug, idle transitions and firmware behavior still need device testing.
+The group passes the full build, imported-symbol checks and checkpatch without
+warnings.
 
 ## Baseline inventory
 

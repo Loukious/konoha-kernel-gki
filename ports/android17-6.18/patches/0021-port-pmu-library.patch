@@ -1,0 +1,852 @@
+--- a/drivers/soc/qcom/dcvs/pmu_lib.c
++++ b/drivers/soc/qcom/dcvs/pmu_lib.c
+@@ -22,7 +22,7 @@
+ #include <linux/cpu_pm.h>
+ #include <linux/cpu.h>
+ #include <linux/mutex.h>
+-#include <linux/cpu.h>
++#include <linux/rculist.h>
+ #include <linux/spinlock.h>
+ #include <linux/perf_event.h>
+ #include <linux/cpuidle.h>
+@@ -96,10 +96,22 @@
+ static LIST_HEAD(idle_notif_list);
+ static DEFINE_SPINLOCK(idle_list_lock);
+ static struct cpucp_hlos_map cpucp_map[MAX_CPUCP_EVT];
+-static struct kobject pmu_kobj;
+-static bool pmu_counters_enabled = true;
++static bool pmu_counters_enabled;
++static DEFINE_MUTEX(pmu_control_lock);
+ static unsigned int pmu_enable_trace;
+ static bool llcc_ignore_setup;
++
++static bool pmu_ready(void)
++{
++	/* Paired with publication after successful probe. */
++	return smp_load_acquire(&qcom_pmu_inited);
++}
++
++static bool counters_ready(void)
++{
++	/* Paired with publication after all counter callbacks are registered. */
++	return smp_load_acquire(&pmu_counters_enabled);
++}
+ 
+ /*
+  * is_amu_valid: Check if AMUs are supported and if the id corresponds to the
+@@ -141,11 +153,16 @@
+ #define CYCLE_COUNTER_ID 0x11
+ static inline u64 cached_count_value(struct event_data *ev, u64 event_cached_count, bool amu)
+ {
+-	struct arm_pmu *cpu_pmu = container_of(ev->pevent->pmu, struct arm_pmu, pmu);
++	struct arm_pmu *cpu_pmu;
+ 
+ 	if (amu)
+ 		return event_cached_count;
+ 
++	/* The LLCC provider is not an ARM CPU PMU. */
++	if (ev->event_id == QCOM_LLCC_PMU_RD_EV)
++		return event_cached_count;
++
++	cpu_pmu = to_arm_pmu(ev->pevent->pmu);
+ 	if (cpu_pmu->pmuver >= ID_AA64DFR0_EL1_PMUVer_V3P5)
+ 		event_cached_count |= (pmu_long_counter ? BIT(63) : GENMASK(63, 31));
+ 	else {
+@@ -271,11 +288,14 @@
+ 	} else {
+ 		if (!event->pevent)
+ 			return event->cached_count;
+-		if (local)
+-			perf_event_read_local(event->pevent, &total, NULL, NULL);
+-		else
++		if (local) {
++			ret = perf_event_read_local(event->pevent, &total, NULL, NULL);
++			if (ret)
++				return event->cached_count;
++		} else {
+ 			total = perf_event_read_value(event->pevent, &enabled,
+ 								&running);
++		}
+ 	}
+ 	event->cached_count = total;
+ 
+@@ -289,10 +309,10 @@
+ 	int i;
+ 	unsigned long flags;
+ 
+-	if (!qcom_pmu_inited)
++	if (!pmu_ready())
+ 		return -ENODEV;
+ 
+-	if (!event_id || !pmu_data || !cpumask_test_cpu(cpu, cpu_possible_mask))
++	if (!event_id || !pmu_data || ((unsigned int)cpu >= nr_cpu_ids || !cpu_possible(cpu)))
+ 		return -EINVAL;
+ 
+ 	cpu_data = per_cpu(cpu_ev_data, cpu);
+@@ -305,7 +325,7 @@
+ 		return -ENOENT;
+ 
+ 	spin_lock_irqsave(&cpu_data->read_lock, flags);
+-	if (cpu_data->is_hp || cpu_data->is_idle || cpu_data->is_pc) {
++	if (!counters_ready() || cpu_data->is_hp || cpu_data->is_idle || cpu_data->is_pc) {
+ 		spin_unlock_irqrestore(&cpu_data->read_lock, flags);
+ 		*pmu_data = event->cached_count;
+ 		return 0;
+@@ -318,7 +338,7 @@
+ 	return 0;
+ }
+ 
+-int __qcom_pmu_read_all(int cpu, struct qcom_pmu_data *data, bool local)
++static int __qcom_pmu_read_all(int cpu, struct qcom_pmu_data *data, bool local)
+ {
+ 	struct cpu_data *cpu_data;
+ 	struct event_data *event;
+@@ -326,15 +346,15 @@
+ 	bool use_cache = false;
+ 	unsigned long flags;
+ 
+-	if (!qcom_pmu_inited)
++	if (!pmu_ready())
+ 		return -ENODEV;
+ 
+-	if (!data || !cpumask_test_cpu(cpu, cpu_possible_mask))
++	if (!data || ((unsigned int)cpu >= nr_cpu_ids || !cpu_possible(cpu)))
+ 		return -EINVAL;
+ 
+ 	cpu_data = per_cpu(cpu_ev_data, cpu);
+ 	spin_lock_irqsave(&cpu_data->read_lock, flags);
+-	if (cpu_data->is_hp || cpu_data->is_idle || cpu_data->is_pc)
++	if (!counters_ready() || cpu_data->is_hp || cpu_data->is_idle || cpu_data->is_pc)
+ 		use_cache = true;
+ 	else
+ 		atomic_inc(&cpu_data->read_cnt);
+@@ -365,10 +385,10 @@
+ 	struct event_data *event;
+ 	int i;
+ 
+-	if (!qcom_pmu_inited)
++	if (!pmu_ready())
+ 		return ERR_PTR(-EPROBE_DEFER);
+ 
+-	if (!event_id || !cpumask_test_cpu(cpu, cpu_possible_mask))
++	if (!event_id || ((unsigned int)cpu >= nr_cpu_ids || !cpu_possible(cpu)))
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	cpu_data = per_cpu(cpu_ev_data, cpu);
+@@ -443,7 +463,7 @@
+ 	list_for_each_entry(tmp_node, &idle_notif_list, node)
+ 		if (tmp_node->idle_cb == idle_node->idle_cb)
+ 			goto out;
+-	list_add_tail(&idle_node->node, &idle_notif_list);
++	list_add_tail_rcu(&idle_node->node, &idle_notif_list);
+ out:
+ 	spin_unlock(&idle_list_lock);
+ 	return 0;
+@@ -461,12 +481,14 @@
+ 	spin_lock(&idle_list_lock);
+ 	list_for_each_entry(tmp_node, &idle_notif_list, node) {
+ 		if (tmp_node->idle_cb == idle_node->idle_cb) {
+-			list_del(&tmp_node->node);
++			list_del_rcu(&tmp_node->node);
+ 			ret = 0;
+ 			break;
+ 		}
+ 	}
+ 	spin_unlock(&idle_list_lock);
++	if (!ret)
++		synchronize_rcu();
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(qcom_pmu_idle_unregister);
+@@ -476,8 +498,6 @@
+ 	int ret = 0;
+ 	unsigned int enable = 1;
+ 
+-	if (!qcom_pmu_inited)
+-		return -EPROBE_DEFER;
+ 	if (!ops || !pmu_base)
+ 		return ret;
+ #if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+@@ -501,8 +521,6 @@
+ 	int j;
+ 	struct pmu_map_msg msg;
+ #endif
+-	if (!qcom_pmu_inited)
+-		return -EPROBE_DEFER;
+ 	if (!ops)
+ 		return ret;
+ 
+@@ -519,7 +537,7 @@
+ 			cid = event->cid;
+ 			if (!is_event_shared(event) ||
+ 			    is_amu_valid(event->amu_id) || !event->pevent ||
+-			    !cpumask_test_cpu(cpu, to_cpumask(&cpucp_map[cid].cpus)))
++			    !(cpucp_map[cid].cpus & BIT(cpu)))
+ 				continue;
+ 			pmu_map[phys_cpu[cpu]][cid] = event->pevent->hw.idx;
+ 		}
+@@ -548,6 +566,9 @@
+ 	struct qcom_pmu_notif_node *idle_node;
+ 	int i, cnt = 0;
+ 	unsigned long flags;
++
++	if (!counters_ready())
++		return;
+ 
+ 	spin_lock_irqsave(&cpu_data->read_lock, flags);
+ 	if (cpu_data->is_idle || cpu_data->is_hp || cpu_data->is_pc) {
+@@ -570,16 +591,24 @@
+ 	pmu_data.num_evs = cnt;
+ 
+ 	/* send snapshot of pmu data to all registered idle clients */
+-	list_for_each_entry(idle_node, &idle_notif_list, node)
++	rcu_read_lock();
++	list_for_each_entry_rcu(idle_node, &idle_notif_list, node)
+ 		idle_node->idle_cb(&pmu_data, dev->cpu, *state);
++	rcu_read_unlock();
+ }
+ 
+ static void qcom_pmu_idle_exit_notif(void *unused, int state,
+ 				     struct cpuidle_device *dev)
+ {
+ 	struct cpu_data *cpu_data = per_cpu(cpu_ev_data, dev->cpu);
+-
++	unsigned long flags;
++
++	if (!counters_ready())
++		return;
++
++	spin_lock_irqsave(&cpu_data->read_lock, flags);
+ 	cpu_data->is_idle = false;
++	spin_unlock_irqrestore(&cpu_data->read_lock, flags);
+ }
+ 
+ static int memlat_pm_notif(struct notifier_block *nb, unsigned long action,
+@@ -592,8 +621,13 @@
+ 	u32 count;
+ 	bool pmu_valid = false;
+ 	bool read_ev  = true;
+-	struct cpucp_pmu_ctrs *base = pmu_base + (sizeof(struct cpucp_pmu_ctrs) * cpu);
++	struct cpucp_pmu_ctrs __iomem *base = pmu_base + (sizeof(struct cpucp_pmu_ctrs) * cpu);
+ 	unsigned long flags;
++
++	if (!counters_ready() ||
++	    (action != CPU_PM_ENTER && action != CPU_PM_EXIT &&
++	     action != CPU_PM_ENTER_FAILED))
++		return NOTIFY_DONE;
+ 
+ 	/* Exit if cpu is in hotplug */
+ 	spin_lock_irqsave(&cpu_data->read_lock, flags);
+@@ -602,7 +636,7 @@
+ 		return NOTIFY_OK;
+ 	}
+ 
+-	if (action == CPU_PM_EXIT) {
++	if (action == CPU_PM_EXIT || action == CPU_PM_ENTER_FAILED) {
+ 		if (pmu_base)
+ 			writel_relaxed(0, &base->valid);
+ 		cpu_data->is_pc = false;
+@@ -656,13 +690,13 @@
+ 	int i, ret = 0;
+ 	unsigned long flags;
+ 	struct event_data *ev;
+-	struct cpucp_pmu_ctrs *base = pmu_base + (sizeof(struct cpucp_pmu_ctrs) * cpu);
++	struct cpucp_pmu_ctrs __iomem *base = pmu_base + (sizeof(struct cpucp_pmu_ctrs) * cpu);
+ 	cpumask_t mask;
+ 
+ 	if (!attr)
+ 		return -ENOMEM;
+ 
+-	if (!qcom_pmu_inited)
++	if (!counters_ready())
+ 		goto out;
+ 
+ 	for (i = 0; i < cpu_data->num_evs; i++) {
+@@ -671,12 +705,14 @@
+ 		if (ret < 0) {
+ 			pr_err("event %d not set for cpu %d ret %d\n",
+ 				ev->event_id, cpu, ret);
+-			break;
++			goto delete_partial;
+ 		}
+ 	}
+ 	cpumask_clear(&mask);
+ 	cpumask_set_cpu(cpu, &mask);
+-	configure_cpucp_map(mask);
++	ret = configure_cpucp_map(mask);
++	if (ret)
++		goto delete_partial;
+ 	/* Set valid as 0 as exiting hotplug */
+ 	if (pmu_base)
+ 		writel_relaxed(0, &base->valid);
+@@ -684,9 +720,14 @@
+ 	spin_lock_irqsave(&cpu_data->read_lock, flags);
+ 	cpu_data->is_hp = false;
+ 	spin_unlock_irqrestore(&cpu_data->read_lock, flags);
++	goto out;
++
++delete_partial:
++	for (i = 0; i < cpu_data->num_evs; i++)
++		delete_event(&cpu_data->events[i]);
+ out:
+ 	kfree(attr);
+-	return 0;
++	return ret;
+ }
+ 
+ static int qcom_pmu_hotplug_going_down(unsigned int cpu)
+@@ -697,9 +738,9 @@
+ 	unsigned long flags;
+ 	bool pmu_valid = false;
+ 	u32 count;
+-	struct cpucp_pmu_ctrs *base = pmu_base + (sizeof(struct cpucp_pmu_ctrs) * cpu);
+-
+-	if (!qcom_pmu_inited)
++	struct cpucp_pmu_ctrs __iomem *base = pmu_base + (sizeof(struct cpucp_pmu_ctrs) * cpu);
++
++	if (!counters_ready())
+ 		return 0;
+ 
+ 	spin_lock_irqsave(&cpu_data->read_lock, flags);
+@@ -752,7 +793,7 @@
+ 	int i, cid, aid;
+ 	unsigned int cpu;
+ 	struct event_data *event;
+-	struct cpucp_pmu_ctrs *base;
++	struct cpucp_pmu_ctrs __iomem *base;
+ 	bool pmu_valid;
+ 	u32 count;
+ 
+@@ -785,14 +826,20 @@
+ 	int i;
+ 	unsigned int cpu;
+ 	struct cpu_data *cpu_data;
+-	struct event_data *event;
+ 	unsigned long flags;
+ 
+-	if (cpuhp_state > 0)
++	/* Stop new callbacks before draining readers and releasing events. */
++	smp_store_release(&pmu_counters_enabled, false);
++	if (cpuhp_state > 0) {
++		/* This GKI-exported wrapper acquires the CPU read lock itself. */
+ 		cpuhp_remove_state_nocalls(cpuhp_state);
++		cpuhp_state = 0;
++	}
++	cpus_read_lock();
+ 	unregister_trace_android_vh_cpu_idle_enter(qcom_pmu_idle_enter_notif, NULL);
+ 	unregister_trace_android_vh_cpu_idle_exit(qcom_pmu_idle_exit_notif, NULL);
+ 	cpu_pm_unregister_notifier(&memlat_event_pm_nb);
++	tracepoint_synchronize_unregister();
+ 	for_each_possible_cpu(cpu) {
+ 		cpu_data = per_cpu(cpu_ev_data, cpu);
+ 		spin_lock_irqsave(&cpu_data->read_lock, flags);
+@@ -800,30 +847,26 @@
+ 		cpu_data->is_idle = true;
+ 		cpu_data->is_pc = true;
+ 		spin_unlock_irqrestore(&cpu_data->read_lock, flags);
+-	}
+-
++		while (atomic_read(&cpu_data->read_cnt) > 0)
++			usleep_range(10, 20);
++	}
++
++	cache_counters();
+ 	for_each_possible_cpu(cpu) {
+ 		cpu_data = per_cpu(cpu_ev_data, cpu);
+-		while (atomic_read(&cpu_data->read_cnt) > 0)
+-			udelay(10);
+-		for (i = 0; i < cpu_data->num_evs; i++) {
+-			event = &cpu_data->events[i];
+-			if (!is_event_valid(event))
+-				continue;
+-			delete_event(event);
+-		}
+-	}
++		for (i = 0; i < cpu_data->num_evs; i++)
++			delete_event(&cpu_data->events[i]);
++	}
++	cpus_read_unlock();
+ }
+ 
+ static void unload_pmu_counters(void)
+ {
+-	if (!qcom_pmu_inited || !pmu_counters_enabled)
++	if (!pmu_ready() || !counters_ready())
+ 		return;
+ 
+-	cache_counters();
+ 	delete_events();
+ 	pr_info("Disabled all perf counters\n");
+-	pmu_counters_enabled = false;
+ }
+ 
+ static int setup_events(void)
+@@ -841,82 +884,98 @@
+ 	cpus_read_lock();
+ 	for_each_possible_cpu(cpu) {
+ 		cpu_data = per_cpu(cpu_ev_data, cpu);
+-		for (i = 0; i < cpu_data->num_evs; i++) {
++		for (i = 0; i < cpu_data->num_evs && cpu_online(cpu); i++) {
+ 			event = &cpu_data->events[i];
+ 			ret = set_event(event, cpu, attr);
+ 			if (ret < 0) {
+ 				pr_err("event %d not set for cpu %d ret %d\n",
+ 					event->event_id, cpu, ret);
++				if (ret == -EPROBE_DEFER || pmu_ready())
++					goto cleanup_events;
++				/* Optional unsupported events retain baseline behavior. */
+ 				event->event_id = 0;
+-				/*
+-				 * Only return error for -EPROBE_DEFER. Clear
+-				 * ret for all other cases as it is okay for
+-				 * some events to fail.
+-				 */
+-				if (ret == -EPROBE_DEFER)
+-					goto cleanup_events;
+-				else
+-					ret = 0;
++				ret = 0;
+ 			}
+ 		}
+ 		spin_lock_irqsave(&cpu_data->read_lock, flags);
+-		cpu_data->is_hp = !cpumask_test_cpu(cpu, cpu_online_mask);
++		cpu_data->is_hp = !cpu_online(cpu);
+ 		cpu_data->is_idle = false;
+ 		cpu_data->is_pc = false;
+ 		spin_unlock_irqrestore(&cpu_data->read_lock, flags);
+ 	}
+ 
++	ret = register_trace_android_vh_cpu_idle_enter(qcom_pmu_idle_enter_notif, NULL);
++	if (ret)
++		goto cleanup_events;
++	ret = register_trace_android_vh_cpu_idle_exit(qcom_pmu_idle_exit_notif, NULL);
++	if (ret)
++		goto remove_enter;
++	ret = cpu_pm_register_notifier(&memlat_event_pm_nb);
++	if (ret)
++		goto remove_exit;
+ 	cpuhp_state = qcom_pmu_cpu_hp_init();
+ 	if (cpuhp_state < 0) {
+ 		ret = cpuhp_state;
+-		pr_err("qcom pmu driver failed to initialize hotplug: %d\n", ret);
+-		goto out;
+-	}
+-
++		cpuhp_state = 0;
++		goto remove_pm;
++	}
++
++	/* Publish initialized per-CPU counters before allowing hotplug/idle callbacks. */
++	smp_store_release(&pmu_counters_enabled, true);
+ 	goto out;
+ 
++remove_pm:
++	cpu_pm_unregister_notifier(&memlat_event_pm_nb);
++remove_exit:
++	unregister_trace_android_vh_cpu_idle_exit(qcom_pmu_idle_exit_notif, NULL);
++remove_enter:
++	unregister_trace_android_vh_cpu_idle_enter(qcom_pmu_idle_enter_notif, NULL);
++	tracepoint_synchronize_unregister();
+ cleanup_events:
+ 	for_each_possible_cpu(cpu) {
+ 		cpu_data = per_cpu(cpu_ev_data, cpu);
+-		for (i = 0; i < cpu_data->num_evs; i++) {
+-			event = &cpu_data->events[i];
+-			delete_event(event);
+-		}
++		for (i = 0; i < cpu_data->num_evs; i++)
++			delete_event(&cpu_data->events[i]);
++		spin_lock_irqsave(&cpu_data->read_lock, flags);
++		cpu_data->is_hp = true;
++		cpu_data->is_idle = true;
++		cpu_data->is_pc = true;
++		spin_unlock_irqrestore(&cpu_data->read_lock, flags);
+ 	}
+ out:
+ 	cpus_read_unlock();
+-	if (ret != -EPROBE_DEFER && ret != cpuhp_state) {
+-		register_trace_android_vh_cpu_idle_enter(qcom_pmu_idle_enter_notif, NULL);
+-		register_trace_android_vh_cpu_idle_exit(qcom_pmu_idle_exit_notif, NULL);
+-		cpu_pm_register_notifier(&memlat_event_pm_nb);
+-	}
+ 	kfree(attr);
+ 	return ret;
+ }
+ 
+-static void load_pmu_counters(void)
++static int load_pmu_counters(void)
+ {
+ 	int ret;
+ 
+-	if (pmu_counters_enabled)
+-		return;
++	if (counters_ready())
++		return 0;
+ 
+ 	ret = setup_events();
+-	if (ret < 0) {
+-		pr_err("Error setting up counters %d\n", ret);
+-		return;
+-	}
+-	configure_cpucp_map(*cpu_possible_mask);
+-	pmu_counters_enabled = true;
++	if (ret < 0)
++		return ret;
++
++	cpus_read_lock();
++	ret = configure_cpucp_map(*cpu_possible_mask);
++	cpus_read_unlock();
++	if (ret) {
++		delete_events();
++		return ret;
++	}
+ 	pr_info("Enabled all perf counters\n");
+-}
+-
+-int cpucp_pmu_init(struct scmi_device *sdev)
++	return 0;
++}
++
++static int cpucp_pmu_init_locked(struct scmi_device *sdev)
+ {
+ 	int pcpu, ret = 0;
+ 	uint32_t cpu;
+ 
+-	if (!sdev || !sdev->handle || !pmu_base)
++	if (IS_ERR_OR_NULL(sdev) || !sdev->handle || !pmu_base)
+ 		return -EINVAL;
+ 
+ #if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+@@ -934,11 +993,14 @@
+ 		pcpu = cpu_logical_to_phys(cpu);
+ 		if (pcpu < 0)
+ 			pcpu = cpu;
++		if (pcpu >= MAX_NUM_CPUS || cpu >= BITS_PER_LONG) {
++			ops = NULL;
++			return -ERANGE;
++		}
+ 		phys_cpu[cpu] = pcpu;
+ 	}
+ 	/*
+-	 * If communication with cpucp doesn't succeed here the device memory
+-	 * will be de-allocated. Make ops NULL to avoid further scmi calls.
++	 * Disable further SCMI calls if firmware rejects PMU configuration.
+ 	 */
+ 	ret = configure_cpucp_map(*cpu_possible_mask);
+ 	if (ret < 0) {
+@@ -952,6 +1014,16 @@
+ 
+ 	return ret;
+ }
++
++int cpucp_pmu_init(struct scmi_device *sdev)
++{
++	guard(mutex)(&pmu_control_lock);
++	guard(cpus_read_lock)();
++
++	if (!pmu_ready())
++		return -EPROBE_DEFER;
++	return cpucp_pmu_init_locked(sdev);
++}
+ EXPORT_SYMBOL_GPL(cpucp_pmu_init);
+ 
+ static int configure_pmu_event(u32 event_id, int amu_id, int cid, int cpu)
+@@ -959,7 +1031,7 @@
+ 	struct cpu_data *cpu_data;
+ 	struct event_data *event;
+ 
+-	if (!event_id || !cpumask_test_cpu(cpu, cpu_possible_mask))
++	if (!event_id || ((unsigned int)cpu >= nr_cpu_ids || !cpu_possible(cpu)))
+ 		return -EINVAL;
+ 
+ 	cpu_data = per_cpu(cpu_ev_data, cpu);
+@@ -968,6 +1040,7 @@
+ 
+ 	event = &cpu_data->events[cpu_data->num_evs];
+ 	event->event_id = event_id;
++	event->cpu = cpu;
+ 	event->amu_id = amu_id;
+ 	event->cid = cid;
+ 	cpu_data->num_evs++;
+@@ -994,7 +1067,7 @@
+ 	if (len % NUM_COL || len == 0)
+ 		return -EINVAL;
+ 	len /= NUM_COL;
+-	if (len >= MAX_PMU_EVS)
++	if (len > MAX_PMU_EVS)
+ 		return -ENOSPC;
+ 
+ 	for (i = 0, j = 0; i < len; i++, j += NUM_COL) {
+@@ -1019,8 +1092,8 @@
+ 		if (ret < 0)
+ 			return -EINVAL;
+ 
+-		for_each_cpu(cpu, to_cpumask(&cpus)) {
+-			if (cpumask_test_cpu(cpu, cpu_possible_mask)) {
++		for_each_set_bit(cpu, &cpus, 32) {
++			if (cpu < nr_cpu_ids && cpu_possible(cpu)) {
+ 				ret = configure_pmu_event(event_id, amu_id, cid, cpu);
+ 				if (ret < 0)
+ 					return ret;
+@@ -1055,7 +1128,7 @@
+ static ssize_t show_enable_counters(struct kobject *kobj,
+ 				    struct attribute *attr, char *buf)
+ {
+-	return scnprintf(buf, PAGE_SIZE, "%u\n", pmu_counters_enabled);
++	return sysfs_emit(buf, "%u\n", counters_ready());
+ }
+ 
+ #define DISABLE_MAGIC	"DEADBEEF"
+@@ -1064,10 +1137,19 @@
+ 				     struct attribute *attr, const char *buf,
+ 				     size_t count)
+ {
+-	if (sysfs_streq(buf, ENABLE_MAGIC))
+-		load_pmu_counters();
+-	else if (sysfs_streq(buf, DISABLE_MAGIC))
++	int ret;
++
++	if (!pmu_ready())
++		return -EPROBE_DEFER;
++	guard(mutex)(&pmu_control_lock);
++
++	if (sysfs_streq(buf, ENABLE_MAGIC)) {
++		ret = load_pmu_counters();
++		if (ret)
++			return ret;
++	} else if (sysfs_streq(buf, DISABLE_MAGIC)) {
+ 		unload_pmu_counters();
++	}
+ 
+ 	return count;
+ }
+@@ -1075,7 +1157,7 @@
+ static ssize_t show_enable_trace(struct kobject *kobj,
+ 				    struct attribute *attr, char *buf)
+ {
+-	return scnprintf(buf, PAGE_SIZE, "%u\n", pmu_enable_trace);
++	return sysfs_emit(buf, "%u\n", READ_ONCE(pmu_enable_trace));
+ }
+ 
+ static ssize_t store_enable_trace(struct kobject *kobj,
+@@ -1084,6 +1166,10 @@
+ {
+ 	unsigned int var;
+ 	int ret;
++
++	if (!pmu_ready())
++		return -EPROBE_DEFER;
++	guard(mutex)(&pmu_control_lock);
+ 
+ 	if (!ops)
+ 		return -ENODEV;
+@@ -1145,7 +1231,13 @@
+ 	.store	= attr_store,
+ };
+ 
++static void pmu_settings_release(struct kobject *kobj)
++{
++	kfree(kobj);
++}
++
+ static const struct kobj_type pmu_settings_ktype = {
++	.release = pmu_settings_release,
+ 	.sysfs_ops	= &pmu_sysfs_ops,
+ 	.default_groups	= pmu_settings_groups,
+ 
+@@ -1154,104 +1246,106 @@
+ static int qcom_pmu_driver_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev, *dev_root;
+-	int ret = 0, idx, len;
++	struct kobject *pmu_kobj;
++	int ret, idx;
+ 	unsigned int cpu;
+ 	struct cpu_data *cpu_data;
+ 	struct resource res;
+ #if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+-	int cpucp_ret = 0;
+ 	struct scmi_device *scmi_dev;
+-
++#endif
++
++	guard(mutex)(&pmu_control_lock);
++	if (pmu_ready())
++		return -EBUSY;
++
++#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+ 	scmi_dev = get_qcom_scmi_device();
+-	if (IS_ERR(scmi_dev)) {
+-		ret = PTR_ERR(scmi_dev);
+-		if (ret == -EPROBE_DEFER)
+-			return ret;
+-		dev_err(dev, "Error getting scmi_dev ret = %d\n", ret);
+-	}
++	if (IS_ERR(scmi_dev))
++		return PTR_ERR(scmi_dev);
+ #endif
+ 	ret = cpu_logical_to_phys(0);
+ 	if (ret == -EPROBE_DEFER)
+ 		return ret;
+ 
+-	if (!pmu_base) {
+-		idx = of_property_match_string(dev->of_node, "reg-names", "pmu-base");
+-		if (idx < 0) {
+-			dev_dbg(dev, "pmu base not found\n");
+-			goto skip_pmu;
++	idx = of_property_match_string(dev->of_node, "reg-names", "pmu-base");
++	if (idx >= 0) {
++		ret = of_address_to_resource(dev->of_node, idx, &res);
++		if (ret)
++			return ret;
++		if (resource_size(&res) < sizeof(struct cpucp_pmu_ctrs) * nr_cpu_ids)
++			return -EINVAL;
++		pmu_base = ioremap(res.start, resource_size(&res));
++		if (!pmu_base)
++			return -ENOMEM;
++		memset_io(pmu_base, 0, resource_size(&res));
++	}
++
++	pmu_long_counter = false;
++	llcc_ignore_setup = of_property_read_bool(dev->of_node, "qcom,ignore-llcc-setup");
++	memset(cpucp_map, 0, sizeof(cpucp_map));
++	for_each_possible_cpu(cpu) {
++		cpu_data = kzalloc(sizeof(*cpu_data), GFP_KERNEL);
++		if (!cpu_data) {
++			ret = -ENOMEM;
++			goto free_data;
+ 		}
+-		ret = of_address_to_resource(dev->of_node, idx, &res);
+-		if (ret < 0) {
+-			dev_err(dev, "failed to get resource ret %d\n", ret);
+-			goto skip_pmu;
+-		}
+-		pmu_base = devm_ioremap(dev, res.start, resource_size(&res));
+-		if (!pmu_base)
+-			goto skip_pmu;
+-		/* Zero out the pmu memory region */
+-		memset_io(pmu_base, 0, resource_size(&res));
+-	}
+-skip_pmu:
+-	if (of_find_property(dev->of_node, "qcom,ignore-llcc-setup", &len)) {
+-		dev_dbg(dev, "Ignoring llcc setup\n");
+-		llcc_ignore_setup = true;
+-	}
+-
+-	for_each_possible_cpu(cpu) {
+-		cpu_data = devm_kzalloc(dev, sizeof(*cpu_data), GFP_KERNEL);
+-		if (!cpu_data)
+-			return -ENOMEM;
+-
+ 		spin_lock_init(&cpu_data->read_lock);
+ 		atomic_set(&cpu_data->read_cnt, 0);
+ 		per_cpu(cpu_ev_data, cpu) = cpu_data;
+ 	}
+ 
+ 	ret = init_pmu_events(dev);
+-	if (ret < 0) {
+-		dev_err(dev, "failed to initialize pmu events: %d\n", ret);
+-		return ret;
+-	}
++	if (ret)
++		goto free_data;
++	ret = setup_events();
++	if (ret)
++		goto free_data;
+ 
+ 	dev_root = bus_get_dev_root(&cpu_subsys);
+-	if (dev_root) {
+-		ret = kobject_init_and_add(&pmu_kobj, &pmu_settings_ktype,
+-						&dev_root->kobj, "pmu_lib");
++	if (!dev_root) {
++		ret = -ENODEV;
++		goto stop_events;
++	}
++	pmu_kobj = kzalloc(sizeof(*pmu_kobj), GFP_KERNEL);
++	if (!pmu_kobj) {
+ 		put_device(dev_root);
+-	} else {
+-		dev_err(dev, "failed to get cpu_subsys dev_root\n");
+-		return -ENODEV;
+-	}
+-	if (ret < 0) {
+-		dev_err(dev, "failed to init pmu counters kobj: %d\n", ret);
+-		kobject_put(&pmu_kobj);
+-		return ret;
+-	}
+-
+-	ret = setup_events();
+-	if (ret < 0) {
+-		dev_err(dev, "failed to setup all pmu/amu events: %d\n", ret);
+-		kobject_put(&pmu_kobj);
+-		return ret;
+-	}
+-
+-	qcom_pmu_inited = true;
++		ret = -ENOMEM;
++		goto stop_events;
++	}
++	ret = kobject_init_and_add(pmu_kobj, &pmu_settings_ktype,
++				   &dev_root->kobj, "pmu_lib");
++	put_device(dev_root);
++	if (ret) {
++		kobject_put(pmu_kobj);
++		goto stop_events;
++	}
++
++	/* Publish the permanent service only after all fallible setup is complete. */
++	smp_store_release(&qcom_pmu_inited, true);
+ #if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+-	if (!IS_ERR(scmi_dev) && pmu_base) {
+-		cpucp_ret = cpucp_pmu_init(scmi_dev);
+-		if (cpucp_ret < 0)
+-			dev_err(dev, "Err during cpucp_pmu_init ret = %d\n", cpucp_ret);
++	if (pmu_base) {
++		cpus_read_lock();
++		ret = cpucp_pmu_init_locked(scmi_dev);
++		cpus_read_unlock();
++		if (ret)
++			dev_err(dev, "CPUCP PMU configuration failed: %d\n", ret);
+ 	}
+ #endif
++	return 0;
++
++stop_events:
++	delete_events();
++free_data:
++	for_each_possible_cpu(cpu) {
++		kfree(per_cpu(cpu_ev_data, cpu));
++		per_cpu(cpu_ev_data, cpu) = NULL;
++	}
++	if (pmu_base) {
++		iounmap(pmu_base);
++		pmu_base = NULL;
++	}
+ 	return ret;
+-}
+-
+-static int qcom_pmu_driver_remove(struct platform_device *pdev)
+-{
+-	qcom_pmu_inited = false;
+-	delete_events();
+-
+-	return 0;
+ }
+ 
+ static const struct of_device_id pmu_match_table[] = {
+@@ -1261,14 +1355,13 @@
+ 
+ static struct platform_driver qcom_pmu_driver = {
+ 	.probe = qcom_pmu_driver_probe,
+-	.remove = qcom_pmu_driver_remove,
+ 	.driver = {
+ 		.name = "qcom-pmu",
+ 		.of_match_table = pmu_match_table,
+ 		.suppress_bind_attrs = true,
+ 	},
+ };
+-module_platform_driver(qcom_pmu_driver);
++builtin_platform_driver(qcom_pmu_driver);
+ 
+ #if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+ MODULE_SOFTDEP("pre: qcom_scmi_client");

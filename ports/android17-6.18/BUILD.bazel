@@ -1104,6 +1104,22 @@ ddk_module(
     deps = [":dcvs_headers", ":interconnect_headers", ":dcvs_fp"],
 )
 
+ddk_headers(
+    name = "pmu_headers",
+    hdrs = ["include/soc/qcom/pmu_lib.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "qcom_pmu_lib",
+    srcs = ["drivers/soc/qcom/dcvs/pmu_lib.c"],
+    out = "qcom-pmu-lib.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":pmu_headers", ":cache_irq_headers", ":scmi_vendor_headers", ":cpu_phys_log_map", ":qcom_llcc_pmu", ":qcom_scmi_client"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1176,6 +1192,7 @@ kernel_module_group(
         ":qcom_scmi_client",
         ":dcvs_fp",
         ":qcom_dcvs",
+        ":qcom_pmu_lib",
     ],
 )
 
