@@ -1076,6 +1076,34 @@ ddk_module(
     deps = [":scmi_vendor_headers"],
 )
 
+ddk_headers(
+    name = "dcvs_headers",
+    hdrs = ["drivers/soc/qcom/dcvs/dcvs_private.h", "drivers/soc/qcom/dcvs/trace-dcvs.h", "include/soc/qcom/dcvs.h", "include/soc/qcom/of_common.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "dcvs_fp",
+    srcs = ["drivers/soc/qcom/dcvs/dcvs_fp.c"],
+    out = "dcvs_fp.ko",
+    includes = ["drivers/soc/qcom/dcvs"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":dcvs_headers", ":platform_headers", ":cmd_db", ":qcom_rpmh"],
+)
+
+ddk_module(
+    name = "qcom_dcvs",
+    srcs = ["drivers/soc/qcom/dcvs/dcvs.c", "drivers/soc/qcom/dcvs/dcvs_icc.c", "drivers/soc/qcom/dcvs/dcvs_epss.c", "drivers/soc/qcom/dcvs/trace-dcvs.c"],
+    out = "qcom-dcvs.ko",
+    includes = ["drivers/soc/qcom/dcvs"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":dcvs_headers", ":interconnect_headers", ":dcvs_fp"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1146,6 +1174,8 @@ kernel_module_group(
         ":qcom_cpucp",
         ":qcom_scmi_vendor",
         ":qcom_scmi_client",
+        ":dcvs_fp",
+        ":qcom_dcvs",
     ],
 )
 

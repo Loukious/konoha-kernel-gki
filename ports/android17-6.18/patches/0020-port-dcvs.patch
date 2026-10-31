@@ -1,0 +1,908 @@
+--- a/drivers/soc/qcom/dcvs/dcvs.c
++++ b/drivers/soc/qcom/dcvs/dcvs.c
+@@ -16,6 +16,8 @@
+ #include <linux/interrupt.h>
+ #include <linux/slab.h>
+ #include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/rculist.h>
+ #include <linux/of_fdt.h>
+ #include <linux/of_address.h>
+ #include <linux/of_device.h>
+@@ -45,9 +47,10 @@
+ };
+ 
+ struct dcvs_voter {
+-	const char		*name;
+ 	struct dcvs_freq	freq;
+ 	struct list_head	node;
++	struct rcu_head	rcu;
++	char			name[];
+ };
+ 
+ struct qcom_dcvs_data {
+@@ -56,9 +59,22 @@
+ 	u32			num_hw;
+ 	u32			num_inited_hw;
+ 	bool			inited;
+-
+-};
+-static struct qcom_dcvs_data	*dcvs_data;
++	bool			root_ready;
++
++};
++
++static struct qcom_dcvs_data *dcvs_data;
++static DEFINE_MUTEX(dcvs_init_lock);
++
++static bool dcvs_ready(void)
++{
++	struct qcom_dcvs_data *data;
++
++	guard(rcu)();
++	data = READ_ONCE(dcvs_data);
++	/* Paired with publication after all hardware paths are initialized. */
++	return data && smp_load_acquire(&data->inited);
++}
+ 
+ static u32 get_target_freq(struct dcvs_path *path, u32 freq);
+ 
+@@ -119,6 +135,8 @@
+ 	struct dcvs_voter *voter;
+ 	struct dcvs_freq new_freq;
+ 
++	guard(mutex)(&dcvs_init_lock);
++
+ 	ret = kstrtouint(buf, 10, &val);
+ 	if (ret < 0)
+ 		return ret;
+@@ -162,6 +180,8 @@
+ 	struct dcvs_path *path;
+ 	u32 cur_freq = 0;
+ 
++	guard(mutex)(&dcvs_init_lock);
++
+ 	for (i = 0; i < NUM_DCVS_PATHS; i++) {
+ 		path = hw->dcvs_paths[i];
+ 		if (!path)
+@@ -244,11 +264,23 @@
+ 	.store	= attr_store,
+ };
+ 
++static void qcom_dcvs_release(struct kobject *kobj)
++{
++	kfree(container_of(kobj, struct qcom_dcvs_data, kobj));
++}
++
++static void dcvs_hw_release(struct kobject *kobj)
++{
++	kfree(to_dcvs_hw(kobj));
++}
++
+ static const struct kobj_type qcom_dcvs_ktype = {
++	.release = qcom_dcvs_release,
+ 	.sysfs_ops	= &qcom_dcvs_sysfs_ops,
+ };
+ 
+ static const struct kobj_type dcvs_hw_ktype = {
++	.release = dcvs_hw_release,
+ 	.sysfs_ops	= &qcom_dcvs_sysfs_ops,
+ 	.default_groups	= dcvs_hw_groups,
+ };
+@@ -256,6 +288,10 @@
+ static inline struct dcvs_path *get_dcvs_path(enum dcvs_hw_type hw,
+ 						enum dcvs_path_type path)
+ {
++	if ((unsigned int)hw >= NUM_DCVS_HW_TYPES ||
++	    (unsigned int)path >= NUM_DCVS_PATHS)
++		return NULL;
++
+ 	if (dcvs_data && dcvs_data->hw_devs[hw] &&
+ 			dcvs_data->hw_devs[hw]->dcvs_paths[path])
+ 		return dcvs_data->hw_devs[hw]->dcvs_paths[path];
+@@ -298,7 +334,8 @@
+ 	struct dcvs_freq new_freq;
+ 	enum dcvs_hw_type hw_type;
+ 
+-	if (!name || !votes || !update_mask)
++	if (!name || !votes || !update_mask ||
++	    (update_mask & ~GENMASK(NUM_DCVS_HW_TYPES - 1, 0)))
+ 		return -EINVAL;
+ 
+ 	for (i = 0; i < NUM_DCVS_HW_TYPES; i++) {
+@@ -352,7 +389,10 @@
+ 	struct dcvs_freq new_freqs[NUM_DCVS_HW_TYPES];
+ 	enum dcvs_hw_type hw_type;
+ 
+-	if (!name || !votes || !update_mask)
++	guard(rcu)();
++
++	if (!name || !votes || !update_mask ||
++	    (update_mask & ~GENMASK(NUM_DCVS_HW_TYPES - 1, 0)))
+ 		return -EINVAL;
+ 
+ 	for (i = 0; i < NUM_DCVS_HW_TYPES; i++) {
+@@ -365,8 +405,7 @@
+ 			return -EINVAL;
+ 
+ 		/* should match one and only voter in list */
+-		voter = list_first_entry(&path->voter_list, struct dcvs_voter,
+-									node);
++		voter = list_first_or_null_rcu(&path->voter_list, struct dcvs_voter, node);
+ 		if (!voter || strcmp(voter->name, name))
+ 			return -EINVAL;
+ 
+@@ -398,7 +437,10 @@
+ 	struct dcvs_freq new_freq;
+ 	enum dcvs_hw_type hw_type;
+ 
+-	if (!name || !votes || !update_mask)
++	guard(rcu)();
++
++	if (!name || !votes || !update_mask ||
++	    (update_mask & ~GENMASK(NUM_DCVS_HW_TYPES - 1, 0)))
+ 		return -EINVAL;
+ 
+ 	for (i = 0; i < NUM_DCVS_HW_TYPES; i++) {
+@@ -410,8 +452,7 @@
+ 			return -EINVAL;
+ 
+ 		/* should match one and only voter in list */
+-		voter = list_first_entry(&path->voter_list, struct dcvs_voter,
+-									node);
++		voter = list_first_or_null_rcu(&path->voter_list, struct dcvs_voter, node);
+ 		if (!voter || strcmp(voter->name, name))
+ 			return -EINVAL;
+ 
+@@ -433,6 +474,9 @@
+ int qcom_dcvs_update_votes(const char *name, struct dcvs_freq *votes,
+ 				u32 update_mask, enum dcvs_path_type path)
+ {
++	if (!dcvs_ready())
++		return -EPROBE_DEFER;
++
+ 	switch (path) {
+ 	case DCVS_SLOW_PATH:
+ 		return qcom_dcvs_sp_update(name, votes, update_mask);
+@@ -455,10 +499,11 @@
+ 	struct dcvs_voter *voter;
+ 	struct dcvs_path *path;
+ 
+-	if (!name || hw_type >= NUM_DCVS_HW_TYPES || path_type >= NUM_DCVS_PATHS)
++	if (!name || (unsigned int)hw_type >= NUM_DCVS_HW_TYPES ||
++	    (unsigned int)path_type >= NUM_DCVS_PATHS)
+ 		return -EINVAL;
+ 
+-	if (!dcvs_data->inited)
++	if (!dcvs_ready())
+ 		return -EPROBE_DEFER;
+ 
+ 	path = get_dcvs_path(hw_type, path_type);
+@@ -476,13 +521,13 @@
+ 			goto unlock_out;
+ 		}
+ 
+-	voter = kzalloc(sizeof(*voter), GFP_KERNEL);
++	voter = kzalloc(struct_size(voter, name, strlen(name) + 1), GFP_KERNEL);
+ 	if (!voter) {
+ 		ret = -ENOMEM;
+ 		goto unlock_out;
+ 	}
+-	voter->name = name;
+-	list_add_tail(&voter->node, &path->voter_list);
++	strscpy(voter->name, name, strlen(name) + 1);
++	list_add_tail_rcu(&voter->node, &path->voter_list);
+ 	path->num_voters++;
+ 
+ unlock_out:
+@@ -499,8 +544,12 @@
+ 	struct dcvs_path *path;
+ 	bool found = false;
+ 
+-	if (!name || hw_type >= NUM_DCVS_HW_TYPES || path_type >= NUM_DCVS_PATHS)
++	if (!name || (unsigned int)hw_type >= NUM_DCVS_HW_TYPES ||
++	    (unsigned int)path_type >= NUM_DCVS_PATHS)
+ 		return -EINVAL;
++
++	if (!dcvs_ready())
++		return -EPROBE_DEFER;
+ 
+ 	path = get_dcvs_path(hw_type, path_type);
+ 	if (!path)
+@@ -519,8 +568,8 @@
+ 	}
+ 
+ 	path->num_voters--;
+-	list_del(&voter->node);
+-	kfree(voter);
++	list_del_rcu(&voter->node);
++	kfree_rcu(voter, rcu);
+ 
+ unlock_out:
+ 	mutex_unlock(&path->voter_lock);
+@@ -532,10 +581,10 @@
+ {
+ 	struct kobject *kobj;
+ 
+-	if (type > NUM_DCVS_HW_TYPES)
++	if ((unsigned int)type > NUM_DCVS_HW_TYPES)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	if (!dcvs_data->inited)
++	if (!dcvs_ready())
+ 		return ERR_PTR(-EPROBE_DEFER);
+ 
+ 	if (type == NUM_DCVS_HW_TYPES)
+@@ -556,10 +605,10 @@
+ {
+ 	struct dcvs_hw *hw;
+ 
+-	if (hw_type >= NUM_DCVS_HW_TYPES)
++	if ((unsigned int)hw_type >= NUM_DCVS_HW_TYPES)
+ 		return -EINVAL;
+ 
+-	if (!dcvs_data->inited)
++	if (!dcvs_ready())
+ 		return -EPROBE_DEFER;
+ 
+ 	hw = dcvs_data->hw_devs[hw_type];
+@@ -597,14 +646,14 @@
+ 	int i;
+ 	struct dcvs_hw *hw;
+ 
+-	if (dcvs_data->num_inited_hw < dcvs_data->num_hw)
++	if (!dcvs_data->root_ready || dcvs_data->num_inited_hw < dcvs_data->num_hw)
+ 		return false;
+ 
+ 	for (i = 0; i < NUM_DCVS_HW_TYPES; i++) {
+ 		hw = dcvs_data->hw_devs[i];
+ 		if (!hw)
+ 			continue;
+-		if (hw->num_inited_paths < hw->num_paths)
++		if (!hw->populated || hw->num_inited_paths < hw->num_paths)
+ 			return false;
+ 	}
+ 
+@@ -615,18 +664,19 @@
+ static int populate_freq_table(struct device *dev, u32 **freq_table)
+ {
+ 	int ret, len;
+-	struct device_node *of_tbl_node, *of_node = dev->of_node;
+-
+-	of_node = of_parse_phandle(of_node, FTBL_PROP, 0);
++	struct device_node *of_tbl_node __free(device_node) = NULL;
++	struct device_node *of_node __free(device_node) = NULL;
++
++	of_node = of_parse_phandle(dev->of_node, FTBL_PROP, 0);
+ 	if (!of_node)
+-		of_node = dev->of_node;
++		of_node = of_node_get(dev->of_node);
+ 
+ 	if (of_get_child_count(of_node))
+ 		of_tbl_node = qcom_dcvs_get_ddr_child_node(of_node);
+ 	else
+-		of_tbl_node = of_node;
+-
+-	if (!of_find_property(of_tbl_node, FTBL_PROP, &len)) {
++		of_tbl_node = of_node_get(of_node);
++
++	if (!of_tbl_node || !of_find_property(of_tbl_node, FTBL_PROP, &len)) {
+ 		dev_err(dev, "Unable to find freq tbl prop\n");
+ 		ret = -EINVAL;
+ 		goto out;
+@@ -652,43 +702,76 @@
+ 	ret = len;
+ 
+ out:
+-	if (of_node != dev->of_node)
+-		of_node_put(of_node);
+-	return ret;
++	return ret;
++}
++
++static void dcvs_root_cleanup(void *arg)
++{
++	struct qcom_dcvs_data *data = arg;
++
++	mutex_lock(&dcvs_init_lock);
++	WRITE_ONCE(data->inited, false);
++	if (dcvs_data == data)
++		WRITE_ONCE(dcvs_data, NULL);
++	mutex_unlock(&dcvs_init_lock);
++	synchronize_rcu();
++	kobject_del(&data->kobj);
++	kobject_put(&data->kobj);
++}
++
++static void dcvs_hw_cleanup(void *arg)
++{
++	struct dcvs_hw *hw = arg;
++
++	mutex_lock(&dcvs_init_lock);
++	if (dcvs_data && dcvs_data->hw_devs[hw->type] == hw) {
++		WRITE_ONCE(dcvs_data->inited, false);
++		dcvs_data->hw_devs[hw->type] = NULL;
++		dcvs_data->num_inited_hw--;
++	}
++	mutex_unlock(&dcvs_init_lock);
++	if (dev_get_drvdata(hw->dev) == hw)
++		dev_set_drvdata(hw->dev, NULL);
++	kobject_del(&hw->kobj);
++	kobject_put(&hw->kobj);
+ }
+ 
+ static int qcom_dcvs_dev_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev, *dev_root;
++	struct qcom_dcvs_data *data;
+ 	int ret;
+ 
+-	dcvs_data = devm_kzalloc(dev, sizeof(*dcvs_data), GFP_KERNEL);
+-	if (!dcvs_data)
++	data = kzalloc(sizeof(*data), GFP_KERNEL);
++	if (!data)
+ 		return -ENOMEM;
+-
+-	dcvs_data->num_hw = of_get_available_child_count(dev->of_node);
+-	if (!dcvs_data->num_hw) {
+-		dev_err(dev, "No dcvs hw nodes provided!\n");
+-		return -ENODEV;
++	kobject_init(&data->kobj, &qcom_dcvs_ktype);
++
++	data->num_hw = of_get_available_child_count(dev->of_node);
++	if (!data->num_hw) {
++		ret = -ENODEV;
++		goto put_kobj;
+ 	}
+ 
+ 	dev_root = bus_get_dev_root(&cpu_subsys);
+-	if (dev_root) {
+-		ret = kobject_init_and_add(&dcvs_data->kobj, &qcom_dcvs_ktype,
+-						&dev_root->kobj, "bus_dcvs");
+-		put_device(dev_root);
+-	} else {
+-		dev_err(dev, "failed to get cpu_subsys dev_root\n");
+-		return -ENODEV;
+-	}
+-	if (ret < 0) {
+-		dev_err(dev, "failed to init qcom-dcvs kobj: %d\n", ret);
+-		kobject_put(&dcvs_data->kobj);
++	if (!dev_root) {
++		ret = -ENODEV;
++		goto put_kobj;
++	}
++	ret = kobject_add(&data->kobj, &dev_root->kobj, "bus_dcvs");
++	put_device(dev_root);
++	if (ret)
++		goto put_kobj;
++
++	ret = devm_add_action_or_reset(dev, dcvs_root_cleanup, data);
++	if (ret)
+ 		return ret;
+-	}
+-	dev_dbg(dev, "Created kobj: %s\n", kobject_name(&dcvs_data->kobj));
+-
++	WRITE_ONCE(dcvs_data, data);
+ 	return 0;
++
++put_kobj:
++	kobject_put(&data->kobj);
++	return ret;
+ }
+ 
+ static int qcom_dcvs_hw_probe(struct platform_device *pdev)
+@@ -704,21 +787,22 @@
+ 	}
+ 
+ 	ret = of_property_read_u32(dev->of_node, QCOM_DCVS_HW_PROP, &hw_type);
+-	if (ret < 0 || hw_type >= NUM_DCVS_HW_TYPES) {
++	if (ret < 0 || (unsigned int)hw_type >= NUM_DCVS_HW_TYPES) {
+ 		dev_err(dev, "Invalid dcvs hw type:%d, ret:%d\n", hw_type, ret);
+ 		return -ENODEV;
+ 	}
+ 
+-	hw = devm_kzalloc(dev, sizeof(*hw), GFP_KERNEL);
++	hw = kzalloc(sizeof(*hw), GFP_KERNEL);
+ 	if (!hw)
+ 		return -ENOMEM;
+ 	hw->dev = dev;
+ 	hw->type = hw_type;
+-
++	kobject_init(&hw->kobj, &dcvs_hw_ktype);
+ 	hw->num_paths = of_get_available_child_count(dev->of_node);
+ 	if (!hw->num_paths) {
+ 		dev_err(dev, "No dcvs paths provided!\n");
+-		return -ENODEV;
++		ret = -ENODEV;
++		goto put_kobj;
+ 	}
+ 
+ 	if (hw_type == DCVS_L3)
+@@ -728,7 +812,9 @@
+ 
+ 	if (ret <= 0) {
+ 		dev_err(dev, "Error reading freq table: %d\n", ret);
+-		return ret;
++		if (!ret)
++			ret = -EINVAL;
++		goto put_kobj;
+ 	}
+ 	hw->table_len = ret;
+ 
+@@ -739,23 +825,53 @@
+ 								&hw->width);
+ 	if (ret < 0 || !hw->width) {
+ 		dev_err(dev, "Missing or invalid bus-width: %d\n", ret);
+-		return -EINVAL;
+-	}
+-
+-	ret = kobject_init_and_add(&hw->kobj, &dcvs_hw_ktype,
+-			&dcvs_data->kobj, dcvs_hw_names[hw_type]);
++		ret = -EINVAL;
++		goto put_kobj;
++	}
++
++	ret = devm_add_action_or_reset(dev, dcvs_hw_cleanup, hw);
++	if (ret)
++		return ret;
++
++	ret = kobject_add(&hw->kobj, &dcvs_data->kobj, "%s", dcvs_hw_names[hw_type]);
+ 	if (ret < 0) {
+ 		dev_err(dev, "failed to init dcvs hw kobj: %d\n", ret);
+-		kobject_put(&hw->kobj);
+ 		return ret;
+ 	}
+ 	dev_dbg(dev, "Created hw kobj: %s\n", kobject_name(&hw->kobj));
+ 
+ 	dev_set_drvdata(dev, hw);
++	mutex_lock(&dcvs_init_lock);
++	if (dcvs_data->hw_devs[hw_type]) {
++		mutex_unlock(&dcvs_init_lock);
++		return -EEXIST;
++	}
+ 	dcvs_data->hw_devs[hw_type] = hw;
+ 	dcvs_data->num_inited_hw++;
+-
+-	return ret;
++	mutex_unlock(&dcvs_init_lock);
++
++	return ret;
++
++put_kobj:
++	kobject_put(&hw->kobj);
++	return ret;
++}
++
++static void dcvs_path_cleanup(void *arg)
++{
++	struct dcvs_path *path = arg;
++	struct dcvs_hw *hw = path->hw;
++
++	mutex_lock(&dcvs_init_lock);
++	if (hw->dcvs_paths[path->type] == path) {
++		if (dcvs_data)
++			WRITE_ONCE(dcvs_data->inited, false);
++		hw->dcvs_paths[path->type] = NULL;
++		hw->num_inited_paths--;
++	}
++	mutex_unlock(&dcvs_init_lock);
++	if (path->type == DCVS_FAST_PATH)
++		teardown_ddrllcc_fp_device(hw, path);
+ }
+ 
+ static int qcom_dcvs_path_probe(struct platform_device *pdev)
+@@ -774,7 +890,7 @@
+ 
+ 	ret = of_property_read_u32(dev->of_node, QCOM_DCVS_PATH_PROP,
+ 								&path_type);
+-	if (ret < 0 || path_type >= NUM_DCVS_PATHS) {
++	if (ret < 0 || (unsigned int)path_type >= NUM_DCVS_PATHS) {
+ 		dev_err(dev, "Invalid path type:%d, ret:%d\n", path_type, ret);
+ 		return -ENODEV;
+ 	}
+@@ -815,7 +931,7 @@
+ 			dev_err(dev, "Unsupported HW for path: %d\n", ret);
+ 			return -EINVAL;
+ 		}
+-		path->percpu_cur_freqs = devm_kzalloc(dev, num_possible_cpus() *
++		path->percpu_cur_freqs = devm_kzalloc(dev, nr_cpu_ids *
+ 						sizeof(*path->percpu_cur_freqs),
+ 						GFP_KERNEL);
+ 		if (!path->percpu_cur_freqs)
+@@ -842,14 +958,26 @@
+ 		new_freqs[hw->type].hw_type = hw->type;
+ 		ret = path->commit_dcvs_freqs(path, &new_freqs[hw->type], 1);
+ 		if (ret < 0)
+-			dev_err(dev, "Err committing freq for path=%d\n", ret);
+-	}
+-
++			return dev_err_probe(dev, ret, "Failed to set initial frequency\n");
++	}
++
++	ret = devm_add_action_or_reset(dev, dcvs_path_cleanup, path);
++	if (ret)
++		return ret;
++
++	mutex_lock(&dcvs_init_lock);
++	if (hw->dcvs_paths[path_type]) {
++		mutex_unlock(&dcvs_init_lock);
++		return -EEXIST;
++	}
+ 	hw->dcvs_paths[path_type] = path;
+ 	hw->num_inited_paths++;
+ 
+-	if (qcom_dcvs_hw_and_paths_inited())
+-		dcvs_data->inited = true;
++	if (qcom_dcvs_hw_and_paths_inited()) {
++		/* Publish device, path and voter-list initialization to consumers. */
++		smp_store_release(&dcvs_data->inited, true);
++	}
++	mutex_unlock(&dcvs_init_lock);
+ 
+ 	return ret;
+ }
+@@ -872,13 +1000,33 @@
+ 			break;
+ 		}
+ 		ret = qcom_dcvs_dev_probe(pdev);
+-		if (!ret && of_get_available_child_count(dev->of_node))
+-			of_platform_populate(dev->of_node, NULL, NULL, dev);
++		if (!ret)
++			ret = devm_of_platform_populate(dev);
++		if (!ret) {
++			mutex_lock(&dcvs_init_lock);
++			dcvs_data->root_ready = true;
++			if (qcom_dcvs_hw_and_paths_inited()) {
++				/* Publish paths after root population has succeeded. */
++				smp_store_release(&dcvs_data->inited, true);
++			}
++			mutex_unlock(&dcvs_init_lock);
++		}
+ 		break;
+ 	case QCOM_DCVS_HW:
+ 		ret = qcom_dcvs_hw_probe(pdev);
+ 		if (!ret && of_get_available_child_count(dev->of_node))
+-			of_platform_populate(dev->of_node, NULL, NULL, dev);
++			ret = devm_of_platform_populate(dev);
++		if (!ret) {
++			struct dcvs_hw *hw = dev_get_drvdata(dev);
++
++			mutex_lock(&dcvs_init_lock);
++			hw->populated = true;
++			if (qcom_dcvs_hw_and_paths_inited()) {
++				/* Publish paths after hardware population has succeeded. */
++				smp_store_release(&dcvs_data->inited, true);
++			}
++			mutex_unlock(&dcvs_init_lock);
++		}
+ 		break;
+ 	case QCOM_DCVS_PATH:
+ 		ret = qcom_dcvs_path_probe(pdev);
+@@ -917,7 +1065,7 @@
+ 		.suppress_bind_attrs = true,
+ 	},
+ };
+-module_platform_driver(qcom_dcvs_driver);
++builtin_platform_driver(qcom_dcvs_driver);
+ 
+ MODULE_DESCRIPTION("QCOM DCVS Driver");
+ MODULE_LICENSE("GPL");
+--- a/drivers/soc/qcom/dcvs/dcvs_fp.c
++++ b/drivers/soc/qcom/dcvs/dcvs_fp.c
+@@ -52,7 +52,7 @@
+ 	struct tcs_cmd		tcs_cmds[NUM_FP_CMDS];
+ };
+ 
+-struct ddrllcc_fp_data		*ddrllcc_data;
++static struct ddrllcc_fp_data *ddrllcc_data;
+ static DEFINE_MUTEX(ddrllcc_lock);
+ 
+ static int ddrllcc_fp_commit(struct dcvs_path *path, struct dcvs_freq *freqs,
+@@ -119,6 +119,8 @@
+ 	}
+ 	bcm->unit = le32_to_cpu(data->unit) / 1000UL;
+ 	bcm->width = le16_to_cpu(data->width);
++	if (!bcm->unit || !bcm->width)
++		return -EINVAL;
+ 	bcm->vcd = data->vcd;
+ 	dev_dbg(dev, "Got BCM %s: addr=%d, unit=%d, width=%d, vcd=%d\n",
+ 			bcm_name, bcm->addr, bcm->unit, bcm->width, bcm->vcd);
+@@ -139,6 +141,10 @@
+ 		dev_dbg(dev, "Probe deferred since FP not init yet\n");
+ 		mutex_unlock(&ddrllcc_lock);
+ 		return -EPROBE_DEFER;
++	}
++	if (ddrllcc_data->paths[hw->type]) {
++		mutex_unlock(&ddrllcc_lock);
++		return -EEXIST;
+ 	}
+ 	path->data = ddrllcc_data;
+ 	path->commit_dcvs_freqs = ddrllcc_fp_commit;
+@@ -152,6 +158,16 @@
+ }
+ EXPORT_SYMBOL_GPL(setup_ddrllcc_fp_device);
+ 
++void teardown_ddrllcc_fp_device(struct dcvs_hw *hw, struct dcvs_path *path)
++{
++	mutex_lock(&ddrllcc_lock);
++	if (ddrllcc_data && (hw->type == DCVS_DDR || hw->type == DCVS_LLCC) &&
++	    ddrllcc_data->paths[hw->type] == path)
++		ddrllcc_data->paths[hw->type] = NULL;
++	mutex_unlock(&ddrllcc_lock);
++}
++EXPORT_SYMBOL_GPL(teardown_ddrllcc_fp_device);
++
+ #define DDR_BCM_PROP	"qcom,ddr-bcm-name"
+ #define LLCC_BCM_PROP	"qcom,llcc-bcm-name"
+ static int qcom_dcvs_fp_probe(struct platform_device *pdev)
+@@ -159,6 +175,10 @@
+ 	struct device *dev = &pdev->dev;
+ 	int i, ret = 0;
+ 	struct ddrllcc_fp_data *fp_data;
++
++	ret = cmd_db_ready();
++	if (ret)
++		return ret;
+ 
+ 	mutex_lock(&ddrllcc_lock);
+ 	if (ddrllcc_data) {
+@@ -231,7 +251,7 @@
+ 		.suppress_bind_attrs = true,
+ 	},
+ };
+-module_platform_driver(qcom_dcvs_fp_driver);
++builtin_platform_driver(qcom_dcvs_fp_driver);
+ 
+ MODULE_DESCRIPTION("QCOM DCVS FP Driver");
+ MODULE_LICENSE("GPL");
+--- a/drivers/soc/qcom/dcvs/dcvs_icc.c
++++ b/drivers/soc/qcom/dcvs/dcvs_icc.c
+@@ -60,7 +60,7 @@
+ 	sp_data = devm_kzalloc(dev, sizeof(*sp_data), GFP_KERNEL);
+ 	if (!sp_data)
+ 		return -ENOMEM;
+-	sp_data->icc_path = of_icc_get(dev, NULL);
++	sp_data->icc_path = devm_of_icc_get(dev, NULL);
+ 	if (IS_ERR(sp_data->icc_path)) {
+ 		ret = PTR_ERR(sp_data->icc_path);
+ 		if (ret != -EPROBE_DEFER)
+--- a/drivers/soc/qcom/dcvs/dcvs_epss.c
++++ b/drivers/soc/qcom/dcvs/dcvs_epss.c
+@@ -26,10 +26,8 @@
+ 	void __iomem	*l3_base;
+ 	u32		l3_shared_offset;
+ 	u32		*l3_percpu_offsets;
++	resource_size_t	l3_size;
+ };
+-
+-struct epss_dev_data *epss_data;
+-static DEFINE_MUTEX(epss_lock);
+ 
+ #define L3_VOTING_OFFSET	0x90
+ #define L3_DOMAIN_OFFSET	0x1000
+@@ -74,6 +72,12 @@
+ 	if (ret < 0)
+ 		ftbl_row_size = FTBL_ROW_SIZE;
+ 
++	if (ftbl_row_size < sizeof(u32) || !IS_ALIGNED(ftbl_row_size, sizeof(u32)) ||
++	    resource_size(&res) < (MAX_L3_ENTRIES - 1) * (u64)ftbl_row_size + sizeof(u32)) {
++		iounmap(ftbl_base);
++		return -EINVAL;
++	}
++
+ 	tmp_l3_table = kcalloc(MAX_L3_ENTRIES, sizeof(*tmp_l3_table), GFP_KERNEL);
+ 	if (!tmp_l3_table) {
+ 		iounmap(ftbl_base);
+@@ -97,6 +101,7 @@
+ 
+ 	*freq_table = devm_kzalloc(dev, len * sizeof(**freq_table), GFP_KERNEL);
+ 	if (!*freq_table) {
++		kfree(tmp_l3_table);
+ 		iounmap(ftbl_base);
+ 		return -ENOMEM;
+ 	}
+@@ -121,6 +126,9 @@
+ 	for (idx = 0; idx < hw->table_len; idx++)
+ 		if (freqs->ib <= hw->freq_table[idx])
+ 			break;
++
++	if (idx == hw->table_len)
++		return -ERANGE;
+ 
+ 	if (hw->type == DCVS_L3) {
+ 		if (shared)
+@@ -132,7 +140,10 @@
+ 		writel_relaxed(idx, d->l3_base + offset);
+ 	}
+ 
+-	path->cur_freq.ib = freqs->ib;
++	if (shared)
++		WRITE_ONCE(path->cur_freq.ib, freqs->ib);
++	else
++		WRITE_ONCE(path->percpu_cur_freqs[smp_processor_id()], freqs->ib);
+ 
+ 	return 0;
+ }
+@@ -151,13 +162,14 @@
+ 	return commit_epss_l3(path, freqs, update_mask, false);
+ }
+ 
+-static int init_epss_data(struct device *dev)
++static int init_epss_data(struct device *dev, struct epss_dev_data **out)
+ {
+ 	int idx, ret = 0;
+ 	struct resource res;
+-
+-	epss_data = devm_kzalloc(dev, sizeof(*epss_data), GFP_KERNEL);
+-	if (!epss_data)
++	struct epss_dev_data *data;
++
++	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
++	if (!data)
+ 		return -ENOMEM;
+ 
+ 	idx = of_property_match_string(dev->parent->of_node, "reg-names",
+@@ -173,15 +185,15 @@
+ 		return ret;
+ 	}
+ 
+-	epss_data->l3_base = devm_ioremap(dev->parent, res.start,
+-							resource_size(&res));
+-	if (!epss_data->l3_base) {
++	data->l3_base = devm_ioremap(dev, res.start, resource_size(&res));
++	if (!data->l3_base) {
+ 		dev_err(dev, "Unable to map l3-base!\n");
+ 		return -ENOMEM;
+ 	}
+ 
+-	return ret;
+-
++	data->l3_size = resource_size(&res);
++	*out = data;
++	return 0;
+ }
+ 
+ static int populate_shared_offset(struct device *dev, u32 *offset)
+@@ -213,7 +225,7 @@
+ 		goto out;
+ 	}
+ 	len /= sizeof(**cpu_offsets);
+-	if (len != num_possible_cpus()) {
++	if (len != nr_cpu_ids) {
+ 		dev_err(dev, "Invalid percpu offsets table len=%d\n", len);
+ 		ret = -EINVAL;
+ 		goto out;
+@@ -242,27 +254,39 @@
+ static int setup_epss_l3_device(struct device *dev, struct dcvs_hw *hw,
+ 					struct dcvs_path *path, bool shared)
+ {
+-	int ret = 0;
+-
+-	mutex_lock(&epss_lock);
+-	if (!epss_data)
+-		ret = init_epss_data(dev);
+-	mutex_unlock(&epss_lock);
++	int ret, cpu;
++	u32 shared_offset, *percpu_offsets;
++	struct epss_dev_data *data;
++
++	ret = init_epss_data(dev, &data);
+ 
+ 	if (ret < 0)
+ 		return ret;
+ 
+ 	if (shared) {
+-		ret = populate_shared_offset(dev, &epss_data->l3_shared_offset);
++		ret = populate_shared_offset(dev, &shared_offset);
++		if (ret)
++			return ret;
++		if (!IS_ALIGNED(shared_offset, sizeof(u32)) ||
++		    (u64)shared_offset + sizeof(u32) > data->l3_size)
++			return -EINVAL;
++		data->l3_shared_offset = shared_offset;
+ 		path->commit_dcvs_freqs = commit_epss_l3_shared;
+ 	} else {
+-		ret = populate_percpu_offsets(dev, &epss_data->l3_percpu_offsets);
++		ret = populate_percpu_offsets(dev, &percpu_offsets);
++		if (ret)
++			return ret;
++		for_each_possible_cpu(cpu)
++			if (!IS_ALIGNED(percpu_offsets[cpu], sizeof(u32)) ||
++			    (u64)percpu_offsets[cpu] + sizeof(u32) > data->l3_size)
++				return -EINVAL;
++		data->l3_percpu_offsets = percpu_offsets;
+ 		path->commit_dcvs_freqs = commit_epss_l3_percpu;
+ 	}
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	path->data = epss_data;
++	path->data = data;
+ 
+ 	return ret;
+ }
+--- a/drivers/soc/qcom/dcvs/dcvs_private.h
++++ b/drivers/soc/qcom/dcvs/dcvs_private.h
+@@ -42,6 +42,7 @@
+ 	struct dcvs_path	*dcvs_paths[NUM_DCVS_PATHS];
+ 	u32			num_paths;
+ 	u32			num_inited_paths;
++	bool			populated;
+ };
+ 
+ 
+@@ -50,6 +51,7 @@
+ 					struct dcvs_path *path);
+ int setup_epss_l3_percpu_device(struct device *dev, struct dcvs_hw *hw,
+ 					struct dcvs_path *path);
++void teardown_ddrllcc_fp_device(struct dcvs_hw *hw, struct dcvs_path *path);
+ #if IS_ENABLED(CONFIG_QCOM_DCVS_FP)
+ int setup_ddrllcc_fp_device(struct device *dev, struct dcvs_hw *hw,
+ 					struct dcvs_path *path);
+--- a/drivers/soc/qcom/dcvs/trace-dcvs.h
++++ b/drivers/soc/qcom/dcvs/trace-dcvs.h
+@@ -33,7 +33,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(name, name);
++		__assign_str(name);
+ 		__entry->hw = hw;
+ 		__entry->path = path;
+ 		__entry->ib = ib;
+@@ -106,7 +106,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(name, name);
++		__assign_str(name);
+ 		__entry->dev_id = dev_id;
+ 		__entry->inst = inst;
+ 		__entry->mem = mem;
+@@ -146,7 +146,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(name, name);
++		__assign_str(name);
+ 		__entry->dev_id = dev_id;
+ 		__entry->inst = inst;
+ 		__entry->mem = mem;
+@@ -178,7 +178,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(name, name);
++		__assign_str(name);
+ 		__entry->mbps = mbps;
+ 		__entry->us = us;
+ 		__entry->wake = wake;
+@@ -207,7 +207,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(name, name);
++		__assign_str(name);
+ 		__entry->mbps = mbps;
+ 		__entry->freq = freq;
+ 		__entry->up_thres = up_thres;
+@@ -241,7 +241,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(name, name);
++		__assign_str(name);
+ 		__entry->mbps = mbps;
+ 		__entry->zone = zone;
+ 		__entry->hist_max = hist_max;
+@@ -277,8 +277,8 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(name, name);
+-		__assign_str(client, client);
++		__assign_str(name);
++		__assign_str(client);
+ 		__entry->ts = ts;
+ 		__entry->meas_mbps = meas_mbps;
+ 		__entry->max_mbps = max_mbps;
