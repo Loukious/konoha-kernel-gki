@@ -1,0 +1,236 @@
+--- a/drivers/soc/qcom/qcom_cpu_vendor_hooks.c
++++ b/drivers/soc/qcom/qcom_cpu_vendor_hooks.c
+@@ -85,60 +85,75 @@
+ 	return 0;
+ }
+ 
+-struct kretprobe spin_bug_probe = {
++static struct kretprobe spin_bug_probe = {
+ 	.entry_handler = entry_spin_bug,
+ 	.maxactive = 1,
+ 	.kp.symbol_name = "spin_bug",
+ };
+ 
+-static void register_spinlock_bug_hook(void)
++static int register_spinlock_bug_hook(void)
+ {
+ 	int ret;
+ 
+ 	ret = register_kretprobe(&spin_bug_probe);
+ 	if (ret)
+ 		pr_err("Failed to register spin_bug_probe: %x\n", ret);
+-}
+-#else
+-static inline void register_spinlock_bug_hook(void) { }
++	return ret;
++}
++
++static void unregister_spinlock_bug_hook(void)
++{
++	unregister_kretprobe(&spin_bug_probe);
++}
++#else
++static inline int register_spinlock_bug_hook(void) { return 0; }
++static inline void unregister_spinlock_bug_hook(void) { }
+ #endif
+ 
+ #ifdef CONFIG_RANDOMIZE_BASE
++/* Export retained by 6.18 GKI; asm/memory.h no longer declares it. */
++extern u64 kimage_vaddr;
+ #define KASLR_OFFSET_MASK	0x00000000FFFFFFFF
+-static void __iomem *map_prop_mem(const char *propname)
+-{
+-	struct device_node *np = of_find_compatible_node(NULL, NULL, propname);
+-	void __iomem *addr;
+-
+-	if (!np) {
+-		pr_err("Unable to find DT property: %s\n", propname);
+-		return NULL;
+-	}
+-
+-	addr = of_iomap(np, 0);
+-	if (!addr)
+-		pr_err("Unable to map memory for DT property: %s\n", propname);
+-	return addr;
++static void __iomem *kaslr_imem;
++
++static void map_kaslr_imem(void)
++{
++	struct device_node *np;
++	struct resource res;
++
++	np = of_find_compatible_node(NULL, NULL, "qcom,msm-imem-kaslr_offset");
++	if (!np)
++		return;
++	if (!of_address_to_resource(np, 0, &res) && resource_size(&res) >= 12)
++		kaslr_imem = ioremap(res.start, 12);
++	of_node_put(np);
++	if (!kaslr_imem)
++		pr_err("Unable to map KASLR offset memory\n");
+ }
+ 
+ static void store_kaslr_offset(void)
+ {
+-	void __iomem *mem = map_prop_mem("qcom,msm-imem-kaslr_offset");
+-
+-	if (!mem)
++	if (!kaslr_imem)
+ 		return;
+ 
+-	__raw_writel(0xdead4ead, mem);
+-	__raw_writel((kimage_vaddr - KIMAGE_VADDR) & KASLR_OFFSET_MASK,
+-		     mem + 4);
+-	__raw_writel(((kimage_vaddr - KIMAGE_VADDR) >> 32) & KASLR_OFFSET_MASK,
+-		     mem + 8);
+-
+-	iounmap(mem);
+-}
+-
+-#else
+-static void store_kaslr_offset(void) {}
++	writel_relaxed((kimage_vaddr - KIMAGE_VADDR) & KASLR_OFFSET_MASK,
++		       kaslr_imem + 4);
++	writel_relaxed(((kimage_vaddr - KIMAGE_VADDR) >> 32) & KASLR_OFFSET_MASK,
++		       kaslr_imem + 8);
++	/* Publish the marker only after both halves of the offset are written. */
++	wmb();
++	writel(0xdead4ead, kaslr_imem);
++}
++
++static void unmap_kaslr_imem(void)
++{
++	iounmap(kaslr_imem);
++	kaslr_imem = NULL;
++}
++#else
++static void map_kaslr_imem(void) { }
++static void store_kaslr_offset(void) { }
++static void unmap_kaslr_imem(void) { }
+ #endif /* CONFIG_RANDOMIZE_BASE */
+ 
+ #if defined(CONFIG_HIBERNATION)
+@@ -151,43 +166,48 @@
+ {
+ 	int ret;
+ 
++	map_kaslr_imem();
+ 	store_kaslr_offset();
++	ret = register_trace_android_vh_ipi_stop(trace_ipi_stop, NULL);
++	if (ret)
++		goto unmap;
++	ret = register_trace_android_vh_printk_hotplug(printk_hotplug, NULL);
++	if (ret)
++		goto unregister_ipi;
++	ret = register_trace_android_vh_timer_calc_index(timer_recalc_index, NULL);
++	if (ret)
++		goto unregister_printk;
++	ret = register_spinlock_bug_hook();
++	if (ret)
++		goto unregister_timer;
+ #ifdef CONFIG_HIBERNATION
+ 	register_syscore_ops(&kaslr_offset_restore_syscore_ops);
+ #endif
+-
+-	ret = register_trace_android_vh_ipi_stop(trace_ipi_stop, NULL);
+-	if (ret) {
+-		pr_err("Failed to register android_vh_ipi_stop hook\n");
+-		return ret;
+-	}
+-
+-	ret = register_trace_android_vh_printk_hotplug(printk_hotplug, NULL);
+-	if (ret) {
+-		pr_err("Failed to android_vh_printk_hotplug hook\n");
+-		unregister_trace_android_vh_ipi_stop(trace_ipi_stop, NULL);
+-		return ret;
+-	}
+-
+-	ret = register_trace_android_vh_timer_calc_index(timer_recalc_index, NULL);
+-	if (ret) {
+-		pr_err("Failed to android_vh_timer_calc_index hook\n");
+-		unregister_trace_android_vh_ipi_stop(trace_ipi_stop, NULL);
+-		unregister_trace_android_vh_printk_hotplug(printk_hotplug, NULL);
+-		return ret;
+-	}
+-
+-	register_spinlock_bug_hook();
+-
++	return 0;
++
++unregister_timer:
++	unregister_trace_android_vh_timer_calc_index(timer_recalc_index, NULL);
++unregister_printk:
++	unregister_trace_android_vh_printk_hotplug(printk_hotplug, NULL);
++unregister_ipi:
++	unregister_trace_android_vh_ipi_stop(trace_ipi_stop, NULL);
++	tracepoint_synchronize_unregister();
++unmap:
++	unmap_kaslr_imem();
+ 	return ret;
+ }
+ 
+ static void __exit qcom_vendor_hook_driver_exit(void)
+ {
+-	/* Reset all initialized global variables and unregister callbacks. */
++#ifdef CONFIG_HIBERNATION
++	unregister_syscore_ops(&kaslr_offset_restore_syscore_ops);
++#endif
++	unregister_spinlock_bug_hook();
+ 	unregister_trace_android_vh_ipi_stop(trace_ipi_stop, NULL);
+ 	unregister_trace_android_vh_printk_hotplug(printk_hotplug, NULL);
+ 	unregister_trace_android_vh_timer_calc_index(timer_recalc_index, NULL);
++	tracepoint_synchronize_unregister();
++	unmap_kaslr_imem();
+ }
+ 
+ #if IS_MODULE(CONFIG_QCOM_CPU_VENDOR_HOOKS)
+--- a/drivers/thermal/qcom/qti_thermal_vendor_hooks.c
++++ b/drivers/thermal/qcom/qti_thermal_vendor_hooks.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/thermal.h>
++#include <linux/module.h>
+ #include <trace/hooks/thermal.h>
+ 
+ static void qti_thermal_pm_notify(void *unused,
+@@ -12,21 +13,9 @@
+ 	*irq_wakeable = true;
+ }
+ 
+-static void disable_cdev_stats(void *unused,
+-		struct thermal_cooling_device *cdev, bool *disable)
+-{
+-	*disable = true;
+-}
+-
+ static int __init qcom_thermal_vendor_hook_driver_init(void)
+ {
+ 	int ret;
+-
+-	ret = register_trace_android_vh_disable_thermal_cooling_stats(
+-			disable_cdev_stats, NULL);
+-	if (ret)
+-		pr_err("Failed to register disable cdev stats hook, err:%d\n",
+-			ret);
+ 
+ 	ret = register_trace_android_vh_thermal_pm_notify_suspend(
+ 			qti_thermal_pm_notify, NULL);
+@@ -34,16 +23,14 @@
+ 		pr_err("Failed to register thermal_pm_notify hook, err:%d\n",
+ 			ret);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static void __exit qcom_thermal_vendor_hook_driver_exit(void)
+ {
+-	unregister_trace_android_vh_disable_thermal_cooling_stats(
+-			disable_cdev_stats, NULL);
+-
+ 	unregister_trace_android_vh_thermal_pm_notify_suspend(
+ 			qti_thermal_pm_notify, NULL);
++	tracepoint_synchronize_unregister();
+ }
+ 
+ #if IS_MODULE(CONFIG_QTI_THERMAL_VENDOR_HOOK)

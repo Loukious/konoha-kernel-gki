@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 93 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 95 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 93 platform `.ko` files, their symbol tables and DDK configurations.
+- 95 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 4116
-imported symbol CRCs across all 93 modules.
+used. The current [validation report](validation-20261031.json) checks 4151
+imported symbol CRCs across all 95 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -230,7 +230,7 @@ wake, receive threads stop, and queued memory work drains before descriptors
 are freed. The deferred-free worker also supports stop and drain. Unknown queue
 names fail cleanly, and receiver allocation/thread failures unwind registration.
 These adaptations pass checkpatch with no errors, warnings or style checks;
-the full build passes 4116 imported-symbol CRC checks without compiler/modpost
+the full build passes 4151 imported-symbol CRC checks without compiler/modpost
 warnings. Cross-VM sharing, secure-display allocation and memory pressure still
 require device testing. `ZONE_DEVICE` and reserved-IPA support remain disabled,
 matching the Onyx HLOS baseline; guest-only mapping paths are not validated.
@@ -382,3 +382,18 @@ panic timeouts are bounded by the Gunyah protocol's 16-bit limit. The recovery
 service remains resident because firmware and minidump retain its data.
 The adaptation passes checkpatch without errors, warnings or style checks.
 Watchdog firing, suspend/resume and firmware behavior still require phone tests.
+
+The vendor-hook group adds `qcom_cpu_vendor_hooks` and
+`qti_thermal_vendor_hooks`. CPU-stop diagnostics, printk hotplug behavior,
+timer-wheel adjustment and KASLR offset recording retain the Onyx behavior.
+The KASLR IMEM mapping is sized and established during initialization; resume
+only writes the existing mapping. The 6.18 GKI export `kimage_vaddr` retains its
+original type and passes the normal symbol CRC check. Hook failures unwind
+registered callbacks; exit drains trace readers and unregisters syscore and
+optional probe callbacks before releasing mappings.
+
+Thermal suspend notification remains enabled. The removed cooling-statistics
+hook is unnecessary with the pinned GKI's `CONFIG_THERMAL_STATISTICS=n`, which
+the module Kconfig requires. Both adapters pass checkpatch without errors,
+warnings or style checks. Runtime CPU-stop, resume and thermal behavior remains
+unverified on hardware.

@@ -1241,6 +1241,26 @@ ddk_module(
     deps = [":watchdog_headers", ":gunyah_headers", ":scm_headers", ":qcom_wdt_core"],
 )
 
+ddk_module(
+    name = "qcom_cpu_vendor_hooks",
+    srcs = ["drivers/soc/qcom/qcom_cpu_vendor_hooks.c"],
+    out = "qcom_cpu_vendor_hooks.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":watchdog_headers", ":qcom_wdt_core"],
+)
+
+ddk_module(
+    name = "qti_thermal_vendor_hooks",
+    srcs = ["drivers/thermal/qcom/qti_thermal_vendor_hooks.c"],
+    out = "qti_thermal_vendor_hooks.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1321,6 +1341,8 @@ kernel_module_group(
         ":minidump",
         ":qcom_wdt_core",
         ":gh_virt_wdt",
+        ":qcom_cpu_vendor_hooks",
+        ":qti_thermal_vendor_hooks",
         ":nvmem_qfprom",
         ":qcom_cpufreq_thermal",
         ":qcom_cpufreq_hw",
