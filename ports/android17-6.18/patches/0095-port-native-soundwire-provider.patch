@@ -1,0 +1,1829 @@
+Subject: Port native SoundWire provider and register transport to 6.18
+
+Retain transactions across synchronous responses and drain callbacks.
+Balance device and OF references and preserve native port layouts.
+Validate register framing and reset-aware page selection.
+
+---
+
+--- a/qcom/opensource/audio-kernel/include/soc/soundwire.h
++++ b/qcom/opensource/audio-kernel/include/soc/soundwire.h
+@@ -10,7 +10,10 @@
+ #include <linux/mutex.h>
+ #include <linux/irqdomain.h>
+ #include <linux/regmap.h>
+-#include "audio_mod_devicetable.h"
++#include <linux/spinlock.h>
++#include <linux/wait.h>
++#include <linux/atomic.h>
++#include <soc/audio_mod_devicetable.h>
+ 
+ enum {
+ 	SWR_UC0 = 0,
+@@ -48,6 +51,10 @@
+ #define SWR_PORT_PARAMS 2
+ 
+ /* Regmap support for soundwire interface */
++struct regmap *__regmap_init_swr(struct swr_device *dev,
++			       const struct regmap_config *config,
++			       struct lock_class_key *lock_key,
++			       const char *lock_name);
+ struct regmap *__devm_regmap_init_swr(struct swr_device *dev,
+ 				      const struct regmap_config *config,
+ 				      struct lock_class_key *lock_key,
+@@ -240,6 +247,13 @@
+ 	void (*device_wakeup_vote)(struct swr_master *mstr);
+ 	void (*device_wakeup_unvote)(struct swr_master *mstr);
+ 	u16 port_en_mask;
++	/* Framework callback reservations; no locks held over controller calls. */
++	spinlock_t state_lock;
++	atomic_t active_calls;
++	wait_queue_head_t call_wait;
++	bool stopping;
++	/* Controller must retain its allocation through this final release. */
++	void (*release)(struct swr_master *master);
+ 
+ };
+ 
+@@ -278,6 +292,13 @@
+ 	bool clk_scale_initialized;
+ 	u8 g_scp1_val; /* used for v1.2 or class devices */
+ 	u8 g_scp2_val; /* used for v1.2 or class devices */
++	atomic_t scp_generation;
++	int scp_cached_generation;
++	u8 scp_valid;
++	spinlock_t driver_lock;
++	atomic_t driver_calls;
++	wait_queue_head_t driver_wait;
++	bool driver_stopping;
+ };
+ 
+ static inline struct swr_device *to_swr_device(struct device *dev)
+@@ -411,6 +432,7 @@
+ 
+ extern void swr_remove_device(struct swr_device *swr_dev);
+ 
++/* Returns a device reference; balance with put_device(&swr->dev). */
+ extern struct swr_device *get_matching_swr_slave_device(struct device_node *np);
+ 
+ extern int swr_device_wakeup_vote(struct swr_device *dev);
+--- a/qcom/opensource/audio-kernel/soc/regmap-swr.c
++++ b/qcom/opensource/audio-kernel/soc/regmap-swr.c
+@@ -26,228 +26,213 @@
+ #define SDCA_READ_WRITE_BIT       (0x8000)
+ static DEFINE_MUTEX(swr_rw_lock);
+ 
++/* swr_rw_lock serializes page selection and the associated data transfer. */
+ static int regmap_swr_reg_address_get(struct swr_device *swr,
+-			u16 *reg_addr, const void *reg, size_t reg_size)
+-{
+-	u8 scp1_val = 0, scp2_val = 0;
+-	u32 temp = 0;
+-	int ret = 0;
+-
+-	if (reg_size == ADDR_BYTES_4) {
+-		temp = (*(u32 *)reg) & SCP1_ADDRESS_VAL_MASK;
+-		scp1_val = temp >> SCP1_ADDRESS_VAL_SHIFT;
+-
+-		temp = (*(u32 *)reg) & SCP2_ADDRESS_VAL_MASK;
+-		scp2_val = temp >> SCP2_ADDRESS_VAL_SHIFT;
+-
+-		if (scp1_val || scp2_val) {
+-			if (scp1_val != swr->g_scp1_val) {
+-				ret = swr_write(swr, swr->dev_num, SCP1_ADDRESS, &scp1_val);
+-				if (ret < 0) {
+-					dev_err(&swr->dev, "%s: write reg scp1_address failed, err %d\n",
+-						__func__, ret);
+-					return ret;
+-				}
+-				swr->g_scp1_val = scp1_val;
+-			}
+-
+-			if (scp2_val != swr->g_scp2_val) {
+-				ret = swr_write(swr, swr->dev_num, SCP2_ADDRESS, &scp2_val);
+-				if (ret < 0) {
+-					dev_err(&swr->dev, "%s: write reg scp2_address failed, err %d\n",
+-					__func__, ret);
+-					return ret;
+-				}
+-				swr->g_scp2_val = scp2_val;
+-			}
+-			*reg_addr = (*(u16 *)reg | SDCA_READ_WRITE_BIT);
+-			dev_dbg(&swr->dev, "%s: reg: 0x%x, scp1_val: 0x%x, scp2_val: 0x%x, reg_addr: 0x%x\n",
+-				__func__, *(u32 *)reg, scp1_val, scp2_val, *reg_addr);
+-		} else {
+-			*reg_addr = *(u16 *)reg;
+-		}
++				     u16 *reg_addr, const void *reg,
++				     size_t reg_size)
++{
++	u32 address = 0;
++	u8 scp1, scp2;
++	int generation, ret;
++
++	if (!swr || !reg || !reg_addr ||
++	    (reg_size != ADDR_BYTES && reg_size != ADDR_BYTES_4))
++		return -EINVAL;
++	if (reg_size == ADDR_BYTES) {
++		memcpy(reg_addr, reg, sizeof(*reg_addr));
++		return 0;
++	}
++	memcpy(&address, reg, sizeof(address));
++	scp1 = (address & SCP1_ADDRESS_VAL_MASK) >> SCP1_ADDRESS_VAL_SHIFT;
++	scp2 = (address & SCP2_ADDRESS_VAL_MASK) >> SCP2_ADDRESS_VAL_SHIFT;
++	*reg_addr = address;
++	if (!scp1 && !scp2)
++		return 0;
++	generation = atomic_read(&swr->scp_generation);
++	if (generation != swr->scp_cached_generation) {
++		swr->scp_valid = 0;
++		swr->scp_cached_generation = generation;
++	}
++	if (!(swr->scp_valid & 1) || scp1 != swr->g_scp1_val) {
++		ret = swr_write(swr, swr->dev_num, SCP1_ADDRESS, &scp1);
++		if (ret)
++			return ret;
++		swr->g_scp1_val = scp1;
++		swr->scp_valid |= 1;
++	}
++	if (!(swr->scp_valid & 2) || scp2 != swr->g_scp2_val) {
++		ret = swr_write(swr, swr->dev_num, SCP2_ADDRESS, &scp2);
++		if (ret)
++			return ret;
++		swr->g_scp2_val = scp2;
++		swr->scp_valid |= 2;
++	}
++	if (generation != atomic_read(&swr->scp_generation)) {
++		swr->scp_valid = 0;
++		return -EAGAIN;
++	}
++	*reg_addr |= SDCA_READ_WRITE_BIT;
++	return 0;
++}
++
++static int regmap_swr_span(const void *reg, size_t reg_size,
++			   size_t count, u32 *address)
++{
++	u16 short_address;
++
++	if (!reg || !count ||
++	    (reg_size != ADDR_BYTES && reg_size != ADDR_BYTES_4))
++		return -EINVAL;
++	if (reg_size == ADDR_BYTES) {
++		memcpy(&short_address, reg, sizeof(short_address));
++		*address = short_address;
++		if (count > 0x10000U - *address)
++			return -EINVAL;
+ 	} else {
+-		*reg_addr = *(u16 *)reg;
+-	}
+-
+-	return ret;
++		memcpy(address, reg, sizeof(*address));
++		if (count - 1 > U32_MAX - *address)
++			return -EINVAL;
++	}
++	return 0;
+ }
+ 
+ static int regmap_swr_gather_write(void *context,
+-				const void *reg, size_t reg_size,
+-				const void *val, size_t val_len)
++				  const void *reg, size_t reg_size,
++				  const void *val, size_t val_len)
+ {
+ 	struct device *dev = context;
+ 	struct swr_device *swr = to_swr_device(dev);
+-	struct regmap *map = dev_get_regmap(dev, NULL);
+-	int i, ret = 0;
+-	u16 reg_addr = 0;
+-	u8 *value;
+-
+-	if (map == NULL) {
+-		dev_err_ratelimited(dev, "%s: regmap is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if (swr == NULL) {
+-		dev_err_ratelimited(dev, "%s: swr device is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if ((reg_size != ADDR_BYTES) && (reg_size != ADDR_BYTES_4)) {
+-		dev_err_ratelimited(dev, "%s: reg size %zd bytes not supported\n",
+-			__func__, reg_size);
+-		return -EINVAL;
+-	}
+-
++	const u8 *value = val;
++	u32 address;
++	u16 reg_addr, short_address;
++	size_t i;
++	int ret;
++
++	if (!swr || !val || !dev_get_regmap(dev, NULL))
++		return -EINVAL;
++	ret = regmap_swr_span(reg, reg_size, val_len, &address);
++	if (ret)
++		return ret;
+ 	mutex_lock(&swr_rw_lock);
+-	ret = regmap_swr_reg_address_get(swr, &reg_addr, reg, reg_size);
+-	if (ret < 0) {
++	for (i = 0; i < val_len; i++, address++) {
++		short_address = address;
++		ret = regmap_swr_reg_address_get(swr, &reg_addr,
++			reg_size == ADDR_BYTES ? (void *)&short_address : &address,
++			reg_size);
++		if (ret)
++			break;
++		ret = swr_write(swr, swr->dev_num, reg_addr, value + i);
++		if (ret)
++			break;
++	}
++	mutex_unlock(&swr_rw_lock);
++	return ret;
++}
++
++static int regmap_swr_raw_multi_reg_write(void *context,
++					 const void *data, size_t count)
++{
++	struct device *dev = context;
++	struct swr_device *swr = to_swr_device(dev);
++	const u8 *buf = data;
++	u16 *reg, reg_addr;
++	u8 *val;
++	size_t addr_bytes, stride, num_regs, i;
++	int ret = 0;
++
++	if (!swr || !data || !dev_get_regmap(dev, NULL))
++		return -EINVAL;
++	addr_bytes = swr->paging_support ? ADDR_BYTES_4 : ADDR_BYTES;
++	stride = addr_bytes + VAL_BYTES;
++	if (!count || count % stride)
++		return -EINVAL;
++	num_regs = count / stride;
++	if (swr->paging_support) {
++		mutex_lock(&swr_rw_lock);
++		for (i = 0; i < num_regs; i++, buf += stride) {
++			ret = regmap_swr_reg_address_get(swr, &reg_addr,
++							buf, addr_bytes);
++			if (ret)
++				break;
++			ret = swr_write(swr, swr->dev_num, reg_addr, buf + addr_bytes);
++			if (ret)
++				break;
++		}
+ 		mutex_unlock(&swr_rw_lock);
+ 		return ret;
+ 	}
+-
+-	/* val_len = VAL_BYTES * val_count */
+-	for (i = 0; i < (val_len / VAL_BYTES); i++) {
+-		value = (u8 *)val + (VAL_BYTES * i);
+-		ret = swr_write(swr, swr->dev_num, (reg_addr + i), value);
+-		if (ret < 0) {
+-			dev_err_ratelimited(dev, "%s: write reg 0x%x failed, err %d\n",
+-				__func__, (reg_addr + i), ret);
+-			break;
+-		}
+-		dev_dbg(dev, "%s: dev_num: 0x%x, gather write reg: 0x%x, value: 0x%x\n",
+-				__func__, swr->dev_num, (reg_addr + i), *value);
+-	}
++	reg = kcalloc(num_regs, sizeof(*reg), GFP_KERNEL);
++	if (!reg)
++		return -ENOMEM;
++	val = kcalloc(num_regs, sizeof(*val), GFP_KERNEL);
++	if (!val) {
++		kfree(reg);
++		return -ENOMEM;
++	}
++	for (i = 0; i < num_regs; i++, buf += stride) {
++		memcpy(&reg[i], buf, sizeof(*reg));
++		val[i] = buf[addr_bytes];
++	}
++	mutex_lock(&swr_rw_lock);
++	ret = swr_bulk_write(swr, swr->dev_num, reg, val, num_regs);
+ 	mutex_unlock(&swr_rw_lock);
++	kfree(val);
++	kfree(reg);
+ 	return ret;
+ }
+ 
+-static int regmap_swr_raw_multi_reg_write(void *context, const void *data,
+-					  size_t count)
++static int regmap_swr_write(void *context, const void *data, size_t count)
++{
++	struct swr_device *swr = to_swr_device(context);
++	size_t addr_bytes;
++
++	if (!swr || !data)
++		return -EINVAL;
++	addr_bytes = swr->paging_support ? ADDR_BYTES_4 : ADDR_BYTES;
++	if (count < addr_bytes + VAL_BYTES)
++		return -EINVAL;
++	if (count > addr_bytes + VAL_BYTES)
++		return regmap_swr_raw_multi_reg_write(context, data, count);
++	return regmap_swr_gather_write(context, data, addr_bytes,
++				       (const u8 *)data + addr_bytes,
++				       count - addr_bytes);
++}
++
++static int regmap_swr_read(void *context, const void *reg, size_t reg_size,
++			   void *val, size_t val_size)
+ {
+ 	struct device *dev = context;
+ 	struct swr_device *swr = to_swr_device(dev);
+-	struct regmap *map = dev_get_regmap(dev, NULL);
+-	size_t num_regs;
+-	int i = 0;
+-	int ret = 0;
+-	u16 *reg;
+-	u8 *val;
+-	u8 *buf;
+-
+-	if (swr == NULL) {
+-		dev_err_ratelimited(dev, "%s: swr device is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if (map == NULL) {
+-		dev_err_ratelimited(dev, "%s: regmap is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if (ADDR_BYTES + VAL_BYTES + PAD_BYTES == 0) {
+-		dev_err_ratelimited(dev, "%s: sum of addr, value and pad is 0\n", __func__);
+-		return -EINVAL;
+-	}
+-	num_regs = count / (ADDR_BYTES + VAL_BYTES + PAD_BYTES);
+-
+-	reg = kcalloc(num_regs, sizeof(u16), GFP_KERNEL);
+-	if (!reg)
+-		return -ENOMEM;
+-
+-	val = kcalloc(num_regs, sizeof(u8), GFP_KERNEL);
+-	if (!val) {
+-		ret = -ENOMEM;
+-		goto mem_fail;
+-	}
+-
+-	buf = (u8 *)data;
+-	for (i = 0; i < num_regs; i++) {
+-		reg[i] = *(u16 *)buf;
+-		buf += (ADDR_BYTES + PAD_BYTES);
+-		val[i] = *buf;
+-		buf += VAL_BYTES;
+-	}
+-	ret = swr_bulk_write(swr, swr->dev_num, reg, val, num_regs);
++	u8 *value = val;
++	u32 address;
++	u16 reg_addr, short_address;
++	size_t chunk;
++	int ret;
++
++	if (!swr || !val || !dev_get_regmap(dev, NULL))
++		return -EINVAL;
++	ret = regmap_swr_span(reg, reg_size, val_size, &address);
+ 	if (ret)
+-		dev_err_ratelimited(dev, "%s: multi reg write failed\n", __func__);
+-
+-	kfree(val);
+-mem_fail:
+-	kfree(reg);
+-	return ret;
+-}
+-
+-static int regmap_swr_write(void *context, const void *data, size_t count)
+-{
+-	struct device *dev = context;
+-	struct swr_device *swr = to_swr_device(dev);
+-	struct regmap *map = dev_get_regmap(dev, NULL);
+-	int addr_bytes = 0;
+-
+-	if (map == NULL) {
+-		dev_err_ratelimited(dev, "%s: regmap is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if (swr == NULL) {
+-		dev_err_ratelimited(dev, "%s: swr is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	addr_bytes = (swr->paging_support ? ADDR_BYTES_4 : ADDR_BYTES);
+-
+-	WARN_ON(count < addr_bytes);
+-
+-	if (count > (addr_bytes + VAL_BYTES + PAD_BYTES))
+-		return regmap_swr_raw_multi_reg_write(context, data, count);
+-	else
+-		return regmap_swr_gather_write(context, data, addr_bytes,
+-					       (data + addr_bytes),
+-					       (count - addr_bytes));
+-}
+-
+-static int regmap_swr_read(void *context,
+-			const void *reg, size_t reg_size,
+-			void *val, size_t val_size)
+-{
+-	struct device *dev = context;
+-	struct swr_device *swr = to_swr_device(dev);
+-	struct regmap *map = dev_get_regmap(dev, NULL);
+-	int ret = 0;
+-	u16 reg_addr = 0;
+-
+-	if (map == NULL) {
+-		dev_err_ratelimited(dev, "%s: regmap is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-	if (swr == NULL) {
+-		dev_err_ratelimited(dev, "%s: swr is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if ((reg_size != ADDR_BYTES) && (reg_size != ADDR_BYTES_4)) {
+-		dev_err_ratelimited(dev, "%s: reg size %zd bytes not supported\n",
+-			__func__, reg_size);
+-		return -EINVAL;
+-	}
+-
++		return ret;
+ 	mutex_lock(&swr_rw_lock);
+-	ret = regmap_swr_reg_address_get(swr, &reg_addr, reg, reg_size);
+-	if (ret < 0) {
+-		dev_err_ratelimited(dev,
+-			"%s: regmap_swr_reg_address_get failed, reg: 0x%x\n",
+-					__func__, *(u32 *)reg);
+-		mutex_unlock(&swr_rw_lock);
+-		return ret;
+-	}
+-
+-	ret = swr_read(swr, swr->dev_num, reg_addr, val, val_size);
+-	if (ret < 0)
+-		dev_err_ratelimited(dev, "%s: codec reg 0x%x read failed %d\n",
+-			__func__, reg_addr, ret);
+-
++	while (val_size) {
++		short_address = address;
++		ret = regmap_swr_reg_address_get(swr, &reg_addr,
++			reg_size == ADDR_BYTES ? (void *)&short_address : &address,
++			reg_size);
++		if (ret)
++			break;
++		/* A paged transfer must not cross the next SCP2 page. */
++		chunk = min_t(size_t, val_size,
++			      reg_size == ADDR_BYTES ? 0x10000U - reg_addr :
++			      0x8000U - (address & 0x7fff));
++		ret = swr_read(swr, swr->dev_num, reg_addr, value, chunk);
++		if (ret)
++			break;
++		address += chunk;
++		value += chunk;
++		val_size -= chunk;
++	}
+ 	mutex_unlock(&swr_rw_lock);
+ 	return ret;
+ }
+@@ -265,6 +250,9 @@
+ 				 struct lock_class_key *lock_key,
+ 				 const char *lock_name)
+ {
++	if (!swr || !config || config->val_bits != 8 || config->pad_bits ||
++	    config->reg_bits != (swr->paging_support ? 32 : 16))
++		return ERR_PTR(-EINVAL);
+ 	return __regmap_init(&swr->dev, &regmap_swr, &swr->dev, config,
+ 			   lock_key, lock_name);
+ }
+@@ -275,6 +263,9 @@
+ 				      struct lock_class_key *lock_key,
+ 				      const char *lock_name)
+ {
++	if (!swr || !config || config->val_bits != 8 || config->pad_bits ||
++	    config->reg_bits != (swr->paging_support ? 32 : 16))
++		return ERR_PTR(-EINVAL);
+ 	return __devm_regmap_init(&swr->dev, &regmap_swr, &swr->dev, config,
+ 				lock_key, lock_name);
+ }
+--- a/qcom/opensource/audio-kernel/soc/soundwire.c
++++ b/qcom/opensource/audio-kernel/soc/soundwire.c
+@@ -14,6 +14,7 @@
+ #include <linux/completion.h>
+ #include <linux/idr.h>
+ #include <linux/pm_runtime.h>
++#include <linux/refcount.h>
+ #include <soc/soundwire.h>
+ 
+ struct boardinfo {
+@@ -29,6 +30,131 @@
+ 
+ static struct device_type swr_dev_type;
+ 
++/* Do not hold a lock across controller callbacks: they may re-enter the bus. */
++static int swr_master_begin(struct swr_master *master)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	if (!master)
++		return -ENODEV;
++	spin_lock_irqsave(&master->state_lock, flags);
++	if (master->stopping)
++		ret = -ENODEV;
++	else
++		atomic_inc(&master->active_calls);
++	spin_unlock_irqrestore(&master->state_lock, flags);
++	return ret;
++}
++
++static void swr_master_end(struct swr_master *master)
++{
++	if (atomic_dec_and_test(&master->active_calls))
++		wake_up_all(&master->call_wait);
++}
++
++struct swr_transaction {
++	struct swr_params params;
++	refcount_t refs;
++};
++
++static void swr_transaction_put(struct swr_params *params)
++{
++	struct swr_transaction *txn;
++
++	if (!params)
++		return;
++	txn = container_of(params, struct swr_transaction, params);
++	if (refcount_dec_and_test(&txn->refs))
++		kfree(txn);
++}
++
++static void swr_transaction_detach(struct swr_master *master,
++				   struct swr_params *params)
++{
++	unsigned long flags;
++	bool detached = false;
++
++	spin_lock_irqsave(&master->state_lock, flags);
++	if (master->port_txn && master->port_txn[params->tid] == params) {
++		master->port_txn[params->tid] = NULL;
++		detached = true;
++	}
++	spin_unlock_irqrestore(&master->state_lock, flags);
++	if (detached)
++		swr_transaction_put(params);
++}
++
++/* The native group leader suppresses duplicate broadcasts from other slaves. */
++static bool swr_group_target(struct swr_device *dev, u8 *dev_num,
++			     bool broadcast)
++{
++	struct swr_master *master = dev->master;
++	unsigned long flags;
++	bool send = true;
++
++	spin_lock_irqsave(&master->state_lock, flags);
++	if (dev->group_id) {
++		if (master->gr_sid != *dev_num) {
++			if (!master->gr_sid)
++				master->gr_sid = *dev_num;
++			else
++				send = false;
++		}
++		if (broadcast)
++			*dev_num = dev->group_id;
++	}
++	spin_unlock_irqrestore(&master->state_lock, flags);
++	return send;
++}
++
++static void swr_driver_drain(struct swr_device *swr)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&swr->driver_lock, flags);
++	swr->driver_stopping = true;
++	spin_unlock_irqrestore(&swr->driver_lock, flags);
++	wait_event(swr->driver_wait, !atomic_read(&swr->driver_calls));
++	spin_lock_irqsave(&swr->driver_lock, flags);
++	swr->driver = NULL;
++	spin_unlock_irqrestore(&swr->driver_lock, flags);
++	atomic_inc(&swr->scp_generation);
++}
++
++static int swr_driver_event(struct swr_device *swr, unsigned int event)
++{
++	struct swr_driver *drv;
++	unsigned long flags;
++	int (*callback)(struct swr_device *) = NULL;
++	int ret;
++
++	if (!swr)
++		return -EINVAL;
++	ret = swr_master_begin(swr->master);
++	if (ret)
++		return ret;
++	atomic_inc(&swr->scp_generation);
++	spin_lock_irqsave(&swr->driver_lock, flags);
++	drv = swr->driver_stopping ? NULL : swr->driver;
++	if (drv) {
++		callback = event == 0 ? drv->device_up :
++			(event == 1 ? drv->device_down : drv->reset_device);
++		if (callback)
++			atomic_inc(&swr->driver_calls);
++	}
++	spin_unlock_irqrestore(&swr->driver_lock, flags);
++	ret = drv ? -ENODEV : (event == 2 ? -EINVAL : 0);
++	if (callback) {
++		ret = callback(swr);
++		if (atomic_dec_and_test(&swr->driver_calls))
++			wake_up_all(&swr->driver_wait);
++	}
++	swr_master_end(swr->master);
++	return ret;
++}
++
++
+ #define SOUNDWIRE_NAME_SIZE	32
+ 
+ static void swr_master_put(struct swr_master *master)
+@@ -46,20 +172,14 @@
+ 
+ static void swr_dev_release(struct device *dev)
+ {
+-	struct swr_device *swr_dev = to_swr_device(dev);
+-	struct swr_master *master;
+-
+-	if (!swr_dev)
+-		return;
+-	master = swr_dev->master;
+-	if (!master)
+-		return;
+-	mutex_lock(&master->mlock);
+-	list_del_init(&swr_dev->dev_list);
+-	mutex_unlock(&master->mlock);
+-	swr_master_put(swr_dev->master);
+-	kfree(swr_dev);
+-}
++	struct swr_device *swr = to_swr_device(dev);
++
++	/* Registration/removal detaches the list before dropping its reference. */
++	of_node_put(dev->of_node);
++	swr_master_put(swr->master);
++	kfree(swr);
++}
++
+ 
+ /**
+  * swr_remove_device - remove a soundwire device
+@@ -69,21 +189,13 @@
+  * device list that master has and remove swr_dev from
+  * it.
+  */
+-void swr_remove_device(struct swr_device *swr_dev)
+-{
+-	struct swr_device *swr_dev_loop, *safe;
+-
+-	/*
+-	 * master still has reference to all nodes and deletes
+-	 * at platform_unregister, so need to init the deleted
+-	 * entry
+-	 */
+-	list_for_each_entry_safe(swr_dev_loop, safe,
+-				 &swr_dev->master->devices,
+-				 dev_list) {
+-		if (swr_dev == swr_dev_loop)
+-			list_del_init(&swr_dev_loop->dev_list);
+-	}
++void swr_remove_device(struct swr_device *swr)
++{
++	if (!swr || !swr->master)
++		return;
++	mutex_lock(&swr->master->mlock);
++	list_del_init(&swr->dev_list);
++	mutex_unlock(&swr->master->mlock);
+ }
+ EXPORT_SYMBOL(swr_remove_device);
+ 
+@@ -102,48 +214,49 @@
+ struct swr_device *swr_new_device(struct swr_master *master,
+ 				 struct swr_boardinfo const *info)
+ {
+-	int result;
+ 	struct swr_device *swr;
+-
+-	if (!master || !swr_master_get(master)) {
+-		pr_err_ratelimited("%s: master is NULL\n", __func__);
++	int ret;
++
++	if (!info || swr_master_begin(master))
+ 		return NULL;
+-	}
+-
++	if (!swr_master_get(master))
++		goto out;
+ 	swr = kzalloc(sizeof(*swr), GFP_KERNEL);
+ 	if (!swr) {
+-		put_device(&master->dev);
+-		return NULL;
++		swr_master_put(master);
++		goto out;
+ 	}
+ 	swr->master = master;
+ 	swr->addr = info->addr;
+ 	strscpy(swr->name, info->name, sizeof(swr->name));
++	INIT_LIST_HEAD(&swr->dev_list);
++	spin_lock_init(&swr->driver_lock);
++	init_waitqueue_head(&swr->driver_wait);
++	atomic_set(&swr->driver_calls, 0);
++	atomic_set(&swr->scp_generation, 0);
++	swr->driver_stopping = true;
++	device_initialize(&swr->dev);
+ 	swr->dev.type = &swr_dev_type;
+ 	swr->dev.parent = &master->dev;
+ 	swr->dev.bus = &soundwire_type;
+-	swr->dev.release = swr_dev_release;
+-	swr->dev.of_node = info->of_node;
++	swr->dev.of_node = of_node_get(info->of_node);
++	ret = dev_set_name(&swr->dev, "%s.%llx", swr->name, swr->addr);
++	if (ret)
++		goto put;
+ 	mutex_lock(&master->mlock);
+ 	list_add_tail(&swr->dev_list, &master->devices);
+ 	mutex_unlock(&master->mlock);
+-
+-	dev_set_name(&swr->dev, "%s.%llx", swr->name, swr->addr);
+-	result = device_register(&swr->dev);
+-	if (result) {
+-		dev_err_ratelimited(&master->dev, "device [%s] register failed err %d\n",
+-			swr->name, result);
+-		goto err_out;
+-	}
+-	dev_dbg(&master->dev, "Device [%s] registered with bus id %s\n",
+-		swr->name, dev_name(&swr->dev));
++	ret = device_add(&swr->dev);
++	if (ret) {
++		swr_remove_device(swr);
++		goto put;
++	}
++	swr_master_end(master);
+ 	return swr;
+-
+-err_out:
+-	dev_dbg(&master->dev, "Failed to register swr device %s at 0x%llx %d\n",
+-		swr->name, swr->addr, result);
+-	swr_master_put(master);
+-	list_del_init(&swr->dev_list);
+-	kfree(swr);
++put:
++	put_device(&swr->dev);
++out:
++	swr_master_end(master);
+ 	return NULL;
+ }
+ EXPORT_SYMBOL(swr_new_device);
+@@ -161,7 +274,7 @@
+ 	struct swr_device *swr;
+ 	struct device_node *node;
+ 
+-	if (!master->dev.of_node)
++	if (!master || !master->dev.of_node)
+ 		return -EINVAL;
+ 
+ 	for_each_available_child_of_node(master->dev.of_node, node) {
+@@ -182,12 +295,11 @@
+ 			continue;
+ 		}
+ 		info.addr = addr;
+-		info.of_node = of_node_get(node);
++		info.of_node = node;
+ 		swr = swr_new_device(master, &info);
+ 		if (!swr) {
+ 			dev_err_ratelimited(&master->dev, "of_swr: Register failed %s\n",
+ 				node->full_name);
+-			of_node_put(node);
+ 			continue;
+ 		}
+ 	}
+@@ -204,17 +316,18 @@
+  */
+ void swr_port_response(struct swr_master *mstr, u8 tid)
+ {
+-	struct swr_params *txn;
+-
+-	txn = mstr->port_txn[tid];
+-
+-	if (txn == NULL) {
+-		dev_err_ratelimited(&mstr->dev, "%s: transaction is already NULL\n",
+-			__func__);
++	struct swr_params *txn = NULL;
++	unsigned long flags;
++
++	if (!mstr)
+ 		return;
+-	}
+-	mstr->port_txn[tid] = NULL;
+-	kfree(txn);
++	spin_lock_irqsave(&mstr->state_lock, flags);
++	if (mstr->port_txn && tid < mstr->last_tid) {
++		txn = mstr->port_txn[tid];
++		mstr->port_txn[tid] = NULL;
++	}
++	spin_unlock_irqrestore(&mstr->state_lock, flags);
++	swr_transaction_put(txn);
+ }
+ EXPORT_SYMBOL(swr_port_response);
+ 
+@@ -228,24 +341,22 @@
+ int swr_remove_from_group(struct swr_device *dev, u8 dev_num)
+ {
+ 	struct swr_master *master;
++	unsigned long flags;
++	bool remove;
++	int ret;
+ 
+ 	if (!dev)
+-		return -ENODEV;
+-
++		return -EINVAL;
+ 	master = dev->master;
+-	if (!master)
+-		return -EINVAL;
+-
+-	if (!dev->group_id)
+-		return 0;
+-
+-	if (master->gr_sid != dev_num)
+-		return 0;
+-
+-	if (master->remove_from_group && master->remove_from_group(master))
+-		dev_dbg(&master->dev, "%s: falling back to GROUP_NONE\n",
+-			__func__);
+-
++	ret = swr_master_begin(master);
++	if (ret)
++		return ret;
++	spin_lock_irqsave(&master->state_lock, flags);
++	remove = dev->group_id && master->gr_sid == dev_num;
++	spin_unlock_irqrestore(&master->state_lock, flags);
++	if (remove && master->remove_from_group)
++		master->remove_from_group(master);
++	swr_master_end(master);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(swr_remove_from_group);
+@@ -258,35 +369,89 @@
+  *
+  * Returns error code for failure and 0 for success
+  */
+-int swr_slvdev_datapath_control(struct swr_device *dev, u8 dev_num,
+-				bool enable)
++int swr_slvdev_datapath_control(struct swr_device *dev, u8 dev_num, bool enable)
+ {
+ 	struct swr_master *master;
+-	int ret = 0;
++	int ret;
+ 
+ 	if (!dev)
+-		return -ENODEV;
+-
++		return -EINVAL;
+ 	master = dev->master;
+-	if (!master)
+-		return -EINVAL;
+-
+-	if (dev->group_id) {
+-		/* Broadcast */
+-		if (master->gr_sid != dev_num) {
+-			if (!master->gr_sid)
+-				master->gr_sid = dev_num;
+-			else
+-				return 0;
++	ret = swr_master_begin(master);
++	if (ret)
++		return ret;
++	if (!master->slvdev_datapath_control)
++		ret = -EOPNOTSUPP;
++	else if (swr_group_target(dev, &dev_num, false))
++		ret = master->slvdev_datapath_control(master, enable);
++	else
++		ret = 0;
++	swr_master_end(master);
++	return ret;
++}
++EXPORT_SYMBOL(swr_slvdev_datapath_control);
++
++static int swr_port_request(struct swr_device *dev, u8 *port_id,
++			    u8 num_port, u8 *ch_mask, u32 *ch_rate,
++			    u8 *num_ch, u8 *port_type, bool connect)
++{
++	struct swr_master *master;
++	struct swr_transaction *txn;
++	int (*callback)(struct swr_master *master, struct swr_params *params);
++	unsigned long flags;
++	int i, ret;
++
++	if (!dev || !port_id || !ch_mask || !port_type || !num_port ||
++	    num_port > SWR_MAX_DEV_PORT_NUM || (connect && (!ch_rate || !num_ch)))
++		return -EINVAL;
++	master = dev->master;
++	ret = swr_master_begin(master);
++	if (ret)
++		return ret;
++	callback = connect ? master->connect_port : master->disconnect_port;
++	if (!callback) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++	txn = kzalloc(sizeof(*txn), GFP_KERNEL);
++	if (!txn) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	/* Keep callback storage alive even when the native response is synchronous. */
++	refcount_set(&txn->refs, 2);
++	txn->params.dev_num = dev->dev_num;
++	txn->params.num_port = num_port;
++	for (i = 0; i < num_port; i++) {
++		txn->params.port_id[i] = port_id[i];
++		txn->params.ch_en[i] = ch_mask[i];
++		txn->params.port_type[i] = port_type[i];
++		if (connect) {
++			txn->params.num_ch[i] = num_ch[i];
++			txn->params.ch_rate[i] = ch_rate[i];
+ 		}
+ 	}
+-
+-	if (master->slvdev_datapath_control)
+-		ret = master->slvdev_datapath_control(master, enable);
+-
++	spin_lock_irqsave(&master->state_lock, flags);
++	for (i = 0; i < master->last_tid; i++)
++		if (!master->port_txn[i])
++			break;
++	if (i == master->last_tid) {
++		spin_unlock_irqrestore(&master->state_lock, flags);
++		kfree(txn);
++		ret = -ENOMEM;
++		goto out;
++	}
++	txn->params.tid = i;
++	master->port_txn[i] = &txn->params;
++	spin_unlock_irqrestore(&master->state_lock, flags);
++	ret = callback(master, &txn->params);
++	if (ret)
++		swr_transaction_detach(master, &txn->params);
++	swr_transaction_put(&txn->params);
++out:
++	swr_master_end(master);
+ 	return ret;
+ }
+-EXPORT_SYMBOL(swr_slvdev_datapath_control);
+ 
+ /**
+  * swr_connect_port - enable soundwire slave port(s)
+@@ -303,77 +468,10 @@
+  * and enable master and slave ports
+  */
+ int swr_connect_port(struct swr_device *dev, u8 *port_id, u8 num_port,
+-			u8 *ch_mask, u32 *ch_rate, u8 *num_ch, u8 *port_type)
+-{
+-	u8 i = 0;
+-	int ret = 0;
+-	struct swr_params *txn = NULL;
+-	struct swr_params **temp_txn = NULL;
+-	struct swr_master *master = dev->master;
+-
+-	if (!master) {
+-		pr_err_ratelimited("%s: Master is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-	if (num_port > SWR_MAX_DEV_PORT_NUM) {
+-		dev_err_ratelimited(&master->dev, "%s: num_port %d exceeds max port %d\n",
+-			__func__, num_port, SWR_MAX_DEV_PORT_NUM);
+-		return -EINVAL;
+-	}
+-
+-	/*
+-	 * create "txn" to accommodate ports enablement of
+-	 * different slave devices calling swr_connect_port at the
+-	 * same time. Once master process the txn data, it calls
+-	 * swr_port_response() to free the transaction. Maximum
+-	 * of 256 transactions can be allocated.
+-	 */
+-	txn = kzalloc(sizeof(struct swr_params), GFP_KERNEL);
+-	if (!txn)
+-		return -ENOMEM;
+-
+-	mutex_lock(&master->mlock);
+-	for (i = 0; i < master->last_tid; i++) {
+-		if (master->port_txn[i] == NULL)
+-			break;
+-	}
+-	if (i >= master->last_tid) {
+-		if (master->last_tid == 255) {
+-			mutex_unlock(&master->mlock);
+-			kfree(txn);
+-			dev_err_ratelimited(&master->dev, "%s Max tid reached\n",
+-				__func__);
+-			return -ENOMEM;
+-		}
+-		temp_txn = krealloc(master->port_txn,
+-				(i + 1) * sizeof(struct swr_params *),
+-				GFP_KERNEL);
+-		if (!temp_txn) {
+-			mutex_unlock(&master->mlock);
+-			kfree(txn);
+-			dev_err_ratelimited(&master->dev, "%s Not able to allocate\n"
+-				"master port transaction memory\n",
+-				__func__);
+-			return -ENOMEM;
+-		}
+-		master->port_txn = temp_txn;
+-		master->last_tid++;
+-	}
+-	master->port_txn[i] = txn;
+-	mutex_unlock(&master->mlock);
+-	txn->tid = i;
+-
+-	txn->dev_num = dev->dev_num;
+-	txn->num_port = num_port;
+-	for (i = 0; i < num_port; i++) {
+-		txn->port_id[i] = port_id[i];
+-		txn->num_ch[i]  = num_ch[i];
+-		txn->ch_rate[i] = ch_rate[i];
+-		txn->ch_en[i]   = ch_mask[i];
+-		txn->port_type[i] = port_type[i];
+-	}
+-	ret = master->connect_port(master, txn);
+-	return ret;
++			 u8 *ch_mask, u32 *ch_rate, u8 *num_ch, u8 *port_type)
++{
++	return swr_port_request(dev, port_id, num_port, ch_mask, ch_rate,
++				num_ch, port_type, true);
+ }
+ EXPORT_SYMBOL(swr_connect_port);
+ 
+@@ -388,69 +486,10 @@
+  * disable master and slave port and (re)configure frame structure
+  */
+ int swr_disconnect_port(struct swr_device *dev, u8 *port_id, u8 num_port,
+-					u8 *ch_mask, u8 *port_type)
+-{
+-	u8 i = 0;
+-	int ret;
+-	struct swr_params *txn = NULL;
+-	struct swr_params **temp_txn = NULL;
+-	struct swr_master *master = dev->master;
+-
+-	if (!master) {
+-		pr_err_ratelimited("%s: Master is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if (num_port > SWR_MAX_DEV_PORT_NUM) {
+-		dev_err_ratelimited(&master->dev, "%s: num_port %d exceeds max port %d\n",
+-			__func__, num_port, SWR_MAX_DEV_PORT_NUM);
+-		return -EINVAL;
+-	}
+-
+-	txn = kzalloc(sizeof(struct swr_params), GFP_KERNEL);
+-	if (!txn)
+-		return -ENOMEM;
+-
+-	mutex_lock(&master->mlock);
+-	for (i = 0; i < master->last_tid; i++) {
+-		if (master->port_txn[i] == NULL)
+-			break;
+-	}
+-	if (i >= master->last_tid) {
+-		if (master->last_tid == 255) {
+-			mutex_unlock(&master->mlock);
+-			kfree(txn);
+-			dev_err_ratelimited(&master->dev, "%s Max tid reached\n",
+-				__func__);
+-			return -ENOMEM;
+-		}
+-		temp_txn = krealloc(master->port_txn,
+-				(i + 1) * sizeof(struct swr_params *),
+-				GFP_KERNEL);
+-		if (!temp_txn) {
+-			mutex_unlock(&master->mlock);
+-			kfree(txn);
+-			dev_err_ratelimited(&master->dev, "%s Not able to allocate\n"
+-				"master port transaction memory\n",
+-				__func__);
+-			return -ENOMEM;
+-		}
+-		master->port_txn = temp_txn;
+-		master->last_tid++;
+-	}
+-	master->port_txn[i] = txn;
+-	mutex_unlock(&master->mlock);
+-	txn->tid = i;
+-
+-	txn->dev_num = dev->dev_num;
+-	txn->num_port = num_port;
+-	for (i = 0; i < num_port; i++) {
+-		txn->port_id[i] = port_id[i];
+-		txn->ch_en[i]   = ch_mask[i];
+-		txn->port_type[i] = port_type[i];
+-	}
+-	ret = master->disconnect_port(master, txn);
+-	return ret;
++			    u8 *ch_mask, u8 *port_type)
++{
++	return swr_port_request(dev, port_id, num_port, ch_mask, NULL,
++				NULL, port_type, false);
+ }
+ EXPORT_SYMBOL(swr_disconnect_port);
+ 
+@@ -462,19 +501,22 @@
+  *
+  * This API will get the logical device number of soundwire slave device
+  */
+-int swr_get_logical_dev_num(struct swr_device *dev, u64 dev_id,
+-			u8 *dev_num)
+-{
+-	int ret = 0;
+-	struct swr_master *master = dev->master;
+-
+-	if (!master) {
+-		pr_err("%s: Master is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-	mutex_lock(&master->mlock);
+-	ret = master->get_logical_dev_num(master, dev_id, dev_num);
+-	mutex_unlock(&master->mlock);
++int swr_get_logical_dev_num(struct swr_device *dev, u64 dev_id, u8 *dev_num)
++{
++	struct swr_master *master;
++	int ret;
++
++	if (!dev || !dev_num)
++		return -EINVAL;
++	master = dev->master;
++	ret = swr_master_begin(master);
++	if (ret)
++		return ret;
++	if (master->get_logical_dev_num)
++		ret = master->get_logical_dev_num(master, dev_id, dev_num);
++	else
++		ret = -EOPNOTSUPP;
++	swr_master_end(master);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(swr_get_logical_dev_num);
+@@ -487,20 +529,22 @@
+  *
+  * This API will set soundwire port params from slave
+  */
+-int swr_init_port_params(struct swr_device *dev,
+-			 u32 num_ports, struct swr_dev_frame_config *pp)
+-{
+-	int ret = 0;
+-	struct swr_master *master = dev->master;
+-
+-	if (!master) {
+-		pr_err("%s: Master is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-	mutex_lock(&master->mlock);
+-	ret = master->init_port_params(master, dev->dev_num,
+-				       num_ports, pp);
+-	mutex_unlock(&master->mlock);
++int swr_init_port_params(struct swr_device *dev, u32 num_ports, struct swr_dev_frame_config *pp)
++{
++	struct swr_master *master;
++	int ret;
++
++	if (!dev || !pp || !num_ports || num_ports > SWR_MAX_DEV_PORT_NUM)
++		return -EINVAL;
++	master = dev->master;
++	ret = swr_master_begin(master);
++	if (ret)
++		return ret;
++	if (master->init_port_params)
++		ret = master->init_port_params(master, dev->dev_num, num_ports, pp);
++	else
++		ret = -EOPNOTSUPP;
++	swr_master_end(master);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(swr_init_port_params);
+@@ -514,20 +558,22 @@
+  */
+ int swr_device_wakeup_vote(struct swr_device *dev)
+ {
+-	int ret = 0;
+-	struct swr_master *master = dev->master;
+-
+-	if (!master) {
+-		pr_err("%s: Master is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-	mutex_lock(&master->mlock);
+-	if (master->device_wakeup_vote)
++	struct swr_master *master;
++	int ret;
++
++	if (!dev)
++		return -EINVAL;
++	master = dev->master;
++	ret = swr_master_begin(master);
++	if (ret)
++		return ret;
++	if (master->device_wakeup_vote) {
+ 		master->device_wakeup_vote(master);
+-	else
+-		ret = -EINVAL;
+-	mutex_unlock(&master->mlock);
+-
++		ret = 0;
++	} else {
++		ret = -EOPNOTSUPP;
++	}
++	swr_master_end(master);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(swr_device_wakeup_vote);
+@@ -542,20 +588,22 @@
+  */
+ int swr_device_wakeup_unvote(struct swr_device *dev)
+ {
+-	int ret = 0;
+-	struct swr_master *master = dev->master;
+-
+-	if (!master) {
+-		pr_err("%s: Master is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-	mutex_lock(&master->mlock);
+-	if (master->device_wakeup_unvote)
++	struct swr_master *master;
++	int ret;
++
++	if (!dev)
++		return -EINVAL;
++	master = dev->master;
++	ret = swr_master_begin(master);
++	if (ret)
++		return ret;
++	if (master->device_wakeup_unvote) {
+ 		master->device_wakeup_unvote(master);
+-	else
+-		ret = -EINVAL;
+-	mutex_unlock(&master->mlock);
+-
++		ret = 0;
++	} else {
++		ret = -EOPNOTSUPP;
++	}
++	swr_master_end(master);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(swr_device_wakeup_unvote);
+@@ -574,11 +622,21 @@
+ int swr_read(struct swr_device *dev, u8 dev_num, u16 reg_addr,
+ 	     void *buf, u32 len)
+ {
+-	struct swr_master *master = dev->master;
+-
+-	if (!master)
+-		return -EINVAL;
+-	return master->read(master, dev_num, reg_addr, buf, len);
++	struct swr_master *master;
++	int ret;
++
++	if (!dev || !buf || !len || len > 0x10000U - reg_addr)
++		return -EINVAL;
++	master = dev->master;
++	ret = swr_master_begin(master);
++	if (ret)
++		return ret;
++	if (master->read)
++		ret = master->read(master, dev_num, reg_addr, buf, len);
++	else
++		ret = -EOPNOTSUPP;
++	swr_master_end(master);
++	return ret;
+ }
+ EXPORT_SYMBOL(swr_read);
+ 
+@@ -597,24 +655,22 @@
+ 		   const void *buf, size_t len)
+ {
+ 	struct swr_master *master;
+-
+-	if (!dev || !dev->master)
+-		return -EINVAL;
+-
++	int ret;
++
++	if (!dev || !buf || !reg || !len)
++		return -EINVAL;
+ 	master = dev->master;
+-	if (dev->group_id) {
+-		if (master->gr_sid != dev_num) {
+-			if (!master->gr_sid)
+-				master->gr_sid = dev_num;
+-			else
+-				return 0;
+-		}
+-		dev_num = dev->group_id;
+-	}
+-	if (master->bulk_write)
+-		return master->bulk_write(master, dev_num, reg, buf, len);
+-
+-	return -EOPNOTSUPP;
++	ret = swr_master_begin(master);
++	if (ret)
++		return ret;
++	if (!master->bulk_write)
++		ret = -EOPNOTSUPP;
++	else if (swr_group_target(dev, &dev_num, true))
++		ret = master->bulk_write(master, dev_num, reg, buf, len);
++	else
++		ret = 0;
++	swr_master_end(master);
++	return ret;
+ }
+ EXPORT_SYMBOL(swr_bulk_write);
+ 
+@@ -631,21 +687,23 @@
+ int swr_write(struct swr_device *dev, u8 dev_num, u16 reg_addr,
+ 	      const void *buf)
+ {
+-	struct swr_master *master = dev->master;
+-
+-	if (!master)
+-		return -EINVAL;
+-
+-	if (dev->group_id) {
+-		if (master->gr_sid != dev_num) {
+-			if (!master->gr_sid)
+-				master->gr_sid = dev_num;
+-			else
+-				return 0;
+-		}
+-		dev_num = dev->group_id;
+-	}
+-	return master->write(master, dev_num, reg_addr, buf);
++	struct swr_master *master;
++	int ret;
++
++	if (!dev || !buf)
++		return -EINVAL;
++	master = dev->master;
++	ret = swr_master_begin(master);
++	if (ret)
++		return ret;
++	if (!master->write)
++		ret = -EOPNOTSUPP;
++	else if (swr_group_target(dev, &dev_num, true))
++		ret = master->write(master, dev_num, reg_addr, buf);
++	else
++		ret = 0;
++	swr_master_end(master);
++	return ret;
+ }
+ EXPORT_SYMBOL(swr_write);
+ 
+@@ -659,21 +717,7 @@
+  */
+ int swr_device_up(struct swr_device *swr_dev)
+ {
+-	struct device *dev;
+-	const struct swr_driver *sdrv;
+-
+-	if (!swr_dev)
+-		return -EINVAL;
+-
+-	dev = &swr_dev->dev;
+-	sdrv = to_swr_driver(dev->driver);
+-	if (!sdrv)
+-		return 0;
+-
+-	if (sdrv->device_up)
+-		return sdrv->device_up(to_swr_device(dev));
+-
+-	return -ENODEV;
++	return swr_driver_event(swr_dev, 0);
+ }
+ EXPORT_SYMBOL(swr_device_up);
+ 
+@@ -687,21 +731,7 @@
+  */
+ int swr_device_down(struct swr_device *swr_dev)
+ {
+-	struct device *dev;
+-	const struct swr_driver *sdrv;
+-
+-	if (!swr_dev)
+-		return -EINVAL;
+-
+-	dev = &swr_dev->dev;
+-	sdrv = to_swr_driver(dev->driver);
+-	if (!sdrv)
+-		return 0;
+-
+-	if (sdrv->device_down)
+-		return sdrv->device_down(to_swr_device(dev));
+-
+-	return -ENODEV;
++	return swr_driver_event(swr_dev, 1);
+ }
+ EXPORT_SYMBOL(swr_device_down);
+ 
+@@ -716,21 +746,7 @@
+  */
+ int swr_reset_device(struct swr_device *swr_dev)
+ {
+-	struct device *dev;
+-	const struct swr_driver *sdrv;
+-
+-	if (!swr_dev)
+-		return -EINVAL;
+-
+-	dev = &swr_dev->dev;
+-	sdrv = to_swr_driver(dev->driver);
+-	if (!sdrv)
+-		return -EINVAL;
+-
+-	if (sdrv->reset_device)
+-		return sdrv->reset_device(to_swr_device(dev));
+-
+-	return -ENODEV;
++	return swr_driver_event(swr_dev, 2);
+ }
+ EXPORT_SYMBOL(swr_reset_device);
+ 
+@@ -746,42 +762,59 @@
+ int swr_set_device_group(struct swr_device *swr_dev, u8 id)
+ {
+ 	struct swr_master *master;
+-
+-	if (!swr_dev)
+-		return -EINVAL;
+-
++	unsigned long flags;
++	int ret;
++
++	if (!swr_dev || (id != SWR_GROUP_NONE && id != SWR_GROUP_12 &&
++			 id != SWR_GROUP_13 && id != SWR_BROADCAST))
++		return -EINVAL;
++	master = swr_dev->master;
++	ret = swr_master_begin(master);
++	if (ret)
++		return ret;
++	spin_lock_irqsave(&master->state_lock, flags);
+ 	swr_dev->group_id = id;
+-	master = swr_dev->master;
+-	if (!id && master)
++	if (!id)
+ 		master->gr_sid = 0;
+-
++	spin_unlock_irqrestore(&master->state_lock, flags);
++	swr_master_end(master);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(swr_set_device_group);
+ 
+ static int swr_drv_probe(struct device *dev)
+ {
+-	const struct swr_driver *sdrv = to_swr_driver(dev->driver);
+-
+-	if (!sdrv)
+-		return -EINVAL;
+-
+-	if (sdrv->probe)
+-		return sdrv->probe(to_swr_device(dev));
+-	return -ENODEV;
+-}
++	struct swr_driver *sdrv = to_swr_driver(dev->driver);
++	struct swr_device *swr = to_swr_device(dev);
++	unsigned long flags;
++	int ret;
++
++	if (!sdrv || !sdrv->probe)
++		return -ENODEV;
++	/* Probe I/O may synchronously wake this device through the controller. */
++	spin_lock_irqsave(&swr->driver_lock, flags);
++	swr->driver = sdrv;
++	swr->driver_stopping = false;
++	spin_unlock_irqrestore(&swr->driver_lock, flags);
++	atomic_inc(&swr->scp_generation);
++	ret = sdrv->probe(swr);
++	if (ret)
++		swr_driver_drain(swr);
++	return ret;
++}
++
+ 
+ static int swr_drv_remove(struct device *dev)
+ {
+-	const struct swr_driver *sdrv = to_swr_driver(dev->driver);
+-
+-	if (!sdrv)
+-		return -EINVAL;
+-
+-	if (sdrv->remove)
+-		return sdrv->remove(to_swr_device(dev));
+-	return -ENODEV;
+-}
++	struct swr_driver *sdrv = to_swr_driver(dev->driver);
++	struct swr_device *swr = to_swr_device(dev);
++
++	swr_driver_drain(swr);
++	if (sdrv && sdrv->remove)
++		return sdrv->remove(swr);
++	return 0;
++}
++
+ 
+ static void swr_drv_shutdown(struct device *dev)
+ {
+@@ -801,11 +834,11 @@
+  */
+ int swr_driver_register(struct swr_driver *drv)
+ {
++	if (!drv || !drv->probe)
++		return -EINVAL;
+ 	drv->driver.bus = &soundwire_type;
+-	if (drv->probe)
+-		drv->driver.probe = swr_drv_probe;
+-	if (drv->remove)
+-		drv->driver.remove = swr_drv_remove;
++	drv->driver.probe = swr_drv_probe;
++	drv->driver.remove = swr_drv_remove;
+ 
+ 	if (drv->shutdown)
+ 		drv->driver.shutdown = swr_drv_shutdown;
+@@ -840,7 +873,7 @@
+ 	swr = swr_new_device(master, bi);
+ 	if (!swr)
+ 		dev_err(&master->dev, "can't create new device for %s\n",
+-			bi->swr_slave->name);
++			bi->name);
+ }
+ 
+ /**
+@@ -855,11 +888,15 @@
+ {
+ 	struct boardinfo *bi;
+ 
++	if (swr_master_begin(master))
++		return;
+ 	mutex_lock(&board_lock);
+-	list_add_tail(&master->list, &swr_master_list);
++	if (list_empty(&master->list))
++		list_add_tail(&master->list, &swr_master_list);
+ 	list_for_each_entry(bi, &board_list, list)
+ 		swr_match_ctrl_to_boardinfo(master, &bi->board_info);
+ 	mutex_unlock(&board_lock);
++	swr_master_end(master);
+ }
+ EXPORT_SYMBOL(swr_master_add_boarddevices);
+ 
+@@ -873,7 +910,7 @@
+ 	list_for_each_entry(master, &swr_master_list, list) {
+ 		mutex_lock(&master->mlock);
+ 		list_for_each_entry(swr, &master->devices, dev_list) {
+-			if (swr->dev.of_node == np) {
++			if (np && swr->dev.of_node == np && get_device(&swr->dev)) {
+ 				found = true;
+ 				mutex_unlock(&master->mlock);
+ 				goto exit;
+@@ -891,14 +928,22 @@
+ 
+ static void swr_unregister_device(struct swr_device *swr)
+ {
+-	if (swr)
++	if (swr) {
++		swr_remove_device(swr);
+ 		device_unregister(&swr->dev);
+-}
++	}
++}
++
+ 
+ static void swr_master_release(struct device *dev)
+ {
+-	/* kfree of master done at swrm_remove of device */
+-}
++	struct swr_master *master = to_swr_master(dev);
++
++	/* Controllers retain their allocation until this final device release. */
++	if (master->release)
++		master->release(master);
++}
++
+ 
+ #define swr_master_attr_gr NULL
+ static struct device_type swr_master_type = {
+@@ -921,71 +966,105 @@
+  */
+ void swr_unregister_master(struct swr_master *master)
+ {
+-	int dummy;
+-	struct swr_master *m_ctrl;
+-
++	struct swr_params **pending;
++	unsigned long flags;
++	int i;
++
++	if (!master)
++		return;
+ 	mutex_lock(&swr_lock);
+-	m_ctrl = idr_find(&master_idr, master->bus_num);
++	if (idr_find(&master_idr, master->bus_num) != master) {
++		mutex_unlock(&swr_lock);
++		return;
++	}
++	idr_remove(&master_idr, master->bus_num);
+ 	mutex_unlock(&swr_lock);
+-	if (m_ctrl != master)
+-		return;
+-
++	spin_lock_irqsave(&master->state_lock, flags);
++	master->stopping = true;
++	spin_unlock_irqrestore(&master->state_lock, flags);
++	wait_event(master->call_wait, !atomic_read(&master->active_calls));
+ 	mutex_lock(&board_lock);
+-	list_del(&master->list);
++	list_del_init(&master->list);
+ 	mutex_unlock(&board_lock);
+-
+-	/* free bus id */
++	device_for_each_child(&master->dev, NULL, __unregister);
++	spin_lock_irqsave(&master->state_lock, flags);
++	pending = master->port_txn;
++	master->port_txn = NULL;
++	master->last_tid = 0;
++	spin_unlock_irqrestore(&master->state_lock, flags);
++	for (i = 0; i < 255; i++)
++		swr_transaction_put(pending[i]);
++	kfree(pending);
++	device_unregister(&master->dev);
++}
++EXPORT_SYMBOL(swr_unregister_master);
++
++/**
++ * swr_register_master - register soundwire master controller
++ * @master: master to be registered
++ *
++ * This API will register master with the framework. master->bus_num
++ * is the desired number with which soundwire framework registers the
++ * master.
++ */
++int swr_register_master(struct swr_master *master)
++{
++	int id, ret;
++
++	if (!master)
++		return -EINVAL;
++	mutex_init(&master->mlock);
++	spin_lock_init(&master->state_lock);
++	init_waitqueue_head(&master->call_wait);
++	atomic_set(&master->active_calls, 0);
++	INIT_LIST_HEAD(&master->devices);
++	INIT_LIST_HEAD(&master->list);
++	master->stopping = true;
++	master->gr_sid = 0;
++	device_initialize(&master->dev);
++	master->dev.bus = &soundwire_type;
++	master->dev.type = &swr_master_type;
++	master->port_txn = kcalloc(255, sizeof(*master->port_txn), GFP_KERNEL);
++	if (!master->port_txn) {
++		ret = -ENOMEM;
++		goto put;
++	}
++	master->last_tid = 255;
++	mutex_lock(&swr_lock);
++	id = of_alias_get_id(master->dev.of_node, "swr");
++	if (id >= 0)
++		master->bus_num = id;
++	if (master->bus_num >= INT_MAX)
++		id = -EINVAL;
++	else
++		id = idr_alloc(&master_idr, master, master->bus_num,
++			       master->bus_num + 1, GFP_KERNEL);
++	mutex_unlock(&swr_lock);
++	if (id < 0) {
++		kfree(master->port_txn);
++		master->port_txn = NULL;
++		master->last_tid = 0;
++		ret = id;
++		goto put;
++	}
++	master->bus_num = id;
++	ret = dev_set_name(&master->dev, "swr%u", master->bus_num);
++	if (!ret)
++		ret = device_add(&master->dev);
++	if (!ret) {
++		master->stopping = false;
++		return 0;
++	}
+ 	mutex_lock(&swr_lock);
+ 	idr_remove(&master_idr, master->bus_num);
+ 	mutex_unlock(&swr_lock);
+-
+-	dummy = device_for_each_child(&master->dev, NULL, __unregister);
+-	device_unregister(&master->dev);
+-}
+-EXPORT_SYMBOL(swr_unregister_master);
+-
+-/**
+- * swr_register_master - register soundwire master controller
+- * @master: master to be registered
+- *
+- * This API will register master with the framework. master->bus_num
+- * is the desired number with which soundwire framework registers the
+- * master.
+- */
+-int swr_register_master(struct swr_master *master)
+-{
+-	int id;
+-	int status = 0;
+-
+-	mutex_lock(&swr_lock);
+-	id = of_alias_get_id(master->dev.of_node, "swr");
+-
+-	if (id >= 0)
+-		master->bus_num = id;
+-	id = idr_alloc(&master_idr, master, master->bus_num,
+-				master->bus_num + 1, GFP_KERNEL);
+-	mutex_unlock(&swr_lock);
+-	if (id < 0)
+-		return id;
+-
+-	master->bus_num = id;
+-
+-	dev_set_name(&master->dev, "swr%u", master->bus_num);
+-	master->dev.bus = &soundwire_type;
+-	master->dev.type = &swr_master_type;
+-	mutex_init(&master->mlock);
+-	status = device_register(&master->dev);
+-	if (status < 0)
+-		goto done;
+-
+-	INIT_LIST_HEAD(&master->devices);
+-	pr_debug("%s: SWR master registered successfully %s\n",
+-		__func__, dev_name(&master->dev));
+-	return 0;
+-
+-done:
+-	idr_remove(&master_idr, master->bus_num);
+-	return status;
++	master->stopping = true;
++	kfree(master->port_txn);
++	master->port_txn = NULL;
++	master->last_tid = 0;
++put:
++	put_device(&master->dev);
++	return ret;
+ }
+ EXPORT_SYMBOL(swr_register_master);
+ 
+@@ -1008,10 +1087,10 @@
+ 	return NULL;
+ }
+ 
+-static int swr_device_match(struct device *dev, struct device_driver *driver)
++static int swr_device_match(struct device *dev, const struct device_driver *driver)
+ {
+ 	struct swr_device *swr_dev;
+-	struct swr_driver *drv = to_swr_driver(driver);
++	const struct swr_driver *drv = container_of_const(driver, struct swr_driver, driver);
+ 
+ 	if (!drv)
+ 		return -EINVAL;
+@@ -1102,7 +1181,12 @@
+ 		)
+ };
+ 
++static void soundwire_dev_release(struct device *dev)
++{
++}
++
+ struct device soundwire_dev = {
++	.release = soundwire_dev_release,
+ 	.init_name = "soundwire",
+ };
+ 
+@@ -1124,11 +1208,13 @@
+ 	int retval;
+ 
+ 	retval = bus_register(&soundwire_type);
+-	if (!retval)
+-		retval = device_register(&soundwire_dev);
+-
+ 	if (retval)
++		return retval;
++	retval = device_register(&soundwire_dev);
++	if (retval) {
++		put_device(&soundwire_dev);
+ 		bus_unregister(&soundwire_type);
++	}
+ 
+ 	return retval;
+ }

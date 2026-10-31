@@ -1,0 +1,2107 @@
+--- a/qcom/opensource/bt-kernel/pwr/btpower.c
++++ b/qcom/opensource/bt-kernel/pwr/btpower.c
+@@ -28,6 +28,9 @@
+ #include <soc/qcom/cmd-db.h>
+ #include <linux/kdev_t.h>
+ #include <linux/refcount.h>
++#include <linux/srcu.h>
++#include <linux/completion.h>
++#include <linux/sched/task.h>
+ #include <linux/idr.h>
+ #include <linux/cdev.h>
+ #include <linux/device.h>
+@@ -412,12 +415,32 @@
+ static int bt_major;
+ static int soc_id;
+ static bool probe_finished;
++static DEFINE_MUTEX(btpower_lifecycle_lock);
++static DEFINE_MUTEX(btpower_ioctl_lock);
++static DEFINE_MUTEX(btpower_operation_lock);
++DEFINE_STATIC_SRCU(btpower_srcu);
++static unsigned long btpower_generation;
++
++struct btpower_request {
++	struct list_head node;
++	struct completion done;
++	refcount_t refs;
++	enum plt_pwr_state request;
++	int result;
++};
++
++static void btpower_request_put(struct btpower_request *request)
++{
++	if (refcount_dec_and_test(&request->refs))
++		kfree(request);
++}
+ static struct fmdOperationStruct fmdStruct;
+ char *default_crash_reason = "Crash reason not found";
+ 
+ static int btpower_enable_ipa_vreg(struct platform_pwr_data *pdata);
+ static inline int btpower_get_retenion_mode_state(void);
+ static void bt_power_vote(struct work_struct *work);
++static void btpower_send_signal(struct platform_pwr_data *, bool, int);
+ 
+ static struct {
+ 	int platform_state[BT_POWER_SRC_SIZE];
+@@ -432,7 +455,7 @@
+ } CrashInfo;
+ 
+ #ifdef CONFIG_BT_HW_SECURE_DISABLE
+-int perisec_cnss_bt_hw_disable_check(struct platform_pwr_data *plat_priv)
++static int perisec_cnss_bt_hw_disable_check(struct platform_pwr_data *plat_priv)
+ {
+ 	struct Object client_env;
+ 	struct Object app_object;
+@@ -493,7 +516,7 @@
+ 	return ret;
+ }
+ #else
+-int perisec_cnss_bt_hw_disable_check(struct platform_pwr_data *plat_priv)
++static int perisec_cnss_bt_hw_disable_check(struct platform_pwr_data *plat_priv)
+ {
+ 	return 0;
+ }
+@@ -509,32 +532,13 @@
+ 
+ static irqreturn_t btpower_host_wake_isr(int irq, void *data)
+ {
+-	struct platform_pwr_data *drvdata = data;
+-	struct kernel_siginfo siginfo;
+-	int host_waking = (SIGIO_OOBS_SINGAL |
+-			   gpio_get_value(drvdata->bt_gpio_host_wake));
+-	int rc = 0;
+-
+-	pr_debug("%s: bt-hostwake-gpio(%d) IRQ(%d) value(%d)\n", __func__,
+-		drvdata->bt_gpio_host_wake, drvdata->irq, host_waking);
+-
+-	if (drvdata->reftask_bt == NULL) {
+-		pr_info("%s: ignore BT-HOSTWAKE IRQ\n", __func__);
+-		return IRQ_HANDLED;
+-	}
+-
+-	// Sending signal to HAL layer
+-	memset(&siginfo, 0, sizeof(siginfo));
+-	siginfo.si_signo = SIGIO;
+-	siginfo.si_code = SI_QUEUE;
+-	siginfo.si_int = host_waking;
+-	rc = send_sig_info(siginfo.si_signo, &siginfo, drvdata->reftask_bt);
+-	if (rc < 0) {
+-		pr_err("%s: failed (%d) to send SIG to HAL(%d)\n", __func__,
+-			rc, drvdata->reftask_bt->pid);
+-	}
++	struct platform_pwr_data *pdata = data;
++	int signal_state = SIGIO_OOBS_SINGAL | gpio_get_value(pdata->bt_gpio_host_wake);
++
++	btpower_send_signal(pdata, true, signal_state);
+ 	return IRQ_HANDLED;
+ }
++
+ #endif
+ 
+ static int vreg_configure(struct vreg_data *vreg, bool retention)
+@@ -572,9 +576,9 @@
+ 	pr_debug("%s: vreg_en for : %s\n", __func__, vreg->name);
+ 
+ 	if (!vreg->is_enabled) {
+-		if (vreg_configure(vreg, false) < 0) {
++		rc = vreg_configure(vreg, false);
++		if (rc < 0)
+ 			return rc;
+-		}
+ 		rc = regulator_enable(vreg->reg);
+ 		if (rc < 0) {
+ 			pr_err("%s: regulator_enable(%s) failed. rc=%d\n",
+@@ -741,7 +745,7 @@
+ }
+ 
+ #ifdef CONFIG_MSM_BT_OOBS
+-void bt_configure_wakeup_gpios(int on)
++static void bt_configure_wakeup_gpios(int on)
+ {
+ 	int bt_gpio_dev_wake = pwr_data->bt_gpio_dev_wake;
+ 	int bt_host_wake_gpio = pwr_data->bt_gpio_host_wake;
+@@ -749,34 +753,39 @@
+ 
+ 	if (on) {
+ 		if (gpio_is_valid(bt_gpio_dev_wake)) {
+-			gpio_set_value(bt_gpio_dev_wake, 1);
++			gpio_set_value_cansleep(bt_gpio_dev_wake, 1);
+ 			pr_debug("%s: BT-ON asserting BT_WAKE(%d)\n", __func__,
+ 				 bt_gpio_dev_wake);
+ 		}
+ 
+-		if (gpio_is_valid(bt_host_wake_gpio)) {
++		if (gpio_is_valid(bt_host_wake_gpio) && !pwr_data->host_irq_requested) {
+ 			pwr_data->irq = gpio_to_irq(bt_host_wake_gpio);
+ 			pr_debug("%s: BT-ON bt-host_wake-gpio(%d) IRQ(%d)\n",
+ 				__func__, bt_host_wake_gpio, pwr_data->irq);
++			if (pwr_data->irq <= 0)
++				return;
+ 			rc = request_irq(pwr_data->irq,
+ 					 btpower_host_wake_isr,
+ 					 IRQF_TRIGGER_FALLING |
+ 					 IRQF_TRIGGER_RISING,
+ 					 "btpower_hostwake_isr", pwr_data);
++			if (!rc)
++				pwr_data->host_irq_requested = true;
+ 			if (rc)
+ 				pr_err("%s: unable to request IRQ %d (%d)\n",
+ 				__func__, bt_host_wake_gpio, rc);
+ 		}
+ 	} else {
+-		if (gpio_is_valid(bt_host_wake_gpio)) {
++		if (pwr_data->host_irq_requested) {
+ 			pr_debug("%s: BT-OFF bt-hostwake-gpio(%d) IRQ(%d) value(%d)\n",
+ 				 __func__, bt_host_wake_gpio, pwr_data->irq,
+-				 gpio_get_value(bt_host_wake_gpio));
++				 gpio_get_value_cansleep(bt_host_wake_gpio));
+ 			free_irq(pwr_data->irq, pwr_data);
++			pwr_data->host_irq_requested = false;
+ 		}
+ 
+ 		if (gpio_is_valid(bt_gpio_dev_wake))
+-			gpio_set_value(bt_gpio_dev_wake, 0);
++			gpio_set_value_cansleep(bt_gpio_dev_wake, 0);
+ 	}
+ }
+ #endif
+@@ -814,6 +823,23 @@
+ 	return rc;
+ }
+ 
++static void bt_release_gpios(void)
++{
++	if (pwr_data->reset_requested) {
++		gpio_set_value_cansleep(pwr_data->bt_gpio_sys_rst, 0);
++		gpio_free(pwr_data->bt_gpio_sys_rst);
++		pwr_data->reset_requested = false;
++	}
++	if (pwr_data->resetb_requested) {
++		gpio_free(pwr_data->bt_gpio_resetb);
++		pwr_data->resetb_requested = false;
++	}
++	if (pwr_data->debug_requested) {
++		gpio_free(pwr_data->bt_gpio_debug);
++		pwr_data->debug_requested = false;
++	}
++}
++
+ static int bt_configure_gpios(int on)
+ {
+ 	int rc = 0;
+@@ -825,13 +851,15 @@
+ 	int assert_dbg_gpio = 0;
+ 
+ 	if (on) {
+-		rc = gpio_request(bt_reset_gpio, "bt_sys_rst_n");
++		if (!pwr_data->reset_requested)
++			rc = gpio_request(bt_reset_gpio, "bt_sys_rst_n");
+ 		if (rc) {
+ 			pr_err("%s: unable to request gpio %d (%d)\n",
+ 					__func__, bt_reset_gpio, rc);
+ 			return rc;
+ 		}
+-		if (bt_resetb_gpio  >=  0) {
++		pwr_data->reset_requested = true;
++		if (bt_resetb_gpio >= 0 && !pwr_data->resetb_requested) {
+ 			rc = gpio_request(bt_resetb_gpio, "bt_resetb_gpio_n");
+ 			if (rc) {
+ 				pr_err("%s: unable to request gpio %d (%d)\n",
+@@ -840,24 +868,26 @@
+ 			}
+ 		}
+ 
++		if (bt_resetb_gpio >= 0)
++			pwr_data->resetb_requested = true;
+ 		pr_info("BTON:Turn Bt OFF asserting BT_EN to low\n");
+ 		pr_info("bt-reset-gpio(%d) value(%d)\n", bt_reset_gpio,
+-			gpio_get_value(bt_reset_gpio));
++			gpio_get_value_cansleep(bt_reset_gpio));
+ 		rc = gpio_direction_output(bt_reset_gpio, 0);
+ 		if (rc) {
+ 			pr_err("%s: Unable to set direction\n", __func__);
+ 			return rc;
+ 		}
+ 		power_src.platform_state[BT_RESET_GPIO] =
+-			gpio_get_value(bt_reset_gpio);
++			gpio_get_value_cansleep(bt_reset_gpio);
+ 		msleep(50);
+ 		pr_info("BTON:Turn Bt OFF post asserting BT_EN to low\n");
+ 		pr_info("bt-reset-gpio(%d) value(%d)\n", bt_reset_gpio,
+-			gpio_get_value(bt_reset_gpio));
++			gpio_get_value_cansleep(bt_reset_gpio));
+ 
+ 		if (bt_sw_ctrl_gpio >= 0) {
+ 			power_src.platform_state[BT_SW_CTRL_GPIO] =
+-			gpio_get_value(bt_sw_ctrl_gpio);
++			gpio_get_value_cansleep(bt_sw_ctrl_gpio);
+ 			if (pwr_data->sw_cntrl_gpio > 0) {
+ 				rc = msm_gpio_mpm_wake_set(pwr_data->sw_cntrl_gpio, 1);
+ 				if (rc < 0) {
+@@ -873,10 +903,10 @@
+ 		}
+ 		if (wl_reset_gpio >= 0)
+ 			pr_info("BTON:Turn Bt ON wl-reset-gpio(%d) value(%d)\n",
+-				wl_reset_gpio, gpio_get_value(wl_reset_gpio));
++				wl_reset_gpio, gpio_get_value_cansleep(wl_reset_gpio));
+ 
+ 		if ((wl_reset_gpio < 0) ||
+-			((wl_reset_gpio >= 0) && gpio_get_value(wl_reset_gpio))) {
++			((wl_reset_gpio >= 0) && gpio_get_value_cansleep(wl_reset_gpio))) {
+ 
+ 			btpower_set_xo_clk_gpio_state(true);
+ 			pr_info("BTON: WLAN ON Asserting BT_EN to high\n");
+@@ -886,11 +916,11 @@
+ 				return rc;
+ 			}
+ 			power_src.platform_state[BT_RESET_GPIO] =
+-				gpio_get_value(bt_reset_gpio);
++				gpio_get_value_cansleep(bt_reset_gpio);
+ 			btpower_set_xo_clk_gpio_state(false);
+ 		}
+-		if ((wl_reset_gpio >= 0) && (gpio_get_value(wl_reset_gpio) == 0)) {
+-			if (gpio_get_value(bt_reset_gpio)) {
++		if ((wl_reset_gpio >= 0) && (gpio_get_value_cansleep(wl_reset_gpio) == 0)) {
++			if (gpio_get_value_cansleep(bt_reset_gpio)) {
+ 				pr_info("BTON: WLAN OFF and BT ON are too close\n");
+ 				pr_info("reset BT_EN, enable it after delay\n");
+ 				rc = gpio_direction_output(bt_reset_gpio, 0);
+@@ -900,10 +930,12 @@
+ 					return rc;
+ 				}
+ 				power_src.platform_state[BT_RESET_GPIO] =
+-					gpio_get_value(bt_reset_gpio);
++					gpio_get_value_cansleep(bt_reset_gpio);
+ 				if (bt_resetb_gpio  >=  0) {
+ 					pr_err("BTON:Turn resetb High\n");
+-					bt_pull_resetb(bt_resetb_gpio, RESETB_GPIO_HIGH);
++					rc = bt_pull_resetb(bt_resetb_gpio, RESETB_GPIO_HIGH);
++					if (rc)
++						return rc;
+ 				}
+ 			}
+ 			pr_info("BTON: WLAN OFF waiting for 100ms delay\n");
+@@ -911,22 +943,27 @@
+ 			msleep(100);
+ 			pr_info("BTON: WLAN OFF Asserting BT_EN to high\n");
+ 			btpower_set_xo_clk_gpio_state(true);
+-			if (bt_resetb_gpio  >=  0)
+-				bt_resetb_operation(bt_resetb_gpio);
++			if (bt_resetb_gpio >= 0) {
++				rc = bt_resetb_operation(bt_resetb_gpio);
++				if (rc) {
++					btpower_set_xo_clk_gpio_state(false);
++					return rc;
++				}
++			}
+ 			rc = gpio_direction_output(bt_reset_gpio, 1);
+ 			if (rc) {
+ 				pr_err("%s: Unable to set direction\n", __func__);
+ 				return rc;
+ 			}
+ 			power_src.platform_state[BT_RESET_GPIO] =
+-				gpio_get_value(bt_reset_gpio);
++				gpio_get_value_cansleep(bt_reset_gpio);
+ 			btpower_set_xo_clk_gpio_state(false);
+ 		}
+ 		/* Below block of code executes if WL_EN is pulled high when
+ 		 * BT_EN is about to pull high. so above two if conditions are
+ 		 * not executed.
+ 		 */
+-		if (!gpio_get_value(bt_reset_gpio)) {
++		if (!gpio_get_value_cansleep(bt_reset_gpio)) {
+ 			btpower_set_xo_clk_gpio_state(true);
+ 			pr_info("BTON: WLAN ON and BT ON are too close\n");
+ 			pr_info("Asserting BT_EN to high\n");
+@@ -936,7 +973,7 @@
+ 				return rc;
+ 			}
+ 			power_src.platform_state[BT_RESET_GPIO] =
+-				gpio_get_value(bt_reset_gpio);
++				gpio_get_value_cansleep(bt_reset_gpio);
+ 			btpower_set_xo_clk_gpio_state(false);
+ 		}
+ 		msleep(50);
+@@ -949,17 +986,18 @@
+ 			if  (rc)  {
+ 				pr_err("%s:SWCTRL Dir Set Problem:%d\n",
+ 					__func__, rc);
+-			}  else  if  (!gpio_get_value(bt_sw_ctrl_gpio))  {
++			}  else  if  (!gpio_get_value_cansleep(bt_sw_ctrl_gpio))  {
+ 				/* SW_CTRL not asserted, assert debug GPIO */
+ 				if  (bt_debug_gpio  >=  0)
+ 					assert_dbg_gpio = 1;
+ 			}
+ 		}
+-		if (assert_dbg_gpio) {
++		if (assert_dbg_gpio && !pwr_data->debug_requested) {
+ 			rc  =  gpio_request(bt_debug_gpio, "bt_debug_n");
+ 			if  (rc)  {
+ 				pr_err("unable to request Debug Gpio\n");
+ 			}  else  {
++				pwr_data->debug_requested = true;
+ 				rc = gpio_direction_output(bt_debug_gpio,  1);
+ 				if (rc)
+ 					pr_err("%s:Prob Set Debug-Gpio\n",
+@@ -967,10 +1005,10 @@
+ 			}
+ 		}
+ 		pr_info("BTON: Turn BT ON bt-reset-gpio(%d) value(%d)\n",
+-			bt_reset_gpio, gpio_get_value(bt_reset_gpio));
++			bt_reset_gpio, gpio_get_value_cansleep(bt_reset_gpio));
+ 		if (bt_sw_ctrl_gpio >= 0) {
+ 			power_src.platform_state[BT_SW_CTRL_GPIO] =
+-			gpio_get_value(bt_sw_ctrl_gpio);
++			gpio_get_value_cansleep(bt_sw_ctrl_gpio);
+ 			pr_info("BTON: Turn BT ON bt-sw-ctrl-gpio(%d) value(%d)\n",
+ 				bt_sw_ctrl_gpio,
+ 				power_src.platform_state[BT_SW_CTRL_GPIO]);
+@@ -979,14 +1017,14 @@
+ #ifdef CONFIG_MSM_BT_OOBS
+ 		bt_configure_wakeup_gpios(on);
+ #endif
+-		gpio_set_value(bt_reset_gpio, 0);
++		gpio_set_value_cansleep(bt_reset_gpio, 0);
+ 		msleep(100);
+ 		pr_info("BT-OFF:bt-reset-gpio(%d) value(%d)\n",
+-			bt_reset_gpio, gpio_get_value(bt_reset_gpio));
++			bt_reset_gpio, gpio_get_value_cansleep(bt_reset_gpio));
+ 		if (bt_sw_ctrl_gpio >= 0) {
+ 			pr_info("BT-OFF:bt-sw-ctrl-gpio(%d) value(%d)\n",
+ 				bt_sw_ctrl_gpio,
+-				gpio_get_value(bt_sw_ctrl_gpio));
++				gpio_get_value_cansleep(bt_sw_ctrl_gpio));
+ 		}
+ 	}
+ 
+@@ -995,37 +1033,31 @@
+ 	return rc;
+ }
+ 
+-static int handle_pwr_disable_req(int core, int reg_num, int retenion_state, int fmd_state)
++static int handle_pwr_disable_req(int core, int reg_num, int retention, int fmd)
+ {
+ 	struct vreg_data *vregs;
+-	int rc;
+-
+-	for (int i = 0; i < reg_num; i++) {
+-		if (core == BT_CORE)
+-			vregs = &pwr_data->bt_vregs[i];
+-		else if (core == UWB_CORE)
+-			vregs = &pwr_data->uwb_vregs[i];
+-		else if (core == PLATFORM_CORE)
+-			vregs = &pwr_data->platform_vregs[i];
+-
+-		if (fmd_state && vregs->fmd_mode_set) {
+-			if (retenion_state != RETENTION_IDLE) {
+-				vreg_disable_retention(vregs);
+-				pr_err("%s: Brought %s reg out-of retention for FMD\n",
+-					__func__, vregs->name);
+-			}
+-			pr_err("%s: Keeping %s reg on power-on state for FMD\n",
+-				__func__, vregs->name);
+-		} else {
+-			rc = vreg_disable(vregs);
+-		}
+-	}
+-	return rc;
++	int i, rc, first_error = 0;
++
++	switch (core) {
++	case BT_CORE: vregs = pwr_data->bt_vregs; break;
++	case UWB_CORE: vregs = pwr_data->uwb_vregs; break;
++	case PLATFORM_CORE: vregs = pwr_data->platform_vregs; break;
++	default: return -EINVAL;
++	}
++	for (i = 0; i < reg_num; i++) {
++		if (fmd && vregs[i].fmd_mode_set)
++			rc = retention != RETENTION_IDLE ? vreg_disable_retention(&vregs[i]) : 0;
++		else
++			rc = vreg_disable(&vregs[i]);
++		if (rc && !first_error)
++			first_error = rc;
++	}
++	return first_error;
+ }
+ 
+ static int bt_regulators_pwr(int pwr_state)
+ {
+-	int i, log_indx, bt_num_vregs, rc = 0;
++	int i, log_indx, bt_num_vregs, rc = 0, cleanup;
+ 	struct vreg_data *bt_vregs = NULL;
+ 
+ 	rc = perisec_cnss_bt_hw_disable_check(pwr_data);
+@@ -1065,7 +1097,7 @@
+ 			}
+ 		}
+ 
+-		if (pwr_data->bt_gpio_sys_rst > 0) {
++		if (gpio_is_valid(pwr_data->bt_gpio_sys_rst)) {
+ 			power_src.bt_state[BT_RESET_GPIO] = DEFAULT_INVALID_VALUE;
+ 			power_src.bt_state[BT_SW_CTRL_GPIO] = DEFAULT_INVALID_VALUE;
+ 			rc = bt_configure_gpios(POWER_ENABLE);
+@@ -1077,7 +1109,7 @@
+ 		}
+ 	} else if (pwr_state == POWER_DISABLE) {
+ 		/* Power Off */
+-		if (pwr_data->bt_gpio_sys_rst > 0) {
++		if (gpio_is_valid(pwr_data->bt_gpio_sys_rst)) {
+ 			if (pwr_data->bt_sec_hw_disable) {
+ 				pr_err("%s: secure hw mode on, not allowed to access gpio",
+ 					__func__);
+@@ -1088,25 +1120,24 @@
+ 		}
+ gpio_fail:
+ 		if (!get_fmd_mode()) {
+-			if (pwr_data->bt_gpio_sys_rst > 0)
+-				gpio_free(pwr_data->bt_gpio_sys_rst);
+-			if (pwr_data->bt_gpio_debug  >  0)
+-				gpio_free(pwr_data->bt_gpio_debug);
++			bt_release_gpios();
+ 			if (pwr_data->bt_chip_clk)
+ 				bt_clk_disable(pwr_data->bt_chip_clk);
+-			if (pwr_data->bt_gpio_resetb  >  0)
+-				gpio_free(pwr_data->bt_gpio_resetb);
+ 		}
+ regulator_fail:
+-		rc = handle_pwr_disable_req(BT_CORE,
++		cleanup = handle_pwr_disable_req(BT_CORE,
+ 			bt_num_vregs,
+ 			btpower_get_retenion_mode_state(),
+ 			get_fmd_mode());
++		if (!rc)
++			rc = cleanup;
+ 	} else if (pwr_state == POWER_RETENTION) {
+ 		/* Retention mode */
+ 		for (i = 0; i < bt_num_vregs; i++) {
+ 			bt_vregs = &pwr_data->bt_vregs[i];
+ 			rc = vreg_enable_retention(bt_vregs);
++			if (rc)
++				return rc;
+ 		}
+ 	} else {
+ 		pr_err("%s: Invalid power mode: %d\n", __func__, pwr_state);
+@@ -1117,7 +1148,7 @@
+ 
+ static int uwb_regulators_pwr(int pwr_state)
+ {
+-	int i, log_indx, uwb_num_vregs, rc = 0;
++	int i, log_indx, uwb_num_vregs, rc = 0, cleanup;
+ 	struct vreg_data *uwb_vregs = NULL;
+ 
+ 	rc = perisec_cnss_bt_hw_disable_check(pwr_data);
+@@ -1156,13 +1187,17 @@
+ regulator_failed:
+ 		for (i = 0; i < uwb_num_vregs; i++) {
+ 			uwb_vregs = &pwr_data->uwb_vregs[i];
+-			rc = vreg_disable(uwb_vregs);
++			cleanup = vreg_disable(uwb_vregs);
++			if (!rc)
++				rc = cleanup;
+ 		}
+ 		break;
+ 	case POWER_RETENTION:
+ 		for (i = 0; i < uwb_num_vregs; i++) {
+ 			uwb_vregs = &pwr_data->uwb_vregs[i];
+ 			rc = vreg_enable_retention(uwb_vregs);
++			if (rc)
++				return rc;
+ 		}
+ 		break;
+ 	}
+@@ -1211,7 +1246,7 @@
+ 
+ static int platform_regulators_pwr(int pwr_state)
+ {
+-	int i, log_indx, platform_num_vregs, rc = 0;
++	int i, log_indx, platform_num_vregs, rc = 0, cleanup;
+ 	struct vreg_data *platform_vregs = NULL;
+ 
+ 	rc = perisec_cnss_bt_hw_disable_check(pwr_data);
+@@ -1261,27 +1296,30 @@
+ 		}
+ gpio_failed:
+ 		if (!get_fmd_mode()) {
+-			if (pwr_data->bt_gpio_sys_rst > 0)
+-				gpio_free(pwr_data->bt_gpio_sys_rst);
+-			if (pwr_data->bt_gpio_debug  >  0)
+-				gpio_free(pwr_data->bt_gpio_debug);
++			bt_release_gpios();
+ 		}
+ regulator_failed:
+-		rc = handle_pwr_disable_req(PLATFORM_CORE,
++		cleanup = handle_pwr_disable_req(PLATFORM_CORE,
+ 			platform_num_vregs,
+ 			btpower_get_retenion_mode_state(),
+ 			get_fmd_mode());
++		if (!rc)
++			rc = cleanup;
+ 		break;
+ 	case POWER_RETENTION:
+ 		for (i = 0; i < platform_num_vregs; i++) {
+ 			platform_vregs = &pwr_data->platform_vregs[i];
+ 			rc = vreg_enable_retention(platform_vregs);
++			if (rc)
++				return rc;
+ 		}
+ 		break;
+ 	case POWER_DISABLE_RETENTION:
+ 		for (i = 0; i < platform_num_vregs; i++) {
+ 			platform_vregs = &pwr_data->platform_vregs[i];
+ 			rc = vreg_disable_retention(platform_vregs);
++			if (rc)
++				return rc;
+ 		}
+ 		break;
+ 	}
+@@ -1328,16 +1366,17 @@
+ 
+ static int btpower_toggle_radio(void *data, bool blocked)
+ {
++	struct platform_pwr_data *pdata = data;
+ 	int ret = 0;
+-	int (*power_control)(int Core, int enable);
+-
+-	power_control =
+-		((struct platform_pwr_data *)data)->power_setup;
+-
++
++	if (!pdata || !pdata->power_setup)
++		return -ENODEV;
++	mutex_lock(&btpower_operation_lock);
+ 	if (previous != blocked)
+-		ret = (*power_control)(BT_CORE, !blocked);
++		ret = pdata->power_setup(BT_CORE, !blocked);
+ 	if (!ret)
+ 		previous = blocked;
++	mutex_unlock(&btpower_operation_lock);
+ 	return ret;
+ }
+ 
+@@ -1369,8 +1408,10 @@
+ 
+ 	/* add file into rfkill0 to handle LDO27 */
+ 	ret = device_create_file(&pdev->dev, &dev_attr_extldo);
+-	if (ret < 0)
+-		pr_err("%s: device create file error\n", __func__);
++	if (ret < 0) {
++		rfkill_destroy(rfkill);
++		return ret;
++	}
+ 
+ 	/* force Bluetooth off during init to allow for user control */
+ 	rfkill_init_sw_state(rfkill, 1);
+@@ -1380,6 +1421,7 @@
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "rfkill register failed=%d\n", ret);
+ 		rfkill_destroy(rfkill);
++		device_remove_file(&pdev->dev, &dev_attr_extldo);
+ 		return ret;
+ 	}
+ 
+@@ -1395,9 +1437,11 @@
+ 	pr_debug("%s\n", __func__);
+ 
+ 	rfkill = platform_get_drvdata(pdev);
+-	if (rfkill)
++	if (rfkill) {
+ 		rfkill_unregister(rfkill);
+-	rfkill_destroy(rfkill);
++		rfkill_destroy(rfkill);
++	}
++	device_remove_file(&pdev->dev, &dev_attr_extldo);
+ 	platform_set_drvdata(pdev, NULL);
+ }
+ 
+@@ -1415,8 +1459,8 @@
+ 		np = dev->of_node;
+ 
+ 	snprintf(prop_name, sizeof(prop_name), "%s-supply", vreg_name);
+-	if (of_parse_phandle(np, prop_name, 0)) {
+-		vreg->reg = regulator_get(dev, vreg_name);
++	if (of_find_property(np, prop_name, NULL)) {
++		vreg->reg = devm_regulator_get(dev, vreg_name);
+ 		if (IS_ERR(vreg->reg)) {
+ 			ret = PTR_ERR(vreg->reg);
+ 			vreg->reg = NULL;
+@@ -1463,22 +1507,20 @@
+ static int bt_dt_parse_clk_info(struct device *dev,
+ 		struct bt_power_clk_data **clk_data)
+ {
+-	int ret = -EINVAL;
++	int ret = 0;
+ 	struct bt_power_clk_data *clk = NULL;
+ 	struct device_node *np = dev->of_node;
+ 
+ 	pr_debug("%s\n", __func__);
+ 
+ 	*clk_data = NULL;
+-	if (of_parse_phandle(np, "clocks", 0)) {
++	if (of_find_property(np, "clocks", NULL)) {
+ 		clk = devm_kzalloc(dev, sizeof(*clk), GFP_KERNEL);
+ 		if (!clk) {
+ 			ret = -ENOMEM;
+ 			goto err;
+ 		}
+ 
+-		/* Allocated 20 bytes size buffer for clock name string */
+-		clk->name = devm_kzalloc(dev, 20, GFP_KERNEL);
+ 
+ 		/* Parse clock name from node */
+ 		ret = of_property_read_string_index(np, "clock-names", 0,
+@@ -1507,22 +1549,9 @@
+ 	return ret;
+ }
+ 
+-static void bt_power_vreg_put(void)
+-{
+-	int i = 0;
+-	struct vreg_data *bt_vregs = NULL;
+-	int bt_num_vregs = pwr_data->bt_num_vregs;
+-
+-	for (; i < bt_num_vregs; i++) {
+-		bt_vregs = &pwr_data->bt_vregs[i];
+-		if (bt_vregs->reg)
+-			regulator_put(bt_vregs->reg);
+-	}
+-}
+-
+ static int get_gpio_dt_pinfo(struct platform_device *pdev)
+ {
+-	int ret;
++	int ret = 0;
+ 	struct device_node *child;
+ 	struct pinctrl *pinctrl1;
+ #ifdef CONFIG_FMD_ENABLE
+@@ -1531,16 +1560,22 @@
+ #endif
+ 	child = pdev->dev.of_node;
+ 
+-	pinctrl1 =  devm_pinctrl_get(&pdev->dev);
++	pinctrl1 = devm_pinctrl_get(&pdev->dev);
++	if (IS_ERR(pinctrl1) && PTR_ERR(pinctrl1) == -EPROBE_DEFER)
++		return -EPROBE_DEFER;
+ 	pwr_data->bt_gpio_sys_rst =
+ 		of_get_named_gpio(child,
+ 					"qcom,bt-reset-gpio", 0);
++	if (pwr_data->bt_gpio_sys_rst == -EPROBE_DEFER)
++		return -EPROBE_DEFER;
+ 	if (pwr_data->bt_gpio_sys_rst < 0)
+ 		pr_warn("bt-reset-gpio not provided in devicetree\n");
+ 
+ 	pwr_data->wl_gpio_sys_rst =
+ 		of_get_named_gpio(child,
+ 					"qcom,wl-reset-gpio", 0);
++	if (pwr_data->wl_gpio_sys_rst == -EPROBE_DEFER)
++		return -EPROBE_DEFER;
+ 	if (pwr_data->wl_gpio_sys_rst < 0)
+ 		pr_err("%s: wl-reset-gpio not provided in device tree\n",
+ 			__func__);
+@@ -1548,6 +1583,8 @@
+ 	pwr_data->bt_gpio_resetb =
+ 		of_get_named_gpio(child,
+ 					"qcom,wl-resetb-gpio", 0);
++	if (pwr_data->bt_gpio_resetb == -EPROBE_DEFER)
++		return -EPROBE_DEFER;
+ 	if (pwr_data->bt_gpio_resetb < 0)
+ 		pr_err("%s: bt_gpio_resetb not provided in device tree\n",
+ 			__func__);
+@@ -1555,12 +1592,16 @@
+ 	pwr_data->bt_gpio_sw_ctrl  =
+ 		of_get_named_gpio(child,
+ 					"qcom,bt-sw-ctrl-gpio",  0);
++	if (pwr_data->bt_gpio_sw_ctrl == -EPROBE_DEFER)
++		return -EPROBE_DEFER;
+ 	if (pwr_data->bt_gpio_sw_ctrl < 0)
+ 		pr_warn("bt-sw-ctrl-gpio not provided in devicetree\n");
+ 
+ 	pwr_data->bt_gpio_fmd_clk_ctrl  =
+ 		of_get_named_gpio(child,
+ 					"qcom,bt-fmd-clk-gpio",  0);
++	if (pwr_data->bt_gpio_fmd_clk_ctrl == -EPROBE_DEFER)
++		return -EPROBE_DEFER;
+ 	if (pwr_data->bt_gpio_fmd_clk_ctrl < 0)
+ 		pr_warn("bt-fmd-clk-gpio not provided in devicetree\n");
+ 
+@@ -1578,6 +1619,8 @@
+ 		} else {
+ 			ret = pinctrl_select_state(pinctrl1, sw_ctrl);
+ 			if (ret)
++				return ret;
++			if (ret)
+ 				pr_err("Failed to select sw_ctrl state, err = %d\n", ret);
+ 		}
+ 		bt_en = pinctrl_lookup_state(pinctrl1, "bt_en");
+@@ -1587,6 +1630,8 @@
+ 		} else {
+ 			ret = pinctrl_select_state(pinctrl1, bt_en);
+ 			if (ret)
++				return ret;
++			if (ret)
+ 				pr_err("Failed to select bt_en state, err = %d\n", ret);
+ 		}
+ 	} else {
+@@ -1595,12 +1640,16 @@
+ #endif
+ 	pwr_data->bt_gpio_debug  = of_get_named_gpio(child,
+ 							"qcom,bt-debug-gpio", 0);
++	if (pwr_data->bt_gpio_debug == -EPROBE_DEFER)
++		return -EPROBE_DEFER;
+ 	if (pwr_data->bt_gpio_debug < 0)
+ 		pr_warn("bt-debug-gpio not provided in devicetree\n");
+ 
+ 	pwr_data->xo_gpio_clk =
+ 		of_get_named_gpio(child,
+ 					"qcom,xo-clk-gpio", 0);
++	if (pwr_data->xo_gpio_clk == -EPROBE_DEFER)
++		return -EPROBE_DEFER;
+ 	if (pwr_data->xo_gpio_clk < 0)
+ 		pr_warn("xo-clk-gpio not provided in devicetree\n");
+ 
+@@ -1608,6 +1657,8 @@
+ 	pwr_data->bt_gpio_dev_wake =
+ 		of_get_named_gpio(child,
+ 				  "qcom,btwake_gpio", 0);
++	if (pwr_data->bt_gpio_dev_wake == -EPROBE_DEFER)
++		return -EPROBE_DEFER;
+ 	if (pwr_data->bt_gpio_dev_wake < 0)
+ 		pr_warn("%s: btwake-gpio not provided in device tree\n",
+ 			__func__);
+@@ -1615,16 +1666,18 @@
+ 	pwr_data->bt_gpio_host_wake =
+ 		of_get_named_gpio(child,
+ 				  "qcom,bthostwake_gpio", 0);
++	if (pwr_data->bt_gpio_host_wake == -EPROBE_DEFER)
++		return -EPROBE_DEFER;
+ 	if (pwr_data->bt_gpio_host_wake < 0)
+ 		pr_warn("%s: bthostwake_gpio not provided in device tree\n",
+ 			__func__);
+ #endif
+-	return true;
++	return 0;
+ }
+ 
+ static int get_power_dt_pinfo(struct platform_device *pdev)
+ {
+-	int rc, i;
++	int rc = 0, i;
+ 	const struct pwr_data *data;
+ 
+ 	data = of_device_get_match_data(&pdev->dev);
+@@ -1634,12 +1687,21 @@
+ 	}
+ 
+ 	memcpy(&pwr_data->compatible, &data->compatible, MAX_PROP_SIZE);
+-	pwr_data->bt_vregs = data->bt_vregs;
++	pwr_data->bt_vregs = devm_kmemdup(&pdev->dev, data->bt_vregs,
++		data->bt_num_vregs * sizeof(*data->bt_vregs), GFP_KERNEL);
++	if (data->bt_num_vregs && !pwr_data->bt_vregs)
++		return -ENOMEM;
+ 	pwr_data->bt_num_vregs = data->bt_num_vregs;
+ 
+ 	if (pwr_data->is_ganges_dt) {
+-		pwr_data->uwb_vregs = data->uwb_vregs;
+-		pwr_data->platform_vregs = data->platform_vregs;
++		pwr_data->uwb_vregs = devm_kmemdup(&pdev->dev, data->uwb_vregs,
++			data->uwb_num_vregs * sizeof(*data->uwb_vregs), GFP_KERNEL);
++		if (data->uwb_num_vregs && !pwr_data->uwb_vregs)
++			return -ENOMEM;
++		pwr_data->platform_vregs = devm_kmemdup(&pdev->dev, data->platform_vregs,
++			data->platform_num_vregs * sizeof(*data->platform_vregs), GFP_KERNEL);
++		if (data->platform_num_vregs && !pwr_data->platform_vregs)
++			return -ENOMEM;
+ 		pwr_data->uwb_num_vregs = data->uwb_num_vregs;
+ 		pwr_data->platform_num_vregs = data->platform_num_vregs;
+ 	}
+@@ -1699,11 +1761,11 @@
+ 	if (pwr_data->is_ganges_dt) {
+ 		for_each_available_child_of_node(pdev->dev.of_node, of_node) {
+ 			if (!strcmp(of_node->name, "bt_ganges")) {
+-				pwr_data->bt_of_node = of_node;
++				pwr_data->bt_of_node = of_node_get(of_node);
+ 				pr_info("%s: %s device node found\n", __func__,
+ 					pwr_data->bt_of_node->name);
+ 			} else if (!strcmp(of_node->name, "uwb_ganges")) {
+-				pwr_data->uwb_of_node = of_node;
++				pwr_data->uwb_of_node = of_node_get(of_node);
+ 				pr_info("%s: %s device node found\n", __func__,
+ 					pwr_data->uwb_of_node->name);
+ 			}
+@@ -1715,8 +1777,12 @@
+ 	if (rc < 0)
+ 		return rc;
+ 
+-	get_gpio_dt_pinfo(pdev);
+-	bt_dt_parse_clk_info(&pdev->dev, &pwr_data->bt_chip_clk);
++	rc = get_gpio_dt_pinfo(pdev);
++	if (rc < 0)
++		return rc;
++	rc = bt_dt_parse_clk_info(&pdev->dev, &pwr_data->bt_chip_clk);
++	if (rc)
++		return rc;
+ 	pwr_data->power_setup = power_regulators;
+ 	return 0;
+ }
+@@ -1728,8 +1794,12 @@
+ 	pdata->pdc_init_table_len = of_property_count_strings(dev->of_node,
+ 				"qcom,pdc_init_table");
+ 	if (pdata->pdc_init_table_len > 0) {
+-		pdata->pdc_init_table = kcalloc(pdata->pdc_init_table_len,
++		pdata->pdc_init_table = devm_kcalloc(dev, pdata->pdc_init_table_len,
+ 				sizeof(char *), GFP_KERNEL);
++		if (!pdata->pdc_init_table) {
++			pdata->pdc_init_table_len = 0;
++			return;
++		}
+ 		ret = of_property_read_string_array(dev->of_node, "qcom,pdc_init_table",
+ 			pdata->pdc_init_table, pdata->pdc_init_table_len);
+ 		if (ret < 0)
+@@ -1741,46 +1811,49 @@
+ 	}
+ }
+ 
+-static void bt_signal_handler(struct work_struct *w_arg)
+-{
+-	struct kernel_siginfo siginfo;
+-	int rc = 0;
+-
+-	memset(&siginfo, 0, sizeof(siginfo));
+-	siginfo.si_signo = SIGIO;
+-	siginfo.si_code = SI_QUEUE;
+-	siginfo.si_int = pwr_data->wrkq_signal_state;
+-	rc = send_sig_info(siginfo.si_signo, &siginfo, pwr_data->reftask_bt);
+-	if (rc < 0)
+-		pr_err("%s: failed (%d) to send SIG to HAL(%d)\n", __func__,
+-				rc, pwr_data->reftask_bt->pid);
+-	else
+-		pr_err("%s: Signal to BT HAL (PID-%d) succesfull\n", __func__,
+-				pwr_data->reftask_bt->pid);
+-}
+-
+-static void uwb_signal_handler(struct work_struct *w_arg)
+-{
+-	struct kernel_siginfo siginfo;
+-	int rc = 0;
+-
+-	memset(&siginfo, 0, sizeof(siginfo));
+-	siginfo.si_signo =  SIGIO;
+-	siginfo.si_code = SI_QUEUE;
+-	siginfo.si_int = pwr_data->wrkq_signal_state;
+-	rc = send_sig_info(siginfo.si_signo, &siginfo, pwr_data->reftask_uwb);
+-	if (rc < 0)
+-		pr_err("%s: failed (%d) to send SIG to HAL(%d)\n", __func__,
+-				rc, pwr_data->reftask_uwb->pid);
+-	else
+-		pr_err("%s: Signal to UWB HAL (PID-%d) succesfull\n", __func__,
+-				pwr_data->reftask_uwb->pid);
++static void btpower_send_signal(struct platform_pwr_data *pdata, bool bluetooth,
++				int signal_state)
++{
++	struct kernel_siginfo siginfo = { .si_signo = SIGIO, .si_code = SI_QUEUE };
++	struct task_struct *task;
++	unsigned long flags;
++
++	spin_lock_irqsave(&pdata->task_lock, flags);
++	task = bluetooth ? pdata->reftask_bt : pdata->reftask_uwb;
++	if (task)
++		get_task_struct(task);
++	spin_unlock_irqrestore(&pdata->task_lock, flags);
++	siginfo.si_int = signal_state;
++	if (task) {
++		send_sig_info(SIGIO, &siginfo, task);
++		put_task_struct(task);
++	}
++}
++
++static void bt_signal_handler(struct work_struct *work)
++{
++	struct platform_pwr_data *pdata = container_of(work, struct platform_pwr_data, bt_wq);
++
++	btpower_send_signal(pdata, true, READ_ONCE(pdata->wrkq_signal_state));
++}
++
++static void uwb_signal_handler(struct work_struct *work)
++{
++	struct platform_pwr_data *pdata = container_of(work, struct platform_pwr_data, uwb_wq);
++
++	btpower_send_signal(pdata, false, READ_ONCE(pdata->wrkq_signal_state));
+ }
+ 
+ static int bt_power_probe(struct platform_device *pdev)
+ {
+ 	int ret = 0;
+ 	int itr;
++
++	mutex_lock(&btpower_lifecycle_lock);
++	if (pwr_data) {
++		mutex_unlock(&btpower_lifecycle_lock);
++		return -EBUSY;
++	}
+ 
+ 	/* Fill whole array with -2 i.e NOT_AVAILABLE state by default
+ 	 * for any GPIO or Reg handle.
+@@ -1793,8 +1866,10 @@
+ 
+ 	pwr_data = kzalloc(sizeof(*pwr_data), GFP_KERNEL);
+ 
+-	if (!pwr_data)
++	if (!pwr_data) {
++		mutex_unlock(&btpower_lifecycle_lock);
+ 		return -ENOMEM;
++	}
+ 
+ 	pwr_data->pdev = pdev;
+ 	pwr_data->reftask_bt = NULL;
+@@ -1806,7 +1881,7 @@
+ /* Get fmd_set NVMEM  Cell Handler */
+ 	pwr_data->nvmem_cell_fmd_set =
+ 		devm_nvmem_cell_get(devi, "fmd_set");
+-	if (IS_ERR(pwr_data->nvmem_cell_fmd_set)) {
++	if (IS_ERR_OR_NULL(pwr_data->nvmem_cell_fmd_set)) {
+ 		rc = PTR_ERR(pwr_data->nvmem_cell_fmd_set);
+ 		pr_err("%s:Failed to get fmd_set nvmem-cells %d\n",
+ 			__func__, rc);
+@@ -1821,7 +1896,7 @@
+ /* Get fmd_chg_pon NVMEM Cell Handler */
+ 		pwr_data->nvmem_cell_fmd_chg_pon =
+ 			devm_nvmem_cell_get(devi, "fmd_chg_pon");
+-		if (IS_ERR(pwr_data->nvmem_cell_fmd_chg_pon)) {
++		if (IS_ERR_OR_NULL(pwr_data->nvmem_cell_fmd_chg_pon)) {
+ 			rc = PTR_ERR(pwr_data->nvmem_cell_fmd_chg_pon);
+ 			pr_err("%s:Failed to get fmd_chg_pon nvmem-cells %d\n",
+ 				__func__, rc);
+@@ -1831,7 +1906,7 @@
+ /* Get fmd_cnt2_stop NVMEM Cell Handler */
+ 		pwr_data->nvmem_cell_fmd_cnt2_stop =
+ 			devm_nvmem_cell_get(devi, "fmd_cnt2_stop");
+-		if (IS_ERR(pwr_data->nvmem_cell_fmd_cnt2_stop)) {
++		if (IS_ERR_OR_NULL(pwr_data->nvmem_cell_fmd_cnt2_stop)) {
+ 			rc = PTR_ERR(pwr_data->nvmem_cell_fmd_cnt2_stop);
+ 			pr_err("%s:Failed to get fmd_cnt2_stop nvmem-cells %d\n",
+ 				__func__, rc);
+@@ -1839,6 +1914,16 @@
+ 			pr_info("%s: Got fmd_cnt2_stop nvmem-cells\n", __func__);
+ 		}
+ 	}
++	if (PTR_ERR_OR_ZERO(pwr_data->nvmem_cell_fmd_set) == -EPROBE_DEFER ||
++	    PTR_ERR_OR_ZERO(pwr_data->nvmem_cell_fmd_chg_pon) == -EPROBE_DEFER ||
++	    PTR_ERR_OR_ZERO(pwr_data->nvmem_cell_fmd_cnt2_stop) == -EPROBE_DEFER) {
++		ret = -EPROBE_DEFER;
++		goto free_pdata;
++	}
++	if (rc == -EPROBE_DEFER) {
++		ret = rc;
++		goto free_pdata;
++	}
+ 	pr_info("%s: FMD nvmem-cells read completed\n", __func__);
+ 
+ 	pwr_data->is_ganges_dt = of_property_read_bool(pdev->dev.of_node,
+@@ -1851,7 +1936,8 @@
+ 	if (!pwr_data->workq) {
+ 		pr_err("%s: Failed to creat the Work Queue (workq)\n",
+ 			__func__);
+-		return -ENOMEM;
++		ret = -ENOMEM;
++		goto free_pdata;
+ 	}
+ 
+ 	INIT_WORK(&pwr_data->uwb_wq, uwb_signal_handler);
+@@ -1864,6 +1950,8 @@
+ 
+ 	skb_queue_head_init(&pwr_data->rxq);
+ 	mutex_init(&pwr_data->pwr_mtx);
++	spin_lock_init(&pwr_data->task_lock);
++	INIT_LIST_HEAD(&pwr_data->request_queue);
+ 	mutex_init(&pwr_data->btpower_state.state_machine_lock);
+ 	pwr_data->btpower_state.power_state = IDLE;
+ 	pwr_data->btpower_state.retention_mode = RETENTION_IDLE;
+@@ -1885,63 +1973,106 @@
+ 			pr_info(" %s:send platform data of btpower\n", __func__);
+ 			pdev->dev.platform_data = pwr_data;
+ 		}
+-	} else if (pdev->dev.platform_data) {
+-		/* Optional data set to default if not provided */
+-		if (!((struct platform_pwr_data *)
+-			(pdev->dev.platform_data))->power_setup)
+-			((struct platform_pwr_data *)
+-				(pdev->dev.platform_data))->power_setup =
+-						power_regulators;
+-
+-		memcpy(pwr_data, pdev->dev.platform_data,
+-			sizeof(struct platform_pwr_data));
+ 	} else {
+-		pr_err("%s: Failed to get platform data\n", __func__);
++		ret = -EINVAL;
+ 		goto free_pdata;
+ 	}
+ 
+-	if (btpower_rfkill_probe(pdev) < 0)
++	bt_power_pdc_init_params(pwr_data);
++	ret = btpower_aop_mbox_init(pwr_data);
++	if (ret == -EPROBE_DEFER)
+ 		goto free_pdata;
+ 
+-	bt_power_pdc_init_params(pwr_data);
+-	btpower_aop_mbox_init(pwr_data);
+-
+-	probe_finished = true;
++	ret = btpower_rfkill_probe(pdev);
++	if (ret < 0)
++		goto free_pdata;
++
++	btpower_generation++;
++	smp_store_release(&probe_finished, true);
++	mutex_unlock(&btpower_lifecycle_lock);
+ 	return 0;
+ 
+ free_pdata:
++	if (pwr_data->workq)
++		destroy_workqueue(pwr_data->workq);
++	if (!IS_ERR_OR_NULL(pwr_data->qmp))
++		qmp_put(pwr_data->qmp);
++	of_node_put(pwr_data->bt_of_node);
++	of_node_put(pwr_data->uwb_of_node);
++	if (pdev->dev.platform_data == pwr_data)
++		pdev->dev.platform_data = NULL;
+ 	kfree(pwr_data);
++	pwr_data = NULL;
++	mutex_unlock(&btpower_lifecycle_lock);
+ 	return ret;
+ }
+ 
+-static int bt_power_remove(struct platform_device *pdev)
+-{
+-	dev_dbg(&pdev->dev, "%s\n", __func__);
+-	probe_finished = false;
++static void bt_power_remove(struct platform_device *pdev)
++{
++	struct btpower_request *request, *next;
++
++	mutex_lock(&btpower_lifecycle_lock);
++	WRITE_ONCE(probe_finished, false);
++	/* Existing ioctls finish before workers, task refs and devres disappear. */
++	synchronize_srcu(&btpower_srcu);
+ 	btpower_rfkill_remove(pdev);
+-	bt_power_vreg_put();
+-	if (pwr_data->is_ganges_dt)
+-		destroy_workqueue(pwr_data->workq);
++	flush_work(&pwr_data->wq_pwr_voting);
++#ifdef CONFIG_MSM_BT_OOBS
++	if (pwr_data->host_irq_requested)
++		bt_configure_wakeup_gpios(0);
++#endif
++	destroy_workqueue(pwr_data->workq);
++	pwr_data->is_fmd_mode_enable = false;
++	bt_release_gpios();
++	handle_pwr_disable_req(BT_CORE, pwr_data->bt_num_vregs, RETENTION_IDLE, 0);
++	handle_pwr_disable_req(UWB_CORE, pwr_data->uwb_num_vregs, RETENTION_IDLE, 0);
++	handle_pwr_disable_req(PLATFORM_CORE, pwr_data->platform_num_vregs, RETENTION_IDLE, 0);
++	if (pwr_data->bt_chip_clk && pwr_data->bt_chip_clk->is_enabled)
++		bt_clk_disable(pwr_data->bt_chip_clk);
++	list_for_each_entry_safe(request, next, &pwr_data->request_queue, node) {
++		list_del(&request->node);
++		btpower_request_put(request);
++	}
++	if (pwr_data->reftask_bt)
++		put_task_struct(pwr_data->reftask_bt);
++	if (pwr_data->reftask_uwb)
++		put_task_struct(pwr_data->reftask_uwb);
++	put_device(pwr_data->slim_dev);
++	if (!IS_ERR_OR_NULL(pwr_data->qmp))
++		qmp_put(pwr_data->qmp);
++	of_node_put(pwr_data->bt_of_node);
++	of_node_put(pwr_data->uwb_of_node);
++	pdev->dev.platform_data = NULL;
+ 	kfree(pwr_data);
+-	return 0;
++	pwr_data = NULL;
++	mutex_unlock(&btpower_lifecycle_lock);
+ }
+ 
+ int btpower_register_slimdev(struct device *dev)
+ {
++	struct device *old;
++	int ret = -EPROBE_DEFER;
++	int idx = srcu_read_lock(&btpower_srcu);
++
++	if (smp_load_acquire(&probe_finished) && dev) {
++		mutex_lock(&btpower_operation_lock);
++		mutex_lock(&pwr_data->pwr_mtx);
++		old = pwr_data->slim_dev;
++		pwr_data->slim_dev = get_device(dev);
++		mutex_unlock(&pwr_data->pwr_mtx);
++		put_device(old);
++		mutex_unlock(&btpower_operation_lock);
++		ret = 0;
++	}
++	srcu_read_unlock(&btpower_srcu, idx);
++	return ret;
++}
++EXPORT_SYMBOL(btpower_register_slimdev);
++
++int btpower_get_chipset_version(void)
++{
+ 	pr_debug("%s\n", __func__);
+-	if (!pwr_data || (dev == NULL)) {
+-		pr_err("%s: Failed to allocate memory\n", __func__);
+-		return -EINVAL;
+-	}
+-	pwr_data->slim_dev = dev;
+-	return 0;
+-}
+-EXPORT_SYMBOL(btpower_register_slimdev);
+-
+-int btpower_get_chipset_version(void)
+-{
+-	pr_debug("%s\n", __func__);
+-	return soc_id;
++	return READ_ONCE(soc_id);
+ }
+ EXPORT_SYMBOL(btpower_get_chipset_version);
+ 
+@@ -2071,18 +2202,30 @@
+ 	pwr_data->sub_state = state;
+ }
+ 
+-int power_enable (enum SubSystem SubSystemType)
+-{
+-	int ret;
++static int power_enable (enum SubSystem SubSystemType)
++{
++	int ret = -EINVAL;
+ 
+ 	switch (get_pwr_state()) {
+ 	case IDLE:
+ 		ret = power_regulators(PLATFORM_CORE, POWER_ENABLE);
++		if (ret)
++			return ret;
+ 		if (SubSystemType == BLUETOOTH) {
+ 			ret = power_regulators(BT_CORE, POWER_ENABLE);
++			if (ret) {
++				if (get_pwr_state() == IDLE)
++					power_regulators(PLATFORM_CORE, POWER_DISABLE);
++				return ret;
++			}
+ 			update_pwr_state(BT_ON);
+ 		} else {
+ 			ret = power_regulators(UWB_CORE, POWER_ENABLE);
++			if (ret) {
++				if (get_pwr_state() == IDLE)
++					power_regulators(PLATFORM_CORE, POWER_DISABLE);
++				return ret;
++			}
+ 			update_pwr_state(UWB_ON);
+ 		}
+ 		break;
+@@ -2093,6 +2236,11 @@
+ 			return 0;
+ 		}
+ 		ret = power_regulators(UWB_CORE, POWER_ENABLE);
++		if (ret) {
++			if (get_pwr_state() == IDLE)
++				power_regulators(PLATFORM_CORE, POWER_DISABLE);
++			return ret;
++		}
+ 		update_pwr_state(ALL_CLIENTS_ON);
+ 		break;
+ 	case UWB_ON:
+@@ -2102,6 +2250,11 @@
+ 			return 0;
+ 		}
+ 		ret = power_regulators(BT_CORE, POWER_ENABLE);
++		if (ret) {
++			if (get_pwr_state() == IDLE)
++				power_regulators(PLATFORM_CORE, POWER_DISABLE);
++			return ret;
++		}
+ 		update_pwr_state(ALL_CLIENTS_ON);
+ 		break;
+ 	case ALL_CLIENTS_ON:
+@@ -2112,27 +2265,12 @@
+ 	return ret;
+ }
+ 
+-void send_signal_to_subsystem(int SubSystemType, int state)
+-{
+-	pwr_data->wrkq_signal_state = state;
+-	if (SubSystemType == BLUETOOTH) {
+-		if (!pwr_data->reftask_bt) {
+-			pr_err("%s: BT client is not register to send signal\n",
+-				__func__);
+-			return;
+-		}
+-		queue_work(pwr_data->workq, &pwr_data->bt_wq);
+-	} else {
+-		if (!pwr_data->reftask_uwb) {
+-			pr_err("%s: UWB client is not register to send signal\n",
+-				__func__);
+-			return;
+-		}
+-		queue_work(pwr_data->workq, &pwr_data->uwb_wq);
+-	}
+-}
+-
+-int power_disable (enum SubSystem SubSystemType)
++static void send_signal_to_subsystem(int subsystem, int state)
++{
++	btpower_send_signal(pwr_data, subsystem == BLUETOOTH, state);
++}
++
++static int power_disable (enum SubSystem SubSystemType)
+ {
+ 	int ret = 0;
+ 	int ret_mode_state = btpower_get_retenion_mode_state();
+@@ -2146,6 +2284,8 @@
+ 	case ALL_CLIENTS_ON:
+ 		if (SubSystemType == BLUETOOTH) {
+ 			ret = power_regulators(BT_CORE, POWER_DISABLE);
++			if (ret)
++				return ret;
+ 			update_pwr_state(UWB_ON);
+ 			if (ret_mode_state == BOTH_CLIENTS_IN_RETENTION)
+ 				btpower_set_retenion_mode_state(UWB_IN_RETENTION);
+@@ -2165,7 +2305,9 @@
+ 			if (grant_pending == BT_WAITING_FOR_GRANT)
+ 				btpower_set_grant_pending_state(NO_OTHER_CLIENT_WAITING_FOR_GRANT);
+ 		} else {
+-			ret  = power_regulators(UWB_CORE, POWER_DISABLE);
++			ret = power_regulators(UWB_CORE, POWER_DISABLE);
++			if (ret)
++				return ret;
+ 			update_pwr_state(BT_ON);
+ 			if (ret_mode_state == BOTH_CLIENTS_IN_RETENTION)
+ 				btpower_set_retenion_mode_state(BT_IN_RETENTION);
+@@ -2193,7 +2335,11 @@
+ 			return 0;
+ 		}
+ 		ret = power_regulators(UWB_CORE, POWER_DISABLE);
++		if (ret)
++			return ret;
+ 		ret = power_regulators(PLATFORM_CORE, POWER_DISABLE);
++		if (ret)
++			return ret;
+ 		update_pwr_state(IDLE);
+ 		update_sub_state(SUB_STATE_IDLE);
+ 		btpower_set_retenion_mode_state(RETENTION_IDLE);
+@@ -2206,7 +2352,11 @@
+ 			return 0;
+ 		}
+ 		ret = power_regulators(BT_CORE, POWER_DISABLE);
++		if (ret)
++			return ret;
+ 		ret = power_regulators(PLATFORM_CORE, POWER_DISABLE);
++		if (ret)
++			return ret;
+ 		update_pwr_state(IDLE);
+ 		update_sub_state(SUB_STATE_IDLE);
+ 		btpower_set_retenion_mode_state(RETENTION_IDLE);
+@@ -2237,17 +2387,20 @@
+ 	return 0;
+ }
+ 
+-void btpower_register_client(int client, int cmd)
+-{
+-	if (cmd == REG_BT_PID) {
+-		pwr_data->reftask_bt = get_current();
+-		pr_info("%s: Registering BT Service(PID-%d) with Power driver\n",
+-			__func__, pwr_data->reftask_bt->tgid);
+-		return;
+-	} else if (cmd == REG_UWB_PID) {
+-		pwr_data->reftask_uwb = get_current();
+-		pr_info("%s: Registering UWB Service(PID-%d) with Power driver\n",
+-			__func__, pwr_data->reftask_uwb->tgid);
++static void btpower_register_client(int client, int cmd)
++{
++	if (cmd == REG_BT_PID || cmd == REG_UWB_PID) {
++		struct task_struct **slot, *old;
++		unsigned long flags;
++
++		get_task_struct(current);
++		spin_lock_irqsave(&pwr_data->task_lock, flags);
++		slot = cmd == REG_BT_PID ? &pwr_data->reftask_bt : &pwr_data->reftask_uwb;
++		old = *slot;
++		*slot = current;
++		spin_unlock_irqrestore(&pwr_data->task_lock, flags);
++		if (old)
++			put_task_struct(old);
+ 		return;
+ 	}
+ 
+@@ -2257,14 +2410,14 @@
+ 		client_state_notified(UWB);
+ }
+ 
+-void log_power_src_val(void)
++static void log_power_src_val(void)
+ {
+ 	int itr = 0;
+ 
+ 	power_src.platform_state[BT_SW_CTRL_GPIO_CURRENT] =
+-		gpio_get_value(pwr_data->bt_gpio_sw_ctrl);
++		gpio_get_value_cansleep(pwr_data->bt_gpio_sw_ctrl);
+ 	power_src.platform_state[BT_RESET_GPIO_CURRENT] =
+-		gpio_get_value(pwr_data->bt_gpio_sys_rst);
++		gpio_get_value_cansleep(pwr_data->bt_gpio_sys_rst);
+ 
+ 	for (itr = 0; itr < pwr_data->bt_num_vregs; itr++)
+ 		set_pwr_srcs_status(&pwr_data->bt_vregs[itr], BT_CORE);
+@@ -2277,7 +2430,7 @@
+ }
+ 
+ 
+-int btpower_retenion(enum plt_pwr_state client)
++static int btpower_retenion(enum plt_pwr_state client)
+ {
+ 	int ret;
+ 	int current_pwr_state = get_pwr_state();
+@@ -2319,12 +2472,12 @@
+ 	return ret;
+ }
+ 
+-int btpower_off(enum plt_pwr_state client)
++static int btpower_off(enum plt_pwr_state client)
+ {
+ 	return power_disable((client == POWER_OFF_BT) ? BLUETOOTH : UWB);
+ }
+ 
+-int btpower_on(enum plt_pwr_state client)
++static int btpower_on(enum plt_pwr_state client)
+ {
+ 	int ret = 0;
+ 	int current_ssr_state = get_sub_state();
+@@ -2357,13 +2510,7 @@
+ 	return ret;
+ }
+ 
+-int STREAM_TO_UINT32 (struct sk_buff *skb)
+-{
+-	return (skb->data[0] | (skb->data[1] << 8) |
+-		(skb->data[2] << 16) | (skb->data[3] << 24));
+-}
+-
+-int btpower_access_ctrl(enum plt_pwr_state request)
++static int btpower_access_ctrl(enum plt_pwr_state request)
+ {
+ 	enum grant_states grant_state = btpower_get_grant_state();
+ 	enum grant_states grant_pending = btpower_get_grant_pending_state();
+@@ -2432,88 +2579,71 @@
+ 
+ static void bt_power_vote(struct work_struct *work)
+ {
+-	struct sk_buff *skb;
+-	int request;
+-	int ret;
+-
+-	while (1) {
+-		mutex_lock(&pwr_data->pwr_mtx);
+-		if (!(skb = skb_dequeue(&pwr_data->rxq))) {
+-			mutex_unlock(&pwr_data->pwr_mtx);
++	struct platform_pwr_data *pdata = container_of(work, struct platform_pwr_data,
++						      wq_pwr_voting);
++	struct btpower_request *pending;
++	int request, ret;
++
++	for (;;) {
++		mutex_lock(&pdata->pwr_mtx);
++		if (list_empty(&pdata->request_queue)) {
++			mutex_unlock(&pdata->pwr_mtx);
+ 			break;
+ 		}
+-		request = STREAM_TO_UINT32(skb);
+-		skb_pull(skb, sizeof(uint32_t));
+-		mutex_unlock(&pwr_data->pwr_mtx);
+-		pr_info("%s: Start %s %s, %s state access %s pending %s\n",
+-			__func__,
+-			ConvertPowerStatusToString(get_pwr_state()),
+-			ConvertSsrStatusToString(get_sub_state()),
+-			ConvertRetentionModeToString(btpower_get_retenion_mode_state()),
+-			ConvertGrantToString(btpower_get_grant_state()),
+-			ConvertGrantToString(btpower_get_grant_pending_state()));
++		pending = list_first_entry(&pdata->request_queue, struct btpower_request, node);
++		list_del(&pending->node);
++		pdata->queued_requests--;
++		mutex_unlock(&pdata->pwr_mtx);
++		request = pending->request;
++		mutex_lock(&btpower_operation_lock);
++		ret = -EINVAL;
+ 		if (request == POWER_ON_BT || request == POWER_ON_UWB)
+-			ret = btpower_on((enum plt_pwr_state)request);
++			ret = btpower_on(request);
+ 		else if (request == POWER_OFF_UWB || request == POWER_OFF_BT)
+-			ret = btpower_off((enum plt_pwr_state)request);
++			ret = btpower_off(request);
+ 		else if (request == POWER_ON_BT_RETENION || request == POWER_ON_UWB_RETENION)
+ 			ret = btpower_retenion(request);
+-		else if (request >= BT_ACCESS_REQ && request <= UWB_RELEASE_ACCESS) {
++		else if (request >= BT_ACCESS_REQ && request <= UWB_RELEASE_ACCESS)
+ 			ret = btpower_access_ctrl(request);
+-			pr_info("%s: grant status %s", __func__, ConvertGrantRetToString((int)ret));
+-		}
+-		pr_info("%s: Completed %s %s, %s state access %s pending %s\n",
+-			__func__,
+-			ConvertPowerStatusToString(get_pwr_state()),
+-			ConvertSsrStatusToString(get_sub_state()),
+-			ConvertRetentionModeToString(btpower_get_retenion_mode_state()),
+-			ConvertGrantToString(btpower_get_grant_state()),
+-			ConvertGrantToString(btpower_get_grant_pending_state()));
+-
+-		pwr_data->wait_status[request] = ret;
+-		kfree_skb(skb);
+-		wake_up_interruptible(&pwr_data->rsp_wait_q[request]);
+-	}
+-}
+-
+-int schedule_client_voting(enum plt_pwr_state request)
+-{
+-	struct sk_buff *skb;
+-	wait_queue_head_t *rsp_wait_q;
+-	int *status;
+-	int ret = 0;
+-	uint32_t req = (uint32_t)request;
+-
++		mutex_unlock(&btpower_operation_lock);
++		pending->result = ret;
++		complete(&pending->done);
++		btpower_request_put(pending);
++	}
++}
++
++static int schedule_client_voting(enum plt_pwr_state request)
++{
++	struct btpower_request *pending;
++	long waited;
++	int ret;
++
++	if ((unsigned int)request >= BT_MAX_PWR_STATE)
++		return -EINVAL;
++	pending = kzalloc(sizeof(*pending), GFP_KERNEL);
++	if (!pending)
++		return -ENOMEM;
++	init_completion(&pending->done);
++	refcount_set(&pending->refs, 2); /* caller and queued worker */
++	pending->request = request;
+ 	mutex_lock(&pwr_data->pwr_mtx);
+-	skb = alloc_skb(sizeof(uint32_t), GFP_KERNEL);
+-
+-	if (!skb) {
+-		pr_err("%s: Unable to create skbuff\n", __func__);
++	if (pwr_data->queued_requests >= 64) {
+ 		mutex_unlock(&pwr_data->pwr_mtx);
+-		return -1;
+-	}
+-
+-	rsp_wait_q = &pwr_data->rsp_wait_q[(u8)request];
+-	status = &pwr_data->wait_status[(u8)request];
+-	*status = PWR_WAITING_RSP;
+-	skb_put_data(skb, &req, sizeof(uint32_t));
+-	skb_queue_tail(&pwr_data->rxq, skb);
++		kfree(pending);
++		return -ENOSPC;
++	}
++	pwr_data->queued_requests++;
++	list_add_tail(&pending->node, &pwr_data->request_queue);
+ 	queue_work(system_highpri_wq, &pwr_data->wq_pwr_voting);
+ 	mutex_unlock(&pwr_data->pwr_mtx);
+-	ret = wait_event_interruptible_timeout(*rsp_wait_q, (*status) != PWR_WAITING_RSP,
+-					       msecs_to_jiffies(BTPOWER_CONFIG_MAX_TIMEOUT));
+-	pr_err("%s: %d", __func__, *status);
+-	if (ret == 0) {
+-		pr_err("%s: failed to vote %d due to timeout", __func__, request);
+-		ret = -ETIMEDOUT;
+-	} else {
+-		ret = *status;
+-	}
+-
++	waited = wait_for_completion_interruptible_timeout(&pending->done,
++				msecs_to_jiffies(BTPOWER_CONFIG_MAX_TIMEOUT));
++	ret = waited > 0 ? pending->result : waited < 0 ? waited : -ETIMEDOUT;
++	btpower_request_put(pending);
+ 	return ret;
+ }
+ 
+-int btpower_handle_client_request(unsigned int cmd, int arg)
++static int btpower_handle_client_request(unsigned int cmd, int arg)
+ {
+ 	int ret = -1;
+ 
+@@ -2552,7 +2682,7 @@
+ 	return ret;
+ }
+ 
+-int btpower_process_access_req(unsigned int cmd, int req)
++static int btpower_process_access_req(unsigned int cmd, int req)
+ {
+ 	int ret = -1;
+ 
+@@ -2573,7 +2703,7 @@
+ 	return ret;
+ }
+ 
+-char* GetUwbSecondaryCrashReason(enum UwbSecondaryReasonCode reason)
++static char* GetUwbSecondaryCrashReason(enum UwbSecondaryReasonCode reason)
+ {
+   for(int i =0; i < (int)(sizeof(uwbSecReasonMap)/sizeof(UwbSecondaryReasonMap)); i++)
+     if (uwbSecReasonMap[i].reason == reason)
+@@ -2582,7 +2712,7 @@
+   return CRASH_REASON_NOT_FOUND;
+ }
+ 
+-char* GetUwbPrimaryCrashReason(enum UwbPrimaryReasonCode reason)
++static char* GetUwbPrimaryCrashReason(enum UwbPrimaryReasonCode reason)
+ {
+   for(int i =0; i < (int)(sizeof(uwbPriReasonMap)/sizeof(UwbPrimaryReasonMap)); i++)
+     if (uwbPriReasonMap[i].reason == reason)
+@@ -2591,7 +2721,7 @@
+   return CRASH_REASON_NOT_FOUND;
+ }
+ 
+-const char *GetSourceSubsystemString(uint32_t source_subsystem)
++static const char *GetSourceSubsystemString(uint32_t source_subsystem)
+ {
+ 	switch (source_subsystem) {
+ 	case PERI_SS:
+@@ -2605,17 +2735,17 @@
+ 	}
+ }
+ 
+-void fmd_set_sdam_bit(unsigned char arg)
++static int fmd_set_sdam_bit(unsigned char arg)
+ {
+ 	int rc = 0;
+ 	u8 *buf;
+ 	size_t len;
+ 	struct device *devi = &pwr_data->pdev->dev;
+ 
+-	if (IS_ERR(pwr_data->nvmem_cell_fmd_set)) {
++	if (IS_ERR_OR_NULL(pwr_data->nvmem_cell_fmd_set)) {
+ 		pr_err("%s: 'fmd_set' cell is not avilable to configure\n",
+ 			__func__);
+-		return;
++		return -ENODEV;
+ 	}
+ 
+ 	rc = nvmem_cell_write(pwr_data->nvmem_cell_fmd_set,
+@@ -2624,17 +2754,17 @@
+ 	if (rc < 0) {
+ 		pr_err("%s: Write SDAM BIT for FMD operation Failed %d\n",
+ 			__func__, rc);
+-		return;
++		return rc;
+ 	}
+ 
+ 	buf = nvmem_cell_read(pwr_data->nvmem_cell_fmd_set, &len);
+ 	if (IS_ERR(buf)) {
+-		dev_err(devi, "Failed to read fmd_set: %ld\n",
+-			PTR_ERR(buf));
+-		pr_err("%s: Failed to read SDAM BIT (fmd_set = %d)\n",
+-			__func__, buf[0]);
++		dev_err(devi, "Failed to read fmd_set: %ld\n", PTR_ERR(buf));
++		return PTR_ERR(buf);
++	}
++	if (!len) {
+ 		kfree(buf);
+-		return;
++		return -EIO;
+ 	}
+ 
+ 	if (buf[0] == arg) {
+@@ -2642,25 +2772,27 @@
+ 		pr_info("%s: Successfully configured SDAM BIT (fmd_set: %u)\n",
+ 			__func__, buf[0]);
+ 	} else {
++		rc = -EIO;
+ 		dev_err(devi, "Failed to configure fmd_set: %ld\n",
+ 			PTR_ERR(buf));
+ 		pr_err("%s: Failed to configure SDAM BIT (fmd_set = %u)\n",
+ 			__func__, buf[0]);
+ 	}
+ 	kfree(buf);
+-}
+-
+-void fmd_reboot_on_usb_detection(unsigned char arg)
++	return rc;
++}
++
++static int fmd_reboot_on_usb_detection(unsigned char arg)
+ {
+ 	int rc = 0;
+ 	u8 *buf;
+ 	size_t len;
+ 	struct device *devi = &pwr_data->pdev->dev;
+ 
+-	if (IS_ERR(pwr_data->nvmem_cell_fmd_chg_pon)) {
++	if (IS_ERR_OR_NULL(pwr_data->nvmem_cell_fmd_chg_pon)) {
+ 		pr_err("%s: 'fmd_chg_pon' cell is not avilable to configure\n",
+ 			__func__);
+-		return;
++		return -ENODEV;
+ 	}
+ 
+ 	rc = nvmem_cell_write(pwr_data->nvmem_cell_fmd_chg_pon,
+@@ -2669,17 +2801,17 @@
+ 	if (rc < 0) {
+ 		pr_err("%s: Write fmd_chg_pon for FMD operation Failed %d\n",
+ 			__func__, rc);
+-		return;
++		return rc;
+ 	}
+ 
+ 	buf = nvmem_cell_read(pwr_data->nvmem_cell_fmd_chg_pon, &len);
+ 	if (IS_ERR(buf)) {
+-		dev_err(devi, "Failed to read fmd_chg_pon: %ld\n",
+-			PTR_ERR(buf));
+-		pr_err("%s: Failed to read fmd_chg_pon = %d\n",
+-			__func__, buf[0]);
++		dev_err(devi, "Failed to read fmd_chg_pon: %ld\n", PTR_ERR(buf));
++		return PTR_ERR(buf);
++	}
++	if (!len) {
+ 		kfree(buf);
+-		return;
++		return -EIO;
+ 	}
+ 
+ 	if (buf[0] == arg) {
+@@ -2687,25 +2819,27 @@
+ 		pr_info("%s: Successfully configured (fmd_chg_pon: %u)\n",
+ 			__func__, buf[0]);
+ 	} else {
++		rc = -EIO;
+ 		dev_err(devi, "Failed to configure fmd_chg_pon: %ld\n",
+ 			PTR_ERR(buf));
+ 		pr_err("%s: Failed to configure fmd_chg_pon = %u\n",
+ 			__func__, buf[0]);
+ 	}
+ 	kfree(buf);
+-}
+-
+-void fmd_write_stop_counter(unsigned char arg)
++	return rc;
++}
++
++static int fmd_write_stop_counter(unsigned char arg)
+ {
+ 	int rc = 0;
+ 	u8 *buf;
+ 	size_t len;
+ 	struct device *devi = &pwr_data->pdev->dev;
+ 
+-	if (IS_ERR(pwr_data->nvmem_cell_fmd_cnt2_stop)) {
++	if (IS_ERR_OR_NULL(pwr_data->nvmem_cell_fmd_cnt2_stop)) {
+ 		pr_err("%s: 'fmd_cnt2_stop' cell is not avilable to configure\n",
+ 			__func__);
+-		return;
++		return -ENODEV;
+ 	}
+ 
+ 	rc = nvmem_cell_write(pwr_data->nvmem_cell_fmd_cnt2_stop,
+@@ -2714,17 +2848,17 @@
+ 	if (rc < 0) {
+ 		pr_err("%s: Write cnt2_stop for FMD operation Failed %d\n",
+ 			__func__, rc);
+-		return;
++		return rc;
+ 	}
+ 
+ 	buf = nvmem_cell_read(pwr_data->nvmem_cell_fmd_cnt2_stop, &len);
+ 	if (IS_ERR(buf)) {
+-		dev_err(devi, "Failed to read fmd_cnt2_stop: %ld\n",
+-			PTR_ERR(buf));
+-		pr_err("%s: Failed to read fmd_cnt2_stop = %d\n",
+-			__func__, buf[0]);
++		dev_err(devi, "Failed to read fmd_cnt2_stop: %ld\n", PTR_ERR(buf));
++		return PTR_ERR(buf);
++	}
++	if (!len) {
+ 		kfree(buf);
+-		return;
++		return -EIO;
+ 	}
+ 
+ 	if (buf[0] == arg) {
+@@ -2732,66 +2866,66 @@
+ 		pr_info("%s: Successfully configured (fmd_cnt2_stop: %u)\n",
+ 			__func__, buf[0]);
+ 	} else {
++		rc = -EIO;
+ 		dev_err(devi, "Failed to configure fmd_cnt2_stop: %ld\n",
+ 			PTR_ERR(buf));
+ 		pr_err("%s: Failed to configure fmd_cnt2_stop = %u\n",
+ 			__func__, buf[0]);
+ 	}
+ 	kfree(buf);
+-}
+-
+-int perform_fmd_operation(void)
++	return rc;
++}
++
++static int perform_fmd_operation(void)
+ {
+ 	int ret = 0;
+ 	switch ((enum FmdOperation) fmdStruct.fmdOperation) {
+ 		case UPDATE_SOC_VER: {
+-			if ((fmdStruct.socFwVer == INVALID_SOC) ||
+-				(fmdStruct.socFwVer > OTHER_FMD_SUPPORTED_BT_SOC)) {
+-				pr_err("%s: Invalid SOC VERSION sent = %d\n",
+-					__func__, fmdStruct.socFwVer);
++			bool clock_was_enabled = pwr_data->bt_chip_clk &&
++				pwr_data->bt_chip_clk->is_enabled;
++
++			if (!fmdStruct.socFwVer ||
++			    (unsigned int)fmdStruct.socFwVer > OTHER_FMD_SUPPORTED_BT_SOC)
+ 				return -EINVAL;
++			if (pwr_data->bt_chip_clk && !clock_was_enabled) {
++				ret = bt_clk_enable(pwr_data->bt_chip_clk);
++				if (ret)
++					return ret;
+ 			}
+-			pwr_data->is_fmd_mode_enable = true;
+-			if (fmdStruct.socFwVer == PEACH_SOC_VERSION_1_0) {
+-				pr_info("%s: UPDATE_SOC_VER :: PEACH_SOC_VER_1_0\n",
+-					__func__);
+-			} else if (fmdStruct.socFwVer == PEACH_SOC_VERSION_2_0) {
+-				pr_info("%s: UPDATE_SOC_VER :: PEACH_SOC_VERSION_2_0\n",
+-					__func__);
++			if (fmdStruct.socFwVer == PEACH_SOC_VERSION_2_0) {
++				ret = vote_wlan_reg_for_fmd();
++				if (ret) {
++					if (pwr_data->bt_chip_clk && !clock_was_enabled)
++						bt_clk_disable(pwr_data->bt_chip_clk);
++					return ret;
++				}
+ #ifdef CONFIG_FMD_ENABLE
+ 				cnss_utils_fmd_status(true);
+ #endif
+-				if (vote_wlan_reg_for_fmd() < 0) {
+-					pr_err("%s: failed to vote wlan_reg\n", __func__);
+-					return -EINVAL;
+-				}
+-			} else {
+-				pr_info("%s: UPDATE_SOC_VER :: OTHER_FMD_SUPPORT_BT_SOC\n",
+-					__func__);
+ 			}
+-
+-			if (pwr_data->bt_chip_clk) {
+-				ret = bt_clk_enable(pwr_data->bt_chip_clk);
+-				if (ret < 0) {
+-					pr_err("%s: failed to bt_chip_clk\n", __func__);
+-					return -EINVAL;
+-				}
+-			}
++			pwr_data->is_fmd_mode_enable = true;
+ 			break;
+ 		}
+ 		case ENABLE_FMD: {
++			if (fmdStruct.rebootStatus < -1 || fmdStruct.rebootStatus > 255 ||
++			    fmdStruct.fmdCycles < -1 || fmdStruct.fmdCycles > 255)
++				return -EINVAL;
+ 			pr_info("%s: ENABLE_FMD\n", __func__);
+ 
+-			fmd_set_sdam_bit((unsigned char)POWER_ENABLE);
++			ret = fmd_set_sdam_bit((unsigned char)POWER_ENABLE);
++			if (ret)
++				return ret;
+ 
+ 			if (fmdStruct.rebootStatus != -1)
+-				fmd_reboot_on_usb_detection((unsigned char)fmdStruct.rebootStatus);
++				ret = fmd_reboot_on_usb_detection((unsigned char)fmdStruct.rebootStatus);
+ 			else
+ 				pr_err("%s: Reboot status upon usb detection is not configured\n",
+ 					__func__);
+ 
++			if (ret)
++				return ret;
+ 			if (fmdStruct.fmdCycles != -1)
+-				fmd_write_stop_counter((unsigned char)fmdStruct.fmdCycles);
++				ret = fmd_write_stop_counter((unsigned char)fmdStruct.fmdCycles);
+ 			else
+ 				pr_err("%s: Fmd stop_counter is not configured\n", __func__);
+ 
+@@ -2812,7 +2946,7 @@
+ 	return ret;
+ }
+ 
+-int bt_kernel_panic(char *arg) {
++static int bt_kernel_panic(char *arg) {
+ 	int ret = 0;
+ 
+ 	pr_info("%s\n", __func__);
+@@ -2825,8 +2959,10 @@
+ 			default_crash_reason, strlen(default_crash_reason));
+ 		strscpy(CrashInfo. SecondaryReason,
+ 			default_crash_reason, strlen(default_crash_reason));
+-		ret = -EFAULT;
+-	}
++		return -EFAULT;
++	}
++	CrashInfo.PrimaryReason[sizeof(CrashInfo.PrimaryReason) - 1] = '\0';
++	CrashInfo.SecondaryReason[sizeof(CrashInfo.SecondaryReason) - 1] = '\0';
+ 
+ 	pr_err("%s: BT kernel panic Primary reason = %s, Secondary reason = %s\n",
+ 		__func__, CrashInfo.PrimaryReason, CrashInfo.SecondaryReason);
+@@ -2838,7 +2974,7 @@
+ }
+ 
+ #ifdef CONFIG_MSM_BT_OOBS
+-int bt_oobs_handler(enum btpower_obs_param clk_cntrl)
++static int bt_oobs_handler(enum btpower_obs_param clk_cntrl)
+ {
+ 	if (!gpio_is_valid(pwr_data->bt_gpio_dev_wake)) {
+ 		pr_debug("%s: BT_CMD_OBS_VOTE_CLOCK bt_dev_wake_n(%d) not configured\n",
+@@ -2854,10 +2990,10 @@
+ 		btpower_uart_transport_locked(pwr_data, true);
+ 		break;
+ 	case BTPOWER_OBS_DEV_OFF:
+-		gpio_set_value(pwr_data->bt_gpio_dev_wake, 0);
++		gpio_set_value_cansleep(pwr_data->bt_gpio_dev_wake, 0);
+ 		break;
+ 	case BTPOWER_OBS_DEV_ON:
+-		gpio_set_value(pwr_data->bt_gpio_dev_wake, 1);
++		gpio_set_value_cansleep(pwr_data->bt_gpio_dev_wake, 1);
+ 		break;
+ 	default:
+ 		pr_debug("%s: BT_CMD_OBS_VOTE_CLOCK clk_cntrl(%d)\n",
+@@ -2866,13 +3002,13 @@
+ 	}
+ 	pr_debug("%s: BT_CMD_OBS_VOTE_CLOCK clk_cntrl(%d) %s\n",
+ 		__func__, clk_cntrl,
+-		gpio_get_value(pwr_data->bt_gpio_dev_wake) ?
++		gpio_get_value_cansleep(pwr_data->bt_gpio_dev_wake) ?
+ 			"Assert" : "Deassert");
+ 	return 0;
+ }
+ #endif
+ 
+-static long bt_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++static long bt_ioctl_dispatch(struct file *file, unsigned int cmd, unsigned long arg)
+ {
+ 	int ret = 0;
+ 	int chipset_version = 0;
+@@ -2912,6 +3048,7 @@
+ 		if (copy_from_user(&fmdStruct, (char *)arg, sizeof(fmdStruct))) {
+ 			pr_err("%s: copy to user failed\n", __func__);
+ 			ret = -EFAULT;
++			break;
+ 		}
+ 		ret = perform_fmd_operation();
+ 		break;
+@@ -2932,10 +3069,10 @@
+ 		pr_warn("%s: unified Current SOC Version : %x\n", __func__,
+ 			chipset_version);
+ 		if (chipset_version) {
+-			soc_id = chipset_version;
++			WRITE_ONCE(soc_id, chipset_version);
+ 		} else {
+ 			pr_err("%s: got invalid soc version\n", __func__);
+-			soc_id = 0;
++			WRITE_ONCE(soc_id, 0);
+ 		}
+ 		break;
+ 	case BT_CMD_GET_CHIPSET_ID:
+@@ -2962,7 +3099,7 @@
+ 					__func__, ret);
+ 			} else {
+ 				power_src.bt_state[BT_SW_CTRL_GPIO] =
+-					gpio_get_value(
++					gpio_get_value_cansleep(
+ 					pwr_data->bt_gpio_sw_ctrl);
+ 				pr_info("bt-sw-ctrl-gpio(%d) value(%d)\n",
+ 					pwr_data->bt_gpio_sw_ctrl,
+@@ -2983,7 +3120,7 @@
+ 		break;
+ 	case BT_CMD_SET_IPA_TCS_INFO:
+ 		pr_info("%s: BT_CMD_SET_IPA_TCS_INFO\n", __func__);
+-		btpower_enable_ipa_vreg(pwr_data);
++		ret = btpower_enable_ipa_vreg(pwr_data);
+ 		break;
+ 	case BT_CMD_KERNEL_PANIC:
+ 
+@@ -3023,6 +3160,40 @@
+ 	}
+ 	return ret;
+ }
++static int bt_open(struct inode *inode, struct file *file)
++{
++	int idx = srcu_read_lock(&btpower_srcu);
++	int ret = -EAGAIN;
++
++	if (smp_load_acquire(&probe_finished)) {
++		file->private_data = (void *)btpower_generation;
++		ret = 0;
++	}
++	srcu_read_unlock(&btpower_srcu, idx);
++	return ret;
++}
++
++static long bt_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	int idx = srcu_read_lock(&btpower_srcu);
++	long ret = -ENODEV;
++	bool queued = cmd == BT_CMD_PWR_CTRL || cmd == UWB_CMD_PWR_CTRL ||
++		cmd == BT_CMD_ACCESS_CTRL || cmd == UWB_CMD_ACCESS_CTRL;
++
++	if (smp_load_acquire(&probe_finished) &&
++	    (unsigned long)file->private_data == btpower_generation) {
++		mutex_lock(&btpower_ioctl_lock);
++		if (!queued)
++			mutex_lock(&btpower_operation_lock);
++		ret = bt_ioctl_dispatch(file, cmd, arg);
++		if (!queued)
++			mutex_unlock(&btpower_operation_lock);
++		mutex_unlock(&btpower_ioctl_lock);
++	}
++	srcu_read_unlock(&btpower_srcu, idx);
++	return ret;
++}
++
+ static struct platform_driver bt_power_driver = {
+ 	.probe = bt_power_probe,
+ 	.remove = bt_power_remove,
+@@ -3033,6 +3204,8 @@
+ };
+ 
+ static const struct file_operations bt_dev_fops = {
++	.owner = THIS_MODULE,
++	.open = bt_open,
+ 	.unlocked_ioctl = bt_ioctl,
+ 	.compat_ioctl = bt_ioctl,
+ };
+@@ -3040,6 +3213,7 @@
+ static int __init btpower_init(void)
+ {
+ 	int ret = 0;
++	struct device *dev;
+ 
+ 	probe_finished = false;
+ 	ret = platform_driver_register(&bt_power_driver);
+@@ -3052,19 +3226,20 @@
+ 	bt_major = register_chrdev(0, "bt", &bt_dev_fops);
+ 	if (bt_major < 0) {
+ 		pr_err("%s: failed to allocate char dev\n", __func__);
+-		ret = -1;
++		ret = bt_major;
+ 		goto chrdev_err;
+ 	}
+ 
+ 	bt_class = class_create("bt-dev");
+ 	if (IS_ERR(bt_class)) {
+ 		pr_err("%s: coudn't create class\n", __func__);
+-		ret = -1;
++		ret = PTR_ERR(bt_class);
+ 		goto class_err;
+ 	}
+ 
+-	if (device_create(bt_class, NULL, MKDEV(bt_major, 0),
+-		NULL, "btpower") == NULL) {
++	dev = device_create(bt_class, NULL, MKDEV(bt_major, 0), NULL, "btpower");
++	if (IS_ERR(dev)) {
++		ret = PTR_ERR(dev);
+ 		pr_err("%s: failed to allocate char dev\n", __func__);
+ 		goto device_err;
+ 	}
+@@ -3094,16 +3269,17 @@
+  *
+  * Return: 0 for success
+  */
+-int bt_aop_send_msg(struct platform_pwr_data *plat_priv, char *mbox_msg)
+-{
+-	int ret = 0;
+-	ret = qmp_send(plat_priv->qmp, mbox_msg, BTPOWER_MBOX_MSG_MAX_LEN);
+-	if (ret < 0)
+-		pr_err("Failed to send AOP qmp  xmsg: %s\n", mbox_msg);
+-	else
+-		ret =0;
+-	return ret;
+-
++static int bt_aop_send_msg(struct platform_pwr_data *plat_priv, char *mbox_msg)
++{
++	char frame[BTPOWER_MBOX_MSG_MAX_LEN] = {};
++	int ret;
++
++	if (!mbox_msg || IS_ERR_OR_NULL(plat_priv->qmp))
++		return -ENODEV;
++	if (strscpy(frame, mbox_msg, sizeof(frame)) < 0)
++		return -EMSGSIZE;
++	ret = qmp_send(plat_priv->qmp, frame, sizeof(frame));
++	return ret < 0 ? ret : 0;
+ }
+ 
+ int bt_aop_pdc_reconfig(struct platform_pwr_data *pdata)
+@@ -3150,19 +3326,24 @@
+ 				   enum btpower_vreg_param param,
+ 				   enum btpower_tcs_seq seq, int val)
+ {
+-	char mbox_msg[BTPOWER_MBOX_MSG_MAX_LEN];
++	char mbox_msg[BTPOWER_MBOX_MSG_MAX_LEN] = {};
+ 	static const char * const vreg_param_str[] = {"v", "m", "e"};
+ 	static const char *const tcs_seq_str[] = {"upval", "dwnval", "enable"};
+ 	int ret = 0;
+ 
+-	if (param > BTPOWER_VREG_ENABLE || seq > BTPOWER_TCS_ALL_SEQ || !vreg_name)
++	if ((unsigned int)param > BTPOWER_VREG_ENABLE ||
++	    (unsigned int)seq > BTPOWER_TCS_ALL_SEQ || !vreg_name)
+ 		return -EINVAL;
+ 
+-	snprintf(mbox_msg, BTPOWER_MBOX_MSG_MAX_LEN,
++	ret = snprintf(mbox_msg, BTPOWER_MBOX_MSG_MAX_LEN,
+ 		 "{class: wlan_pdc, res: %s.%s, %s: %d}", vreg_name,
+ 		 vreg_param_str[param], tcs_seq_str[seq], val);
+ 
++	if (ret < 0 || ret >= sizeof(mbox_msg))
++		return -EMSGSIZE;
+ 	pr_info("%s: sending AOP Mbox msg: %s\n", __func__, mbox_msg);
++	if (IS_ERR_OR_NULL(pdata->qmp))
++		return -ENODEV;
+ 	ret = qmp_send(pdata->qmp, mbox_msg, BTPOWER_MBOX_MSG_MAX_LEN);
+ 	if (ret < 0)
+ 		pr_err("%s:Failed to send AOP mbox msg(%s), err(%d)\n",
+@@ -3174,9 +3355,8 @@
+ static int btpower_enable_ipa_vreg(struct platform_pwr_data *pdata)
+ {
+ 	int ret = 0;
+-	static bool config_done;
+-
+-	if (config_done) {
++
++	if (pdata->ipa_config_done) {
+ 		pr_info("%s: IPA Vreg already configured\n", __func__);
+ 		return 0;
+ 	}
+@@ -3190,7 +3370,7 @@
+ 					       BTPOWER_TCS_UP_SEQ, 1);
+ 		if (ret >=  0) {
+ 			pr_info("%s:Enabled iPA\n", __func__);
+-			config_done = true;
++			pdata->ipa_config_done = true;
+ 		}
+ 	}
+ 
+@@ -3199,7 +3379,9 @@
+ 
+ static void __exit btpower_exit(void)
+ {
+-	qmp_put(pwr_data->qmp);
++	device_destroy(bt_class, MKDEV(bt_major, 0));
++	class_destroy(bt_class);
++	unregister_chrdev(bt_major, "bt");
+ 	platform_driver_unregister(&bt_power_driver);
+ }
+ 
+--- a/qcom/opensource/bt-kernel/include/btpower.h
++++ b/qcom/opensource/bt-kernel/include/btpower.h
+@@ -690,6 +690,14 @@
+ 	struct work_struct wq_pwr_voting;
+ 	struct sk_buff_head rxq;
+ 	struct mutex pwr_mtx;
++	bool reset_requested;
++	bool resetb_requested;
++	bool debug_requested;
++	spinlock_t task_lock;
++	bool host_irq_requested;
++	struct list_head request_queue;
++	unsigned int queued_requests;
++	bool ipa_config_done;
+ 	bool is_fmd_mode_enable;
+ 	struct nvmem_cell *nvmem_cell_fmd_set;
+ 	struct nvmem_cell *nvmem_cell_fmd_chg_pon;

@@ -1,0 +1,1792 @@
+--- a/qcom/opensource/dataipa/drivers/platform/msm/gsi/gsi.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/gsi/gsi.c
+@@ -4203,7 +4203,7 @@
+ }
+ EXPORT_SYMBOL(gsi_is_event_pending);
+ 
+-int __gsi_get_gci_cookie(struct gsi_chan_ctx *ctx, uint16_t idx)
++static int __gsi_get_gci_cookie(struct gsi_chan_ctx *ctx, uint16_t idx)
+ {
+ 	int i;
+ 	int end;
+@@ -4242,7 +4242,7 @@
+ 	return 0xFFFF;
+ }
+ 
+-int __gsi_populate_gci_tre(struct gsi_chan_ctx *ctx,
++static int __gsi_populate_gci_tre(struct gsi_chan_ctx *ctx,
+ 	struct gsi_xfer_elem *xfer)
+ {
+ 	struct gsi_gci_tre gci_tre;
+@@ -4280,7 +4280,7 @@
+ 	return 0;
+ }
+ 
+-int __gsi_populate_tre(struct gsi_chan_ctx *ctx,
++static int __gsi_populate_tre(struct gsi_chan_ctx *ctx,
+ 	struct gsi_xfer_elem *xfer)
+ {
+ 	struct gsi_tre tre;
+@@ -5954,7 +5954,7 @@
+ {
+ 	struct va_md_entry entry;
+ 
+-	strlcpy(entry.owner, "gsi_mini", sizeof(entry.owner));
++	strscpy(entry.owner, "gsi_mini", sizeof(entry.owner));
+ 	entry.vaddr = (unsigned long)gsi_ctx;
+ 	entry.size = sizeof(struct gsi_ctx);
+ 	qcom_va_md_add_region(&entry);
+@@ -6017,6 +6017,7 @@
+ 	.probe          = msm_gsi_probe,
+ 	.driver		= {
+ 		.name	= "gsi",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = msm_gsi_match,
+ 	},
+ };
+@@ -6050,16 +6051,7 @@
+ }
+ arch_initcall(gsi_init);
+ 
+-/*
+- * Module exit.
+- */
+-static void __exit gsi_exit(void)
+-{
+-	if (running_emulation && pdev)
+-		platform_device_unregister(pdev);
+-	platform_driver_unregister(&msm_gsi_driver);
+-}
+-module_exit(gsi_exit);
++/* Native channel/IRQ/minidump teardown is incomplete; keep GSI resident. */
+ 
+ MODULE_LICENSE("GPL v2");
+ MODULE_DESCRIPTION("Generic Software Interface (GSI)");
+--- a/qcom/opensource/dataipa/drivers/platform/msm/gsi/gsihal/gsihal.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/gsi/gsihal/gsihal.c
+@@ -5,6 +5,7 @@
+ */
+ 
+ #include "gsihal_i.h"
++#include "gsihal.h"
+ #include "gsihal_reg.h"
+ 
+ struct gsihal_context *gsihal_ctx;
+--- a/qcom/opensource/dataipa/drivers/platform/msm/gsi/gsihal/gsihal_reg.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/gsi/gsihal/gsihal_reg.c
+@@ -180,7 +180,7 @@
+ * gsihal_reg_name_str() - returns string that represent the register
+ * @reg_name: [in] register name
+ */
+-const char *gsihal_reg_name_str(enum gsihal_reg_name reg_name)
++static const char *gsihal_reg_name_str(enum gsihal_reg_name reg_name)
+ {
+ 	if (reg_name < 0 || reg_name >= GSI_REG_MAX) {
+ 		GSIERR("requested name of invalid reg=%d\n", reg_name);
+@@ -2493,6 +2493,13 @@
+  */
+ bool gsihal_check_ring_length_valid(u32 r_len, u32 elem_size)
+ {
++	if ((elem_size != 4 && elem_size != 8 && elem_size != 16 &&
++	     elem_size != 32 && elem_size != 64) ||
++	    r_len < elem_size || r_len % elem_size) {
++		GSIERR("invalid ring length %u or element size %u\n", r_len, elem_size);
++		return false;
++	}
++
+ 	if (gsihal_ctx->gsi_ver >= GSI_VER_3_0) {
+ 		if (r_len & ~GSI_V3_0_EE_n_GSI_CH_k_CNTXT_1_R_LENGTH_BMSK) {
+ 			GSIERR("bad params ring_len %u is out of bounds\n", r_len);
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_clients/ipa_mhi_client.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_clients/ipa_mhi_client.c
+@@ -2087,7 +2087,7 @@
+  * This function is called by IPA MHI client driver on MHI reset to destroy all
+  * IPA MHI channels.
+  */
+-int ipa_mhi_destroy_all_channels(void)
++static int ipa_mhi_destroy_all_channels(void)
+ {
+ 	int res;
+ 
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_clients/ipa_uc_offload.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_clients/ipa_uc_offload.c
+@@ -404,7 +404,7 @@
+ 	ipa_smmu_free_sgt(&params->ring_base_sgt);
+ }
+ 
+-int ipa_uc_ntn_conn_pipes(struct ipa_ntn_conn_in_params *inp,
++static int ipa_uc_ntn_conn_pipes(struct ipa_ntn_conn_in_params *inp,
+ 			struct ipa_ntn_conn_out_params *outp,
+ 			struct ipa_uc_offload_ctx *ntn_ctx)
+ {
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_clients/ipa_usb.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_clients/ipa_usb.c
+@@ -100,8 +100,9 @@
+ 
+ struct ipa3_usb_pm_context {
+ 	struct ipa_pm_register_params reg_params;
+-	struct work_struct *remote_wakeup_work;
++	struct work_struct remote_wakeup_work;
+ 	u32 hdl;
++	bool associated;
+ };
+ 
+ enum ipa3_usb_state {
+@@ -183,6 +184,9 @@
+ 	struct completion dev_ready_comp;
+ 	u32 qmi_req_id;
+ 	spinlock_t state_lock;
++	/* Protect callback/token snapshots without nesting state_lock. */
++	spinlock_t notify_lock;
++	bool shutting_down;
+ 	bool dl_data_pending;
+ 	struct workqueue_struct *wq;
+ 	struct mutex general_mutex;
+@@ -216,11 +220,6 @@
+ };
+ 
+ static void ipa3_usb_wq_notify_remote_wakeup(struct work_struct *work);
+-static void ipa3_usb_wq_dpl_notify_remote_wakeup(struct work_struct *work);
+-static DECLARE_WORK(ipa3_usb_notify_remote_wakeup_work,
+-	ipa3_usb_wq_notify_remote_wakeup);
+-static DECLARE_WORK(ipa3_usb_dpl_notify_remote_wakeup_work,
+-	ipa3_usb_wq_dpl_notify_remote_wakeup);
+ 
+ static struct ipa3_usb_context *ipa3_usb_ctx;
+ 
+@@ -469,20 +468,44 @@
+ 	return is_legal;
+ }
+ 
++static void ipa3_usb_set_notify_data(enum ipa3_usb_transport_type ttype,
++				     void *user_data)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&ipa3_usb_ctx->notify_lock, flags);
++	ipa3_usb_ctx->ttype_ctx[ttype].user_data = user_data;
++	spin_unlock_irqrestore(&ipa3_usb_ctx->notify_lock, flags);
++}
++
++static void ipa3_usb_reset_notify(enum ipa3_usb_transport_type ttype)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&ipa3_usb_ctx->notify_lock, flags);
++	ipa3_usb_ctx->ttype_ctx[ttype].ipa_usb_notify_cb = NULL;
++	ipa3_usb_ctx->ttype_ctx[ttype].user_data = NULL;
++	spin_unlock_irqrestore(&ipa3_usb_ctx->notify_lock, flags);
++}
++
+ static void ipa3_usb_notify_do(enum ipa3_usb_transport_type ttype,
+ 	enum ipa_usb_notify_event event)
+ {
+ 	int (*cb)(enum ipa_usb_notify_event, void *user_data);
+ 	void *user_data;
++	unsigned long flags;
+ 	int res;
+ 
+ 	IPA_USB_DBG("Trying to notify USB with %s\n",
+ 		ipa3_usb_notify_event_to_string(event));
+ 
+-	cb = ipa3_usb_ctx->ttype_ctx[ttype].ipa_usb_notify_cb;
++	spin_lock_irqsave(&ipa3_usb_ctx->notify_lock, flags);
++	cb = ipa3_usb_ctx->shutting_down ? NULL :
++		ipa3_usb_ctx->ttype_ctx[ttype].ipa_usb_notify_cb;
+ 	user_data = ipa3_usb_ctx->ttype_ctx[ttype].user_data;
+-
+-	if (cb) {
++	spin_unlock_irqrestore(&ipa3_usb_ctx->notify_lock, flags);
++
++	if (cb && user_data) {
+ 		res = cb(event, user_data);
+ 		IPA_USB_DBG("Notified USB with %s. is_dpl=%d result=%d\n",
+ 			ipa3_usb_notify_event_to_string(event),
+@@ -504,45 +527,21 @@
+ 
+ static void ipa3_usb_wq_notify_remote_wakeup(struct work_struct *work)
+ {
+-	bool rwakeup_pending;
++	struct ipa3_usb_pm_context *pm_ctx =
++		container_of(work, struct ipa3_usb_pm_context, remote_wakeup_work);
++	struct ipa3_usb_transport_type_ctx *ttype_ctx =
++		container_of(pm_ctx, struct ipa3_usb_transport_type_ctx, pm_ctx);
++	enum ipa3_usb_transport_type ttype = ttype_ctx - ipa3_usb_ctx->ttype_ctx;
+ 	unsigned long flags;
+-	enum ipa3_usb_transport_type ttype =
+-		IPA_USB_TRANSPORT_TETH;
+-
+ 
+ 	spin_lock_irqsave(&ipa3_usb_ctx->state_lock, flags);
+-	rwakeup_pending =
+-		ipa3_usb_ctx->ttype_ctx[ttype].rwakeup_pending;
+-	if (!rwakeup_pending) {
+-		rwakeup_pending = true;
+-		ipa3_usb_notify_do(ttype,
+-			IPA_USB_REMOTE_WAKEUP);
+-	}
+-	ipa3_usb_ctx->ttype_ctx[ttype].rwakeup_pending =
+-		rwakeup_pending;
++	if (!READ_ONCE(ipa3_usb_ctx->shutting_down) &&
++	    ttype_ctx->state == IPA_USB_SUSPENDED && !ttype_ctx->rwakeup_pending) {
++		ttype_ctx->rwakeup_pending = true;
++		ipa3_usb_notify_do(ttype, IPA_USB_REMOTE_WAKEUP);
++	}
+ 	spin_unlock_irqrestore(&ipa3_usb_ctx->state_lock, flags);
+ }
+-
+-static void ipa3_usb_wq_dpl_notify_remote_wakeup(struct work_struct *work)
+-{
+-	bool rwakeup_pending;
+-	unsigned long flags;
+-	enum ipa3_usb_transport_type ttype =
+-		IPA_USB_TRANSPORT_DPL;
+-
+-	spin_lock_irqsave(&ipa3_usb_ctx->state_lock, flags);
+-	rwakeup_pending =
+-		ipa3_usb_ctx->ttype_ctx[ttype].rwakeup_pending;
+-	if (!rwakeup_pending) {
+-		rwakeup_pending = true;
+-		ipa3_usb_notify_do(ttype,
+-			IPA_USB_REMOTE_WAKEUP);
+-	}
+-	ipa3_usb_ctx->ttype_ctx[ttype].rwakeup_pending =
+-		rwakeup_pending;
+-	spin_unlock_irqrestore(&ipa3_usb_ctx->state_lock, flags);
+-}
+-
+ 
+ static void ipa3_usb_pm_cb(void *p, enum ipa_pm_cb_event event)
+ {
+@@ -561,9 +560,10 @@
+ 	spin_lock_irqsave(&ipa3_usb_ctx->state_lock, flags);
+ 	IPA_USB_DBG("state is %s\n",
+ 		ipa3_usb_state_to_string(ttype_ctx->state));
+-	if (ttype_ctx->state == IPA_USB_SUSPENDED)
++	if (!READ_ONCE(ipa3_usb_ctx->shutting_down) &&
++	    ttype_ctx->state == IPA_USB_SUSPENDED)
+ 		queue_work(ipa3_usb_ctx->wq,
+-			ttype_ctx->pm_ctx.remote_wakeup_work);
++			&ttype_ctx->pm_ctx.remote_wakeup_work);
+ 	spin_unlock_irqrestore(&ipa3_usb_ctx->state_lock, flags);
+ 	IPA_USB_DBG_LOW("exit\n");
+ }
+@@ -626,6 +626,8 @@
+ 	return 0;
+ }
+ 
++static int ipa3_usb_deregister_pm(enum ipa3_usb_transport_type ttype);
++
+ static int ipa3_usb_register_pm(enum ipa3_usb_transport_type ttype)
+ {
+ 	struct ipa3_usb_transport_type_ctx *ttype_ctx =
+@@ -639,9 +641,11 @@
+ 	 * One for DPL,
+ 	 */
+ 
+-	if (!IPA3_USB_IS_TTYPE_DPL(ttype) && (ipa3_usb_ctx->num_init_prot > 0)
+-		&& (ttype != IPA_USB_TRANSPORT_TETH_2))
+-		return 0;
++	if (ttype_ctx->pm_ctx.hdl != ~0U) {
++		if (ttype_ctx->pm_ctx.associated)
++			return 0;
++		goto associate_cons;
++	}
+ 
+ 	memset(&ttype_ctx->pm_ctx.reg_params, 0,
+ 		sizeof(ttype_ctx->pm_ctx.reg_params));
+@@ -662,6 +666,7 @@
+ 		goto fail_pm_reg;
+ 	}
+ 
++associate_cons:
+ 	consumer = (ttype == IPA_USB_TRANSPORT_DPL) ?
+ 		IPA_CLIENT_USB_DPL_CONS :
+ 		(ttype == IPA_USB_TRANSPORT_TETH_2) ?
+@@ -673,11 +678,15 @@
+ 		goto fail_pm_cons;
+ 	}
+ 
++	ttype_ctx->pm_ctx.associated = true;
+ 	return 0;
+ 
+ fail_pm_cons:
+-	ipa_pm_deregister(ttype_ctx->pm_ctx.hdl);
++	/* Keep a failed rollback handle so a later init can retry it. */
++	ipa3_usb_deregister_pm(ttype);
++	return result;
+ fail_pm_reg:
++	ttype_ctx->pm_ctx.hdl = ~0U;
+ 	memset(&ttype_ctx->pm_ctx.reg_params, 0,
+ 		sizeof(ttype_ctx->pm_ctx.reg_params));
+ 	return result;
+@@ -689,10 +698,14 @@
+ 		&ipa3_usb_ctx->ttype_ctx[ttype].pm_ctx;
+ 	int result;
+ 
++	if (pm_ctx->hdl == ~0U)
++		return 0;
+ 	result = ipa_pm_deregister(pm_ctx->hdl);
+ 	if (result)
+ 		return result;
+ 
++	pm_ctx->hdl = ~0U;
++	pm_ctx->associated = false;
+ 	memset(&pm_ctx->reg_params, 0, sizeof(pm_ctx->reg_params));
+ 	return 0;
+ }
+@@ -766,10 +779,19 @@
+ 			   void *user_data)
+ {
+ 	int result = -EFAULT;
++	unsigned long flags;
++	bool pm_created;
++	int cleanup;
+ 	enum ipa3_usb_transport_type ttype;
+ 	struct ipa3_usb_teth_prot_context *teth_prot_ptr;
+ 
++	if (!ipa3_usb_ctx)
++		return -ENODEV;
+ 	mutex_lock(&ipa3_usb_ctx->general_mutex);
++	if (READ_ONCE(ipa3_usb_ctx->shutting_down)) {
++		result = -ENODEV;
++		goto bad_params;
++	}
+ 	IPA_USB_DBG_LOW("entry\n");
+ 	if (teth_prot < 0 || teth_prot >= IPA_USB_MAX_TETH_PROT_SIZE ||
+ 		((teth_prot == IPA_USB_RNDIS || teth_prot == IPA_USB_ECM) &&
+@@ -788,29 +810,22 @@
+ 		goto bad_params;
+ 	}
+ 
+-	/* Register with IPA PM */
++	/* Validate before creating PM resources or publishing a callback. */
+ 	teth_prot_ptr = &ipa3_usb_ctx->teth_prot_ctx[teth_prot];
++	if (teth_prot_ptr->state != IPA_USB_TETH_PROT_INVALID) {
++		result = -EPERM;
++		goto bad_params;
++	}
++	if (ipa3_usb_ctx->ttype_ctx[ttype].ipa_usb_notify_cb &&
++	    (IPA3_USB_IS_TTYPE_DPL(ttype) ||
++	     ipa3_usb_ctx->ttype_ctx[ttype].ipa_usb_notify_cb != ipa_usb_notify_cb)) {
++		result = -EINVAL;
++		goto bad_params;
++	}
++	pm_created = ipa3_usb_ctx->ttype_ctx[ttype].pm_ctx.hdl == ~0U;
+ 	result = ipa3_usb_register_pm(ttype);
+-	if (result) {
+-		IPA_USB_ERR("Failed registering IPA PM\n");
+-		goto bad_params;
+-	}
+-
+-	if (!ipa3_usb_ctx->ttype_ctx[ttype].ipa_usb_notify_cb) {
+-		ipa3_usb_ctx->ttype_ctx[ttype].ipa_usb_notify_cb =
+-			ipa_usb_notify_cb;
+-	} else if (!IPA3_USB_IS_TTYPE_DPL(ttype)) {
+-		if (ipa3_usb_ctx->ttype_ctx[ttype].ipa_usb_notify_cb !=
+-			ipa_usb_notify_cb) {
+-			IPA_USB_ERR("Got different notify_cb\n");
+-			result = -EINVAL;
+-			goto bad_params;
+-		}
+-	} else {
+-		IPA_USB_ERR("Already has dpl_notify_cb\n");
+-		result = -EINVAL;
+-		goto bad_params;
+-	}
++	if (result)
++		goto bad_params;
+ 
+ 	/* Initialize tethering protocol */
+ 	switch (teth_prot) {
+@@ -942,15 +957,19 @@
+ 	if (!ipa3_usb_set_state(IPA_USB_INITIALIZED, false, ttype))
+ 		IPA_USB_ERR("failed to change state to initialized\n");
+ 
++	spin_lock_irqsave(&ipa3_usb_ctx->notify_lock, flags);
++	ipa3_usb_ctx->ttype_ctx[ttype].ipa_usb_notify_cb = ipa_usb_notify_cb;
++	spin_unlock_irqrestore(&ipa3_usb_ctx->notify_lock, flags);
+ 	IPA_USB_DBG_LOW("exit\n");
+ 	mutex_unlock(&ipa3_usb_ctx->general_mutex);
+ 	return 0;
+ 
+ teth_prot_init_fail:
+-	if ((IPA3_USB_IS_TTYPE_DPL(ttype))
+-		|| (ipa3_usb_ctx->num_init_prot == 0)
+-		|| (teth_prot == IPA_USB_RMNET_CV2X)) {
+-		ipa3_usb_deregister_pm(ttype);
++	teth_prot_ptr->user_data = NULL;
++	if (pm_created) {
++		cleanup = ipa3_usb_deregister_pm(ttype);
++		if (cleanup)
++			IPA_USB_ERR("PM rollback failed: %d\n", cleanup);
+ 	}
+ bad_params:
+ 	mutex_unlock(&ipa3_usb_ctx->general_mutex);
+@@ -980,6 +999,8 @@
+ 
+ static bool ipa3_usb_check_chan_params(struct ipa_usb_xdci_chan_params *params)
+ {
++	if (!params)
++		return false;
+ 	IPA_USB_DBG_LOW("gevntcount_low_addr = %x\n",
+ 			params->gevntcount_low_addr);
+ 	IPA_USB_DBG_LOW("gevntcount_hi_addr = %x\n",
+@@ -997,6 +1018,9 @@
+ 
+ 	if (params->teth_prot < 0 ||
+ 		params->teth_prot >= IPA_USB_MAX_TETH_PROT_SIZE ||
++		(params->dir != CHAN_DIR_TO_GSI &&
++		 params->dir != CHAN_DIR_FROM_GSI) ||
++		!params->xfer_ring_len ||
+ 		params->xfer_ring_len % GSI_CHAN_RE_SIZE_16B ||
+ 		params->xfer_scratch.const_buffer_size < 1 ||
+ 		params->xfer_scratch.const_buffer_size > 31) {
+@@ -1426,8 +1450,7 @@
+ 				ipa3_usb_teth_prot_to_string(teth_prot));
+ 			break;
+ 		}
+-		ipa3_usb_ctx->ttype_ctx[ttype].user_data =
+-			teth_prot_ptr->user_data;
++		ipa3_usb_set_notify_data(ttype, teth_prot_ptr->user_data);
+ 		result = rndis_ipa_pipe_connect_notify(
+ 			teth_conn_params->usb_to_ipa_clnt_hdl,
+ 			teth_conn_params->ipa_to_usb_clnt_hdl,
+@@ -1438,7 +1461,7 @@
+ 		if (result) {
+ 			IPA_USB_ERR("failed to connect %s\n",
+ 				ipa3_usb_teth_prot_to_string(teth_prot));
+-			ipa3_usb_ctx->ttype_ctx[ttype].user_data = NULL;
++			ipa3_usb_set_notify_data(ttype, NULL);
+ 			return result;
+ 		}
+ 		teth_prot_ptr->state =
+@@ -1453,15 +1476,14 @@
+ 				ipa3_usb_teth_prot_to_string(teth_prot));
+ 			break;
+ 		}
+-		ipa3_usb_ctx->ttype_ctx[ttype].user_data =
+-			teth_prot_ptr->user_data;
++		ipa3_usb_set_notify_data(ttype, teth_prot_ptr->user_data);
+ 		result = ecm_ipa_connect(teth_conn_params->usb_to_ipa_clnt_hdl,
+ 			teth_conn_params->ipa_to_usb_clnt_hdl,
+ 			teth_prot_ptr->teth_prot_params.ecm.private);
+ 		if (result) {
+ 			IPA_USB_ERR("failed to connect %s\n",
+ 				ipa3_usb_teth_prot_to_string(teth_prot));
+-			ipa3_usb_ctx->ttype_ctx[ttype].user_data = NULL;
++			ipa3_usb_set_notify_data(ttype, NULL);
+ 			return result;
+ 		}
+ 		teth_prot_ptr->state =
+@@ -1483,8 +1505,7 @@
+ 		if (result)
+ 			return result;
+ 
+-		ipa3_usb_ctx->ttype_ctx[ttype].user_data =
+-			teth_prot_ptr->user_data;
++		ipa3_usb_set_notify_data(ttype, teth_prot_ptr->user_data);
+ 		teth_bridge_params.ipa_usb_pipe_hdl =
+ 			teth_conn_params->ipa_to_usb_clnt_hdl;
+ 		teth_bridge_params.usb_ipa_pipe_hdl =
+@@ -1499,7 +1520,7 @@
+ 
+ 		result = ipa3_usb_connect_teth_bridge(&teth_bridge_params);
+ 		if (result) {
+-			ipa3_usb_ctx->ttype_ctx[ttype].user_data = NULL;
++			ipa3_usb_set_notify_data(ttype, NULL);
+ 			return result;
+ 		}
+ 
+@@ -1518,8 +1539,7 @@
+ 			break;
+ 		}
+ 
+-		ipa3_usb_ctx->ttype_ctx[ttype].user_data =
+-			ipa3_usb_ctx->teth_prot_ctx[teth_prot].user_data;
++		ipa3_usb_set_notify_data(ttype, ipa3_usb_ctx->teth_prot_ctx[teth_prot].user_data);
+ 		ipa3_usb_ctx->teth_prot_ctx[IPA_USB_DIAG].state =
+ 			IPA_USB_TETH_PROT_CONNECTED;
+ 		ipa3_usb_notify_do(ttype, IPA_USB_DEVICE_READY);
+@@ -1618,7 +1638,7 @@
+ 		break;
+ 	}
+ 
+-	ipa3_usb_ctx->ttype_ctx[ttype].user_data = NULL;
++	ipa3_usb_set_notify_data(ttype, NULL);
+ 	return result;
+ }
+ 
+@@ -1924,13 +1944,30 @@
+ 	int result = -EFAULT;
+ 	struct ipa_usb_xdci_connect_params_internal conn_params;
+ 
++	if (!ipa3_usb_ctx)
++		return -ENODEV;
+ 	mutex_lock(&ipa3_usb_ctx->general_mutex);
++	if (READ_ONCE(ipa3_usb_ctx->shutting_down)) {
++		result = -ENODEV;
++		goto bad_params;
++	}
+ 	IPA_USB_DBG_LOW("entry\n");
+ 	if (connect_params == NULL || dl_chan_params == NULL ||
+ 		dl_out_params == NULL ||
+ 		(connect_params->teth_prot != IPA_USB_DIAG &&
+ 		(ul_chan_params == NULL || ul_out_params == NULL))) {
+ 		IPA_USB_ERR("bad parameters\n");
++		result = -EINVAL;
++		goto bad_params;
++	}
++
++	if (connect_params->teth_prot < 0 ||
++	    connect_params->teth_prot >= IPA_USB_MAX_TETH_PROT_SIZE ||
++	    dl_chan_params->teth_prot != connect_params->teth_prot ||
++	    dl_chan_params->dir != CHAN_DIR_FROM_GSI ||
++	    (connect_params->teth_prot != IPA_USB_DIAG &&
++	     (ul_chan_params->teth_prot != connect_params->teth_prot ||
++	      ul_chan_params->dir != CHAN_DIR_TO_GSI))) {
+ 		result = -EINVAL;
+ 		goto bad_params;
+ 	}
+@@ -2092,7 +2129,13 @@
+ 	enum ipa3_usb_state orig_state;
+ 	enum ipa3_usb_transport_type ttype;
+ 
++	if (!ipa3_usb_ctx)
++		return -ENODEV;
+ 	mutex_lock(&ipa3_usb_ctx->general_mutex);
++	if (READ_ONCE(ipa3_usb_ctx->shutting_down)) {
++		result = -ENODEV;
++		goto bad_params;
++	}
+ 	IPA_USB_DBG_LOW("entry\n");
+ 
+ 	ttype = IPA3_USB_GET_TTYPE(teth_prot);
+@@ -2109,6 +2152,8 @@
+ 		spin_unlock_irqrestore(&ipa3_usb_ctx->state_lock, flags);
+ 		result = ipa_usb_xdci_dismiss_channels(ul_clnt_hdl, dl_clnt_hdl,
+ 			teth_prot);
++		if (!result)
++			cancel_work_sync(&ipa3_usb_ctx->ttype_ctx[ttype].pm_ctx.remote_wakeup_work);
+ 		mutex_unlock(&ipa3_usb_ctx->general_mutex);
+ 		return result;
+ 	}
+@@ -2184,6 +2229,7 @@
+ 		}
+ 	}
+ 
++	cancel_work_sync(&ipa3_usb_ctx->ttype_ctx[ttype].pm_ctx.remote_wakeup_work);
+ 	IPA_USB_DBG_LOW("exit\n");
+ 	mutex_unlock(&ipa3_usb_ctx->general_mutex);
+ 	return 0;
+@@ -2201,7 +2247,13 @@
+ 	enum ipa3_usb_transport_type ttype;
+ 	struct ipa3_usb_teth_prot_context *teth_prot_ptr;
+ 
++	if (!ipa3_usb_ctx)
++		return -ENODEV;
+ 	mutex_lock(&ipa3_usb_ctx->general_mutex);
++	if (READ_ONCE(ipa3_usb_ctx->shutting_down)) {
++		result = -ENODEV;
++		goto bad_params;
++	}
+ 	IPA_USB_DBG_LOW("entry\n");
+ 	if (teth_prot < 0 || teth_prot >= IPA_USB_MAX_TETH_PROT_SIZE) {
+ 		IPA_USB_ERR("bad parameters\n");
+@@ -2217,8 +2269,20 @@
+ 		goto bad_params;
+ 	}
+ 
+-	/* Clean-up tethering protocol */
++	/* Keep protocol ownership intact if PM cleanup needs a retry. */
+ 	teth_prot_ptr = &ipa3_usb_ctx->teth_prot_ctx[teth_prot];
++	if (teth_prot_ptr->state != IPA_USB_TETH_PROT_INITIALIZED) {
++		result = -EINVAL;
++		goto bad_params;
++	}
++	if (ttype != IPA_USB_TRANSPORT_TETH ||
++	    ipa3_usb_ctx->num_init_prot == 1) {
++		result = ipa3_usb_deregister_pm(ttype);
++		if (result)
++			goto bad_params;
++		ipa3_usb_reset_notify(ttype);
++		cancel_work_sync(&ipa3_usb_ctx->ttype_ctx[ttype].pm_ctx.remote_wakeup_work);
++	}
+ 
+ 	switch (teth_prot) {
+ 	case IPA_USB_RNDIS:
+@@ -2303,8 +2367,7 @@
+ 		if (!ipa3_usb_set_state(IPA_USB_INVALID, false, ttype))
+ 			IPA_USB_ERR(
+ 				"failed to change state to invalid\n");
+-		ipa3_usb_deregister_pm(ttype);
+-		ipa3_usb_ctx->ttype_ctx[ttype].ipa_usb_notify_cb = NULL;
++
+ 	}
+ 
+ 	IPA_USB_DBG_LOW("exit\n");
+@@ -2407,7 +2470,13 @@
+ 	int result = 0;
+ 	enum ipa3_usb_transport_type ttype;
+ 
++	if (!ipa3_usb_ctx)
++		return -ENODEV;
+ 	mutex_lock(&ipa3_usb_ctx->general_mutex);
++	if (READ_ONCE(ipa3_usb_ctx->shutting_down)) {
++		result = -ENODEV;
++		goto bad_params;
++	}
+ 	IPA_USB_DBG_LOW("entry\n");
+ 
+ 	if (teth_prot < 0 || teth_prot >= IPA_USB_MAX_TETH_PROT_SIZE) {
+@@ -2569,7 +2638,13 @@
+ 	enum ipa3_usb_transport_type ttype;
+ 	struct ipa_ep_cfg_ctrl ep_cfg_ctrl;
+ 
++	if (!ipa3_usb_ctx)
++		return -ENODEV;
+ 	mutex_lock(&ipa3_usb_ctx->general_mutex);
++	if (READ_ONCE(ipa3_usb_ctx->shutting_down)) {
++		result = -ENODEV;
++		goto bad_params;
++	}
+ 	IPA_USB_DBG_LOW("entry\n");
+ 
+ 	if (teth_prot < 0 || teth_prot >= IPA_USB_MAX_TETH_PROT_SIZE) {
+@@ -2716,19 +2791,13 @@
+ 	ipa3_usb_ctx->dl_data_pending = false;
+ 	mutex_init(&ipa3_usb_ctx->general_mutex);
+ 
+-	/* init PM related members */
+-	pm_ctx = &ipa3_usb_ctx->ttype_ctx[IPA_USB_TRANSPORT_TETH].pm_ctx;
+-	pm_ctx->hdl = ~0;
+-	pm_ctx->remote_wakeup_work = &ipa3_usb_notify_remote_wakeup_work;
+-	pm_ctx = &ipa3_usb_ctx->ttype_ctx[IPA_USB_TRANSPORT_TETH_2].pm_ctx;
+-	pm_ctx->hdl = ~0;
+-	pm_ctx->remote_wakeup_work = &ipa3_usb_notify_remote_wakeup_work;
+-	pm_ctx = &ipa3_usb_ctx->ttype_ctx[IPA_USB_TRANSPORT_DPL].pm_ctx;
+-	pm_ctx->hdl = ~0;
+-	pm_ctx->remote_wakeup_work = &ipa3_usb_dpl_notify_remote_wakeup_work;
+-
+-	for (i = 0; i < IPA_USB_TRANSPORT_MAX; i++)
+-		ipa3_usb_ctx->ttype_ctx[i].user_data = NULL;
++	spin_lock_init(&ipa3_usb_ctx->notify_lock);
++	for (i = 0; i < IPA_USB_TRANSPORT_MAX; i++) {
++		pm_ctx = &ipa3_usb_ctx->ttype_ctx[i].pm_ctx;
++		pm_ctx->hdl = ~0;
++		INIT_WORK(&pm_ctx->remote_wakeup_work,
++			  ipa3_usb_wq_notify_remote_wakeup);
++	}
+ 
+ 	spin_lock_irqsave(&ipa3_usb_ctx->state_lock, flags);
+ 	for (i = 0; i < IPA_USB_TRANSPORT_MAX; i++)
+@@ -2755,13 +2824,28 @@
+ 
+ ipa_usb_workqueue_fail:
+ 	pr_err("init failed (%d)\n", -res);
++	ipa_usb_debugfs_remove();
++	if (ipa3_usb_ctx->wq)
++		destroy_workqueue(ipa3_usb_ctx->wq);
+ 	kfree(ipa3_usb_ctx);
++	ipa3_usb_ctx = NULL;
+ 	return res;
+ }
+ 
+ void ipa3_usb_exit(void)
+ {
++	unsigned long flags;
++	int i;
++
++	if (!ipa3_usb_ctx)
++		return;
+ 	IPA_USB_DBG_LOW("IPA_USB exit\n");
++	ipa3_unregister_ipa_ready_cb(ipa_ready_callback, &usb_ops);
++	spin_lock_irqsave(&ipa3_usb_ctx->state_lock, flags);
++	WRITE_ONCE(ipa3_usb_ctx->shutting_down, true);
++	spin_unlock_irqrestore(&ipa3_usb_ctx->state_lock, flags);
++	for (i = 0; i < IPA_USB_TRANSPORT_MAX; i++)
++		ipa3_usb_reset_notify(i);
+ 
+ 	/*
+ 	 * Deregister for xdci lock/unlock callback from ipa core driver.
+@@ -2775,7 +2859,9 @@
+ 	ipa_exit_callback();
+ #endif
+ 	ipa_usb_debugfs_remove();
++	destroy_workqueue(ipa3_usb_ctx->wq);
+ 	kfree(ipa3_usb_ctx);
++	ipa3_usb_ctx = NULL;
+ }
+ 
+ int ipa3_usb_register_ready_cb(void)
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_rm_i.h
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_rm_i.h
+@@ -147,4 +147,7 @@
+ 
+ void ipa_rm_exit(void);
+ 
++int ipa_rm_add_dependency_sync_from_ioctl(enum ipa_rm_resource_name resource_name,
++					  enum ipa_rm_resource_name depends_on_name);
++
+ #endif /* _IPA_RM_I_H_ */
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/dump/ipa5.5/ipa_reg_dump.h
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/dump/ipa5.5/ipa_reg_dump.h
+@@ -2070,4 +2070,6 @@
+ 	struct reg_access_funcs_s *access[2];
+ };
+ 
++void ipa_reg_save_rsrc_cnts_test_bus(void);
++
+ #endif /* #if !defined(_IPA_REG_DUMP_H_) */
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa.c
+@@ -147,6 +147,8 @@
+ 	void *user_data;
+ };
+ 
++static DEFINE_MUTEX(ipa_ready_notify_lock);
++
+ static void ipa3_start_tag_process(struct work_struct *work);
+ static DECLARE_WORK(ipa3_tag_work, ipa3_start_tag_process);
+ 
+@@ -566,6 +568,7 @@
+ 	.probe = ipa3_plat_drv_probe,
+ 	.driver = {
+ 		.name = DRV_NAME,
++		.suppress_bind_attrs = true,
+ 		.pm = &ipa_pm_ops,
+ 		.of_match_table = ipa_plat_drv_match,
+ 	},
+@@ -7850,16 +7853,23 @@
+ {
+ 	struct ipa_ready_cb_info *info;
+ 	struct ipa_ready_cb_info *next;
++	LIST_HEAD(callbacks);
++
++	mutex_lock(&ipa_ready_notify_lock);
++	mutex_lock(&ipa3_ctx->lock);
++	list_splice_init(&ipa3_ctx->ipa_ready_cb_list, &callbacks);
++	mutex_unlock(&ipa3_ctx->lock);
+ 
+ 	/* Call all the CBs */
+ 	list_for_each_entry_safe(info, next,
+-		&ipa3_ctx->ipa_ready_cb_list, link) {
++		&callbacks, link) {
+ 		if (info->ready_cb)
+ 			info->ready_cb(info->user_data);
+ 
+ 		list_del(&info->link);
+ 		kfree(info);
+ 	}
++	mutex_unlock(&ipa_ready_notify_lock);
+ }
+ 
+ int ipa_register_ipa_ready_cb(void(*ipa_ready_cb)(void *user_data),
+@@ -7894,6 +7904,22 @@
+ 	return 0;
+ }
+ EXPORT_SYMBOL(ipa_register_ipa_ready_cb);
++
++void ipa3_unregister_ipa_ready_cb(ipa_ready_cb callback, void *user_data)
++{
++	struct ipa_ready_cb_info *entry, *next;
++
++	mutex_lock(&ipa_ready_notify_lock);
++	mutex_lock(&ipa3_ctx->lock);
++	list_for_each_entry_safe(entry, next, &ipa3_ctx->ipa_ready_cb_list, link) {
++		if (entry->ready_cb == callback && entry->user_data == user_data) {
++			list_del(&entry->link);
++			kfree(entry);
++		}
++	}
++	mutex_unlock(&ipa3_ctx->lock);
++	mutex_unlock(&ipa_ready_notify_lock);
++}
+ 
+ void ipa3_notify_clients_registered(void)
+ {
+@@ -9120,31 +9146,38 @@
+ 	return rcvd_pkts;
+ }
+ 
+-static inline void ipa3_enable_napi_netdev(void)
++static int ipa3_enable_napi_netdev(void)
+ {
+ 	if (ipa3_ctx->lan_rx_napi_enable || ipa3_ctx->tx_napi_enable) {
+-		init_dummy_netdev(&ipa3_ctx->generic_ndev);
++		ipa3_ctx->generic_ndev = alloc_netdev_dummy(0);
++		if (!ipa3_ctx->generic_ndev)
++			return -ENOMEM;
+ 		if(ipa3_ctx->lan_rx_napi_enable) {
+ #if (LINUX_VERSION_CODE > KERNEL_VERSION(6, 0, 14))
+ 			netif_napi_add(
+-				&ipa3_ctx->generic_ndev,
++				ipa3_ctx->generic_ndev,
+ 				&ipa3_ctx->napi_lan_rx,
+ 				ipa3_lan_poll);
+ #else
+ 			netif_napi_add(
+-				&ipa3_ctx->generic_ndev,
++				ipa3_ctx->generic_ndev,
+ 				&ipa3_ctx->napi_lan_rx,
+ 				ipa3_lan_poll,
+ 				NAPI_WEIGHT);
+ #endif
+ 		}
+ 	}
++	return 0;
+ }
+ 
+ static inline void ipa3_disable_napi_netdev(void)
+ {
++	if (!ipa3_ctx->generic_ndev)
++		return;
+ 	if (ipa3_ctx->lan_rx_napi_enable)
+ 		netif_napi_del(&ipa3_ctx->napi_lan_rx);
++	free_netdev(ipa3_ctx->generic_ndev);
++	ipa3_ctx->generic_ndev = NULL;
+ }
+ 
+ static u32 get_tx_wrapper_cache_size(u32 cache_size)
+@@ -9882,7 +9915,9 @@
+ 		ipa3_proxy_clk_unvote();
+ 
+ 	/* Create the dummy netdev for LAN RX NAPI*/
+-	ipa3_enable_napi_netdev();
++	result = ipa3_enable_napi_netdev();
++	if (result)
++		goto fail_wwan_init;
+ 
+ 	result = ipa3_wwan_init();
+ 	if (result) {
+@@ -12547,6 +12582,8 @@
+ 
+ static int __init ipa_module_init(void)
+ {
++	int result;
++
+ 	pr_debug("IPA module init\n");
+ 
+ 	ipa3_ctx = kzalloc(sizeof(*ipa3_ctx), GFP_KERNEL);
+@@ -12558,30 +12595,32 @@
+ 
+ 	if (running_emulation) {
+ 		/* Register as a PCI device driver */
+-		return pci_register_driver(&ipa_pci_driver);
+-	}
+-
+-	register_pm_notifier(&ipa_pm_notifier);
++		result = pci_register_driver(&ipa_pci_driver);
++		if (result)
++			goto free_context;
++		return 0;
++	}
++
++	result = register_pm_notifier(&ipa_pm_notifier);
++	if (result)
++		goto free_context;
+ 	/* Register as a platform device driver */
+-	return platform_driver_register(&ipa_plat_drv);
+-}
+-subsys_initcall(ipa_module_init);
+-
+-static void __exit ipa_module_exit(void)
+-{
+-	if (running_emulation)
+-		pci_unregister_driver(&ipa_pci_driver);
+-	platform_driver_unregister(&ipa_plat_drv);
+-	if(ipa3_ctx->hw_stats) {
+-		kfree(ipa3_ctx->hw_stats);
+-		ipa3_ctx->hw_stats = NULL;
+-	}
++	result = platform_driver_register(&ipa_plat_drv);
++	if (!result)
++		return 0;
+ 	unregister_pm_notifier(&ipa_pm_notifier);
+-	ipa_ssr_driver_dump_deinit();
++free_context:
+ 	kfree(ipa3_ctx);
+ 	ipa3_ctx = NULL;
+-}
+-module_exit(ipa_module_exit);
++	return result;
++}
++subsys_initcall(ipa_module_init);
++
++/*
++ * The native hardware has no complete IRQ/DMA/client removal sequence.
++ * Keep this provider resident rather than free contexts used by hardware.
++ * USB protocol disconnect/deinit remains supported independently.
++ */
+ 
+ MODULE_SOFTDEP("pre: subsys-pil-tz");
+ MODULE_SOFTDEP("pre: qcom-arm-smmu-mod");
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_dp.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_dp.c
+@@ -1557,9 +1557,8 @@
+ 		INIT_LIST_HEAD(&ep->sys->avail_tx_wrapper_list);
+ 		ep->sys->avail_tx_wrapper = 0;
+ 		spin_lock_init(&ep->sys->spinlock);
+-		hrtimer_init(&ep->sys->db_timer, CLOCK_MONOTONIC,
+-			HRTIMER_MODE_REL);
+-		ep->sys->db_timer.function = ipa3_ring_doorbell_timer_fn;
++		hrtimer_setup(&ep->sys->db_timer, ipa3_ring_doorbell_timer_fn,
++			      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 
+ 		/* create IPA PM resources for handling polling mode */
+ 		if (sys_in->client == IPA_CLIENT_APPS_WAN_CONS &&
+@@ -1631,11 +1630,11 @@
+ 		ipa3_ctx->tx_napi_enable) {
+ 		if (sys_in->client == IPA_CLIENT_APPS_LAN_PROD) {
+ #if (LINUX_VERSION_CODE > KERNEL_VERSION(6, 0, 14))
+-			netif_napi_add_tx_weight(&ipa3_ctx->generic_ndev,
++			netif_napi_add_tx_weight(ipa3_ctx->generic_ndev,
+ 			&ep->sys->napi_tx, tx_completion_func,
+ 			NAPI_TX_WEIGHT);
+ #else
+-			netif_tx_napi_add(&ipa3_ctx->generic_ndev,
++			netif_tx_napi_add(ipa3_ctx->generic_ndev,
+ 			&ep->sys->napi_tx, tx_completion_func,
+ 			NAPI_TX_WEIGHT);
+ 
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_hw_stats.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_hw_stats.c
+@@ -7,6 +7,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/kernel.h>
+ #include <linux/delay.h>
++#include <linux/vmalloc.h>
+ #include "ipa_i.h"
+ #include "ipahal.h"
+ #include "ipahal_hw_stats.h"
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_i.h
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_i.h
+@@ -2550,7 +2550,7 @@
+ 	bool lan_rx_napi_enable;
+ 	bool tx_napi_enable;
+ 	bool tx_poll;
+-	struct net_device generic_ndev;
++	struct net_device *generic_ndev;
+ 	struct napi_struct napi_lan_rx;
+ 	u32 icc_num_cases;
+ 	u32 icc_num_paths;
+@@ -3458,6 +3458,7 @@
+ int ipa3_usb_init(void);
+ void ipa3_usb_exit(void);
+ int ipa3_usb_register_ready_cb(void);
++void ipa3_unregister_ipa_ready_cb(ipa_ready_cb callback, void *user_data);
+ 
+ void ipa3_q6_pre_shutdown_cleanup(void);
+ void ipa3_q6_post_shutdown_cleanup(void);
+@@ -3848,4 +3849,111 @@
+ int ipa3_update_client_holb_per_stats(enum ipa_per_stats_type_e stats_type, uint32_t data);
+ int ipa3_update_dma_per_stats(enum ipa_per_stats_type_e stats_type, uint32_t data);
+ 
++/* Native provider entry points shared by IPA translation units. */
++int ipa3_uc_mhi_init_engine(struct ipa_mhi_msi_info *msi, u32 mmio_addr,
++	u32 host_ctrl_addr, u32 host_data_addr, u32 first_ch_idx,
++	u32 first_evt_idx);
++/**
++ * ipa3_del_hdr_hpc_usr() - Remove the specified headers from SW
++ * and optionally commit them to IPA HW
++ * @hdls:	[inout] set of headers to delete
++ * @by_user:	Operation requested by user?
++ *
++ * Returns:	0 on success, negative on failure
++ *
++ * Note:	Should not be called from atomic context
++ */
++int ipa3_del_hdr_hpc_usr(struct ipa_ioc_del_hdr *hdls, bool by_user);
++/**
++ * ipa3_get_clients_from_rm_resource() - get IPA clients which are related to an
++ * IPA_RM resource
++ *
++ * @resource: [IN] IPA Resource Manager resource
++ * @clients: [OUT] Empty array which will contain the list of clients. The
++ *         caller must initialize this array.
++ *
++ * Return codes: 0 on success, negative on failure.
++ */
++int ipa3_get_clients_from_rm_resource(
++	enum ipa_rm_resource_name resource,
++	struct ipa3_client_names *clients);
++/**
++ * _ipa_sram_settings_read_v3_0() - Read SRAM settings from HW
++ *
++ * Returns:	None
++ */
++void _ipa_sram_settings_read_v3_0(void);
++/**
++ * ipa3_cfg_ep_cfg_pipe_replicate() - IPA end-point cfg
++ * pipe replication
++ * @clnt_hdl:   [in] opaque client handle assigned by IPA to client
++ *
++ * Return value: none
++ */
++void ipa3_cfg_ep_cfg_pipe_replicate(u32 clnt_hdl);
++const char *ipa3_get_mode_type_str(enum ipa_mode_type mode);
++const char *ipa3_get_aggr_enable_str(enum ipa_aggr_en_type aggr_en);
++const char *ipa3_get_aggr_type_str(enum ipa_aggr_type aggr_type);
++/**
++ * ipa3_cfg_ep_metadata() - IPA end-point metadata configuration
++ * @clnt_hdl:	[in] opaque client handle assigned by IPA to client
++ * @ipa_ep_cfg:	[in] IPA end-point configuration params
++ *
++ * Returns:	0 on success, negative on failure
++ *
++ * Note:	Should not be called from atomic context
++ */
++int ipa3_cfg_ep_metadata(u32 clnt_hdl, const struct ipa_ep_cfg_metadata *ep_md);
++int ipa3_send_adpl_msg(unsigned long skb_data);
++/**
++ * ipa3_get_transport_type()
++ *
++ * Return value: enum ipa_transport_type
++ */
++enum ipa_transport_type ipa3_get_transport_type(void);
++int ipa_setup_odl_pipe(void);
++void __ipa_ntn3_prod_stats_get(struct ipa_ntn3_stats_rx *stats, enum ipa_client_type client);
++void __ipa_ntn3_cons_stats_get(struct ipa_ntn3_stats_tx *stats, enum ipa_client_type client);
++int ipa3_connect_gsi_wdi_pipe(struct ipa_wdi_in_params *in,
++	struct ipa_wdi_out_params *out);
++struct iommu_domain *ipa3_get_11ad_smmu_domain(void);
++int ipa3_suspend_gsi_wdi_pipe(u32 clnt_hdl);
++/**
++ * ipa3_setup_dflt_rt_tables() - Setup default routing tables
++ *
++ * Return codes:
++ * 0: success
++ * -ENOMEM: failed to allocate memory
++ * -EPERM: failed to add the tables
++ */
++int ipa3_setup_dflt_rt_tables(void);
++long compat_ipa3_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
++/**
++ * ipa3_active_clks_status() - update the current msm bus clock vote
++ * status
++ */
++int ipa3_active_clks_status(void);
++void __ipa3_update_curr_poll_state(enum ipa_client_type client, int state);
++enum hrtimer_restart ipa3_ring_doorbell_timer_fn(struct hrtimer *param);
++void ipa3_tx_cmd_comp(void *user1, int user2);
++
++/* Native exported USB provider entry points. */
++int ipa_usb_init_teth_prot(enum ipa_usb_teth_prot teth_prot,
++			   struct ipa_usb_teth_params *teth_params,
++			   int (*ipa_usb_notify_cb)(enum ipa_usb_notify_event,
++			   void *),
++			   void *user_data);
++int ipa_usb_xdci_connect(struct ipa_usb_xdci_chan_params *ul_chan_params,
++			 struct ipa_usb_xdci_chan_params *dl_chan_params,
++			 struct ipa_req_chan_out_params *ul_out_params,
++			 struct ipa_req_chan_out_params *dl_out_params,
++			 struct ipa_usb_xdci_connect_params *connect_params);
++int ipa_usb_xdci_disconnect(u32 ul_clnt_hdl, u32 dl_clnt_hdl,
++			    enum ipa_usb_teth_prot teth_prot);
++int ipa_usb_deinit_teth_prot(enum ipa_usb_teth_prot teth_prot);
++int ipa_usb_xdci_suspend(u32 ul_clnt_hdl, u32 dl_clnt_hdl,
++	enum ipa_usb_teth_prot teth_prot, bool with_remote_wakeup);
++int ipa_usb_xdci_resume(u32 ul_clnt_hdl, u32 dl_clnt_hdl,
++	enum ipa_usb_teth_prot teth_prot);
++
+ #endif /* _IPA3_I_H_ */
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_intf.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_intf.c
+@@ -713,6 +713,10 @@
+ 	DEFINE_WAIT_FUNC(wait, woken_wake_function);
+ 	int locked;
+ 
++	if (!count)
++		return 0;
++	if (count < sizeof(struct ipa_msg_meta))
++		return -EMSGSIZE;
+ 	start = buf;
+ 
+ 	add_wait_queue(&ipa3_ctx->msg_waitq, &wait);
+@@ -723,6 +727,10 @@
+ 		if (!list_empty(&ipa3_ctx->msg_list)) {
+ 			msg = list_first_entry(&ipa3_ctx->msg_list,
+ 					struct ipa3_push_msg, link);
++			if (count - sizeof(msg->meta) < msg->meta.msg_len) {
++				ret = -EMSGSIZE;
++				break;
++			}
+ 			list_del(&msg->link);
+ 		}
+ 
+@@ -734,22 +742,25 @@
+ 			if (copy_to_user(buf, &msg->meta,
+ 					  sizeof(struct ipa_msg_meta))) {
+ 				ret = -EFAULT;
++				if (msg->buff)
++					msg->callback(msg->buff, msg->meta.msg_len,
++						      msg->meta.msg_type);
+ 				kfree(msg);
+ 				msg = NULL;
+ 				break;
+ 			}
+ 			buf += sizeof(struct ipa_msg_meta);
+-			count -= sizeof(struct ipa_msg_meta);
+ 			if (msg->buff) {
+ 				if (copy_to_user(buf, msg->buff,
+ 						  msg->meta.msg_len)) {
+ 					ret = -EFAULT;
++					msg->callback(msg->buff, msg->meta.msg_len,
++						      msg->meta.msg_type);
+ 					kfree(msg);
+ 					msg = NULL;
+ 					break;
+ 				}
+ 				buf += msg->meta.msg_len;
+-				count -= msg->meta.msg_len;
+ 				msg->callback(msg->buff, msg->meta.msg_len,
+ 					       msg->meta.msg_type);
+ 			}
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_net.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_net.c
+@@ -33,14 +33,14 @@
+ 	if (rc) {
+ 		IPAERR("ipa3_wwan_platform_driver_register failed: %d\n",
+ 			   rc);
+-		ipa3_wwan_cleanup();
++		return rc;
+ 	}
+ 
+ 	rc = rndis_ipa_init_module();
+ 	if (rc) {
+ 		IPAERR("rndis_ipa_init_module failed: %d\n",
+ 			   rc);
+-		rndis_ipa_cleanup_module();
++		ipa3_wwan_cleanup();
+ 	}
+ 
+ 	return rc;
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_trace.h
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_trace.h
+@@ -138,7 +138,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(name, skb->dev->name);
++		__assign_str(name);
+ 		__entry->skbaddr = skb;
+ 		__entry->protocol = ntohs(skb->protocol);
+ 		__entry->len = skb->len;
+@@ -271,7 +271,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(name, skb->dev->name);
++		__assign_str(name);
+ 		__entry->skbaddr = skb;
+ 		__entry->protocol = ntohs(skb->protocol);
+ 		__entry->len = skb->len;
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipahal/ipahal.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipahal/ipahal.c
+@@ -540,7 +540,7 @@
+ 	return pyld;
+ }
+ 
+-int ipa_imm_cmd_modify_ip_packet_init_ex(
++static int ipa_imm_cmd_modify_ip_packet_init_ex(
+ 	enum ipahal_imm_cmd_name cmd,
+ 	const void *cmd_data,
+ 	const void *params,
+@@ -2657,7 +2657,7 @@
+  *
+  * ***************************************************************
+  */
+-void ipa_qmap_hdr_parse_v4_5(
++static void ipa_qmap_hdr_parse_v4_5(
+ 	union qmap_hdr_u*     qmap_hdr,
+ 	struct qmap_hdr_data* qmap_data_rslt )
+ {
+@@ -2672,7 +2672,7 @@
+ 	qmap_data_rslt->zero_checksum = qmap_hdr->qmap5_0.zero_checksum;
+ }
+ 
+-void ipa_qmap_hdr_parse_v5_0(
++static void ipa_qmap_hdr_parse_v5_0(
+ 	union qmap_hdr_u*     qmap_hdr,
+ 	struct qmap_hdr_data* qmap_data_rslt )
+ {
+@@ -2690,7 +2690,7 @@
+ 	qmap_data_rslt->segment_size = qmap_hdr->qmap5_0.segment_size;
+ }
+ 
+-void ipa_qmap_hdr_parse_v5_5(
++static void ipa_qmap_hdr_parse_v5_5(
+ 	union qmap_hdr_u*     qmap_hdr,
+ 	struct qmap_hdr_data* qmap_data_rslt )
+ {
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipahal/ipahal_reg.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipahal/ipahal_reg.c
+@@ -8,6 +8,7 @@
+ #include "ipa.h"
+ #include <linux/kernel.h>
+ #include <linux/msm_ipa.h>
++#include "ipahal.h"
+ #include "ipahal_i.h"
+ #include "ipahal_reg.h"
+ #include "ipahal_reg_i.h"
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c
+@@ -3730,7 +3730,7 @@
+ 	return ret;
+ }
+ 
+-static int ipa3_wwan_remove(struct platform_device *pdev)
++static void ipa3_wwan_remove(struct platform_device *pdev)
+ {
+ 	int ret, j;
+ 
+@@ -3803,7 +3803,6 @@
+ 	rmnet_ipa3_ctx->dl_csum_offload_enabled = false;
+ 	atomic_set(&rmnet_ipa3_ctx->is_initialized, 0);
+ 	IPAWANINFO("rmnet_ipa completed deinitialization\n");
+-	return 0;
+ }
+ 
+ /**
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa_fd_ioctl.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa_fd_ioctl.c
+@@ -550,7 +550,7 @@
+ }
+ 
+ #ifdef CONFIG_COMPAT
+-long ipa3_compat_wan_ioctl(struct file *file,
++static long ipa3_compat_wan_ioctl(struct file *file,
+ 		unsigned int cmd,
+ 		unsigned long arg)
+ {
+--- a/qcom/opensource/datarmnet-ext/mem/rmnet_mem_main.c
++++ b/qcom/opensource/datarmnet-ext/mem/rmnet_mem_main.c
+@@ -9,153 +9,378 @@
+ #include "rmnet_mem_nl.h"
+ #include "rmnet_mem.h"
+ #include "rmnet_mem_priv.h"
+-MODULE_LICENSE("\x47\x50\x4c\x20\x76\x32");DEFINE_SPINLOCK(rmnet_mem_lock);int 
+-DATARMNETfb2a1a4560[POOL_LEN];module_param_array(DATARMNETfb2a1a4560,int,NULL,
+-(0xcb7+5769-0x221c));MODULE_PARM_DESC(DATARMNETfb2a1a4560,
+-"\x67\x61\x76\x65\x75\x70\x20\x70\x65\x72\x20\x69\x64");int max_pool_size[
+-POOL_LEN]={(0xd2d+202-0xdf7),(0xd2d+202-0xdf7),MAX_POOL_O2,MAX_POOL_O3};
+-module_param_array(max_pool_size,int,NULL,(0xdb7+6665-0x261c));MODULE_PARM_DESC(
+-max_pool_size,
+-"\x4d\x61\x78\x20\x50\x6f\x6f\x6c\x20\x73\x69\x7a\x65\x20\x70\x65\x72\x20\x6f\x72\x64\x65\x72"
+-);int static_pool_size[POOL_LEN];module_param_array(static_pool_size,int,NULL,
+-(0xcb7+5769-0x221c));MODULE_PARM_DESC(static_pool_size,
+-"\x50\x6f\x6f\x6c\x20\x73\x69\x7a\x65\x20\x70\x65\x72\x20\x6f\x72\x64\x65\x72");
+-int pool_unbound_feature[POOL_LEN]={(0xd2d+202-0xdf7),(0xd2d+202-0xdf7),
+-(0xd26+209-0xdf6),(0xd26+209-0xdf6)};module_param_array(pool_unbound_feature,int
+-,NULL,(0xdb7+6665-0x261c));MODULE_PARM_DESC(pool_unbound_featue,
+-"\x50\x6f\x6f\x6c\x20\x62\x6f\x75\x6e\x64\x20\x67\x61\x74\x65");int 
+-rmnet_mem_order_requests[POOL_LEN];module_param_array(rmnet_mem_order_requests,
+-int,NULL,(0xcb7+5769-0x221c));MODULE_PARM_DESC(rmnet_mem_order_requests,
+-"\x52\x65\x71\x75\x65\x73\x74\x20\x70\x65\x72\x20\x6f\x72\x64\x65\x72");int 
+-rmnet_mem_id_req[POOL_LEN];module_param_array(rmnet_mem_id_req,int,NULL,
+-(0xcb7+5769-0x221c));MODULE_PARM_DESC(rmnet_mem_id_req,
+-"\x52\x65\x71\x75\x65\x73\x74\x20\x70\x65\x72\x20\x69\x64");int 
+-rmnet_mem_id_recycled[POOL_LEN];module_param_array(rmnet_mem_id_recycled,int,
+-NULL,(0xcb7+5769-0x221c));MODULE_PARM_DESC(rmnet_mem_id_recycled,
+-"\x52\x65\x63\x79\x63\x6c\x65\x64\x20\x70\x65\x72\x20\x69\x64");int 
+-DATARMNETa293261aea[DATARMNETbc3b36ce41];module_param_array(DATARMNETa293261aea,
+-int,NULL,(0xcb7+5769-0x221c));MODULE_PARM_DESC(DATARMNETa293261aea,
+-"\x52\x6d\x6e\x65\x74\x20\x6d\x65\x6d\x20\x73\x74\x61\x74\x73\x20\x66\x6f\x72\x20\x6d\x6f\x64\x75\x6c\x65\x73"
+-);int DATARMNETaceba3d00e[DATARMNETfdc300cd1f];module_param_array(
+-DATARMNETaceba3d00e,int,NULL,(0xcb7+5769-0x221c));MODULE_PARM_DESC(
+-DATARMNETaceba3d00e,"\x45\x72\x72\x6f\x72\x20\x63\x6f\x75\x6e\x74\x69\x6e\x67");
+-unsigned int DATARMNETf85ebffa7a[POOL_LEN];module_param_array(
+-DATARMNETf85ebffa7a,uint,NULL,(0xdb7+6665-0x261c));MODULE_PARM_DESC(
+-DATARMNETf85ebffa7a,
+-"\x50\x6f\x6f\x6c\x20\x73\x69\x7a\x65\x20\x76\x6f\x74\x65\x20\x74\x68\x61\x74\x20\x69\x73\x20\x61\x63\x74\x69\x76\x65\x20\x6f\x6e\x20\x50\x42\x20\x69\x6e\x64"
+-);unsigned DATARMNET15e53a8338[POOL_LEN]={(0xd2d+202-0xdf7),(0xd2d+202-0xdf7),
+-DATARMNETe4e4a9ca82,DATARMNETeb73899668};module_param_array(DATARMNET15e53a8338,
+-uint,NULL,(0xcb7+5769-0x221c));MODULE_PARM_DESC(DATARMNET15e53a8338,
+-"\x50\x6f\x6f\x6c\x20\x73\x69\x7a\x65\x20\x77\x71\x20\x77\x69\x6c\x6c\x20\x61\x64\x6a\x75\x73\x74\x20\x74\x6f\x20\x6f\x6e\x20\x72\x75\x6e"
+-);static char*verinfo[]={"\x32\x30\x30\x33\x62\x61\x65\x33"};module_param_array(
+-verinfo,charp,NULL,(0xcb7+5769-0x221c));MODULE_PARM_DESC(verinfo,
+-"\x56\x65\x72\x73\x69\x6f\x6e\x20\x6f\x66\x20\x74\x68\x65\x20\x64\x72\x69\x76\x65\x72"
+-);struct workqueue_struct*mem_wq;struct delayed_work pool_adjust_work;int 
+-DATARMNETb84a1c23e6;struct hrtimer DATARMNET7bbd010c46;struct list_head 
+-rmnet_mem_pool[POOL_LEN];struct mem_info{struct page*addr;struct list_head 
+-mem_head;u8 order;};void rmnet_mem_page_ref_inc_entry(struct page*page,unsigned 
+-id){page_ref_inc(page);}EXPORT_SYMBOL_GPL(rmnet_mem_page_ref_inc_entry);struct 
+-rmnet_mem_notif_s{struct raw_notifier_head chain;spinlock_t lock;};struct 
+-rmnet_mem_notif_s rmnet_mem_notifier={.chain=RAW_NOTIFIER_INIT(
+-rmnet_mem_notifier.chain),.lock=__SPIN_LOCK_UNLOCKED(rmnet_mem_notifier.lock),};
+-EXPORT_SYMBOL_GPL(rmnet_mem_notifier);int rmnet_mem_get_pool_size(unsigned order
+-){if(order>=POOL_LEN){DATARMNETaceba3d00e[DATARMNET0b84d87330]++;return
+-(0xd2d+202-0xdf7);}return(static_pool_size[order])?static_pool_size[order]:
+-DATARMNET15e53a8338[order];}EXPORT_SYMBOL_GPL(rmnet_mem_get_pool_size);int 
+-rmnet_mem_mode_notify(unsigned pool_size){unsigned long flags;spin_lock_irqsave(
+-&rmnet_mem_notifier.lock,flags);raw_notifier_call_chain(&rmnet_mem_notifier.
+-chain,pool_size,NULL);spin_unlock_irqrestore(&rmnet_mem_notifier.lock,flags);
+-return NOTIFY_OK;}int rmnet_mem_register_notifier(struct notifier_block*nb){
+-unsigned long flags;int ret;spin_lock_irqsave(&rmnet_mem_notifier.lock,flags);
+-ret=raw_notifier_chain_register(&rmnet_mem_notifier.chain,nb);
+-spin_unlock_irqrestore(&rmnet_mem_notifier.lock,flags);return ret;}
+-EXPORT_SYMBOL_GPL(rmnet_mem_register_notifier);int rmnet_mem_unregister_notifier
+-(struct notifier_block*nb){unsigned long flags;int ret;spin_lock_irqsave(&
+-rmnet_mem_notifier.lock,flags);ret=raw_notifier_chain_unregister(&
+-rmnet_mem_notifier.chain,nb);spin_unlock_irqrestore(&rmnet_mem_notifier.lock,
+-flags);return ret;}EXPORT_SYMBOL_GPL(rmnet_mem_unregister_notifier);struct 
+-mem_info*rmnet_mem_add_page(struct page*page,u8 pageorder){struct mem_info*
+-mem_slot;mem_slot=kzalloc(sizeof(*mem_slot),GFP_ATOMIC);if(!mem_slot){
+-DATARMNETaceba3d00e[DATARMNETbcd0fd349d]++;return NULL;}static_pool_size[
+-pageorder]++;mem_slot->order=pageorder;mem_slot->addr=(void*)page;INIT_LIST_HEAD
+-(&mem_slot->mem_head);if(pageorder<POOL_LEN){list_add_rcu(&mem_slot->mem_head,&(
+-rmnet_mem_pool[pageorder]));}return mem_slot;}void rmnet_mem_free_all(void){
+-unsigned long flags;struct mem_info*mem_slot;struct list_head*ptr=NULL,*next=
+-NULL;int i;spin_lock_irqsave(&rmnet_mem_lock,flags);for(i=(0xd2d+202-0xdf7);i<
+-POOL_LEN;i++){list_for_each_safe(ptr,next,&rmnet_mem_pool[i]){mem_slot=
+-list_entry(ptr,struct mem_info,mem_head);list_del(&mem_slot->mem_head);put_page(
+-mem_slot->addr);static_pool_size[mem_slot->order]--;kfree(mem_slot);}}
+-spin_unlock_irqrestore(&rmnet_mem_lock,flags);}struct page*
+-rmnet_mem_get_pages_entry(gfp_t gfp_mask,unsigned int order,int*code,int*
+-pageorder,unsigned id){unsigned long flags;struct mem_info*mem_page;struct page*
+-page=NULL;int i=(0xd2d+202-0xdf7);int j=(0xd2d+202-0xdf7);int 
+-DATARMNET8224a106d8=(0xd2d+202-0xdf7);spin_lock_irqsave(&rmnet_mem_lock,flags);
+-if(order<POOL_LEN){rmnet_mem_id_req[id]++;rmnet_mem_order_requests[order]++;for(
+-j=order;j>(0xd2d+202-0xdf7)&&j<POOL_LEN;j++){do{mem_page=
+-list_first_entry_or_null(&rmnet_mem_pool[j],struct mem_info,mem_head);if(!
+-mem_page){break;}if(page_ref_count(mem_page->addr)==(0xd26+209-0xdf6)){
+-rmnet_mem_id_recycled[j]++;page=mem_page->addr;page_ref_inc(mem_page->addr);
+-list_rotate_left(&rmnet_mem_pool[j]);break;}list_rotate_left(&rmnet_mem_pool[j])
+-;i++;}while(i<=(0xd0a+237-0xdf2));if(page&&pageorder){*pageorder=j;break;}i=
+-(0xd2d+202-0xdf7);}}if(static_pool_size[order]<max_pool_size[order]&&
+-pool_unbound_feature[order]){DATARMNET8224a106d8=(0xd26+209-0xdf6);}else 
+-spin_unlock_irqrestore(&rmnet_mem_lock,flags);if(!page){DATARMNETfb2a1a4560[id]
+-++;if(order<(0xd18+223-0xdf4)){page=__dev_alloc_pages((DATARMNET8224a106d8)?
+-GFP_ATOMIC:gfp_mask,order);if(page){if(DATARMNET8224a106d8){rmnet_mem_add_page(
+-page,order);page_ref_inc(page);}if(pageorder){*pageorder=order;}}}else{if(
+-DATARMNET8224a106d8){page=__dev_alloc_pages((DATARMNET8224a106d8)?GFP_ATOMIC:
+-gfp_mask,order);if(page){rmnet_mem_add_page(page,order);page_ref_inc(page);}if(
+-pageorder){*pageorder=order;}}}}if(DATARMNET8224a106d8)spin_unlock_irqrestore(&
+-rmnet_mem_lock,flags);if(pageorder&&code&&page){if(*pageorder==order)*code=
+-RMNET_MEM_SUCCESS;else if(*pageorder>order)*code=RMNET_MEM_UPGRADE;else if(*
+-pageorder<order)*code=RMNET_MEM_DOWNGRADE;}else if(pageorder&&code){*code=
+-RMNET_MEM_FAIL;*pageorder=(0xd2d+202-0xdf7);}return page;}EXPORT_SYMBOL_GPL(
+-rmnet_mem_get_pages_entry);void rmnet_mem_put_page_entry(struct page*page){
+-put_page(page);}EXPORT_SYMBOL_GPL(rmnet_mem_put_page_entry);static void 
+-mem_update_pool_work(struct work_struct*work){int i;int DATARMNET2df6d5c0a2;
+-local_bh_disable();for(i=(0xd2d+202-0xdf7);i<POOL_LEN;i++){DATARMNET2df6d5c0a2=(
+-DATARMNETb84a1c23e6&&DATARMNETf85ebffa7a[i])?DATARMNET3657d13d98(
+-DATARMNETf85ebffa7a[i],DATARMNET15e53a8338[i]):DATARMNET15e53a8338[i];
+-rmnet_mem_adjust(DATARMNET2df6d5c0a2,i);}local_bh_enable();}void 
+-rmnet_mem_adjust(unsigned perm_size,u8 pageorder){struct list_head*entry,*next;
+-struct mem_info*mem_slot;int i;struct page*newpage=NULL;int adjustment;unsigned 
+-long flags;if(pageorder>=POOL_LEN||perm_size>MAX_STATIC_POOL){
+-DATARMNETaceba3d00e[DATARMNETf03ba54970]++;return;}adjustment=perm_size-
+-static_pool_size[pageorder];if(perm_size==static_pool_size[pageorder])return;
+-spin_lock_irqsave(&rmnet_mem_lock,flags);if(perm_size>static_pool_size[pageorder
+-]){for(i=(0xd2d+202-0xdf7);i<(adjustment);i++){newpage=__dev_alloc_pages(
+-GFP_ATOMIC,pageorder);if(!newpage){continue;}rmnet_mem_add_page(newpage,
+-pageorder);}}else{list_for_each_safe(entry,next,&(rmnet_mem_pool[pageorder])){
+-mem_slot=list_entry(entry,struct mem_info,mem_head);list_del(&mem_slot->mem_head
+-);put_page(mem_slot->addr);kfree(mem_slot);static_pool_size[pageorder]--;if(
+-static_pool_size[pageorder]==perm_size)break;}}spin_unlock_irqrestore(&
+-rmnet_mem_lock,flags);if(pageorder==POOL_NOTIF){rmnet_mem_mode_notify(perm_size)
+-;}}enum hrtimer_restart DATARMNET2c79fa7b83(struct hrtimer*DATARMNET6e4292679f){
+-unsigned DATARMNET28085cfd14;DATARMNETb84a1c23e6=(0xd2d+202-0xdf7);
+-DATARMNETa293261aea[DATARMNETc8e634191a]++;DATARMNET28085cfd14=msecs_to_jiffies(
+-DATARMNET675090896c);queue_delayed_work(mem_wq,&pool_adjust_work,
+-DATARMNET28085cfd14);return HRTIMER_NORESTART;}void rmnet_mem_pb_ind(void){if(!
+-DATARMNETf85ebffa7a[POOL_NOTIF]){DATARMNETa293261aea[DATARMNET55412eb785]++;
+-return;}DATARMNETb84a1c23e6=(0xd26+209-0xdf6);if(hrtimer_active(&
+-DATARMNET7bbd010c46)){hrtimer_cancel(&DATARMNET7bbd010c46);}else{
+-cancel_delayed_work(&pool_adjust_work);queue_delayed_work(mem_wq,&
+-pool_adjust_work,(0xd2d+202-0xdf7));}DATARMNETa293261aea[RMNET_MEM_PB_IND]++;
+-hrtimer_start(&DATARMNET7bbd010c46,ns_to_ktime(DATARMNETc8ec566153*
+-DATARMNET68fc0be252),HRTIMER_MODE_REL|HRTIMER_MODE_PINNED);}EXPORT_SYMBOL_GPL(
+-rmnet_mem_pb_ind);int __init rmnet_mem_module_init(void){int rc,i=
+-(0xd2d+202-0xdf7);pr_info(
+-"\x25\x73\x28\x29\x3a\x20\x53\x74\x61\x72\x74\x69\x6e\x67\x20\x72\x6d\x6e\x65\x74\x20\x6d\x65\x6d\x20\x6d\x6f\x64\x75\x6c\x65" "\n"
+-,__func__);for(i=(0xd2d+202-0xdf7);i<POOL_LEN;i++){INIT_LIST_HEAD(&(
+-rmnet_mem_pool[i]));}mem_wq=alloc_workqueue("\x6d\x65\x6d\x5f\x77\x71",
+-WQ_HIGHPRI,(0xd2d+202-0xdf7));if(!mem_wq){pr_err(
+-"\x25\x73\x28\x29\x3a\x20\x46\x61\x69\x6c\x65\x64\x20\x74\x6f\x20\x61\x6c\x6c\x6f\x63\x20\x77\x6f\x72\x6b\x71\x75\x65\x75\x65\x20" "\n"
+-,__func__);return-ENOMEM;}INIT_DELAYED_WORK(&pool_adjust_work,
+-mem_update_pool_work);rc=rmnet_mem_nl_register();if(rc){pr_err(
+-"\x25\x73\x28\x29\x3a\x20\x46\x61\x69\x6c\x65\x64\x20\x74\x6f\x20\x72\x65\x67\x69\x73\x74\x65\x72\x20\x67\x65\x6e\x65\x72\x69\x63\x20\x6e\x65\x74\x6c\x69\x6e\x6b\x20\x66\x61\x6d\x69\x6c\x79" "\n"
+-,__func__);destroy_workqueue(mem_wq);mem_wq=NULL;return-ENOMEM;}hrtimer_init(&
+-DATARMNET7bbd010c46,CLOCK_MONOTONIC,HRTIMER_MODE_REL);DATARMNET7bbd010c46.
+-function=DATARMNET2c79fa7b83;return(0xd2d+202-0xdf7);}void __exit 
+-rmnet_mem_module_exit(void){rmnet_mem_nl_unregister();if(mem_wq){
+-cancel_delayed_work_sync(&pool_adjust_work);drain_workqueue(mem_wq);
+-destroy_workqueue(mem_wq);mem_wq=NULL;}rmnet_mem_free_all();}module_init(
+-rmnet_mem_module_init);module_exit(rmnet_mem_module_exit);
++MODULE_DESCRIPTION("Qualcomm RMNET page pool manager");
++MODULE_LICENSE("GPL v2");
++DEFINE_SPINLOCK(rmnet_mem_lock);
++int DATARMNETfb2a1a4560[POOL_LEN];
++module_param_array(DATARMNETfb2a1a4560, int, NULL, (0xcb7 + 5769 - 0x221c));
++MODULE_PARM_DESC(DATARMNETfb2a1a4560,
++		 "\x67\x61\x76\x65\x75\x70\x20\x70\x65\x72\x20\x69\x64");
++int max_pool_size[POOL_LEN] = { (0xd2d + 202 - 0xdf7), (0xd2d + 202 - 0xdf7),
++				MAX_POOL_O2, MAX_POOL_O3 };
++module_param_array(max_pool_size, int, NULL, (0xdb7 + 6665 - 0x261c));
++MODULE_PARM_DESC(
++	max_pool_size,
++	"\x4d\x61\x78\x20\x50\x6f\x6f\x6c\x20\x73\x69\x7a\x65\x20\x70\x65\x72\x20\x6f\x72\x64\x65\x72");
++int static_pool_size[POOL_LEN];
++module_param_array(static_pool_size, int, NULL, (0xcb7 + 5769 - 0x221c));
++MODULE_PARM_DESC(
++	static_pool_size,
++	"\x50\x6f\x6f\x6c\x20\x73\x69\x7a\x65\x20\x70\x65\x72\x20\x6f\x72\x64\x65\x72");
++int pool_unbound_feature[POOL_LEN] = { (0xd2d + 202 - 0xdf7),
++				       (0xd2d + 202 - 0xdf7),
++				       (0xd26 + 209 - 0xdf6),
++				       (0xd26 + 209 - 0xdf6) };
++module_param_array(pool_unbound_feature, int, NULL, (0xdb7 + 6665 - 0x261c));
++MODULE_PARM_DESC(pool_unbound_featue,
++		 "\x50\x6f\x6f\x6c\x20\x62\x6f\x75\x6e\x64\x20\x67\x61\x74\x65");
++int rmnet_mem_order_requests[POOL_LEN];
++module_param_array(rmnet_mem_order_requests, int, NULL,
++		   (0xcb7 + 5769 - 0x221c));
++MODULE_PARM_DESC(
++	rmnet_mem_order_requests,
++	"\x52\x65\x71\x75\x65\x73\x74\x20\x70\x65\x72\x20\x6f\x72\x64\x65\x72");
++int rmnet_mem_id_req[POOL_LEN];
++module_param_array(rmnet_mem_id_req, int, NULL, (0xcb7 + 5769 - 0x221c));
++MODULE_PARM_DESC(rmnet_mem_id_req,
++		 "\x52\x65\x71\x75\x65\x73\x74\x20\x70\x65\x72\x20\x69\x64");
++int rmnet_mem_id_recycled[POOL_LEN];
++module_param_array(rmnet_mem_id_recycled, int, NULL, (0xcb7 + 5769 - 0x221c));
++MODULE_PARM_DESC(rmnet_mem_id_recycled,
++		 "\x52\x65\x63\x79\x63\x6c\x65\x64\x20\x70\x65\x72\x20\x69\x64");
++int DATARMNETa293261aea[DATARMNETbc3b36ce41];
++module_param_array(DATARMNETa293261aea, int, NULL, (0xcb7 + 5769 - 0x221c));
++MODULE_PARM_DESC(
++	DATARMNETa293261aea,
++	"\x52\x6d\x6e\x65\x74\x20\x6d\x65\x6d\x20\x73\x74\x61\x74\x73\x20\x66\x6f\x72\x20\x6d\x6f\x64\x75\x6c\x65\x73");
++int DATARMNETaceba3d00e[DATARMNETfdc300cd1f];
++module_param_array(DATARMNETaceba3d00e, int, NULL, (0xcb7 + 5769 - 0x221c));
++MODULE_PARM_DESC(DATARMNETaceba3d00e,
++		 "\x45\x72\x72\x6f\x72\x20\x63\x6f\x75\x6e\x74\x69\x6e\x67");
++unsigned int DATARMNETf85ebffa7a[POOL_LEN];
++module_param_array(DATARMNETf85ebffa7a, uint, NULL, (0xdb7 + 6665 - 0x261c));
++MODULE_PARM_DESC(
++	DATARMNETf85ebffa7a,
++	"\x50\x6f\x6f\x6c\x20\x73\x69\x7a\x65\x20\x76\x6f\x74\x65\x20\x74\x68\x61\x74\x20\x69\x73\x20\x61\x63\x74\x69\x76\x65\x20\x6f\x6e\x20\x50\x42\x20\x69\x6e\x64");
++unsigned int DATARMNET15e53a8338[POOL_LEN] = { (0xd2d + 202 - 0xdf7),
++					   (0xd2d + 202 - 0xdf7),
++					   DATARMNETe4e4a9ca82,
++					   DATARMNETeb73899668 };
++module_param_array(DATARMNET15e53a8338, uint, NULL, (0xcb7 + 5769 - 0x221c));
++MODULE_PARM_DESC(
++	DATARMNET15e53a8338,
++	"\x50\x6f\x6f\x6c\x20\x73\x69\x7a\x65\x20\x77\x71\x20\x77\x69\x6c\x6c\x20\x61\x64\x6a\x75\x73\x74\x20\x74\x6f\x20\x6f\x6e\x20\x72\x75\x6e");
++static char *verinfo[] = { "\x32\x30\x30\x33\x62\x61\x65\x33" };
++module_param_array(verinfo, charp, NULL, (0xcb7 + 5769 - 0x221c));
++MODULE_PARM_DESC(
++	verinfo,
++	"\x56\x65\x72\x73\x69\x6f\x6e\x20\x6f\x66\x20\x74\x68\x65\x20\x64\x72\x69\x76\x65\x72");
++struct workqueue_struct *mem_wq;
++struct delayed_work pool_adjust_work;
++int DATARMNETb84a1c23e6;
++struct hrtimer DATARMNET7bbd010c46;
++struct list_head rmnet_mem_pool[POOL_LEN];
++struct mem_info {
++	struct page *addr;
++	struct list_head mem_head;
++	u8 order;
++};
++
++void rmnet_mem_page_ref_inc_entry(struct page *page, unsigned int id)
++{
++	page_ref_inc(page);
++}
++EXPORT_SYMBOL_GPL(rmnet_mem_page_ref_inc_entry);
++struct rmnet_mem_notif_s {
++	struct raw_notifier_head chain;
++	spinlock_t lock;
++};
++
++struct rmnet_mem_notif_s rmnet_mem_notifier = {
++	.chain = RAW_NOTIFIER_INIT(rmnet_mem_notifier.chain),
++	.lock = __SPIN_LOCK_UNLOCKED(rmnet_mem_notifier.lock),
++};
++EXPORT_SYMBOL_GPL(rmnet_mem_notifier);
++int rmnet_mem_get_pool_size(unsigned int order)
++{
++	if (order >= POOL_LEN) {
++		DATARMNETaceba3d00e[DATARMNET0b84d87330]++;
++		return (0xd2d + 202 - 0xdf7);
++	}
++	return (static_pool_size[order]) ? static_pool_size[order] :
++					   DATARMNET15e53a8338[order];
++}
++EXPORT_SYMBOL_GPL(rmnet_mem_get_pool_size);
++static int rmnet_mem_mode_notify(unsigned int pool_size)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&rmnet_mem_notifier.lock, flags);
++	raw_notifier_call_chain(&rmnet_mem_notifier.chain, pool_size, NULL);
++	spin_unlock_irqrestore(&rmnet_mem_notifier.lock, flags);
++	return NOTIFY_OK;
++}
++
++int rmnet_mem_register_notifier(struct notifier_block *nb)
++{
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&rmnet_mem_notifier.lock, flags);
++	ret = raw_notifier_chain_register(&rmnet_mem_notifier.chain, nb);
++	spin_unlock_irqrestore(&rmnet_mem_notifier.lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(rmnet_mem_register_notifier);
++int rmnet_mem_unregister_notifier(struct notifier_block *nb)
++{
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&rmnet_mem_notifier.lock, flags);
++	ret = raw_notifier_chain_unregister(&rmnet_mem_notifier.chain, nb);
++	spin_unlock_irqrestore(&rmnet_mem_notifier.lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(rmnet_mem_unregister_notifier);
++static struct mem_info *rmnet_mem_add_page(struct page *page, u8 pageorder)
++{
++	struct mem_info *mem_slot;
++
++	mem_slot = kzalloc(sizeof(*mem_slot), GFP_ATOMIC);
++	if (!mem_slot) {
++		DATARMNETaceba3d00e[DATARMNETbcd0fd349d]++;
++		return NULL;
++	}
++	static_pool_size[pageorder]++;
++	mem_slot->order = pageorder;
++	mem_slot->addr = (void *)page;
++	INIT_LIST_HEAD(&mem_slot->mem_head);
++	if (pageorder < POOL_LEN)
++		list_add_rcu(&mem_slot->mem_head, &rmnet_mem_pool[pageorder]);
++	return mem_slot;
++}
++
++static void rmnet_mem_free_all(void)
++{
++	unsigned long flags;
++	struct mem_info *mem_slot;
++	struct list_head *ptr = NULL, *next = NULL;
++	int i;
++
++	spin_lock_irqsave(&rmnet_mem_lock, flags);
++	for (i = (0xd2d + 202 - 0xdf7); i < POOL_LEN; i++) {
++		list_for_each_safe(ptr, next, &rmnet_mem_pool[i]) {
++			mem_slot = list_entry(ptr, struct mem_info, mem_head);
++			list_del(&mem_slot->mem_head);
++			put_page(mem_slot->addr);
++			static_pool_size[mem_slot->order]--;
++			kfree(mem_slot);
++		}
++	}
++	spin_unlock_irqrestore(&rmnet_mem_lock, flags);
++}
++
++struct page *rmnet_mem_get_pages_entry(gfp_t gfp_mask, unsigned int order,
++				       int *code, int *pageorder,
++				       unsigned int id)
++{
++	struct mem_info *mem_page;
++	struct page *page = NULL;
++	unsigned long flags;
++	unsigned int selected_order = order;
++	unsigned int attempts, j;
++	bool expand_pool;
++
++	if (order >= POOL_LEN || id >= ARRAY_SIZE(rmnet_mem_id_req)) {
++		if (code)
++			*code = RMNET_MEM_FAIL;
++		if (pageorder)
++			*pageorder = 0;
++		return NULL;
++	}
++
++	spin_lock_irqsave(&rmnet_mem_lock, flags);
++	rmnet_mem_id_req[id]++;
++	rmnet_mem_order_requests[order]++;
++	for (j = order; j > 0 && j < POOL_LEN && !page; j++) {
++		attempts = 0;
++		do {
++			mem_page = list_first_entry_or_null(
++				&rmnet_mem_pool[j], struct mem_info, mem_head);
++			if (!mem_page)
++				break;
++			if (page_ref_count(mem_page->addr) == 1) {
++				rmnet_mem_id_recycled[j]++;
++				page = mem_page->addr;
++				page_ref_inc(page);
++				selected_order = j;
++			}
++			list_rotate_left(&rmnet_mem_pool[j]);
++		} while (!page && ++attempts <= 5);
++	}
++
++	expand_pool = static_pool_size[order] < max_pool_size[order] &&
++		      pool_unbound_feature[order];
++	if (!expand_pool)
++		spin_unlock_irqrestore(&rmnet_mem_lock, flags);
++	if (!page) {
++		DATARMNETfb2a1a4560[id]++;
++		if (order < 3 || expand_pool) {
++			page = __dev_alloc_pages(
++				expand_pool ? GFP_ATOMIC : gfp_mask, order);
++			if (page && expand_pool &&
++			    rmnet_mem_add_page(page, order))
++				page_ref_inc(page);
++		}
++	}
++	if (expand_pool)
++		spin_unlock_irqrestore(&rmnet_mem_lock, flags);
++
++	if (pageorder)
++		*pageorder = page ? selected_order : 0;
++	if (code) {
++		if (!page)
++			*code = RMNET_MEM_FAIL;
++		else if (selected_order == order)
++			*code = RMNET_MEM_SUCCESS;
++		else if (selected_order > order)
++			*code = RMNET_MEM_UPGRADE;
++		else
++			*code = RMNET_MEM_DOWNGRADE;
++	}
++	return page;
++}
++EXPORT_SYMBOL_GPL(rmnet_mem_get_pages_entry);
++void rmnet_mem_put_page_entry(struct page *page)
++{
++	put_page(page);
++}
++EXPORT_SYMBOL_GPL(rmnet_mem_put_page_entry);
++static void mem_update_pool_work(struct work_struct *work)
++{
++	int i;
++	int DATARMNET2df6d5c0a2;
++
++	local_bh_disable();
++	for (i = (0xd2d + 202 - 0xdf7); i < POOL_LEN; i++) {
++		DATARMNET2df6d5c0a2 =
++			(DATARMNETb84a1c23e6 && DATARMNETf85ebffa7a[i]) ?
++				DATARMNET3657d13d98(DATARMNETf85ebffa7a[i],
++						    DATARMNET15e53a8338[i]) :
++				DATARMNET15e53a8338[i];
++		rmnet_mem_adjust(DATARMNET2df6d5c0a2, i);
++	}
++	local_bh_enable();
++}
++
++void rmnet_mem_adjust(unsigned int perm_size, u8 pageorder)
++{
++	struct mem_info *mem_slot;
++	struct list_head *entry, *next;
++	struct page *newpage;
++	unsigned long flags;
++	unsigned int attempts;
++
++	if (pageorder >= POOL_LEN || perm_size > MAX_STATIC_POOL) {
++		DATARMNETaceba3d00e[DATARMNETf03ba54970]++;
++		return;
++	}
++	spin_lock_irqsave(&rmnet_mem_lock, flags);
++	if (perm_size == static_pool_size[pageorder]) {
++		spin_unlock_irqrestore(&rmnet_mem_lock, flags);
++		return;
++	}
++	if (perm_size > static_pool_size[pageorder]) {
++		attempts = perm_size - static_pool_size[pageorder];
++		while (attempts--) {
++			newpage = __dev_alloc_pages(GFP_ATOMIC, pageorder);
++			if (newpage && !rmnet_mem_add_page(newpage, pageorder))
++				put_page(newpage);
++		}
++	} else {
++		list_for_each_safe(entry, next, &rmnet_mem_pool[pageorder]) {
++			if (static_pool_size[pageorder] == perm_size)
++				break;
++			mem_slot = list_entry(entry, struct mem_info, mem_head);
++			list_del(&mem_slot->mem_head);
++			put_page(mem_slot->addr);
++			kfree(mem_slot);
++			static_pool_size[pageorder]--;
++		}
++	}
++	spin_unlock_irqrestore(&rmnet_mem_lock, flags);
++	if (pageorder == POOL_NOTIF)
++		rmnet_mem_mode_notify(perm_size);
++}
++
++static enum hrtimer_restart
++DATARMNET2c79fa7b83(struct hrtimer *DATARMNET6e4292679f)
++{
++	unsigned int DATARMNET28085cfd14;
++
++	DATARMNETb84a1c23e6 = (0xd2d + 202 - 0xdf7);
++	DATARMNETa293261aea[DATARMNETc8e634191a]++;
++	DATARMNET28085cfd14 = msecs_to_jiffies(DATARMNET675090896c);
++	queue_delayed_work(mem_wq, &pool_adjust_work, DATARMNET28085cfd14);
++	return HRTIMER_NORESTART;
++}
++
++void rmnet_mem_pb_ind(void)
++{
++	if (!DATARMNETf85ebffa7a[POOL_NOTIF]) {
++		DATARMNETa293261aea[DATARMNET55412eb785]++;
++		return;
++	}
++	DATARMNETb84a1c23e6 = (0xd26 + 209 - 0xdf6);
++	if (hrtimer_active(&DATARMNET7bbd010c46)) {
++		hrtimer_cancel(&DATARMNET7bbd010c46);
++	} else {
++		cancel_delayed_work(&pool_adjust_work);
++		queue_delayed_work(mem_wq, &pool_adjust_work,
++				   (0xd2d + 202 - 0xdf7));
++	}
++	DATARMNETa293261aea[RMNET_MEM_PB_IND]++;
++	hrtimer_start(&DATARMNET7bbd010c46,
++		      ns_to_ktime(DATARMNETc8ec566153 * DATARMNET68fc0be252),
++		      HRTIMER_MODE_REL | HRTIMER_MODE_PINNED);
++}
++EXPORT_SYMBOL_GPL(rmnet_mem_pb_ind);
++
++static int __init rmnet_mem_module_init(void)
++{
++	int rc, i;
++
++	pr_info("%s(): Starting rmnet mem module\n", __func__);
++	for (i = 0; i < POOL_LEN; i++)
++		INIT_LIST_HEAD(&rmnet_mem_pool[i]);
++	mem_wq = alloc_workqueue("mem_wq", WQ_HIGHPRI, 0);
++	if (!mem_wq)
++		return -ENOMEM;
++	INIT_DELAYED_WORK(&pool_adjust_work, mem_update_pool_work);
++	hrtimer_setup(&DATARMNET7bbd010c46, DATARMNET2c79fa7b83,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	rc = rmnet_mem_nl_register();
++	if (rc) {
++		destroy_workqueue(mem_wq);
++		mem_wq = NULL;
++		return rc;
++	}
++	return 0;
++}
++
++static void __exit rmnet_mem_module_exit(void)
++{
++	rmnet_mem_nl_unregister();
++	hrtimer_cancel(&DATARMNET7bbd010c46);
++	if (mem_wq) {
++		cancel_delayed_work_sync(&pool_adjust_work);
++		drain_workqueue(mem_wq);
++		destroy_workqueue(mem_wq);
++		mem_wq = NULL;
++	}
++	rmnet_mem_free_all();
++}
++
++module_init(rmnet_mem_module_init);
++module_exit(rmnet_mem_module_exit);

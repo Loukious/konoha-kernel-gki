@@ -1,0 +1,39 @@
+{
+  "tests": {
+    "btpower_fmd": {
+      "FMD_enable_failure_and_repeated_update_cases": 16
+    },
+    "btpower_resources": {
+      "regulator_fault_and_retention_cases": 79
+    },
+    "btpower_wire": {
+      "native_nvmem_and_AOP_frame_cases": 858
+    },
+    "btpower_requests": {
+      "request_results_timeouts_queue_bound_cases": 79
+    },
+    "btpower_lifetime": {
+      "admission_rebind_provider_and_concurrent_withdrawal_cases": 14
+    },
+    "btpower_gpio": {
+      "gpio_request_unwind_and_repeat_cases": 50
+    }
+  },
+  "source_sha256": {
+    "qcom/opensource/bt-kernel/pwr/btpower.c": "10003b97eb05fd773e3e5a973ec2225d6ad237bf51dff317f5a9ce82c49cbe52",
+    "qcom/opensource/bt-kernel/include/btpower.h": "f8e7220ce3d7aedb8714f5c0b50767798f07bd3780885440d1f8c5055c54566a"
+  },
+  "harness_sha256": {
+    "btpower_fmd.c": "bb6901ae8c33140b43e75fd4e04b20d8be8f330a690921cbfd20431ce8484f4f",
+    "btpower_gpio.c": "5c154c225cd6b8f01a736f3c4fd53d20212af05ca96201762b7f15d50adaddef",
+    "btpower_lifetime.c": "3ad93aabd09437fc9f34479cbcccb5cecf73017e4f04893b96f21ad5ab9dfb14",
+    "btpower_requests.c": "7810a3398ae650c80b4476af4e9c2314962c64933a00ea3a34abcecc022a9537",
+    "btpower_resources.c": "c9b0a1576b7698f38e4cc0de482d3e8f678cfe75c02c085afb686e540054f183",
+    "btpower_wire.c": "f14f4005903ca682b51d5ee8506d0faba84e89c3f04c40926f4e37539a15305e"
+  },
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Compiled production functions with mocked regulator/GPIO/clock, nvmem/AOP, task-independent file admission, queue/completion and host synchronization. Withdrawal is a host SRCU model around the actual entry functions; probe/remove are built, not executed in this harness. No live hardware, firmware, kernel IRQ or Bluetooth/audio validation."
+}

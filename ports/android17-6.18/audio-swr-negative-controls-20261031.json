@@ -1,0 +1,51 @@
+{
+  "tests": {
+    "callback_storage_freed_by_sync_response": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "==3711337==ERROR: AddressSanitizer: heap-use-after-free on address 0x6fac905e0041 at pc 0x6255ba804b03 bp 0x7ffe5c0d84d0 sp 0x7ffe5c0d84c0"
+    },
+    "controller_teardown_without_drain": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "swr_provider: /tmp/onyx-swr-test-h7228fu0/swr_provider.c:1782: drain: Assertion `!atomic_load(&unregister_done)' failed."
+    },
+    "driver_teardown_without_drain": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "swr_provider: /tmp/onyx-swr-test-h7228fu0/swr_provider.c:1768: slave_remove: Assertion `!atomic_read(&d->driver_calls)' failed."
+    },
+    "short_write_underflow": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "==3711415==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x7484c7be0010 at pc 0x650b9093f848 bp 0x7ffc4986bff0 sp 0x7ffc4986bfe0"
+    },
+    "native_three_byte_paged_stride": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "swr_regmap: /tmp/onyx-swr-test-h7228fu0/swr_regmap.c:858: paging: Assertion `!regmap_swr_write(&slave.dev,p+1,10)&&calls==6&&!bulk_calls' failed."
+    },
+    "stale_page_cache_after_reset": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "swr_regmap: /tmp/onyx-swr-test-h7228fu0/swr_regmap.c:858: paging: Assertion `!regmap_swr_write(&slave.dev,p+6,5)&&calls==3' failed."
+    }
+  },
+  "source_sha256": {
+    "qcom/opensource/audio-kernel/soc/soundwire.c": "b118c11da94078480cc5ee82cb9bfbfd9f80396a985600a2ed73c2ae9c652c7e",
+    "qcom/opensource/audio-kernel/soc/regmap-swr.c": "776b8c821014701b319c4cc4482f3763feb9812cdb1c1dd041746ee1e34dcceb",
+    "qcom/opensource/audio-kernel/include/soc/soundwire.h": "33e8a4605b05c63f893e77954bd99ff761f07c7e7026eadad7da3177cd2d991e"
+  },
+  "provider_header_sha256": {
+    "qcom/opensource/audio-kernel/include/soc/audio_mod_devicetable.h": "1b5bd7024846b7744a3dc50a9121ffe2c8b13d80105ddda8fef022a6df26823f"
+  },
+  "harness_sha256": {
+    "swr_provider.c": "d7de308af35f195f45035f6c4b70e60b15500837d13741cd8b8a725a657bee4b",
+    "swr_regmap.c": "6e5a7848116574ffc3168d670c08bbd3dfd6d6e445794f4b6d373084ef4c12b9"
+  },
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Full provider/regmap sources and actual public header with pthread locks, callback drain, simulated device registration/refcounts, allocation failures and controller transfers. Native controller allocation lifetime and group state changes still need adaptation. Native asynchronous transaction IDs require exactly one response before reuse; the wire callback has no generation field. Does not exercise Linux driver core, firmware or physical SoundWire bus."
+}

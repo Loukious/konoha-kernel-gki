@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 238 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 244 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 238 platform `.ko` files, their symbol tables and DDK configurations.
+- 244 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 13,024
-imported symbol CRCs across all 238 modules.
+used. The current [validation report](validation-20261031.json) checks 13,703
+imported symbol CRCs across all 244 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1455,3 +1455,54 @@ ROM module build coverage is 236/466 (50.6%), leaving 230 names to
 assess or port, including alternative hardware. Main WLAN/Bluetooth, remaining
 audio, camera/video, device interfaces and image/installer work remain. No
 flashable 6.18 ZIP or phone validation exists yet.
+
+
+## IPA transport, SoundWire and Bluetooth power
+
+The four native IPA transport modules retain IPA 5.5/GSI, modem QMI, USB and
+RMNET behavior, all 383 export names, and native public/ioctl/QMI layouts.
+USB channels validate rings and paired parameters before allocation; power
+management handles survive failed release for retry. Notifications and readiness
+callbacks drain during withdrawal. RMNET pools validate clients and retain page
+ownership; message reads preserve oversized messages and free payloads on copy
+faults. [IPA tests](ipa-validation-20261031.json) pass nine sanitizer suites and
+eight fault controls, including over three million ring, channel and read-size
+cases. IPA/GSI stay resident because their native hardware teardown is incomplete.
+Live modem, DMA/IOMMU ordering, tethering and WLAN offload remain untested.
+
+SoundWire preserves 28 exports and seven native public structures. Transactions
+retain storage through synchronous completion; master and driver withdrawal drain
+active callbacks. Child devices retain master/OF references, and lookup returns a
+device reference for callers to release. Regmap handles native 16-bit registers
+and 32-bit paged registers, validates record sizes, splits page crossings and
+invalidates cached pages on reset. [SoundWire tests](audio-swr-validation-20261031.json)
+pass sixteen full-source groups (367 cases) and six fault controls. Controllers
+must retain their allocation through master.release and drain hardware responses;
+codecs must release lookup references and use generation-based page invalidation.
+These [controller/codec contracts](soundwire-consumer-contract.md) and physical
+audio validation remain unfinished.
+
+Bluetooth power keeps native command values, exports and DT properties. It
+preserves regulator errors, owns GPIO requests, validates NVMEM responses and
+sends bounded zero-filled AOP frames. Power/FMD state publishes after success.
+Per-request results survive caller timeout, and old files cannot access a new
+probe. Hardware operations and Slimbus pointer replacement serialize; IPA setup
+state belongs to the current device. [Power tests](btpower-validation-20261031.json)
+pass 1,096 cases and nine fault controls. Probe/remove are compiled but not
+executed by those host tests. Bluetooth firmware, UART, audio and electrical
+behavior remain untested; optional Slimbus platform_data requires consumer-owned
+lifetime beyond the retained device reference.
+
+The actual ROM WLAN module selects HIF_IPCI and imports the ICNSS2 platform
+driver. Its recorded dependencies do not include the standard PCIe/MHI host
+modules. CNSS2/MHI is a separate ROM-listed transport; its necessity for the
+active phone hardware is not established by module build coverage.
+The selected monitor/direct-injection WLAN source pin remains unchanged.
+
+The combined 244-module archive `artifacts/20261031T152813204716Z` passes
+13,703 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
+and overlay checks pass with 1,084 existing vendor DTC warnings.
+ROM module build coverage is 242/466 (51.9%), leaving 224 names to
+assess or port, including alternative hardware. ICNSS2/main WLAN, remaining
+Bluetooth/audio, camera/video, device interfaces and image/installer work remain.
+No flashable 6.18 ZIP or phone validation exists yet.

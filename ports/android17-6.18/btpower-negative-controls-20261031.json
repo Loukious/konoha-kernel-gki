@@ -1,0 +1,66 @@
+{
+  "tests": {
+    "IPA_rebind_inherits_stale_flag": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "IPA_rebind_inherits_stale_flag: /tmp/onyx-btpower-tests-6u_qxgpv/IPA_rebind_inherits_stale_flag.c:265: main: Assertion `!btpower_enable_ipa_vreg(&replacement)&&replacement.ipa_config_done&&qmp_calls==calls+1' failed."
+    },
+    "FMD_published_before_clock_success": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "FMD_published_before_clock_success: /tmp/onyx-btpower-tests-6u_qxgpv/FMD_published_before_clock_success.c:99: main: Assertion `perform_fmd_operation()==-EIO&&!data.is_fmd_mode_enable' failed."
+    },
+    "discard_regulator_configuration_error": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "discard_regulator_configuration_error: /tmp/onyx-btpower-tests-6u_qxgpv/discard_regulator_configuration_error.c:498: main: Assertion `bt_regulators_pwr(POWER_ENABLE)==-EIO' failed."
+    },
+    "unchecked_nvmem_error_pointer": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "unchecked_nvmem_error_pointer: /tmp/onyx-btpower-tests-6u_qxgpv/unchecked_nvmem_error_pointer.c:24: kfree: Assertion `p&&!IS_ERR(p)' failed."
+    },
+    "read_past_AOP_string": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "==3919042==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x7152c97e60d0 at pc 0x000000401f93 bp 0x7ffe4b4b0ab0 sp 0x7ffe4b4b0aa0"
+    },
+    "worker_reference_missing": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "==3919339==ERROR: AddressSanitizer: heap-use-after-free on address 0x7457d4fe0050 at pc 0x0000004021b1 bp 0x7ffd70885220 sp 0x7ffd70885210"
+    },
+    "double_hardware_unlock": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "double_hardware_unlock: /tmp/onyx-btpower-tests-6u_qxgpv/double_hardware_unlock.c:124: bt_power_vote: Assertion `!pthread_mutex_unlock(&btpower_operation_lock)' failed."
+    },
+    "old_file_rebind": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "old_file_rebind: /tmp/onyx-btpower-tests-6u_qxgpv/old_file_rebind.c:94: main: Assertion `bt_ioctl(&old,OTHER,4)==-ENODEV' failed."
+    },
+    "unowned_GPIO_free": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "unowned_GPIO_free: /tmp/onyx-btpower-tests-6u_qxgpv/unowned_GPIO_free.c:22: gpio_free: Assertion `n>=0&&n<8&&owned[n]' failed."
+    }
+  },
+  "source_sha256": {
+    "qcom/opensource/bt-kernel/pwr/btpower.c": "10003b97eb05fd773e3e5a973ec2225d6ad237bf51dff317f5a9ce82c49cbe52",
+    "qcom/opensource/bt-kernel/include/btpower.h": "f8e7220ce3d7aedb8714f5c0b50767798f07bd3780885440d1f8c5055c54566a"
+  },
+  "harness_sha256": {
+    "btpower_fmd.c": "bb6901ae8c33140b43e75fd4e04b20d8be8f330a690921cbfd20431ce8484f4f",
+    "btpower_gpio.c": "5c154c225cd6b8f01a736f3c4fd53d20212af05ca96201762b7f15d50adaddef",
+    "btpower_lifetime.c": "3ad93aabd09437fc9f34479cbcccb5cecf73017e4f04893b96f21ad5ab9dfb14",
+    "btpower_requests.c": "7810a3398ae650c80b4476af4e9c2314962c64933a00ea3a34abcecc022a9537",
+    "btpower_resources.c": "c9b0a1576b7698f38e4cc0de482d3e8f678cfe75c02c085afb686e540054f183",
+    "btpower_wire.c": "f14f4005903ca682b51d5ee8506d0faba84e89c3f04c40926f4e37539a15305e"
+  },
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Compiled production functions with mocked regulator/GPIO/clock, nvmem/AOP, task-independent file admission, queue/completion and host synchronization. Withdrawal is a host SRCU model around the actual entry functions; probe/remove are built, not executed in this harness. No live hardware, firmware, kernel IRQ or Bluetooth/audio validation."
+}
