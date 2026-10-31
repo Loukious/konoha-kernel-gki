@@ -1,0 +1,2666 @@
+diff --git a/qcom/opensource/bt-kernel/btfmcodec/btfm_codec.c b/qcom/opensource/bt-kernel/btfmcodec/btfm_codec.c
+--- a/qcom/opensource/bt-kernel/btfmcodec/btfm_codec.c
++++ b/qcom/opensource/bt-kernel/btfmcodec/btfm_codec.c
+@@ -12,13 +12,15 @@
+ #include <linux/kernel.h>
+ #include <linux/fs.h>
+ #include <linux/module.h>
++#include <linux/unaligned.h>
++#include "btfm_codec_interface.h"
+ #include "btfm_codec.h"
+ #include "btfm_codec_pkt.h"
+ #include "btfm_codec_btadv_interface.h"
+ 
+ #define dev_to_btfmcodec(_dev) container_of(_dev, struct btfmcodec_data, dev)
+ 
+-static DEFINE_IDR(dev_minor);
++DEFINE_SRCU(btfmcodec_endpoint_srcu);
+ static struct class *dev_class;
+ static dev_t dev_major;
+ struct btfmcodec_data *btfmcodec;
+@@ -66,7 +68,14 @@
+ {
+ 	struct btfmcodec_char_device *btfmcodec_dev = cdev_to_btfmchardev(inode->i_cdev);
+ 	struct btfmcodec_data *btfmcodec = (struct btfmcodec_data *)btfmcodec_dev->btfmcodec;
+-	unsigned int active_clients = refcount_read(&btfmcodec_dev->active_clients);
++	unsigned int active_clients;
++
++	mutex_lock(&btfmcodec_dev->lock);
++	if (!btfmcodec_dev->ready) {
++		mutex_unlock(&btfmcodec_dev->lock);
++		return -ENODEV;
++	}
++	active_clients = refcount_read(&btfmcodec_dev->active_clients);
+ 
+ 	BTFMCODEC_INFO("for %s by %s:%d active_clients[%d]\n",
+ 		       btfmcodec_dev->dev_name, current->comm,
+@@ -74,12 +83,16 @@
+ 	/* Don't allow a new client if already one is active. */
+ 	if (active_clients > 1) {
+ 		BTFMCODEC_WARN("%s: Not honoring open as other client is active", __func__);
+-		return EACCES;
++		mutex_unlock(&btfmcodec_dev->lock);
++		return -EACCES;
+ 	}
+ 	/* for now have btfmcodec and later we can think of having it btfmcodec_dev */
+ 	file->private_data = btfmcodec;
++	get_device(&btfmcodec->dev);
++	WRITE_ONCE(btfmcodec_dev->closing, false);
+ 	refcount_inc(&btfmcodec_dev->active_clients);
+ 
++	mutex_lock(&btfmcodec->states.state_machine_lock);
+ 	BTFMCODEC_INFO("current_state %s prev_state %s",
+ 			coverttostring(btfmcodec->states.current_state),
+ 			coverttostring(btfmcodec->states.prev_state));
+@@ -92,6 +105,8 @@
+ 	}
+ 
+ 	btfmcodec->states.prev_state = IDLE;
++	mutex_unlock(&btfmcodec->states.state_machine_lock);
++	mutex_unlock(&btfmcodec_dev->lock);
+ 	return 0;
+ }
+ 
+@@ -106,64 +121,55 @@
+  */
+ static int btfmcodec_dev_release(struct inode *inode, struct file *file)
+ {
+-	struct btfmcodec_char_device *btfmcodec_dev = cdev_to_btfmchardev(inode->i_cdev);
++	struct btfmcodec_data *codec = file->private_data;
++	struct btfmcodec_char_device *chardev = codec->btfmcodec_dev;
+ 	unsigned long flags;
+-	int idx;
+-
+-	BTFMCODEC_INFO("for %s by %s:%d active_clients[%u]\n",
+-		       btfmcodec_dev->dev_name, current->comm,
+-		       task_pid_nr(current), refcount_read(&btfmcodec_dev->active_clients));
+-
+-	refcount_dec(&btfmcodec_dev->active_clients);
+-	if (refcount_read(&btfmcodec_dev->active_clients) == 1) {
+-		spin_lock_irqsave(&btfmcodec_dev->tx_queue_lock, flags);
+-		skb_queue_purge(&btfmcodec_dev->txq);
+-		/* Wakeup the device if waiting for the data */
+-		wake_up_interruptible(&btfmcodec_dev->readq);
+-		spin_unlock_irqrestore(&btfmcodec_dev->tx_queue_lock, flags);
+-		/* we need to have separte rx lock for below buff */
+-		skb_queue_purge(&btfmcodec_dev->rxq);
+-		skb_queue_purge(&btfmcodec_dev->trans_rxq);
+-	}
+-
+-	/* Notify waiting clients that client is closed or killed */
+-	for (idx = 0; idx < BTM_PKT_TYPE_MAX; idx++) {
+-		btfmcodec_dev->status[idx] = BTM_RSP_NOT_RECV_CLIENT_KILLED;
+-		wake_up_interruptible(&btfmcodec_dev->rsp_wait_q[idx]);
+-	}
+-
+-	if (btfmcodec_dev->wq_hwep_shutdown.func)
+-		cancel_work_sync(&btfmcodec_dev->wq_hwep_shutdown);
+-	if (btfmcodec_dev->wq_hwep_configure.func)
+-		cancel_work_sync(&btfmcodec_dev->wq_hwep_configure);
+-	if (btfmcodec_dev->wq_prepare_bearer.func)
+-		cancel_work_sync(&btfmcodec_dev->wq_prepare_bearer);
+-
++
++	mutex_lock(&chardev->lock);
++	/* Finish previously admitted producers before closing the queue. */
++	spin_lock_irqsave(&chardev->tx_queue_lock, flags);
++	WRITE_ONCE(chardev->closing, true);
++	spin_unlock_irqrestore(&chardev->tx_queue_lock, flags);
++	mutex_unlock(&chardev->lock);
++	btfmcodec_stop_commands(codec);
++	btfmcodec_drain_commands(codec);
++	mutex_lock(&chardev->read_lock);
++	skb_queue_purge(&chardev->txq);
++	mutex_unlock(&chardev->read_lock);
++	mutex_lock(&chardev->lock);
++	refcount_dec(&chardev->active_clients);
++	mutex_unlock(&chardev->lock);
++	put_device(&codec->dev);
+ 	return 0;
+ }
+ 
+-btm_opcode STREAM_TO_UINT32 (struct sk_buff *skb)
+-{
+-	return (skb->data[0] | (skb->data[1] << 8) |
+-		(skb->data[2] << 16) | (skb->data[3] << 24));
+-}
+-
+-static void btfmcodec_dev_rxwork(struct work_struct *work)
++static btm_opcode STREAM_TO_UINT32(struct sk_buff *skb)
++{
++	return get_unaligned_le32(skb->data);
++}
++
++static void btfmcodec_dev_rxwork_impl(struct work_struct *work)
+ {
+ 	struct btfmcodec_char_device *btfmcodec_dev = container_of(work, struct btfmcodec_char_device, rx_work);
+ 	struct sk_buff *skb;
+ 	struct btfmcodec_state_machine *state = &btfmcodec->states;
+ 	uint32_t len;
+-	uint8_t status;
++	u8 status = 0xff;
+ 	int idx;
+ 	uint8_t *bearer_switch_ind, *dma_rsp;
+ 
+ 	BTFMCODEC_DBG("start");
+ 	while ((skb = skb_dequeue(&btfmcodec_dev->rxq))) {
+-		btm_opcode opcode = STREAM_TO_UINT32(skb);
++		btm_opcode opcode;
++
++		if (skb->len < BTM_HEADER_LEN)
++			goto discard;
++		opcode = STREAM_TO_UINT32(skb);
+ 		skb_pull(skb, sizeof(btm_opcode));
+ 		len = STREAM_TO_UINT32(skb);
+ 		skb_pull(skb, sizeof(len));
++		if (len != skb->len)
++			goto discard;
+ 		switch (opcode) {
+ 		case BTM_BTFMCODEC_PREPARE_AUDIO_BEARER_SWITCH_REQ:
+ 			idx = BTM_PKT_TYPE_PREPARE_REQ;
+@@ -238,7 +244,7 @@
+ 				status);
+ 			wake_up_interruptible(&btfmcodec_dev->rsp_wait_q[idx]);
+ 			BTFMCODEC_INFO("%s: waiting to cancel prepare bearer wq", __func__);
+-			cancel_work_sync(&btfmcodec_dev->wq_prepare_bearer);
++			/* The bearer worker may need subsequent RX responses. */
+ 			BTFMCODEC_INFO("%s: prepare bearer wq canceled", __func__);
+ 			break;
+ 		case BTM_BTFMCODEC_BEARER_SWITCH_IND:
+@@ -265,7 +271,6 @@
+ 			}
+ 			BTFMCODEC_INFO("Rx BTM_BTFMCODEC_CTRL_LOG_LVL_IND status:%d",
+ 					log_lvl);
+-			wake_up_interruptible(&btfmcodec_dev->rsp_wait_q[idx]);
+ 			break;
+ 		case BTM_BTFMCODEC_USECASE_START_RSP:
+ 			idx = BTM_PKT_TYPE_USECASE_START_RSP;
+@@ -286,9 +291,24 @@
+ 		default:
+ 			BTFMCODEC_ERR("wrong opcode:%08x", opcode);
+ 		}
++discard:
+ 		kfree_skb(skb);
+ 	}
+ 	BTFMCODEC_DBG("end");
++}
++
++static void btfmcodec_dev_rxwork(struct work_struct *work)
++{
++	int idx = btfmcodec_endpoint_enter();
++
++	if (idx < 0) {
++		struct btfmcodec_char_device *chardev = container_of(work,
++				struct btfmcodec_char_device, rx_work);
++		skb_queue_purge(&chardev->rxq);
++		return;
++	}
++	btfmcodec_dev_rxwork_impl(work);
++	btfmcodec_endpoint_exit(idx);
+ }
+ 
+ /*
+@@ -305,60 +325,47 @@
+ static ssize_t btfmcodec_dev_write(struct file *file,
+ 			const char __user *buf, size_t count, loff_t *ppos)
+ {
+-	struct btfmcodec_data *btfmcodec = file->private_data;
+-	struct btfmcodec_char_device *btfmcodec_dev= NULL;
++	struct btfmcodec_data *codec = file->private_data;
++	struct btfmcodec_char_device *chardev = codec->btfmcodec_dev;
+ 	struct sk_buff *skb;
+-	void *kbuf;
+-	int ret =  0;
+-
+-	if (!btfmcodec || !btfmcodec->btfmcodec_dev || refcount_read(&btfmcodec->btfmcodec_dev->active_clients) == 1) {
+-		BTFMCODEC_INFO("%s: %d\n", current->comm, task_pid_nr(current));
+-		return -EINVAL;
+-	} else {
+-		btfmcodec_dev = btfmcodec->btfmcodec_dev;
+-	}
+-
+-	if (mutex_lock_interruptible(&btfmcodec_dev->lock)) {
+-		ret = -ERESTARTSYS;
+-		goto free_kbuf;
+-	}
+-
+-	/* Hack for Now */
+-	if (count < MIN_PKT_LEN) {
+-		BTFMCODEC_ERR("minimum packet len should be greater than 3 bytes");
+-		goto free_kbuf;
+-	}
+-	if (refcount_read(&btfmcodec->btfmcodec_dev->active_clients) == 0) {
+-		BTFMCODEC_WARN("Client disconnected");
++	int ret;
++
++	if (!count)
++		return 0;
++	if (count < MIN_PKT_LEN || count > 4096)
++		return -EMSGSIZE;
++	if (mutex_lock_interruptible(&chardev->lock))
++		return -ERESTARTSYS;
++	if (READ_ONCE(chardev->closing)) {
+ 		ret = -ENETRESET;
+-		goto free_kbuf;
+-	}
+-
+-	BTFMCODEC_DBG("begin to %s buffer_size %zu\n", btfmcodec_dev->dev_name, count);
+-	kbuf = memdup_user(buf, count);
+-	if (IS_ERR(kbuf)) {
+-		ret = PTR_ERR(kbuf);
+-		goto free_kbuf;
+-	}
+-
+-	/* Check whether we need a dedicated chunk of memory for this driver */
+-	skb = alloc_skb(count* sizeof(size_t), GFP_KERNEL);
++		goto unlock;
++	}
++	if (skb_queue_len(&chardev->rxq) >= 64) {
++		ret = -ENOSPC;
++		goto unlock;
++	}
++	skb = alloc_skb(count, GFP_KERNEL);
+ 	if (!skb) {
+-		BTFMCODEC_ERR("failed to allocate memory for recevied packet");
+ 		ret = -ENOMEM;
+-		goto free_kbuf;
+-	}
+-
+-	skb_put_data(skb, (uint8_t *)kbuf, count);
+-	skb_queue_tail(&btfmcodec_dev->rxq, skb);
+-	schedule_work(&btfmcodec_dev->rx_work);
+-
+-	kfree(kbuf);
+-
+-free_kbuf:
+-	mutex_unlock(&btfmcodec_dev->lock);
+-	BTFMCODEC_DBG("finish to %s ret %d\n", btfmcodec_dev->dev_name, ret);
+-	return ret < 0 ? ret : count;
++		goto unlock;
++	}
++	if (copy_from_user(skb_put(skb, count), buf, count)) {
++		ret = -EFAULT;
++		goto free_skb;
++	}
++	if (get_unaligned_le32(skb->data + sizeof(u32)) != count - BTM_HEADER_LEN) {
++		ret = -EINVAL;
++		goto free_skb;
++	}
++	skb_queue_tail(&chardev->rxq, skb);
++	schedule_work(&chardev->rx_work);
++	mutex_unlock(&chardev->lock);
++	return count;
++free_skb:
++	kfree_skb(skb);
++unlock:
++	mutex_unlock(&chardev->lock);
++	return ret;
+ }
+ 
+ int btfmcodec_dev_enqueue_pkt(struct btfmcodec_char_device *btfmcodec_dev, void *buf, int len)
+@@ -367,9 +374,12 @@
+ 	unsigned long flags;
+ 	uint8_t *cmd = buf;
+ 
++	if (!buf || len < 1 || len > 4096)
++		return -EINVAL;
+ 	BTFMCODEC_DBG("start");
+ 	spin_lock_irqsave(&btfmcodec_dev->tx_queue_lock, flags);
+-	if (refcount_read(&btfmcodec_dev->active_clients) == 1) {
++	if (refcount_read(&btfmcodec_dev->active_clients) == 1 ||
++	    READ_ONCE(btfmcodec_dev->closing) || skb_queue_len(&btfmcodec_dev->txq) >= 64) {
+ 		BTFMCODEC_WARN("no active clients discarding the packet");
+ 		spin_unlock_irqrestore(&btfmcodec_dev->tx_queue_lock, flags);
+ 		return -EINVAL;
+@@ -394,8 +404,14 @@
+ {
+ 	struct sk_buff *skb;
+ 
++	if (transport < BT || transport > NONE)
++		return -EINVAL;
+ 	mutex_lock(&btfmcodec_dev->trans_lock);
+-	skb = alloc_skb(1, GFP_ATOMIC);
++	if (skb_queue_len(&btfmcodec_dev->trans_rxq) >= 64) {
++		mutex_unlock(&btfmcodec_dev->trans_lock);
++		return -ENOSPC;
++	}
++	skb = alloc_skb(1, GFP_KERNEL);
+ 	if (!skb) {
+ 		BTFMCODEC_ERR("failed to allocate memory");
+ 		mutex_unlock(&btfmcodec_dev->trans_lock);
+@@ -446,7 +462,7 @@
+ 	BTFMCODEC_DBG("start");
+ 	if (!btfmcodec || !btfmcodec->btfmcodec_dev || refcount_read(&btfmcodec->btfmcodec_dev->active_clients) == 1) {
+ 		BTFMCODEC_INFO("%s: %d\n", current->comm, task_pid_nr(current));
+-		return -EINVAL;
++		return EPOLLERR;
+ 	} else {
+ 		btfmcodec_dev = btfmcodec->btfmcodec_dev;
+ 	}
+@@ -488,58 +504,49 @@
+ static ssize_t btfmcodec_dev_read(struct file *file,
+ 			char __user *buf, size_t count, loff_t *ppos)
+ {
+-	struct btfmcodec_data *btfmcodec = file->private_data;
+-	struct btfmcodec_char_device *btfmcodec_dev= NULL;
+-	unsigned long flags;
++	struct btfmcodec_data *codec = file->private_data;
++	struct btfmcodec_char_device *chardev = codec->btfmcodec_dev;
+ 	struct sk_buff *skb;
+-	int use;
+-
+-	BTFMCODEC_DBG("start");
+-	if (!btfmcodec || !btfmcodec->btfmcodec_dev || refcount_read(&btfmcodec->btfmcodec_dev->active_clients) == 1) {
+-		BTFMCODEC_INFO("%s: %d\n", current->comm, task_pid_nr(current));
+-		return -EINVAL;
++	ssize_t ret;
++	size_t used;
++
++	if (!count)
++		return 0;
++	if (mutex_lock_interruptible(&chardev->read_lock))
++		return -ERESTARTSYS;
++	while (!(skb = skb_dequeue(&chardev->txq))) {
++		if (READ_ONCE(chardev->closing)) {
++			ret = -ENETRESET;
++			goto unlock;
++		}
++		if (file->f_flags & O_NONBLOCK) {
++			ret = -EAGAIN;
++			goto unlock;
++		}
++		if (wait_event_interruptible(chardev->readq,
++					     !skb_queue_empty(&chardev->txq) ||
++					     READ_ONCE(chardev->closing))) {
++			ret = -ERESTARTSYS;
++			goto unlock;
++		}
++	}
++	used = min_t(size_t, count, skb->len);
++	if (copy_to_user(buf, skb->data, used)) {
++		ret = -EFAULT;
+ 	} else {
+-		btfmcodec_dev = btfmcodec->btfmcodec_dev;
+-	}
+-
+-	spin_lock_irqsave(&btfmcodec_dev->tx_queue_lock, flags);
+-	/* Wait for data in the queue */
+-	if (skb_queue_empty(&btfmcodec_dev->txq)) {
+-		spin_unlock_irqrestore(&btfmcodec_dev->tx_queue_lock, flags);
+-
+-		if (file->f_flags & O_NONBLOCK)
+-			return -EAGAIN;
+-
+-		/* Wait until we get data*/
+-		if (wait_event_interruptible(btfmcodec_dev->readq,
+-					     !skb_queue_empty(&btfmcodec_dev->txq)))
+-			return -ERESTARTSYS;
+-
+-		/* We lost the client while waiting */
+-		if (refcount_read(&btfmcodec->btfmcodec_dev->active_clients) == 1)
+-			return -ENETRESET;
+-
+-		spin_lock_irqsave(&btfmcodec_dev->tx_queue_lock, flags);
+-	}
+-
+-	skb = skb_dequeue(&btfmcodec_dev->txq);
+-	spin_unlock_irqrestore(&btfmcodec_dev->tx_queue_lock, flags);
+-	if (!skb)
+-		return -EFAULT;
+-
+-	use = min_t(size_t, count, skb->len);
+-	if (copy_to_user(buf, skb->data, use))
+-		use = -EFAULT;
+-
+-	kfree_skb(skb);
+-
+-	BTFMCODEC_DBG("end for %s by %s:%d ret[%d]\n", btfmcodec_dev->dev_name,
+-		       current->comm, task_pid_nr(current), use);
+-
+-	return use;
+-}
+-
+-bool isCpSupported(void)
++		skb_pull(skb, used);
++		ret = used;
++	}
++	if (skb->len)
++		skb_queue_head(&chardev->txq, skb);
++	else
++		kfree_skb(skb);
++unlock:
++	mutex_unlock(&chardev->read_lock);
++	return ret;
++}
++
++bool btfmcodec_cp_supported(void)
+ {
+ 	return is_cp_supported;
+ }
+@@ -549,6 +556,10 @@
+ 	struct btfmcodec_data *btfmcodec = file->private_data;
+ 	struct hwep_data *hwep_info;
+ 
++	if (cmd != BTM_CP_UPDATE)
++		return -ENOTTY;
++	if (arg > 1)
++		return -EINVAL;
+ 	BTFMCODEC_INFO("%s: command %04x", __func__, cmd);
+ 
+ 	mutex_lock(&btfmcodec->hwep_drv_lock);
+@@ -561,7 +572,6 @@
+ 		return 0;
+ 	}
+ 
+-	mutex_unlock(&btfmcodec->hwep_drv_lock);
+ 	switch (cmd) {
+ 	case BTM_CP_UPDATE: {
+ 		if ((int)arg == 1) {
+@@ -586,6 +596,7 @@
+ 	}
+ 	}
+ 
++	mutex_unlock(&btfmcodec->hwep_drv_lock);
+ 	return 0;
+ }
+ static const struct file_operations btfmcodec_fops = {
+@@ -627,171 +638,210 @@
+ 	return 0;
+ }
+ 
+-struct btfmcodec_data* btfm_get_btfmcodec(void)
+-{
+-	return btfmcodec;
++struct btfmcodec_data *btfm_get_btfmcodec(void)
++{
++	struct btfmcodec_data *codec = READ_ONCE(btfmcodec);
++
++	return codec && READ_ONCE(codec->btfmcodec_dev->ready) ? codec : NULL;
+ }
+ EXPORT_SYMBOL(btfm_get_btfmcodec);
+ 
++bool btfmcodec_commands_stopped(struct btfmcodec_char_device *chardev)
++{
++	struct btfmcodec_data *codec = chardev->btfmcodec;
++
++	return READ_ONCE(chardev->closing) || READ_ONCE(codec->hwep_stopping);
++}
++
++int btfmcodec_wait_response(struct btfmcodec_char_device *chardev, int index,
++			    unsigned int timeout_ms)
++{
++	int ret;
++
++	ret = wait_event_interruptible_timeout(chardev->rsp_wait_q[index],
++					       READ_ONCE(chardev->status[index]) !=
++					       BTM_WAITING_RSP ||
++		btfmcodec_commands_stopped(chardev), msecs_to_jiffies(timeout_ms));
++	if (btfmcodec_commands_stopped(chardev))
++		return -ESHUTDOWN;
++	if (ret < 0)
++		return ret;
++	if (!ret)
++		return -ETIMEDOUT;
++	return READ_ONCE(chardev->status[index]) == BTM_RSP_RECV ? 0 : -EIO;
++}
++
++void btfmcodec_stop_commands(struct btfmcodec_data *codec)
++{
++	struct btfmcodec_char_device *chardev = codec->btfmcodec_dev;
++	int i;
++
++	for (i = 0; i < BTM_PKT_TYPE_MAX; i++) {
++		WRITE_ONCE(chardev->status[i], BTM_RSP_NOT_RECV_CLIENT_KILLED);
++		wake_up_interruptible(&chardev->rsp_wait_q[i]);
++	}
++	wake_up_interruptible(&chardev->readq);
++}
++
++void btfmcodec_drain_commands(struct btfmcodec_data *codec)
++{
++	struct btfmcodec_char_device *chardev = codec->btfmcodec_dev;
++
++	cancel_work_sync(&chardev->rx_work);
++	cancel_work_sync(&chardev->wq_prepare_bearer);
++	cancel_work_sync(&chardev->wq_hwep_shutdown);
++	cancel_work_sync(&chardev->wq_hwep_configure);
++	skb_queue_purge(&chardev->rxq);
++	mutex_lock(&chardev->trans_lock);
++	skb_queue_purge(&chardev->trans_rxq);
++	mutex_unlock(&chardev->trans_lock);
++}
++
++int btfmcodec_endpoint_enter(void)
++{
++	int idx = srcu_read_lock(&btfmcodec_endpoint_srcu);
++
++	if (!btfmcodec || READ_ONCE(btfmcodec->hwep_stopping) ||
++	    !READ_ONCE(btfmcodec->hwep_info)) {
++		srcu_read_unlock(&btfmcodec_endpoint_srcu, idx);
++		return -ENODEV;
++	}
++	return idx;
++}
++
++void btfmcodec_endpoint_exit(int idx)
++{
++	srcu_read_unlock(&btfmcodec_endpoint_srcu, idx);
++}
++
+ static DEVICE_ATTR_RW(btfmcodec_attributes);
++static struct attribute *btfmcodec_attrs[] = {
++	&dev_attr_btfmcodec_attributes.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(btfmcodec);
++
++static void btfmcodec_device_release(struct device *dev)
++{
++	struct btfmcodec_data *codec = dev_to_btfmcodec(dev);
++
++	kfree(codec->btfmcodec_dev);
++	kfree(codec);
++}
+ 
+ static int __init btfmcodec_init(void)
+ {
+-	struct btfmcodec_state_machine *states;
+-	struct btfmcodec_char_device *btfmcodec_dev;
+-	struct device *dev;
++	struct btfmcodec_data *codec;
++	struct btfmcodec_char_device *chardev;
+ 	int ret, i;
+ 
+-	BTFMCODEC_INFO("starting up the module");
+-	btfmcodec = kzalloc(sizeof(struct btfmcodec_data), GFP_KERNEL);
+-	if (!btfmcodec) {
+-		BTFMCODEC_ERR("failed to allocate memory");
++	codec = kzalloc(sizeof(*codec), GFP_KERNEL);
++	if (!codec)
+ 		return -ENOMEM;
+-	}
+-
+-	mutex_init(&btfmcodec->hwep_drv_lock);
+-	states = &btfmcodec->states;
+-	states->current_state = IDLE;
+-	states->next_state = IDLE;
+-
+-	BTFMCODEC_INFO("creating device node");
+-	/* create device node for communication between userspace and kernel */
+-	btfmcodec_dev = kzalloc(sizeof(struct btfmcodec_char_device), GFP_KERNEL);
+-	if (!btfmcodec_dev) {
+-		BTFMCODEC_ERR("failed to allocate memory");
++	chardev = kzalloc(sizeof(*chardev), GFP_KERNEL);
++	if (!chardev) {
++		kfree(codec);
++		return -ENOMEM;
++	}
++	codec->btfmcodec_dev = chardev;
++	chardev->btfmcodec = codec;
++	mutex_init(&codec->hwep_drv_lock);
++	mutex_init(&codec->config_lock);
++	mutex_init(&codec->states.state_machine_lock);
++	INIT_LIST_HEAD(&codec->config_head);
++	mutex_init(&chardev->lock);
++	mutex_init(&chardev->trans_lock);
++	mutex_init(&chardev->read_lock);
++	refcount_set(&chardev->active_clients, 1);
++	skb_queue_head_init(&chardev->rxq);
++	skb_queue_head_init(&chardev->txq);
++	skb_queue_head_init(&chardev->trans_rxq);
++	spin_lock_init(&chardev->tx_queue_lock);
++	init_waitqueue_head(&chardev->readq);
++	for (i = 0; i < BTM_PKT_TYPE_MAX; i++)
++		init_waitqueue_head(&chardev->rsp_wait_q[i]);
++	INIT_WORK(&chardev->rx_work, btfmcodec_dev_rxwork);
++	INIT_WORK(&chardev->wq_hwep_shutdown, btfmcodec_wq_hwep_shutdown);
++	INIT_WORK(&chardev->wq_prepare_bearer, btfmcodec_wq_prepare_bearer);
++	INIT_WORK(&chardev->wq_hwep_configure, btfmcodec_wq_hwep_configure);
++	chardev->workqueue = alloc_ordered_workqueue("btfmcodec_wq", 0);
++	if (!chardev->workqueue) {
+ 		ret = -ENOMEM;
+-		goto info_cleanup;
+-	}
+-
+-	BTFMCODEC_INFO("trying to get major number\n");
+-	ret = alloc_chrdev_region(&dev_major, 0, 0, "btfmcodec");
+-	if (ret < 0) {
+-		BTFMCODEC_ERR("failed to allocate character device region");
+-		goto dev_cleanup;
+-	}
+-
+-	BTFMCODEC_INFO("creating btfm codec class");
++		goto free_alloc;
++	}
++	ret = alloc_chrdev_region(&dev_major, 0, 1, "btfmcodec");
++	if (ret)
++		goto destroy_workqueue;
+ 	dev_class = class_create("btfmcodec");
+ 	if (IS_ERR(dev_class)) {
+ 		ret = PTR_ERR(dev_class);
+-		BTFMCODEC_ERR("class_create failed ret:%d\n", ret);
+-		goto deinit_chrdev;
+-	}
+-
+-	btfmcodec_dev->reuse_minor = idr_alloc(&dev_minor, btfmcodec, 1, 0, GFP_KERNEL);
+-	if (ret < 0) {
+-		BTFMCODEC_ERR("failed to allocated minor number");
+-		goto deinit_class;
+-	}
+-
+-	dev = &btfmcodec->dev;
+-	dev->driver = &driver;
+-
+-	// ToDo Rethink of having btfmcodec alone instead of btfmcodec
+-	btfmcodec->btfmcodec_dev = btfmcodec_dev;
+-	refcount_set(&btfmcodec_dev->active_clients, 1);
+-	mutex_init(&btfmcodec_dev->lock);
+-	mutex_init(&btfmcodec_dev->trans_lock);
+-	strscpy(btfmcodec_dev->dev_name, "btfmcodec_dev", DEVICE_NAME_MAX_LEN);
+-	device_initialize(dev);
+-	dev->class = dev_class;
+-	dev->devt = MKDEV(MAJOR(dev_major), btfmcodec_dev->reuse_minor);
+-	dev_set_drvdata(dev, btfmcodec);
+-
+-	cdev_init(&btfmcodec_dev->cdev, &btfmcodec_fops);
+-	btfmcodec_dev->cdev.owner = THIS_MODULE;
+-	btfmcodec_dev->btfmcodec = (struct btfmcodec_data *)btfmcodec;
+-	dev_set_name(dev, btfmcodec_dev->dev_name, btfmcodec_dev->reuse_minor);
+-	ret = cdev_add(&btfmcodec_dev->cdev, dev->devt, 1);
+-	if (ret) {
+-		BTFMCODEC_ERR("cdev_add failed with error no %d", ret);
+-		goto idr_cleanup;
+-	}
+-
+-	// ToDo to handler HIDL abrupt kill
+-	dev->release = NULL;
+-	ret = device_add(dev);
+-	if (ret) {
+-		BTFMCODEC_ERR("Failed to add device error no %d", ret);
+-		goto free_device;
+-	}
+-
+-	BTFMCODEC_ERR("Creating a sysfs entry with name: %s", btfmcodec_dev->dev_name);
+-	ret = device_create_file(dev, &dev_attr_btfmcodec_attributes);
+-	if (ret) {
+-		BTFMCODEC_ERR("Failed to create a devicd node: %s", btfmcodec_dev->dev_name);
+-		goto free_device;
+-	}
+-
+-	BTFMCODEC_INFO("created a node at /dev/%s with %u:%u\n",
+-		btfmcodec_dev->dev_name, dev_major, btfmcodec_dev->reuse_minor);
+-
+-	skb_queue_head_init(&btfmcodec_dev->rxq);
+-	skb_queue_head_init(&btfmcodec_dev->trans_rxq);
+-	mutex_init(&btfmcodec_dev->lock);
+-	INIT_WORK(&btfmcodec_dev->rx_work, btfmcodec_dev_rxwork);
+-	init_waitqueue_head(&btfmcodec_dev->readq);
+-	spin_lock_init(&btfmcodec_dev->tx_queue_lock);
+-	skb_queue_head_init(&btfmcodec_dev->txq);
+-	INIT_LIST_HEAD(&btfmcodec->config_head);
+-	for (i = 0; i < BTM_PKT_TYPE_MAX; i++) {
+-		init_waitqueue_head(&btfmcodec_dev->rsp_wait_q[i]);
+-	}
+-	mutex_init(&states->state_machine_lock);
+-	btfmcodec_dev->workqueue = alloc_ordered_workqueue("btfmcodec_wq", 0);
+-	if (!btfmcodec_dev->workqueue) {
+-		BTFMCODEC_ERR("btfmcodec_dev Workqueue not initialized properly");
+-		ret = -ENOMEM;
+-		goto free_device;
+-	}
++		goto unregister_region;
++	}
++	device_initialize(&codec->dev);
++	codec->dev.release = btfmcodec_device_release;
++	codec->dev.driver = &driver;
++	codec->dev.class = dev_class;
++	codec->dev.groups = btfmcodec_groups;
++	codec->dev.devt = dev_major;
++	dev_set_drvdata(&codec->dev, codec);
++	strscpy(chardev->dev_name, "btfmcodec_dev", sizeof(chardev->dev_name));
++	ret = dev_set_name(&codec->dev, "%s", chardev->dev_name);
++	if (ret)
++		goto put_dev;
++	cdev_init(&chardev->cdev, &btfmcodec_fops);
++	chardev->cdev.owner = THIS_MODULE;
++	/* All queues, locks and work are ready before either interface is visible. */
++	btfmcodec = codec;
++	ret = cdev_device_add(&chardev->cdev, &codec->dev);
++	if (ret)
++		goto clear_global;
++	mutex_lock(&chardev->lock);
++	WRITE_ONCE(chardev->ready, true);
++	mutex_unlock(&chardev->lock);
++	return 0;
++clear_global:
++	btfmcodec = NULL;
++put_dev:
++	class_destroy(dev_class);
++	unregister_chrdev_region(dev_major, 1);
++	destroy_workqueue(chardev->workqueue);
++	put_device(&codec->dev);
+ 	return ret;
+-
+-free_device:
+-	put_device(dev);
+-idr_cleanup:
+-	idr_remove(&dev_minor, btfmcodec_dev->reuse_minor);
+-deinit_class:
++unregister_region:
++	unregister_chrdev_region(dev_major, 1);
++destroy_workqueue:
++	destroy_workqueue(chardev->workqueue);
++free_alloc:
++	kfree(chardev);
++	kfree(codec);
++	return ret;
++}
++
++static void __exit btfmcodec_deinit(void)
++{
++	struct btfmcodec_data *codec = btfmcodec;
++	struct btfmcodec_char_device *chardev = codec->btfmcodec_dev;
++	unsigned long flags;
++
++	/* Consumers and open file operations hold the normal module reference. */
++	mutex_lock(&chardev->lock);
++	WRITE_ONCE(chardev->ready, false);
++	/* Finish previously admitted producers before closing the queue. */
++	spin_lock_irqsave(&chardev->tx_queue_lock, flags);
++	WRITE_ONCE(chardev->closing, true);
++	spin_unlock_irqrestore(&chardev->tx_queue_lock, flags);
++	WRITE_ONCE(codec->hwep_stopping, true);
++	mutex_unlock(&chardev->lock);
++	cdev_device_del(&chardev->cdev, &codec->dev);
++	btfmcodec_stop_commands(codec);
++	synchronize_srcu(&btfmcodec_endpoint_srcu);
++	btfmcodec_drain_commands(codec);
++	destroy_workqueue(chardev->workqueue);
++	skb_queue_purge(&chardev->txq);
++	WRITE_ONCE(btfmcodec, NULL);
+ 	class_destroy(dev_class);
+-deinit_chrdev:
+-	unregister_chrdev_region(MAJOR(dev_major), 0);
+-dev_cleanup:
+-	kfree(btfmcodec_dev);
+-info_cleanup:
+-	kfree(btfmcodec);
+-
+-	return ret;
+-}
+-
+-static void __exit btfmcodec_deinit(void)
+-{
+-	struct btfmcodec_char_device *btfmcodec_dev;
+-	struct device *dev;
+-	BTFMCODEC_INFO("%s: cleaning up btfm codec driver", __func__);
+-	if (!btfmcodec) {
+-		BTFMCODEC_ERR("%s: skiping driver cleanup", __func__);
+-		goto info_cleanup;
+-	}
+-
+-	dev = &btfmcodec->dev;
+-
+-	device_remove_file(dev, &dev_attr_btfmcodec_attributes);
+-	put_device(dev);
+-
+-	if (!btfmcodec->btfmcodec_dev) {
+-		BTFMCODEC_ERR("%s: skiping device node cleanup", __func__);
+-		goto info_cleanup;
+-	}
+-
+-	btfmcodec_dev = btfmcodec->btfmcodec_dev;
+-	skb_queue_purge(&btfmcodec_dev->rxq);
+-	idr_remove(&dev_minor, btfmcodec_dev->reuse_minor);
+-	class_destroy(dev_class);
+-	unregister_chrdev_region(MAJOR(dev_major), 0);
+-	kfree(btfmcodec_dev);
+-info_cleanup:
+-	kfree(btfmcodec);
+-	BTFMCODEC_INFO("%s: btfm codec driver cleanup completed", __func__);
+-	return;
++	unregister_chrdev_region(dev_major, 1);
++	put_device(&codec->dev);
+ }
+ 
+ MODULE_LICENSE("GPL v2");
+@@ -799,3 +849,4 @@
+ 
+ module_init(btfmcodec_init);
+ module_exit(btfmcodec_deinit);
++
+diff --git a/qcom/opensource/bt-kernel/btfmcodec/btfm_codec_btadv_interface.c b/qcom/opensource/bt-kernel/btfmcodec/btfm_codec_btadv_interface.c
+--- a/qcom/opensource/bt-kernel/btfmcodec/btfm_codec_btadv_interface.c
++++ b/qcom/opensource/bt-kernel/btfmcodec/btfm_codec_btadv_interface.c
+@@ -13,14 +13,20 @@
+ 		&btfmcodec_dev->rsp_wait_q[BTM_PKT_TYPE_HWEP_SHUTDOWN];
+ 	int ret;
+ 	uint8_t *status = &btfmcodec_dev->status[BTM_PKT_TYPE_HWEP_SHUTDOWN];
++
++	if (btfmcodec_commands_stopped(btfmcodec_dev))
++		return;
+ 
+ 	*status = BTM_WAITING_RSP;
+ 	BTFMCODEC_INFO("queuing work to shutdown");
+ 	schedule_work(&btfmcodec_dev->wq_hwep_shutdown);
+ 	BTFMCODEC_INFO("waiting here for shutdown");
+ 	ret = wait_event_interruptible_timeout(*rsp_wait_q,
+-		*status != BTM_WAITING_RSP,
++		*status != BTM_WAITING_RSP ||
++		btfmcodec_commands_stopped(btfmcodec_dev),
+ 		msecs_to_jiffies(BTM_MASTER_CONFIG_RSP_TIMEOUT));
++	if (btfmcodec_commands_stopped(btfmcodec_dev))
++		return;
+ 
+ 	/* Rethink of having a new packet to notify transport switch error */
+ 	if (ret == 0) {
+@@ -134,9 +140,12 @@
+ 	uint8_t *status = &btfmcodec_dev->status[BTM_PKT_TYPE_BEARER_SWITCH_IND];
+ 
+ 	ret = wait_event_interruptible_timeout(*rsp_wait_q,
+-		(*status != BTM_WAITING_RSP ||
++		(btfmcodec_commands_stopped(btfmcodec_dev) ||
++		*status != BTM_WAITING_RSP ||
+ 		skb_queue_empty(&btfmcodec_dev->trans_rxq) != true),
+ 		msecs_to_jiffies(BTM_BEARER_SWITCH_IND_TIMEOUT));
++	if (btfmcodec_commands_stopped(btfmcodec_dev))
++		return -ESHUTDOWN;
+ 
+ 	if (!skb_queue_empty(&btfmcodec_dev->trans_rxq)) {
+ 		BTFMCODEC_INFO("%s: new transport is waiting to process", __func__);
+@@ -169,12 +178,17 @@
+ 	uint8_t *status = &btfmcodec_dev->status[BTM_PKT_TYPE_HWEP_CONFIG];
+ 	int ret;
+ 
++	if (btfmcodec_commands_stopped(btfmcodec_dev))
++		return -ESHUTDOWN;
++
++	*status = BTM_WAITING_RSP;
+ 	schedule_work(&btfmcodec_dev->wq_hwep_configure);
+-
+-	*status = BTM_WAITING_RSP;
+ 	ret = wait_event_interruptible_timeout(*rsp_wait_q,
+-		*status != BTM_WAITING_RSP,
++		*status != BTM_WAITING_RSP ||
++		btfmcodec_commands_stopped(btfmcodec_dev),
+ 		msecs_to_jiffies(BTM_MASTER_CONFIG_RSP_TIMEOUT));
++	if (btfmcodec_commands_stopped(btfmcodec_dev))
++		return -ESHUTDOWN;
+ 
+ 	if (ret == 0) {
+ 		BTFMCODEC_ERR("failed to recevie complete hwep configure");
+@@ -242,7 +256,7 @@
+ 	btfmcodec_state current_state;
+ 	int ret = -1;
+ 
+-	if (new_transport > (ARRAY_SIZE(transport_type_text))) {
++	if (new_transport < BT || new_transport > NONE) {
+ 		btfmcodec_frame_prepare_bearer_rsp_pkt(btfmcodec_dev,
+ 			(uint8_t) btfmcodec_get_current_transport(state),
+ 			MSG_WRONG_TRANSPORT_TYPE);
+@@ -336,7 +350,7 @@
+ 	}
+ }
+ 
+-void btfmcodec_wq_prepare_bearer(struct work_struct *work)
++static void btfmcodec_wq_prepare_bearer_impl(struct work_struct *work)
+ {
+ 	struct btfmcodec_char_device *btfmcodec_dev = container_of(work,
+ 						struct btfmcodec_char_device,
+@@ -350,3 +364,13 @@
+ 	else
+ 		btfmcodec_prepare_bearer(btfmcodec_dev, transport);
+ }
++
++void btfmcodec_wq_prepare_bearer(struct work_struct *work)
++{
++	int idx = btfmcodec_endpoint_enter();
++
++	if (idx < 0)
++		return;
++	btfmcodec_wq_prepare_bearer_impl(work);
++	btfmcodec_endpoint_exit(idx);
++}
+diff --git a/qcom/opensource/bt-kernel/btfmcodec/btfm_codec_hw_interface.c b/qcom/opensource/bt-kernel/btfmcodec/btfm_codec_hw_interface.c
+--- a/qcom/opensource/bt-kernel/btfmcodec/btfm_codec_hw_interface.c
++++ b/qcom/opensource/bt-kernel/btfmcodec/btfm_codec_hw_interface.c
+@@ -5,90 +5,95 @@
+ #include "btfm_codec.h"
+ #include "btfm_codec_hw_interface.h"
+ #include "btfm_codec_interface.h"
++#include "btfm_codec_btadv_interface.h"
+ 
+-int btfmcodec_register_hw_ep (struct hwep_data *ep_info)
++static DEFINE_MUTEX(btfmcodec_registration_lock);
++
++int btfmcodec_register_hw_ep(struct hwep_data *ep_info)
+ {
+-	struct btfmcodec_data *btfmcodec;
+-	struct hwep_data *hwep_info;
+-	int ret = 0;
++	struct btfmcodec_data *codec = btfm_get_btfmcodec();
++	struct hwep_data *copy;
++	int ret;
+ 
+-	btfmcodec = btfm_get_btfmcodec();
+-	mutex_lock(&btfmcodec->hwep_drv_lock);
+-	if (!btfmcodec) {
+-		BTFMCODEC_ERR("btfm codec driver it not initialized");
+-		ret = -EPERM;
+-		goto end;
++	if (!codec)
++		return -EPROBE_DEFER;
++	if (!ep_info || ep_info->num_dai <= 0 || ep_info->num_dai > 64 ||
++	    ep_info->num_mixer_ctrl < 0 || ep_info->num_mixer_ctrl > 64 ||
++	    !ep_info->dai_drv || !ep_info->dev ||
++	    (ep_info->num_mixer_ctrl && !ep_info->mixer_ctrl) ||
++	    !memchr(ep_info->driver_name, '\0', DEVICE_NAME_MAX_LEN))
++		return -EINVAL;
++	mutex_lock(&btfmcodec_registration_lock);
++	mutex_lock(&codec->hwep_drv_lock);
++	if (codec->hwep_info) {
++		ret = -EBUSY;
++		goto unlock;
+ 	}
+-
+-	if (ep_info->num_dai == 0) {
+-		BTFMCODEC_ERR("no active information provided by hw ep interface");
+-		ret = -EPERM;
+-		goto end;
+-
++	copy = kmemdup(ep_info, sizeof(*copy), GFP_KERNEL);
++	if (!copy) {
++		ret = -ENOMEM;
++		goto unlock;
+ 	}
+-
+-	hwep_info = btfmcodec->hwep_info;
+-	if (hwep_info) {
+-		BTFMCODEC_ERR("driver already holds hardware endpoint info");
+-		ret = -EPERM;
+-		goto end;
++	get_device(copy->dev);
++	WRITE_ONCE(codec->hwep_stopping, true);
++	WRITE_ONCE(codec->hwep_info, copy);
++	mutex_unlock(&codec->hwep_drv_lock);
++	ret = btfm_register_codec(copy);
++	mutex_lock(&codec->hwep_drv_lock);
++	if (ret) {
++		WRITE_ONCE(codec->hwep_info, NULL);
++		put_device(copy->dev);
++		kfree(copy);
++	} else {
++		WRITE_ONCE(codec->hwep_stopping, false);
+ 	}
+-
+-	hwep_info = kzalloc(sizeof(struct hwep_data), GFP_KERNEL);
+-	if (!hwep_info) {
+-		BTFMCODEC_ERR("%s: failed to allocate memory\n", __func__);
+-		ret = -ENOMEM;
+-		goto end;
+-	}
+-
+-	btfmcodec->hwep_info = hwep_info;
+-	memcpy(hwep_info, ep_info, sizeof(struct hwep_data));
+-
+-	BTFMCODEC_INFO("Below driver registered with btfm codec\n");
+-	BTFMCODEC_INFO("Driver name: %s\n", hwep_info->driver_name);
+-	BTFMCODEC_INFO("Num of dai: %d supported", hwep_info->num_dai);
+-	BTFMCODEC_INFO("Master config enabled: %u\n", test_bit(BTADV_AUDIO_MASTER_CONFIG,
+-		&hwep_info->flags));
+-	ret = btfm_register_codec(hwep_info);
+-end:
+-	mutex_unlock(&btfmcodec->hwep_drv_lock);
++unlock:
++	mutex_unlock(&codec->hwep_drv_lock);
++	mutex_unlock(&btfmcodec_registration_lock);
+ 	return ret;
+ }
+ 
+-int btfmcodec_unregister_hw_ep (char *driver_name)
++int btfmcodec_unregister_hw_ep(char *driver_name)
+ {
+-	struct btfmcodec_data *btfmcodec;
+-	struct hwep_data *hwep_info;
+-	int ret;
++	struct btfmcodec_data *codec = btfm_get_btfmcodec();
++	struct hwep_data *endpoint;
++	struct hwep_configurations *config, *next;
++	int ret = 0;
+ 
+-	btfmcodec = btfm_get_btfmcodec();
+-	mutex_lock(&btfmcodec->hwep_drv_lock);
+-	if (!btfmcodec) {
+-		BTFMCODEC_ERR("btfm codec driver it not initialized");
+-		ret = -EPERM;
+-		goto end;
++	if (!codec || !driver_name)
++		return -EINVAL;
++	mutex_lock(&btfmcodec_registration_lock);
++	mutex_lock(&codec->hwep_drv_lock);
++	endpoint = codec->hwep_info;
++	if (!endpoint || strncmp(endpoint->driver_name, driver_name, DEVICE_NAME_MAX_LEN)) {
++		ret = -ENOENT;
++		mutex_unlock(&codec->hwep_drv_lock);
++		goto unlock;
+ 	}
+-
+-	hwep_info = btfmcodec->hwep_info;
+-	if (!hwep_info) {
+-		BTFMCODEC_ERR("%s: no active hardware endpoint registered\n", __func__);
+-		ret = -EPERM;
+-		goto end;
++	WRITE_ONCE(codec->hwep_stopping, true);
++	mutex_unlock(&codec->hwep_drv_lock);
++	btfmcodec_stop_commands(codec);
++	synchronize_srcu(&btfmcodec_endpoint_srcu);
++	btfmcodec_drain_commands(codec);
++	/* ASoC removal may call the endpoint's remove callback. */
++	btfm_unregister_codec();
++	mutex_lock(&codec->btfmcodec_dev->read_lock);
++	skb_queue_purge(&codec->btfmcodec_dev->txq);
++	mutex_unlock(&codec->btfmcodec_dev->read_lock);
++	mutex_lock(&codec->config_lock);
++	list_for_each_entry_safe(config, next, &codec->config_head, dai_list) {
++		list_del(&config->dai_list);
++		kfree(config);
+ 	}
+-
+-	if(!strncmp(hwep_info->driver_name, driver_name, DEVICE_NAME_MAX_LEN)) {
+-		btfm_unregister_codec();
+-		kfree(hwep_info);
+-		BTFMCODEC_INFO("%s: deleted %s hardware endpoint\n", __func__, driver_name);
+-		ret = -1;
+-		goto end;
+-	} else {
+-		BTFMCODEC_ERR("%s: No hardware endpoint registered with %s\n", __func__, driver_name);
+-		ret = -1;
+-		goto end;
+-	}
+-end:
+-	mutex_unlock(&btfmcodec->hwep_drv_lock);
++	mutex_unlock(&codec->config_lock);
++	btfmcodec_set_current_state(&codec->states, IDLE);
++	mutex_lock(&codec->hwep_drv_lock);
++	WRITE_ONCE(codec->hwep_info, NULL);
++	mutex_unlock(&codec->hwep_drv_lock);
++	put_device(endpoint->dev);
++	kfree(endpoint);
++unlock:
++	mutex_unlock(&btfmcodec_registration_lock);
+ 	return ret;
+ }
+ 
+diff --git a/qcom/opensource/bt-kernel/btfmcodec/btfm_codec_interface.c b/qcom/opensource/bt-kernel/btfmcodec/btfm_codec_interface.c
+--- a/qcom/opensource/bt-kernel/btfmcodec/btfm_codec_interface.c
++++ b/qcom/opensource/bt-kernel/btfmcodec/btfm_codec_interface.c
+@@ -16,8 +16,8 @@
+ uint8_t num_channels;
+ static int btfmcodec_port_state_notify(uint8_t port_state);
+ 
+-static int btfm_codec_get_mixer_control(struct snd_kcontrol *kcontrol,
+-					struct snd_ctl_elem_value *ucontrol)
++static int btfm_codec_get_mixer_control_impl(struct snd_kcontrol *kcontrol,
++					     struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct snd_soc_component *codec = kcontrol->private_data;
+ 	struct btfmcodec_data *btfmcodec = snd_soc_component_get_drvdata(codec);
+@@ -33,18 +33,31 @@
+ 			id.name, mixer_ctrl[i].name);
+ 		if (!strncmp(id.name, mixer_ctrl[i].name, 64)) {
+ 			BTFMCODEC_DBG("Matched");
+-			mixer_ctrl[i].get(kcontrol, ucontrol);
+-			break;
++			if (!mixer_ctrl[i].get)
++				return -EOPNOTSUPP;
++			return mixer_ctrl[i].get(kcontrol, ucontrol);
+ 		}
+ 	}
+-	if (num_mixer_ctrl == i)
+-		return 0;
+-	return 1;
+-}
+-
+-
+-static int btfmcodec_put_mixer_control(struct snd_kcontrol *kcontrol,
+-				     struct snd_ctl_elem_value *ucontrol)
++	return -ENOENT;
++}
++
++static int btfm_codec_get_mixer_control(struct snd_kcontrol *kcontrol,
++					struct snd_ctl_elem_value *ucontrol)
++{
++	int idx = btfmcodec_endpoint_enter();
++	int ret;
++
++	if (idx < 0)
++		return idx;
++	mutex_lock(&btfm_get_btfmcodec()->config_lock);
++	ret = btfm_codec_get_mixer_control_impl(kcontrol, ucontrol);
++	mutex_unlock(&btfm_get_btfmcodec()->config_lock);
++	btfmcodec_endpoint_exit(idx);
++	return ret;
++}
++
++static int btfmcodec_put_mixer_control_impl(struct snd_kcontrol *kcontrol,
++					    struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct snd_soc_component *codec = kcontrol->private_data;
+ 	struct btfmcodec_data *btfmcodec = snd_soc_component_get_drvdata(codec);
+@@ -60,96 +73,108 @@
+ 			id.name, mixer_ctrl[i].name);
+ 		if (!strncmp(id.name, mixer_ctrl[i].name, 64)) {
+ 			BTFMCODEC_DBG("Matched");
+-			mixer_ctrl[i].put(kcontrol, ucontrol);
+-			break;
++			if (!mixer_ctrl[i].put)
++				return -EOPNOTSUPP;
++			return mixer_ctrl[i].put(kcontrol, ucontrol);
+ 		}
+ 	}
+-	if (num_mixer_ctrl == i)
++	return -ENOENT;
++}
++
++static int btfmcodec_put_mixer_control(struct snd_kcontrol *kcontrol,
++				       struct snd_ctl_elem_value *ucontrol)
++{
++	int idx = btfmcodec_endpoint_enter();
++	int ret;
++
++	if (idx < 0)
++		return idx;
++	mutex_lock(&btfm_get_btfmcodec()->config_lock);
++	ret = btfmcodec_put_mixer_control_impl(kcontrol, ucontrol);
++	mutex_unlock(&btfm_get_btfmcodec()->config_lock);
++	btfmcodec_endpoint_exit(idx);
++	return ret;
++}
++
++static int btfmcodec_codec_probe(struct snd_soc_component *codec)
++{
++	struct btfmcodec_data *btfmcodec = snd_soc_component_get_drvdata(codec);
++	struct hwep_data *hwep_info = btfmcodec->hwep_info;
++	struct snd_kcontrol_new *controls;
++	int count = hwep_info->num_mixer_ctrl;
++	int ret, i;
++
++	if (hwep_info->drv && hwep_info->drv->hwep_probe) {
++		ret = hwep_info->drv->hwep_probe(codec);
++		if (ret)
++			return ret;
++	}
++	if (!count)
+ 		return 0;
+-	return 1;
+-}
+-
+-static int btfmcodec_codec_probe(struct snd_soc_component *codec)
++	controls = kmemdup(hwep_info->mixer_ctrl, count * sizeof(*controls), GFP_KERNEL);
++	if (!controls) {
++		ret = -ENOMEM;
++		goto remove;
++	}
++	for (i = 0; i < count; i++) {
++		if (controls[i].get)
++			controls[i].get = btfm_codec_get_mixer_control;
++		if (controls[i].put)
++			controls[i].put = btfmcodec_put_mixer_control;
++	}
++	ret = snd_soc_add_component_controls(codec, controls, count);
++	kfree(controls);
++	if (!ret)
++		return 0;
++remove:
++	if (hwep_info->drv && hwep_info->drv->hwep_remove)
++		hwep_info->drv->hwep_remove(codec);
++	return ret;
++}
++
++static void btfmcodec_codec_remove(struct snd_soc_component *codec)
+ {
+ 	struct btfmcodec_data *btfmcodec = snd_soc_component_get_drvdata(codec);
+-	struct btfmcodec_state_machine *state = &btfmcodec->states;
+ 	struct hwep_data *hwep_info = btfmcodec->hwep_info;
+-	int num_mixer_ctrl = hwep_info->num_mixer_ctrl;
+-	BTFMCODEC_DBG("");
+-
+-	// ToDo: check Whether probe has to allowed when state if different
+-	if (btfmcodec_get_current_transport(state)!= IDLE) {
+-		BTFMCODEC_WARN("Received probe when state is :%s",
+-			coverttostring(btfmcodec_get_current_transport(state)));
+-	} else if (hwep_info->drv && hwep_info->drv->hwep_probe) {
+-		hwep_info->drv->hwep_probe(codec);
+-		/* Register mixer control */
+-		if (hwep_info->mixer_ctrl && num_mixer_ctrl >= 1) {
+-			struct snd_kcontrol_new *mixer_ctrl;
+-			int i = 0;
+-			mixer_ctrl = (struct snd_kcontrol_new *)
+-				      kzalloc(num_mixer_ctrl *
+-				      sizeof(struct snd_kcontrol_new), GFP_KERNEL);
+-			if (!mixer_ctrl) {
+-				BTFMCODEC_ERR("failed to register mixer controls");
+-				goto end;
+-			}
+-
+-			BTFMCODEC_INFO("Registering %d mixer controls", num_mixer_ctrl);
+-			memcpy(mixer_ctrl, hwep_info->mixer_ctrl, num_mixer_ctrl * sizeof(struct snd_kcontrol_new));
+-			for (; i< num_mixer_ctrl; i++) {
+-				BTFMCODEC_INFO("name of control:%s", mixer_ctrl[i].name);
+-				mixer_ctrl[i].get = btfm_codec_get_mixer_control;
+-			        mixer_ctrl[i].put = btfmcodec_put_mixer_control;
+-			}
+-			snd_soc_add_component_controls(codec, mixer_ctrl, num_mixer_ctrl);
+-			kfree(mixer_ctrl);
+-			BTFMCODEC_INFO("CODEC address while registering mixer ctrl:%p", codec);
+-		}
+-	}
+-
+-end:
+-	// ToDo to add mixer control.
+-	return 0;
+-}
+-
+-static void btfmcodec_codec_remove(struct snd_soc_component *codec)
++
++	if (hwep_info->drv && hwep_info->drv->hwep_remove)
++		hwep_info->drv->hwep_remove(codec);
++}
++
++static int btfmcodec_codec_write_impl(struct snd_soc_component *codec,
++				      unsigned int reg, unsigned int value)
+ {
+ 	struct btfmcodec_data *btfmcodec = snd_soc_component_get_drvdata(codec);
+ 	struct btfmcodec_state_machine *state = &btfmcodec->states;
+ 	struct hwep_data *hwep_info = btfmcodec->hwep_info;
+ 	BTFMCODEC_DBG("");
+ 
+-	// ToDo: check whether remove has to allowed when state if different
+-	if (btfmcodec_get_current_transport(state)!= IDLE) {
+-		BTFMCODEC_WARN("Received probe when state is :%s",
+-			coverttostring(btfmcodec_get_current_transport(state)));
+-	} else if (hwep_info->drv && hwep_info->drv->hwep_remove) {
+-		hwep_info->drv->hwep_remove(codec);
+-	}
+-}
+-
+-static int btfmcodec_codec_write(struct snd_soc_component *codec,
+-			unsigned int reg, unsigned int value)
+-{
+-	struct btfmcodec_data *btfmcodec = snd_soc_component_get_drvdata(codec);
+-	struct btfmcodec_state_machine *state = &btfmcodec->states;
+-	struct hwep_data *hwep_info = btfmcodec->hwep_info;
+-	BTFMCODEC_DBG("");
+-
+ 	// ToDo: check whether write has to allowed when state if different
+ 	if (btfmcodec_get_current_transport(state)!= IDLE) {
+ 		BTFMCODEC_WARN("Received probe when state is :%s",
+ 			coverttostring(btfmcodec_get_current_transport(state)));
+-	} else if (hwep_info->drv && hwep_info->drv->hwep_remove) {
++	} else if (hwep_info->drv && hwep_info->drv->hwep_write) {
+ 		return hwep_info->drv->hwep_write(codec, reg, value);
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-static unsigned int btfmcodec_codec_read(struct snd_soc_component *codec,
+-				unsigned int reg)
++static int btfmcodec_codec_write(struct snd_soc_component *codec,
++				 unsigned int reg, unsigned int value)
++{
++	int idx = btfmcodec_endpoint_enter();
++	int ret;
++
++	if (idx < 0)
++		return idx;
++	ret = btfmcodec_codec_write_impl(codec, reg, value);
++	btfmcodec_endpoint_exit(idx);
++	return ret;
++}
++
++static unsigned int btfmcodec_codec_read_impl(struct snd_soc_component *codec,
++					      unsigned int reg)
+ {
+ 	struct btfmcodec_data *btfmcodec = snd_soc_component_get_drvdata(codec);
+ 	struct btfmcodec_state_machine *state = &btfmcodec->states;
+@@ -167,6 +192,19 @@
+ 	return 0;
+ }
+ 
++static unsigned int btfmcodec_codec_read(struct snd_soc_component *codec,
++					 unsigned int reg)
++{
++	int idx = btfmcodec_endpoint_enter();
++	unsigned int ret;
++
++	if (idx < 0)
++		return idx;
++	ret = btfmcodec_codec_read_impl(codec, reg);
++	btfmcodec_endpoint_exit(idx);
++	return ret;
++}
++
+ static const struct snd_soc_component_driver btfmcodec_codec_component = {
+ 	.probe	= btfmcodec_codec_probe,
+ 	.remove	= btfmcodec_codec_remove,
+@@ -174,7 +212,6 @@
+ 	.write	= btfmcodec_codec_write,
+ };
+ 
+-
+ static inline void * btfmcodec_get_dai_drvdata(struct hwep_data *hwep_info)
+ {
+ 	if (!hwep_info || !hwep_info->dai_drv) return NULL;
+@@ -194,8 +231,8 @@
+ 	}
+ }
+ 
+-static int btfmcodec_dai_startup(struct snd_pcm_substream *substream,
+-		struct snd_soc_dai *dai)
++static int btfmcodec_dai_startup_impl(struct snd_pcm_substream *substream,
++				      struct snd_soc_dai *dai)
+ {
+ 	struct btfmcodec_data *btfmcodec = snd_soc_component_get_drvdata(dai->component);
+ 	struct btfmcodec_state_machine *state = &btfmcodec->states;
+@@ -212,6 +249,21 @@
+ 	}
+ 
+ 	return 0;
++}
++
++static int btfmcodec_dai_startup(struct snd_pcm_substream *substream,
++				 struct snd_soc_dai *dai)
++{
++	int idx = btfmcodec_endpoint_enter();
++	int ret;
++
++	if (idx < 0)
++		return idx;
++	mutex_lock(&btfm_get_btfmcodec()->config_lock);
++	ret = btfmcodec_dai_startup_impl(substream, dai);
++	mutex_unlock(&btfm_get_btfmcodec()->config_lock);
++	btfmcodec_endpoint_exit(idx);
++	return ret;
+ }
+ 
+ int btfmcodec_hwep_shutdown(struct btfmcodec_data *btfmcodec, int id,
+@@ -223,8 +275,6 @@
+ 					      btfmcodec_get_dai_drvdata(hwep_info);
+ 	struct btfmcodec_state_machine *state = &btfmcodec->states;
+ 	struct btm_master_shutdown_req shutdown_req;
+-	wait_queue_head_t *rsp_wait_q =
+-			&btfmcodec_dev->rsp_wait_q[BTM_PKT_TYPE_MASTER_SHUTDOWN_RSP];
+ 	uint8_t *status = &btfmcodec_dev->status[BTM_PKT_TYPE_MASTER_SHUTDOWN_RSP];
+ 	int ret = 0;
+ 
+@@ -238,21 +288,13 @@
+ 		shutdown_req.stream_id = id;
+ 		/* See if we need to protect below with lock */
+ 		*status = BTM_WAITING_RSP;
+-		btfmcodec_dev_enqueue_pkt(btfmcodec_dev, &shutdown_req, (shutdown_req.len +
++		ret = btfmcodec_dev_enqueue_pkt(btfmcodec_dev, &shutdown_req, (shutdown_req.len +
+ 					BTM_HEADER_LEN));
+ 
+-		ret = wait_event_interruptible_timeout(*rsp_wait_q,
+-			(*status) != BTM_WAITING_RSP,
+-			msecs_to_jiffies(BTM_MASTER_CONFIG_RSP_TIMEOUT));
+-		if (ret == 0) {
+-			BTFMCODEC_ERR("failed to recevie response from BTADV audio Manager");
+-		} else {
+-			if (*status == BTM_RSP_RECV)
+-				ret = 0;
+-			else if (*status == BTM_FAIL_RESP_RECV ||
+-				 *status == BTM_RSP_NOT_RECV_CLIENT_KILLED)
+-				ret = -1;
+-		}
++		if (!ret)
++			ret = btfmcodec_wait_response(btfmcodec_dev,
++						      BTM_PKT_TYPE_MASTER_SHUTDOWN_RSP,
++				BTM_MASTER_CONFIG_RSP_TIMEOUT);
+ 	} else {
+ 		if (!disable_master)
+ 		BTFMCODEC_WARN("Not sending master shutdown request as graph might have closed");
+@@ -268,7 +310,7 @@
+ 	return ret;
+ }
+ 
+-void btfmcodec_wq_hwep_shutdown(struct work_struct *work)
++static void btfmcodec_wq_hwep_shutdown_impl(struct work_struct *work)
+ {
+ 	struct btfmcodec_char_device *btfmcodec_dev = container_of(work,
+ 						struct btfmcodec_char_device,
+@@ -301,6 +343,18 @@
+ 	wake_up_interruptible(&btfmcodec_dev->rsp_wait_q[idx]);
+ }
+ 
++void btfmcodec_wq_hwep_shutdown(struct work_struct *work)
++{
++	int idx = btfmcodec_endpoint_enter();
++
++	if (idx < 0)
++		return;
++	mutex_lock(&btfm_get_btfmcodec()->config_lock);
++	btfmcodec_wq_hwep_shutdown_impl(work);
++	mutex_unlock(&btfm_get_btfmcodec()->config_lock);
++	btfmcodec_endpoint_exit(idx);
++}
++
+ static int btfmcodec_delete_configs(struct btfmcodec_data *btfmcodec, uint8_t id)
+ {
+ 	struct list_head *head = &btfmcodec->config_head;
+@@ -311,6 +365,7 @@
+ 		if (hwep_configs->stream_id == id) {
+ 			BTFMCODEC_INFO("deleting configs with id %d", id);
+ 			list_del(&hwep_configs->dai_list);
++			kfree(hwep_configs);
+ 			ret = 1;
+ 			break;
+ 		}
+@@ -319,14 +374,14 @@
+ 	return ret;
+ }
+ 
+-static void btfmcodec_dai_shutdown(struct snd_pcm_substream *substream,
+-				 struct snd_soc_dai *dai)
++static void btfmcodec_dai_shutdown_impl(struct snd_pcm_substream *substream,
++					struct snd_soc_dai *dai)
+ {
+ 	struct btfmcodec_data *btfmcodec = snd_soc_component_get_drvdata(dai->component);
+ 	struct btfmcodec_state_machine *state = &btfmcodec->states;
+ 
+-	BTFMCODEC_DBG("dai->name: %s, dai->id: %d, dai->rate: %d", dai->name,
+-		dai->id, dai->rate);
++	BTFMCODEC_DBG("dai->name: %s, dai->id: %d, substream->runtime->rate: %d", dai->name,
++		      dai->id, substream->runtime->rate);
+ 
+ 	if (btfmcodec_get_current_transport(state) == IDLE) {
+ 		BTFMCODEC_INFO("%s not allowing shutdown as state is IDLE", __func__);   
+@@ -347,7 +402,7 @@
+ 			__func__);
+ 		btfmcodec_hwep_shutdown(btfmcodec, dai->id, false);
+ 		btfmcodec_delete_configs(btfmcodec, dai->id);
+-		if (!btfmcodec_is_valid_cache_avb(btfmcodec))
++		if (!!list_empty(&btfmcodec->config_head))
+ 			btfmcodec_set_current_state(state, IDLE);
+ 		return;
+ 	}
+@@ -364,7 +419,7 @@
+ 		/* first master shutdown has to done */
+ 		btfmcodec_hwep_shutdown(btfmcodec, dai->id, false);
+ 		btfmcodec_delete_configs(btfmcodec, dai->id);
+-		if (!btfmcodec_is_valid_cache_avb(btfmcodec))
++		if (!!list_empty(&btfmcodec->config_head))
+ 			btfmcodec_set_current_state(state, IDLE);
+ 		else {
+ 			BTFMCODEC_WARN("valid stream id is available not updating state\n");
+@@ -373,6 +428,19 @@
+ 	}
+ }
+ 
++static void btfmcodec_dai_shutdown(struct snd_pcm_substream *substream,
++				   struct snd_soc_dai *dai)
++{
++	int idx = btfmcodec_endpoint_enter();
++
++	if (idx < 0)
++		return;
++	mutex_lock(&btfm_get_btfmcodec()->config_lock);
++	btfmcodec_dai_shutdown_impl(substream, dai);
++	mutex_unlock(&btfm_get_btfmcodec()->config_lock);
++	btfmcodec_endpoint_exit(idx);
++}
++
+ int btfmcodec_hwep_hw_params (struct btfmcodec_data *btfmcodec, uint32_t bps,
+ 			      uint32_t direction, uint8_t num_channels)
+ {
+@@ -389,9 +457,9 @@
+ 	}
+ }
+ 
+-static int btfmcodec_dai_hw_params(struct snd_pcm_substream *substream,
+-			    struct snd_pcm_hw_params *params,
+-			    struct snd_soc_dai *dai)
++static int btfmcodec_dai_hw_params_impl(struct snd_pcm_substream *substream,
++					struct snd_pcm_hw_params *params,
++					struct snd_soc_dai *dai)
+ {
+ 	struct btfmcodec_data *btfmcodec = snd_soc_component_get_drvdata(dai->component);
+ 	struct btfmcodec_state_machine *state = &btfmcodec->states;
+@@ -415,17 +483,35 @@
+ 	return 0;
+ }
+ 
++static int btfmcodec_dai_hw_params(struct snd_pcm_substream *substream,
++				   struct snd_pcm_hw_params *params,
++			    struct snd_soc_dai *dai)
++{
++	int idx = btfmcodec_endpoint_enter();
++	int ret;
++
++	if (idx < 0)
++		return idx;
++	mutex_lock(&btfm_get_btfmcodec()->config_lock);
++	ret = btfmcodec_dai_hw_params_impl(substream, params, dai);
++	mutex_unlock(&btfm_get_btfmcodec()->config_lock);
++	btfmcodec_endpoint_exit(idx);
++	return ret;
++}
++
+ bool btfmcodec_is_valid_cache_avb(struct btfmcodec_data *btfmcodec)
+ {
+ 	struct list_head *head = &btfmcodec->config_head;
+ 	struct hwep_configurations *hwep_configs, *tmp;
+ 	bool cache_avb = false;
+ 
++	mutex_lock(&btfmcodec->config_lock);
+ 	list_for_each_entry_safe(hwep_configs, tmp, head, dai_list) {
+ 		cache_avb = true;
+ 		break;
+ 	}
+ 
++	mutex_unlock(&btfmcodec->config_lock);
+ 	return cache_avb;
+ }
+ 
+@@ -434,21 +520,22 @@
+ 				   int id, uint8_t codectype)
+ {
+ 	struct list_head *head = &btfmcodec->config_head;
+-	struct hwep_configurations *hwep_configs, *tmp;
+-
+-	list_for_each_entry_safe(hwep_configs, tmp, head, dai_list) {
+-		if (hwep_configs->stream_id == id) {
+-			BTFMCODEC_WARN("previous entry for %d is already available",
+-				id);
+-			list_del(&hwep_configs->dai_list);
+-		}
+-	}
++	struct hwep_configurations *hwep_configs, *tmp, *old;
+ 
+ 	hwep_configs = kzalloc(sizeof(struct hwep_configurations),
+ 				GFP_KERNEL);
+ 	if (!hwep_configs) {
+ 		BTFMCODEC_ERR("failed to allocate memory");
+ 		return -ENOMEM;
++	}
++
++	list_for_each_entry_safe(tmp, old, head, dai_list) {
++		if (tmp->stream_id == id) {
++			BTFMCODEC_WARN("previous entry for %d is already available",
++				       id);
++			list_del(&tmp->dai_list);
++			kfree(tmp);
++		}
+ 	}
+ 
+ 	hwep_configs->stream_id = id; /* Stream identifier */
+@@ -467,18 +554,18 @@
+ {
+ 	struct btfmcodec_char_device *btfmcodec_dev = btfmcodec->btfmcodec_dev;
+ 	struct hwep_data *hwep_info = btfmcodec->hwep_info;
+-	struct master_hwep_configurations hwep_configs;
+-	struct btm_master_config_req config_req;
++	struct master_hwep_configurations hwep_configs = { 0 };
++	struct btm_master_config_req config_req = { 0 };
+ 	struct hwep_dai_driver *dai_drv = (struct hwep_dai_driver *)
+ 					      btfmcodec_get_dai_drvdata(hwep_info);
+-	wait_queue_head_t *rsp_wait_q =
+-		&btfmcodec_dev->rsp_wait_q[BTM_PKT_TYPE_MASTER_CONFIG_RSP];
+ 	uint8_t *status = &btfmcodec_dev->status[BTM_PKT_TYPE_MASTER_CONFIG_RSP];
+ 	int ret = 0;
+ 
+ 	if (dai_drv && dai_drv->dai_ops && dai_drv->dai_ops->hwep_get_configs) {
+-		dai_drv->dai_ops->hwep_get_configs((void *)btfmcodec->hwep_info,
++		ret = dai_drv->dai_ops->hwep_get_configs((void *)btfmcodec->hwep_info,
+ 						   &hwep_configs, id);
++		if (ret < 0)
++			return ret;
+ 	} else {
+ 		BTFMCODEC_ERR("No hwep_get_configs is set by hw ep driver");
+ 		return -1;
+@@ -506,41 +593,30 @@
+ 	BTFMCODEC_DBG("================================================\n");
+ 	/* See if we need to protect below with lock */
+ 	*status = BTM_WAITING_RSP;
+-	btfmcodec_dev_enqueue_pkt(btfmcodec_dev, &config_req, (config_req.len +
++	ret = btfmcodec_dev_enqueue_pkt(btfmcodec_dev, &config_req, (config_req.len +
+ 				BTM_HEADER_LEN));
+-	ret = wait_event_interruptible_timeout(*rsp_wait_q,
+-		(*status) != BTM_WAITING_RSP,
+-		msecs_to_jiffies(BTM_MASTER_CONFIG_RSP_TIMEOUT));
+-	if (ret == 0) {
+-		BTFMCODEC_ERR("failed to recevie response from BTADV audio Manager");
+-		ret = -ETIMEDOUT;
+-	} else {
+-		if (*status == BTM_RSP_RECV)
+-			return 0;
+-		else if (*status == BTM_FAIL_RESP_RECV ||
+-			 *status == BTM_RSP_NOT_RECV_CLIENT_KILLED)
+-			return -1;
+-	}
+-
+-	return ret;
++	if (ret < 0)
++		return ret;
++	return btfmcodec_wait_response(btfmcodec_dev, BTM_PKT_TYPE_MASTER_CONFIG_RSP,
++				       BTM_MASTER_CONFIG_RSP_TIMEOUT);
+ }
+ 
+ static int btfmcodec_configure_dma(struct btfmcodec_data *btfmcodec, uint8_t id)
+ {
+ 	struct btfmcodec_char_device *btfmcodec_dev = btfmcodec->btfmcodec_dev;
+ 	struct hwep_data *hwep_info = btfmcodec->hwep_info;
+-	struct hwep_dma_configurations dma_config;
+-	struct btm_dma_config_req dma_config_req;
++	struct hwep_dma_configurations dma_config = { 0 };
++	struct btm_dma_config_req dma_config_req = { 0 };
+ 	struct hwep_dai_driver *dai_drv = (struct hwep_dai_driver *)
+ 					      btfmcodec_get_dai_drvdata(hwep_info);
+-	wait_queue_head_t *rsp_wait_q =
+-		&btfmcodec_dev->rsp_wait_q[BTM_PKT_TYPE_DMA_CONFIG_RSP];
+ 	uint8_t *status = &btfmcodec_dev->status[BTM_PKT_TYPE_DMA_CONFIG_RSP];
+ 	int ret = 0;
+ 
+ 	if (dai_drv && dai_drv->dai_ops && dai_drv->dai_ops->hwep_get_configs) {
+-		dai_drv->dai_ops->hwep_get_configs((void *)btfmcodec->hwep_info,
++		ret = dai_drv->dai_ops->hwep_get_configs((void *)btfmcodec->hwep_info,
+ 						   &dma_config, id);
++		if (ret < 0)
++			return ret;
+ 	} else {
+ 		BTFMCODEC_ERR("No hwep_get_configs is set by hw ep driver");
+ 		return -1;
+@@ -571,25 +647,13 @@
+ 	BTFMCODEC_DBG("================================================\n");
+ 
+ 	*status = BTM_WAITING_RSP;
+-	btfmcodec_dev_enqueue_pkt(btfmcodec_dev, &dma_config_req, (dma_config_req.len +
++	ret = btfmcodec_dev_enqueue_pkt(btfmcodec_dev, &dma_config_req, (dma_config_req.len +
+ 				BTM_HEADER_LEN));
+-
+-	ret = wait_event_interruptible_timeout(*rsp_wait_q,
+-		(*status) != BTM_WAITING_RSP,
+-		msecs_to_jiffies(BTM_MASTER_DMA_CONFIG_RSP_TIMEOUT));
+-
+-	if (ret == 0) {
+-		BTFMCODEC_ERR("failed to recevie response from BTADV audio Manager");
+-		ret = -ETIMEDOUT;
+-	} else {
+-		if (*status == BTM_RSP_RECV)
+-			return 0;
+-		else if (*status == BTM_FAIL_RESP_RECV ||
+-			 *status == BTM_RSP_NOT_RECV_CLIENT_KILLED)
+-			return -1;
+-	}
+-
+-	return ret;
++	if (ret < 0)
++		return ret;
++
++	return btfmcodec_wait_response(btfmcodec_dev, BTM_PKT_TYPE_DMA_CONFIG_RSP,
++				       BTM_MASTER_DMA_CONFIG_RSP_TIMEOUT);
+ }
+ 
+ int btfmcodec_hwep_prepare(struct btfmcodec_data *btfmcodec, uint32_t sampling_rate,
+@@ -641,8 +705,6 @@
+ {
+ 	struct btfmcodec_char_device *btfmcodec_dev = btfmcodec->btfmcodec_dev;
+ 	struct btm_usecase_start_ind ind;
+-	wait_queue_head_t *rsp_wait_q =
+-		&btfmcodec_dev->rsp_wait_q[BTM_PKT_TYPE_USECASE_START_RSP];
+ 	uint8_t *status = &btfmcodec_dev->status[BTM_PKT_TYPE_USECASE_START_RSP];
+ 	int ret;
+ 
+@@ -657,46 +719,34 @@
+ 		return ret;
+ 
+ 	BTFMCODEC_INFO("waiting for BTM_BTFMCODEC_USECASE_START_RSP");
+-	ret = wait_event_interruptible_timeout(*rsp_wait_q,
+-		*status != BTM_WAITING_RSP,
+-		msecs_to_jiffies(BTM_MASTER_CONFIG_RSP_TIMEOUT));
+-
+-	if (ret == 0) {
+-		BTFMCODEC_ERR("failed to recevie BTM_USECASE_START_IND_RSP");
+-		ret = -MSG_INTERNAL_TIMEOUT;
+-	} else {
+-		if (*status == BTM_RSP_RECV) {
+-			ret = 0;
+-		} else if (*status == BTM_FAIL_RESP_RECV) {
+-			BTFMCODEC_ERR("Rx BTM_USECASE_START_IND_RSP with failure status");
+-			ret = -1;
+-		} else if (*status == BTM_RSP_NOT_RECV_CLIENT_KILLED) {
+-			BTFMCODEC_ERR("client killed so moving further");
+-			ret = -1;
+-		}
+-	}
+-	return ret;
+-}
+-
+-static int btfmcodec_dai_prepare(struct snd_pcm_substream *substream,
+-		struct snd_soc_dai *dai)
++	return btfmcodec_wait_response(btfmcodec_dev, BTM_PKT_TYPE_USECASE_START_RSP,
++				       BTM_MASTER_CONFIG_RSP_TIMEOUT);
++}
++
++static int btfmcodec_dai_prepare_impl(struct snd_pcm_substream *substream,
++				      struct snd_soc_dai *dai)
+ {
+ 	struct btfmcodec_data *btfmcodec = snd_soc_component_get_drvdata(dai->component);
+ 	struct btfmcodec_state_machine *state = &btfmcodec->states;
+ 	struct hwep_data *hwep_info = btfmcodec->hwep_info;
+ 	struct hwep_dai_driver *dai_drv = (struct hwep_dai_driver *)
+ 					      btfmcodec_get_dai_drvdata(hwep_info);
+-	uint8_t *codectype = dai_drv->dai_ops->hwep_codectype;
+-	uint32_t sampling_rate = dai->rate;
++	u8 *codectype = dai_drv && dai_drv->dai_ops ?
++		dai_drv->dai_ops->hwep_codectype : NULL;
++	u32 sampling_rate = substream->runtime->rate;
+ 	uint32_t direction = substream->stream;
+ 	int id = dai->id;
+ 	int ret ;
+ 
+-	BTFMCODEC_INFO("dai->name: %s, dai->id: %d, dai->rate: %d direction: %d",
+-		dai->name, id, sampling_rate, direction);
+-
++	BTFMCODEC_INFO("dai->name: %s, dai->id: %d, substream->runtime->rate: %d direction: %d",
++		       dai->name, id, sampling_rate, direction);
++
++	if (!dai_drv || !dai_drv->dai_ops || !dai_drv->dai_ops->hwep_codectype)
++		return -EINVAL;
+ 	ret = btfmcodec_check_and_cache_configs(btfmcodec, sampling_rate,
+ 						direction, id, *codectype);
++	if (ret < 0)
++		return ret;
+ 	if (btfmcodec_get_current_transport(state) != IDLE &&
+ 	    btfmcodec_get_current_transport(state) != BT_Connected) {
+ 		BTFMCODEC_WARN("cached required info as state is:%s",
+@@ -713,6 +763,21 @@
+ 	return ret;
+ }
+ 
++static int btfmcodec_dai_prepare(struct snd_pcm_substream *substream,
++				 struct snd_soc_dai *dai)
++{
++	int idx = btfmcodec_endpoint_enter();
++	int ret;
++
++	if (idx < 0)
++		return idx;
++	mutex_lock(&btfm_get_btfmcodec()->config_lock);
++	ret = btfmcodec_dai_prepare_impl(substream, dai);
++	mutex_unlock(&btfm_get_btfmcodec()->config_lock);
++	btfmcodec_endpoint_exit(idx);
++	return ret;
++}
++
+ int btfmcodec_hwep_set_channel_map(void *hwep_info, unsigned int tx_num,
+ 				unsigned int *tx_slot, unsigned int rx_num,
+ 				unsigned int *rx_slot)
+@@ -730,25 +795,49 @@
+ 
+ }
+ 
+-static int btfmcodec_dai_set_channel_map(struct snd_soc_dai *dai,
+-				unsigned int tx_num, unsigned int *tx_slot,
+-				unsigned int rx_num, unsigned int *rx_slot)
++static int btfmcodec_dai_set_channel_map_impl(struct snd_soc_dai *dai,
++					      unsigned int tx_num, const unsigned int *tx_slot,
++					      unsigned int rx_num, const unsigned int *rx_slot)
+ {
+ 	struct btfmcodec_data *btfmcodec = snd_soc_component_get_drvdata(dai->component);
+-	struct btfmcodec_state_machine states = btfmcodec->states;
++	unsigned int tx_copy[16], rx_copy[16];
++	btfmcodec_state current_state = btfmcodec_get_current_transport(&btfmcodec->states);
++
++	if (tx_num > ARRAY_SIZE(tx_copy) || rx_num > ARRAY_SIZE(rx_copy) ||
++	    (tx_num && !tx_slot) || (rx_num && !rx_slot))
++		return -EINVAL;
++	if (tx_num)
++		memcpy(tx_copy, tx_slot, tx_num * sizeof(*tx_slot));
++	if (rx_num)
++		memcpy(rx_copy, rx_slot, rx_num * sizeof(*rx_slot));
+ 
+ 	BTFMCODEC_DBG("");
+ 	// ToDo: check whether hw_params has to allowed when state if different
+-	if (states.current_state != IDLE) {
+-		BTFMCODEC_WARN("Received probe when state is :%s", coverttostring(states.current_state));
++	if (current_state != IDLE) {
++		BTFMCODEC_WARN("Received probe when state is :%s", coverttostring(current_state));
+ 	} else {
+ 		return btfmcodec_hwep_set_channel_map((void *)btfmcodec->hwep_info, tx_num,
+-						   tx_slot, rx_num, rx_slot);
++						   tx_copy, rx_num, rx_copy);
+ 	}
+ 
+ 	return 0;
+ }
+ 
++static int btfmcodec_dai_set_channel_map(struct snd_soc_dai *dai,
++					 unsigned int tx_num, const unsigned int *tx_slot,
++				unsigned int rx_num, const unsigned int *rx_slot)
++{
++	int idx = btfmcodec_endpoint_enter();
++	int ret;
++
++	if (idx < 0)
++		return idx;
++	mutex_lock(&btfm_get_btfmcodec()->config_lock);
++	ret = btfmcodec_dai_set_channel_map_impl(dai, tx_num, tx_slot, rx_num, rx_slot);
++	mutex_unlock(&btfm_get_btfmcodec()->config_lock);
++	btfmcodec_endpoint_exit(idx);
++	return ret;
++}
+ 
+ int btfmcodec_hwep_get_channel_map(void *hwep_info, unsigned int *tx_num,
+ 				unsigned int *tx_slot, unsigned int *rx_num,
+@@ -766,9 +855,9 @@
+ 	}
+ }
+ 
+-static int btfmcodec_dai_get_channel_map(struct snd_soc_dai *dai,
+-				 unsigned int *tx_num, unsigned int *tx_slot,
+-				 unsigned int *rx_num, unsigned int *rx_slot)
++static int btfmcodec_dai_get_channel_map_impl(const struct snd_soc_dai *dai,
++					      unsigned int *tx_num, unsigned int *tx_slot,
++					      unsigned int *rx_num, unsigned int *rx_slot)
+ {
+ 	struct btfmcodec_data *btfmcodec = snd_soc_component_get_drvdata(dai->component);
+ //	struct btfmcodec_state_machine states = btfmcodec->states;
+@@ -786,7 +875,23 @@
+ 	return 0;
+ }
+ 
+-void btfmcodec_wq_hwep_configure(struct work_struct *work)
++static int btfmcodec_dai_get_channel_map(const struct snd_soc_dai *dai,
++					 unsigned int *tx_num, unsigned int *tx_slot,
++				 unsigned int *rx_num, unsigned int *rx_slot)
++{
++	int idx = btfmcodec_endpoint_enter();
++	int ret;
++
++	if (idx < 0)
++		return idx;
++	mutex_lock(&btfm_get_btfmcodec()->config_lock);
++	ret = btfmcodec_dai_get_channel_map_impl(dai, tx_num, tx_slot, rx_num, rx_slot);
++	mutex_unlock(&btfm_get_btfmcodec()->config_lock);
++	btfmcodec_endpoint_exit(idx);
++	return ret;
++}
++
++static void btfmcodec_wq_hwep_configure_impl(struct work_struct *work)
+ {
+ 	struct btfmcodec_char_device *btfmcodec_dev = container_of(work,
+ 						struct btfmcodec_char_device,
+@@ -794,7 +899,7 @@
+ 	struct btfmcodec_data *btfmcodec = (struct btfmcodec_data *)btfmcodec_dev->btfmcodec;
+ 	struct list_head *head = &btfmcodec->config_head;
+ 	struct hwep_configurations *hwep_configs = NULL, *tmp;
+-	int ret;
++	int ret = -ENODATA;
+ 	int idx = BTM_PKT_TYPE_HWEP_CONFIG;
+ 	uint32_t sample_rate, direction;
+ 	uint8_t id, bit_width, codectype, num_channels;
+@@ -814,7 +919,7 @@
+ 		if (ret >= 0)
+ 			ret = btfmcodec_hwep_prepare(btfmcodec, sample_rate, direction, id, true);
+ 		if (ret < 0) {
+-			hwep_configs->is_port_opened = 1;
++			hwep_configs->is_port_opened = 0;
+ 			BTFMCODEC_ERR("failed to configure hwep %d", hwep_configs->stream_id);
+ 			break;
+ 		} else {
+@@ -841,6 +946,19 @@
+ 	}
+ 	wake_up_interruptible(&btfmcodec_dev->rsp_wait_q[idx]);
+ }
++
++void btfmcodec_wq_hwep_configure(struct work_struct *work)
++{
++	int idx = btfmcodec_endpoint_enter();
++
++	if (idx < 0)
++		return;
++	mutex_lock(&btfm_get_btfmcodec()->config_lock);
++	btfmcodec_wq_hwep_configure_impl(work);
++	mutex_unlock(&btfm_get_btfmcodec()->config_lock);
++	btfmcodec_endpoint_exit(idx);
++}
++
+ static struct snd_soc_dai_ops btfmcodec_dai_ops = {
+ 	.startup = btfmcodec_dai_startup,
+ 	.shutdown = btfmcodec_dai_shutdown,
+@@ -904,13 +1022,11 @@
+ int btfm_register_codec(struct hwep_data *hwep_info)
+ {
+ 	struct btfmcodec_data *btfmcodec;
+-	struct btfmcodec_char_device *btfmcodec_dev;
+ 	struct device *dev;
+ 	struct hwep_dai_driver *dai_drv;
+ 	int i, ret;
+ 
+ 	btfmcodec = btfm_get_btfmcodec();
+-	btfmcodec_dev = btfmcodec->btfmcodec_dev;
+ 	dev = &btfmcodec->dev;
+ 
+ 	btfmcodec->notifier.nb.notifier_call = btfmcodec_adsp_ssr_notify;
+@@ -925,6 +1041,9 @@
+ 	btfmcodec_dai_info = kzalloc((sizeof(struct snd_soc_dai_driver) * hwep_info->num_dai), GFP_KERNEL);
+ 	if (!btfmcodec_dai_info) {
+ 		BTFMCODEC_ERR("failed to allocate memory");
++		qcom_unregister_ssr_notifier(btfmcodec->notifier.notifier,
++					     &btfmcodec->notifier.nb);
++		btfmcodec->notifier.notifier = NULL;
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -939,25 +1058,30 @@
+ 
+ 	BTFMCODEC_INFO("Adding %d dai support to codec", hwep_info->num_dai);
+ 	BTFMCODEC_INFO("slim bus driver name:%s", dev->driver->name);
++	if (btfmcodec_cp_supported()) {
++		if (!strcmp(hwep_info->driver_name, "btfmslim"))
++			set_bit(BTADV_AUDIO_MASTER_CONFIG, &hwep_info->flags);
++		else if (!strcmp(hwep_info->driver_name, "btfmswr_slave"))
++			set_bit(BTADV_CONFIGURE_DMA, &hwep_info->flags);
++
++	BTFMCODEC_INFO("%s: master %d dma codec %d", __func__,
++		       (int)test_bit(BTADV_AUDIO_MASTER_CONFIG, &hwep_info->flags),
++			(int)test_bit(BTADV_CONFIGURE_DMA, &hwep_info->flags));
++	}
++
+ 	ret = snd_soc_register_component(dev, &btfmcodec_codec_component,
+ 					btfmcodec_dai_info, hwep_info->num_dai);
+ 	BTFMCODEC_INFO("Dev node address: %p", dev);
+ 	BTFMCODEC_INFO("btfmcodec address :%p", btfmcodec);
+ 	BTFMCODEC_INFO("HWEPINFO address:%p", hwep_info);
+ 	BTFMCODEC_INFO("btfmcodec_dev INFO address:%p", btfmcodec->btfmcodec_dev);
+-	INIT_WORK(&btfmcodec_dev->wq_hwep_shutdown, btfmcodec_wq_hwep_shutdown);
+-	INIT_WORK(&btfmcodec_dev->wq_prepare_bearer, btfmcodec_wq_prepare_bearer);
+-	INIT_WORK(&btfmcodec_dev->wq_hwep_configure, btfmcodec_wq_hwep_configure);
+-
+-	if (isCpSupported()) {
+-		if (!strcmp(hwep_info->driver_name, "btfmslim"))
+-			set_bit(BTADV_AUDIO_MASTER_CONFIG, &hwep_info->flags);
+-		else if (!strcmp(hwep_info->driver_name, "btfmswr_slave"))
+-			set_bit(BTADV_CONFIGURE_DMA, &hwep_info->flags);
+-
+-	BTFMCODEC_INFO("%s: master %d dma codec %d", __func__,
+-			(int)test_bit(BTADV_AUDIO_MASTER_CONFIG, &hwep_info->flags),
+-			(int)test_bit(BTADV_CONFIGURE_DMA, &hwep_info->flags));
++
++	if (ret) {
++		qcom_unregister_ssr_notifier(btfmcodec->notifier.notifier,
++					     &btfmcodec->notifier.nb);
++		btfmcodec->notifier.notifier = NULL;
++		kfree(btfmcodec_dai_info);
++		btfmcodec_dai_info = NULL;
+ 	}
+ 
+ 	return ret;
+@@ -968,5 +1092,10 @@
+ 	struct btfmcodec_data *btfmcodec;
+ 
+ 	btfmcodec = btfm_get_btfmcodec();
++	qcom_unregister_ssr_notifier(btfmcodec->notifier.notifier,
++				     &btfmcodec->notifier.nb);
++	btfmcodec->notifier.notifier = NULL;
+ 	snd_soc_unregister_component(&btfmcodec->dev);
+-}
++	kfree(btfmcodec_dai_info);
++	btfmcodec_dai_info = NULL;
++}
+diff --git a/qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec.h b/qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec.h
+--- a/qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec.h
++++ b/qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec.h
+@@ -10,6 +10,7 @@
+ #include <linux/bitops.h>
+ #include <linux/printk.h>
+ #include <linux/cdev.h>
++#include <linux/srcu.h>
+ #include <linux/skbuff.h>
+ #include "btfm_codec_hw_interface.h"
+ 
+@@ -74,6 +75,10 @@
+ 	refcount_t active_clients;
+ 	struct mutex lock;
+ 	struct mutex trans_lock;
++	/* Serializes partial reads and receive-queue purge. */
++	struct mutex read_lock;
++	bool closing;
++	bool ready;
+ 	int reuse_minor;
+ 	char dev_name[DEVICE_NAME_MAX_LEN];
+ 	struct workqueue_struct *workqueue;
+@@ -104,8 +109,20 @@
+ 	struct list_head config_head;
+ 	struct adsp_notifier notifier;
+ 	struct mutex hwep_drv_lock;
++	/* Serializes cached configurations and hardware parameter callbacks. */
++	struct mutex config_lock;
++	bool hwep_stopping;
+ };
+ 
++extern struct srcu_struct btfmcodec_endpoint_srcu;
++int btfmcodec_endpoint_enter(void);
++void btfmcodec_endpoint_exit(int idx);
++void btfmcodec_stop_commands(struct btfmcodec_data *codec);
++void btfmcodec_drain_commands(struct btfmcodec_data *codec);
+ struct btfmcodec_data *btfm_get_btfmcodec(void);
+-bool isCpSupported(void);
++bool btfmcodec_cp_supported(void);
++bool btfmcodec_commands_stopped(struct btfmcodec_char_device *chardev);
++int btfmcodec_wait_response(struct btfmcodec_char_device *chardev, int index,
++			    unsigned int timeout_ms);
++
+ #endif /*__LINUX_BTFM_CODEC_H */
+diff --git a/qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_btadv_interface.h b/qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_btadv_interface.h
+--- a/qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_btadv_interface.h
++++ b/qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_btadv_interface.h
+@@ -20,4 +20,18 @@
+ void btfmcodec_initiate_hwep_shutdown(struct btfmcodec_char_device *btfmcodec_dev);
+ btfmcodec_state btfmcodec_get_current_transport(struct btfmcodec_state_machine *state);
+ btfmcodec_state btfmcodec_get_prev_transport(struct btfmcodec_state_machine *state);
++
++void btfmcodec_move_to_next_state(struct btfmcodec_state_machine *state);
++void btfmcodec_revert_current_state(struct btfmcodec_state_machine *state);
++int btfmcodec_frame_transport_switch_ind_pkt(struct btfmcodec_char_device *btfmcodec_dev,
++					     u8 active_transport,
++					uint8_t status);
++int btfmcodec_frame_prepare_bearer_rsp_pkt(struct btfmcodec_char_device *btfmcodec_dev,
++					   u8 active_transport,
++					uint8_t status);
++int btfmcodec_wait_for_bearer_ind(struct btfmcodec_char_device *btfmcodec_dev);
++int btfmcodec_initiate_hwep_configuration(struct btfmcodec_char_device *btfmcodec_dev);
++void btfmcodec_configure_hwep(struct btfmcodec_char_device *btfmcodec_dev);
++void btfmcodec_prepare_bearer(struct btfmcodec_char_device *btfmcodec_dev,
++			      enum transport_type new_transport);
+ #endif /* __LINUX_BTFM_CODEC_BTADV_INTERFACE_H */
+diff --git a/qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_interface.h b/qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_interface.h
+--- a/qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_interface.h
++++ b/qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_interface.h
+@@ -7,6 +7,24 @@
+ #define __LINUX_BTFM_CODEC_INTERFACE
+ 
+ #include "btfm_codec_hw_interface.h"
++struct btfmcodec_data;
+ int btfm_register_codec(struct hwep_data *hwep_info);
+ void btfm_unregister_codec(void);
++
++int btfmcodec_hwep_startup(struct btfmcodec_data *btfmcodec);
++int btfmcodec_hwep_shutdown(struct btfmcodec_data *btfmcodec, int id,
++			    bool disable_master);
++void btfmcodec_wq_hwep_shutdown(struct work_struct *work);
++int btfmcodec_hwep_hw_params(struct btfmcodec_data *btfmcodec, uint32_t bps,
++			     u32 direction, uint8_t num_channels);
++bool btfmcodec_is_valid_cache_avb(struct btfmcodec_data *btfmcodec);
++int btfmcodec_hwep_prepare(struct btfmcodec_data *btfmcodec, uint32_t sampling_rate,
++			   u32 direction, int id, bool seamless);
++int btfmcodec_hwep_set_channel_map(void *hwep_info, unsigned int tx_num,
++				   unsigned int *tx_slot, unsigned int rx_num,
++				unsigned int *rx_slot);
++int btfmcodec_hwep_get_channel_map(void *hwep_info, unsigned int *tx_num,
++				   unsigned int *tx_slot, unsigned int *rx_num,
++				unsigned int *rx_slot, int id);
++void btfmcodec_wq_hwep_configure(struct work_struct *work);
+ #endif /*__LINUX_BTFM_CODEC_INTERFACE */
+diff --git a/qcom/opensource/bt-kernel/soundwire/btfm_swr.c b/qcom/opensource/bt-kernel/soundwire/btfm_swr.c
+--- a/qcom/opensource/bt-kernel/soundwire/btfm_swr.c
++++ b/qcom/opensource/bt-kernel/soundwire/btfm_swr.c
+@@ -28,6 +28,7 @@
+ static int btfm_swr_major;
+ struct btfmswr *pbtfmswr;
+ static int btfm_num_ports_open;
++static DEFINE_MUTEX(btfm_swr_lock);
+ 
+ #define BT_CMD_SWR_TEST	0xbfac
+ #define SWRS_SCP_STATUS 0x00000044
+@@ -59,7 +60,7 @@
+ 	}
+ }
+ 
+-int btfm_swr_hw_init(void)
++static int btfm_swr_hw_init_locked(void)
+ {
+ 	uint8_t dev_num = 0;
+ 	int ret = 0;
+@@ -110,8 +111,10 @@
+ 		msleep(DELAY_BEFORE_SLAVE_RESET);
+ 		BTFMSWR_INFO("Doing slave reset");
+ 		reg_val = 0x80;
+-		swr_write(pbtfmswr->swr_slave, dev_num,
+-				 SWRS_SCP_CONTROL, &reg_val);
++		ret = swr_write(pbtfmswr->swr_slave, dev_num,
++				SWRS_SCP_CONTROL, &reg_val);
++		if (ret)
++			return ret;
+ 		msleep(DELAY_FOR_SWR_SLAVE_RESET);
+ 		BTFMSWR_INFO("Done writing %x to SWR slave register", reg_val);
+ 
+@@ -138,175 +141,266 @@
+ 	return ret;
+ }
+ 
++int btfm_swr_hw_init(void)
++{
++	int ret;
++
++	mutex_lock(&btfm_swr_lock);
++	if (!pbtfmswr || pbtfmswr->stopping)
++		ret = -ENODEV;
++	else
++		ret = btfm_swr_hw_init_locked();
++	mutex_unlock(&btfm_swr_lock);
++	return ret;
++}
++
++static int btfm_swr_enable_port_locked(u8 port_num, u8 ch_count,
++				       u32 sample_rate, u8 usecase)
++{
++	u8 port_id = port_num - 1;
++	u8 ch_mask = ch_count == 2 ? TWO_CHANNEL_MASK : ONE_CHANNEL_MASK;
++	int ret;
++
++	if (!port_num || port_num >= ARRAY_SIZE(pbtfmswr->ports) ||
++	    !ch_count || ch_count > 2 || !sample_rate || !pbtfmswr->initialized)
++		return -EINVAL;
++	if (pbtfmswr->ports[port_num].disconnect_pending)
++		return -EBUSY;
++	if (pbtfmswr->ports[port_num].connected) {
++		if (pbtfmswr->ports[port_num].channels != ch_count ||
++		    pbtfmswr->ports[port_num].usecase != usecase ||
++		    pbtfmswr->ports[port_num].sample_rate != sample_rate)
++			return -EINVAL;
++		if (pbtfmswr->ports[port_num].active)
++			return -EISCONN;
++	} else {
++		ret = swr_connect_port(pbtfmswr->swr_slave, &port_id, 1,
++				       &ch_mask, &sample_rate, &ch_count, &usecase);
++		if (ret)
++			return ret;
++		pbtfmswr->ports[port_num].connected = true;
++		pbtfmswr->ports[port_num].channels = ch_count;
++		pbtfmswr->ports[port_num].usecase = usecase;
++		pbtfmswr->ports[port_num].sample_rate = sample_rate;
++		btfm_num_ports_open++;
++	}
++	ret = swr_slvdev_datapath_control(pbtfmswr->swr_slave,
++					  pbtfmswr->swr_slave->dev_num, true);
++	if (ret) {
++		if (!swr_disconnect_port(pbtfmswr->swr_slave, &port_id, 1,
++					 &ch_mask, &usecase)) {
++			pbtfmswr->ports[port_num].connected = false;
++			btfm_num_ports_open--;
++		}
++		return ret;
++	}
++	pbtfmswr->ports[port_num].active = true;
++	return 0;
++}
++
+ int btfm_swr_enable_port(u8 port_num, u8 ch_count, u32 sample_rate, u8 usecase)
+ {
+-	int ret = 0;
+-	u8 port_id[MAX_BT_PORTS];
+-	u8 num_ch[MAX_BT_PORTS];
+-	u8 ch_mask[MAX_BT_PORTS];
+-	u32 ch_rate[MAX_BT_PORTS];
+-	u8 port_type[MAX_BT_PORTS];
+-	u8 num_port = 1;
+-	int reg_val = 0;
+-
+-	// master expects port num -1 to be sent
+-	port_id[0] = port_num-1;
+-	num_ch[0] = ch_count;
+-	ch_mask[0] = ch_count == 2 ? TWO_CHANNEL_MASK :	ONE_CHANNEL_MASK;
+-	ch_rate[0] = sample_rate;
+-	port_type[0] = usecase;
+-
+-	BTFMSWR_INFO("enabling port : %d, with num channels %d\n", port_num, ch_count);
+-
+-	if (btfm_num_ports_open == 0) {
+-		BTFMSWR_INFO("reading SWRS_SCP_STATUS");
+-		swr_read(pbtfmswr->swr_slave, pbtfmswr->swr_slave->dev_num,
+-				 SWRS_SCP_STATUS, &reg_val, 1);
+-		BTFMSWR_INFO("read %d from SWRS_SCP_STATUS", reg_val);
+-	}
+-
+-	ret = swr_connect_port(pbtfmswr->swr_slave, &port_id[0], num_port,
+-							&ch_mask[0], &ch_rate[0], &num_ch[0],
+-							&port_type[0]);
+-
+-	if (ret < 0) {
+-		BTFMSWR_ERR("swr_connect_port failed, error %d", ret);
++	int ret;
++
++	mutex_lock(&btfm_swr_lock);
++	if (!pbtfmswr || pbtfmswr->stopping)
++		ret = -ENODEV;
++	else
++		ret = btfm_swr_enable_port_locked(port_num, ch_count,
++						  sample_rate, usecase);
++	mutex_unlock(&btfm_swr_lock);
++	return ret;
++}
++
++static int btfm_swr_disable_port_locked(u8 port_num, u8 ch_count, u8 usecase)
++{
++	u8 port_id = port_num - 1;
++	u8 ch_mask = ch_count == 2 ? TWO_CHANNEL_MASK : ONE_CHANNEL_MASK;
++	int ret;
++
++	if (!port_num || port_num >= ARRAY_SIZE(pbtfmswr->ports) ||
++	    !ch_count || ch_count > 2 ||
++	    pbtfmswr->ports[port_num].channels != ch_count ||
++	    pbtfmswr->ports[port_num].usecase != usecase)
++		return -EINVAL;
++	if (!pbtfmswr->ports[port_num].disconnect_pending) {
++		if (!pbtfmswr->ports[port_num].connected)
++			return -ENOENT;
++		ret = swr_disconnect_port(pbtfmswr->swr_slave, &port_id, 1,
++					  &ch_mask, &usecase);
++		if (ret)
++			return ret;
++		pbtfmswr->ports[port_num].connected = false;
++		pbtfmswr->ports[port_num].disconnect_pending = true;
++	}
++	ret = swr_slvdev_datapath_control(pbtfmswr->swr_slave,
++					  pbtfmswr->swr_slave->dev_num, false);
++	if (ret)
+ 		return ret;
+-	}
+-
+-	BTFMSWR_INFO("calling swr_slvdev_datapath_control\n");
+-	ret = swr_slvdev_datapath_control(pbtfmswr->swr_slave,
+-							pbtfmswr->swr_slave->dev_num,
+-							true);
+-	if (ret < 0)
+-		BTFMSWR_ERR("swr_slvdev_datapath_control failed");
+-
+-	if (ret == 0)
+-		btfm_num_ports_open++;
+-
+-	BTFMSWR_INFO("btfm_num_ports_open: %d", btfm_num_ports_open);
+-
+-	return ret;
++	pbtfmswr->ports[port_num].disconnect_pending = false;
++	pbtfmswr->ports[port_num].active = false;
++	btfm_num_ports_open--;
++	return 0;
+ }
+ 
+ int btfm_swr_disable_port(u8 port_num, u8 ch_count, u8 usecase)
+ {
+-	int ret = 0;
+-	u8 port_id[MAX_BT_PORTS];
+-	u8 ch_mask[MAX_BT_PORTS];
+-	u8 port_type[MAX_BT_PORTS];
+-	u8 num_port = 1;
+-	int reg_val = 0;
+-
+-	// master expects port num -1 to be sent
+-	port_id[0] = port_num-1;
+-	ch_mask[0] = ch_count == 2 ? TWO_CHANNEL_MASK :	ONE_CHANNEL_MASK;
+-	port_type[0] = usecase;
+-
+-	BTFMSWR_INFO("reading SWRS_SCP_STATUS before disabling the port");
+-	swr_read(pbtfmswr->swr_slave, pbtfmswr->swr_slave->dev_num,
+-			SWRS_SCP_STATUS, &reg_val, 1);
+-	BTFMSWR_INFO("read %d from SWRS_SCP_STATUS", reg_val);
+-
+-	BTFMSWR_INFO("disabling port : %d\n", port_num);
+-	ret = swr_disconnect_port(pbtfmswr->swr_slave, &port_id[0], num_port,
+-							&ch_mask[0], &port_type[0]);
+-
+-	if (ret < 0)
+-		BTFMSWR_ERR("swr_disconnect_port port failed, error %d", ret);
+-
+-	BTFMSWR_INFO("calling swr_slvdev_datapath_control\n");
+-	ret = swr_slvdev_datapath_control(pbtfmswr->swr_slave,
+-							pbtfmswr->swr_slave->dev_num,
+-							false);
+-	if (ret < 0)
+-		BTFMSWR_ERR("swr_slvdev_datapath_control failed");
+-
+-	if (btfm_num_ports_open > 0)
+-		btfm_num_ports_open--;
+-
+-	BTFMSWR_INFO("btfm_num_ports_open: %d", btfm_num_ports_open);
+-
+-	return ret;
++	int ret;
++
++	mutex_lock(&btfm_swr_lock);
++	if (!pbtfmswr || pbtfmswr->stopping)
++		ret = -ENODEV;
++	else
++		ret = btfm_swr_disable_port_locked(port_num, ch_count, usecase);
++	mutex_unlock(&btfm_swr_lock);
++	return ret;
++}
++
++static void btfm_swr_free(struct kref *ref)
++{
++	struct btfmswr *priv = container_of(ref, struct btfmswr, ref);
++
++	kfree(priv);
++}
++
++static int btfm_swr_open(struct inode *inode, struct file *file)
++{
++	int ret = -ENODEV;
++
++	mutex_lock(&btfm_swr_lock);
++	if (pbtfmswr && !pbtfmswr->stopping) {
++		kref_get(&pbtfmswr->ref);
++		file->private_data = pbtfmswr;
++		ret = 0;
++	}
++	mutex_unlock(&btfm_swr_lock);
++	return ret;
++}
++
++static int btfm_swr_release(struct inode *inode, struct file *file)
++{
++	struct btfmswr *priv = file->private_data;
++
++	kref_put(&priv->ref, btfm_swr_free);
++	return 0;
+ }
+ 
+ static long btfm_swr_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ {
+-	int ret = 0;
+-
+-	BTFMSWR_INFO("");
+-	switch (cmd) {
+-	case BT_CMD_SWR_TEST:
+-		BTFMSWR_INFO("cmd BT_CMD_SLIM_TEST, call btfm_swr_hw_init");
+-		ret = btfm_swr_hw_init();
+-		break;
+-	}
++	struct btfmswr *priv = file->private_data;
++	int ret = -ENOTTY;
++
++	mutex_lock(&btfm_swr_lock);
++	if (priv != pbtfmswr || priv->stopping)
++		ret = -ENODEV;
++	else if (cmd == BT_CMD_SWR_TEST)
++		ret = btfm_swr_hw_init_locked();
++	mutex_unlock(&btfm_swr_lock);
+ 	return ret;
+ }
+ 
+ static const struct file_operations bt_dev_fops = {
++	.owner = THIS_MODULE,
++	.open = btfm_swr_open,
++	.release = btfm_swr_release,
+ 	.unlocked_ioctl = btfm_swr_ioctl,
+ 	.compat_ioctl = btfm_swr_ioctl,
+ };
+ 
+ static int btfm_swr_probe(struct swr_device *pdev)
+ {
+-	int ret = 0;
+-
+-	BTFMSWR_INFO("");
+-
+-	pbtfmswr = devm_kzalloc(&pdev->dev,
+-					sizeof(struct btfmswr), GFP_KERNEL);
+-	if (!pbtfmswr) {
+-		BTFMSWR_ERR("memory allocation to driver failed");
++	struct btfmswr *priv;
++	struct device *chardev;
++	int ret;
++
++	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
++	if (!priv)
+ 		return -ENOMEM;
+-	}
+-
+-	swr_set_dev_data(pdev, pbtfmswr);
+-	pbtfmswr->swr_slave = pdev;
+-	pbtfmswr->dev = &pdev->dev;
+-	pbtfmswr->initialized = false;
+-
+-	// register with ALSA
+-	ret = btfm_swr_register_hw_ep(pbtfmswr);
+-	if (ret) {
+-		BTFMSWR_ERR("registration with ALSA failed, returning");
+-		goto dealloc;
+-	}
++	kref_init(&priv->ref);
++	priv->swr_slave = pdev;
++	priv->dev = &pdev->dev;
++	priv->stopping = true;
++	mutex_lock(&btfm_swr_lock);
++	if (pbtfmswr) {
++		mutex_unlock(&btfm_swr_lock);
++		kref_put(&priv->ref, btfm_swr_free);
++		return -EBUSY;
++	}
++	pbtfmswr = priv;
++	btfm_num_ports_open = 0;
++	swr_set_dev_data(pdev, priv);
++	mutex_unlock(&btfm_swr_lock);
+ 
+ 	btfm_swr_major = register_chrdev(0, "btfm_swr", &bt_dev_fops);
+ 	if (btfm_swr_major < 0) {
+-		BTFMSWR_ERR("%s: failed to allocate char dev\n", __func__);
+-		ret = -1;
+-		goto register_err;
+-	}
+-
+-	//btfm_swr_class = class_create(THIS_MODULE, "btfmswr-dev");
++		ret = btfm_swr_major;
++		goto clear_data;
++	}
+ 	btfm_swr_class = class_create("btfmswr-dev");
+ 	if (IS_ERR(btfm_swr_class)) {
+-		BTFMSWR_ERR("%s: coudn't create class\n", __func__);
+-		ret = -1;
+-		goto class_err;
+-	}
+-
+-	if (device_create(btfm_swr_class, NULL, MKDEV(btfm_swr_major, 0),
+-		NULL, "btfmswr") == NULL) {
+-		BTFMSWR_ERR("%s: failed to allocate char dev\n", __func__);
+-		ret = -1;
+-		goto device_err;
+-	}
+-	return ret;
+-
+-device_err:
++		ret = PTR_ERR(btfm_swr_class);
++		goto unregister_chrdev;
++	}
++	chardev = device_create(btfm_swr_class, NULL,
++				MKDEV(btfm_swr_major, 0), NULL, "btfmswr");
++	if (IS_ERR(chardev)) {
++		ret = PTR_ERR(chardev);
++		goto destroy_class;
++	}
++	/* Endpoint registration is final; callbacks cannot race later failure. */
++	ret = btfm_swr_register_hw_ep(priv);
++	if (ret)
++		goto destroy_device;
++	mutex_lock(&btfm_swr_lock);
++	priv->stopping = false;
++	mutex_unlock(&btfm_swr_lock);
++	return 0;
++
++destroy_device:
++	device_destroy(btfm_swr_class, MKDEV(btfm_swr_major, 0));
++destroy_class:
+ 	class_destroy(btfm_swr_class);
+-class_err:
++unregister_chrdev:
+ 	unregister_chrdev(btfm_swr_major, "btfm_swr");
+-
+-register_err:
++clear_data:
++	mutex_lock(&btfm_swr_lock);
++	pbtfmswr = NULL;
++	swr_set_dev_data(pdev, NULL);
++	mutex_unlock(&btfm_swr_lock);
++	kref_put(&priv->ref, btfm_swr_free);
++	return ret;
++}
++
++static int btfm_swr_remove(struct swr_device *pdev)
++{
++	struct btfmswr *priv = swr_get_dev_data(pdev);
++	int port, ret;
++
++	mutex_lock(&btfm_swr_lock);
++	priv->stopping = true;
++	mutex_unlock(&btfm_swr_lock);
++	device_destroy(btfm_swr_class, MKDEV(btfm_swr_major, 0));
++	unregister_chrdev(btfm_swr_major, "btfm_swr");
++	/* Never hold the hardware lock while the codec drains callbacks. */
+ 	btfm_swr_unregister_hwep();
+-dealloc:
+-	kfree(pbtfmswr);
+-	return ret;
++	mutex_lock(&btfm_swr_lock);
++	for (port = 1; port < ARRAY_SIZE(priv->ports); port++) {
++		if (!priv->ports[port].connected &&
++		    !priv->ports[port].disconnect_pending)
++			continue;
++		ret = btfm_swr_disable_port_locked(port,
++						   priv->ports[port].channels,
++						   priv->ports[port].usecase);
++		if (ret)
++			BTFMSWR_ERR("port %d teardown failed: %d", port, ret);
++	}
++	class_destroy(btfm_swr_class);
++	pbtfmswr = NULL;
++	btfm_num_ports_open = 0;
++	swr_set_dev_data(pdev, NULL);
++	mutex_unlock(&btfm_swr_lock);
++	kref_put(&priv->ref, btfm_swr_free);
++	return 0;
+ }
+ 
+ static const struct swr_device_id btfm_swr_id[] = {
+@@ -324,10 +418,12 @@
+ static struct swr_driver btfm_swr_driver = {
+ 	.driver = {
+ 		.name = "btfmswr-driver",
++		.suppress_bind_attrs = true,
+ 		.owner = THIS_MODULE,
+ 		.of_match_table = btfm_swr_dt_match,
+ 	},
+ 	.probe = btfm_swr_probe,
++	.remove = btfm_swr_remove,
+ 	.id_table = btfm_swr_id,
+ };
+ 
+diff --git a/qcom/opensource/bt-kernel/soundwire/btfm_swr.h b/qcom/opensource/bt-kernel/soundwire/btfm_swr.h
+--- a/qcom/opensource/bt-kernel/soundwire/btfm_swr.h
++++ b/qcom/opensource/bt-kernel/soundwire/btfm_swr.h
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/types.h>
+ #include <linux/mutex.h>
++#include <linux/kref.h>
+ #include <bindings/audio-codec-port-types.h>
+ #include <soc/soundwire.h>
+ 
+@@ -61,6 +62,16 @@
+ 
+ 
+ struct btfmswr {
++	struct kref ref;
++	bool stopping;
++	struct {
++		bool connected;
++		bool active;
++		bool disconnect_pending;
++		u8 channels;
++		u8 usecase;
++		u32 sample_rate;
++	} ports[BTFM_NUM_CODEC_DAIS + 1];
+ 	struct device *dev;
+ 	struct swr_device *swr_slave;
+ 	bool initialized;
+diff --git a/qcom/opensource/bt-kernel/soundwire/btfm_swr_hw_interface.c b/qcom/opensource/bt-kernel/soundwire/btfm_swr_hw_interface.c
+--- a/qcom/opensource/bt-kernel/soundwire/btfm_swr_hw_interface.c
++++ b/qcom/opensource/bt-kernel/soundwire/btfm_swr_hw_interface.c
+@@ -60,6 +60,9 @@
+ 					struct snd_ctl_elem_value *ucontrol)
+ {
+ 	BTFMSWR_DBG("");
++	if (ucontrol->value.integer.value[0] < 0 ||
++	    ucontrol->value.integer.value[0] > 1)
++		return -EINVAL;
+ 	btfm_feedback_ch_setting = ucontrol->value.integer.value[0];
+ 	return 1;
+ }
+@@ -75,6 +78,9 @@
+ static int btfm_put_codec_type(struct snd_kcontrol *kcontrol,
+ 				struct snd_ctl_elem_value *ucontrol)
+ {
++	if (ucontrol->value.integer.value[0] < 0 ||
++	    ucontrol->value.integer.value[0] >= ARRAY_SIZE(codec_text))
++		return -EINVAL;
+ 	usecase_codec = ucontrol->value.integer.value[0];
+ 	BTFMSWR_DBG("codec type set to:%s", codec_text[usecase_codec]);
+ 	return 1;
+@@ -149,8 +155,11 @@
+ 		return;
+ 	}
+ 
++	if (btfmswr->p_dai_port->port_info[id].port >= ARRAY_SIZE(btfmswr->ports))
++		return;
+ 	ret = btfm_swr_disable_port(btfmswr->p_dai_port->port_info[id].port,
+-				    btfmswr->num_channels, port_type);
++		btfmswr->ports[btfmswr->p_dai_port->port_info[id].port].channels,
++		port_type);
+ }
+ 
+ static int btfm_swr_dai_hw_params(void *dai, uint32_t bps,
+@@ -160,6 +169,9 @@
+ 	struct btfmswr *btfmswr = dev_get_drvdata(hwep_info->dev);
+ 
+ 	BTFMSWR_DBG("");
++	if (!num_channels || num_channels > 2 || !bps || bps > 32 ||
++	    direction > SNDRV_PCM_STREAM_CAPTURE)
++		return -EINVAL;
+ 	btfmswr->bps = bps;
+ 	btfmswr->direction = direction;
+ 	btfmswr->num_channels = num_channels;
+@@ -167,7 +179,7 @@
+ 	return 0;
+ }
+ 
+-void btfm_get_sampling_rate(uint32_t *sampling_rate)
++static void btfm_get_sampling_rate(uint32_t *sampling_rate)
+ {
+ 	uint8_t codec_types_avb = ARRAY_SIZE(codec_text);
+ 
+@@ -269,6 +281,8 @@
+ 	struct hwep_data *hwep_info = (struct hwep_data *)dai;
+ 	struct btfmswr *btfmswr = dev_get_drvdata(hwep_info->dev);
+ 
++	if (!rx_slot || !tx_slot || !rx_num || !tx_num)
++		return -EINVAL;
+ 	*rx_slot = 0;
+ 	*tx_slot = 0;
+ 	*rx_num = 0;
+@@ -295,12 +309,14 @@
+ 	return 0;
+ }
+ 
+-int btfm_swr_dai_get_configs(void *dai, void *config, uint8_t id)
++static int btfm_swr_dai_get_configs(void *dai, void *config, uint8_t id)
+ {
+ 	struct hwep_data *hwep_info = (struct hwep_data *)dai;
+ 	struct btfmswr *btfmswr = dev_get_drvdata(hwep_info->dev);
+ 	struct hwep_dma_configurations *hwep_config;
+ 
++	if (!config || id >= BTFM_NUM_CODEC_DAIS)
++		return -EINVAL;
+ 	BTFMSWR_INFO("DAI id %u", id);
+ 	hwep_config = (struct hwep_dma_configurations *)config;
+ 

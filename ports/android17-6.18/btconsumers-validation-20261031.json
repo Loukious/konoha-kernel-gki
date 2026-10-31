@@ -1,0 +1,181 @@
+{
+  "tests": {
+    "packets": {
+      "packet_and_transport_cases": 312,
+      "short_headers_rejected": true,
+      "partial_reads_retained": true,
+      "usercopy_and_allocation_failures_balanced": true,
+      "queues_bounded": true
+    },
+    "commands": {
+      "command_failure_and_framing_cases": 40,
+      "positive_native_get_configs": true,
+      "stop_after_status_reset": true,
+      "shutdown_hardware_cleanup_on_failure": true
+    },
+    "component": {
+      "mixer_return_cases": 34,
+      "component_failure_unwind": true,
+      "remove_in_active_transport": true,
+      "cache_replacement_failure_preserves_old": true
+    },
+    "ports": {
+      "port_validation_cases": 1024,
+      "rollback_and_retry_all_ports": true,
+      "sample_rate_retained_on_failed_rollback": true,
+      "native_chip_port_tables": true,
+      "reset_failures_and_active_port_protection": true
+    },
+    "lifetime": {
+      "init_failure_steps": 7,
+      "partial_cdev_open_rejected": true,
+      "delayed_cdev_reference_release": true,
+      "single_client_until_drain": true,
+      "deinit_balanced": true
+    },
+    "endpoint": {
+      "registration_failure_steps": 4,
+      "native_dai_flags_preserved": true,
+      "pthread_callback_blocks_unregister": true,
+      "stop_denies_new_callbacks": true,
+      "drain_before_provider_release": true,
+      "reregister_after_cleanup": true
+    },
+    "swr_lifetime": {
+      "probe_failure_steps": 5,
+      "final_endpoint_publication": true,
+      "drain_without_hardware_lock": true,
+      "stale_file_rejects_reprobe": true,
+      "failed_remove_cleanup_reported": true
+    },
+    "params": {
+      "codec_rate_cases": 1792,
+      "mixer_bounds": true,
+      "parameter_validation": true,
+      "native_dma_fields_and_positive_return": true,
+      "channel_map_bounds": true
+    }
+  },
+  "negative_controls": {
+    "packet_short_header": {
+      "rejected": true,
+      "diagnostic": "==1123818==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x776b73be0030 at pc 0x000000402ca7 bp 0x7fffc6b76210 sp 0x7fffc6b76200"
+    },
+    "packet_envelope_length": {
+      "rejected": true,
+      "diagnostic": "==1124860==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x6f05a91e0138 at pc 0x00000040383d bp 0x7fff14072710 sp 0x7fff14072700"
+    },
+    "partial_read_discards_tail": {
+      "rejected": true,
+      "diagnostic": "/tmp/btconsumer-test-cg8kub_f/partial_read_discards_tail.c:626:157: runtime error: member access within null pointer of type 'struct sk_buff'"
+    },
+    "enqueue_error_ignored": {
+      "rejected": true,
+      "diagnostic": "enqueue_error_ignored: /tmp/btconsumer-test-cg8kub_f/enqueue_error_ignored.c:612: main: Assertion `ret==expected' failed."
+    },
+    "positive_get_configs_rejected": {
+      "rejected": true,
+      "diagnostic": "positive_get_configs_rejected: /tmp/btconsumer-test-cg8kub_f/positive_get_configs_rejected.c:612: main: Assertion `ret==expected' failed."
+    },
+    "timeout_success": {
+      "rejected": true,
+      "diagnostic": "timeout_success: /tmp/btconsumer-test-cg8kub_f/timeout_success.c:612: main: Assertion `ret==expected' failed."
+    },
+    "stop_predicate_removed": {
+      "rejected": true,
+      "diagnostic": "stop_predicate_removed: /tmp/btconsumer-test-cg8kub_f/stop_predicate_removed.c:612: main: Assertion `wait_condition' failed."
+    },
+    "control_error_masked": {
+      "rejected": true,
+      "diagnostic": "control_error_masked: /tmp/btconsumer-test-cg8kub_f/control_error_masked.c:438: main: Assertion `btfmcodec_put_mixer_control(&k,&v)==ret&&cb_calls==2' failed."
+    },
+    "component_probe_error_masked": {
+      "rejected": true,
+      "diagnostic": "component_probe_error_masked: /tmp/btconsumer-test-cg8kub_f/component_probe_error_masked.c:439: main: Assertion `btfmcodec_codec_probe(&component)==-ENODEV&&!add_calls&&!remove_calls' failed."
+    },
+    "cache_replacement_leak": {
+      "rejected": true,
+      "diagnostic": "cache_replacement_leak: /tmp/btconsumer-test-cg8kub_f/cache_replacement_leak.c:440: main: Assertion `btfmcodec_check_and_cache_configs(&codec,96000,0,2,4)==1&&live==1' failed."
+    },
+    "port_bound_removed": {
+      "rejected": true,
+      "diagnostic": "/tmp/btconsumer-test-cg8kub_f/port_bound_removed.c:352:21: runtime error: index 6 out of bounds for type '<unknown> [6]'"
+    },
+    "rollback_count_lost": {
+      "rejected": true,
+      "diagnostic": "rollback_count_lost: /tmp/btconsumer-test-cg8kub_f/rollback_count_lost.c:450: main: Assertion `btfm_swr_enable_port(port,2,48000,7)==-ETIMEDOUT&&!btfm_num_ports_open&&!context.ports[port].connected' failed."
+    },
+    "retry_rate_ignored": {
+      "rejected": true,
+      "diagnostic": "retry_rate_ignored: /tmp/btconsumer-test-cg8kub_f/retry_rate_ignored.c:450: main: Assertion `btfm_swr_enable_port(port,2,96000,7)==-EINVAL' failed."
+    },
+    "reset_write_error_ignored": {
+      "rejected": true,
+      "diagnostic": "reset_write_error_ignored: /tmp/btconsumer-test-cg8kub_f/reset_write_error_ignored.c:451: main: Assertion `btfm_swr_hw_init()==-EIO&&!context.initialized' failed."
+    },
+    "premature_cdev_open": {
+      "rejected": true,
+      "diagnostic": "premature_cdev_open: /tmp/btconsumer-test-cg8kub_f/premature_cdev_open.c:294: cdev_device_add: Assertion `btfmcodec_dev_open(&i,&f)==-ENODEV&&!f.private_data' failed."
+    },
+    "file_device_reference_lost": {
+      "rejected": true,
+      "diagnostic": "file_device_reference_lost: /tmp/btconsumer-test-cg8kub_f/file_device_reference_lost.c:534: main: Assertion `!btfmcodec_dev_open(&i,&f)&&c->dev.refs==2&&ch->active_clients==2' failed."
+    },
+    "endpoint_device_reference_lost": {
+      "rejected": true,
+      "diagnostic": "endpoint_device_reference_lost: /tmp/btconsumer-test-cg8kub_f/endpoint_device_reference_lost.c:625: main: Assertion `btfmcodec_register_hw_ep(&ep)<0&&!context.hwep_info&&provider.refs==1&&!live&&!ssr_live&&!soc_live' failed."
+    },
+    "endpoint_drain_bypassed": {
+      "rejected": true,
+      "diagnostic": "endpoint_drain_bypassed: /tmp/btconsumer-test-cg8kub_f/endpoint_drain_bypassed.c:405: btfmcodec_drain_commands: Assertion `!btfmcodec_endpoint_srcu.readers' failed."
+    },
+    "stale_file_reaches_reprobe": {
+      "rejected": true,
+      "diagnostic": "stale_file_reaches_reprobe: /tmp/btconsumer-test-cg8kub_f/stale_file_reaches_reprobe.c:269: main: Assertion `btfm_swr_ioctl(&f,BT_CMD_SWR_TEST,0)==-ENODEV' failed."
+    },
+    "swr_open_reference_lost": {
+      "rejected": true,
+      "diagnostic": "swr_open_reference_lost: /tmp/btconsumer-test-cg8kub_f/swr_open_reference_lost.c:269: main: Assertion `!btfm_swr_open(NULL,&f)&&old->ref.refs==2' failed."
+    },
+    "qlea_rate_regression": {
+      "rejected": true,
+      "diagnostic": "qlea_rate_regression: /tmp/btconsumer-test-cg8kub_f/qlea_rate_regression.c:404: main: Assertion `actual==expected' failed."
+    },
+    "dma_second_interface_regression": {
+      "rejected": true,
+      "diagnostic": "dma_second_interface_regression: /tmp/btconsumer-test-cg8kub_f/dma_second_interface_regression.c:407: main: Assertion `config.stream_id==id&&config.sample_rate==96000&&config.bit_width==24&&config.num_channels==2&&config.codectype==LC3&&config.active_channel_mask==3&&config.lpaif==5&&config.inf_index==(id==3||id==4?2:1)' failed."
+    }
+  },
+  "source_sha256": {
+    "qcom/opensource/bt-kernel/btfmcodec/Makefile": "e48852014ea259c79cb16e98673f2d97db3643575a8d34a7a09a3123bf5e2e31",
+    "qcom/opensource/bt-kernel/btfmcodec/btfm_codec.c": "46cbfa4fe154daebc8a87fddf9302a7d394bacde113384677285764069b6245a",
+    "qcom/opensource/bt-kernel/btfmcodec/btfm_codec_btadv_interface.c": "f7e0b62e240d93e89414a1018fa32f9e69491a85fb371adc5bf7b11b7d2064e4",
+    "qcom/opensource/bt-kernel/btfmcodec/btfm_codec_hw_interface.c": "41360d0197658e23ae5c3f74d68ea69a3c8d9c2899ee61cef6460535e0ef008e",
+    "qcom/opensource/bt-kernel/btfmcodec/btfm_codec_interface.c": "8829e24e3a46fa10c8230e3a5539066db062b5deb75069f38e4473abaf1aa59c",
+    "qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec.h": "2f01a7e185168f3404cbdb4ff03700833df0e568f7afb918efd4ec89d3b9edaa",
+    "qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_btadv_interface.h": "20bab12de2d4f5b605076231715a1e744e51795022488d5413643ce4117ac961",
+    "qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_hw_interface.h": "c696bf3d45b3faa04f2f911ec4c950b761269e195a092093cc0f9a2c134fc1f4",
+    "qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_interface.h": "e6e6040790b0db3cd3140aa1a0d8e235b5b052974e61628fa1e4ceba5ce1cd14",
+    "qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_pkt.h": "daaa01802ecad9e3ca73fd8b2b76f29ff88d619440430e87baccef465875df21",
+    "qcom/opensource/bt-kernel/soundwire/Makefile": "2a18d254a2abf120d0b7756579fb39f9de47a199addb368dc05e50ff9595bad3",
+    "qcom/opensource/bt-kernel/soundwire/btfm_swr.c": "0a15953154d5e8596664705ef180ebb7be765ee75c83898f3bad197541105f4d",
+    "qcom/opensource/bt-kernel/soundwire/btfm_swr.h": "96f9c906d24217d353c3d63b45496dabf51dfb5f78860c5a8762a05efddd851e",
+    "qcom/opensource/bt-kernel/soundwire/btfm_swr_hw_interface.c": "461f12739f460c0f8fed4be4c2fb6644a11d717a72f29aea400219d9f43378c9",
+    "qcom/opensource/bt-kernel/soundwire/btfm_swr_hw_interface.h": "01802fa3cb533077d42304eff255730d7c04b09273fcca9e75e139f6954f1f4c",
+    "qcom/opensource/bt-kernel/soundwire/btfm_swr_slave.c": "4c12265d2ae41f29e9158eecb9de33d60379523ea265e4e53d61c0a8da84904d",
+    "qcom/opensource/bt-kernel/soundwire/btfm_swr_slave.h": "e7a7e0b6ff96f66fc50ab11c2d1d3de6f57b6e70a46447b98be4d31454e4a3dd",
+    "qcom/opensource/bt-kernel/Kbuild": "940c7b1a19b2202d2acdf28472539d9d226f96e400f193e7cf6d44e58c36d957"
+  },
+  "harness_sha256": {
+    "btconsumer_commands.c": "0ff9c583990c11c8956dd7f8c7437a06d74df505c0f648cc9b329e7e5d871d57",
+    "btconsumer_component.c": "ac9f1be1bca7472e36f0979b98f5c81c16f7574ed8e285e1135e4c85688d35c5",
+    "btconsumer_endpoint.c": "d0227bdf1e9a2cd0b6c619cfe12a026ebd7f55f66c05e955f62ac49e449fcae5",
+    "btconsumer_lifetime.c": "057c7c61435a5b366da1a50b27faae0131507d7613df7494bce51c808d591a1f",
+    "btconsumer_mock.h": "077a26943f04587441466f97b4e15fd55c635776144cb7604b249ede9a6e8880",
+    "btconsumer_packets.c": "12190b46d1e626206b0ebf389b543d7e7ab7191c21747f1f1a997e2b4c6bed21",
+    "btconsumer_params.c": "005af69afec88ef1eb4a58db6bef079fcfe01b512fe5616d7c3461e0d9405a90",
+    "btconsumer_ports.c": "8aecd1c4e533ac1db826410c7f2f07c40605672ce5168249c85acec0c97d37e2",
+    "btconsumer_swr_lifetime.c": "124222bf40d23566d9a8d09b0721957ca6126b86dc9288e27d8df78e32e42cf3"
+  },
+  "limits": "Extracted production functions; kernel services mocked. Firmware, audio hardware, IRQ/workqueue scheduling and actual ALSA/SoundWire concurrency require device validation."
+}

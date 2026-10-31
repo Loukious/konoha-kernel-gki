@@ -3202,6 +3202,90 @@ ddk_module(
     copts = ["-DCONFIG_CNSS_OUT_OF_TREE", "-DCONFIG_ICNSS2_QMI", "-DCONFIG_CNSS2_SMMU_DB_SUPPORT", "-DCONFIG_CNSS2_SSR_DRIVER_DUMP", "-DCONFIG_CNSS_HW_SECURE_DISABLE", "-DCONFIG_CNSS_HW_SECURE_SMEM", "-DCONFIG_CNSS_PLAT_IPC_QMI_SVC", "-DCONFIG_WCNSS_MEM_PRE_ALLOC"],
 )
 
+ddk_headers(
+    name = "audio_swrctrl_headers",
+    hdrs = ["qcom/opensource/audio-kernel/include/soc/swr-common.h", "qcom/opensource/audio-kernel/include/soc/swr-wcd.h", "qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.h", "qcom/opensource/audio-kernel/soc/swr-mstr-registers.h", "qcom/opensource/audio-kernel/soc/swr-slave-registers.h"],
+    includes = ["qcom/opensource/audio-kernel/include", "qcom/opensource/audio-kernel/soc"],
+)
+
+ddk_module(
+    name = "swr_ctrl_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "swr_ctrl_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_swrctrl_headers", ":audio_swr_headers", ":audio_spf_headers", ":audio_foundation_headers", ":swr_dlkm", ":spf_core_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_headers(
+    name = "rmnet_headers",
+    hdrs = ["qcom/opensource/datarmnet/core/dfc.h", "qcom/opensource/datarmnet/core/dfc_defs.h", "qcom/opensource/datarmnet/core/qmi_rmnet.h", "qcom/opensource/datarmnet/core/qmi_rmnet_i.h", "qcom/opensource/datarmnet/core/rmnet_config.h", "qcom/opensource/datarmnet/core/rmnet_ctl.h", "qcom/opensource/datarmnet/core/rmnet_ctl_client.h", "qcom/opensource/datarmnet/core/rmnet_descriptor.h", "qcom/opensource/datarmnet/core/rmnet_genl.h", "qcom/opensource/datarmnet/core/rmnet_handlers.h", "qcom/opensource/datarmnet/core/rmnet_hook.h", "qcom/opensource/datarmnet/core/rmnet_ll.h", "qcom/opensource/datarmnet/core/rmnet_ll_core.h", "qcom/opensource/datarmnet/core/rmnet_map.h", "qcom/opensource/datarmnet/core/rmnet_module.h", "qcom/opensource/datarmnet/core/rmnet_private.h", "qcom/opensource/datarmnet/core/rmnet_qmap.h", "qcom/opensource/datarmnet/core/rmnet_qmi.h", "qcom/opensource/datarmnet/core/rmnet_trace.h", "qcom/opensource/datarmnet/core/rmnet_vnd.h", "qcom/opensource/datarmnet/core/wda.h"],
+    includes = ["qcom/opensource/datarmnet/core"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "rmnet_ctl",
+    srcs = ["qcom/opensource/datarmnet/core/rmnet_ctl_client.c", "qcom/opensource/datarmnet/core/rmnet_ctl_ipa.c", ":qcom/opensource/dataipa/config/dataipa_vendor.h"],
+    out = "rmnet_ctl.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":rmnet_headers", ":ipa_transport_headers", ":platform_headers", ":remote_headers", ":ipam", ":qcom_ipc_logging"],
+    copts = ["-DRMNET_TRACE_INCLUDE_PATH=.", "-include", "$(location :qcom/opensource/dataipa/config/dataipa_vendor.h)"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "rmnet_core",
+    srcs = ["qcom/opensource/datarmnet/core/rmnet_config.c", "qcom/opensource/datarmnet/core/rmnet_handlers.c", "qcom/opensource/datarmnet/core/rmnet_descriptor.c", "qcom/opensource/datarmnet/core/rmnet_genl.c", "qcom/opensource/datarmnet/core/rmnet_map_command.c", "qcom/opensource/datarmnet/core/rmnet_map_data.c", "qcom/opensource/datarmnet/core/rmnet_module.c", "qcom/opensource/datarmnet/core/rmnet_vnd.c", "qcom/opensource/datarmnet/core/rmnet_ll.c", "qcom/opensource/datarmnet/core/rmnet_ll_ipa.c", "qcom/opensource/datarmnet/core/qmi_rmnet.c", "qcom/opensource/datarmnet/core/wda_qmi.c", "qcom/opensource/datarmnet/core/dfc_qmi.c", "qcom/opensource/datarmnet/core/dfc_qmap.c", "qcom/opensource/datarmnet/core/rmnet_qmap.c", "qcom/opensource/datarmnet/core/rmnet_ll_qmap.c", ":qcom/opensource/dataipa/config/dataipa_vendor.h"],
+    out = "rmnet_core.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":rmnet_headers", ":ipa_transport_headers", ":platform_headers", ":remote_headers", ":ipam", ":qcom_ipc_logging", ":rmnet_ctl", ":rmnet_mem", ":qmi_helpers"],
+    copts = ["-DRMNET_TRACE_INCLUDE_PATH=.", "-include", "$(location :qcom/opensource/dataipa/config/dataipa_vendor.h)"],
+    visibility = ["//visibility:public"],
+)
+
+
+ddk_headers(
+    name = "btfmcodec_headers",
+    hdrs = ["qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec.h", "qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_btadv_interface.h", "qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_hw_interface.h", "qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_interface.h", "qcom/opensource/bt-kernel/btfmcodec/include/btfm_codec_pkt.h"],
+    includes = ["qcom/opensource/bt-kernel/btfmcodec/include"],
+)
+
+ddk_headers(
+    name = "btfm_swr_headers",
+    hdrs = ["qcom/opensource/bt-kernel/soundwire/btfm_swr.h", "qcom/opensource/bt-kernel/soundwire/btfm_swr_hw_interface.h", "qcom/opensource/bt-kernel/soundwire/btfm_swr_slave.h"],
+    includes = ["qcom/opensource/bt-kernel/soundwire"],
+)
+
+ddk_module(
+    name = "btfmcodec",
+    srcs = ["qcom/opensource/bt-kernel/btfmcodec/btfm_codec.c", "qcom/opensource/bt-kernel/btfmcodec/btfm_codec_hw_interface.c", "qcom/opensource/bt-kernel/btfmcodec/btfm_codec_interface.c", "qcom/opensource/bt-kernel/btfmcodec/btfm_codec_btadv_interface.c"],
+    out = "btfmcodec.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":btfmcodec_headers", ":remote_headers", ":rproc_qcom_common"],
+    copts = ["-DCONFIG_MSM_BT_POWER", "-DCONFIG_SLIM_BTFM_CODEC", "-DCONFIG_BTFM_SWR", "-DCONFIG_FMD_ENABLE"],
+)
+
+ddk_module(
+    name = "bt_fm_swr",
+    srcs = ["qcom/opensource/bt-kernel/soundwire/btfm_swr.c", "qcom/opensource/bt-kernel/soundwire/btfm_swr_hw_interface.c", "qcom/opensource/bt-kernel/soundwire/btfm_swr_slave.c"],
+    out = "bt_fm_swr.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":btfm_swr_headers", ":btfmcodec_headers", ":btfmcodec", ":btpower_headers", ":btpower", ":audio_swr_headers", ":swr_dlkm"],
+    copts = ["-DCONFIG_MSM_BT_POWER", "-DCONFIG_SLIM_BTFM_CODEC", "-DCONFIG_BTFM_SWR", "-DCONFIG_FMD_ENABLE"],
+)
+
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3438,6 +3522,11 @@ kernel_module_group(
         ":btpower",
         ":cnss2",
         ":icnss2",
+        ":swr_ctrl_dlkm",
+        ":rmnet_ctl",
+        ":rmnet_core",
+        ":btfmcodec",
+        ":bt_fm_swr",
     ],
 )
 

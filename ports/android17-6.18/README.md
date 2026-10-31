@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 246 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 251 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 246 platform `.ko` files, their symbol tables and DDK configurations.
+- 251 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 14,382
-imported symbol CRCs across all 246 modules.
+used. The current [validation report](validation-20261031.json) checks 14,776
+imported symbol CRCs across all 251 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1569,3 +1569,39 @@ ROM module build coverage is 244/466 (52.4%), leaving 222 names to
 assess or port, including alternative hardware. Main WLAN, remaining Bluetooth
 and audio consumers, camera/video, device interfaces and image/installer work
 remain. No flashable 6.18 ZIP or phone validation exists yet.
+
+
+## SoundWire controller, RMNET and Bluetooth consumers
+
+The native SoundWire controller (`swr_ctrl_dlkm`) now builds against the frozen
+SoundWire and SPF providers. It retains its platform/master allocation until
+the final master reference is released, gates and drains notifications and bus
+calls, and balances IRQ, PM, clock and port ownership. Port configuration is
+validated before mutation, and transport errors are returned to callers.
+Eleven sanitizer suites (3,906 cases) and eleven rejecting controls pass against
+the integrated sources. Parent removal still requires consumers to release
+retained references and synchronize their IRQ callbacks.
+
+Native RMNET core/control preserve all eighteen compilation units and 145
+exports. The port adapts rtnetlink/timer APIs, checks QMAP lengths, balances
+genl replies, validates hook ownership and drains endpoint readers/tasklets.
+Six sanitizer suites and seven rejecting controls pass. Both modules remain
+resident because pending IPA readiness callbacks cannot be cancelled through
+the frozen provider's external API. No modem or network-throughput testing has
+been performed.
+
+The native Bluetooth codec (`btfmcodec`) and SoundWire consumer (`bt_fm_swr`)
+retain seven compilation units, three exports and their protocol/chip tables.
+Their eight sanitizer suites and twenty-two rejecting controls cover packet
+bounds, callback withdrawal, request failures, component lifetime and port
+handling. The native shared `hw_params` API has no DAI identifier; this limitation
+is retained. Real ALSA/SoundWire concurrency, firmware and DMA quiescence remain
+unvalidated. The separate SLIM/NGD chain is still being ported.
+
+The combined archive `artifacts/20261031T163841245441Z` contains 251 platform modules and
+passes 14,776 imported-symbol CRC checks without compiler/modpost warnings.
+Device-tree and overlay checks pass with 1,084 existing vendor DTC warnings.
+ROM module build coverage is 249/466 (53.4%); this counts module
+names and does not measure overall completion. Main WLAN, remaining audio and
+Bluetooth consumers, camera/video, shared-provider lifetime work, boot/DLKM
+images and the installer remain. No flashable 6.18 ZIP or phone validation exists.

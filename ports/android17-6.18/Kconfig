@@ -1102,3 +1102,23 @@ config ICNSS2
 config ICNSS2_QMI
 	bool "Onyx native ICNSS2_QMI"
 	depends on ICNSS2
+
+# Native controller selection comes from the frozen sunautoconf.h.
+
+config RMNET_CORE
+	tristate "Onyx native RMNET core"
+	depends on RMNET_MEM && RMNET_CTL
+	select GRO_CELLS
+
+config RMNET_CTL
+	tristate "Onyx native RMNET control"
+
+config RMNET_LA_PLATFORM
+	bool "Native RMNET LA platform"
+	depends on RMNET_CORE || RMNET_CTL
+
+config BTFM_CODEC
+	tristate "Onyx native Bluetooth FM codec"
+
+config BTFM_SWR
+	tristate "Onyx native Bluetooth FM SoundWire endpoint"

@@ -1,0 +1,860 @@
+--- a/qcom/opensource/datarmnet/core/dfc.h
++++ b/qcom/opensource/datarmnet/core/dfc.h
+@@ -50,7 +50,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(dev_name, name);
++		__assign_str(dev_name);
+ 		__entry->txq = txq;
+ 		__entry->enable = enable;
+ 	),
+@@ -113,7 +113,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(dev_name, name);
++		__assign_str(dev_name);
+ 		__entry->bearer_id = bearer_id;
+ 		__entry->len = len;
+ 		__entry->mark = mark;
+@@ -142,7 +142,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(dev_name, name);
++		__assign_str(dev_name);
+ 		__entry->bid = bearer_id;
+ 		__entry->fid = flow_id;
+ 		__entry->ip = ip_type;
+@@ -348,7 +348,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(cmd_str, cmd);
++		__assign_str(cmd_str);
+ 		__entry->type = type;
+ 		__entry->num_bearer = num_bearer;
+ 		memcpy(__get_dynamic_array(bearers), bearers, num_bearer);
+--- a/qcom/opensource/datarmnet/core/qmi_rmnet.c
++++ b/qcom/opensource/datarmnet/core/qmi_rmnet.c
+@@ -293,7 +293,7 @@
+ 	if (!bearer->watchdog_started)
+ 		return;
+ 
+-	del_timer(&bearer->watchdog);
++	timer_delete(&bearer->watchdog);
+ 	bearer->watchdog_started = false;
+ 
+ 	trace_dfc_watchdog(bearer->qos->mux_id, bearer->bearer_id, 0);
+@@ -307,9 +307,9 @@
+ {
+ 	if (qos->removed_bearer) {
+ 		qos->removed_bearer->watchdog_quit = true;
+-		del_timer_sync(&qos->removed_bearer->watchdog);
++		timer_delete_sync(&qos->removed_bearer->watchdog);
+ 		qos->removed_bearer->ch_switch.timer_quit = true;
+-		del_timer_sync(&qos->removed_bearer->ch_switch.guard_timer);
++		timer_delete_sync(&qos->removed_bearer->ch_switch.guard_timer);
+ 		kfree(qos->removed_bearer);
+ 		qos->removed_bearer = NULL;
+ 	}
+@@ -1128,9 +1128,9 @@
+ 
+ 	list_for_each_entry(bearer, &qosi->bearer_head, list) {
+ 		bearer->watchdog_quit = true;
+-		del_timer_sync(&bearer->watchdog);
++		timer_delete_sync(&bearer->watchdog);
+ 		bearer->ch_switch.timer_quit = true;
+-		del_timer_sync(&bearer->ch_switch.guard_timer);
++		timer_delete_sync(&bearer->ch_switch.guard_timer);
+ 	}
+ 
+ 	list_add(&qosi->list, &qos_cleanup_list);
+--- a/qcom/opensource/datarmnet/core/rmnet_config.c
++++ b/qcom/opensource/datarmnet/core/rmnet_config.c
+@@ -189,10 +189,13 @@
+ 	}
+ }
+ 
+-static int rmnet_newlink(struct net *src_net, struct net_device *dev,
+-			 struct nlattr *tb[], struct nlattr *data[],
++static int rmnet_newlink(struct net_device *dev,
++			 struct rtnl_newlink_params *params,
+ 			 struct netlink_ext_ack *extack)
+ {
++	struct net *src_net = rtnl_newlink_link_net(params);
++	struct nlattr **tb = params->tb;
++	struct nlattr **data = params->data;
+ 	struct net_device *real_dev;
+ 	int mode = RMNET_EPMODE_VND;
+ 	struct rmnet_endpoint *ep;
+@@ -201,6 +204,8 @@
+ 	int err = 0;
+ 	u16 mux_id;
+ 
++	if (!tb[IFLA_LINK] || !data)
++		return -EINVAL;
+ 	real_dev = __dev_get_by_index(src_net, nla_get_u32(tb[IFLA_LINK]));
+ 	if (!real_dev || !dev)
+ 		return -ENODEV;
+@@ -853,39 +858,29 @@
+ {
+ 	int rc;
+ 
++	rc = rmnet_core_genl_init();
++	if (rc)
++		return rc;
+ 	rc = register_netdevice_notifier(&rmnet_dev_notifier);
+-	if (rc != 0)
+-		return rc;
+-
++	if (rc)
++		goto unregister_genl;
+ 	rc = rtnl_link_register(&rmnet_link_ops);
+-	if (rc != 0) {
+-		unregister_netdevice_notifier(&rmnet_dev_notifier);
+-		return rc;
+-	}
+-
++	if (rc)
++		goto unregister_notifier;
++	/* IPA readiness callbacks cannot be withdrawn by external modules. */
+ 	rc = rmnet_ll_init();
+-	if (rc != 0) {
+-		unregister_netdevice_notifier(&rmnet_dev_notifier);
+-		rtnl_link_unregister(&rmnet_link_ops);
+-		return rc;
+-	}
+-
+-	rmnet_core_genl_init();
+-
+-	try_module_get(THIS_MODULE);
++	if (!rc)
++		return 0;
++	rtnl_link_unregister(&rmnet_link_ops);
++unregister_notifier:
++	unregister_netdevice_notifier(&rmnet_dev_notifier);
++unregister_genl:
++	rmnet_core_genl_deinit();
+ 	return rc;
+ }
+ 
+-static void __exit rmnet_exit(void)
+-{
+-	unregister_netdevice_notifier(&rmnet_dev_notifier);
+-	rtnl_link_unregister(&rmnet_link_ops);
+-	rmnet_ll_exit();
+-	rmnet_core_genl_deinit();
+-
+-	module_put(THIS_MODULE);
+-}
+ 
+ module_init(rmnet_init)
+-module_exit(rmnet_exit)
++/* Resident: IPA retains readiness callbacks and native low-latency state. */
++MODULE_DESCRIPTION("Native Qualcomm RMNET MAP data path");
+ MODULE_LICENSE("GPL v2");
+--- a/qcom/opensource/datarmnet/core/rmnet_ctl_client.c
++++ b/qcom/opensource/datarmnet/core/rmnet_ctl_client.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <linux/debugfs.h>
++#include <linux/mutex.h>
+ #include <linux/ipc_logging.h>
+ #include <linux/version.h>
+ #include "rmnet_ctl.h"
+@@ -25,7 +26,7 @@
+ 	struct rmnet_ctl_client __rcu *client;
+ 	struct dentry *dbgfs_dir;
+ 	struct dentry *dbgfs_loglvl;
+-	void *ipc_log;
++	void __rcu *ipc_log;
+ };
+ 
+ #if defined(CONFIG_IPA_DEBUG) || defined(CONFIG_MHI_DEBUG)
+@@ -38,7 +39,7 @@
+ static u8 ipc_log_lvl = RMNET_CTL_LOG_ERR;
+ #endif
+ 
+-static DEFINE_SPINLOCK(client_lock);
++static DEFINE_MUTEX(client_lock);
+ static struct rmnet_ctl_endpoint ctl_ep;
+ 
+ void rmnet_ctl_set_dbgfs(bool enable)
+@@ -54,15 +55,23 @@
+ 					  (struct dentry *) ctl_ep.dbgfs_dir,
+ 					  (u8 *) &ipc_log_lvl);
+ 
+-		if (!ctl_ep.ipc_log)
+-			ctl_ep.ipc_log = ipc_log_context_create(
+-				RMNET_CTL_LOG_PAGE, RMNET_CTL_LOG_NAME, 0);
++		if (!rcu_access_pointer(ctl_ep.ipc_log)) {
++			void *log;
++
++			log = ipc_log_context_create(RMNET_CTL_LOG_PAGE,
++						     RMNET_CTL_LOG_NAME, 0);
++
++			rcu_assign_pointer(ctl_ep.ipc_log, log);
++		}
+ 	} else {
++		void *log = rcu_access_pointer(ctl_ep.ipc_log);
++
++		RCU_INIT_POINTER(ctl_ep.ipc_log, NULL);
++		synchronize_rcu();
+ 		debugfs_remove_recursive(ctl_ep.dbgfs_dir);
+-		ipc_log_context_destroy(ctl_ep.ipc_log);
++		ipc_log_context_destroy(log);
+ 		ctl_ep.dbgfs_dir = NULL;
+ 		ctl_ep.dbgfs_loglvl = NULL;
+-		ctl_ep.ipc_log = NULL;
+ 	}
+ }
+ 
+@@ -76,7 +85,7 @@
+ 	struct rmnet_ctl_client *client;
+ 	struct sk_buff *skb;
+ 
+-	if (unlikely(!data || !len))
++	if (unlikely(!data || !len || len > U32_MAX))
+ 		return;
+ 
+ 	if (len == 0xFFFFFFFF) {
+@@ -90,7 +99,7 @@
+ 			skb->protocol = htons(ETH_P_MAP);
+ 			client->hooks.ctl_dl_client_hook(skb);
+ 		} else {
+-			kfree(skb);
++			kfree_skb(skb);
+ 		}
+ 
+ 		rcu_read_unlock();
+@@ -125,20 +134,18 @@
+ 		return NULL;
+ 	client->hooks = *hook;
+ 
+-	spin_lock(&client_lock);
++	mutex_lock(&client_lock);
+ 
+ 	/* Only support one client for now */
+ 	if (rcu_dereference(ctl_ep.client)) {
+-		spin_unlock(&client_lock);
++		mutex_unlock(&client_lock);
+ 		kfree(client);
+ 		return NULL;
+ 	}
+ 
++	rmnet_ctl_set_dbgfs(true);
+ 	rcu_assign_pointer(ctl_ep.client, client);
+-
+-	spin_unlock(&client_lock);
+-
+-	rmnet_ctl_set_dbgfs(true);
++	mutex_unlock(&client_lock);
+ 
+ 	return client;
+ }
+@@ -148,52 +155,46 @@
+ {
+ 	struct rmnet_ctl_client *client = (struct rmnet_ctl_client *)handle;
+ 
+-	spin_lock(&client_lock);
+-
+-	if (rcu_dereference(ctl_ep.client) != client) {
+-		spin_unlock(&client_lock);
++	mutex_lock(&client_lock);
++
++	if (!client || rcu_access_pointer(ctl_ep.client) != client) {
++		mutex_unlock(&client_lock);
+ 		return -EINVAL;
+ 	}
+ 
+ 	RCU_INIT_POINTER(ctl_ep.client, NULL);
+-
+-	spin_unlock(&client_lock);
+-
+ 	synchronize_rcu();
+ 	kfree(client);
+ 
+ 	rmnet_ctl_set_dbgfs(false);
+-
++	mutex_unlock(&client_lock);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(rmnet_ctl_unregister_client);
+ 
+ int rmnet_ctl_send_client(void *handle, struct sk_buff *skb)
+ {
+-	struct rmnet_ctl_client *client = (struct rmnet_ctl_client *)handle;
++	struct rmnet_ctl_client *client = handle;
+ 	struct rmnet_ctl_dev *dev;
+ 	int rc = -EINVAL;
+ 
+-	if (client != rcu_dereference(ctl_ep.client)) {
++	if (!skb)
++		return rc;
++	rcu_read_lock();
++	if (!client || client != rcu_dereference(ctl_ep.client)) {
+ 		kfree_skb(skb);
+-		return rc;
+-	}
+-
++		goto unlock;
++	}
+ 	rmnet_ctl_log_info("TX", skb->data, skb->len);
+-
+-	rcu_read_lock();
+-
+ 	dev = rcu_dereference(ctl_ep.dev);
+ 	if (dev && dev->xmit)
+ 		rc = dev->xmit(dev, skb);
+ 	else
+ 		kfree_skb(skb);
+-
++unlock:
+ 	rcu_read_unlock();
+-
+ 	if (rc)
+ 		rmnet_ctl_log_err("TXE", rc, NULL, 0);
+-
+ 	return rc;
+ }
+ EXPORT_SYMBOL(rmnet_ctl_send_client);
+@@ -201,14 +202,18 @@
+ void rmnet_ctl_log(enum rmnet_ctl_log_lvl lvl, const char *msg,
+ 		   int rc, const void *data, unsigned int len)
+ {
+-	if (lvl <= ipc_log_lvl && ctl_ep.ipc_log) {
+-		if (data == NULL || len == 0)
+-			ipc_log_string(ctl_ep.ipc_log, "%3s(%d): (null)\n",
+-				       msg, rc);
++	void *log;
++
++	rcu_read_lock();
++	log = rcu_dereference(ctl_ep.ipc_log);
++	if (lvl <= READ_ONCE(ipc_log_lvl) && log) {
++		if (!data || !len)
++			ipc_log_string(log, "%3s(%d): (null)\n", msg, rc);
+ 		else
+-			ipc_log_string(ctl_ep.ipc_log, "%3s(%d): %*ph\n",
++			ipc_log_string(log, "%3s(%d): %*ph\n",
+ 				       msg, rc, len > 32 ? 32 : len, data);
+ 	}
++	rcu_read_unlock();
+ }
+ EXPORT_SYMBOL(rmnet_ctl_log);
+ 
+@@ -229,11 +234,15 @@
+ {
+ 	struct rmnet_ctl_dev *dev;
+ 
++	if (n < 0 || (n && !s))
++		return -EINVAL;
+ 	rcu_read_lock();
+ 	dev = rcu_dereference(ctl_ep.dev);
+ 	if (dev && n > 0) {
+ 		n = min(n, (int)(sizeof(dev->stats) / sizeof(u64)));
+ 		memcpy(s, &dev->stats, n * sizeof(u64));
++	} else {
++		n = 0;
+ 	}
+ 	rcu_read_unlock();
+ 
+--- a/qcom/opensource/datarmnet/core/rmnet_ctl_client.h
++++ b/qcom/opensource/datarmnet/core/rmnet_ctl_client.h
+@@ -36,6 +36,10 @@
+ 	struct rmnet_ctl_stats stats;
+ };
+ 
++void *rmnet_ctl_register_client(struct rmnet_ctl_client_hooks *hook);
++int rmnet_ctl_unregister_client(void *handle);
++int rmnet_ctl_send_client(void *handle, struct sk_buff *skb);
++
+ void rmnet_ctl_endpoint_post(const void *data, size_t len);
+ void rmnet_ctl_endpoint_setdev(const struct rmnet_ctl_dev *dev);
+ void rmnet_ctl_set_dbgfs(bool enable);
+--- a/qcom/opensource/datarmnet/core/rmnet_ctl_ipa.c
++++ b/qcom/opensource/datarmnet/core/rmnet_ctl_ipa.c
+@@ -18,7 +18,6 @@
+ };
+ 
+ static struct rmnet_ctl_ipa_dev ctl_ipa_dev;
+-static bool rmnet_ctl_ipa_registered;
+ 
+ static int rmnet_ctl_send_ipa(struct rmnet_ctl_dev *dev, struct sk_buff *skb)
+ {
+@@ -63,11 +62,12 @@
+ static void rmnet_ctl_remove(void *user_data)
+ {
+ 	rmnet_ctl_endpoint_setdev(NULL);
++	synchronize_rcu();
+ 
+ 	pr_info("rmnet_ctl driver removed\n");
+ }
+ 
+-static void rmnet_ctl_ipa_ready(void *user_data)
++static int rmnet_ctl_ipa_register(void)
+ {
+ 	int rc;
+ 
+@@ -81,8 +81,12 @@
+ 
+ 	if (rc)
+ 		pr_err("%s: %d\n", __func__, rc);
+-	else
+-		rmnet_ctl_ipa_registered = true;
++	return rc;
++}
++
++static void rmnet_ctl_ipa_ready(void *user_data)
++{
++	rmnet_ctl_ipa_register();
+ }
+ 
+ static int __init rmnet_ctl_init(void)
+@@ -91,23 +95,12 @@
+ 
+ 	rc = ipa_register_ipa_ready_cb(rmnet_ctl_ipa_ready, NULL);
+ 	if (rc == -EEXIST)
+-		rmnet_ctl_ipa_ready(NULL);
+-	else if (rc)
+-		pr_err("%s: %d\n", __func__, rc);
+-
+-	return 0;
+-}
+-
+-static void __exit rmnet_ctl_exit(void)
+-{
+-	if (rmnet_ctl_ipa_registered) {
+-		ipa_unregister_rmnet_ctl_cb();
+-		rmnet_ctl_ipa_registered = false;
+-	}
++		return rmnet_ctl_ipa_register();
++	return rc;
+ }
+ 
+ module_init(rmnet_ctl_init)
+-module_exit(rmnet_ctl_exit)
++/* Resident: the provider has no exported readiness callback cancellation. */
+ 
+ MODULE_DESCRIPTION("RmNet control IPA Driver");
+ MODULE_LICENSE("GPL v2");
+--- a/qcom/opensource/datarmnet/core/rmnet_descriptor.c
++++ b/qcom/opensource/datarmnet/core/rmnet_descriptor.c
+@@ -1961,8 +1961,8 @@
+ 	rmnet_recycle_frag_descriptor(frag_desc, port);
+ }
+ 
+-void rmnet_descriptor_classify_chain_count(u64 chain_count,
+-					   struct rmnet_port *port)
++static void rmnet_descriptor_classify_chain_count(u64 chain_count,
++						  struct rmnet_port *port)
+ {
+ 	u64 index;
+ 
+@@ -1976,8 +1976,8 @@
+ 	port->stats.dl_chain_stat[index] += chain_count;
+ }
+ 
+-void rmnet_descriptor_classify_frag_count(u64 frag_count,
+-					  struct rmnet_port *port)
++static void rmnet_descriptor_classify_frag_count(u64 frag_count,
++						 struct rmnet_port *port)
+ {
+ 	u64 index;
+ 
+--- a/qcom/opensource/datarmnet/core/rmnet_genl.c
++++ b/qcom/opensource/datarmnet/core/rmnet_genl.c
+@@ -141,8 +141,8 @@
+ 	spin_unlock_irqrestore(&rmnet_pid_ht_splock, ht_flags);
+ }
+ 
+-void rmnet_boost_for_pid(pid_t pid, int boost_enable,
+-			 u64 boost_period)
++static void rmnet_boost_for_pid(pid_t pid, int boost_enable,
++				u64 boost_period)
+ {
+ 	struct hlist_node *tmp;
+ 	struct rmnet_pid_node_s *node_p;
+@@ -247,8 +247,8 @@
+ 	pid_bps_resp_ptr->list_len = i;
+ }
+ 
+-int rmnet_core_genl_send_resp(struct genl_info *info,
+-			      struct rmnet_core_pid_bps_resp *pid_bps_resp)
++static int rmnet_core_genl_send_resp(struct genl_info *info,
++				     struct rmnet_core_pid_bps_resp *pid_bps_resp)
+ {
+ 	struct sk_buff *skb;
+ 	void *msg_head;
+@@ -259,7 +259,7 @@
+ 		goto out;
+ 	}
+ 
+-	skb = genlmsg_new(sizeof(struct rmnet_core_pid_bps_resp), GFP_KERNEL);
++	skb = genlmsg_new(nla_total_size(sizeof(*pid_bps_resp)), GFP_KERNEL);
+ 	if (!skb)
+ 		goto out;
+ 
+@@ -268,13 +268,13 @@
+ 			       0, RMNET_CORE_GENL_CMD_PID_BPS_REQ);
+ 	if (!msg_head) {
+ 		rc = -ENOMEM;
+-		goto out;
++		goto free_skb;
+ 	}
+ 	rc = nla_put(skb, RMNET_CORE_GENL_ATTR_PID_BPS,
+ 		     sizeof(struct rmnet_core_pid_bps_resp),
+ 		     pid_bps_resp);
+ 	if (rc != 0)
+-		goto out;
++		goto free_skb;
+ 
+ 	genlmsg_end(skb, msg_head);
+ 
+@@ -285,8 +285,9 @@
+ 	rm_err("%s", "SHS_GNL: Successfully sent pid/bytes info\n");
+ 	return RMNET_GENL_SUCCESS;
+ 
++free_skb:
++	kfree_skb(skb);
+ out:
+-	/* TODO: Need to free skb?? */
+ 	rm_err("%s", "SHS_GNL: FAILED to send pid/bytes info\n");
+ 	rmnet_core_userspace_connected = 0;
+ 	return RMNET_GENL_FAILURE;
+@@ -435,8 +436,7 @@
+ 	ret = genl_register_family(&rmnet_core_genl_family);
+ 	if (ret != 0) {
+ 		rm_err("CORE_GNL: register family failed: %i", ret);
+-		genl_unregister_family(&rmnet_core_genl_family);
+-		return RMNET_GENL_FAILURE;
++		return ret;
+ 	}
+ 
+ 	rm_err("CORE_GNL: successfully registered generic netlink family: %s",
+--- a/qcom/opensource/datarmnet/core/rmnet_ll_ipa.c
++++ b/qcom/opensource/datarmnet/core/rmnet_ll_ipa.c
+@@ -30,7 +30,7 @@
+ #define MAX_Q_LEN 1000
+ 
+ #if !defined(__arch_um__)
+-static struct rmnet_ll_endpoint *rmnet_ll_ipa_ep;
++static struct rmnet_ll_endpoint __rcu *rmnet_ll_ipa_ep;
+ static struct sk_buff_head tx_pending_list;
+ extern spinlock_t rmnet_ll_tx_lock;
+ 
+@@ -62,13 +62,17 @@
+ 
+ static void rmnet_ll_ipa_rx(void *arg, void *rx_data)
+ {
+-	struct rmnet_ll_endpoint *ll_ep = rmnet_ll_ipa_ep;
++	struct rmnet_ll_endpoint *ll_ep;
+ 	struct rmnet_ll_stats *stats = rmnet_ll_get_stats();
+ 	struct sk_buff *skb, *tmp;
+ 
+ 	if (arg == (void *)(uintptr_t)(IPA_RMNET_LL_FLOW_EVT)) {
+-		stats->tx_enabled++;
+-		tasklet_schedule(&tx_pending_task);
++		spin_lock_bh(&rmnet_ll_tx_lock);
++		if (rcu_access_pointer(rmnet_ll_ipa_ep)) {
++			stats->tx_enabled++;
++			tasklet_schedule(&tx_pending_task);
++		}
++		spin_unlock_bh(&rmnet_ll_tx_lock);
+ 		return;
+ 	}
+ 
+@@ -78,6 +82,15 @@
+ 	}
+ 
+ 	skb = rx_data;
++	if (!skb)
++		return;
++	rcu_read_lock();
++	ll_ep = rcu_dereference(rmnet_ll_ipa_ep);
++	if (!ll_ep) {
++		kfree_skb(skb);
++		rcu_read_unlock();
++		return;
++	}
+ 	/* Odds are IPA does this, but just to be safe */
+ 	skb->dev = ll_ep->phys_dev;
+ 	skb->protocol = htons(ETH_P_MAP);
+@@ -95,12 +108,15 @@
+ 
+ 	stats->rx_pkts++;
+ 	netif_rx(skb);
++	rcu_read_unlock();
+ }
+ 
+ static void rmnet_ll_ipa_probe(void *arg)
+ {
+ 	struct rmnet_ll_endpoint *ll_ep;
+ 
++	if (rcu_access_pointer(rmnet_ll_ipa_ep))
++		return;
+ 	ll_ep = kzalloc(sizeof(*ll_ep), GFP_KERNEL);
+ 	if (!ll_ep) {
+ 		pr_err("%s(): allocating LL CTX failed\n", __func__);
+@@ -114,22 +130,29 @@
+ 		return;
+ 	}
+ 
+-	*((struct rmnet_ll_endpoint **)arg) = ll_ep;
++	spin_lock_bh(&rmnet_ll_tx_lock);
++	rcu_assign_pointer(rmnet_ll_ipa_ep, ll_ep);
++	spin_unlock_bh(&rmnet_ll_tx_lock);
+ }
+ 
+ static void rmnet_ll_ipa_remove(void *arg)
+ {
+-	struct rmnet_ll_endpoint **ll_ep = arg;
++	struct rmnet_ll_endpoint *ll_ep;
+ 	struct sk_buff *skb;
+ 
+-	dev_put((*ll_ep)->phys_dev);
+-	kfree(*ll_ep);
+-	*ll_ep = NULL;
+-
+ 	spin_lock_bh(&rmnet_ll_tx_lock);
++	ll_ep = rcu_dereference_protected(rmnet_ll_ipa_ep,
++					  lockdep_is_held(&rmnet_ll_tx_lock));
++	RCU_INIT_POINTER(rmnet_ll_ipa_ep, NULL);
+ 	while ((skb = __skb_dequeue(&tx_pending_list)))
+ 		kfree_skb(skb);
+ 	spin_unlock_bh(&rmnet_ll_tx_lock);
++	tasklet_kill(&tx_pending_task);
++	synchronize_rcu();
++	if (ll_ep) {
++		dev_put(ll_ep->phys_dev);
++		kfree(ll_ep);
++	}
+ }
+ 
+ static void rmnet_ll_ipa_ready(void * __unused)
+@@ -161,8 +184,10 @@
+ 	struct rmnet_ll_stats *stats = rmnet_ll_get_stats();
+ 	int rc;
+ 
+-	if (!rmnet_ll_ipa_ep)
++	if (!rcu_access_pointer(rmnet_ll_ipa_ep)) {
++		kfree_skb(skb);
+ 		return -ENODEV;
++	}
+ 
+ 	if (!skb_queue_empty(&tx_pending_list))
+ 		goto queue_skb;
+@@ -209,12 +234,8 @@
+ 
+ static int rmnet_ll_ipa_exit(void)
+ {
+-	if (rmnet_ll_ipa_ep) {
+-		ipa_unregister_rmnet_ll_cb();
+-		/* Teardown? */
+-		rmnet_ll_ipa_ep = NULL;
+-	}
+-
++	ipa_unregister_rmnet_ll_cb();
++	rmnet_ll_ipa_remove(NULL);
+ 	return 0;
+ }
+ #else
+--- a/qcom/opensource/datarmnet/core/rmnet_ll_qmap.c
++++ b/qcom/opensource/datarmnet/core/rmnet_ll_qmap.c
+@@ -208,7 +208,7 @@
+ 	} else {
+ 		/* Success or permanent failure */
+ 		bearer->ch_switch.timer_quit = true;
+-		del_timer(&bearer->ch_switch.guard_timer);
++		timer_delete(&bearer->ch_switch.guard_timer);
+ 		bearer->ch_switch.state = CH_SWITCH_NONE;
+ 		bearer->ch_switch.retry_left = 0;
+ 		ll_send_nl_ack(bearer);
+--- a/qcom/opensource/datarmnet/core/rmnet_map_data.c
++++ b/qcom/opensource/datarmnet/core/rmnet_map_data.c
+@@ -346,12 +346,17 @@
+ {
+ 	struct rmnet_map_header *maph;
+ 	struct sk_buff *skbn;
+-	unsigned char *data = rmnet_map_data_ptr(skb), *next_hdr = NULL;
++	unsigned char *data, *next_hdr = NULL;
+ 	u32 packet_len;
+ 
+-	if (skb->len == 0)
++	if (skb->len < sizeof(*maph))
+ 		return NULL;
+-
++	/* Native receive descriptors contain one complete page fragment. */
++	if (skb_is_nonlinear(skb) &&
++	    (skb_headlen(skb) || skb_shinfo(skb)->nr_frags != 1 ||
++	     skb_frag_size(skb_shinfo(skb)->frags) < skb->len))
++		return NULL;
++	data = rmnet_map_data_ptr(skb);
+ 	maph = (struct rmnet_map_header *)data;
+ 	packet_len = ntohs(maph->pkt_len) + sizeof(struct rmnet_map_header);
+ 
+@@ -457,8 +462,8 @@
+ }
+ EXPORT_SYMBOL(rmnet_map_checksum_downlink_packet);
+ 
+-void rmnet_map_v4_checksum_uplink_packet(struct sk_buff *skb,
+-					 struct net_device *orig_dev)
++static void rmnet_map_v4_checksum_uplink_packet(struct sk_buff *skb,
++						struct net_device *orig_dev)
+ {
+ 	struct rmnet_priv *priv = netdev_priv(orig_dev);
+ 	struct rmnet_map_ul_csum_header *ul_header;
+@@ -521,9 +526,9 @@
+ 	}
+ }
+ 
+-void rmnet_map_v5_checksum_uplink_packet(struct sk_buff *skb,
+-					 struct rmnet_port *port,
+-					 struct net_device *orig_dev)
++static void rmnet_map_v5_checksum_uplink_packet(struct sk_buff *skb,
++						struct rmnet_port *port,
++						struct net_device *orig_dev)
+ {
+ 	struct rmnet_priv *priv = netdev_priv(orig_dev);
+ 	struct rmnet_map_v5_csum_header *ul_header;
+@@ -1308,7 +1313,7 @@
+ 	spin_unlock_bh(&state->agg_lock);
+ }
+ 
+-enum hrtimer_restart rmnet_map_flush_tx_packet_queue(struct hrtimer *t)
++static enum hrtimer_restart rmnet_map_flush_tx_packet_queue(struct hrtimer *t)
+ {
+ 	struct rmnet_aggregation_state *state;
+ 
+@@ -1613,9 +1618,8 @@
+ 
+ 		spin_lock_init(&state->agg_lock);
+ 		INIT_LIST_HEAD(&state->agg_list);
+-		hrtimer_init(&state->hrtimer, CLOCK_MONOTONIC,
+-			     HRTIMER_MODE_REL);
+-		state->hrtimer.function = rmnet_map_flush_tx_packet_queue;
++		hrtimer_setup(&state->hrtimer, rmnet_map_flush_tx_packet_queue,
++			      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 		INIT_WORK(&state->agg_wq, rmnet_map_flush_tx_packet_work);
+ 		state->stats = &port->stats.agg;
+ 
+--- a/qcom/opensource/datarmnet/core/rmnet_module.c
++++ b/qcom/opensource/datarmnet/core/rmnet_module.c
+@@ -18,6 +18,7 @@
+ 
+ static struct rmnet_module_hook_info
+ rmnet_module_hooks[__RMNET_MODULE_NUM_HOOKS];
++static DEFINE_SPINLOCK(rmnet_hook_lock);
+ 
+ void
+ rmnet_module_hook_register(const struct rmnet_module_hook_register_info *info,
+@@ -26,23 +27,27 @@
+ 	struct rmnet_module_hook_info *hook_info;
+ 	int i;
+ 
++	if (!info)
++		return;
++	spin_lock_bh(&rmnet_hook_lock);
+ 	for (i = 0; i < hook_count; i++) {
+ 		int hook = info[i].hooknum;
+ 
+-		if (hook < __RMNET_MODULE_NUM_HOOKS) {
++		if (hook >= 0 && hook < __RMNET_MODULE_NUM_HOOKS) {
+ 			hook_info = &rmnet_module_hooks[hook];
+ 			rcu_assign_pointer(hook_info->func, info[i].func);
+ 		}
+ 	}
++	spin_unlock_bh(&rmnet_hook_lock);
+ }
+ EXPORT_SYMBOL(rmnet_module_hook_register);
+ 
+ bool rmnet_module_hook_is_set(int hook)
+ {
+-	if (hook >= __RMNET_MODULE_NUM_HOOKS)
++	if (hook < 0 || hook >= __RMNET_MODULE_NUM_HOOKS)
+ 		return false;
+ 
+-	return rcu_dereference(rmnet_module_hooks[hook].func) != NULL;
++	return !!rcu_access_pointer(rmnet_module_hooks[hook].func);
+ }
+ EXPORT_SYMBOL(rmnet_module_hook_is_set);
+ 
+@@ -53,14 +58,19 @@
+ 	struct rmnet_module_hook_info *hook_info;
+ 	int i;
+ 
++	if (!info)
++		return;
++	spin_lock_bh(&rmnet_hook_lock);
+ 	for (i = 0; i < hook_count; i++) {
+ 		int hook = info[i].hooknum;
+ 
+-		if (hook < __RMNET_MODULE_NUM_HOOKS) {
++		if (hook >= 0 && hook < __RMNET_MODULE_NUM_HOOKS) {
+ 			hook_info = &rmnet_module_hooks[hook];
+-			rcu_assign_pointer(hook_info->func, NULL);
++			if (rcu_access_pointer(hook_info->func) == info[i].func)
++				rcu_assign_pointer(hook_info->func, NULL);
+ 		}
+ 	}
++	spin_unlock_bh(&rmnet_hook_lock);
+ }
+ EXPORT_SYMBOL(rmnet_module_hook_unregister_no_sync);
+ 
+--- a/qcom/opensource/datarmnet/core/rmnet_trace.h
++++ b/qcom/opensource/datarmnet/core/rmnet_trace.h
+@@ -40,7 +40,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(dev_name, skb->dev->name);
++		__assign_str(dev_name);
+ 		__entry->len = skb->len;
+ 	),
+ 
+@@ -139,8 +139,8 @@
+ 		__entry->dest = dest;
+ 		__entry->ip_proto = ip_proto;
+ 		__entry->xport_proto = xport_proto;
+-		__assign_str(saddr, saddr);
+-		__assign_str(daddr, daddr);
++		__assign_str(saddr);
++		__assign_str(daddr);
+ 	),
+ 
+ 	TP_printk("GSO: skbaddr=%pK, len=%d, data_len=%d, [%s][%s] src=%s %u dest=%s %u",
+@@ -174,8 +174,8 @@
+ 		__entry->ip_proto = ip_proto;
+ 		__entry->type = type;
+ 		__entry->sequence = sequence;
+-		__assign_str(saddr, saddr);
+-		__assign_str(daddr, daddr);
++		__assign_str(saddr);
++		__assign_str(daddr);
+ 	),
+ 
+ 	TP_printk("ICMP: skbaddr=%pK, len=%d, [%s] type=%u sequence=%u source=%s dest=%s",
+@@ -227,8 +227,8 @@
+ 	TP_fast_assign(
+ 		__entry->skbaddr = skb;
+ 		__entry->len = skb->len;
+-		__assign_str(saddr, saddr);
+-		__assign_str(daddr, daddr);
++		__assign_str(saddr);
++		__assign_str(daddr);
+ 		__entry->source = tp->source;
+ 		__entry->dest = tp->dest;
+ 		__entry->seq = tp->seq;
+@@ -284,8 +284,8 @@
+ 	TP_fast_assign(
+ 		__entry->skbaddr = skb;
+ 		__entry->len = skb->len;
+-		__assign_str(saddr, saddr);
+-		__assign_str(daddr, daddr);
++		__assign_str(saddr);
++		__assign_str(daddr);
+ 		__entry->source = uh->source;
+ 		__entry->dest = uh->dest;
+ 		__entry->ip_id = ip_id;

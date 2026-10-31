@@ -1,0 +1,105 @@
+{
+  "tests": {
+    "signed_fifo_shift": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "/tmp/onyx-swrctrl-test-fudq7ewn/swrctrl.c:1540:8: runtime error: left shift of 128 by 24 places cannot be represented in type 'int'"
+    },
+    "response_on_failed_request": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "swrctrl: /tmp/onyx-swrctrl-test-fudq7ewn/swrctrl.c:2745: port_failures: Assertion `!responses&&!pm_refs&&!s->master.num_port&&!s->master.port_en_mask&&list_empty(&s->mport_cfg[0].port_req_list)' failed."
+    },
+    "missing_config_usecase_guard": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "==1122771==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x7b97b41e0090 at pc 0x5f770286a9a2 bp 0x7ffec7309e90 sp 0x7ffec7309e80"
+    },
+    "missing_frame_device_guard": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "/tmp/onyx-swrctrl-test-fudq7ewn/swrctrl.c:1810:15: runtime error: index 154 out of bounds for type 'swr_port_params [154]'"
+    },
+    "read_only_first_byte": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "swrctrl: /tmp/onyx-swrctrl-test-fudq7ewn/swrctrl.c:2746: io: Assertion `out[0]==1&&out[3]==4&&io_count==4&&!pm_refs' failed."
+    },
+    "masked_fifo_error": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "swrctrl: /tmp/onyx-swrctrl-test-fudq7ewn/swrctrl.c:2748: fifo: Assertion `swrm_cmd_fifo_rd_cmd(s,&data,2,0,0x1234,1)==-EIO&&io_count==4' failed."
+    },
+    "missing_bus_drain": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "swrctrl: /tmp/onyx-swrctrl-test-fudq7ewn/swrctrl.c:1320: free_irq: Assertion `!atomic_read(&s->notify_calls)&&!atomic_read(&s->master.active_calls)' failed."
+    },
+    "missing_notification_drain": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "swrctrl: /tmp/onyx-swrctrl-test-fudq7ewn/swrctrl.c:1320: free_irq: Assertion `!atomic_read(&s->notify_calls)&&!atomic_read(&s->master.active_calls)' failed."
+    },
+    "missing_master_release_wait": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "swrctrl: /tmp/onyx-swrctrl-test-fudq7ewn/swrctrl.c:2751: lifecycle: Assertion `!atomic_load(&stop_done)&&pending_master&&s->refs.refs==2' failed."
+    },
+    "leaked_second_irq": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "swrctrl: /tmp/onyx-swrctrl-test-fudq7ewn/swrctrl.c:1344: swr_unregister_master: Assertion `!irq_live&&!wake_live&&!pm_live&&cancel_count==2' failed."
+    },
+    "lost_probe_error": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "swrctrl: /tmp/onyx-swrctrl-test-fudq7ewn/swrctrl.c:2754: probe_failures: Assertion `r<0&&!pdev.dev.data&&!qos_live&&!master_live&&!irq_live&&!wake_live&&!pm_live&&!children' failed."
+    }
+  },
+  "source_sha256": {
+    "qcom/opensource/audio-kernel/include/soc/swr-common.h": "5255dd2315331c183d0f0c2c762fa58ea7e650cf9e5739aebfbe7bad59e4ddc9",
+    "qcom/opensource/audio-kernel/include/soc/swr-wcd.h": "df656f95a549d13d4314668e8ac7b93c0abd03e859c8632a2a49827f931ff554",
+    "qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.c": "3e34e4ee31987312f2b6b2122a2db9999fdb2d1ad91d2585050be65d13455e15",
+    "qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.h": "c7ff86c514d7318b666af281166a2ea02da5dd6e192f0b8683ef607a4ff292ec",
+    "qcom/opensource/audio-kernel/soc/swr-mstr-registers.h": "5896afe13580f0c7331b86c801e3c20a3e558c4fb88fccf5598fcf29fb035bc4",
+    "qcom/opensource/audio-kernel/soc/swr-slave-registers.h": "fe4fbe941c38181123197783cfd98959602676623b0690bdbbe3ee8cd6419170"
+  },
+  "harness_sha256": {
+    "swrctrl.c": "9ad071acf68251b3368302927d92df4d4ea64f90eb72a3b7776666791faddd53"
+  },
+  "extracted_production_functions": [
+    "swrm_get_clk_div",
+    "swrm_get_clk_div_rate",
+    "swrm_is_port_en",
+    "copy_port_tables",
+    "swrm_get_port_config",
+    "swrm_is_fractional_sample_rate",
+    "swrm_adjust_sample_rate",
+    "swrm_get_master_port",
+    "swrm_get_packed_reg_val",
+    "swrm_get_port_req",
+    "swrm_cleanup_disabled_port_reqs",
+    "swrm_connect_port",
+    "swrm_disconnect_port",
+    "swrm_init_port_params",
+    "swrm_set_port_config",
+    "swrm_cmd_fifo_rd_cmd",
+    "swrm_read",
+    "swrm_write",
+    "swrm_bulk_write",
+    "swrm_free",
+    "swrm_master_release",
+    "swrm_drop_platform",
+    "swrm_free_port_requests",
+    "swrm_stop",
+    "swrm_probe",
+    "swrm_remove",
+    "swrm_register_wake_irq",
+    "swrm_wcd_notify"
+  ],
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Exact staged functions and native headers with mocked device core, PM, IRQ, clocks, register transport and DT. Pthread waits test controller drain and retained master release. No physical bus, firmware, real IRQ/workqueue scheduler or audio validation."
+}

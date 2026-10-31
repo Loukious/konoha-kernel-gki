@@ -6,8 +6,8 @@
     "/home/loukious/Android/custom-rom/out/target/product/onyx/vendor_dlkm/lib/modules/modules.load": "71ddc08a21c19c67a0f5a12fac978ccae626b64adc10b244309764ca7afb24b8"
   },
   "vendor_names": 466,
-  "built_vendor_names": 244,
-  "percent": 52.4,
+  "built_vendor_names": 249,
+  "percent": 53.4,
   "built_extra_names": [
     "deferred-free-helper",
     "qseecom_dlkm"
@@ -19,9 +19,7 @@
     "block2mtd",
     "boot_stats",
     "bootmonitor",
-    "bt_fm_swr",
     "btfm_slim_codec",
-    "btfmcodec",
     "bwmon",
     "c1dcvs_scmi_v2",
     "cambistmclkcc-sun",
@@ -182,8 +180,6 @@
     "radio-i2c-rtc6226-qca",
     "rdbg",
     "rmnet_aps",
-    "rmnet_core",
-    "rmnet_ctl",
     "rmnet_offload",
     "rmnet_perf",
     "rmnet_perf_tether",
@@ -213,7 +209,6 @@
     "stm_heartbeat",
     "stm_p_ost",
     "stub_dlkm",
-    "swr_ctrl_dlkm",
     "swr_dmic_dlkm",
     "swr_haptics_dlkm",
     "sys_pm_vx",
@@ -244,6 +239,9 @@
     "SoundWire provider is ported; controller allocations must survive master.release, codecs must balance retained device lookups, and controllers must drain IRQ/response producers. Native controllers/codecs remain to be ported.",
     "Bluetooth power is ported. Codec/audio consumers remain, and optional Slimbus platform_data requires lifetime ownership by the bound consumer driver.",
     "ICNSS2 retains its module after publishing native SMMU fault callbacks because the IOMMU provider lacks synchronized callback withdrawal. Physical platform removal is unsupported; safe unload needs a provider-side API.",
-    "CNSS2 native module cleanup is compiled and host-tested; physical hot-removal and outstanding external-pointer lifetime are not established. The main Onyx WLAN driver uses ICNSS2 and still requires its own port."
+    "CNSS2 native module cleanup is compiled and host-tested; physical hot-removal and outstanding external-pointer lifetime are not established. The main Onyx WLAN driver uses ICNSS2 and still requires its own port.",
+    "SoundWire controller removal waits for retained master/slave references; LPASS/codec consumers must drop references and synchronize parent IRQ callbacks before removal. Hardware and complete parent/consumer sequencing remain unvalidated.",
+    "RMNET core/control are resident because IPA exposes no synchronized withdrawal for pending readiness callbacks. Native data paths compile and tested error paths pass; modem/data-plane behavior remains unvalidated.",
+    "Bluetooth codec and SoundWire consumers preserve the native shared hw_params contract, which has no DAI identifier. Their host tests do not establish real ALSA/SoundWire concurrency, firmware behavior or DMA quiescence."
   ]
 }
