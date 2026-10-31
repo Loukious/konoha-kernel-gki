@@ -1164,6 +1164,21 @@ ddk_module(
     kernel_build = "//common:kernel_aarch64",
 )
 
+ddk_headers(
+    name = "debug_symbol_headers",
+    hdrs = ["drivers/soc/qcom/debug_symbol.h", "drivers/android/debug_kinfo.h"],
+)
+
+ddk_module(
+    name = "debug_symbol",
+    srcs = ["drivers/soc/qcom/debug_symbol.c"],
+    out = "debug_symbol.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":debug_symbol_headers"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1238,6 +1253,7 @@ kernel_module_group(
         ":qcom_dcvs",
         ":qcom_pmu_lib",
         ":qfprom_sys",
+        ":debug_symbol",
         ":nvmem_qfprom",
         ":qcom_cpufreq_thermal",
         ":qcom_cpufreq_hw",
