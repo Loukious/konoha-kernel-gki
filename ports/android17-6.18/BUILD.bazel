@@ -1537,9 +1537,303 @@ ddk_module(
     deps = [":geni_headers", ":platform_headers", ":msm_gpi", ":qcom_ipc_logging"],
 )
 
+ddk_headers(
+    name = "remote_headers",
+    hdrs = ["include/linux/soc/qcom/qmi.h", "drivers/soc/qcom/pdr_internal.h", "include/linux/soc/qcom/pdr.h", "drivers/rpmsg/qcom_glink_native.h", "include/linux/rpmsg/qcom_glink.h", "include/linux/rpmsg/qcom_smd.h", "drivers/remoteproc/qcom_common.h", "include/linux/remoteproc/qcom_rproc.h", "include/trace/events/rproc_qcom.h", "drivers/rpmsg/rpmsg_internal.h", "drivers/remoteproc/remoteproc_internal.h", "drivers/remoteproc/remoteproc_elf_helpers.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "qmi_helpers",
+    srcs = ["drivers/soc/qcom/qmi_interface.c", "drivers/soc/qcom/qmi_encdec.c"],
+    out = "qmi_helpers.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":remote_headers", ":platform_headers", ":loader_headers", ":qrtr"],
+)
+
+ddk_module(
+    name = "pdr_interface",
+    srcs = ["drivers/soc/qcom/pdr_interface.c"],
+    out = "pdr_interface.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":remote_headers", ":platform_headers", ":loader_headers", ":qmi_helpers", ":rproc_qcom_common"],
+)
+
+ddk_module(
+    name = "smp2p",
+    srcs = ["drivers/soc/qcom/smp2p.c"],
+    out = "smp2p.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":remote_headers", ":platform_headers", ":loader_headers", ":smem", ":qcom_ipc_logging"],
+)
+
+ddk_module(
+    name = "smp2p_sleepstate",
+    srcs = ["drivers/soc/qcom/smp2p_sleepstate.c"],
+    out = "smp2p_sleepstate.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":remote_headers", ":platform_headers", ":loader_headers", ":smp2p"],
+)
+
+ddk_module(
+    name = "qcom_glink",
+    srcs = ["drivers/rpmsg/qcom_glink_native.c", "drivers/rpmsg/qcom_glink_ssr.c", "drivers/rpmsg/qcom_glink_memshare.c"],
+    out = "qcom_glink.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":remote_headers", ":platform_headers", ":loader_headers", ":qcom_ipc_logging"],
+)
+
+ddk_module(
+    name = "qcom_glink_smem",
+    srcs = ["drivers/rpmsg/qcom_glink_smem.c"],
+    out = "qcom_glink_smem.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":remote_headers", ":platform_headers", ":loader_headers", ":qcom_glink", ":smem", ":qcom_ipc_logging"],
+)
+
+ddk_module(
+    name = "qcom_smd",
+    srcs = ["drivers/rpmsg/qcom_smd.c"],
+    out = "qcom_smd.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":remote_headers", ":platform_headers", ":loader_headers", ":smem"],
+)
+
+ddk_module(
+    name = "rproc_qcom_common",
+    srcs = ["drivers/remoteproc/qcom_common.c", "drivers/remoteproc/qcom_tracepoints.c"],
+    out = "rproc_qcom_common.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":remote_headers", ":platform_headers", ":loader_headers", ":qcom_glink", ":qcom_glink_smem", ":qcom_smd", ":smem"],
+)
+
+ddk_headers(
+    name = "mca_headers",
+    hdrs = glob(["drivers/power/supply/mca/include/mca/common/*.h"]) + ["drivers/misc/hwid/hwid.h"],
+    includes = ["drivers/power/supply/mca/include", "drivers/misc/hwid"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_headers(
+    name = "pmic_glink_headers",
+    hdrs = ["include/linux/soc/qcom/qti_pmic_glink.h"],
+    linux_includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_sysfs",
+    srcs = ["drivers/power/supply/mca/mca_common/mca_sysfs.c"],
+    out = "mca_sysfs.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mca_headers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_event",
+    srcs = ["drivers/power/supply/mca/mca_common/mca_event.c"],
+    out = "mca_event.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mca_headers", ":mca_sysfs"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_log",
+    srcs = ["drivers/power/supply/mca/mca_common/mca_log.c"],
+    out = "mca_log.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mca_headers", ":mca_sysfs", ":mca_event"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_common",
+    srcs = ["drivers/power/supply/mca/mca_common/mca_voter.c"],
+    out = "mca_common.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mca_headers", ":mca_log"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_parse_dts",
+    srcs = ["drivers/power/supply/mca/mca_common/mca_parse_dts.c"],
+    out = "mca_parse_dts.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mca_headers", ":mca_log"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_workqueue",
+    srcs = ["drivers/power/supply/mca/mca_common/mca_workqueue.c"],
+    out = "mca_workqueue.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mca_headers", ":mca_log"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_hwid",
+    srcs = ["drivers/power/supply/mca/mca_common/mca_hwid.c"],
+    out = "mca_hwid.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mca_headers", ":mca_log", ":hwid"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_charge_interface",
+    srcs = ["drivers/power/supply/mca/mca_common/mca_charge_interface.c"],
+    out = "mca_charge_interface.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mca_headers", ":mca_log", ":mca_sysfs", ":mca_event"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_adsp_glink",
+    srcs = ["drivers/power/supply/mca/mca_common/mca_adsp_glink.c"],
+    out = "mca_adsp_glink.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mca_headers", ":mca_log", ":qti_pmic_glink", ":pmic_glink_headers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_qcom_smem",
+    srcs = ["drivers/power/supply/mca/mca_common/mca_qcom_smem.c"],
+    out = "mca_qcom_smem.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mca_headers", ":mca_log", ":smem"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "qti_pmic_glink",
+    srcs = ["drivers/soc/qcom/qti_pmic_glink.c"],
+    out = "qti_pmic_glink.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":pmic_glink_headers", ":platform_headers", ":qcom_ipc_logging", ":remote_headers", ":pdr_interface", ":rproc_qcom_common"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_headers(
+    name = "ucsi_glink_headers",
+    hdrs = ["include/linux/usb/ucsi_glink.h"],
+    linux_includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "ucsi_qti_glink",
+    srcs = ["drivers/usb/typec/ucsi/ucsi_qti_glink.c", "drivers/usb/typec/ucsi/ucsi.h"],
+    out = "ucsi_qti_glink.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":ucsi_glink_headers", ":pmic_glink_headers", ":qti_pmic_glink", ":platform_headers", ":qcom_ipc_logging"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "msm_geni_serial",
+    srcs = ["drivers/tty/serial/msm_geni_serial.c", "drivers/tty/serial/serial_trace.h", "include/uapi/linux/msm_geni_serial.h"],
+    out = "msm_geni_serial.ko",
+    linux_includes = ["include"],
+    includes = ["drivers/tty/serial"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":geni_headers", ":platform_headers", ":msm_gpi", ":qcom_ipc_logging"],
+)
+
+ddk_headers(
+    name = "wcd_headers",
+    hdrs = ["include/linux/soc/qcom/wcd939x-i2c.h", "drivers/misc/hwid/hwid.h"],
+    includes = ["drivers/misc/hwid"],
+    linux_includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wcd_usbss_i2c",
+    srcs = glob(["drivers/soc/qcom/wcd-usbss-*", "drivers/soc/qcom/wcd939x-i2c.c"]),
+    out = "wcd_usbss_i2c.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":wcd_headers", ":platform_headers", ":soc_headers", ":hwid",
+            ":qti_regmap_debugfs", ":ucsi_glink_headers",
+            ":ucsi_qti_glink"],
+    visibility = ["//visibility:public"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
+        ":qmi_helpers",
+        ":pdr_interface",
+        ":smp2p",
+        ":smp2p_sleepstate",
+        ":qcom_glink",
+        ":qcom_glink_smem",
+        ":qcom_smd",
+        ":rproc_qcom_common",
+        ":mca_sysfs",
+        ":mca_event",
+        ":mca_log",
+        ":mca_common",
+        ":mca_parse_dts",
+        ":mca_workqueue",
+        ":mca_hwid",
+        ":mca_charge_interface",
+        ":mca_adsp_glink",
+        ":mca_qcom_smem",
+        ":qti_pmic_glink",
+        ":ucsi_qti_glink",
+        ":msm_geni_serial",
+        ":wcd_usbss_i2c",
         ":hwid", ":qcom_scm", ":pinctrl_msm", ":pinctrl_tuna",
         ":qcom_ipc_logging", ":qcom_pdc", ":cmd_db", ":crm_v2", ":qcom_rpmh",
         ":qcom_hwspinlock", ":smem", ":socinfo", ":spmi_pmic_arb",

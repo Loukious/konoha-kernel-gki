@@ -468,3 +468,64 @@ config I2C_MSM_GENI
 config SPI_MSM_GENI
 	tristate "Onyx GENI SPI"
 	depends on SPI && QCOM_GENI_SE && MSM_GPI_DMA
+
+config RPMSG_QCOM_GLINK
+	tristate "Onyx Qualcomm GLINK"
+
+config QCOM_SMP2P_SLEEPSTATE
+	tristate "Onyx SMP2P sleep-state notifications"
+	depends on QCOM_SMP2P
+
+config RPROC_SSR_NOTIF_TIMEOUT
+	int "Onyx subsystem restart notifier timeout"
+	default 10000
+
+config QCOM_RPROC_COMMON
+	tristate "Onyx remoteproc common services"
+
+config QCOM_PDR_HELPERS
+	tristate "Onyx PDR helpers"
+
+config PDR_INDICATION_NOTIF_TIMEOUT
+	int "Onyx PDR notifier timeout in milliseconds"
+	default 3000
+
+config QCOM_PANIC_ON_NOTIF_TIMEOUT
+	bool "Onyx panic on subsystem notification timeout"
+
+config QCOM_PANIC_ON_PDR_NOTIF_TIMEOUT
+	bool "Onyx panic on PDR notification timeout"
+
+config QCOM_RPROC_BOTH_DUMPS
+	bool "Onyx collect both subsystem minidump and full dump"
+
+config XM_POWER_SUPPLY
+	tristate "Xiaomi MCA power supply framework"
+
+config MCA_QCOM_ADSP
+	tristate "Xiaomi MCA ADSP communication"
+	depends on XM_POWER_SUPPLY && QTI_PMIC_GLINK
+
+config MCA_QCOM_SMEM
+	tristate "Xiaomi MCA shared battery information"
+	depends on XM_POWER_SUPPLY
+
+config QTI_PMIC_GLINK
+	tristate "Qualcomm PMIC GLINK"
+	depends on RPMSG
+	select QCOM_PDR_HELPERS
+	select QCOM_RPROC_COMMON
+
+config UCSI_QTI_GLINK
+	tristate "Onyx UCSI PMIC GLINK"
+	depends on TYPEC_UCSI && QTI_PMIC_GLINK
+
+config SERIAL_MSM_GENI
+	tristate "Onyx GENI high-speed UART"
+	depends on ARCH_QCOM && QCOM_GENI_SE && MSM_GPI_DMA
+	select SERIAL_CORE
+
+config QCOM_WCD_USBSS_I2C
+	tristate "Onyx WCD939x USB switch"
+	depends on I2C && UCSI_QTI_GLINK
+	select REGMAP

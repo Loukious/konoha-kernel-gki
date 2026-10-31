@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 118 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 140 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 118 platform `.ko` files, their symbol tables and DDK configurations.
+- 140 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 5568
-imported symbol CRCs across all 118 modules.
+used. The current [validation report](validation-20261031.json) checks 6542
+imported symbol CRCs across all 140 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -723,3 +723,48 @@ they do not exercise bus transfers, real interrupts, runtime PM or firmware.
 The full 118-module build passes 5,568 imported-symbol CRC checks with no kernel
 compiler or modpost warnings. Device-tree checks pass with the existing 1,084
 vendor DTC warnings recorded separately. The adaptation passes checkpatch.
+
+
+The remote-service group adds QMI, PDR, SMP2P/sleepstate, GLINK/SMEM, SMD and
+remoteproc SSR support. RPMSG/remoteproc private layouts come from pinned common.
+Socket callback teardown, indication-list locking, shared-memory bounds, DMA
+ranges and SSR hook/timer unwinding are checked. ROM notification policies are
+preserved: 20,000 ms SSR and 9,000 ms PDR timeouts, panic-on-timeout and dual dumps.
+`verify_remote.py` passes 764,136 extracted-helper cases with ASan/UBSan, twelve
+source-order checks and configuration checks.
+
+Twelve charging modules provide MCA helpers, PMIC GLINK, ADSP/QBG communication
+and UCSI. Callbacks detach and drain before client release, malformed/short
+messages fail, and firmware replies must match their requests. UCSI uses the
+current core operations and blocking accessory notifiers; timed-out requests
+require reconnect because the firmware protocol has no transaction cookie.
+UCSI 1.x is supported by its 48-byte firmware window; a reported 2.x version
+returns an explicit unsupported error. MCA sysfs/debugfs unwind partial creation
+and expose teardown APIs. `verify_charging.py` exercises message sizes, response
+matching, event/SMEM boundaries and rollback with ASan/UBSan. Battery power-supply
+registration, charge policy and hardware drivers remain separate work.
+
+The high-speed GENI UART uses current serial-core FIFOs and immutable DMA TX
+snapshots with flush generations. Channel requests run during startup, callbacks
+are drained before successful cancellation releases mappings, and clock/PM/probe
+failures unwind their resources. The common RX cancel bit 14 matches upstream
+fix c657243ae12000dc57e3648b0ddd30da9ffd1f14. `verify_uart.py` passes 131,076 TX,
+327,680 packing, 576 power, 225 RX and 16 cancellation cases. Failed GPI hardware
+STOP/RESET during final channel release still does not prove DMA quiescence;
+this hardware-failure recovery limitation remains explicit.
+
+The WCD939x USB switch uses a protected per-device context, initializes producers
+before publication and drains callbacks/work before freeing resources. Paged I2C
+rejects partial transfers, checks page/length boundaries and writes all bytes.
+Register errors propagate while successful vendor register sequences are retained.
+`verify_wcd.py` passes 20,163 transport, 72 short-transfer, 32,768 differential
+register-trace, 637 failure, 13 PM and 256 cleanup cases with ASan/UBSan.
+
+All 140 modules build together with 6,542 matching imported-symbol CRCs and
+no kernel compiler/modpost warnings. Device-tree checks pass with the same 1,084
+recorded vendor DTC warnings. The checkpoint covers 139 of 466 distinct vendor
+load-list names (29.8%); the additional module is a heap helper. This count includes
+shared-list alternative hardware and is not an overall completion percentage.
+Host tests simulate kernel services and do not validate live IRQ/DMA/SRCU,
+firmware, charging, USB operation or device boot. Image assembly and the remaining
+driver stack are still required before a flashable ZIP exists.

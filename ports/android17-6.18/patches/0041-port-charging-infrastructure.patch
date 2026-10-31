@@ -1,0 +1,3148 @@
+--- a/drivers/power/supply/mca/mca_common/mca_sysfs.c
++++ b/drivers/power/supply/mca/mca_common/mca_sysfs.c
+@@ -17,7 +17,6 @@
+  *
+  */
+ #include <mca/common/mca_sysfs.h>
+-#include <linux/version.h>
+ 
+ #define MCA_SYSFS_DEFAULT_DEV_NUM 5
+ 
+@@ -26,7 +25,7 @@
+ static LIST_HEAD(g_mca_sysfs_list_header);
+ static DEFINE_MUTEX(g_mca_sysfs_class_lock);
+ 
+-const char *g_mca_sysfs_dev_name_list[MCA_SYSFS_DEFAULT_DEV_NUM] = {
++static const char * const g_mca_sysfs_dev_name_list[MCA_SYSFS_DEFAULT_DEV_NUM] = {
+ 	"charger", "fuelgauge", "typec", "battery", "hw_monitor",
+ };
+ 
+@@ -47,48 +46,30 @@
+ 	return NULL;
+ }
+ 
+-static struct mca_sysfs_class_node *
+-mca_sysfs_get_or_create_class(const char *cls_name)
+-{
+-	struct list_head *header = &g_mca_sysfs_list_header;
+-	struct mca_sysfs_class_node *l_node = NULL;
+-
+-	mutex_lock(&g_mca_sysfs_class_lock);
+-	l_node = mca_sysfs_get_class_node(cls_name);
+-	if (l_node)
+-		goto find_node;
+-
+-	l_node = kmalloc(sizeof(*l_node), GFP_KERNEL);
+-	if (!l_node)
+-		goto failed;
+-
+-	l_node->class_name = cls_name;
+-#if 0
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 9))
+-	l_node->mca_class = class_create(cls_name);
+-#else
+-	l_node->mca_class = class_create(THIS_MODULE, cls_name);
+-#endif
+-#endif
+-
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+-	l_node->mca_class = class_create(THIS_MODULE, cls_name);
+-#else
+-	l_node->mca_class = class_create(cls_name);
+-#endif
+-
+-	if (!l_node->mca_class) {
+-		kfree(l_node);
+-		goto failed;
+-	}
+-	INIT_LIST_HEAD(&l_node->dev_list_header);
+-	list_add_tail(&l_node->node, header);
+-
+-find_node:
+-	mutex_unlock(&g_mca_sysfs_class_lock);
+-	return l_node;
+-failed:
+-	mutex_unlock(&g_mca_sysfs_class_lock);
++/* Caller holds g_mca_sysfs_class_lock. Classes live until module exit. */
++static struct mca_sysfs_class_node *mca_sysfs_get_or_create_class(const char *cls_name)
++{
++	struct mca_sysfs_class_node *node;
++
++	node = mca_sysfs_get_class_node(cls_name);
++	if (node)
++		return node;
++	node = kzalloc(sizeof(*node), GFP_KERNEL);
++	if (!node)
++		return NULL;
++	node->class_name = kstrdup(cls_name, GFP_KERNEL);
++	if (!node->class_name)
++		goto free_node;
++	node->mca_class = class_create(cls_name);
++	if (IS_ERR(node->mca_class))
++		goto free_name;
++	INIT_LIST_HEAD(&node->dev_list_header);
++	list_add_tail(&node->node, &g_mca_sysfs_list_header);
++	return node;
++free_name:
++	kfree(node->class_name);
++free_node:
++	kfree(node);
+ 	return NULL;
+ }
+ 
+@@ -102,55 +83,53 @@
+ 
+ 	list_for_each_entry(dev_node, &class_node->dev_list_header, node) {
+ 		if (!strcmp(dev_node->name, name))
+-			return dev_node->dev;
++			return get_device(dev_node->dev);
+ 	}
+ 
+ 	return NULL;
+ }
+ 
+ struct device *mca_sysfs_create_group(const char *cls_name,
+-				      const char *dev_name,
+-				      const struct attribute_group *group)
+-{
+-	struct device *l_device = NULL;
+-	struct mca_sysfs_class_node *class_node = NULL;
+-	struct mca_sysfs_dev_node *dev_node = NULL;
++				    const char *dev_name,
++				    const struct attribute_group *group)
++{
++	struct mca_sysfs_class_node *class_node;
++	struct mca_sysfs_dev_node *dev_node;
++	struct device *dev, *existing;
+ 
+ 	if (!cls_name || !dev_name || !group)
+ 		return NULL;
+-
++	dev_node = kzalloc(sizeof(*dev_node), GFP_KERNEL);
++	if (!dev_node)
++		return NULL;
++	dev_node->name = kstrdup(dev_name, GFP_KERNEL);
++	if (!dev_node->name)
++		goto free_node;
++	mutex_lock(&g_mca_sysfs_class_lock);
+ 	class_node = mca_sysfs_get_or_create_class(cls_name);
+-	if (!class_node) {
+-		pr_err("can not find class %s", cls_name);
+-		return NULL;
+-	}
+-
+-	l_device = device_create(class_node->mca_class, NULL, 0, NULL, "%s",
+-				 dev_name);
+-	if (!l_device) {
+-		pr_err("create device %s fai\n", dev_name);
+-		return NULL;
+-	}
+-
+-	if (sysfs_create_group(&l_device->kobj, group)) {
+-		pr_err("%s creat sys group fail\n", dev_name);
+-		goto error;
+-	}
+-
+-	dev_node = kmalloc(sizeof(*dev_node), GFP_KERNEL);
+-	if (!dev_node)
+-		goto error;
+-	dev_node->name = dev_name;
+-	dev_node->dev = l_device;
+-	mutex_lock(&g_mca_sysfs_class_lock);
++	if (!class_node)
++		goto unlock;
++	existing = mca_sysfs_get_device(class_node, dev_name);
++	if (existing) {
++		put_device(existing);
++		goto unlock;
++	}
++	dev = device_create(class_node->mca_class, NULL, 0, NULL, "%s", dev_name);
++	if (IS_ERR(dev))
++		goto unlock;
++	if (sysfs_create_group(&dev->kobj, group)) {
++		device_unregister(dev);
++		goto unlock;
++	}
++	dev_node->dev = dev;
+ 	list_add_tail(&dev_node->node, &class_node->dev_list_header);
+ 	mutex_unlock(&g_mca_sysfs_class_lock);
+-	pr_info("group %s/%s create succ\n", cls_name, dev_name);
+-	return l_device;
+-
+-error:
+-	put_device(l_device);
+-	device_unregister(l_device);
++	return dev;
++unlock:
++	mutex_unlock(&g_mca_sysfs_class_lock);
++	kfree(dev_node->name);
++free_node:
++	kfree(dev_node);
+ 	return NULL;
+ }
+ EXPORT_SYMBOL(mca_sysfs_create_group);
+@@ -158,55 +137,65 @@
+ void mca_sysfs_remove_group(const char *cls_name, struct device *dev,
+ 			    const struct attribute_group *group)
+ {
+-	struct mca_sysfs_class_node *class_node = NULL;
+-	struct mca_sysfs_dev_node *dev_node, *temp_node;
+-
+-	if (!dev || !group)
+-		return;
+-
+-	sysfs_remove_group(&dev->kobj, group);
+-	put_device(dev);
++	struct mca_sysfs_class_node *class_node;
++	struct mca_sysfs_dev_node *node, *found = NULL;
++
++	if (!cls_name || !dev || !group)
++		return;
++	mutex_lock(&g_mca_sysfs_class_lock);
+ 	class_node = mca_sysfs_get_class_node(cls_name);
+-	if (!class_node && !list_empty(&class_node->dev_list_header)) {
+-		list_for_each_entry_safe(dev_node, temp_node,
+-					 &class_node->dev_list_header, node) {
+-			if (dev_node->dev == dev) {
+-				list_del(&dev_node->node);
+-				kfree(dev_node);
++	if (class_node) {
++		list_for_each_entry(node, &class_node->dev_list_header, node) {
++			if (node->dev == dev) {
++				list_del(&node->node);
++				found = node;
+ 				break;
+ 			}
+ 		}
+ 	}
++	mutex_unlock(&g_mca_sysfs_class_lock);
++	if (!found)
++		return;
++	sysfs_remove_group(&dev->kobj, group);
+ 	device_unregister(dev);
++	kfree(found->name);
++	kfree(found);
+ }
+ EXPORT_SYMBOL(mca_sysfs_remove_group);
++
++static struct device *mca_sysfs_get_power_device(const char *name)
++{
++	struct mca_sysfs_class_node *class_node;
++	struct device *dev = NULL;
++
++	mutex_lock(&g_mca_sysfs_class_lock);
++	class_node = mca_sysfs_get_class_node("xm_power");
++	if (class_node)
++		dev = mca_sysfs_get_device(class_node, name);
++	mutex_unlock(&g_mca_sysfs_class_lock);
++	return dev;
++}
+ 
+ int mca_sysfs_create_link_group(const char *dev_name, const char *link_name,
+ 				struct device *target_dev,
+ 				const struct attribute_group *group)
+ {
+ 	struct device *dev;
+-	struct mca_sysfs_class_node *class_node = NULL;
++	int ret;
+ 
+ 	if (!dev_name || !link_name || !target_dev || !group)
+-		return -1;
+-
+-	class_node = mca_sysfs_get_class_node("xm_power");
+-	if (!class_node || !class_node->mca_class)
+-		return -1;
+-
+-	dev = mca_sysfs_get_device(class_node, dev_name);
++		return -EINVAL;
++	dev = mca_sysfs_get_power_device(dev_name);
+ 	if (!dev)
+-		return -1;
+-
+-	if (sysfs_create_group(&target_dev->kobj, group))
+-		return -1;
+-
+-	if (sysfs_create_link(&dev->kobj, &target_dev->kobj, link_name))
+-		return -1;
+-
+-	pr_info("creat %s/%s success\n", dev_name, link_name);
+-	return 0;
++		return -ENODEV;
++	ret = sysfs_create_group(&target_dev->kobj, group);
++	if (!ret) {
++		ret = sysfs_create_link(&dev->kobj, &target_dev->kobj, link_name);
++		if (ret)
++			sysfs_remove_group(&target_dev->kobj, group);
++	}
++	put_device(dev);
++	return ret;
+ }
+ EXPORT_SYMBOL(mca_sysfs_create_link_group);
+ 
+@@ -215,61 +204,65 @@
+ 				 const struct attribute_group *group)
+ {
+ 	struct device *dev;
+-	struct mca_sysfs_class_node *class_node = NULL;
+ 
+ 	if (!dev_name || !link_name || !target_dev || !group)
+ 		return;
+-
+-	class_node = mca_sysfs_get_class_node("xm_power");
+-	if (!class_node || !class_node->mca_class)
+-		return;
+-
+-	dev = mca_sysfs_get_device(class_node, dev_name);
++	dev = mca_sysfs_get_power_device(dev_name);
++	if (dev) {
++		sysfs_remove_link(&dev->kobj, link_name);
++		put_device(dev);
++	}
++	sysfs_remove_group(&target_dev->kobj, group);
++}
++EXPORT_SYMBOL(mca_sysfs_remove_link_group);
++
++int mca_sysfs_create_files(const char *dev_name,
++			   struct mca_sysfs_attr_info *attr, const int attr_size)
++{
++	struct device *dev;
++	int i, ret = 0;
++
++	if (!dev_name || !attr || attr_size <= 0)
++		return -EINVAL;
++	dev = mca_sysfs_get_power_device(dev_name);
+ 	if (!dev)
+-		return;
+-
+-	sysfs_remove_link(&dev->kobj, link_name);
+-	sysfs_remove_group(&target_dev->kobj, group);
+-}
+-EXPORT_SYMBOL(mca_sysfs_remove_link_group);
+-
+-int mca_sysfs_create_files(const char *dev_name,
+-			   struct mca_sysfs_attr_info *attr,
+-			   const int attr_size)
+-{
+-	struct device *dev;
+-	struct mca_sysfs_class_node *class_node = NULL;
+-	int ret = 0;
+-
+-	if (!dev_name || !attr)
+-		return -1;
+-
+-	class_node = mca_sysfs_get_class_node("xm_power");
+-	if (!class_node || !class_node->mca_class)
+-		return -1;
+-
+-	dev = mca_sysfs_get_device(class_node, dev_name);
+-	if (!dev)
+-		return -1;
+-
+-	for (int i = 0; i < attr_size; i++) {
++		return -ENODEV;
++	for (i = 0; i < attr_size; i++) {
+ 		ret = sysfs_create_file(&dev->kobj, &attr[i].attr.attr);
+ 		if (ret) {
+-			pr_err("creat %s file failed\n",
+-			       attr[i].attr.attr.name);
+-			sysfs_remove_file(&dev->kobj, &attr[i].attr.attr);
++			while (i--)
++				sysfs_remove_file(&dev->kobj, &attr[i].attr.attr);
++			break;
+ 		}
+ 	}
++	put_device(dev);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(mca_sysfs_create_files);
++
++void mca_sysfs_remove_files(const char *dev_name,
++			    struct mca_sysfs_attr_info *attr, int attr_size)
++{
++	struct device *dev;
++	int i;
++
++	if (!dev_name || !attr || attr_size <= 0)
++		return;
++	dev = mca_sysfs_get_power_device(dev_name);
++	if (!dev)
++		return;
++	for (i = 0; i < attr_size; i++)
++		sysfs_remove_file(&dev->kobj, &attr[i].attr.attr);
++	put_device(dev);
++}
++EXPORT_SYMBOL(mca_sysfs_remove_files);
+ 
+ void mca_sysfs_init_attrs(struct attribute **attrs,
+ 			  struct mca_sysfs_attr_info *attr_info, int size)
+ {
+ 	int i;
+ 
+-	if (!attrs || !attr_info)
++	if (!attrs || !attr_info || size < 0)
+ 		return;
+ 
+ 	for (i = 0; i < size; i++)
+@@ -297,39 +290,59 @@
+ }
+ EXPORT_SYMBOL(mca_sysfs_lookup_attr);
+ 
++static void mca_sysfs_cleanup(void)
++{
++	struct mca_sysfs_class_node *cls, *cls_tmp;
++	struct mca_sysfs_dev_node *dev, *dev_tmp;
++
++	list_for_each_entry_safe(cls, cls_tmp, &g_mca_sysfs_list_header, node) {
++		list_del(&cls->node);
++		list_for_each_entry_safe(dev, dev_tmp, &cls->dev_list_header, node) {
++			list_del(&dev->node);
++			device_unregister(dev->dev);
++			kfree(dev->name);
++			kfree(dev);
++		}
++		class_destroy(cls->mca_class);
++		kfree(cls->class_name);
++		kfree(cls);
++	}
++}
++
+ static int mca_sysfs_init(void)
+ {
+-	struct mca_sysfs_dev_node *dev_node = NULL;
+-	struct mca_sysfs_class_node *class_node = NULL;
+-	int i;
+-
+-	class_node = mca_sysfs_get_or_create_class("xm_power");
+-	if (!class_node)
+-		return -1;
+-
++	struct mca_sysfs_class_node *cls;
++	struct mca_sysfs_dev_node *node;
++	int i, ret = -ENOMEM;
++
++	mutex_lock(&g_mca_sysfs_class_lock);
++	cls = mca_sysfs_get_or_create_class("xm_power");
++	if (!cls)
++		goto error;
+ 	for (i = 0; i < MCA_SYSFS_DEFAULT_DEV_NUM; i++) {
+-		if (!dev_node) {
+-			dev_node = kmalloc(sizeof(*dev_node), GFP_KERNEL);
+-			if (!dev_node)
+-				return 0;
++		node = kzalloc(sizeof(*node), GFP_KERNEL);
++		if (!node)
++			goto error;
++		node->name = kstrdup(g_mca_sysfs_dev_name_list[i], GFP_KERNEL);
++		if (!node->name) {
++			kfree(node);
++			goto error;
+ 		}
+-		dev_node->name = g_mca_sysfs_dev_name_list[i];
+-		dev_node->dev = device_create(class_node->mca_class, NULL, 0,
+-					      NULL, "%s", dev_node->name);
+-		if (!dev_node->dev) {
+-			pr_err("create device %s fail\n", dev_node->name);
+-			continue;
++		node->dev = device_create(cls->mca_class, NULL, 0, NULL, "%s", node->name);
++		if (IS_ERR(node->dev)) {
++			ret = PTR_ERR(node->dev);
++			kfree(node->name);
++			kfree(node);
++			goto error;
+ 		}
+-		mutex_lock(&g_mca_sysfs_class_lock);
+-		list_add_tail(&dev_node->node, &class_node->dev_list_header);
+-		mutex_unlock(&g_mca_sysfs_class_lock);
+-		dev_node = NULL;
+-	}
+-
+-	if (!dev_node)
+-		kfree(dev_node);
+-
++		list_add_tail(&node->node, &cls->dev_list_header);
++	}
++	mutex_unlock(&g_mca_sysfs_class_lock);
+ 	return 0;
++error:
++	mutex_unlock(&g_mca_sysfs_class_lock);
++	mca_sysfs_cleanup();
++	return ret;
+ }
+ 
+ static struct dentry *g_mca_dbg_dir;
+@@ -352,11 +365,13 @@
+ 		return -ENOMEM;
+ 
+ 	ret = pattr->attr_info->show(pattr, buf);
+-	seq_write(s, buf, ret);
++	if (ret >= 0 && ret <= PAGE_SIZE)
++		seq_write(s, buf, ret);
++	else if (ret > PAGE_SIZE)
++		ret = -EOVERFLOW;
+ 	kfree(buf);
+ 
+-	pr_err("show:%s ret=%d\n", pattr->attr_info->file, ret);
+-	return 0;
++	return ret < 0 ? ret : 0;
+ }
+ 
+ static ssize_t mca_debugfs_template_write(struct file *file,
+@@ -380,13 +395,13 @@
+ 	if (size >= PAGE_SIZE) {
+ 		pr_err("input too long\n");
+ 		kfree(buf);
+-		return -ENOMEM;
++		return -E2BIG;
+ 	}
+ 
+ 	if (copy_from_user(buf, data, size)) {
+ 		pr_err("can not copy data form user to kernel\n");
+ 		kfree(buf);
+-		return -ENOSPC;
++		return -EFAULT;
+ 	}
+ 	buf[size] = '\0';
+ 
+@@ -403,64 +418,124 @@
+ }
+ 
+ static const struct file_operations mca_debugfs_template_fops = {
++	.owner = THIS_MODULE,
++	.llseek = seq_lseek,
+ 	.open = mca_debugfs_template_open,
+ 	.read = seq_read,
+ 	.write = mca_debugfs_template_write,
+ 	.release = single_release,
+ };
+ 
+-static struct dentry *mca_debugfs_get_or_create_dir(const char *dir_name)
+-{
+-	struct dentry *dir = NULL;
+-
+-	if (!g_mca_dbg_dir) {
+-		pr_err("root directory is null");
+-		return NULL;
+-	}
+-
+-	mutex_lock(&g_mca_debugfs_dir_lock);
+-	dir = debugfs_lookup(dir_name, g_mca_dbg_dir);
+-	if (IS_ERR_OR_NULL(dir))
+-		dir = debugfs_create_dir(dir_name, g_mca_dbg_dir);
+-	if (IS_ERR_OR_NULL(dir)) {
+-		pr_err("%s dir create fail", dir_name);
+-		dir = NULL;
+-	}
+-	mutex_unlock(&g_mca_debugfs_dir_lock);
+-	return dir;
++struct mca_debugfs_group {
++	struct list_head node;
++	char *name;
++	struct dentry **files;
++	struct mca_debugfs_attr_data *attrs;
++	int count;
++};
++
++static LIST_HEAD(mca_debugfs_groups);
++
++static void mca_debugfs_free_group(struct mca_debugfs_group *group)
++{
++	int i;
++
++	/* debugfs_remove waits for active operations on each protected file. */
++	for (i = 0; i < group->count; i++)
++		debugfs_remove(group->files[i]);
++	kfree(group->attrs);
++	kfree(group->files);
++	kfree(group->name);
++	kfree(group);
+ }
+ 
+ int mca_debugfs_create_group(const char *dir_name,
+ 			     struct mca_debugfs_attr_info *attr_info,
+ 			     const int attr_size, void *dev_data)
+ {
+-	struct dentry *dir = NULL;
+-	struct dentry *file = NULL;
+-	struct mca_debugfs_attr_data *attr_data = NULL;
+-
+-	dir = mca_debugfs_get_or_create_dir(dir_name);
+-	if (!dir)
+-		return -1;
+-
+-	attr_data = kcalloc(attr_size, sizeof(*attr_data), GFP_KERNEL);
+-	if (!attr_data)
+-		return -1;
+-
+-	for (int i = 0; i < attr_size; i++) {
+-		attr_data[i].attr_info = &attr_info[i];
+-		attr_data[i].private = dev_data;
++	struct mca_debugfs_group *group;
++	struct dentry *dir, *file;
++	int i, ret = -ENOMEM;
++	bool lookup_ref;
++
++	if (!dir_name || !attr_info || attr_size <= 0)
++		return -EINVAL;
++	if (IS_ERR_OR_NULL(g_mca_dbg_dir))
++		return -ENODEV;
++	group = kzalloc(sizeof(*group), GFP_KERNEL);
++	if (!group)
++		return -ENOMEM;
++	group->name = kstrdup(dir_name, GFP_KERNEL);
++	group->attrs = kcalloc(attr_size, sizeof(*group->attrs), GFP_KERNEL);
++	group->files = kcalloc(attr_size, sizeof(*group->files), GFP_KERNEL);
++	if (!group->name || !group->attrs || !group->files)
++		goto free_group;
++
++	mutex_lock(&g_mca_debugfs_dir_lock);
++	dir = debugfs_lookup(dir_name, g_mca_dbg_dir);
++	lookup_ref = !IS_ERR_OR_NULL(dir);
++	if (!lookup_ref)
++		dir = debugfs_create_dir(dir_name, g_mca_dbg_dir);
++	if (IS_ERR_OR_NULL(dir)) {
++		ret = dir ? PTR_ERR(dir) : -ENOMEM;
++		goto unlock;
++	}
++	for (i = 0; i < attr_size; i++) {
++		group->attrs[i].attr_info = &attr_info[i];
++		group->attrs[i].private = dev_data;
+ 		file = debugfs_create_file(attr_info[i].file, attr_info[i].mode,
+-					   dir, &attr_data[i],
+-					   &mca_debugfs_template_fops);
+-		if (file == NULL) {
+-			pr_err("%s file create fail", attr_info[i].file);
+-			kfree(attr_data);
+-			return -1;
++					   dir, &group->attrs[i], &mca_debugfs_template_fops);
++		if (IS_ERR_OR_NULL(file)) {
++			ret = file ? PTR_ERR(file) : -ENOMEM;
++			if (lookup_ref)
++				dput(dir);
++			goto unlock;
+ 		}
+-	}
++		group->files[group->count++] = file;
++	}
++	if (lookup_ref)
++		dput(dir);
++	list_add_tail(&group->node, &mca_debugfs_groups);
++	mutex_unlock(&g_mca_debugfs_dir_lock);
+ 	return 0;
++unlock:
++	mutex_unlock(&g_mca_debugfs_dir_lock);
++free_group:
++	mca_debugfs_free_group(group);
++	return ret;
+ }
+ EXPORT_SYMBOL(mca_debugfs_create_group);
++
++void mca_debugfs_remove_group(const char *dir_name)
++{
++	struct mca_debugfs_group *group, *tmp;
++	LIST_HEAD(removed);
++
++	if (!dir_name)
++		return;
++	mutex_lock(&g_mca_debugfs_dir_lock);
++	list_for_each_entry_safe(group, tmp, &mca_debugfs_groups, node) {
++		if (!strcmp(group->name, dir_name))
++			list_move_tail(&group->node, &removed);
++	}
++	mutex_unlock(&g_mca_debugfs_dir_lock);
++	list_for_each_entry_safe(group, tmp, &removed, node) {
++		list_del(&group->node);
++		mca_debugfs_free_group(group);
++	}
++}
++EXPORT_SYMBOL(mca_debugfs_remove_group);
++
++static void mca_debugfs_cleanup(void)
++{
++	struct mca_debugfs_group *group, *tmp;
++
++	list_for_each_entry_safe(group, tmp, &mca_debugfs_groups, node) {
++		list_del(&group->node);
++		mca_debugfs_free_group(group);
++	}
++	debugfs_remove_recursive(g_mca_dbg_dir);
++}
+ 
+ static int mca_debugfs_init(void)
+ {
+@@ -483,6 +558,15 @@
+ }
+ EXPORT_SYMBOL(mca_debugfs_create_group);
+ 
++void mca_debugfs_remove_group(const char *dir_name)
++{
++}
++EXPORT_SYMBOL(mca_debugfs_remove_group);
++
++static void mca_debugfs_cleanup(void)
++{
++}
++
+ static int mca_debugfs_init(void)
+ {
+ 	return 0;
+@@ -491,14 +575,19 @@
+ 
+ static int __init mca_fs_init(void)
+ {
++	int ret;
++
++	ret = mca_sysfs_init();
++	if (ret)
++		return ret;
+ 	mca_debugfs_init();
+-	mca_sysfs_init();
+ 	return 0;
+ }
+ 
+ static void __exit mca_fs_exit(void)
+ {
+-	debugfs_remove_recursive(g_mca_dbg_dir);
++	mca_debugfs_cleanup();
++	mca_sysfs_cleanup();
+ }
+ 
+ module_init(mca_fs_init);
+--- a/drivers/power/supply/mca/mca_common/mca_event.c
++++ b/drivers/power/supply/mca/mca_common/mca_event.c
+@@ -46,10 +46,10 @@
+ 		return -1;
+ 
+ 	if (type >= MCA_EVENT_TYPE_END)
+-		return 0;
++		return -EINVAL;
+ 
+ 	if (!nb)
+-		return 0;
++		return -EINVAL;
+ 
+ 	return blocking_notifier_chain_register(&g_mca_event_bnh[type], nb);
+ }
+@@ -62,10 +62,10 @@
+ 		return -1;
+ 
+ 	if (type >= MCA_EVENT_TYPE_END)
+-		return 0;
++		return -EINVAL;
+ 
+ 	if (!nb)
+-		return 0;
++		return -EINVAL;
+ 
+ 	return blocking_notifier_chain_unregister(&g_mca_event_bnh[type], nb);
+ }
+@@ -103,7 +103,7 @@
+ 		return;
+ 	}
+ 
+-	if (n_data->event_len >= MCA_EVENT_NOTIFY_SIZE) {
++	if (n_data->event_len < 0 || n_data->event_len >= MCA_EVENT_NOTIFY_SIZE) {
+ 		pr_err("event_len is invalid\n");
+ 		return;
+ 	}
+@@ -130,16 +130,16 @@
+ 		return;
+ 	}
+ 
+-	if (!n_data || (int)num < 1) {
++	if (!n_data || !num || num >= UEVENT_NUM_ENVP) {
+ 		pr_err("n_data or num is invalid\n");
+ 		return;
+ 	}
+ 
+-	uevent_buf = kmalloc((size_t)num * MCA_EVENT_NOTIFY_SIZE, GFP_KERNEL);
++	uevent_buf = kcalloc(num, MCA_EVENT_NOTIFY_SIZE, GFP_KERNEL);
+ 	if (!uevent_buf)
+ 		return;
+ 
+-	envp = kmalloc((size_t)(num + 1) * sizeof(char *), GFP_KERNEL);
++	envp = kcalloc(num + 1, sizeof(*envp), GFP_KERNEL);
+ 	if (!envp) {
+ 		kfree(uevent_buf);
+ 		return;
+@@ -151,7 +151,7 @@
+ 			goto out;
+ 		}
+ 
+-		if (n_data[i].event_len >= MCA_EVENT_NOTIFY_SIZE) {
++		if (n_data[i].event_len < 0 || n_data[i].event_len >= MCA_EVENT_NOTIFY_SIZE) {
+ 			pr_err("event_len is invalid\n");
+ 			goto out;
+ 		}
+@@ -266,8 +266,11 @@
+ 	mca_event_block_notify_init();
+ 	mutex_init(&l_dev->block_notify_mutex);
+ 	l_dev->dev = mca_event_sysfs_create_group();
+-	if (l_dev->dev)
+-		l_dev->sysfs_ne = &l_dev->dev->kobj;
++	if (!l_dev->dev) {
++		kfree(l_dev);
++		return -ENOMEM;
++	}
++	l_dev->sysfs_ne = &l_dev->dev->kobj;
+ 
+ 	g_mca_event_dev = l_dev;
+ 
+--- a/drivers/power/supply/mca/mca_common/mca_log.c
++++ b/drivers/power/supply/mca/mca_common/mca_log.c
+@@ -497,7 +497,7 @@
+ 	info->dev = mca_sysfs_create_group("xm_power", "charge_log",
+ 					   &mca_log_sysfs_attr_group);
+ 
+-	return 0;
++	return info->dev ? 0 : -ENOMEM;
+ }
+ 
+ static void mca_log_sysfs_remove_group(struct mca_log_buf_info *info)
+@@ -548,6 +548,8 @@
+ 	struct mca_log_buf_info *info = &g_mca_log_info;
+ 	int i;
+ 
++	mca_log_sysfs_remove_group(&g_mca_log_info);
++	info->init_flag = 0;
+ 	for (i = 0; i < MCA_LOG_BUFF_COUNT; i++) {
+ 		if (info->log_buff_cache[i]) {
+ 			kfree(info->log_buff_cache[i]);
+@@ -557,7 +559,6 @@
+ 	kfree(info->log_buff);
+ 	info->log_buff = NULL;
+ 
+-	mca_log_sysfs_remove_group(&g_mca_log_info);
+ }
+ module_exit(mca_log_exit);
+ 
+--- a/drivers/power/supply/mca/mca_common/mca_workqueue.c
++++ b/drivers/power/supply/mca/mca_common/mca_workqueue.c
+@@ -21,6 +21,7 @@
+ #include <linux/kernel.h>
+ #include <linux/workqueue.h>
+ #include <mca/common/mca_log.h>
++#include <mca/common/mca_workqueue.h>
+ 
+ #ifndef MCA_LOG_TAG
+ #define MCA_LOG_TAG "mca_workqueue"
+--- a/drivers/power/supply/mca/mca_common/mca_hwid.c
++++ b/drivers/power/supply/mca/mca_common/mca_hwid.c
+@@ -25,16 +25,15 @@
+ #define MCA_LOG_TAG "mca_hwid"
+ #endif
+ 
++static struct mca_hwid hwid;
+ static struct mca_hwid *phwid;
++static DEFINE_MUTEX(hwid_lock);
+ 
+ const struct mca_hwid *mca_get_hwid_info(void)
+ {
++	mutex_lock(&hwid_lock);
+ 	if (!phwid) {
+-		phwid = kzalloc(sizeof(struct mca_hwid), GFP_KERNEL);
+-		if (!phwid) {
+-			mca_log_err("kzalloc phwid failed\n");
+-			return NULL;
+-		}
++		phwid = &hwid;
+ 		phwid->platform_version = get_hw_version_platform();
+ 		phwid->country_version = get_hw_country_version();
+ 		phwid->major_version = get_hw_version_major();
+@@ -53,6 +52,7 @@
+ 			phwid->major_version, phwid->minor_version,
+ 			phwid->build_version);
+ 	}
++	mutex_unlock(&hwid_lock);
+ 	return phwid;
+ }
+ EXPORT_SYMBOL(mca_get_hwid_info);
+--- a/drivers/power/supply/mca/mca_common/mca_charge_interface.c
++++ b/drivers/power/supply/mca/mca_common/mca_charge_interface.c
+@@ -455,11 +455,9 @@
+ 	return 0;
+ }
+ 
+-static int mca_charge_if_remove(struct platform_device *pdev)
++static void mca_charge_if_remove(struct platform_device *pdev)
+ {
+ 	mca_charge_if_sysfs_remove_group(&pdev->dev);
+-
+-	return 0;
+ }
+ 
+ static const struct of_device_id match_table[] = {
+--- a/drivers/power/supply/mca/mca_common/mca_adsp_glink.c
++++ b/drivers/power/supply/mca/mca_common/mca_adsp_glink.c
+@@ -9,7 +9,10 @@
+ #include <linux/list.h>
+ #include <linux/string.h>
+ #include <linux/err.h>
++#include <linux/srcu.h>
++#include <linux/spinlock.h>
+ #include <linux/of_device.h>
++#include <linux/of.h>
+ #include <linux/soc/qcom/qti_pmic_glink.h>
+ #include <mca/common/mca_log.h>
+ #include <mca/common/mca_adsp_glink.h>
+@@ -51,14 +54,22 @@
+ struct mca_adsp_glink_dev {
+ 	struct device *dev;
+ 	struct pmic_glink_client *client;
++	struct pmic_glink_client *qbg_client;
+ 	struct mutex rw_lock;
++	spinlock_t response_lock;
+ 	struct completion ack;
+-	int glink_state;
+-	struct work_struct sync_work;
+-	u32 cur_property_id;
++	bool online;
++	bool pending;
++	u32 owner;
++	u32 property_id;
++	u32 opcode;
++	u32 seq;
+ 	int retcode;
+-	u32 seq;
+ 	u8 read_buf[MCA_ADSP_PROP_DATA_LEN];
++	struct workqueue_struct *wq;
++	struct work_struct notify_work;
++	struct mutex notify_lock;
++	struct list_head notifications;
+ };
+ 
+ struct mca_adsp_ops_node {
+@@ -67,368 +78,370 @@
+ 	struct mca_adsp_glink_ops *ops;
+ };
+ 
+-static struct mca_adsp_glink_dev *g_mca_adsp_glink;
++struct mca_adsp_event {
++	struct list_head node;
++	bool state_event;
++	enum pmic_glink_state state;
++	struct mca_adsp_glink_notify_msg msg;
++};
++
++static struct mca_adsp_glink_dev __rcu *g_mca_adsp_glink;
++static DEFINE_MUTEX(mca_provider_lock);
++static DEFINE_MUTEX(mca_ops_lock);
++DEFINE_STATIC_SRCU(mca_provider_srcu);
++DEFINE_STATIC_SRCU(mca_ops_srcu);
+ static LIST_HEAD(g_mca_adsp_glink_ops_head);
+ static LIST_HEAD(g_mca_adsp_glink_qbg_ops_head);
+ 
++static int mca_adsp_glink_xfer(u32 owner, int property_id, void *value,
++			       size_t size, bool write)
++{
++	struct mca_adsp_glink_req_msg msg = {};
++	struct mca_adsp_glink_dev *mca;
++	struct pmic_glink_client *client;
++	unsigned long flags;
++	int idx, ret;
++
++	if (!value || !size || size > MCA_ADSP_PROP_DATA_LEN || property_id < 0)
++		return -EINVAL;
++	idx = srcu_read_lock(&mca_provider_srcu);
++	mca = srcu_dereference(g_mca_adsp_glink, &mca_provider_srcu);
++	if (!mca) {
++		ret = -ENODEV;
++		goto out;
++	}
++	mutex_lock(&mca->rw_lock);
++	spin_lock_irqsave(&mca->response_lock, flags);
++	if (!mca->online) {
++		spin_unlock_irqrestore(&mca->response_lock, flags);
++		ret = -ENOTCONN;
++		goto unlock;
++	}
++	msg.hdr.owner = owner;
++	msg.hdr.type = MCA_ADSP_GLINK_MSG_REQ;
++	msg.hdr.opcode = write ? MCA_ADSP_GLINK_OPCODE_WRITE : MCA_ADSP_GLINK_OPCODE_READ;
++	msg.property_id = property_id;
++	msg.seq = ++mca->seq;
++	if (write)
++		memcpy(msg.data, value, size);
++	mca->owner = owner;
++	mca->property_id = property_id;
++	mca->opcode = msg.hdr.opcode;
++	mca->retcode = -ETIMEDOUT;
++	mca->pending = true;
++	reinit_completion(&mca->ack);
++	spin_unlock_irqrestore(&mca->response_lock, flags);
++
++	client = owner == MCA_ADSP_GLINK_QBG_OWNER ? mca->qbg_client : mca->client;
++	ret = pmic_glink_write(client, &msg, sizeof(msg));
++	if (!ret) {
++		wait_for_completion_timeout(&mca->ack,
++					    msecs_to_jiffies(MCA_ADSP_GLINK_TIMEOUT_MS));
++		spin_lock_irqsave(&mca->response_lock, flags);
++		ret = mca->retcode;
++		if (!ret && !write)
++			memcpy(value, mca->read_buf, size);
++		spin_unlock_irqrestore(&mca->response_lock, flags);
++	}
++	spin_lock_irqsave(&mca->response_lock, flags);
++	mca->pending = false;
++	spin_unlock_irqrestore(&mca->response_lock, flags);
++unlock:
++	mutex_unlock(&mca->rw_lock);
++out:
++	srcu_read_unlock(&mca_provider_srcu, idx);
++	return ret;
++}
++
+ int mca_adsp_glink_write_prop(int prop_id, void *value, size_t size)
+ {
+-	struct mca_adsp_glink_dev *mca = g_mca_adsp_glink;
+-	struct mca_adsp_glink_req_msg msg = { 0 };
+-	int ret = -1;
+-
+-	if (!value || size >= MCA_ADSP_PROP_DATA_LEN || !mca)
+-		return -1;
+-
+-	mutex_lock(&mca->rw_lock);
+-	mca->seq++;
+-	msg.hdr.owner = MCA_ADSP_GLINK_OWNER;
+-	msg.hdr.type = MCA_ADSP_GLINK_MSG_REQ;
+-	msg.hdr.opcode = MCA_ADSP_GLINK_OPCODE_WRITE;
+-	msg.property_id = prop_id;
+-	msg.seq = mca->seq;
+-	memcpy(msg.data, value, size);
+-
+-	if (mca->glink_state == 0) {
+-		mca_log_err("glink state is down\n");
+-		ret = -ENOTCONN;
+-		goto out;
+-	}
+-
+-	reinit_completion(&mca->ack);
+-	mca->retcode = 0;
+-	mca->cur_property_id = prop_id;
+-	ret = pmic_glink_write(mca->client, &msg, sizeof(msg));
+-	if (ret == 0) {
+-		if (wait_for_completion_timeout(
+-			    &mca->ack,
+-			    msecs_to_jiffies(MCA_ADSP_GLINK_TIMEOUT_MS)) == 0) {
+-			mca_log_err("timed out sending message, prop_id: %d\n",
+-				    mca->cur_property_id);
+-			ret = -ETIMEDOUT;
+-		} else {
+-			ret = mca->retcode;
+-		}
+-		mca->cur_property_id = 0xffffffff;
+-	}
+-out:
+-	mutex_unlock(&mca->rw_lock);
+-	return ret;
++	return mca_adsp_glink_xfer(MCA_ADSP_GLINK_OWNER, prop_id, value, size, true);
+ }
+ EXPORT_SYMBOL(mca_adsp_glink_write_prop);
+ 
+ int mca_adsp_glink_read_prop(int prop_id, void *value, size_t size)
+ {
+-	struct mca_adsp_glink_dev *mca = g_mca_adsp_glink;
+-	struct mca_adsp_glink_req_msg msg = { 0 };
+-	int ret = -1;
+-
+-	if (!value || size >= MCA_ADSP_PROP_DATA_LEN || !mca)
+-		return -1;
+-
+-	mutex_lock(&mca->rw_lock);
+-	mca->seq++;
+-	msg.hdr.owner = MCA_ADSP_GLINK_OWNER;
+-	msg.hdr.type = MCA_ADSP_GLINK_MSG_REQ;
+-	msg.hdr.opcode = MCA_ADSP_GLINK_OPCODE_READ;
+-	msg.property_id = prop_id;
+-	msg.seq = mca->seq;
+-
+-	if (mca->glink_state == 0) {
+-		mca_log_err("glink state is down\n");
+-		ret = -ENOTCONN;
+-		goto out;
+-	}
+-
+-	reinit_completion(&mca->ack);
+-	mca->retcode = 0;
+-	mca->cur_property_id = prop_id;
+-	ret = pmic_glink_write(mca->client, &msg, sizeof(msg));
+-	if (ret == 0) {
+-		if (wait_for_completion_timeout(
+-			    &mca->ack,
+-			    msecs_to_jiffies(MCA_ADSP_GLINK_TIMEOUT_MS)) == 0) {
+-			mca_log_err("timed out sending message, prop_id: %d\n",
+-				    mca->cur_property_id);
+-			ret = -ETIMEDOUT;
+-		} else {
+-			ret = mca->retcode;
+-			if (ret == 0) {
+-				memcpy(value, mca->read_buf, size);
+-				memset(mca->read_buf, 0,
+-				       MCA_ADSP_PROP_DATA_LEN);
+-			}
+-		}
+-		mca->cur_property_id = 0xffffffff;
+-	}
+-out:
+-	mutex_unlock(&mca->rw_lock);
+-	return ret;
++	return mca_adsp_glink_xfer(MCA_ADSP_GLINK_OWNER, prop_id, value, size, false);
+ }
+ EXPORT_SYMBOL(mca_adsp_glink_read_prop);
+ 
+-int mca_adsp_glink_resister_ops(struct mca_adsp_glink_ops *ops, void *priv)
+-{
+-	struct mca_adsp_ops_node *n;
+-
++int mca_adsp_glink_qbg_write_prop(int prop_id, void *value, size_t size)
++{
++	return mca_adsp_glink_xfer(MCA_ADSP_GLINK_QBG_OWNER, prop_id, value, size, true);
++}
++EXPORT_SYMBOL(mca_adsp_glink_qbg_write_prop);
++
++int mca_adsp_glink_qbg_read_prop(int prop_id, void *value, size_t size)
++{
++	return mca_adsp_glink_xfer(MCA_ADSP_GLINK_QBG_OWNER, prop_id, value, size, false);
++}
++EXPORT_SYMBOL(mca_adsp_glink_qbg_read_prop);
++
++static int mca_adsp_register_ops(struct list_head *head,
++			       struct mca_adsp_glink_ops *ops, void *priv)
++{
++	struct mca_adsp_ops_node *n, *existing;
++
++	if (!ops)
++		return -EINVAL;
+ 	n = kzalloc(sizeof(*n), GFP_KERNEL);
+ 	if (!n)
+ 		return -ENOMEM;
+-
+ 	n->ops = ops;
+ 	n->priv = priv;
+-	list_add(&n->node, &g_mca_adsp_glink_ops_head);
++	mutex_lock(&mca_ops_lock);
++	list_for_each_entry(existing, head, node) {
++		if (existing->ops == ops && existing->priv == priv) {
++			mutex_unlock(&mca_ops_lock);
++			kfree(n);
++			return -EEXIST;
++		}
++	}
++	list_add_tail_rcu(&n->node, head);
++	mutex_unlock(&mca_ops_lock);
+ 	return 0;
+ }
++
++static void mca_adsp_unregister_ops(struct list_head *head,
++				    struct mca_adsp_glink_ops *ops, void *priv)
++{
++	struct mca_adsp_ops_node *n, *found = NULL;
++
++	mutex_lock(&mca_ops_lock);
++	list_for_each_entry(n, head, node) {
++		if (n->ops == ops && n->priv == priv) {
++			list_del_rcu(&n->node);
++			found = n;
++			break;
++		}
++	}
++	mutex_unlock(&mca_ops_lock);
++	if (found) {
++		synchronize_srcu(&mca_ops_srcu);
++		kfree(found);
++	}
++}
++
++int mca_adsp_glink_resister_ops(struct mca_adsp_glink_ops *ops, void *priv)
++{
++	return mca_adsp_register_ops(&g_mca_adsp_glink_ops_head, ops, priv);
++}
+ EXPORT_SYMBOL(mca_adsp_glink_resister_ops);
+ 
+-int mca_adsp_glink_qbg_write_prop(int prop_id, void *value, size_t size)
+-{
+-	struct mca_adsp_glink_dev *mca = g_mca_adsp_glink;
+-	struct mca_adsp_glink_req_msg msg = { 0 };
+-	int ret = -1;
+-
+-	if (!value || size >= MCA_ADSP_PROP_DATA_LEN || !mca)
+-		return -1;
+-
+-	mutex_lock(&mca->rw_lock);
+-	mca->seq++;
+-	msg.hdr.owner = MCA_ADSP_GLINK_QBG_OWNER;
+-	msg.hdr.type = MCA_ADSP_GLINK_MSG_REQ;
+-	msg.hdr.opcode = MCA_ADSP_GLINK_OPCODE_WRITE;
+-	msg.property_id = prop_id;
+-	msg.seq = mca->seq;
+-	memcpy(msg.data, value, size);
+-
+-	if (mca->glink_state == 0) {
+-		mca_log_err("glink state is down\n");
+-		ret = -ENOTCONN;
+-		goto out;
+-	}
+-
+-	reinit_completion(&mca->ack);
+-	mca->retcode = 0;
+-	mca->cur_property_id = prop_id;
+-	ret = pmic_glink_write(mca->client, &msg, sizeof(msg));
+-	if (ret == 0) {
+-		if (wait_for_completion_timeout(
+-			    &mca->ack,
+-			    msecs_to_jiffies(MCA_ADSP_GLINK_TIMEOUT_MS)) == 0) {
+-			mca_log_err("timed out sending message, prop_id: %d\n",
+-				    mca->cur_property_id);
+-			ret = -ETIMEDOUT;
+-		} else {
+-			ret = mca->retcode;
++int mca_adsp_glink_qbg_resister_ops(struct mca_adsp_glink_ops *ops, void *priv)
++{
++	return mca_adsp_register_ops(&g_mca_adsp_glink_qbg_ops_head, ops, priv);
++}
++EXPORT_SYMBOL(mca_adsp_glink_qbg_resister_ops);
++
++void mca_adsp_glink_unregister_ops(struct mca_adsp_glink_ops *ops, void *priv)
++{
++	mca_adsp_unregister_ops(&g_mca_adsp_glink_ops_head, ops, priv);
++}
++EXPORT_SYMBOL(mca_adsp_glink_unregister_ops);
++
++void mca_adsp_glink_qbg_unregister_ops(struct mca_adsp_glink_ops *ops, void *priv)
++{
++	mca_adsp_unregister_ops(&g_mca_adsp_glink_qbg_ops_head, ops, priv);
++}
++EXPORT_SYMBOL(mca_adsp_glink_qbg_unregister_ops);
++
++static void mca_adsp_dispatch(struct list_head *head, struct mca_adsp_event *event)
++{
++	struct mca_adsp_ops_node *n;
++	int idx;
++
++	idx = srcu_read_lock(&mca_ops_srcu);
++	list_for_each_entry_rcu(n, head, node, srcu_read_lock_held(&mca_ops_srcu)) {
++		if (!event->state_event) {
++			if (n->ops->notification)
++				n->ops->notification(event->msg.property_id, event->msg.data,
++						     MCA_ADSP_PROP_DATA_LEN, n->priv);
++		} else if (event->state == PMIC_GLINK_STATE_UP) {
++			if (n->ops->glink_state_up)
++				n->ops->glink_state_up(n->priv);
++		} else if (n->ops->glink_state_down) {
++			n->ops->glink_state_down(n->priv);
+ 		}
+-		mca->cur_property_id = 0xffffffff;
+-	}
+-out:
+-	mutex_unlock(&mca->rw_lock);
+-	return ret;
+-}
+-EXPORT_SYMBOL(mca_adsp_glink_qbg_write_prop);
+-
+-int mca_adsp_glink_qbg_read_prop(int prop_id, void *value, size_t size)
+-{
+-	struct mca_adsp_glink_dev *mca = g_mca_adsp_glink;
+-	struct mca_adsp_glink_req_msg msg = { 0 };
+-	int ret = -1;
+-
+-	if (!value || size >= MCA_ADSP_PROP_DATA_LEN || !mca)
+-		return -1;
+-
+-	mutex_lock(&mca->rw_lock);
+-	mca->seq++;
+-	msg.hdr.owner = MCA_ADSP_GLINK_QBG_OWNER;
+-	msg.hdr.type = MCA_ADSP_GLINK_MSG_REQ;
+-	msg.hdr.opcode = MCA_ADSP_GLINK_OPCODE_READ;
+-	msg.property_id = prop_id;
+-	msg.seq = mca->seq;
+-
+-	if (mca->glink_state == 0) {
+-		mca_log_err("glink state is down\n");
+-		ret = -ENOTCONN;
+-		goto out;
+-	}
+-
+-	reinit_completion(&mca->ack);
+-	mca->retcode = 0;
+-	mca->cur_property_id = prop_id;
+-	ret = pmic_glink_write(mca->client, &msg, sizeof(msg));
+-	if (ret == 0) {
+-		if (wait_for_completion_timeout(
+-			    &mca->ack,
+-			    msecs_to_jiffies(MCA_ADSP_GLINK_TIMEOUT_MS)) == 0) {
+-			mca_log_err("timed out sending message, prop_id: %d\n",
+-				    mca->cur_property_id);
+-			ret = -ETIMEDOUT;
+-		} else {
+-			ret = mca->retcode;
+-			if (ret == 0) {
+-				memcpy(value, mca->read_buf, size);
+-				memset(mca->read_buf, 0,
+-				       MCA_ADSP_PROP_DATA_LEN);
+-			}
+-		}
+-		mca->cur_property_id = 0xffffffff;
+-	}
+-out:
+-	mutex_unlock(&mca->rw_lock);
+-	return ret;
+-}
+-EXPORT_SYMBOL(mca_adsp_glink_qbg_read_prop);
+-
+-int mca_adsp_glink_qbg_resister_ops(struct mca_adsp_glink_ops *ops, void *priv)
+-{
+-	struct mca_adsp_ops_node *n;
+-
+-	n = kzalloc(sizeof(*n), GFP_KERNEL);
+-	if (!n)
+-		return -ENOMEM;
+-
+-	n->ops = ops;
+-	n->priv = priv;
+-	list_add(&n->node, &g_mca_adsp_glink_qbg_ops_head);
++	}
++	srcu_read_unlock(&mca_ops_srcu, idx);
++}
++
++static void mca_adsp_notify_work(struct work_struct *work)
++{
++	struct mca_adsp_glink_dev *mca = container_of(work, struct mca_adsp_glink_dev,
++						    notify_work);
++	struct mca_adsp_event *event;
++
++	mutex_lock(&mca->notify_lock);
++	while (!list_empty(&mca->notifications)) {
++		event = list_first_entry(&mca->notifications, struct mca_adsp_event, node);
++		list_del(&event->node);
++		mutex_unlock(&mca->notify_lock);
++		if (event->state_event || event->msg.hdr.owner == MCA_ADSP_GLINK_OWNER)
++			mca_adsp_dispatch(&g_mca_adsp_glink_ops_head, event);
++		if (event->state_event || event->msg.hdr.owner == MCA_ADSP_GLINK_QBG_OWNER)
++			mca_adsp_dispatch(&g_mca_adsp_glink_qbg_ops_head, event);
++		kfree(event);
++		mutex_lock(&mca->notify_lock);
++	}
++	mutex_unlock(&mca->notify_lock);
++}
++
++static void mca_adsp_queue_event(struct mca_adsp_glink_dev *mca,
++				 struct mca_adsp_event *event)
++{
++	mutex_lock(&mca->notify_lock);
++	list_add_tail(&event->node, &mca->notifications);
++	queue_work(mca->wq, &mca->notify_work);
++	mutex_unlock(&mca->notify_lock);
++}
++
++static int mca_adsp_glink_callback(void *priv, void *data, size_t len)
++{
++	struct mca_adsp_glink_dev *mca = priv;
++	const struct pmic_glink_hdr *hdr = data;
++	const struct mca_adsp_glink_resp_msg *msg = data;
++	struct mca_adsp_event *event;
++	unsigned long flags;
++
++	if (!data || len < sizeof(*hdr) ||
++	    (hdr->owner != MCA_ADSP_GLINK_OWNER && hdr->owner != MCA_ADSP_GLINK_QBG_OWNER))
++		return -EINVAL;
++	if (hdr->type == MCA_ADSP_GLINK_MSG_NOTIFY) {
++		if (len != sizeof(event->msg))
++			return -EMSGSIZE;
++		event = kzalloc(sizeof(*event), GFP_KERNEL);
++		if (!event)
++			return -ENOMEM;
++		memcpy(&event->msg, data, sizeof(event->msg));
++		mca_adsp_queue_event(mca, event);
++		return 0;
++	}
++	if (hdr->type != MCA_ADSP_GLINK_MSG_REQ || len != sizeof(*msg))
++		return -EMSGSIZE;
++	spin_lock_irqsave(&mca->response_lock, flags);
++	if (mca->pending && msg->seq == mca->seq && msg->property_id == mca->property_id &&
++	    hdr->owner == mca->owner && hdr->opcode == mca->opcode) {
++		mca->retcode = msg->retcode ? -EREMOTEIO : 0;
++		if (!mca->retcode && hdr->opcode == MCA_ADSP_GLINK_OPCODE_READ)
++			memcpy(mca->read_buf, msg->data, sizeof(mca->read_buf));
++		mca->pending = false;
++		complete(&mca->ack);
++	}
++	spin_unlock_irqrestore(&mca->response_lock, flags);
+ 	return 0;
+ }
+-EXPORT_SYMBOL(mca_adsp_glink_qbg_resister_ops);
+-
+-static int
+-mca_adsp_glink_handle_notification(struct mca_adsp_glink_dev *mca,
+-				   struct mca_adsp_glink_notify_msg *msg)
+-{
+-	struct mca_adsp_ops_node *n;
+-	struct list_head *head;
+-
+-	head = (msg->hdr.owner == MCA_ADSP_GLINK_QBG_OWNER) ?
+-		       &g_mca_adsp_glink_qbg_ops_head :
+-		       &g_mca_adsp_glink_ops_head;
+-
+-	mca_log_info("mca_adsp receive notification %d, owner %d\n",
+-		     msg->property_id, msg->hdr.owner);
+-	list_for_each_entry(n, head, node) {
+-		if (n->ops && n->ops->notification)
+-			n->ops->notification(msg->property_id, msg->data,
+-					     MCA_ADSP_PROP_DATA_LEN, n->priv);
+-	}
+-	return 0;
+-}
+-
+-static int mca_adsp_glink_handle_message(struct mca_adsp_glink_dev *mca,
+-					 struct mca_adsp_glink_resp_msg *msg,
+-					 size_t len)
+-{
+-	if (len == sizeof(*msg) && msg->retcode == 0) {
+-		if (msg->seq != mca->seq) {
+-			mca_log_err("invalid seq_num: %d != %d\n", mca->seq,
+-				    msg->seq);
+-			return 0;
+-		}
+-		if (msg->hdr.opcode == MCA_ADSP_GLINK_OPCODE_READ)
+-			memcpy(mca->read_buf, msg->data,
+-			       MCA_ADSP_PROP_DATA_LEN);
+-	} else {
+-		mca_log_err(
+-			"glink retcode error, property_id: %d, retcode: %d, len: %lu %lu\n",
+-			msg->property_id, msg->retcode, len, sizeof(*msg));
+-		mca->retcode = msg->retcode;
+-	}
++
++static void mca_adsp_glink_state_cb(void *priv, enum pmic_glink_state state)
++{
++	struct mca_adsp_glink_dev *mca = priv;
++	struct mca_adsp_event *event;
++	unsigned long flags;
++
++	spin_lock_irqsave(&mca->response_lock, flags);
++	mca->online = state == PMIC_GLINK_STATE_UP;
++	if (!mca->online && mca->pending) {
++		mca->retcode = -ENOTCONN;
++		mca->pending = false;
++		complete(&mca->ack);
++	}
++	spin_unlock_irqrestore(&mca->response_lock, flags);
++	event = kzalloc(sizeof(*event), GFP_KERNEL);
++	if (event) {
++		event->state_event = true;
++		event->state = state;
++		mca_adsp_queue_event(mca, event);
++	}
++}
++
++static void mca_adsp_stop(struct mca_adsp_glink_dev *mca)
++{
++	unsigned long flags;
++
++	mutex_lock(&mca_provider_lock);
++	if (rcu_access_pointer(g_mca_adsp_glink) == mca)
++		rcu_assign_pointer(g_mca_adsp_glink, NULL);
++	mutex_unlock(&mca_provider_lock);
++	spin_lock_irqsave(&mca->response_lock, flags);
++	mca->online = false;
++	mca->pending = false;
++	mca->retcode = -ENODEV;
+ 	complete(&mca->ack);
+-	return 0;
+-}
+-
+-static int mca_adsp_glink_callback(void *priv, void *data, size_t len)
+-{
+-	struct mca_adsp_glink_dev *mca = priv;
+-	struct pmic_glink_hdr *hdr = data;
+-
+-	if (hdr->type == MCA_ADSP_GLINK_MSG_NOTIFY)
+-		return mca_adsp_glink_handle_notification(mca, data);
+-
+-	return mca_adsp_glink_handle_message(mca, data, len);
+-}
+-
+-static void mca_adsp_glink_sync_work(struct work_struct *work)
+-{
+-	struct mca_adsp_ops_node *n;
+-
+-	list_for_each_entry(n, &g_mca_adsp_glink_ops_head, node) {
+-		if (n->ops && n->ops->glink_state_up)
+-			n->ops->glink_state_up(n->priv);
+-	}
+-	list_for_each_entry(n, &g_mca_adsp_glink_qbg_ops_head, node) {
+-		if (n->ops && n->ops->glink_state_up)
+-			n->ops->glink_state_up(n->priv);
+-	}
+-}
+-
+-static void mca_adsp_glink_state_cb(void *priv, enum pmic_glink_state state)
+-{
+-	struct mca_adsp_glink_dev *mca = priv;
+-	struct mca_adsp_ops_node *n;
+-
+-	mca->glink_state = state;
+-	if (state == PMIC_GLINK_STATE_UP) {
+-		queue_work(system_wq, &mca->sync_work);
+-	} else {
+-		list_for_each_entry(n, &g_mca_adsp_glink_ops_head, node) {
+-			if (n->ops && n->ops->glink_state_down)
+-				n->ops->glink_state_down(n->priv);
+-		}
+-		list_for_each_entry(n, &g_mca_adsp_glink_qbg_ops_head, node) {
+-			if (n->ops && n->ops->glink_state_down)
+-				n->ops->glink_state_down(n->priv);
+-		}
+-	}
++	spin_unlock_irqrestore(&mca->response_lock, flags);
++	/* Exported property requests may have captured the old provider. */
++	synchronize_srcu(&mca_provider_srcu);
++	if (!IS_ERR_OR_NULL(mca->client))
++		pmic_glink_unregister_client(mca->client);
++	if (!IS_ERR_OR_NULL(mca->qbg_client))
++		pmic_glink_unregister_client(mca->qbg_client);
++	/* Events are dispatched outside PMIC RX so callbacks can read properties. */
++	destroy_workqueue(mca->wq);
+ }
+ 
+ static int mca_adsp_glink_probe(struct platform_device *pdev)
+ {
++	struct pmic_glink_client_data client_data = {};
+ 	struct mca_adsp_glink_dev *mca;
+-	struct pmic_glink_client_data client_data = { 0 };
+ 	int ret;
+ 
+ 	mca = devm_kzalloc(&pdev->dev, sizeof(*mca), GFP_KERNEL);
+ 	if (!mca)
+ 		return -ENOMEM;
+-
+ 	mca->dev = &pdev->dev;
+-	mca->cur_property_id = 0xffffffff;
+ 	mutex_init(&mca->rw_lock);
++	spin_lock_init(&mca->response_lock);
+ 	init_completion(&mca->ack);
+-	mca->glink_state = 1;
+-	INIT_WORK(&mca->sync_work, mca_adsp_glink_sync_work);
+-
+-	client_data.name = "mca_adap_glink";
++	mutex_init(&mca->notify_lock);
++	INIT_LIST_HEAD(&mca->notifications);
++	INIT_WORK(&mca->notify_work, mca_adsp_notify_work);
++	mca->online = true;
++	mca->wq = alloc_ordered_workqueue("mca_adsp", WQ_MEM_RECLAIM);
++	if (!mca->wq)
++		return -ENOMEM;
++	client_data.name = "mca_adsp_glink";
+ 	client_data.id = MCA_ADSP_GLINK_OWNER;
+ 	client_data.priv = mca;
+ 	client_data.msg_cb = mca_adsp_glink_callback;
+ 	client_data.state_cb = mca_adsp_glink_state_cb;
+-
+ 	mca->client = pmic_glink_register_client(&pdev->dev, &client_data);
+ 	if (IS_ERR(mca->client)) {
+ 		ret = PTR_ERR(mca->client);
+-		if (ret == -EPROBE_DEFER)
+-			return ret;
+-		mca_log_err("Error in registering with pmic_glink %d\n", ret);
+-		return ret;
+-	}
+-
++		goto stop;
++	}
++	client_data.name = "mca_adsp_qbg_glink";
++	client_data.id = MCA_ADSP_GLINK_QBG_OWNER;
++	client_data.state_cb = NULL;
++	mca->qbg_client = pmic_glink_register_client(&pdev->dev, &client_data);
++	if (IS_ERR(mca->qbg_client)) {
++		ret = PTR_ERR(mca->qbg_client);
++		goto stop;
++	}
++	mutex_lock(&mca_provider_lock);
++	if (rcu_access_pointer(g_mca_adsp_glink)) {
++		mutex_unlock(&mca_provider_lock);
++		ret = -EBUSY;
++		goto stop;
++	}
++	rcu_assign_pointer(g_mca_adsp_glink, mca);
++	mutex_unlock(&mca_provider_lock);
+ 	platform_set_drvdata(pdev, mca);
+-	g_mca_adsp_glink = mca;
+-	mca_log_err("probe ok\n");
+ 	return 0;
+-}
+-
+-static int mca_adsp_glink_remove(struct platform_device *pdev)
+-{
+-	return 0;
++stop:
++	mca_adsp_stop(mca);
++	return ret;
++}
++
++static void mca_adsp_glink_remove(struct platform_device *pdev)
++{
++	mca_adsp_stop(platform_get_drvdata(pdev));
+ }
+ 
+ static const struct of_device_id mca_adsp_match_table[] = {
+ 	{ .compatible = "mca,adsp_glink" },
+ 	{},
+ };
++MODULE_DEVICE_TABLE(of, mca_adsp_match_table);
+ 
+ static struct platform_driver mca_adsp_driver = {
+ 	.driver = {
+--- a/drivers/power/supply/mca/mca_common/mca_qcom_smem.c
++++ b/drivers/power/supply/mca/mca_common/mca_qcom_smem.c
+@@ -19,28 +19,34 @@
+ 	u8 cell_sn; /* 0x25 */
+ };
+ 
++static struct mca_smem_battery_info *mca_smem_get_battery_info(void)
++{
++	struct mca_smem_battery_info *info;
++	size_t size;
++	int ret;
++
++	ret = qcom_smem_alloc(QCOM_SMEM_HOST_ANY, SMEM_ID_VENDOR_BATTERY_INFO,
++			      sizeof(*info));
++	if (ret < 0 && ret != -EEXIST)
++		return ERR_PTR(ret);
++	info = qcom_smem_get(QCOM_SMEM_HOST_ANY, SMEM_ID_VENDOR_BATTERY_INFO, &size);
++	if (IS_ERR(info))
++		return info;
++	if (size < sizeof(*info))
++		return ERR_PTR(-EMSGSIZE);
++	return info;
++}
++
+ int get_smem_battery_info(int *is_zero_speed)
+ {
+ 	struct mca_smem_battery_info *info;
+-	int ret;
+ 
+-	ret = qcom_smem_alloc(QCOM_SMEM_HOST_ANY, SMEM_ID_VENDOR_BATTERY_INFO,
+-			      sizeof(struct mca_smem_battery_info));
+-	if (ret < 0 && ret != -EEXIST) {
+-		mca_log_err("unable to allocate shared state entry\n");
+-		return 0;
+-	}
+-
+-	info = qcom_smem_get(QCOM_SMEM_HOST_ANY, SMEM_ID_VENDOR_BATTERY_INFO,
+-			     NULL);
+-	if (IS_ERR(info)) {
+-		mca_log_err("Unable to acquire shared state entry\n");
+-		return 0;
+-	}
+-
+-	*is_zero_speed = info->zero_speed_start_mode;
+-	mca_log_err("zero_speed_start_mode: %d\n", *is_zero_speed);
+-
++	if (!is_zero_speed)
++		return -EINVAL;
++	info = mca_smem_get_battery_info();
++	if (IS_ERR(info))
++		return PTR_ERR(info);
++	*is_zero_speed = READ_ONCE(info->zero_speed_start_mode);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(get_smem_battery_info);
+@@ -48,26 +54,17 @@
+ int get_smem_battery_verify_result(u8 *verified, u8 *chip_ok)
+ {
+ 	struct mca_smem_battery_info *info;
+-	int ret;
++	u8 result;
+ 
+-	ret = qcom_smem_alloc(QCOM_SMEM_HOST_ANY, SMEM_ID_VENDOR_BATTERY_INFO,
+-			      sizeof(struct mca_smem_battery_info));
+-	if (ret < 0 && ret != -EEXIST) {
+-		mca_log_err("unable to allocate shared state entry\n");
+-		return 0;
+-	}
++	if (!verified || !chip_ok)
++		return -EINVAL;
++	info = mca_smem_get_battery_info();
++	if (IS_ERR(info))
++		return PTR_ERR(info);
++	result = READ_ONCE(info->verify_result);
+ 
+-	info = qcom_smem_get(QCOM_SMEM_HOST_ANY, SMEM_ID_VENDOR_BATTERY_INFO,
+-			     NULL);
+-	if (IS_ERR(info)) {
+-		mca_log_err("Unable to acquire shared state entry\n");
+-		return 0;
+-	}
+-
+-	*verified = (info->verify_result >> 5) & 1;
+-	*chip_ok = (info->verify_result >> 4) & 1;
+-	mca_log_err("uefi_batt_verfitied: %d, uefi_batt_verfitied_chip_ok: %d\n",
+-		    *verified, *chip_ok);
++	*verified = (result >> 5) & 1;
++	*chip_ok = (result >> 4) & 1;
+ 	return 0;
+ }
+ EXPORT_SYMBOL(get_smem_battery_verify_result);
+@@ -75,24 +72,13 @@
+ int get_smem_battery_cell_sn(u32 *cell_sn)
+ {
+ 	struct mca_smem_battery_info *info;
+-	int ret;
+ 
+-	ret = qcom_smem_alloc(QCOM_SMEM_HOST_ANY, SMEM_ID_VENDOR_BATTERY_INFO,
+-			      sizeof(struct mca_smem_battery_info));
+-	if (ret < 0 && ret != -EEXIST) {
+-		mca_log_err("unable to allocate shared state entry\n");
+-		return 0;
+-	}
+-
+-	info = qcom_smem_get(QCOM_SMEM_HOST_ANY, SMEM_ID_VENDOR_BATTERY_INFO,
+-			     NULL);
+-	if (IS_ERR(info)) {
+-		mca_log_err("Unable to acquire shared state entry\n");
+-		return 0;
+-	}
+-
+-	*cell_sn = info->cell_sn;
+-	mca_log_err("uefi_battery_cell_sn: %d\n", *cell_sn);
++	if (!cell_sn)
++		return -EINVAL;
++	info = mca_smem_get_battery_info();
++	if (IS_ERR(info))
++		return PTR_ERR(info);
++	*cell_sn = READ_ONCE(info->cell_sn);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(get_smem_battery_cell_sn);
+--- a/drivers/power/supply/mca/include/mca/common/mca_sysfs.h
++++ b/drivers/power/supply/mca/include/mca/common/mca_sysfs.h
+@@ -96,11 +96,14 @@
+ int mca_sysfs_create_files(const char *dev_name,
+ 			   struct mca_sysfs_attr_info *attr,
+ 			   const int attr_size);
++void mca_sysfs_remove_files(const char *dev_name,
++			    struct mca_sysfs_attr_info *attr, int attr_size);
+ void mca_sysfs_init_attrs(struct attribute **attrs,
+ 			  struct mca_sysfs_attr_info *attr_info, int size);
+ struct mca_sysfs_attr_info *
+ mca_sysfs_lookup_attr(const char *name, struct mca_sysfs_attr_info *attr_info,
+ 		      int size);
++void mca_debugfs_remove_group(const char *dir_name);
+ int mca_debugfs_create_group(const char *dir_name,
+ 			     struct mca_debugfs_attr_info *attr_info,
+ 			     const int attr_size, void *dev_data);
+--- a/drivers/power/supply/mca/include/mca/common/mca_adsp_glink.h
++++ b/drivers/power/supply/mca/include/mca/common/mca_adsp_glink.h
+@@ -21,4 +21,8 @@
+ int mca_adsp_glink_qbg_read_prop(int prop_id, void *value, size_t size);
+ int mca_adsp_glink_qbg_resister_ops(struct mca_adsp_glink_ops *ops, void *priv);
+ 
++/* Unregister before freeing callback state. Do not call from an ops callback. */
++void mca_adsp_glink_unregister_ops(struct mca_adsp_glink_ops *ops, void *priv);
++void mca_adsp_glink_qbg_unregister_ops(struct mca_adsp_glink_ops *ops, void *priv);
++
+ #endif /* _MCA_COMMON_MCA_ADSP_GLINK_H_ */
+--- a/drivers/soc/qcom/qti_pmic_glink.c
++++ b/drivers/soc/qcom/qti_pmic_glink.c
+@@ -18,6 +18,7 @@
+ #include <linux/rpmsg.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
++#include <linux/srcu.h>
+ #include <linux/workqueue.h>
+ #include <linux/remoteproc/qcom_rproc.h>
+ #include <linux/soc/qcom/pdr.h>
+@@ -72,6 +73,9 @@
+ 	void			*ipc_log;
+ 	struct idr		client_idr;
+ 	struct mutex		client_lock;
++	struct srcu_struct	client_srcu;
++	bool			removing;
++	bool			rx_enabled;
+ 	struct rw_semaphore	rpdev_sem;
+ 	spinlock_t		rx_lock;
+ 	struct work_struct	rx_work;
+@@ -129,21 +133,20 @@
+ static DEFINE_MUTEX(pmic_glink_dev_lock);
+ 
+ static void pmic_glink_notify_clients(struct pmic_glink_dev *pgdev,
+-					enum pmic_glink_state state)
++				     enum pmic_glink_state state)
+ {
+ 	struct pmic_glink_client *pos;
++	int idx;
+ 
+ 	pm_stay_awake(pgdev->dev);
+-
+-	mutex_lock(&pgdev->client_lock);
+-	list_for_each_entry(pos, &pgdev->client_dev_list, node)
++	idx = srcu_read_lock(&pgdev->client_srcu);
++	list_for_each_entry_rcu(pos, &pgdev->client_dev_list, node,
++			       srcu_read_lock_held(&pgdev->client_srcu))
+ 		pos->state_cb(pos->priv, state);
+-	mutex_unlock(&pgdev->client_lock);
+-
++	srcu_read_unlock(&pgdev->client_srcu, idx);
+ 	pm_relax(pgdev->dev);
+-
+-	pmic_glink_dbg(pgdev, "state_cb done %d\n", state);
+-}
++}
++
+ 
+ static int pmic_glink_ssr_notifier_cb(struct notifier_block *nb,
+ 				unsigned long code, void *data)
+@@ -216,22 +219,31 @@
+ 	return NULL;
+ }
+ 
+-static struct pmic_glink_dev *get_pmic_glink_from_rpdev(
+-						struct rpmsg_device *rpdev)
+-{
+-	struct pmic_glink_dev *tmp, *pos;
++static struct pmic_glink_dev *get_pmic_glink_from_rpdev(struct rpmsg_device *rpdev)
++{
++	struct pmic_glink_dev *pos, *pgdev = NULL;
++	struct device_link *link;
+ 
+ 	mutex_lock(&pmic_glink_dev_lock);
+-	list_for_each_entry_safe(pos, tmp, &pmic_glink_dev_list, dev_list) {
+-		if (!strcmp(rpdev->id.name, pos->channel_name)) {
+-			mutex_unlock(&pmic_glink_dev_lock);
+-			return pos;
++	list_for_each_entry(pos, &pmic_glink_dev_list, dev_list) {
++		if (strcmp(rpdev->id.name, pos->channel_name))
++			continue;
++		link = device_link_add(&rpdev->dev, pos->dev,
++				       DL_FLAG_AUTOREMOVE_CONSUMER);
++		if (!link)
++			break;
++		if (READ_ONCE(link->status) != DL_STATE_CONSUMER_PROBE &&
++		    READ_ONCE(link->status) != DL_STATE_ACTIVE) {
++			device_link_del(link);
++			break;
+ 		}
++		pgdev = pos;
++		break;
+ 	}
+ 	mutex_unlock(&pmic_glink_dev_lock);
+-
+-	return NULL;
+-}
++	return pgdev;
++}
++
+ 
+ /**
+  * pmic_glink_write() - Send data from client to remote subsystem
+@@ -249,6 +261,8 @@
+ 
+ 	if (!client || !client->pgdev || !client->name)
+ 		return -ENODEV;
++	if (!data || len < (int)sizeof(struct pmic_glink_hdr) || len > INT_MAX)
++		return -EINVAL;
+ 
+ 	down_read(&client->pgdev->rpdev_sem);
+ 
+@@ -303,7 +317,8 @@
+ 	if (!dev || !dev->parent)
+ 		return ERR_PTR(-ENODEV);
+ 
+-	if (!client_data->id || !client_data->msg_cb || !client_data->name)
++	if (!client_data || !client_data->id || client_data->id >= INT_MAX ||
++	    !client_data->msg_cb || !client_data->name)
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	pgdev = get_pmic_glink_from_dev(dev->parent);
+@@ -314,7 +329,7 @@
+ 	}
+ 
+ 	down_read(&pgdev->rpdev_sem);
+-	if (!atomic_read(&pgdev->state)) {
++	if (READ_ONCE(pgdev->removing) || !atomic_read(&pgdev->state)) {
+ 		up_read(&pgdev->rpdev_sem);
+ 		pr_err("pmic_glink is not up\n");
+ 		return ERR_PTR(-EPROBE_DEFER);
+@@ -352,7 +367,7 @@
+ 
+ 	if (client->state_cb) {
+ 		INIT_LIST_HEAD(&client->node);
+-		list_add_tail(&client->node, &pgdev->client_dev_list);
++		list_add_tail_rcu(&client->node, &pgdev->client_dev_list);
+ 	}
+ 	mutex_unlock(&pgdev->client_lock);
+ 
+@@ -361,33 +376,20 @@
+ }
+ EXPORT_SYMBOL(pmic_glink_register_client);
+ 
+-/**
+- * pmic_glink_unregister_client() - Unregister a PMIC Glink client
+- *
+- * @client: Client device pointer that is registered already
+- *
+- * Return: 0 if success, negative on error.
+- *
+- * This function should be called by a client when it wants to unregister from
+- * pmic_glink driver. Messages will not be routed to client after this is done.
+- */
+ int pmic_glink_unregister_client(struct pmic_glink_client *client)
+ {
+-	struct pmic_glink_client *pos, *tmp;
++	struct pmic_glink_dev *pgdev;
+ 
+ 	if (!client || !client->pgdev)
+ 		return -ENODEV;
+-
+-	mutex_lock(&client->pgdev->client_lock);
+-	list_for_each_entry_safe(pos, tmp, &client->pgdev->client_dev_list,
+-				node) {
+-		if (pos == client)
+-			list_del(&client->node);
+-	}
+-	idr_remove(&client->pgdev->client_idr, client->id);
+-	mutex_unlock(&client->pgdev->client_lock);
+-
+-	pmic_glink_dbg(client->pgdev, "Unregistered client %s\n", client->name);
++	pgdev = client->pgdev;
++	mutex_lock(&pgdev->client_lock);
++	if (client->state_cb)
++		list_del_rcu(&client->node);
++	idr_remove(&pgdev->client_idr, client->id);
++	mutex_unlock(&pgdev->client_lock);
++	/* Callbacks may sleep, and no callback can retain freed client data. */
++	synchronize_srcu(&pgdev->client_srcu);
+ 	kfree(client->name);
+ 	kfree(client);
+ 	return 0;
+@@ -395,52 +397,47 @@
+ EXPORT_SYMBOL(pmic_glink_unregister_client);
+ 
+ static void pmic_glink_rx_callback(struct pmic_glink_dev *pgdev,
+-					struct pmic_glink_buf *pbuf)
+-{
++				   struct pmic_glink_buf *pbuf)
++{
++	struct pmic_glink_hdr *hdr = (void *)pbuf->buf;
+ 	struct pmic_glink_client *client;
+-	struct pmic_glink_hdr *hdr;
+-
+-	hdr = (struct pmic_glink_hdr *)pbuf->buf;
+-
++	int idx;
++
++	idx = srcu_read_lock(&pgdev->client_srcu);
+ 	mutex_lock(&pgdev->client_lock);
+ 	client = idr_find(&pgdev->client_idr, hdr->owner);
+ 	mutex_unlock(&pgdev->client_lock);
+-
+-	if (!client || !client->msg_cb) {
+-		pr_err("No client present for %u\n", hdr->owner);
+-		return;
+-	}
+-
+-	if (pgdev->log_enable) {
+-		if (pgdev->log_filter == hdr->owner)
+-			pr_info("Rx data: %*ph\n", (int)pbuf->len, pbuf->buf);
+-		else if (pgdev->log_filter == 65535)
+-			pr_info("[%u] Rx data: %*ph\n", hdr->owner,
+-				(int)pbuf->len, pbuf->buf);
+-	}
+-
+-	client->msg_cb(client->priv, pbuf->buf, pbuf->len);
+-}
++	if (client) {
++		if (pgdev->log_enable &&
++		    (pgdev->log_filter == hdr->owner || pgdev->log_filter == 65535))
++			pr_info("[%u] Rx data: %*ph\n", hdr->owner, (int)pbuf->len, pbuf->buf);
++		client->msg_cb(client->priv, pbuf->buf, pbuf->len);
++	}
++	srcu_read_unlock(&pgdev->client_srcu, idx);
++}
++
+ 
+ static void pmic_glink_rx_work(struct work_struct *work)
+ {
+-	struct pmic_glink_dev *pdev = container_of(work, struct pmic_glink_dev,
+-						rx_work);
+-	struct pmic_glink_buf *pbuf, *tmp;
++	struct pmic_glink_dev *pgdev = container_of(work, struct pmic_glink_dev, rx_work);
++	struct pmic_glink_buf *pbuf;
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&pdev->rx_lock, flags);
+-	if (!list_empty(&pdev->rx_list)) {
+-		list_for_each_entry_safe(pbuf, tmp, &pdev->rx_list, node) {
+-			spin_unlock_irqrestore(&pdev->rx_lock, flags);
+-			pmic_glink_rx_callback(pdev, pbuf);
+-			spin_lock_irqsave(&pdev->rx_lock, flags);
+-			list_del(&pbuf->node);
+-			kfree(pbuf);
++	for (;;) {
++		spin_lock_irqsave(&pgdev->rx_lock, flags);
++		if (list_empty(&pgdev->rx_list)) {
++			spin_unlock_irqrestore(&pgdev->rx_lock, flags);
++			break;
+ 		}
+-	}
+-	spin_unlock_irqrestore(&pdev->rx_lock, flags);
+-}
++		pbuf = list_first_entry(&pgdev->rx_list, struct pmic_glink_buf, node);
++		list_del(&pbuf->node);
++		spin_unlock_irqrestore(&pgdev->rx_lock, flags);
++		if (READ_ONCE(pgdev->rx_enabled))
++			pmic_glink_rx_callback(pgdev, pbuf);
++		kfree(pbuf);
++	}
++}
++
+ 
+ static int pmic_glink_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
+ 				int len, void *priv, u32 addr)
+@@ -449,13 +446,13 @@
+ 	struct pmic_glink_buf *pbuf;
+ 	unsigned long flags;
+ 
+-	if (len < sizeof(struct pmic_glink_hdr)) {
++	if (!pdev || !data || len < (int)sizeof(struct pmic_glink_hdr)) {
+ 		pr_err("Received length %d less than header size: %zu\n", len,
+ 			sizeof(struct pmic_glink_hdr));
+ 		return -EINVAL;
+ 	}
+ 
+-	pbuf = kzalloc(sizeof(*pbuf) + len, GFP_ATOMIC);
++	pbuf = kzalloc(struct_size(pbuf, buf, len), GFP_ATOMIC);
+ 	if (!pbuf)
+ 		return -ENOMEM;
+ 
+@@ -463,33 +460,42 @@
+ 	memcpy(pbuf->buf, data, len);
+ 
+ 	spin_lock_irqsave(&pdev->rx_lock, flags);
++	if (!pdev->rx_enabled) {
++		spin_unlock_irqrestore(&pdev->rx_lock, flags);
++		kfree(pbuf);
++		return -ENOTCONN;
++	}
+ 	list_add_tail(&pbuf->node, &pdev->rx_list);
++	queue_work(pdev->rx_wq, &pdev->rx_work);
+ 	spin_unlock_irqrestore(&pdev->rx_lock, flags);
+-
+-	queue_work(pdev->rx_wq, &pdev->rx_work);
+ 	return 0;
+ }
+ 
+ static void pmic_glink_rpmsg_remove(struct rpmsg_device *rpdev)
+ {
+-	struct pmic_glink_dev *pgdev = NULL;
+-
+-	pgdev = get_pmic_glink_from_rpdev(rpdev);
+-	if (!pgdev) {
+-		pr_err("Failed to get pmic_glink_dev for %s\n", rpdev->id.name);
++	struct pmic_glink_dev *pgdev = dev_get_drvdata(&rpdev->dev);
++	unsigned long flags;
++
++	if (!pgdev)
+ 		return;
+-	}
+-
+ 	down_write(&pgdev->rpdev_sem);
+ 	atomic_set(&pgdev->state, 0);
+ 	pgdev->rpdev = NULL;
+ 	up_write(&pgdev->rpdev_sem);
+-	pmic_glink_dbg(pgdev, "%s removed\n", rpdev->id.name);
+-}
++	spin_lock_irqsave(&pgdev->rx_lock, flags);
++	pgdev->rx_enabled = false;
++	spin_unlock_irqrestore(&pgdev->rx_lock, flags);
++	cancel_work_sync(&pgdev->init_work);
++	flush_workqueue(pgdev->rx_wq);
++	pmic_glink_notify_clients(pgdev, PMIC_GLINK_STATE_DOWN);
++	dev_set_drvdata(&rpdev->dev, NULL);
++}
++
+ 
+ static int pmic_glink_rpmsg_probe(struct rpmsg_device *rpdev)
+ {
+ 	struct pmic_glink_dev *pgdev = NULL;
++	unsigned long flags;
+ 
+ 	pgdev = get_pmic_glink_from_rpdev(rpdev);
+ 	if (!pgdev) {
+@@ -498,6 +504,13 @@
+ 	}
+ 
+ 	down_write(&pgdev->rpdev_sem);
++	if (pgdev->removing || pgdev->rpdev) {
++		up_write(&pgdev->rpdev_sem);
++		return -EBUSY;
++	}
++	spin_lock_irqsave(&pgdev->rx_lock, flags);
++	pgdev->rx_enabled = true;
++	spin_unlock_irqrestore(&pgdev->rx_lock, flags);
+ 	dev_set_drvdata(&rpdev->dev, pgdev);
+ 	pgdev->rpdev = rpdev;
+ 	atomic_set(&pgdev->state, 1);
+@@ -513,6 +526,8 @@
+ 	{ "PMIC_LOGS_ADSP_APPS" },
+ 	{}
+ };
++
++MODULE_DEVICE_TABLE(rpmsg, pmic_glink_rpmsg_match);
+ 
+ static struct rpmsg_driver pmic_glink_rpmsg_driver = {
+ 	.id_table = pmic_glink_rpmsg_match,
+@@ -552,6 +567,9 @@
+ 	struct device *dev = pgdev->dev;
+ 	int rc;
+ 
++	if (READ_ONCE(pgdev->removing) || !atomic_read(&pgdev->state))
++		return;
++
+ 	if (atomic_read(&pgdev->pdr_state) == SERVREG_SERVICE_STATE_DOWN ||
+ 	    atomic_read(&pgdev->prev_state) == QCOM_SSR_BEFORE_SHUTDOWN) {
+ 		pmic_glink_notify_clients(pgdev, PMIC_GLINK_STATE_UP);
+@@ -559,7 +577,7 @@
+ 		atomic_set(&pgdev->prev_state, QCOM_SSR_AFTER_POWERUP);
+ 	}
+ 
+-	if (pgdev->child_probed)
++	if (READ_ONCE(pgdev->removing) || !atomic_read(&pgdev->state) || pgdev->child_probed)
+ 		return;
+ 
+ 	rc = of_platform_populate(dev->of_node, NULL, NULL, dev);
+@@ -606,7 +624,7 @@
+ 		return rc;
+ 	}
+ 
+-	if (strlen(pgdev->channel_name) > RPMSG_NAME_SIZE) {
++	if (strlen(pgdev->channel_name) >= RPMSG_NAME_SIZE) {
+ 		pr_err("pmic glink channel name %s exceeds length\n",
+ 			pgdev->channel_name);
+ 		return -EINVAL;
+@@ -643,9 +661,15 @@
+ 		}
+ 	}
+ 
++	pgdev->dev = dev;
++	rc = init_srcu_struct(&pgdev->client_srcu);
++	if (rc)
++		return rc;
++
+ 	pgdev->rx_wq = create_singlethread_workqueue("pmic_glink_rx");
+ 	if (!pgdev->rx_wq) {
+ 		pr_err("Failed to create pmic_glink_rx wq\n");
++		cleanup_srcu_struct(&pgdev->client_srcu);
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -715,32 +739,40 @@
+ error_pdr:
+ 	pdr_handle_release(pgdev->pdr_handle);
+ error_service:
+-	qcom_unregister_ssr_notifier(pgdev->subsys_handle, &pgdev->ssr_nb);
++	if (pgdev->subsys_name)
++		qcom_unregister_ssr_notifier(pgdev->subsys_handle, &pgdev->ssr_nb);
+ error_subsys:
+ 	ipc_log_context_destroy(pgdev->ipc_log);
+ 	idr_destroy(&pgdev->client_idr);
+ 	destroy_workqueue(pgdev->rx_wq);
++	cleanup_srcu_struct(&pgdev->client_srcu);
+ 	return rc;
+ }
+ 
+-static int pmic_glink_remove(struct platform_device *pdev)
++static void pmic_glink_remove(struct platform_device *pdev)
+ {
+ 	struct pmic_glink_dev *pgdev = dev_get_drvdata(&pdev->dev);
+ 
+-	ipc_log_context_destroy(pgdev->ipc_log);
+-	pdr_handle_release(pgdev->pdr_handle);
+-	qcom_unregister_ssr_notifier(pgdev->subsys_handle, &pgdev->ssr_nb);
+-	device_init_wakeup(pgdev->dev, false);
+-	debugfs_remove_recursive(pgdev->debugfs_dir);
++	pmic_glink_dev_remove(pgdev);
++	down_write(&pgdev->rpdev_sem);
++	pgdev->removing = true;
++	atomic_set(&pgdev->state, 0);
++	up_write(&pgdev->rpdev_sem);
++	if (pgdev->pdr_service_name)
++		pdr_handle_release(pgdev->pdr_handle);
++	if (pgdev->subsys_name)
++		qcom_unregister_ssr_notifier(pgdev->subsys_handle, &pgdev->ssr_nb);
++	cancel_work_sync(&pgdev->init_work);
++	of_platform_depopulate(&pdev->dev);
+ 	flush_workqueue(pgdev->rx_wq);
+ 	destroy_workqueue(pgdev->rx_wq);
++	debugfs_remove_recursive(pgdev->debugfs_dir);
++	device_init_wakeup(pgdev->dev, false);
+ 	idr_destroy(&pgdev->client_idr);
+-	of_platform_depopulate(&pdev->dev);
+-	pgdev->child_probed = false;
+-	pmic_glink_dev_remove(pgdev);
+-
+-	return 0;
+-}
++	cleanup_srcu_struct(&pgdev->client_srcu);
++	ipc_log_context_destroy(pgdev->ipc_log);
++}
++
+ 
+ static const struct of_device_id pmic_glink_of_match[] = {
+ 	{ .compatible = "qcom,qti-pmic-glink" },
+@@ -765,7 +797,10 @@
+ 	if (rc < 0)
+ 		return rc;
+ 
+-	return register_rpmsg_driver(&pmic_glink_rpmsg_driver);
++	rc = register_rpmsg_driver(&pmic_glink_rpmsg_driver);
++	if (rc)
++		platform_driver_unregister(&pmic_glink_driver);
++	return rc;
+ }
+ module_init(pmic_glink_init);
+ 
+--- a/include/linux/soc/qcom/qti_pmic_glink.h
++++ b/include/linux/soc/qcom/qti_pmic_glink.h
+@@ -8,6 +8,8 @@
+ #define __QTI_PMIC_GLINK_H
+ 
+ #include <linux/types.h>
++#include <linux/err.h>
++#include <linux/kconfig.h>
+ 
+ struct pmic_glink_client;
+ struct device;
+@@ -24,6 +26,9 @@
+  * @priv:	private data for client
+  * @msg_cb:	callback function for client to receive the messages that
+  *		are intended to be delivered to it over PMIC Glink
++ * Callbacks may sleep. Do not unregister a client from either callback;
++ * unregister waits for pending callbacks. Serialize writes with unregister.
++ *
+  * @state_cb:	callback function to notify pmic glink state in the event of
+  *		a subsystem restart (SSR) or a protection domain restart (PDR)
+  */
+--- a/drivers/usb/typec/ucsi/ucsi_qti_glink.c
++++ b/drivers/usb/typec/ucsi/ucsi_qti_glink.c
+@@ -32,14 +32,13 @@
+ #define UC_UCSI_USBC_NOTIFY_IND		0x13
+ 
+ /* Generic definitions */
+-#define CMD_PENDING			1
+ #define UCSI_LOG_BUF_SIZE		256
+ #define NUM_LOG_PAGES			10
+ #define UCSI_WAIT_TIME_MS		5000
+ 
+ #define ucsi_dbg(fmt, ...) \
+ 	do { \
+-		ipc_log_string(ucsi_ipc_log, fmt, ##__VA_ARGS__); \
++		ipc_log_string(udev->ipc_log, fmt, ##__VA_ARGS__); \
+ 		pr_debug(fmt, ##__VA_ARGS__); \
+ 	} while (0)
+ 
+@@ -77,27 +76,27 @@
+ };
+ 
+ struct ucsi_dev {
+-	struct device			*dev;
+-	struct ucsi			*ucsi;
+-	struct pmic_glink_client	*client;
+-	struct dentry			*debugfs_dir;
+-	struct completion		read_ack;
+-	struct completion		write_ack;
+-	struct completion		sync_write_ack;
+-	struct mutex			read_lock;
+-	struct mutex			write_lock;
+-	struct mutex			notify_lock;
+-	struct mutex			state_lock;
+-	struct ucsi_read_buf_resp_msg	rx_buf;
+-	unsigned long			flags;
+-	atomic_t			rx_valid;
+-	unsigned long			cmd_requested_flags;
+-	struct list_head		constat_info_list;
+-	struct work_struct		notify_work;
+-	struct work_struct		setup_work;
+-	struct work_struct		unregister_work;
+-	atomic_t			state;
+-	bool				remoteproc_timestamp_en;
++	struct device *dev;
++	struct ucsi *ucsi;
++	struct pmic_glink_client *client;
++	struct dentry *debugfs_dir;
++	void *ipc_log;
++	struct mutex io_lock;
++	struct mutex state_lock;
++	spinlock_t response_lock;
++	struct completion ack;
++	bool pending;
++	u32 pending_opcode;
++	int result;
++	u8 read_buf[UCSI_BUF_SIZE];
++	atomic_t state;
++	bool stopping;
++	bool restart;
++	bool remoteproc_timestamp_en;
++	struct work_struct state_work;
++	struct work_struct notify_work;
++	struct mutex notify_lock;
++	struct list_head constat_info_list;
+ };
+ 
+ struct remoteproc_ts {
+@@ -107,18 +106,17 @@
+ 	u32	dec;
+ };
+ 
+-static void *ucsi_ipc_log;
+-static RAW_NOTIFIER_HEAD(ucsi_glink_notifier);
++static BLOCKING_NOTIFIER_HEAD(ucsi_glink_notifier);
+ 
+ int register_ucsi_glink_notifier(struct notifier_block *nb)
+ {
+-	return raw_notifier_chain_register(&ucsi_glink_notifier, nb);
++	return blocking_notifier_chain_register(&ucsi_glink_notifier, nb);
+ }
+ EXPORT_SYMBOL(register_ucsi_glink_notifier);
+ 
+ int unregister_ucsi_glink_notifier(struct notifier_block *nb)
+ {
+-	return raw_notifier_chain_unregister(&ucsi_glink_notifier, nb);
++	return blocking_notifier_chain_unregister(&ucsi_glink_notifier, nb);
+ }
+ EXPORT_SYMBOL(unregister_ucsi_glink_notifier);
+ 
+@@ -184,249 +182,93 @@
+ 	}
+ }
+ 
+-static int handle_ucsi_read_ack(struct ucsi_dev *udev, void *data, size_t len)
+-{
+-	if (len != sizeof(udev->rx_buf)) {
+-		pr_err("Incorrect received length %zu expected %zu\n", len,
+-			sizeof(udev->rx_buf));
+-		atomic_set(&udev->rx_valid, 0);
++/* The firmware has no transaction cookie: serialize read and write requests. */
++static int ucsi_qti_xfer(struct ucsi_dev *udev, unsigned int offset,
++		       void *value, size_t size, bool write)
++{
++	struct ucsi_write_buf_req_msg req = {};
++	unsigned long flags;
++	int ret;
++
++	if (!value || !size || offset >= UCSI_BUF_SIZE ||
++	    size > UCSI_BUF_SIZE - offset)
+ 		return -EINVAL;
+-	}
+-
+-	memcpy(&udev->rx_buf, data, sizeof(udev->rx_buf));
+-	if (udev->rx_buf.ret_code) {
+-		pr_err("ret_code: %u\n", udev->rx_buf.ret_code);
+-		return -EINVAL;
+-	}
+-
+-	pr_debug("read ack\n");
+-	atomic_set(&udev->rx_valid, 1);
+-	complete(&udev->read_ack);
+-
+-	return 0;
+-}
+-
+-static int handle_ucsi_write_ack(struct ucsi_dev *udev, void *data, size_t len)
+-{
+-	struct ucsi_write_buf_resp_msg *msg_ptr;
+-
+-	if (len != sizeof(*msg_ptr)) {
+-		pr_err("Incorrect received length %zu expected %zu\n", len,
+-			sizeof(*msg_ptr));
+-		return -EINVAL;
+-	}
+-
+-	msg_ptr = data;
+-	if (msg_ptr->ret_code) {
+-		pr_err("ret_code: %u\n", msg_ptr->ret_code);
+-		return -EINVAL;
+-	}
+-
+-	pr_debug("write ack\n");
+-	complete(&udev->write_ack);
+-
+-	return 0;
+-}
+-
+-static int handle_ucsi_notify(struct ucsi_dev *udev, void *data, size_t len)
+-{
+-	struct ucsi_notify_ind_msg *msg_ptr;
+-	struct ucsi_connector *con;
+-	u32 cci;
+-	u8 con_num;
+-
+-	if (len != sizeof(*msg_ptr)) {
+-		pr_err("Incorrect received length %zu expected %zu\n", len,
+-			sizeof(*msg_ptr));
+-		return -EINVAL;
+-	}
+-
+-	mutex_lock(&udev->state_lock);
+-	if (atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN) {
+-		pr_err("glink state is down\n");
+-		mutex_unlock(&udev->state_lock);
+-		return -ENOTCONN;
+-	}
+-
+-	if (!udev->ucsi) {
+-		pr_err("ucsi is NULL\n");
+-		mutex_unlock(&udev->state_lock);
+-		return -ENODEV;
+-	}
+-
+-	msg_ptr = data;
+-	cci = msg_ptr->notification;
+-	ucsi_log(udev, "notify:", UCSI_CCI, (u8 *)&cci, sizeof(cci));
+-
+-	if (test_bit(CMD_PENDING, &udev->flags) &&
+-		cci & (UCSI_CCI_ACK_COMPLETE | UCSI_CCI_COMMAND_COMPLETE)) {
+-		pr_debug("received ack\n");
+-		complete(&udev->sync_write_ack);
+-	}
+-
+-	con_num = UCSI_CCI_CONNECTOR(cci);
+-	pr_debug("con_num: %u num_connectors: %u\n", con_num,
+-		udev->ucsi->cap.num_connectors);
+-
+-	if (con_num && con_num <= udev->ucsi->cap.num_connectors &&
+-		udev->ucsi->connector) {
+-		con = &udev->ucsi->connector[con_num - 1];
+-		if (con && con->ucsi)
+-			ucsi_connector_change(udev->ucsi, con_num);
+-	}
+-	mutex_unlock(&udev->state_lock);
+-
+-	return 0;
+-}
+-
+-static int ucsi_callback(void *priv, void *data, size_t len)
+-{
+-	struct pmic_glink_hdr *hdr = data;
+-	struct ucsi_dev *udev = priv;
+-	struct remoteproc_ts ts;
+-
+-	if (udev->remoteproc_timestamp_en) {
+-		get_remoteproc_timestamp(&ts);
+-		ucsi_dbg("owner: %u type: %u opcode: %u len:%zu (%02u:%02u:%02u.%06u)\n",
+-			hdr->owner, hdr->type, hdr->opcode, len, ts.hh, ts.mm,
+-			ts.ss, ts.dec);
+-	} else {
+-		ucsi_dbg("owner: %u type: %u opcode: %u len:%zu\n", hdr->owner,
+-			hdr->type, hdr->opcode, len);
+-	}
+-
+-	if (hdr->opcode == UC_UCSI_READ_BUF_REQ)
+-		handle_ucsi_read_ack(udev, data, len);
+-	else if (hdr->opcode == UC_UCSI_WRITE_BUF_REQ)
+-		handle_ucsi_write_ack(udev, data, len);
+-	else if (hdr->opcode == UC_UCSI_USBC_NOTIFY_IND)
+-		handle_ucsi_notify(udev, data, len);
+-	else
+-		pr_err("Unknown message opcode: %d\n", hdr->opcode);
+-
+-	return 0;
+-}
+-
+-static bool validate_ucsi_msg(unsigned int offset, size_t len)
+-{
+-	pr_debug("offset %u len %zu\n", offset, len);
+-
+-	if (offset > UCSI_BUF_SIZE - 1 || len > UCSI_BUF_SIZE ||
+-		offset + len > UCSI_BUF_SIZE) {
+-		pr_err("Incorrect length %zu or offset %u\n", len, offset);
+-		return false;
+-	}
+-
+-	return true;
+-}
+-
+-#define CONN_STAT_REQD	1
+-static int ucsi_qti_glink_write(struct ucsi_dev *udev, unsigned int offset,
+-			       const void *val, size_t val_len, bool sync)
+-{
+-	struct ucsi_write_buf_req_msg ucsi_buf = { { 0 } };
+-	int rc;
+-
+-	if (!validate_ucsi_msg(offset, val_len))
+-		return -EINVAL;
+-
+-	ucsi_log(udev, sync ? "sync_write:" : "async_write:", offset,
+-			(u8 *)val, val_len);
+-
+-	if (atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN)
+-		return 0;
+-
+-	ucsi_buf.hdr.owner = MSG_OWNER_UC;
+-	ucsi_buf.hdr.type = MSG_TYPE_REQ_RESP;
+-	ucsi_buf.hdr.opcode = UC_UCSI_WRITE_BUF_REQ;
+-	memcpy(&ucsi_buf.buf[offset], val, val_len);
+-
+-	mutex_lock(&udev->write_lock);
+-	pr_debug("%s write\n", sync ? "sync" : "async");
+-	reinit_completion(&udev->write_ack);
+-
+-	if (sync) {
+-		set_bit(CMD_PENDING, &udev->flags);
+-		reinit_completion(&udev->sync_write_ack);
+-	}
+-
+-	rc = pmic_glink_write(udev->client, &ucsi_buf,
+-					sizeof(ucsi_buf));
+-	if (rc < 0) {
+-		pr_err("Error in sending message rc=%d\n", rc);
+-		goto out;
+-	}
+-
+-	rc = wait_for_completion_timeout(&udev->write_ack,
+-				msecs_to_jiffies(UCSI_WAIT_TIME_MS));
+-	if (!rc) {
+-		pr_err("timed out\n");
+-		rc = -ETIMEDOUT;
+-		goto out;
+-	} else {
+-		rc = 0;
+-	}
+-
+-	if (sync) {
+-		rc = wait_for_completion_timeout(&udev->sync_write_ack,
+-					msecs_to_jiffies(UCSI_WAIT_TIME_MS));
+-		if (!rc) {
+-			pr_err("timed out for sync_write_ack\n");
+-			rc = -ETIMEDOUT;
+-			goto out;
+-		} else {
+-			rc = 0;
+-		}
+-	}
+-
+-	if (((u8 *)val)[0] == UCSI_GET_CONNECTOR_STATUS) {
+-		mutex_lock(&udev->notify_lock);
+-		set_bit(CONN_STAT_REQD, &udev->cmd_requested_flags);
+-		mutex_unlock(&udev->notify_lock);
+-	}
+-
+-out:
+-	if (sync)
+-		clear_bit(CMD_PENDING, &udev->flags);
+-
+-	mutex_unlock(&udev->write_lock);
+-	return rc;
+-}
+-
+-static int ucsi_qti_async_write(struct ucsi *ucsi, unsigned int offset,
+-			       const void *val, size_t val_len)
+-{
+-	struct ucsi_dev *udev = ucsi_get_drvdata(ucsi);
+-
+-	return ucsi_qti_glink_write(udev, offset, val, val_len, false);
+-}
+-
+-
+-static int ucsi_qti_sync_write(struct ucsi *ucsi, unsigned int offset,
+-			       const void *val, size_t val_len)
+-{
+-	struct ucsi_dev *udev = ucsi_get_drvdata(ucsi);
+-
+-	return ucsi_qti_glink_write(udev, offset, val, val_len, true);
+-}
+-
+-static void ucsi_qti_clean_notification(struct ucsi_dev *udev)
+-{
+-	struct constat_info_entry *entry, *tmp;
+-
+-	mutex_lock(&udev->notify_lock);
+-	list_for_each_entry_safe(entry, tmp, &udev->constat_info_list, node) {
+-		list_del(&entry->node);
+-		kfree(entry);
+-	}
+-	INIT_LIST_HEAD(&udev->constat_info_list);
+-	mutex_unlock(&udev->notify_lock);
++	req.hdr.owner = MSG_OWNER_UC;
++	req.hdr.type = MSG_TYPE_REQ_RESP;
++	req.hdr.opcode = write ? UC_UCSI_WRITE_BUF_REQ : UC_UCSI_READ_BUF_REQ;
++	if (write)
++		memcpy(req.buf + offset, value, size);
++
++	mutex_lock(&udev->io_lock);
++	spin_lock_irqsave(&udev->response_lock, flags);
++	if (atomic_read(&udev->state) != PMIC_GLINK_STATE_UP || udev->stopping) {
++		spin_unlock_irqrestore(&udev->response_lock, flags);
++		ret = -ENOTCONN;
++		goto unlock;
++	}
++	reinit_completion(&udev->ack);
++	udev->pending = true;
++	udev->pending_opcode = req.hdr.opcode;
++	udev->result = -ETIMEDOUT;
++	spin_unlock_irqrestore(&udev->response_lock, flags);
++
++	ret = pmic_glink_write(udev->client, &req,
++			      write ? sizeof(req) : sizeof(req.hdr));
++	if (!ret) {
++		wait_for_completion_timeout(&udev->ack,
++					    msecs_to_jiffies(UCSI_WAIT_TIME_MS));
++		spin_lock_irqsave(&udev->response_lock, flags);
++		ret = udev->result;
++		if (!ret && !write)
++			memcpy(value, udev->read_buf + offset, size);
++		spin_unlock_irqrestore(&udev->response_lock, flags);
++	}
++	spin_lock_irqsave(&udev->response_lock, flags);
++	udev->pending = false;
++	/* A late reply must not complete a later transaction. Recover on reconnect. */
++	if (ret == -ETIMEDOUT)
++		atomic_set(&udev->state, PMIC_GLINK_STATE_DOWN);
++	spin_unlock_irqrestore(&udev->response_lock, flags);
++	if (!ret)
++		ucsi_log(udev, write ? "write:" : "read:", offset, value, size);
++unlock:
++	mutex_unlock(&udev->io_lock);
++	return ret;
++}
++
++static int ucsi_qti_read_version(struct ucsi *ucsi, u16 *version)
++{
++	int ret;
++
++	ret = ucsi_qti_xfer(ucsi_get_drvdata(ucsi), UCSI_VERSION,
++			    version, sizeof(*version), false);
++	/* The vendor transport has only the UCSI 1.x 48-byte register window. */
++	if (!ret && *version >= UCSI_VERSION_2_0)
++		ret = -EOPNOTSUPP;
++	return ret;
++}
++
++static int ucsi_qti_read_cci(struct ucsi *ucsi, u32 *cci)
++{
++	return ucsi_qti_xfer(ucsi_get_drvdata(ucsi), UCSI_CCI,
++			     cci, sizeof(*cci), false);
++}
++
++static int ucsi_qti_read_message_in(struct ucsi *ucsi, void *value, size_t size)
++{
++	return ucsi_qti_xfer(ucsi_get_drvdata(ucsi), UCSI_MESSAGE_IN,
++			     value, size, false);
++}
++
++static int ucsi_qti_async_control(struct ucsi *ucsi, u64 command)
++{
++	return ucsi_qti_xfer(ucsi_get_drvdata(ucsi), UCSI_CONTROL,
++			     &command, sizeof(command), true);
+ }
+ 
+ static void ucsi_qti_notify_work(struct work_struct *work)
+ {
+-	struct ucsi_dev *udev = container_of(work, struct ucsi_dev,
+-			notify_work);
++	struct ucsi_dev *udev = container_of(work, struct ucsi_dev, notify_work);
+ 	struct constat_info_entry *entry;
+ 
+ 	mutex_lock(&udev->notify_lock);
+@@ -435,310 +277,257 @@
+ 					struct constat_info_entry, node);
+ 		list_del(&entry->node);
+ 		mutex_unlock(&udev->notify_lock);
+-		raw_notifier_call_chain(&ucsi_glink_notifier,
+-					0, &entry->constat_info);
++		blocking_notifier_call_chain(&ucsi_glink_notifier, 0, &entry->constat_info);
+ 		kfree(entry);
+ 		mutex_lock(&udev->notify_lock);
+ 	}
+ 	mutex_unlock(&udev->notify_lock);
+ }
+ 
+-static void ucsi_qti_notify(struct ucsi_dev *udev, unsigned int offset,
+-			    struct ucsi_connector_status *status, size_t len)
+-{
+-	u8 conn_partner_type;
+-	bool cmd_requested;
++static void ucsi_qti_connector_status(struct ucsi_connector *con)
++{
++	struct ucsi_dev *udev = ucsi_get_drvdata(con->ucsi);
+ 	struct constat_info_entry *entry;
+ 
+-	if (len != sizeof(*status))
++	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
+ 		return;
+-
++	switch (UCSI_CONSTAT(con, PARTNER_TYPE)) {
++	case UCSI_CONSTAT_PARTNER_TYPE_AUDIO:
++		entry->constat_info.acc = TYPEC_ACCESSORY_AUDIO;
++		break;
++	case UCSI_CONSTAT_PARTNER_TYPE_DEBUG:
++		entry->constat_info.acc = TYPEC_ACCESSORY_DEBUG;
++		break;
++	default:
++		entry->constat_info.acc = TYPEC_ACCESSORY_NONE;
++		break;
++	}
+ 	mutex_lock(&udev->notify_lock);
+-	cmd_requested = test_bit(CONN_STAT_REQD, &udev->cmd_requested_flags);
++	list_add_tail(&entry->node, &udev->constat_info_list);
++	schedule_work(&udev->notify_work);
+ 	mutex_unlock(&udev->notify_lock);
+-
+-	if (cmd_requested && offset == UCSI_MESSAGE_IN) {
+-		entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+-		if (!entry)
+-			return;
+-
+-		INIT_LIST_HEAD(&entry->node);
+-		conn_partner_type = UCSI_CONSTAT_PARTNER_TYPE(status->flags);
+-
+-		switch (conn_partner_type) {
+-		case UCSI_CONSTAT_PARTNER_TYPE_AUDIO:
+-			entry->constat_info.acc = TYPEC_ACCESSORY_AUDIO;
+-			break;
+-		case UCSI_CONSTAT_PARTNER_TYPE_DEBUG:
+-			entry->constat_info.acc = TYPEC_ACCESSORY_DEBUG;
+-			break;
+-		default:
+-			entry->constat_info.acc = TYPEC_ACCESSORY_NONE;
+-			break;
+-		}
+-
+-		mutex_lock(&udev->notify_lock);
+-		list_add_tail(&entry->node, &udev->constat_info_list);
+-		clear_bit(CONN_STAT_REQD, &udev->cmd_requested_flags);
+-		mutex_unlock(&udev->notify_lock);
+-
+-		schedule_work(&udev->notify_work);
+-	}
+-}
+-
+-static int ucsi_qti_read(struct ucsi *ucsi, unsigned int offset,
+-			       void *val, size_t val_len)
+-{
+-	struct ucsi_dev *udev = ucsi_get_drvdata(ucsi);
+-	struct ucsi_read_buf_req_msg ucsi_buf = { { 0 } };
+-	int rc;
+-
+-	if (!validate_ucsi_msg(offset, val_len))
++}
++
++static const struct ucsi_operations ucsi_qti_ops = {
++	.read_version = ucsi_qti_read_version,
++	.read_cci = ucsi_qti_read_cci,
++	.poll_cci = ucsi_qti_read_cci,
++	.read_message_in = ucsi_qti_read_message_in,
++	.sync_control = ucsi_sync_control_common,
++	.async_control = ucsi_qti_async_control,
++	.connector_status = ucsi_qti_connector_status,
++};
++
++static int ucsi_callback(void *priv, void *data, size_t len)
++{
++	struct ucsi_dev *udev = priv;
++	const struct pmic_glink_hdr *hdr = data;
++	const struct ucsi_read_buf_resp_msg *read = data;
++	const struct ucsi_write_buf_resp_msg *write = data;
++	const struct ucsi_notify_ind_msg *notify = data;
++	unsigned long flags;
++	int ret;
++
++	if (!data || len < sizeof(*hdr) || hdr->owner != MSG_OWNER_UC)
+ 		return -EINVAL;
+-
+-	if (atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN)
++	if (hdr->opcode == UC_UCSI_USBC_NOTIFY_IND) {
++		if (len != sizeof(*notify) || notify->receiver != UC_NOTIFY_RECEIVER_UCSI)
++			return -EINVAL;
++		mutex_lock(&udev->state_lock);
++		if (udev->ucsi && !udev->stopping &&
++		    atomic_read(&udev->state) == PMIC_GLINK_STATE_UP)
++			ucsi_notify_common(udev->ucsi, notify->notification);
++		mutex_unlock(&udev->state_lock);
+ 		return 0;
+-
+-	ucsi_buf.hdr.owner = MSG_OWNER_UC;
+-	ucsi_buf.hdr.type = MSG_TYPE_REQ_RESP;
+-	ucsi_buf.hdr.opcode = UC_UCSI_READ_BUF_REQ;
+-
+-	mutex_lock(&udev->read_lock);
+-
+-	pr_debug("read offset %s len %zu\n", offset_to_name(offset), val_len);
+-	reinit_completion(&udev->read_ack);
+-	rc = pmic_glink_write(udev->client, &ucsi_buf,
+-					sizeof(ucsi_buf));
+-	if (rc < 0) {
+-		pr_err("Error in sending message rc=%d\n", rc);
+-		goto out;
+-	}
+-
+-	rc = wait_for_completion_timeout(&udev->read_ack,
+-				msecs_to_jiffies(UCSI_WAIT_TIME_MS));
+-	if (!rc) {
+-		pr_err("timed out\n");
+-		rc = -ETIMEDOUT;
+-		goto out;
++	}
++	if (hdr->opcode != UC_UCSI_READ_BUF_REQ && hdr->opcode != UC_UCSI_WRITE_BUF_REQ)
++		return -EINVAL;
++	spin_lock_irqsave(&udev->response_lock, flags);
++	if (!udev->pending || udev->pending_opcode != hdr->opcode) {
++		spin_unlock_irqrestore(&udev->response_lock, flags);
++		return 0;
++	}
++	if (hdr->opcode == UC_UCSI_READ_BUF_REQ) {
++		ret = len != sizeof(*read) ? -EMSGSIZE : read->ret_code ? -EREMOTEIO : 0;
++		if (!ret)
++			memcpy(udev->read_buf, read->buf, sizeof(udev->read_buf));
+ 	} else {
+-		rc = 0;
+-	}
+-
+-	if (!atomic_read(&udev->rx_valid)) {
+-		rc = -ENODATA;
+-		goto out;
+-	}
+-
+-	memcpy((u8 *)val, &udev->rx_buf.buf[offset], val_len);
+-	atomic_set(&udev->rx_valid, 0);
+-	ucsi_log(udev, "read:", offset, (u8 *)val, val_len);
+-	ucsi_qti_notify(udev, offset, val, val_len);
+-
+-out:
+-	mutex_unlock(&udev->read_lock);
+-
+-	return rc;
+-}
+-
+-static const struct ucsi_operations ucsi_qti_ops = {
+-	.read = ucsi_qti_read,
+-	.sync_write = ucsi_qti_sync_write,
+-	.async_write = ucsi_qti_async_write
+-};
+-
+-static int ucsi_setup(struct ucsi_dev *udev)
+-{
+-	int rc;
+-
+-	if (udev->ucsi) {
+-		dev_err(udev->dev, "ucsi is not NULL\n");
+-		return -EINVAL;
+-	}
++		ret = len != sizeof(*write) ? -EMSGSIZE : write->ret_code ? -EREMOTEIO : 0;
++	}
++	udev->result = ret;
++	udev->pending = false;
++	complete(&udev->ack);
++	spin_unlock_irqrestore(&udev->response_lock, flags);
++	return ret;
++}
++
++/* One worker owns registration; detach callbacks before unregister can free connectors. */
++static void ucsi_qti_state_work(struct work_struct *work)
++{
++	struct ucsi_dev *udev = container_of(work, struct ucsi_dev, state_work);
++	struct ucsi *ucsi;
++	bool up, restart;
++	int ret;
+ 
+ 	mutex_lock(&udev->state_lock);
+-	udev->ucsi = ucsi_create(udev->dev, &ucsi_qti_ops);
+-	if (IS_ERR(udev->ucsi)) {
+-		rc = PTR_ERR(udev->ucsi);
+-		dev_err(udev->dev, "ucsi_create failed rc=%d\n", rc);
++	up = !udev->stopping && atomic_read(&udev->state) == PMIC_GLINK_STATE_UP;
++	restart = udev->restart;
++	udev->restart = false;
++	ucsi = udev->ucsi;
++	if (ucsi && (!up || restart))
++		udev->ucsi = NULL;
++	mutex_unlock(&udev->state_lock);
++	if (ucsi && (!up || restart)) {
++		ucsi_unregister(ucsi);
++		ucsi_destroy(ucsi);
++		ucsi = NULL;
++	}
++	if (!up || ucsi)
++		return;
++	ucsi = ucsi_create(udev->dev, &ucsi_qti_ops);
++	if (IS_ERR(ucsi)) {
++		dev_err(udev->dev, "failed to create UCSI: %ld\n", PTR_ERR(ucsi));
++		return;
++	}
++	ucsi_set_drvdata(ucsi, udev);
++	mutex_lock(&udev->state_lock);
++	udev->ucsi = ucsi;
++	mutex_unlock(&udev->state_lock);
++	ret = ucsi_register(ucsi);
++	if (ret) {
++		mutex_lock(&udev->state_lock);
+ 		udev->ucsi = NULL;
+ 		mutex_unlock(&udev->state_lock);
+-		return rc;
+-	}
+-
+-	ucsi_set_drvdata(udev->ucsi, udev);
+-
+-	rc = ucsi_register(udev->ucsi);
+-	if (rc) {
+-		dev_err(udev->dev, "ucsi_register failed rc=%d\n", rc);
+-		ucsi_destroy(udev->ucsi);
+-		udev->ucsi = NULL;
+-		mutex_unlock(&udev->state_lock);
+-		return rc;
+-	}
+-
++		ucsi_destroy(ucsi);
++		dev_err(udev->dev, "failed to register UCSI: %d\n", ret);
++	}
++}
++
++static void ucsi_qti_state_cb(void *priv, enum pmic_glink_state state)
++{
++	struct ucsi_dev *udev = priv;
++	unsigned long flags;
++
++	mutex_lock(&udev->state_lock);
++	spin_lock_irqsave(&udev->response_lock, flags);
++	atomic_set(&udev->state, state);
++	if (state == PMIC_GLINK_STATE_DOWN) {
++		udev->restart = true;
++		if (udev->pending) {
++			udev->result = -ENOTCONN;
++			udev->pending = false;
++			complete(&udev->ack);
++		}
++	}
++	spin_unlock_irqrestore(&udev->response_lock, flags);
++	if (!udev->stopping)
++		schedule_work(&udev->state_work);
+ 	mutex_unlock(&udev->state_lock);
+-	return 0;
+-}
+-
+-static void ucsi_qti_setup_work(struct work_struct *work)
+-{
+-	struct ucsi_dev *udev = container_of(work, struct ucsi_dev,
+-			setup_work);
+-
+-	ucsi_setup(udev);
+-}
+-
+-static void ucsi_qti_unregister_work(struct work_struct *work)
+-{
+-	struct ucsi_dev *udev = container_of(work, struct ucsi_dev,
+-			unregister_work);
+-
+-	if (!udev->ucsi) {
+-		dev_dbg(udev->dev, "ucsi is NULL\n");
+-		return;
+-	}
++}
++
++static void ucsi_qti_stop(struct ucsi_dev *udev)
++{
++	struct ucsi *ucsi;
++	struct constat_info_entry *entry, *tmp;
++	unsigned long flags;
+ 
+ 	mutex_lock(&udev->state_lock);
+-	ucsi_qti_clean_notification(udev);
+-	ucsi_unregister(udev->ucsi);
+-	ucsi_destroy(udev->ucsi);
++	spin_lock_irqsave(&udev->response_lock, flags);
++	udev->stopping = true;
++	atomic_set(&udev->state, PMIC_GLINK_STATE_DOWN);
++	udev->result = -ENOTCONN;
++	udev->pending = false;
++	complete(&udev->ack);
++	spin_unlock_irqrestore(&udev->response_lock, flags);
++	mutex_unlock(&udev->state_lock);
++	mutex_lock(&udev->io_lock);
++	mutex_unlock(&udev->io_lock);
++	pmic_glink_unregister_client(udev->client);
++	cancel_work_sync(&udev->state_work);
++	mutex_lock(&udev->state_lock);
++	ucsi = udev->ucsi;
+ 	udev->ucsi = NULL;
+ 	mutex_unlock(&udev->state_lock);
+-}
+-
+-static void ucsi_qti_state_cb(void *priv, enum pmic_glink_state state)
+-{
+-	struct ucsi_dev *udev = priv;
+-
+-	dev_dbg(udev->dev, "state: %d\n", state);
+-
+-	mutex_lock(&udev->state_lock);
+-	atomic_set(&udev->state, state);
+-	mutex_unlock(&udev->state_lock);
+-
+-	switch (state) {
+-	case PMIC_GLINK_STATE_DOWN:
+-		cancel_work_sync(&udev->setup_work);
+-		schedule_work(&udev->unregister_work);
+-		break;
+-	case PMIC_GLINK_STATE_UP:
+-		cancel_work_sync(&udev->unregister_work);
+-		schedule_work(&udev->setup_work);
+-		break;
+-	default:
+-		break;
++	if (ucsi) {
++		ucsi_unregister(ucsi);
++		ucsi_destroy(ucsi);
++	}
++	cancel_work_sync(&udev->notify_work);
++	list_for_each_entry_safe(entry, tmp, &udev->constat_info_list, node) {
++		list_del(&entry->node);
++		kfree(entry);
+ 	}
+ }
+ 
+ static int ucsi_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+-	struct pmic_glink_client_data client_data;
++	struct pmic_glink_client_data client_data = {};
+ 	struct ucsi_dev *udev;
+-	int rc;
++	int ret;
+ 
+ 	udev = devm_kzalloc(dev, sizeof(*udev), GFP_KERNEL);
+ 	if (!udev)
+ 		return -ENOMEM;
+-
++	udev->dev = dev;
++	mutex_init(&udev->io_lock);
++	mutex_init(&udev->state_lock);
++	mutex_init(&udev->notify_lock);
++	spin_lock_init(&udev->response_lock);
++	init_completion(&udev->ack);
+ 	INIT_LIST_HEAD(&udev->constat_info_list);
++	INIT_WORK(&udev->state_work, ucsi_qti_state_work);
+ 	INIT_WORK(&udev->notify_work, ucsi_qti_notify_work);
+-	INIT_WORK(&udev->setup_work, ucsi_qti_setup_work);
+-	INIT_WORK(&udev->unregister_work, ucsi_qti_unregister_work);
+-	mutex_init(&udev->read_lock);
+-	mutex_init(&udev->write_lock);
+-	mutex_init(&udev->notify_lock);
+-	mutex_init(&udev->state_lock);
+-	init_completion(&udev->read_ack);
+-	init_completion(&udev->write_ack);
+-	init_completion(&udev->sync_write_ack);
+-	atomic_set(&udev->rx_valid, 0);
+ 	atomic_set(&udev->state, PMIC_GLINK_STATE_UP);
+-
++	udev->ipc_log = ipc_log_context_create(NUM_LOG_PAGES, "ucsi", 0);
+ 	client_data.id = MSG_OWNER_UC;
+ 	client_data.name = "ucsi";
+ 	client_data.msg_cb = ucsi_callback;
+ 	client_data.priv = udev;
+ 	client_data.state_cb = ucsi_qti_state_cb;
+-
++	/* State callbacks can start immediately; hold the lock until client publication. */
++	mutex_lock(&udev->state_lock);
+ 	udev->client = pmic_glink_register_client(dev, &client_data);
+ 	if (IS_ERR(udev->client)) {
+-		rc = PTR_ERR(udev->client);
+-		if (rc != -EPROBE_DEFER)
+-			dev_err(dev, "Error in registering with pmic_glink rc=%d\n",
+-				rc);
+-		return rc;
+-	}
+-
++		ret = PTR_ERR(udev->client);
++		mutex_unlock(&udev->state_lock);
++		ipc_log_context_destroy(udev->ipc_log);
++		return ret;
++	}
++	schedule_work(&udev->state_work);
++	mutex_unlock(&udev->state_lock);
+ 	platform_set_drvdata(pdev, udev);
+-	udev->dev = dev;
+-
+-	ucsi_ipc_log = ipc_log_context_create(NUM_LOG_PAGES, "ucsi", 0);
+-	if (!ucsi_ipc_log)
+-		dev_warn(dev, "Error in creating ipc_log_context\n");
+-
+ 	udev->debugfs_dir = debugfs_create_dir("ucsi_glink", NULL);
+-	if (IS_ERR(udev->debugfs_dir)) {
+-		dev_err(dev, "Failed to create ucsi_glink directory: %ld\n",
+-			PTR_ERR(udev->debugfs_dir));
+-		udev->debugfs_dir = NULL;
+-	} else {
+-		debugfs_create_bool("remoteproc_timestamp_en", 0600,
+-				udev->debugfs_dir,
+-				&udev->remoteproc_timestamp_en);
+-	}
+-
+-	rc = ucsi_setup(udev);
+-	if (rc) {
+-		debugfs_remove_recursive(udev->debugfs_dir);
+-		ipc_log_context_destroy(ucsi_ipc_log);
+-		ucsi_ipc_log = NULL;
+-		pmic_glink_unregister_client(udev->client);
+-	}
+-
+-	return rc;
+-}
+-
+-static int ucsi_remove(struct platform_device *pdev)
+-{
+-	struct device *dev = &pdev->dev;
+-	struct ucsi_dev *udev = dev_get_drvdata(dev);
+-	int rc;
++	if (!IS_ERR_OR_NULL(udev->debugfs_dir))
++		debugfs_create_bool("remoteproc_timestamp_en", 0600, udev->debugfs_dir,
++				    &udev->remoteproc_timestamp_en);
++	return 0;
++}
++
++static void ucsi_remove(struct platform_device *pdev)
++{
++	struct ucsi_dev *udev = platform_get_drvdata(pdev);
+ 
+ 	debugfs_remove_recursive(udev->debugfs_dir);
+-	cancel_work_sync(&udev->notify_work);
+-	cancel_work_sync(&udev->setup_work);
+-	if (!cancel_work_sync(&udev->unregister_work)) {
+-		ucsi_qti_clean_notification(udev);
+-		ucsi_unregister(udev->ucsi);
+-		ucsi_destroy(udev->ucsi);
+-	}
+-
+-	rc = pmic_glink_unregister_client(udev->client);
+-	if (rc < 0)
+-		dev_err(dev, "pmic_glink_unregister_client failed rc=%d\n",
+-			rc);
+-
+-	ipc_log_context_destroy(ucsi_ipc_log);
+-	ucsi_ipc_log = NULL;
+-
+-	return rc;
++	ucsi_qti_stop(udev);
++	ipc_log_context_destroy(udev->ipc_log);
+ }
+ 
+ static const struct of_device_id ucsi_match_table[] = {
+-	{.compatible = "qcom,ucsi-glink"},
++	{ .compatible = "qcom,ucsi-glink" },
+ 	{},
+ };
++MODULE_DEVICE_TABLE(of, ucsi_match_table);
+ 
+ static struct platform_driver ucsi_driver = {
+-	.driver	= {
++	.driver = {
+ 		.name = "ucsi_glink",
+ 		.of_match_table = ucsi_match_table,
+ 	},
+-	.probe	= ucsi_probe,
+-	.remove	= ucsi_remove,
+-};
+-
++	.probe = ucsi_probe,
++	.remove = ucsi_remove,
++};
+ module_platform_driver(ucsi_driver);
+ 
+ MODULE_DESCRIPTION("QTI UCSI Glink driver");

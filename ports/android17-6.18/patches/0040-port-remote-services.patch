@@ -1,0 +1,1051 @@
+--- a/drivers/soc/qcom/qmi_interface.c
++++ b/drivers/soc/qcom/qmi_interface.c
+@@ -418,6 +418,13 @@
+ 	kfree(dest);
+ }
+ 
++static void qmi_sock_detach(struct socket *sock)
++{
++	write_lock_bh(&sock->sk->sk_callback_lock);
++	sock->sk->sk_user_data = NULL;
++	write_unlock_bh(&sock->sk->sk_callback_lock);
++}
++
+ /**
+  * qmi_handle_net_reset() - invoked to handle ENETRESET on a QMI handle
+  * @qmi:	the QMI context
+@@ -446,6 +453,7 @@
+ 		return;
+ 
+ 	mutex_lock(&qmi->sock_lock);
++	qmi_sock_detach(qmi->sock);
+ 	sock_release(qmi->sock);
+ 	qmi->sock = NULL;
+ 	mutex_unlock(&qmi->sock_lock);
+@@ -561,18 +569,15 @@
+ 
+ static void qmi_data_ready(struct sock *sk)
+ {
+-	struct qmi_handle *qmi = sk->sk_user_data;
++	struct qmi_handle *qmi;
+ 
+ 	trace_sk_data_ready(sk);
+-
+-	/*
+-	 * This will be NULL if we receive data while being in
+-	 * qmi_handle_release()
+-	 */
+-	if (!qmi)
+-		return;
+-
+-	queue_work(qmi->wq, &qmi->work);
++	/* Serialize callback queueing with socket detach and handle release. */
++	read_lock_bh(&sk->sk_callback_lock);
++	qmi = sk->sk_user_data;
++	if (qmi)
++		queue_work(qmi->wq, &qmi->work);
++	read_unlock_bh(&sk->sk_callback_lock);
+ }
+ 
+ static struct socket *qmi_sock_create(struct qmi_handle *qmi,
+@@ -680,13 +685,15 @@
+  */
+ void qmi_handle_release(struct qmi_handle *qmi)
+ {
+-	struct socket *sock = qmi->sock;
++	struct socket *sock;
+ 	struct qmi_service *svc, *tmp;
+ 	struct qmi_txn *txn;
+ 	int txn_id;
+ 
+-	sock->sk->sk_user_data = NULL;
+-	cancel_work_sync(&qmi->work);
++	/* A running reset can replace qmi->sock; drain it before taking the socket. */
++	disable_work_sync(&qmi->work);
++	sock = qmi->sock;
++	qmi_sock_detach(sock);
+ 
+ 	qmi_recv_del_server(qmi, -1, -1);
+ 
+--- a/drivers/soc/qcom/qmi_encdec.c
++++ b/drivers/soc/qcom/qmi_encdec.c
+@@ -452,7 +452,7 @@
+ {
+ 	u32 i, rc = 0;
+ 
+-	if (elem_len * elem_size > src_len)
++	if (!elem_size || elem_len > src_len / elem_size)
+ 		return -EINVAL;
+ 
+ 	for (i = 0; i < elem_len; i++) {
+--- a/drivers/soc/qcom/pdr_interface.c
++++ b/drivers/soc/qcom/pdr_interface.c
+@@ -36,6 +36,7 @@
+ };
+ 
+ struct pdr_handle {
++	bool stopping;
+ 	struct qmi_handle locator_hdl;
+ 	struct qmi_handle notifier_hdl;
+ 
+@@ -83,6 +84,9 @@
+ 	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle,
+ 					      locator_hdl);
+ 
++	if (READ_ONCE(pdr->stopping))
++		return 0;
++
+ 	mutex_lock(&pdr->lock);
+ 	/* Create a local client port for QMI communication */
+ 	pdr->locator_addr.sq_family = AF_QIPCRTR;
+@@ -103,6 +107,9 @@
+ {
+ 	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle,
+ 					      locator_hdl);
++
++	if (READ_ONCE(pdr->stopping))
++		return;
+ 
+ 	mutex_lock(&pdr->lock);
+ 	pdr->locator_init_complete = false;
+@@ -201,6 +208,9 @@
+ 	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle,
+ 					      notifier_hdl);
+ 	struct pdr_service *pds;
++
++	if (READ_ONCE(pdr->stopping))
++		return 0;
+ 
+ 	mutex_lock(&pdr->list_lock);
+ 	list_for_each_entry(pds, &pdr->lookups, node) {
+@@ -226,6 +236,9 @@
+ 					      notifier_hdl);
+ 	struct pdr_service *pds;
+ 
++	if (READ_ONCE(pdr->stopping))
++		return;
++
+ 	mutex_lock(&pdr->list_lock);
+ 	list_for_each_entry(pds, &pdr->lookups, node) {
+ 		if (pds->service == svc->service &&
+@@ -274,9 +287,10 @@
+ 
+ static void ind_notif_timeout_handler(struct timer_list *t)
+ {
+-	struct pdr_list_node *ind = from_timer(ind, t, timer);
++	struct pdr_list_node *ind = timer_container_of(ind, t, timer);
+ 	struct pdr_service *pds = ind->pds;
+ 
++	/* Keep the ROM-configured watchdog policy for stalled remote clients. */
+ 	if (IS_ENABLED(CONFIG_QCOM_PANIC_ON_PDR_NOTIF_TIMEOUT) &&
+ 	    system_state != SYSTEM_RESTART &&
+ 	    system_state != SYSTEM_POWER_OFF &&
+@@ -291,11 +305,18 @@
+ {
+ 	struct pdr_handle *pdr = container_of(work, struct pdr_handle,
+ 					      indack_work);
+-	struct pdr_list_node *ind, *tmp;
++	struct pdr_list_node *ind;
+ 	struct pdr_service *pds;
+ 	unsigned long timeout;
+ 
+-	list_for_each_entry_safe(ind, tmp, &pdr->indack_list, node) {
++	for (;;) {
++		mutex_lock(&pdr->list_lock);
++		ind = list_first_entry_or_null(&pdr->indack_list, struct pdr_list_node, node);
++		if (ind)
++			list_del(&ind->node);
++		mutex_unlock(&pdr->list_lock);
++		if (!ind)
++			break;
+ 		pds = ind->pds;
+ 
+ 		mutex_lock(&pdr->status_lock);
+@@ -303,7 +324,7 @@
+ 		timeout = jiffies + msecs_to_jiffies(PDR_IND_NOTIF_TIMEOUT);
+ 		mod_timer(&ind->timer, timeout);
+ 		pdr->status(pds->state, pds->service_path, pdr->priv);
+-		del_timer_sync(&ind->timer);
++		timer_delete_sync(&ind->timer);
+ 		mutex_unlock(&pdr->status_lock);
+ 
+ 		/* Ack the indication after clients release the PD resources */
+@@ -311,10 +332,6 @@
+ 
+ 		pr_info("PDR: Indication ack sent to %s, state: 0x%x, trans-id: %d\n",
+ 			pds->service_path, pds->state, ind->transaction_id);
+-
+-		mutex_lock(&pdr->list_lock);
+-		list_del(&ind->node);
+-		mutex_unlock(&pdr->list_lock);
+ 
+ 		kfree(ind);
+ 	}
+@@ -329,6 +346,9 @@
+ 	const struct servreg_state_updated_ind *ind_msg = data;
+ 	struct pdr_list_node *ind;
+ 	struct pdr_service *pds = NULL, *iter;
++
++	if (READ_ONCE(pdr->stopping))
++		return;
+ 
+ 	if (!ind_msg || !ind_msg->service_path[0] ||
+ 	    strlen(ind_msg->service_path) > SERVREG_NAME_LENGTH)
+@@ -718,10 +738,6 @@
+ 	if (ret < 0)
+ 		goto destroy_indack;
+ 
+-	ret = qmi_add_lookup(&pdr->locator_hdl, SERVREG_LOCATOR_SERVICE, 1, 1);
+-	if (ret < 0)
+-		goto release_qmi_handle;
+-
+ 	ret = qmi_handle_init(&pdr->notifier_hdl,
+ 			      SERVREG_STATE_UPDATED_IND_MAX_LEN,
+ 			      &pdr_notifier_ops,
+@@ -729,8 +745,14 @@
+ 	if (ret < 0)
+ 		goto release_qmi_handle;
+ 
++	ret = qmi_add_lookup(&pdr->locator_hdl, SERVREG_LOCATOR_SERVICE, 1, 1);
++	if (ret < 0)
++		goto release_notifier_handle;
++
+ 	return pdr;
+ 
++release_notifier_handle:
++	qmi_handle_release(&pdr->notifier_hdl);
+ release_qmi_handle:
+ 	qmi_handle_release(&pdr->locator_hdl);
+ destroy_indack:
+@@ -753,27 +775,30 @@
+ void pdr_handle_release(struct pdr_handle *pdr)
+ {
+ 	struct pdr_service *pds, *tmp;
++	struct pdr_list_node *ind, *next;
+ 
+ 	if (IS_ERR_OR_NULL(pdr))
+ 		return;
+ 
+-	mutex_lock(&pdr->list_lock);
++	WRITE_ONCE(pdr->stopping, true);
++	/* Block new queueing before draining workers that still use QMI. */
++	disable_work_sync(&pdr->locator_work);
++	disable_work_sync(&pdr->notifier_work);
++	disable_work_sync(&pdr->indack_work);
++	qmi_handle_release(&pdr->locator_hdl);
++	qmi_handle_release(&pdr->notifier_hdl);
++
++	list_for_each_entry_safe(ind, next, &pdr->indack_list, node) {
++		list_del(&ind->node);
++		timer_shutdown_sync(&ind->timer);
++		kfree(ind);
++	}
+ 	list_for_each_entry_safe(pds, tmp, &pdr->lookups, node) {
+ 		list_del(&pds->node);
+ 		kfree(pds);
+ 	}
+-	mutex_unlock(&pdr->list_lock);
+-
+-	cancel_work_sync(&pdr->locator_work);
+-	cancel_work_sync(&pdr->notifier_work);
+-	cancel_work_sync(&pdr->indack_work);
+-
+ 	destroy_workqueue(pdr->notifier_wq);
+ 	destroy_workqueue(pdr->indack_wq);
+-
+-	qmi_handle_release(&pdr->locator_hdl);
+-	qmi_handle_release(&pdr->notifier_hdl);
+-
+ 	kfree(pdr);
+ }
+ EXPORT_SYMBOL(pdr_handle_release);
+--- a/drivers/soc/qcom/smp2p.c
++++ b/drivers/soc/qcom/smp2p.c
+@@ -163,14 +163,14 @@
+ 	struct mbox_client mbox_client;
+ 	struct mbox_chan *mbox_chan;
+ 
++	void *ilc;
+ 	struct list_head inbound;
+ 	struct list_head outbound;
+ };
+ 
+-static void *ilc;
+ #define SMP2P_LOG_PAGE_CNT 2
+-#define SMP2P_INFO(x, ...)	\
+-	ipc_log_string(ilc, "[%s]: "x, __func__, ##__VA_ARGS__)
++#define SMP2P_INFO(smp2p, x, ...)	\
++	ipc_log_string((smp2p)->ilc, "[%s]: "x, __func__, ##__VA_ARGS__)
+ 
+ static void qcom_smp2p_kick(struct qcom_smp2p *smp2p)
+ {
+@@ -203,7 +203,7 @@
+ 	struct smp2p_smem_item *out = smp2p->out;
+ 	u32 val;
+ 
+-	SMP2P_INFO("%d: SSR detected, doing SSR Handshake\n", smp2p->remote_pid);
++	SMP2P_INFO(smp2p, "%d: SSR detected, doing SSR Handshake\n", smp2p->remote_pid);
+ 	smp2p->ssr_ack = !smp2p->ssr_ack;
+ 
+ 	val = out->flags & ~BIT(SMP2P_FLAGS_RESTART_ACK_BIT);
+@@ -226,7 +226,7 @@
+ 			smp2p->ssr_ack_enabled = true;
+ 
+ 		smp2p->negotiation_done = true;
+-		SMP2P_INFO("%d: state=open ssr_ack=%d\n", smp2p->remote_pid,
++		SMP2P_INFO(smp2p, "%d: state=open ssr_ack=%d\n", smp2p->remote_pid,
+ 			   smp2p->ssr_ack_enabled);
+ 	}
+ }
+@@ -237,16 +237,21 @@
+ 	struct smp2p_entry *entry;
+ 	unsigned long status;
+ 	int irq_pin;
+-	char buf[SMP2P_MAX_ENTRY_NAME];
++	char buf[SMP2P_MAX_ENTRY_NAME + 1] = {};
++	u16 entries;
+ 	u32 val;
+ 	int i;
+ 
+ 	in = smp2p->in;
+ 
++	entries = READ_ONCE(in->valid_entries);
++	if (entries > SMP2P_MAX_ENTRY)
++		return;
++
+ 	/* Match newly created entries */
+-	for (i = smp2p->valid_entries; i < in->valid_entries; i++) {
++	for (i = smp2p->valid_entries; i < entries; i++) {
+ 		list_for_each_entry(entry, &smp2p->inbound, node) {
+-			memcpy(buf, in->entries[i].name, sizeof(buf));
++			memcpy(buf, in->entries[i].name, SMP2P_MAX_ENTRY_NAME);
+ 			if (!strcmp(buf, entry->name)) {
+ 				entry->value = &in->entries[i].value;
+ 				break;
+@@ -255,14 +260,14 @@
+ 	}
+ 	smp2p->valid_entries = i;
+ 
+-	SMP2P_INFO("%d: smp2p_num:%d in_num:%d\n",
++	SMP2P_INFO(smp2p, "%d: smp2p_num:%d in_num:%d\n",
+ 		   smp2p->remote_pid, smp2p->valid_entries, in->valid_entries);
+ 
+ 	/* Fire interrupts based on any value changes */
+ 	list_for_each_entry(entry, &smp2p->inbound, node) {
+ 		/* Ignore entries not yet allocated by the remote side */
+ 		if (!entry->value) {
+-			SMP2P_INFO("%d:\t%s: skipping not ready\n",
++			SMP2P_INFO(smp2p, "%d:\t%s: skipping not ready\n",
+ 				   smp2p->remote_pid, entry->name);
+ 			continue;
+ 		}
+@@ -276,7 +281,7 @@
+ 		mb();
+ 		status |= *entry->irq_pending;
+ 
+-		SMP2P_INFO("%d:\t%s: status:%0lx val:%0x\n",
++		SMP2P_INFO(smp2p, "%d:\t%s: status:%0lx val:%0x\n",
+ 			   smp2p->remote_pid, entry->name, status, val);
+ 
+ 		/* No changes of this entry? */
+@@ -322,6 +327,10 @@
+ 			goto out;
+ 		}
+ 
++		if (size < sizeof(*in)) {
++			dev_err(smp2p->dev, "Remote SMP2P item is too small\n");
++			goto out;
++		}
+ 		smp2p->in = in;
+ 	}
+ 
+@@ -382,7 +391,7 @@
+ 	struct smp2p_entry *entry = irq_data_get_irq_chip_data(irqd);
+ 	irq_hw_number_t irq = irqd_to_hwirq(irqd);
+ 
+-	SMP2P_INFO("%d: %s: %lu\n", entry->smp2p->remote_pid, entry->name, irq);
++	SMP2P_INFO(entry->smp2p, "%d: %s: %lu\n", entry->smp2p->remote_pid, entry->name, irq);
+ 	set_bit(irq, entry->irq_pending);
+ 
+ 	/* Ensure irq_pending is visible to all cpus that retried interrupt
+@@ -448,7 +457,7 @@
+ 	val |= value;
+ 	writel(val, entry->value);
+ 	spin_unlock_irqrestore(&entry->lock, flags);
+-	SMP2P_INFO("%d: %s: orig:0x%0x new:0x%0x\n",
++	SMP2P_INFO(entry->smp2p, "%d: %s: orig:0x%0x new:0x%0x\n",
+ 		   entry->smp2p->remote_pid, entry->name, orig, val);
+ 
+ 	if (val != orig)
+@@ -467,6 +476,9 @@
+ {
+ 	struct smp2p_smem_item *out = smp2p->out;
+ 	char buf[SMP2P_MAX_ENTRY_NAME] = {};
++
++	if (out->valid_entries >= SMP2P_MAX_ENTRY)
++		return -ENOSPC;
+ 
+ 	/* Allocate an entry from the smem item */
+ 	strscpy(buf, entry->name, SMP2P_MAX_ENTRY_NAME);
+@@ -492,6 +504,7 @@
+ 	unsigned smem_id = smp2p->smem_items[SMP2P_OUTBOUND];
+ 	unsigned pid = smp2p->remote_pid;
+ 	int ret;
++	size_t size;
+ 
+ 	ret = qcom_smem_alloc(pid, smem_id, sizeof(*out));
+ 	if (ret < 0 && ret != -EEXIST) {
+@@ -501,11 +514,14 @@
+ 		return ret;
+ 	}
+ 
+-	out = qcom_smem_get(pid, smem_id, NULL);
++	out = qcom_smem_get(pid, smem_id, &size);
+ 	if (IS_ERR(out)) {
+ 		dev_err(smp2p->dev, "Unable to acquire local smp2p item\n");
+ 		return PTR_ERR(out);
+ 	}
++
++	if (size < sizeof(*out))
++		return -EINVAL;
+ 
+ 	memset(out, 0, sizeof(*out));
+ 	out->magic = SMP2P_MAGIC;
+@@ -563,6 +579,14 @@
+ 	return 0;
+ }
+ 
++static void smp2p_destroy_log(void *data)
++{
++	struct qcom_smp2p *smp2p = data;
++
++	if (smp2p->ilc)
++		ipc_log_context_destroy(smp2p->ilc);
++}
++
+ static int qcom_smp2p_probe(struct platform_device *pdev)
+ {
+ 	struct smp2p_entry *entry;
+@@ -572,14 +596,15 @@
+ 	int irq;
+ 	int ret;
+ 
+-	if (!ilc)
+-		ilc = ipc_log_context_create(SMP2P_LOG_PAGE_CNT, "smp2p", 0);
+-
+ 	smp2p = devm_kzalloc(&pdev->dev, sizeof(*smp2p), GFP_KERNEL);
+ 	if (!smp2p)
+ 		return -ENOMEM;
+ 
+ 	smp2p->dev = &pdev->dev;
++	smp2p->ilc = ipc_log_context_create(SMP2P_LOG_PAGE_CNT, dev_name(&pdev->dev), 0);
++	ret = devm_add_action_or_reset(&pdev->dev, smp2p_destroy_log, smp2p);
++	if (ret)
++		return ret;
+ 	INIT_LIST_HEAD(&smp2p->inbound);
+ 	INIT_LIST_HEAD(&smp2p->outbound);
+ 
+@@ -698,6 +723,7 @@
+ 
+ set_wake_irq_fail:
+ 	dev_pm_clear_wake_irq(&pdev->dev);
++	devm_free_irq(&pdev->dev, irq, smp2p);
+ 
+ unwind_interfaces:
+ 	list_for_each_entry(entry, &smp2p->inbound, node)
+@@ -720,12 +746,13 @@
+ 	return -EINVAL;
+ }
+ 
+-static int qcom_smp2p_remove(struct platform_device *pdev)
++static void qcom_smp2p_remove(struct platform_device *pdev)
+ {
+ 	struct qcom_smp2p *smp2p = platform_get_drvdata(pdev);
+ 	struct smp2p_entry *entry;
+ 
+ 	dev_pm_clear_wake_irq(&pdev->dev);
++	devm_free_irq(&pdev->dev, smp2p->irq, smp2p);
+ 
+ 	list_for_each_entry(entry, &smp2p->inbound, node)
+ 		irq_domain_remove(entry->domain);
+@@ -738,8 +765,6 @@
+ 	kfree(smp2p->irq_devname);
+ 
+ 	smp2p->out->valid_entries = 0;
+-
+-	return 0;
+ }
+ 
+ static const struct of_device_id qcom_smp2p_of_match[] = {
+--- a/drivers/soc/qcom/smp2p_sleepstate.c
++++ b/drivers/soc/qcom/smp2p_sleepstate.c
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2014-2022,2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ #include <linux/module.h>
++#include <linux/slab.h>
+ #include <linux/suspend.h>
+ #include <linux/platform_device.h>
+ #include <linux/soc/qcom/smem_state.h>
+@@ -12,99 +13,99 @@
+ #include <linux/of.h>
+ #include <linux/pm_wakeup.h>
+ 
+-#define PROC_AWAKE_ID 12 /* 12th bit */
+-#define AWAKE_BIT BIT(PROC_AWAKE_ID)
+-static struct qcom_smem_state *state;
+-static struct wakeup_source *notify_ws;
++/* The remote sleep-state protocol uses bit 12, independently of DT bit 0. */
++#define AWAKE_BIT BIT(12)
+ 
+-/**
+- * sleepstate_pm_notifier() - PM notifier callback function.
+- * @nb:		Pointer to the notifier block.
+- * @event:	Suspend state event from PM module.
+- * @unused:	Null pointer from PM module.
+- *
+- * This function is register as callback function to get notifications
+- * from the PM module on the system suspend state.
+- */
++struct smp2p_sleepstate {
++	struct qcom_smem_state *state;
++	struct wakeup_source *notify_ws;
++	struct notifier_block pm_nb;
++};
++
+ static int sleepstate_pm_notifier(struct notifier_block *nb,
+-				  unsigned long event, void *unused)
++				 unsigned long event, void *unused)
+ {
++	struct smp2p_sleepstate *sleep = container_of(nb, struct smp2p_sleepstate, pm_nb);
++	int ret;
++
+ 	switch (event) {
+ 	case PM_SUSPEND_PREPARE:
+-		qcom_smem_state_update_bits(state, AWAKE_BIT, 0);
+-		break;
+-
++		ret = qcom_smem_state_update_bits(sleep->state, AWAKE_BIT, 0);
++		return notifier_from_errno(ret);
+ 	case PM_POST_SUSPEND:
+-		qcom_smem_state_update_bits(state, AWAKE_BIT, AWAKE_BIT);
++		qcom_smem_state_update_bits(sleep->state, AWAKE_BIT, AWAKE_BIT);
+ 		break;
+ 	}
+-
+ 	return NOTIFY_DONE;
+ }
+ 
+-static struct notifier_block sleepstate_pm_nb = {
+-	.notifier_call = sleepstate_pm_notifier,
+-	.priority = INT_MAX,
+-};
++static irqreturn_t smp2p_sleepstate_handler(int irq, void *data)
++{
++	struct smp2p_sleepstate *sleep = data;
+ 
+-static irqreturn_t smp2p_sleepstate_handler(int irq, void *ctxt)
++	__pm_wakeup_event(sleep->notify_ws, 200);
++	return IRQ_HANDLED;
++}
++
++static void smp2p_sleepstate_unregister_notifier(void *data)
+ {
+-	__pm_wakeup_event(notify_ws, 200);
+-	return IRQ_HANDLED;
++	struct smp2p_sleepstate *sleep = data;
++
++	unregister_pm_notifier(&sleep->pm_nb);
++}
++
++static void smp2p_sleepstate_unregister_wakeup(void *data)
++{
++	struct smp2p_sleepstate *sleep = data;
++
++	wakeup_source_unregister(sleep->notify_ws);
+ }
+ 
+ static int smp2p_sleepstate_probe(struct platform_device *pdev)
+ {
+-	int ret;
+-	int irq;
+ 	struct device *dev = &pdev->dev;
+-	struct device_node *node = dev->of_node;
++	struct smp2p_sleepstate *sleep;
++	unsigned int bit;
++	int irq, ret;
+ 
+-	state = qcom_smem_state_get(&pdev->dev, 0, &ret);
+-	if (IS_ERR(state))
+-		return PTR_ERR(state);
+-	qcom_smem_state_update_bits(state, AWAKE_BIT, AWAKE_BIT);
++	sleep = devm_kzalloc(dev, sizeof(*sleep), GFP_KERNEL);
++	if (!sleep)
++		return -ENOMEM;
++	sleep->state = devm_qcom_smem_state_get(dev, NULL, &bit);
++	if (IS_ERR(sleep->state))
++		return PTR_ERR(sleep->state);
+ 
+-	ret = register_pm_notifier(&sleepstate_pm_nb);
+-	if (ret) {
+-		dev_err(dev, "%s: power state notif error %d\n", __func__, ret);
++	irq = platform_get_irq_byname(pdev, "smp2p-sleepstate-in");
++	if (irq < 0)
++		return irq;
++	sleep->notify_ws = wakeup_source_register(dev, "smp2p-sleepstate");
++	if (!sleep->notify_ws)
++		return -ENOMEM;
++	ret = devm_add_action_or_reset(dev, smp2p_sleepstate_unregister_wakeup, sleep);
++	if (ret)
+ 		return ret;
+-	}
+-
+-	notify_ws = wakeup_source_register(&pdev->dev, "smp2p-sleepstate");
+-	if (!notify_ws) {
+-		ret = -ENOMEM;
+-		goto err_ws;
+-	}
+-
+-	irq = of_irq_get_byname(node, "smp2p-sleepstate-in");
+-	if (irq <= 0) {
+-		dev_err(dev, "failed to get irq for smp2p_sleep_state\n");
+-		ret = -EPROBE_DEFER;
+-		goto err;
+-	}
+-	dev_dbg(dev, "got smp2p-sleepstate-in irq %d\n", irq);
+-	ret = devm_request_threaded_irq(dev, irq, NULL,
+-					smp2p_sleepstate_handler,
++	ret = devm_request_threaded_irq(dev, irq, NULL, smp2p_sleepstate_handler,
+ 					IRQF_ONESHOT | IRQF_TRIGGER_RISING |
+ 					IRQF_TRIGGER_FALLING | IRQF_NO_SUSPEND,
+-					"smp2p_sleepstate", dev);
+-	if (ret) {
+-		dev_err(dev, "fail to register smp2p threaded_irq=%d\n", irq);
+-		goto err;
+-	}
+-	return 0;
+-err:
+-	wakeup_source_unregister(notify_ws);
+-err_ws:
+-	unregister_pm_notifier(&sleepstate_pm_nb);
+-	return ret;
++					"smp2p_sleepstate", sleep);
++	if (ret)
++		return ret;
++	ret = qcom_smem_state_update_bits(sleep->state, AWAKE_BIT, AWAKE_BIT);
++	if (ret)
++		return ret;
++	sleep->pm_nb.notifier_call = sleepstate_pm_notifier;
++	sleep->pm_nb.priority = INT_MAX;
++	ret = register_pm_notifier(&sleep->pm_nb);
++	if (ret)
++		return ret;
++	return devm_add_action_or_reset(dev, smp2p_sleepstate_unregister_notifier, sleep);
+ }
+ 
+ static const struct of_device_id smp2p_slst_match_table[] = {
+-	{.compatible = "qcom,smp2p-sleepstate"},
++	{ .compatible = "qcom,smp2p-sleepstate" },
+ 	{},
+ };
++MODULE_DEVICE_TABLE(of, smp2p_slst_match_table);
+ 
+ static struct platform_driver smp2p_sleepstate_driver = {
+ 	.probe = smp2p_sleepstate_probe,
+@@ -113,20 +114,7 @@
+ 		.of_match_table = smp2p_slst_match_table,
+ 	},
+ };
++module_platform_driver(smp2p_sleepstate_driver);
+ 
+-static int __init smp2p_sleepstate_init(void)
+-{
+-	int ret;
+-
+-	ret = platform_driver_register(&smp2p_sleepstate_driver);
+-	if (ret) {
+-		pr_err("%s: register failed %d\n", __func__, ret);
+-		return ret;
+-	}
+-
+-	return 0;
+-}
+-
+-module_init(smp2p_sleepstate_init);
+ MODULE_DESCRIPTION("SMP2P SLEEP STATE");
+ MODULE_LICENSE("GPL");
+--- a/drivers/rpmsg/qcom_glink_native.c
++++ b/drivers/rpmsg/qcom_glink_native.c
+@@ -15,6 +15,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ #include <linux/rpmsg.h>
++#include <linux/rpmsg/qcom_glink.h>
+ #include <linux/sizes.h>
+ #include <linux/slab.h>
+ #include <linux/wait.h>
+--- a/drivers/rpmsg/qcom_glink_memshare.c
++++ b/drivers/rpmsg/qcom_glink_memshare.c
+@@ -8,6 +8,8 @@
+ #include <linux/list.h>
+ #include <linux/types.h>
+ #include <linux/slab.h>
++#include <linux/rpmsg/qcom_glink.h>
++#include "qcom_glink_native.h"
+ 
+ struct qcom_glink_mem_entry {
+ 	struct device *dev;
+@@ -72,19 +74,19 @@
+ 
+ 	spin_lock_irqsave(&qcom_glink_mem_entry_lock, flags);
+ 	list_for_each_entry(mem, &qcom_glink_mem_entries, node) {
+-		int offset = da - mem->da;
++		u64 offset;
+ 
+ 		if (!mem->va)
+ 			continue;
+ 
+-		if (offset < 0)
++		if (da < mem->da)
+ 			continue;
+-
+-		if (offset + len > mem->len)
++		offset = da - mem->da;
++		if (offset > mem->len || len > mem->len - offset)
+ 			continue;
+ 
+ 		ptr = mem->va + offset;
+-		dma_sync_single_for_cpu(mem->dev, da, len, DMA_FROM_DEVICE);
++		dma_sync_single_for_cpu(mem->dev, mem->dma + offset, len, DMA_FROM_DEVICE);
+ 
+ 		break;
+ 	}
+--- a/drivers/rpmsg/qcom_glink_smem.c
++++ b/drivers/rpmsg/qcom_glink_smem.c
+@@ -68,6 +68,12 @@
+ 
+ #define to_smem_pipe(p) container_of(p, struct glink_smem_pipe, native)
+ 
++static bool glink_smem_size_valid(size_t length)
++{
++	return length > FIFO_FULL_RESERVE + TX_BLOCKED_CMD_RESERVE &&
++		length <= U32_MAX && IS_ALIGNED(length, 8);
++}
++
+ static size_t glink_smem_rx_avail(struct qcom_glink_pipe *np)
+ {
+ 	struct glink_smem_pipe *pipe = to_smem_pipe(np);
+@@ -86,12 +92,17 @@
+ 			return 0;
+ 		}
+ 
++		if (!glink_smem_size_valid(len))
++			return 0;
+ 		pipe->fifo = fifo;
+ 		pipe->native.length = len;
+ 	}
+ 
+-	head = le32_to_cpu(*pipe->head);
+-	tail = le32_to_cpu(*pipe->tail);
++	head = le32_to_cpu(READ_ONCE(*pipe->head));
++	tail = le32_to_cpu(READ_ONCE(*pipe->tail));
++
++	if (head >= pipe->native.length || tail >= pipe->native.length)
++		return 0;
+ 
+ 	if (head < tail)
+ 		len = pipe->native.length - tail + head;
+@@ -111,11 +122,13 @@
+ 	unsigned char *bytedata = (unsigned char *)data;
+ 	struct qcom_glink_smem *smem = pipe->smem;
+ 	size_t len;
+-	u32 tail;
+-
+-	tail = le32_to_cpu(*pipe->tail);
+-
+-	if (WARN_ON_ONCE(tail > pipe->native.length))
++	size_t tail;
++
++	tail = le32_to_cpu(READ_ONCE(*pipe->tail));
++
++	if (WARN_ON_ONCE(tail >= pipe->native.length ||
++			 offset >= pipe->native.length ||
++			 count > pipe->native.length - offset))
+ 		return;
+ 
+ 	tail += offset;
+@@ -136,10 +149,10 @@
+ 		memcpy_fromio(data + len, pipe->fifo, (count - len));
+ 
+ 	if (count == 1)
+-		GLINK_SMEM_INFO("RX: remote-pid=%d, head=0x%x, tail=0x%x, [%02x]\n",
++		GLINK_SMEM_INFO("RX: remote-pid=%d, head=0x%x, tail=0x%zx, [%02x]\n",
+ 			smem->remote_pid, le32_to_cpu(*pipe->head), tail, bytedata[0]);
+ 	if (count > 1)
+-		GLINK_SMEM_INFO("RX: remote-pid=%d, head=0x%x, tail=0x%x, [%02x %02x]\n",
++		GLINK_SMEM_INFO("RX: remote-pid=%d, head=0x%x, tail=0x%zx, [%02x %02x]\n",
+ 			smem->remote_pid, le32_to_cpu(*pipe->head), tail, bytedata[1], bytedata[0]);
+ }
+ 
+@@ -147,10 +160,12 @@
+ 				  size_t count)
+ {
+ 	struct glink_smem_pipe *pipe = to_smem_pipe(np);
+-	u32 tail;
+-
+-	tail = le32_to_cpu(*pipe->tail);
+-
++	size_t tail;
++
++	tail = le32_to_cpu(READ_ONCE(*pipe->tail));
++
++	if (WARN_ON_ONCE(tail >= pipe->native.length || count > pipe->native.length))
++		return;
+ 	tail += count;
+ 	if (tail >= pipe->native.length)
+ 		tail %= pipe->native.length;
+@@ -165,8 +180,11 @@
+ 	u32 tail;
+ 	u32 avail;
+ 
+-	head = le32_to_cpu(*pipe->head);
+-	tail = le32_to_cpu(*pipe->tail);
++	head = le32_to_cpu(READ_ONCE(*pipe->head));
++	tail = le32_to_cpu(READ_ONCE(*pipe->tail));
++
++	if (head >= pipe->native.length || tail >= pipe->native.length)
++		return 0;
+ 
+ 	if (tail <= head)
+ 		avail = pipe->native.length - head + tail;
+@@ -190,7 +208,7 @@
+ {
+ 	size_t len;
+ 
+-	if (WARN_ON_ONCE(head > pipe->native.length))
++	if (WARN_ON_ONCE(head >= pipe->native.length || count > pipe->native.length))
+ 		return head;
+ 
+ 	len = min_t(size_t, count, pipe->native.length - head);
+@@ -200,11 +218,7 @@
+ 	if (len != count)
+ 		memcpy(pipe->fifo, data + len, count - len);
+ 
+-	head += count;
+-	if (head >= pipe->native.length)
+-		head -= pipe->native.length;
+-
+-	return head;
++	return ((size_t)head + count) % pipe->native.length;
+ }
+ 
+ static void glink_smem_tx_write(struct qcom_glink_pipe *glink_pipe,
+@@ -215,7 +229,10 @@
+ 	struct qcom_glink_smem *smem = pipe->smem;
+ 	unsigned int head;
+ 
+-	head = le32_to_cpu(*pipe->head);
++	head = le32_to_cpu(READ_ONCE(*pipe->head));
++	if (WARN_ON_ONCE(head >= pipe->native.length || hlen > pipe->native.length ||
++			 dlen > pipe->native.length - hlen))
++		return;
+ 
+ 	head = glink_smem_tx_write_one(pipe, head, hdr, hlen);
+ 	head = glink_smem_tx_write_one(pipe, head, data, dlen);
+@@ -345,8 +362,17 @@
+ 		goto err_put_dev;
+ 	}
+ 
++	if (!glink_smem_size_valid(tx_pipe->native.length)) {
++		ret = -EINVAL;
++		goto err_put_dev;
++	}
++
+ 	scnprintf(smem->irqname, 32, "glink-native-%u", remote_pid);
+ 	smem->irq = of_irq_get(smem->dev.of_node, 0);
++	if (smem->irq <= 0) {
++		ret = smem->irq ?: -EINVAL;
++		goto err_put_dev;
++	}
+ 	ret = devm_request_irq(&smem->dev, smem->irq, qcom_glink_smem_intr,
+ 			       IRQF_NO_SUSPEND | IRQF_NO_AUTOEN,
+ 			       smem->irqname, smem);
+--- a/drivers/rpmsg/qcom_smd.c
++++ b/drivers/rpmsg/qcom_smd.c
+@@ -1596,7 +1596,7 @@
+ 
+ static struct platform_driver qcom_smd_driver = {
+ 	.probe = qcom_smd_probe,
+-	.remove_new = qcom_smd_remove,
++	.remove = qcom_smd_remove,
+ 	.driver = {
+ 		.name = "qcom-smd",
+ 		.of_match_table = qcom_smd_of_match,
+--- a/drivers/remoteproc/qcom_common.c
++++ b/drivers/remoteproc/qcom_common.c
+@@ -324,12 +324,16 @@
+ 	int ret;
+ 	struct minidump_subsystem *subsystem;
+ 	struct minidump_global_toc *toc;
++	size_t size;
++
++	if (minidump_id >= MAX_NUM_OF_SS)
++		return;
+ 
+ 	/* Get Global minidump ToC*/
+-	toc = qcom_smem_get(QCOM_SMEM_HOST_ANY, SBL_MINIDUMP_SMEM_ID, NULL);
++	toc = qcom_smem_get(QCOM_SMEM_HOST_ANY, SBL_MINIDUMP_SMEM_ID, &size);
+ 
+ 	/* check if global table pointer exists and init is set */
+-	if (IS_ERR(toc) || !toc->status) {
++	if (IS_ERR(toc) || size < sizeof(*toc) || !toc->status) {
+ 		dev_err(&rproc->dev, "Minidump TOC not found in SMEM\n");
+ 		return;
+ 	}
+@@ -390,24 +394,32 @@
+ static int glink_subdev_start(struct rproc_subdev *subdev)
+ {
+ 	struct qcom_rproc_glink *glink = to_glink_subdev(subdev);
++	int ret;
+ 
+ 	trace_rproc_qcom_event(dev_name(glink->dev->parent), GLINK_SUBDEV_NAME, "start");
+ 
+ 	glink->edge = qcom_glink_smem_register(glink->dev, glink->node);
+ 	if (IS_ERR(glink->edge)) {
+-		dev_err(glink->dev, "Failed to register glink smem\n");
+-		return PTR_ERR_OR_ZERO(glink->edge);
+-	}
+-
++		ret = PTR_ERR(glink->edge);
++		glink->edge = NULL;
++		return ret;
++	}
+ 	glink->nb.notifier_call = glink_early_ssr_notifier_event;
+-
+ 	glink->notifier_handle = qcom_register_early_ssr_notifier(glink->ssr_name, &glink->nb);
+ 	if (IS_ERR(glink->notifier_handle)) {
+-		dev_err(glink->dev, "Failed to register for SSR notifier\n");
++		ret = PTR_ERR(glink->notifier_handle);
+ 		glink->notifier_handle = NULL;
+-	}
+-
+-	return qcom_glink_smem_start(glink->edge);
++		goto remove_edge;
++	}
++	ret = qcom_glink_smem_start(glink->edge);
++	if (!ret)
++		return 0;
++	qcom_unregister_early_ssr_notifier(glink->notifier_handle, &glink->nb);
++	glink->notifier_handle = NULL;
++remove_edge:
++	qcom_glink_smem_unregister(glink->edge);
++	glink->edge = NULL;
++	return ret;
+ }
+ 
+ static void glink_subdev_stop(struct rproc_subdev *subdev, bool crashed)
+@@ -533,8 +545,13 @@
+ 	trace_rproc_qcom_event(dev_name(smd->dev->parent), SMD_SUBDEV_NAME, "start");
+ 
+ 	smd->edge = qcom_smd_register_edge(smd->dev, smd->node);
+-
+-	return PTR_ERR_OR_ZERO(smd->edge);
++	if (IS_ERR(smd->edge)) {
++		int ret = PTR_ERR(smd->edge);
++
++		smd->edge = NULL;
++		return ret;
++	}
++	return 0;
+ }
+ 
+ static void smd_subdev_stop(struct rproc_subdev *subdev, bool crashed)
+@@ -602,6 +619,11 @@
+ 		goto out;
+ 	}
+ 	info->name = kstrdup_const(name, GFP_KERNEL);
++	if (!info->name) {
++		kfree(info);
++		info = ERR_PTR(-ENOMEM);
++		goto out;
++	}
+ 	srcu_init_notifier_head(&info->notifier_list);
+ 	srcu_init_notifier_head(&info->early_notifier_list);
+ 
+@@ -669,8 +691,9 @@
+ 
+ static void ssr_notif_timeout_handler(struct timer_list *t)
+ {
+-	struct qcom_rproc_ssr *ssr = from_timer(ssr, t, timer);
+-
++	struct qcom_rproc_ssr *ssr = timer_container_of(ssr, t, timer);
++
++	/* Keep the ROM-configured watchdog policy for stalled remote clients. */
+ 	if (IS_ENABLED(CONFIG_QCOM_PANIC_ON_NOTIF_TIMEOUT) &&
+ 	    system_state != SYSTEM_RESTART &&
+ 	    system_state != SYSTEM_POWER_OFF &&
+@@ -706,7 +729,7 @@
+ 	timeout = jiffies + msecs_to_jiffies(SSR_NOTIF_TIMEOUT);
+ 	mod_timer(&ssr->timer, timeout);
+ 	srcu_notifier_call_chain(&ssr->info->notifier_list, ssr->notification, data);
+-	del_timer_sync(&ssr->timer);
++	timer_delete_sync(&ssr->timer);
+ }
+ 
+ static int ssr_notify_prepare(struct rproc_subdev *subdev)
+@@ -807,7 +830,10 @@
+  */
+ void qcom_remove_ssr_subdev(struct rproc *rproc, struct qcom_rproc_ssr *ssr)
+ {
++	if (!ssr->info)
++		return;
+ 	rproc_remove_subdev(rproc, &ssr->subdev);
++	timer_shutdown_sync(&ssr->timer);
+ 	ssr->info = NULL;
+ }
+ EXPORT_SYMBOL_GPL(qcom_remove_ssr_subdev);
+@@ -877,6 +903,7 @@
+ 
+ unregister_rproc_recovery_vh:
+ 	unregister_trace_android_vh_rproc_recovery(qcom_check_ssr_status, NULL);
++	tracepoint_synchronize_unregister();
+ remove_coredump_sysfs:
+ 	sysfs_remove_file(sysfs_kobject, &both_coredumps_attr.attr);
+ remove_shutdown_sysfs:
+@@ -890,10 +917,21 @@
+ 
+ static void __exit qcom_common_exit(void)
+ {
++	struct qcom_ssr_subsystem *info, *tmp;
++
+ 	sysfs_remove_file(sysfs_kobject, &both_coredumps_attr.attr);
+ 	sysfs_remove_file(sysfs_kobject, &shutdown_requested_attr.attr);
+ 	kobject_put(sysfs_kobject);
++	unregister_trace_android_vh_rproc_recovery_set(rproc_recovery_notifier, NULL);
+ 	unregister_trace_android_vh_rproc_recovery(qcom_check_ssr_status, NULL);
++	tracepoint_synchronize_unregister();
++	list_for_each_entry_safe(info, tmp, &qcom_ssr_subsystem_list, list) {
++		list_del(&info->list);
++		srcu_cleanup_notifier_head(&info->notifier_list);
++		srcu_cleanup_notifier_head(&info->early_notifier_list);
++		kfree_const(info->name);
++		kfree(info);
++	}
+ }
+ module_exit(qcom_common_exit);
+ 
+--- a/include/trace/events/rproc_qcom.h
++++ b/include/trace/events/rproc_qcom.h
+@@ -24,9 +24,9 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(name, name);
+-		__assign_str(event, event);
+-		__assign_str(subevent, subevent);
++		__assign_str(name);
++		__assign_str(event);
++		__assign_str(subevent);
+ 	),
+ 
+ 	TP_printk("%s: %s: %s", __get_str(name), __get_str(event), __get_str(subevent))
