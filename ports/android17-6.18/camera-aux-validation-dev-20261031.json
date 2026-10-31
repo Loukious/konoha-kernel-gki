@@ -1,0 +1,147 @@
+{
+  "tests": {
+    "logger": {
+      "init_faults": 4,
+      "message_lengths": 2050,
+      "copy_fault_retention": true,
+      "complete_record_eviction": true,
+      "concurrent_io": 1000
+    },
+    "messenger": {
+      "init_faults": 4,
+      "malformed_names": 141,
+      "reader_zero_and_duplicates": true,
+      "unregistered_read_unlock": true,
+      "fifo_eviction": 15,
+      "copy_fault_retention": true,
+      "disabled_switch_release": true
+    },
+    "scheduler": {
+      "allocation_failure": true,
+      "hook_registration_failures": 4,
+      "partial_hook_retry": true,
+      "cpu_bounds": 96,
+      "invalid_commands": 6,
+      "task_reference_balance": true,
+      "core_denials_preserved": true,
+      "rcu_updates": 200,
+      "concurrent_callbacks": 10000
+    }
+  },
+  "negative_controls": {
+    "scheduler_last_allowed_cpu_denied": {
+      "rejected": true,
+      "diagnostic": "scheduler_last_allowed_cpu_denied: /tmp/camera-aux-test-xooc6onz/scheduler_last_allowed_cpu_denied.c:596: main: Assertion `allowed' failed."
+    },
+    "logger_short_read_overflow": {
+      "rejected": true,
+      "diagnostic": "logger_short_read_overflow: /tmp/camera-aux-test-xooc6onz/logger_short_read_overflow.c:478: main: Assertion `cameralog_read(NULL,out,2,&pos)==-EMSGSIZE' failed."
+    },
+    "logger_consume_before_copy": {
+      "rejected": true,
+      "diagnostic": "logger_consume_before_copy: /tmp/camera-aux-test-xooc6onz/logger_consume_before_copy.c:478: main: Assertion `kfifo_len(&message_kfifo)==sizeof(struct camlog_dev)' failed."
+    },
+    "logger_fifo_unwind_leak": {
+      "rejected": true,
+      "diagnostic": "logger_fifo_unwind_leak: /tmp/camera-aux-test-xooc6onz/logger_fifo_unwind_leak.c:472: clean: Assertion `!alloc_live&&!chrdev_live&&!class_live&&!device_live' failed."
+    },
+    "logger_last_message_unterminated": {
+      "rejected": true,
+      "diagnostic": "logger_last_message_unterminated: /tmp/camera-aux-test-xooc6onz/logger_last_message_unterminated.c:479: main: Assertion `!strcmp(out,\"x!\")' failed."
+    },
+    "messenger_write_bound_lost": {
+      "rejected": true,
+      "diagnostic": "messenger_write_bound_lost: /tmp/camera-aux-test-xooc6onz/messenger_write_bound_lost.c:878: main: Assertion `cameramsger_write(&files[0],large,sizeof(large),&pos)==WRITE_ERROR_LEN_INVALID' failed."
+    },
+    "messenger_sender_overflow": {
+      "rejected": true,
+      "diagnostic": "messenger_sender_overflow: /tmp/camera-aux-test-xooc6onz/messenger_sender_overflow.c:882: main: Assertion `wr(&files[1],packet)==WRITE_ERROR_FORMAT_INVALID' failed."
+    },
+    "messenger_receiver_overflow": {
+      "rejected": true,
+      "diagnostic": "/tmp/camera-aux-test-xooc6onz/messenger_receiver_overflow.c:574:10: runtime error: index 60 out of bounds for type 'char [60]'"
+    },
+    "messenger_duplicate_reader_zero": {
+      "rejected": true,
+      "diagnostic": "messenger_duplicate_reader_zero: /tmp/camera-aux-test-xooc6onz/messenger_duplicate_reader_zero.c:879: main: Assertion `wr(&files[1],\"reg|second\")==CREATE_READER_ERROR_EXIST' failed."
+    },
+    "messenger_reader_zero_release_lost": {
+      "rejected": true,
+      "diagnostic": "messenger_reader_zero_release_lost: /tmp/camera-aux-test-xooc6onz/messenger_reader_zero_release_lost.c:885: main: Assertion `!c_msger_dev.readers[0].used&&c_msger_dev.r_entity_count==1' failed."
+    },
+    "messenger_unregistered_read_lock_leak": {
+      "rejected": true,
+      "diagnostic": "messenger_unregistered_read_lock_leak: /tmp/camera-aux-test-xooc6onz/messenger_unregistered_read_lock_leak.c:881: main: Assertion `!pthread_mutex_trylock(&c_msger_dev.g_lock.raw)' failed."
+    },
+    "messenger_copy_fault_consumes": {
+      "rejected": true,
+      "diagnostic": "messenger_copy_fault_consumes: /tmp/camera-aux-test-xooc6onz/messenger_copy_fault_consumes.c:881: main: Assertion `cameramsger_read(&files[0],out,sizeof(out),&pos)==12&&!strcmp(out,\"sender|hello\")' failed."
+    },
+    "messenger_short_read_consumes": {
+      "rejected": true,
+      "diagnostic": "messenger_short_read_consumes: /tmp/camera-aux-test-xooc6onz/messenger_short_read_consumes.c:880: main: Assertion `cameramsger_read(&files[0],out,2,&pos)==-EMSGSIZE' failed."
+    },
+    "messenger_unpublished_open": {
+      "rejected": true,
+      "diagnostic": "messenger_unpublished_open: /tmp/camera-aux-test-xooc6onz/messenger_unpublished_open.c:78: register_chrdev: Assertion `f->open(NULL,&file)==-ENODEV' failed."
+    },
+    "scheduler_duplicate_hook_retry": {
+      "rejected": true,
+      "diagnostic": "scheduler_duplicate_hook_retry: /tmp/camera-aux-test-xooc6onz/scheduler_duplicate_hook_retry.c:137: hook_register: Assertion `!(hooks&BIT(n))' failed."
+    },
+    "scheduler_partial_hook_callbacks_active": {
+      "rejected": true,
+      "diagnostic": "scheduler_partial_hook_callbacks_active: /tmp/camera-aux-test-xooc6onz/scheduler_partial_hook_callbacks_active.c:592: main: Assertion `allowed' failed."
+    },
+    "scheduler_failed_init_dangling_hooks": {
+      "rejected": true,
+      "diagnostic": "scheduler_failed_init_dangling_hooks: /tmp/camera-aux-test-xooc6onz/scheduler_failed_init_dangling_hooks.c:592: main: Assertion `!rc&&csdata&&registered_hooks==BIT(f-1)-1&&!sched_ready' failed."
+    },
+    "scheduler_cpu_array_bound_lost": {
+      "rejected": true,
+      "diagnostic": "/tmp/camera-aux-test-xooc6onz/scheduler_cpu_array_bound_lost.c:448:64: runtime error: index 8 out of bounds for type 'u8 [8]'"
+    },
+    "scheduler_overrides_core_denial": {
+      "rejected": true,
+      "diagnostic": "scheduler_overrides_core_denial: /tmp/camera-aux-test-xooc6onz/scheduler_overrides_core_denial.c:596: main: Assertion `!allowed' failed."
+    },
+    "scheduler_uninitialized_mask": {
+      "rejected": true,
+      "diagnostic": "scheduler_uninitialized_mask: /tmp/camera-aux-test-xooc6onz/scheduler_uninitialized_mask.c:595: main: Assertion `csdata->ctl_cpus.bits==1&&csdata->offset==1&&csdata->pids[0]==20' failed."
+    },
+    "pid_lookup_reference_lost": {
+      "rejected": true,
+      "diagnostic": "pid_lookup_reference_lost: /tmp/camera-aux-test-xooc6onz/pid_lookup_reference_lost.c:128: put_task_struct: Assertion `p->refs>0' failed."
+    },
+    "pid_lookup_allocation_error_deref": {
+      "rejected": true,
+      "diagnostic": "/tmp/camera-aux-test-xooc6onz/pid_lookup_allocation_error_deref.c:328:9: runtime error: null pointer passed as argument 1, which is declared to never be null"
+    }
+  },
+  "source_sha256": {
+    "qcom/opensource/camera-kernel/drivers/cam_log/cam_log.c": "e012d4d0494fc3816eb26646a31656a7773dfe78bc7a69804d4c3bf8aaa34135",
+    "qcom/opensource/camera-kernel/drivers/cam_log/cam_log.h": "87917b939b02474d562695e5c35c52e0d087515914c749d56b8901195995a4d1",
+    "qcom/opensource/camera-kernel/drivers/cam_msger/cam_binder.c": "9ec8f0d152ff7917f45219e79bef310088e08e0e035ee2f26026fd5afabf2376",
+    "qcom/opensource/camera-kernel/drivers/cam_msger/cam_binder.h": "95e1255b8ea546af5a408fe773f4ba2cd7b4a4eef4c0391d8e7ed5d8601be6b6",
+    "qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger.c": "e7bb54a4e1e80d116d255eb17df16d17d8ab31e962c7b12869eb46f6d1027b9c",
+    "qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger.h": "d08a18d8582d96654f72023f0e984c793079f7f81aff08df700f4b671af7770a",
+    "qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger_common.c": "26e02c31e622b6c14768323465cbf900fa35623e2b29e1d90eb065b573640f9c",
+    "qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger_common.h": "e37a87800d7d8ce6d31fb6046ff0f9f52fb82871961600985f8b76ac6aa60222",
+    "qcom/opensource/camera-kernel/drivers/cam_msger/cam_pid.c": "e1999db22ab94045acfd07e0b892fb01f0a3d1d4262f2c3b38c49e2304e6f976",
+    "qcom/opensource/camera-kernel/drivers/cam_msger/cam_pid.h": "f55e239c1fa7ac4042bf62b85ae561a61cc31aaff5ed8438fb6bdd158d24f14a",
+    "qcom/opensource/camera-kernel/drivers/cam_msger/cam_sched.c": "9b90c47790043d3d9a974d2c106ff3d1d83c3fee6e6b0d7743377a46b3c61859",
+    "qcom/opensource/camera-kernel/drivers/cam_msger/cam_sched.h": "292af9bf6b2ff3422dfb4d4bd411fa02ef88f718ea4d28526668c65d9f932920",
+    "qcom/opensource/camera-kernel/Kbuild": "41d8252bed4c68210a6de75128623db9c4e3b820c31c1b53557e2feea1a0585e",
+    "qcom/opensource/camera-kernel/Makefile": "953fd13529e61ca50a0d1f23c47898f1ce0f539a728c109b5fb0a71695ae9fda",
+    "qcom/opensource/camera-kernel/Kconfig": "7e6f9ea6d1b2f594006dd7df89a059022241229c183139ec55f36a8e6b839b9c",
+    "qcom/opensource/camera-kernel/config/sun.mk": "d1d82f5cbccc61f468d71ae2b5d344be832a2b2668828a170dc8a1715b320882"
+  },
+  "harness_sha256": {
+    "camera_fake.h": "7c6bc698f6465d197b08d9cbddbeda030bf74e709d30f220aa7f3312aedd076a",
+    "camera_logger.c": "3d7c8ca53aace1e1270913bb7ee632af7f8d225407e3defeb4000656ca69b2f9",
+    "camera_messenger.c": "a778dc24ad7985f6e82b9d87ad5be95597ff12c7cf3d2afe0884cd4de34b1273",
+    "camera_msger_stubs.h": "ec253e0e5c7f40d758be9c9864f70c14f48337b2f57de97655051d91c0ce8c8d",
+    "camera_scheduler.c": "8e39f51798067b16198c302884a4928a1bf4830856a2a7fd4473437717da4ce3"
+  },
+  "limits": "Production source with mocked device/char/FIFO/user-copy/hooks and pthread RCU/mutex services; not actual VFS, scheduler, hardware or camera-stack validation."
+}

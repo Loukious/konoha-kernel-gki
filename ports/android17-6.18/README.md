@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 263 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 265 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 263 platform `.ko` files, their symbol tables and DDK configurations.
+- 265 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 16,319
-imported symbol CRCs across all 263 modules.
+used. The current [validation report](validation-20261031.json) checks 16,400
+imported symbol CRCs across all 265 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1754,3 +1754,27 @@ overlay checks pass with existing vendor warnings. ROM module-name coverage
 is 260/466 (55.8%). Main camera, EVA, remaining audio/peripherals, KernelSU and
 NetHunter integration, boot/DLKM images and ZIP packaging remain. No phone boot,
 live codec/DSP behavior or flashable ZIP is claimed.
+
+
+## Native camera logger and messenger
+
+The two auxiliary camera modules retain six native units and sixteen exact
+inputs. Logger queue operations bound lengths and preserve records on failed
+copies. Messenger commands validate fields, include reader zero in ownership
+checks, retain task references and serialize configuration with immutable RCU
+snapshots. Scheduler hooks preserve existing CPU denials and runnable affinity.
+The native resident messenger lifecycle keeps published restricted callbacks
+valid; a later enable request retries incomplete hook registration.
+
+Three production-source sanitizer suites and 22 deliberately broken controls
+pass against integrated sources. Native devices, command families, dependencies,
+aliases and the logger export are preserved. The
+[auxiliary port record](camera-aux-port.md) describes scheduling, residency
+and test limitations.
+
+Archive `artifacts/20261031T193422696930Z` contains 265 modules, passes 16,400
+imported-symbol CRC checks without compiler/modpost warnings and passes device
+tree/overlay checks with existing vendor warnings. ROM module-name coverage
+is 262/466 (56.2%). Main camera, EVA, remaining audio/peripherals, KernelSU and
+NetHunter integration and boot/DLKM/ZIP packaging remain unfinished. No phone
+boot or hardware camera operation is claimed.

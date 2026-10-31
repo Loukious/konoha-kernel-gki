@@ -1,0 +1,1813 @@
+diff --git a/qcom/opensource/camera-kernel/drivers/cam_log/cam_log.c b/qcom/opensource/camera-kernel/drivers/cam_log/cam_log.c
+index f9386f2..9c405f2 100644
+--- a/qcom/opensource/camera-kernel/drivers/cam_log/cam_log.c
++++ b/qcom/opensource/camera-kernel/drivers/cam_log/cam_log.c
+@@ -23,6 +23,7 @@
+ #include <linux/delay.h>
+ #include <linux/uaccess.h>
+ #include <linux/ktime.h>
++#include <linux/cred.h>
+ #include <linux/timer.h>
+ #include <linux/notifier.h>
+ #include <linux/fb.h>
+@@ -35,10 +36,11 @@
+ static struct camlog_dev s_read_buf;
+ static struct camlog_dev s_write_buf;
+ 
+-static struct mutex camlog_message_lock;
+-static wait_queue_head_t camlog_is_not_empty;
++static DEFINE_MUTEX(camlog_message_lock);
++static DECLARE_WAIT_QUEUE_HEAD(camlog_is_not_empty);
++static bool camlog_ready;
+ static dev_t devt;
+-static int debugLevel = 0;
++static int debug_level;
+ static struct kfifo message_kfifo;
+ 
+ #define MY_IOCTL_TYPE 'M'
+@@ -94,205 +96,173 @@ static void dump(void)
+ 		"----------------- DUMP CAMERALOG END   ------------------------");
+ }
+ 
+-static long cameralog_ioctl(struct file *filp, unsigned int cmd,
+-			    unsigned long arg)
++static long cameralog_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ {
+-	pr_debug(" cameralog_ioctl! %u  %lu\n", cmd, arg);
++	void __user *data = (void __user *)arg;
++	int value;
++	long ret = 0;
++
++	mutex_lock(&camlog_message_lock);
++	if (!camlog_ready) {
++		ret = -ENODEV;
++		goto out;
++	}
+ 	switch (cmd) {
+-	case IOCTL_CMD_LOG_SWITCH: {
+-		if (0 >= debugLevel) {
+-			debugLevel = 1;
+-		} else {
+-			debugLevel = 0;
+-		}
+-	} break;
+-	case IOCTL_CMD_SET_DEBUG_ON: {
+-		debugLevel = 1;
+-	} break;
+-	case IOCTL_CMD_SET_DEBUG_OFF: {
+-		debugLevel = 0;
+-	} break;
+-	case IOCTL_CMD_DUMP: {
++	case IOCTL_CMD_LOG_SWITCH:
++		debug_level = debug_level <= 0;
++		break;
++	case IOCTL_CMD_SET_DEBUG_ON:
++		debug_level = 1;
++		break;
++	case IOCTL_CMD_SET_DEBUG_OFF:
++		debug_level = 0;
++		break;
++	case IOCTL_CMD_DUMP:
+ 		dump();
+-	} break;
+-	case IOCTL_CMD_SET_DEBUG_LEVEL: {
+-		int data;
+-		if (copy_from_user(&data, (int *)arg, sizeof(int))) {
+-			return -EFAULT;
+-		}
+-		debugLevel = data;
+-	} break;
+-	case IOCTL_CMD_READ_KFIFO_CNT: {
+-		int len = kfifo_len(&message_kfifo);
+-		if (copy_to_user((int *)arg, &len, sizeof(int))) {
+-			return -EFAULT;
+-		}
+-	} break;
+-	case IOCTL_CMD_READ_LAST_MSG: {
+-		if (copy_to_user((char *)arg, s_last_message,
+-				 strlen(s_last_message) + 1)) {
+-			return -EFAULT;
+-		}
+-	} break;
++		break;
++	case IOCTL_CMD_SET_DEBUG_LEVEL:
++		if (copy_from_user(&value, data, sizeof(value)))
++			ret = -EFAULT;
++		else
++			debug_level = value;
++		break;
++	case IOCTL_CMD_READ_KFIFO_CNT:
++		/* Preserve the native byte-count ioctl contract. */
++		value = kfifo_len(&message_kfifo);
++		if (copy_to_user(data, &value, sizeof(value)))
++			ret = -EFAULT;
++		break;
++	case IOCTL_CMD_READ_LAST_MSG:
++		if (copy_to_user(data, s_last_message,
++				 strnlen(s_last_message, MESSAGE_MAX - 1) + 1))
++			ret = -EFAULT;
++		break;
+ 	default:
+-		return -ENOTTY;
++		ret = -ENOTTY;
+ 	}
+-
+-	return 0;
++out:
++	mutex_unlock(&camlog_message_lock);
++	return ret;
+ }
++
+ static int cameralog_open(struct inode *inode, struct file *filp)
+ {
+-	pr_debug(" cameralog_open!\n");
+-	return 0;
++	int ret;
++
++	mutex_lock(&camlog_message_lock);
++	ret = camlog_ready ? 0 : -ENODEV;
++	mutex_unlock(&camlog_message_lock);
++	return ret;
+ }
+-/**
+-*
+-* @return Number of bytes read.
+-*/
++
+ static ssize_t cameralog_read(struct file *fp, char __user *buff, size_t length,
+ 			      loff_t *ppos)
+ {
+-	ssize_t bytes_read = 0;
+-	int ret = 0;
+-	int message_len = 0;
+-	struct task_struct *caller_task = current;
+-
+-	if (debugLevel > 0) {
+-		pr_debug("cameralog_read .");
+-	}
++	ssize_t ret = 0;
++	size_t message_len;
+ 
++	if (!length)
++		return 0;
+ 	mutex_lock(&camlog_message_lock);
+-	memset(&s_read_buf, 0, sizeof(struct camlog_dev));
+-	if (debugLevel > 0) {
+-		pr_debug("cameralog_read  kfifo len:%lu",
+-			 kfifo_len(&message_kfifo) / sizeof(struct camlog_dev));
++	if (!camlog_ready) {
++		ret = -ENODEV;
++		goto out;
+ 	}
+-
+-	ret = kfifo_out(&message_kfifo, &s_read_buf, sizeof(struct camlog_dev));
+-	if (ret != sizeof(struct camlog_dev)) {
+-		if (debugLevel > 0) {
+-			pr_debug(
+-				"cameralog_read: not read anything from kfifo %d  expect:%lu\n",
+-				ret, sizeof(struct camlog_dev));
+-		}
+-		mutex_unlock(&camlog_message_lock);
+-		return 0;
++	if (kfifo_out_peek(&message_kfifo, &s_read_buf, sizeof(s_read_buf)) !=
++	    sizeof(s_read_buf))
++		goto out;
++	message_len = strnlen(s_read_buf.m_camlog_message, MESSAGE_MAX);
++	if (length < message_len) {
++		ret = -EMSGSIZE;
++		goto out;
+ 	}
+-
+-	message_len = strlen(s_read_buf.m_camlog_message);
+-	if (message_len > 0) {
++	/* The native record protocol replaces its final byte with a newline. */
++	if (message_len)
+ 		s_read_buf.m_camlog_message[message_len - 1] = '\n';
+-	} else {
+-		mutex_unlock(&camlog_message_lock);
+-		return 0;
+-	}
+-	if (debugLevel > 0) {
+-		pr_debug("cameralog_read message to user:%s   len:%d",
+-			 s_read_buf.m_camlog_message, message_len);
++	if (copy_to_user(buff, s_read_buf.m_camlog_message, message_len)) {
++		ret = -EFAULT;
++		goto out;
+ 	}
+-
+-	ret = copy_to_user(buff, s_read_buf.m_camlog_message, message_len);
+-
+-	if (ret == 0) {
+-		bytes_read = message_len;
++	if (kfifo_out(&message_kfifo, &s_read_buf, sizeof(s_read_buf)) != sizeof(s_read_buf)) {
++		ret = -EIO;
++		goto out;
+ 	}
+-	if (debugLevel > 0) {
+-		pr_debug("cameralog_read return len:%zd", bytes_read);
+-	}
+-	s_last_reader_uid = from_kuid(&init_user_ns, caller_task->cred->uid);
+-	s_last_reader_pid = task_pid_nr(caller_task);
+-
++	s_last_reader_uid = from_kuid(&init_user_ns, current_uid());
++	s_last_reader_pid = task_pid_nr(current);
++	ret = message_len;
++out:
+ 	mutex_unlock(&camlog_message_lock);
+-	return bytes_read;
++	return ret;
+ }
++
+ void camlog_send_message(void)
+ {
+ 	pr_debug(" camlog_send_message ss  \n");
+ }
+ EXPORT_SYMBOL(camlog_send_message);
+-/**
+-*
+-* @return number of bytes actually written
+-*/
+-static ssize_t cameralog_write(struct file *fp, const char *buff, size_t length,
++static ssize_t cameralog_write(struct file *fp, const char __user *buff, size_t length,
+ 			       loff_t *ppos)
+ {
+-	int ret = 0;
+-	ssize_t bytes_wirte = 0;
+-	int valid_len = 0;
+-	struct task_struct *caller_task = current;
+-
+-	if (debugLevel > 0) {
+-		pr_debug("cameralog_write .");
+-	}
++	ssize_t ret;
++	size_t valid_len = min_t(size_t, length, MESSAGE_MAX - 1);
+ 
+ 	mutex_lock(&camlog_message_lock);
+-	memset(&s_write_buf, 0, sizeof(struct camlog_dev));
+-
+-	valid_len = length >= MESSAGE_MAX ? MESSAGE_MAX - 1 : length;
+-	ret = copy_from_user(s_write_buf.m_camlog_message, buff, valid_len);
+-	if (0 == ret) {
+-		bytes_wirte = strlen(s_write_buf.m_camlog_message);
+-	}
+-	if (debugLevel > 0) {
+-		pr_debug("cameralog_write  valid_len:%d  strlen:%zd.",
+-			 valid_len, bytes_wirte);
+-	}
+-	if (0 == bytes_wirte) {
+-		//empty string!
+-		mutex_unlock(&camlog_message_lock);
+-		return 0;
+-	}
+-	if (debugLevel > 0) {
+-		pr_debug("cameralog_write  input  msg : %s",
+-			 s_write_buf.m_camlog_message);
++	if (!camlog_ready) {
++		ret = -ENODEV;
++		goto out;
+ 	}
+-	//pr_debug("cameralog_write avail:%d", kfifo_avail(&message_kfifo) );
+-	while (kfifo_avail(&message_kfifo) < sizeof(struct camlog_dev)) {
+-		ret = kfifo_out(&message_kfifo, &s_read_buf,
+-				sizeof(struct camlog_dev));
+-		if (ret != sizeof(struct camlog_dev)) {
+-			kfifo_skip(&message_kfifo);
+-		}
+-		//pr_debug("avail:%d", kfifo_avail(&message_kfifo) );
++	memset(&s_write_buf, 0, sizeof(s_write_buf));
++	if (copy_from_user(s_write_buf.m_camlog_message, buff, valid_len)) {
++		ret = -EFAULT;
++		goto out;
+ 	}
+-	ret = kfifo_in(&message_kfifo, &s_write_buf, sizeof(struct camlog_dev));
+-	if (ret != sizeof(struct camlog_dev)) {
+-		if (debugLevel > 0) {
+-			pr_debug(
+-				"cameralog: Failed to write to kfifo %d -  %lu\n",
+-				ret, sizeof(struct camlog_dev));
++	ret = strnlen(s_write_buf.m_camlog_message, valid_len);
++	if (!ret)
++		goto out;
++	s_write_buf.writer_uid = from_kuid(&init_user_ns, current_uid());
++	s_write_buf.writer_pid = task_pid_nr(current);
++	/* Drop complete oldest records, retaining the native overwrite policy. */
++	while (kfifo_avail(&message_kfifo) < sizeof(s_write_buf)) {
++		if (kfifo_out(&message_kfifo, &s_read_buf, sizeof(s_read_buf)) !=
++		    sizeof(s_read_buf)) {
++			ret = -EIO;
++			goto out;
+ 		}
+-		mutex_unlock(&camlog_message_lock);
+-		return 0;
+ 	}
+-	s_last_caller_uid = from_kuid(&init_user_ns, caller_task->cred->uid);
+-	s_last_caller_pid = task_pid_nr(caller_task);
+-	strncpy(s_last_message, s_write_buf.m_camlog_message, bytes_wirte);
+-	if (debugLevel > 0) {
+-		pr_debug("cameralog message kfifo   len:%d",
+-			 kfifo_len(&message_kfifo));
++	if (kfifo_in(&message_kfifo, &s_write_buf, sizeof(s_write_buf)) != sizeof(s_write_buf)) {
++		ret = -EIO;
++		goto out;
+ 	}
+-	mutex_unlock(&camlog_message_lock);
++	s_last_caller_uid = s_write_buf.writer_uid;
++	s_last_caller_pid = s_write_buf.writer_pid;
++	strscpy(s_last_message, s_write_buf.m_camlog_message, sizeof(s_last_message));
+ 	wake_up_interruptible(&camlog_is_not_empty);
+-	return bytes_wirte;
++out:
++	mutex_unlock(&camlog_message_lock);
++	return ret;
+ }
++
+ static int cameralog_release(struct inode *inode, struct file *filp)
+ {
+ 	pr_debug(" cameralog_release!\n");
+ 	wake_up_interruptible(&camlog_is_not_empty);
+ 	return 0;
+ }
+-static unsigned int cameralog_poll(struct file *file,
+-				   struct poll_table_struct *poll_table)
++
++static __poll_t cameralog_poll(struct file *file, struct poll_table_struct *poll_table)
+ {
+-	unsigned int mask = 0;
++	__poll_t mask = 0;
++
+ 	poll_wait(file, &camlog_is_not_empty, poll_table);
+-	if (kfifo_len(&message_kfifo) > 0) {
+-		mask = POLLIN | POLLRDNORM;
+-	}
++	mutex_lock(&camlog_message_lock);
++	if (!camlog_ready)
++		mask = EPOLLHUP | EPOLLERR;
++	else if (kfifo_len(&message_kfifo) >= sizeof(struct camlog_dev))
++		mask = EPOLLIN | EPOLLRDNORM;
++	mutex_unlock(&camlog_message_lock);
+ 	return mask;
+ }
++
+ static const struct file_operations cameralog_fops = {
+ 	.owner = THIS_MODULE,
+ 	.unlocked_ioctl = cameralog_ioctl,
+@@ -303,38 +273,50 @@ static const struct file_operations cameralog_fops = {
+ 	.write = cameralog_write,
+ };
+ static struct class *camlog_class;
+-static unsigned int camlog_major;
++static int camlog_major;
+ static int __init cameralog_init(void)
+ {
+ 	struct device *device;
+-	int ret = 0;
+-	ret = kfifo_alloc(&message_kfifo,
+-			  KFIFO_COUNT * sizeof(struct camlog_dev), GFP_KERNEL);
+-	if (ret) {
+-		printk(KERN_ERR
+-		       "cameralog message kfifo: Failed to allocate kfifo\n");
++	int ret;
++
++	ret = kfifo_alloc(&message_kfifo, KFIFO_COUNT * sizeof(struct camlog_dev), GFP_KERNEL);
++	if (ret)
+ 		return ret;
+-	}
+ 	camlog_major = register_chrdev(0, CAMLOG_DEV_NAME, &cameralog_fops);
++	if (camlog_major < 0) {
++		ret = camlog_major;
++		goto free_fifo;
++	}
+ 	camlog_class = class_create(CAMLOG_DEV_NAME);
+ 	if (IS_ERR(camlog_class)) {
+-		unregister_chrdev(camlog_major, CAMLOG_DEV_NAME);
+-		pr_warn("Failed to create class.\n");
+-		return PTR_ERR(camlog_class);
++		ret = PTR_ERR(camlog_class);
++		goto unregister;
+ 	}
+ 	devt = MKDEV(camlog_major, 0);
+ 	device = device_create(camlog_class, NULL, devt, NULL, CAMLOG_DEV_NAME);
+ 	if (IS_ERR(device)) {
+-		pr_err("error while trying to create %s\n", CAMLOG_DEV_NAME);
+-		return -EINVAL;
++		ret = PTR_ERR(device);
++		goto destroy_class;
+ 	}
+-	mutex_init(&camlog_message_lock);
+-	init_waitqueue_head(&camlog_is_not_empty);
++	mutex_lock(&camlog_message_lock);
++	camlog_ready = true;
++	mutex_unlock(&camlog_message_lock);
+ 	return 0;
++destroy_class:
++	class_destroy(camlog_class);
++unregister:
++	unregister_chrdev(camlog_major, CAMLOG_DEV_NAME);
++free_fifo:
++	kfifo_free(&message_kfifo);
++	return ret;
+ }
+ module_init(cameralog_init);
+ static void __exit cameralog_exit(void)
+ {
++	mutex_lock(&camlog_message_lock);
++	camlog_ready = false;
++	mutex_unlock(&camlog_message_lock);
++	wake_up_interruptible(&camlog_is_not_empty);
+ 	device_destroy(camlog_class, devt);
+ 	class_destroy(camlog_class);
+ 	unregister_chrdev(camlog_major, CAMLOG_DEV_NAME);
+diff --git a/qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger.c b/qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger.c
+index d05cc33..b1c4ec1 100644
+--- a/qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger.c
++++ b/qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger.c
+@@ -35,6 +35,13 @@
+ 
+ unsigned int msger_siwtches = COC_ENABLE;
+ static cammsger_dev c_msger_dev;
++static bool msger_ready;
++static bool cameramsger_is_ready(void)
++{
++	/* Pair with initialization publication before accessing queues or locks. */
++	return smp_load_acquire(&msger_ready);
++}
++
+ static submodule submodules[] = {
+ 	//{init, write, read, pool, ioctl, release}
+ 	{ cam_sched_init, cam_sched_w_pids, NULL, NULL, cam_sched_ioctl,
+@@ -44,7 +51,7 @@ static submodule submodules[] = {
+ 
+ u8 debug(int log_type)
+ {
+-	return (log_type == c_msger_dev.debug);
++	return log_type == READ_ONCE(c_msger_dev.debug);
+ }
+ 
+ static void dump(void)
+@@ -78,12 +85,11 @@ static void dump(void)
+ 	mutex_unlock(&c_msger_dev.g_lock);
+ }
+ 
+-static void clear_r_entity(int idx)
++static void clear_r_entity_locked(int idx)
+ {
+-	if (idx < 0 || idx >= READER_COUNT_MAX)
++	if (idx < 0 || idx >= READER_COUNT_MAX || !c_msger_dev.readers[idx].used)
+ 		return;
+ 
+-	mutex_lock(&c_msger_dev.g_lock);
+ 	c_msger_dev.readers[idx].pid = 0;
+ 	c_msger_dev.readers[idx].tgid = 0;
+ 	c_msger_dev.readers[idx].used = 0;
+@@ -95,15 +101,15 @@ static void clear_r_entity(int idx)
+ 	memset(&(c_msger_dev.readers[idx].msgs), 0,
+ 	       sizeof(m_item) * MSG_COUNT_MAX);
+ 	c_msger_dev.r_entity_count--;
+-	mutex_unlock(&c_msger_dev.g_lock);
+ 
+ 	wake_up_interruptible(&(c_msger_dev.readers[idx].wait_queue));
+ }
++
+ static int find_reader_by_fp(struct file *filp)
+ {
+ 	int idx = 0;
+ 	if (filp == NULL)
+-		return idx;
++		return READER_COUNT_MAX;
+ 	for (idx = 0; idx < READER_COUNT_MAX; idx++) {
+ 		if (!c_msger_dev.readers[idx].used)
+ 			continue;
+@@ -112,6 +118,7 @@ static int find_reader_by_fp(struct file *filp)
+ 	}
+ 	return idx;
+ }
++
+ static int find_reader_by_name_or_tgid(char *name, int tgid)
+ {
+ 	int idx = 0;
+@@ -140,165 +147,81 @@ static int find_new_reader_idx(void)
+ 
+ static int cameramsger_open(struct inode *inode, struct file *filp)
+ {
+-	m_pr(LTYPE_COC, "cameramsger_open, thread:%d file:%p\n", current->pid,
+-	     filp);
+-	return 0;
++	return cameramsger_is_ready() ? 0 : -ENODEV;
+ }
+-static unsigned int cameramsger_poll(struct file *file,
+-				     struct poll_table_struct *poll_table)
+-{
+-	unsigned int mask = 0;
+-	u8 hit = 0;
+-	int idx = 0, len_submodules = 0;
+ 
+-	switch_enable_and_exec(COC_ENABLE)
+-	{
+-		m_pr(LTYPE_COC, "cameramsger_poll pid:%d tid:%d file:%p\n",
+-		     current->tgid, current->pid, file);
+-		mutex_lock(&c_msger_dev.g_lock);
+-		for (idx = 0; idx < READER_COUNT_MAX; idx++) {
+-			if (!c_msger_dev.readers[idx].used)
+-				continue;
+-			if (c_msger_dev.readers[idx].fp != file)
+-				continue;
+-			if (current->tgid != c_msger_dev.readers[idx].tgid)
+-				continue;
+-			break;
+-		}
+-		mutex_unlock(&c_msger_dev.g_lock);
++static __poll_t cameramsger_poll(struct file *file, struct poll_table_struct *poll_table)
++{
++	__poll_t mask = 0;
++	int idx;
+ 
+-		if (idx < READER_COUNT_MAX) { //found reader
+-			if (c_msger_dev.readers[idx].front !=
+-			    c_msger_dev.readers[idx].rear) { //have messages
+-				mask = POLLIN | POLLRDNORM;
+-				m_pr(LTYPE_COC,
+-				     "cameramsger_poll tid:%d have messages.\n",
+-				     current->pid);
+-				return mask;
+-			}
+-			m_pr(LTYPE_COC, "cameramsger_poll poll_wait_begin.\n");
+-			poll_wait(file, &(c_msger_dev.readers[idx].wait_queue),
+-				  poll_table);
+-			m_pr(LTYPE_COC, "cameramsger_poll poll_wait_end.\n");
+-			if (c_msger_dev.readers[idx].front ==
+-			    c_msger_dev.readers[idx].rear) {
+-				mask = 0;
+-				return mask; //message array empty
+-			}
+-			mask = POLLIN | POLLRDNORM;
+-			m_pr(LTYPE_COC,
+-			     "cameramsger_poll reader pid:%d tid:%d fp:%p have messages.\n",
+-			     current->pid, current->tgid, file);
+-			return mask;
+-		}
+-	}
+-	//check submodules
+-	len_submodules = ARRAY_SIZE(submodules);
+-	for (idx = 0; idx < len_submodules; idx++) {
+-		if (submodules[idx].poll != NULL) {
+-			mask = submodules[idx].poll(file, poll_table, &hit);
+-			if (hit)
+-				return mask;
+-		}
++	if (!cameramsger_is_ready())
++		return EPOLLERR;
++	mutex_lock(&c_msger_dev.g_lock);
++	idx = find_reader_by_fp(file);
++	if ((READ_ONCE(msger_siwtches) & COC_ENABLE) && idx < READER_COUNT_MAX &&
++	    current->tgid == c_msger_dev.readers[idx].tgid) {
++		poll_wait(file, &c_msger_dev.readers[idx].wait_queue, poll_table);
++		if (c_msger_dev.readers[idx].front != c_msger_dev.readers[idx].rear)
++			mask = EPOLLIN | EPOLLRDNORM;
+ 	}
++	mutex_unlock(&c_msger_dev.g_lock);
+ 	return mask;
+ }
+ 
+-static ssize_t cameramsger_read(struct file *fp, char __user *buff,
+-				size_t length, loff_t *ppos)
++static ssize_t cameramsger_read(struct file *fp, char __user *buff, size_t length,
++				loff_t *ppos)
+ {
+-	u8 hit = 0;
+-	int idx = 0;
+-	int len = 0, len_submodules = 0;
+-	int ret = READER_ERROR_EMPTY;
+-	r_entity *reader = NULL;
+-
+-	switch_enable_and_exec(COC_ENABLE)
+-	{
+-		mutex_lock(&c_msger_dev.g_lock);
+-		for (idx = 0; idx < READER_COUNT_MAX; idx++) {
+-			reader = &(c_msger_dev.readers[idx]);
+-			if (!reader->used)
+-				continue;
+-			if (reader->fp != fp)
+-				continue;
+-			if (current->tgid != reader->tgid)
+-				continue;
+-			break;
+-		}
+-		if (idx < READER_COUNT_MAX) {
+-			if (reader->front == reader->rear) {
+-				ret = READER_ERROR_EMPTY;
+-				goto _func_done; //message array empty
+-			}
++	r_entity *reader;
++	size_t len;
++	int idx, ret = READER_ERROR_EMPTY;
+ 
+-			m_pr(LTYPE_COC,
+-			     "cameramsger_read find message curr-tid:%d c_msger_dev.readers[idx]_info pid:%d file:%p.\n",
+-			     current->pid, reader->tgid, reader->fp);
+-
+-			len = (length < MSG_LEN_MAX) ? length : MSG_LEN_MAX;
+-			ret = copy_to_user(
+-				buff, &(reader->msgs[reader->front].data), len);
+-
+-			if (ret == 0) {
+-				ret = strnlen(
+-					&(reader->msgs[reader->front].data[0]),
+-					len);
+-			} else if (ret > 0) {
+-				ret = READER_ERROR_COPY_TO_USER_FAILED;
+-			}
+-
+-			m_pr(LTYPE_COC,
+-			     "cameramsger_read message(msg-idx:%d) read finish, mssage:%s, len:%d, ret:%d, message_len:%lu\n",
+-			     reader->front,
+-			     &(reader->msgs[reader->front]).data[0], len, ret,
+-			     strnlen(&(reader->msgs[reader->front].data[0]),
+-				     len));
+-
+-			reader->front = (reader->front + 1) % MSG_COUNT_MAX;
+-_func_done:
+-			mutex_unlock(&c_msger_dev.g_lock);
+-			return ret;
+-		}
++	if (!length)
++		return 0;
++	if (!cameramsger_is_ready())
++		return -ENODEV;
++	mutex_lock(&c_msger_dev.g_lock);
++	idx = find_reader_by_fp(fp);
++	if (!(READ_ONCE(msger_siwtches) & COC_ENABLE) || idx == READER_COUNT_MAX)
++		goto out;
++	reader = &c_msger_dev.readers[idx];
++	if (current->tgid != reader->tgid || reader->front == reader->rear)
++		goto out;
++	len = strnlen(reader->msgs[reader->front].data, MSG_LEN_MAX);
++	if (length < len) {
++		ret = -EMSGSIZE;
++		goto out;
+ 	}
+-	//check submodules
+-	len_submodules = ARRAY_SIZE(submodules);
+-	for (idx = 0; idx < len_submodules; idx++) {
+-		if (submodules[idx].read != NULL) {
+-			ret = submodules[idx].read(fp, buff, length, &hit);
+-			if (hit)
+-				return ret;
+-		}
++	/* Keep complete records queued after short reads or user-copy faults. */
++	if (copy_to_user(buff, reader->msgs[reader->front].data,
++			 min_t(size_t, length, len + 1))) {
++		ret = READER_ERROR_COPY_TO_USER_FAILED;
++		goto out;
+ 	}
++	reader->front = (reader->front + 1) % MSG_COUNT_MAX;
++	ret = len;
++out:
++	mutex_unlock(&c_msger_dev.g_lock);
+ 	return ret;
+ }
+ 
+ static int switch_update(struct file *fp, char *buff, int length)
+ {
+-	int idx = 0;
+-	int v_swh = 0;
+-	char *token = NULL;
+-	char *rest = buff;
++	unsigned int value;
++	int ret;
+ 
+-	if (buff[3] != '|')
++	if (length < 5 || buff[3] != '|' || kstrtouint(buff + 4, 10, &value) ||
++	    (value & ~(COC_ENABLE | SCD_ENABLE | PID_ENABLE | BID_ENABLE)))
+ 		return WRITE_ERROR_FORMAT_INVALID;
+-
+-	while ((token = strsep(&rest, SPLIT_DELIM)) != NULL) {
+-		if (idx > 1)
+-			break;
+-		if (idx == 1 && !kstrtoint(token, 10, &v_swh)) {
+-			m_pr(LTYPE_COC, "%s v_swh:%d msger_siwtches_0x%x\n",
+-			     __func__, v_swh, msger_siwtches);
+-			msger_siwtches |= v_swh;
+-			msger_siwtches &= v_swh;
+-			m_pr(LTYPE_COC,
+-			     "%s v_swh:%d v_swh_0x%x msger_siwtches_0x%x\n",
+-			     __func__, v_swh, v_swh, msger_siwtches);
+-		}
+-		idx++;
++	if (value & SCD_ENABLE) {
++		ret = cam_sched_enable();
++		if (ret)
++			return ret;
+ 	}
++	WRITE_ONCE(msger_siwtches, value);
+ 	return length;
+ }
++
+ /*Acquires c_msger_dev.g_lock before invoking reg_reader*/
+ static int reg_reader(struct file *fp, char *buff, int length)
+ {
+@@ -319,18 +242,18 @@ static int reg_reader(struct file *fp, char *buff, int length)
+ 	     &buff[4]);
+ 
+ 	//check exist
++	if (find_reader_by_fp(fp) < READER_COUNT_MAX)
++		return CREATE_READER_ERROR_EXIST;
+ 	reader_idx = find_reader_by_name_or_tgid(&buff[4], current->tgid);
+ 	m_pr(LTYPE_COC, "%s reader_already_registed reader_idx:%d\n", __func__,
+ 	     reader_idx);
+-	if (reader_idx && reader_idx < READER_COUNT_MAX) {
++	if (reader_idx < READER_COUNT_MAX)
+ 		return CREATE_READER_ERROR_EXIST;
+-	}
+ 
+ 	//check have space
+ 	reader_idx = find_new_reader_idx();
+-	if (reader_idx && reader_idx >= READER_COUNT_MAX) {
++	if (reader_idx >= READER_COUNT_MAX)
+ 		return CREATE_READER_ERROR_NOSPACE;
+-	}
+ 	//add reader
+ 	reader = &(c_msger_dev.readers[reader_idx]);
+ 	reader->fp = fp;
+@@ -354,6 +277,8 @@ static int add_message(int reader_idx, m_item *item)
+ 	if (reader_idx < 0 || reader_idx >= READER_COUNT_MAX)
+ 		return WRITE_ERROR_NO_MSG_SPACE;
+ 	reader = &(c_msger_dev.readers[reader_idx]);
++	if (!reader->used)
++		return WRITE_ERROR_NO_RECEVER;
+ 
+ 	rear = (reader->rear + 1) % MSG_COUNT_MAX;
+ 	if (rear == reader->front) {
+@@ -372,60 +297,45 @@ static int add_message(int reader_idx, m_item *item)
+ /*Acquires c_msger_dev.g_lock before invoking snd_message*/
+ static int snd_message(char *buff, int length)
+ {
+-	int i = 0;
+-	int j = 0;
+-	int reader_idx = -1;
+-	int at_pos[3] = { -1, -1, -1 }; //| position
++	m_item *item;
++	char receiver[READER_ID_MAX];
++	char *first, *second, *third;
++	size_t receiver_len, sender_len, message_len;
++	int idx, ret;
+ 
+-	m_item item;
+-	char *msg = NULL;
+-	char sender[READER_ID_MAX];
+-	char recever[READER_ID_MAX];
+-	memset(sender, 0, READER_ID_MAX);
+-	memset(recever, 0, READER_ID_MAX);
+-	memset(&item, 0, sizeof(m_item));
+-
+-	if (length <= 7)
++	if (length <= 7 || length >= MSG_LEN_MAX || strncmp(buff, "snd|", 4))
+ 		return WRITE_ERROR_FORMAT_INVALID;
+-	for (i = 0; i < length; i++) {
+-		if (buff[i] == '|')
+-			at_pos[j++] = i;
+-		if (j > 2)
+-			break;
+-	}
+-	m_pr(LTYPE_COC, "%s at position:%d - %d - %d\n", __func__, at_pos[0],
+-	     at_pos[1], at_pos[2]);
+-	if (at_pos[1] - at_pos[0] <= 1 || at_pos[2] - at_pos[1] <= 1)
++	first = buff + 3;
++	second = strchr(first + 1, '|');
++	if (!second)
+ 		return WRITE_ERROR_FORMAT_INVALID;
+-
+-	i = 0;
+-	for (j = at_pos[0] + 1; j < at_pos[1]; j++) {
+-		recever[i++] = buff[j];
+-	}
+-
+-	i = 0;
+-	for (j = at_pos[1] + 1; j < at_pos[2]; j++) {
+-		sender[i++] = buff[j];
+-	}
+-
+-	msg = (char *)&(buff[at_pos[1] + 1]);
+-	m_pr(LTYPE_COC, "%s sender:%s recever:%s msg:%s\n", __func__, sender,
+-	     recever, msg);
+-
+-	reader_idx = find_reader_by_name_or_tgid(recever, -1);
+-	if (reader_idx && reader_idx >= READER_COUNT_MAX)
++	third = strchr(second + 1, '|');
++	if (!third)
++		return WRITE_ERROR_FORMAT_INVALID;
++	receiver_len = second - first - 1;
++	sender_len = third - second - 1;
++	message_len = length - (second + 1 - buff);
++	if (!receiver_len || receiver_len >= READER_ID_MAX || !sender_len ||
++	    sender_len >= READER_ID_MAX || message_len >= MSG_LEN_MAX)
++		return WRITE_ERROR_FORMAT_INVALID;
++	memcpy(receiver, first + 1, receiver_len);
++	receiver[receiver_len] = '\0';
++	idx = find_reader_by_name_or_tgid(receiver, -1);
++	if (idx >= READER_COUNT_MAX)
+ 		return WRITE_ERROR_NO_RECEVER;
+-
+-	memcpy(item.from, sender, READER_ID_MAX);
+-	memcpy(item.to, recever, READER_ID_MAX);
+-	memcpy(item.data, msg, length - (at_pos[1] + 1));
+-	if (add_message(reader_idx, &item) == 0)
+-		return length;
+-
+-	return 0;
++	item = kzalloc(sizeof(*item), GFP_KERNEL);
++	if (!item)
++		return -ENOMEM;
++	memcpy(item->to, receiver, receiver_len);
++	memcpy(item->from, second + 1, sender_len);
++	/* Native readers receive sender|payload, including the sender field. */
++	memcpy(item->data, second + 1, message_len);
++	ret = add_message(idx, item);
++	kfree(item);
++	return ret ? ret : length;
+ }
+ 
+-static ssize_t cameramsger_write(struct file *fp, const char *buff,
++static ssize_t cameramsger_write(struct file *fp, const char __user *buff,
+ 				 size_t length, loff_t *ppos)
+ {
+ 	u8 hit = 0;
+@@ -434,21 +344,32 @@ static ssize_t cameramsger_write(struct file *fp, const char *buff,
+ 	int retv = WRITE_ERROR_UNSPORT_MSG_TYPE;
+ 
+ 	m_pr(LTYPE_COC, "%s len:%zu", __func__, length);
+-	if (length <= 4)
++	if (length <= 4 || length >= MSG_LEN_MAX)
+ 		return WRITE_ERROR_LEN_INVALID;
++	if (!cameramsger_is_ready())
++		return -ENODEV;
+ 	if (buff == NULL)
+ 		return WRITE_ERROR_BUF_ADDR_INVALID;
+ 
+ 	m_pr(LTYPE_COC, "%s current thread tid:%d uid:%d\n", __func__,
+-	     current->pid, from_kuid(current_user_ns(), current_uid()));
++	     current->pid, from_kuid(&init_user_ns, current_uid()));
+ 
+-	if (from_kuid(current_user_ns(), current_uid()) >= NORMAL_APP_MIN_UID) {
++	if (from_kuid(&init_user_ns, current_uid()) >= NORMAL_APP_MIN_UID)
+ 		return WRITE_ERROR_NO_PERMISSION;
+-	}
+ 
+ 	mutex_lock(&c_msger_dev.g_lock);
+ 	memset(&(c_msger_dev.d_cache), 0, sizeof(char) * MSG_LEN_MAX);
+ 	cpy_len = copy_from_user(&(c_msger_dev.d_cache[0]), buff, length);
++	if (cpy_len) {
++		retv = WRITE_ERROR_CPY_FROM_USER;
++		goto __func_done;
++	}
++	cpy_len = strnlen(c_msger_dev.d_cache, length);
++	if (cpy_len < length - 1) {
++		retv = WRITE_ERROR_FORMAT_INVALID;
++		goto __func_done;
++	}
++	length = cpy_len;
+ 
+ 	m_pr(LTYPE_COC, "%s: copy after:%s len:%zu cpy_len:%d", __func__,
+ 	     &(c_msger_dev.d_cache[0]), length, cpy_len);
+@@ -458,7 +379,7 @@ static ssize_t cameramsger_write(struct file *fp, const char *buff,
+ 		goto __func_done;
+ 	}
+ 
+-	switch_enable_and_exec(COC_ENABLE)
++	if (READ_ONCE(msger_siwtches) & COC_ENABLE)
+ 	{
+ 		if (strncmp(&(c_msger_dev.d_cache[0]), "reg", 3) == 0) {
+ 			retv = reg_reader(fp, &(c_msger_dev.d_cache[0]),
+@@ -488,6 +409,7 @@ __func_done:
+ 	mutex_unlock(&c_msger_dev.g_lock);
+ 	return retv;
+ }
++
+ static int cameramsger_release(struct inode *inode, struct file *filp)
+ {
+ 	int idx = 0;
+@@ -501,11 +423,10 @@ static int cameramsger_release(struct inode *inode, struct file *filp)
+ 	if (filp == NULL)
+ 		return RELEASE_ERROR_FILE_ADDR_INVALID;
+ 
+-	switch_enable_and_exec(COC_ENABLE)
+ 	{
+ 		mutex_lock(&c_msger_dev.g_lock);
+ 		reader_idx = find_reader_by_fp(filp);
+-		if (reader_idx && reader_idx < READER_COUNT_MAX) {
++		if (reader_idx < READER_COUNT_MAX) {
+ 			m_pr(LTYPE_COC,
+ 			     "cameramsger_release find reader:pid:%d tid:%d fp:%p name:%s:\n",
+ 			     c_msger_dev.readers[reader_idx].tgid,
+@@ -514,9 +435,9 @@ static int cameramsger_release(struct inode *inode, struct file *filp)
+ 			     c_msger_dev.readers[reader_idx].name);
+ 
+ 			rl_pid = c_msger_dev.readers[reader_idx].tgid;
+-			mutex_unlock(&c_msger_dev.g_lock);
+-
++			rcu_read_lock();
+ 			rl_task = get_pid_task(find_vpid(rl_pid), PIDTYPE_PID);
++			rcu_read_unlock();
+ 			if (rl_task == NULL) {
+ 				is_rl_task_die = true;
+ 			} else {
+@@ -536,7 +457,6 @@ static int cameramsger_release(struct inode *inode, struct file *filp)
+ 				put_task_struct(rl_task);
+ 			}
+ 
+-			mutex_lock(&c_msger_dev.g_lock);
+ 			if (is_rl_task_die) {
+ 				for (idx = 0; idx < READER_COUNT_MAX; idx++) {
+ 					if (!c_msger_dev.readers[idx].used ||
+@@ -571,8 +491,8 @@ static int cameramsger_release(struct inode *inode, struct file *filp)
+ 						     .tgid);
+ 				}
+ 			}
++			clear_r_entity_locked(reader_idx);
+ 			mutex_unlock(&c_msger_dev.g_lock);
+-			clear_r_entity(reader_idx);
+ 		} else {
+ 			mutex_unlock(&c_msger_dev.g_lock);
+ 		}
+@@ -592,6 +512,8 @@ static long cameramsger_ioctl(struct file *filp, unsigned int cmd,
+ {
+ 	u8 hit = 0;
+ 	int idx = 0, len_submodules = 0;
++	if (!cameramsger_is_ready())
++		return -ENODEV;
+ 	m_pr(LTYPE_COC, "%s: %u %lu\n", __func__, cmd, arg);
+ 	switch (cmd) {
+ 	case IOC_CMD_PID_DEBUG_ON:
+@@ -638,80 +560,60 @@ static long cameramsger_ioctl(struct file *filp, unsigned int cmd,
+ 	return 0;
+ }
+ 
++static const struct file_operations cameramsger_fops = {
++	.owner = THIS_MODULE,
++	.open = cameramsger_open,
++	.poll = cameramsger_poll,
++	.read = cameramsger_read,
++	.write = cameramsger_write,
++	.release = cameramsger_release,
++	.unlocked_ioctl = cameramsger_ioctl,
++};
++
+ static int __init cameramsger_init(void)
+ {
+-	int idx = 0, len_submodules = 0;
+-
+-	m_pr(LTYPE_COC, "mode init cameramsger_init begin\n");
+-	strcpy(c_msger_dev.name, "cam_msger");
+-	strcpy(c_msger_dev.version, "2.0");
++	int idx, ret;
+ 
+-	c_msger_dev.dev_fops.owner = THIS_MODULE,
+-	c_msger_dev.dev_fops.open = cameramsger_open,
+-	c_msger_dev.dev_fops.poll = cameramsger_poll,
+-	c_msger_dev.dev_fops.read = cameramsger_read,
+-	c_msger_dev.dev_fops.write = cameramsger_write,
+-	c_msger_dev.dev_fops.release = cameramsger_release,
+-	c_msger_dev.dev_fops.unlocked_ioctl = cameramsger_ioctl,
++	strscpy(c_msger_dev.name, "cam_msger", sizeof(c_msger_dev.name));
++	strscpy(c_msger_dev.version, "2.0", sizeof(c_msger_dev.version));
++	mutex_init(&c_msger_dev.g_lock);
++	for (idx = 0; idx < READER_COUNT_MAX; idx++)
++		init_waitqueue_head(&c_msger_dev.readers[idx].wait_queue);
+ 
+-	c_msger_dev.cammsger_major =
+-		register_chrdev(0, c_msger_dev.name, &(c_msger_dev.dev_fops));
++	ret = register_chrdev(0, c_msger_dev.name, &cameramsger_fops);
++	if (ret < 0)
++		return ret;
++	c_msger_dev.cammsger_major = ret;
+ 	c_msger_dev.cammsger_class = class_create(c_msger_dev.name);
+ 	if (IS_ERR(c_msger_dev.cammsger_class)) {
+-		unregister_chrdev(c_msger_dev.cammsger_major, c_msger_dev.name);
+-		pr_warn("Failed to create class.\n");
+-		return PTR_ERR(c_msger_dev.cammsger_class);
++		ret = PTR_ERR(c_msger_dev.cammsger_class);
++		goto unregister;
+ 	}
+-
+ 	c_msger_dev.devt = MKDEV(c_msger_dev.cammsger_major, 0);
+ 	c_msger_dev.device = device_create(c_msger_dev.cammsger_class, NULL,
+-					   c_msger_dev.devt, NULL,
+-					   c_msger_dev.name);
+-
+-	c_msger_dev.debug = 0;
+-	c_msger_dev.r_entity_count = 0;
+-	memset(&(c_msger_dev.d_cache), 0, sizeof(char) * MSG_LEN_MAX);
+-	mutex_init(&c_msger_dev.g_lock);
+-
+-	for (idx = 0; idx < READER_COUNT_MAX; idx++) {
+-		c_msger_dev.readers[idx].pid = 0;
+-		c_msger_dev.readers[idx].tgid = 0;
+-		c_msger_dev.readers[idx].used = 0;
+-		c_msger_dev.readers[idx].rear = 0;
+-		c_msger_dev.readers[idx].front = 0;
+-		memset(&(c_msger_dev.readers[idx].name), 0,
+-		       sizeof(char) * READER_ID_MAX);
+-		memset(&(c_msger_dev.readers[idx].msgs), 0,
+-		       sizeof(m_item) * MSG_COUNT_MAX);
+-		init_waitqueue_head(&(c_msger_dev.readers[idx].wait_queue));
+-	}
+-
++					 c_msger_dev.devt, NULL, "%s", c_msger_dev.name);
+ 	if (IS_ERR(c_msger_dev.device)) {
+-		pr_err("error while trying to create %s\n", c_msger_dev.name);
+-		return -EINVAL;
++		ret = PTR_ERR(c_msger_dev.device);
++		goto destroy_class;
+ 	}
+-
+-	len_submodules = ARRAY_SIZE(submodules);
+-	for (idx = 0; idx < len_submodules; idx++) {
+-		if (submodules[idx].init != NULL)
+-			submodules[idx].init();
+-	}
+-
+-	m_pr(LTYPE_COC, "mode init sucesss\n");
++	/* No fallible initialization may follow permanent restricted hook registration. */
++	ret = cam_sched_init();
++	if (ret)
++		goto destroy_device;
++	/* Publish all initialized queues and permanent hook state to openers. */
++	smp_store_release(&msger_ready, true);
+ 	return 0;
++destroy_device:
++	device_destroy(c_msger_dev.cammsger_class, c_msger_dev.devt);
++destroy_class:
++	class_destroy(c_msger_dev.cammsger_class);
++unregister:
++	unregister_chrdev(c_msger_dev.cammsger_major, c_msger_dev.name);
++	return ret;
+ }
+ 
+-/*static void __exit cameramsger_exit(void)
+-{
+-    device_destroy(c_msger_dev.cammsger_class, c_msger_dev.devt);
+-    class_destroy(c_msger_dev.cammsger_class);
+-    unregister_chrdev(c_msger_dev.cammsger_major, c_msger_dev.name);
+-    mutex_destroy(&c_msger_dev.g_lock);
+-    unregister_trace_android_rvh_wake_up_new_task(m_wake_up_new_task, NULL);
+-}*/
+-
++/* Native resident module: restricted scheduler hooks cannot be unregistered. */
+ module_init(cameramsger_init);
+-//module_exit(cameramsger_exit);
+ MODULE_DESCRIPTION("camera messager device driver");
+ MODULE_LICENSE("GPL v2");
+ // END Camera_CameraOpt
+diff --git a/qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger.h b/qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger.h
+index 7676296..8a3bd32 100644
+--- a/qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger.h
++++ b/qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger.h
+@@ -71,9 +71,7 @@
+ 
+ extern unsigned int msger_siwtches;
+ 
+-#define switch_enable_and_exec(swh) if (msger_siwtches & swh)
+ 
+-#define switch_disable_and_exec(swh) if (!(msger_siwtches & swh))
+ 
+ typedef struct {
+ 	int used;
+@@ -102,7 +100,6 @@ typedef struct cammsger_dev {
+ 
+ 	dev_t devt;
+ 	struct device *device;
+-	struct file_operations dev_fops;
+ 
+ 	struct mutex g_lock; //global Lock
+ 	int r_entity_count;
+@@ -112,7 +109,7 @@ typedef struct cammsger_dev {
+ 	char d_cache[MSG_LEN_MAX];
+ } cammsger_dev;
+ 
+-typedef void (*init_f)(void);
++typedef int (*init_f)(void);
+ typedef int (*write_f)(struct file *fp, char *data, int length, u8 *hit);
+ typedef int (*read_f)(struct file *fp, char __user *buff, int length, u8 *hit);
+ typedef void (*release_f)(struct inode *inode, struct file *filp);
+diff --git a/qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger_common.c b/qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger_common.c
+index b35a9c7..57fb3c4 100644
+--- a/qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger_common.c
++++ b/qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger_common.c
+@@ -2,75 +2,47 @@
+ #include "cam_msger_common.h"
+ #include <linux/string_helpers.h>
+ #include <linux/pid.h>
++#include <linux/sched/signal.h>
+ 
+ #define PID_ARRAY_SIZE 10
+ 
+ int find_pid_cmdline(char *cmdline)
+ {
+-	struct task_struct *task = NULL;
+-
+-	int ret_pid = -1;
+-	int idx = 0;
+-	int cmdline_len = 0;
+-	int pids[PID_ARRAY_SIZE] = { -1 };
+-	char *tmp_cmdline = NULL;
+-
+-	if (cmdline == NULL)
+-		return ret_pid;
+-
+-	cmdline_len = strnlen(cmdline, CMDLINE_MAX_LEN) - 1;
+-	if (cmdline_len <= 0)
+-		return ret_pid;
+-
+-	m_pr(LTYPE_COC, "[%s] cmdline:%s cmdline_len:%d\n", __func__, cmdline,
+-	     cmdline_len);
+-	if (tasklist_empty())
+-		return ret_pid;
++	struct task_struct *task, *tasks[PID_ARRAY_SIZE];
++	char comm[TASK_COMM_LEN], *candidate;
++	size_t length;
++	int count = 0, idx, ret = -1;
++
++	if (!cmdline)
++		return -1;
++	length = strnlen(cmdline, CMDLINE_MAX_LEN);
++	if (!length || length == CMDLINE_MAX_LEN)
++		return -1;
++	if (cmdline[length - 1] == '\n')
++		length--;
++	if (!length)
++		return -1;
+ 	rcu_read_lock();
+ 	for_each_process(task) {
+-		if (task == NULL || task->tasks.next == NULL ||
+-		    list_empty(&task->tasks))
++		if (count == PID_ARRAY_SIZE)
+ 			break;
+-		if (task->pid != task->tgid)
++		get_task_comm(comm, task);
++		if (length < TASK_COMM_LEN && strlen(comm) > length)
+ 			continue;
+-		if (cmdline_len < TASK_COMM_LEN &&
+-		    strnlen(task->comm, TASK_COMM_LEN) > cmdline_len)
++		if (!strstr(cmdline, comm))
+ 			continue;
+-
+-		if (idx >= PID_ARRAY_SIZE)
+-			break;
+-
+-		if (strstr(cmdline, task->comm) != NULL) {
+-			pids[idx++] = task->tgid;
+-			m_pr(LTYPE_COC, "[%s] cmdline:%s idx:%d pid:%d\n",
+-			     __func__, task->comm, (idx - 1), pids[idx - 1]);
+-		}
++		get_task_struct(task);
++		tasks[count++] = task;
+ 	}
+ 	rcu_read_unlock();
+-	m_pr(LTYPE_COC, "[%s] cmdline_len:%d idx:%d\n", __func__, cmdline_len,
+-	     idx);
+-	for (idx = 0; idx < PID_ARRAY_SIZE; idx++) {
+-		if (pids[idx] > 0) {
+-			task = get_pid_task(find_vpid(pids[idx]), PIDTYPE_PID);
+-			if (!task)
+-				continue;
+-			tmp_cmdline =
+-				kstrdup_quotable_cmdline(task, GFP_KERNEL);
+-			m_pr(LTYPE_COC,
+-			     "[%s] tm_cmdline:%s cmdline:%s camdline_len:%d strncmp:%d\n",
+-			     __func__, tmp_cmdline, cmdline, cmdline_len,
+-			     strncmp(tmp_cmdline, cmdline, cmdline_len));
+-			if (strncmp(tmp_cmdline, cmdline, cmdline_len) == 0) {
+-				ret_pid = task->tgid;
+-				kfree(tmp_cmdline);
+-				put_task_struct(task);
+-				break;
+-			}
+-			kfree(tmp_cmdline);
+-			put_task_struct(task);
++	for (idx = 0; idx < count; idx++) {
++		if (ret < 0) {
++			candidate = kstrdup_quotable_cmdline(tasks[idx], GFP_KERNEL);
++			if (candidate && !strncmp(candidate, cmdline, length))
++				ret = tasks[idx]->tgid;
++			kfree(candidate);
+ 		}
++		put_task_struct(tasks[idx]);
+ 	}
+-
+-	return ret_pid;
++	return ret;
+ }
+-// END Camera_CameraOpt
+diff --git a/qcom/opensource/camera-kernel/drivers/cam_msger/cam_pid.c b/qcom/opensource/camera-kernel/drivers/cam_msger/cam_pid.c
+index 042f6dc..658c782 100644
+--- a/qcom/opensource/camera-kernel/drivers/cam_msger/cam_pid.c
++++ b/qcom/opensource/camera-kernel/drivers/cam_msger/cam_pid.c
+@@ -21,7 +21,8 @@ int get_tgid_by_cmdline(struct file *fp, char *buff, int length, u8 *hit)
+ 		return WRITE_ERR_CMD_LIENE_INVALID;
+ 
+ 	*hit = 0;
+-	switch_disable_and_exec(PID_ENABLE) return -1;
++	if (!(READ_ONCE(msger_siwtches) & PID_ENABLE))
++		return -1;
+ 	if (strncmp(buff, "ctp", 3) == 0)
+ 		*hit = 1;
+ 	if (!(*hit))
+diff --git a/qcom/opensource/camera-kernel/drivers/cam_msger/cam_sched.c b/qcom/opensource/camera-kernel/drivers/cam_msger/cam_sched.c
+index 2052b33..2dcd3e8 100644
+--- a/qcom/opensource/camera-kernel/drivers/cam_msger/cam_sched.c
++++ b/qcom/opensource/camera-kernel/drivers/cam_msger/cam_sched.c
+@@ -14,392 +14,240 @@
+ #define WRITE_ERR_CSCHED_MALLOC_FAILED -2004
+ #define WRITE_ERR_KERL_ALLOC_FAILE -2005
+ 
+-static struct cam_sched_data *csdata = NULL;
++/* Published configurations are immutable; the messenger serializes writers. */
++static struct cam_sched_data __rcu *csdata;
++static unsigned int registered_hooks;
++static bool sched_ready;
+ 
+ static void sched_dump(void)
+ {
+-	int i = 0;
+-	struct cam_sched_data *csdata_bp;
+-	printk(KERN_INFO "struct cam_sched_data[csdata]\n");
+-	if (csdata == NULL)
+-		return;
++	struct cam_sched_data *data;
++	int i;
++
+ 	rcu_read_lock();
+-	csdata_bp = rcu_dereference(csdata);
+-	printk(KERN_INFO "offset:%d\n", csdata_bp->offset);
+-	printk(KERN_INFO "ctl_cpus:%*pbl\n",
+-	       cpumask_pr_args(&(csdata_bp->ctl_cpus)));
+-	printk(KERN_INFO "CPU-flags:\n");
+-	for (i = 0; i < CPU_NR; i++) {
+-		printk(KERN_INFO "cpu:%d flag:%d\n", i, csdata_bp->flag[i]);
+-	}
+-	printk(KERN_INFO "The PID of the managed thread:\n");
+-	for (i = 0; i < MONITOR_MAX_PID; i++) {
+-		if (csdata_bp->pids[i] > 0) {
+-			printk(KERN_INFO "i:%d %d\n", i, csdata_bp->pids[i]);
+-		}
+-	}
++	data = rcu_dereference(csdata);
++	if (!data)
++		goto out;
++	pr_info("camera scheduler mask: %*pbl\n", cpumask_pr_args(&data->ctl_cpus));
++	for (i = 0; i < data->offset; i++)
++		pr_info("camera scheduler pid: %d\n", data->pids[i]);
++out:
+ 	rcu_read_unlock();
+ }
+-static void clear_cam_sched_data_entity(struct cam_sched_data *item)
+-{
+-	if (item == NULL)
+-		return;
+-	item->offset = 0;
+-	cpumask_clear(&(item->ctl_cpus));
+-	memset(&(item->pids), 0, sizeof(pid_t) * MONITOR_MAX_PID);
+-	memset(&(item->flag[0]), TISOT_DEFAULT, sizeof(u8) * CPU_NR);
+-}
+-void cam_sched_ioctl(struct file *filp, unsigned int cmd, unsigned long arg,
+-		     u8 *hit)
++
++void cam_sched_ioctl(struct file *filp, unsigned int cmd, unsigned long arg, u8 *hit)
+ {
+-	if (cmd != IOC_CMD_SCHED_DUMP)
+-		return;
+-	sched_dump();
+-	*hit = 1;
++	if (cmd == IOC_CMD_SCHED_DUMP) {
++		sched_dump();
++		*hit = 1;
++	}
+ }
++
+ int cam_sched_w_pids(struct file *fp, char *buff, int length, u8 *hit)
+ {
+-	int i = 0;
+-	int j = 0;
+-	int idx = 0;
+-	int cpu = 0;
+-	int cpumask = 0;
+-	int token_len = 0;
+-	int tisot_flag = TISOT_NEVERALLOW;
+-	char *token = NULL;
+-	char *rest = buff;
+-
+-	u8 offset = 0;
++	struct cam_sched_data *data, *old;
++	char *rest = buff, *token;
+ 	pid_t pids[MONITOR_MAX_PID] = { 0 };
+-	int pid_tmp = -1;
+-
+-	cpumask_t ctl_cpus;
+-
+-	struct cam_sched_data *csdata_new = NULL;
+-	struct cam_sched_data *csdata_bp = NULL;
+-
+-	if (buff == NULL)
+-		return WRITE_ERR_USR_BUFF_NULL;
+-
+-	m_pr(LTYPE_SCHED, "[%s] buff:%s len:%d \n", __func__, buff, length);
++	unsigned int mask;
++	int flag, count = 0, pid, cpu, i, j;
+ 
+ 	*hit = 0;
+-	switch_disable_and_exec(SCD_ENABLE) return -1;
+-	if (strncmp(buff, "ctl", 3) == 0)
+-		*hit = 1;
+-	if (!(*hit))
++	if (!buff)
++		return WRITE_ERR_USR_BUFF_NULL;
++	if (!(READ_ONCE(msger_siwtches) & SCD_ENABLE) || strncmp(buff, "ctl|", 4))
+ 		return -1;
+-
+-	if (length <= WRITE_CONTENT_MIN_LEN)
+-		return WRITE_ERR_CONT_2_SHORT;
+-	if (length >= WRITE_CONTENT_MAX_LEN)
+-		return WRITE_ERR_FORMAT_INVALID;
+-	if (strstr(buff, SPLIT_DELIM) == NULL)
++	*hit = 1;
++	if (length <= WRITE_CONTENT_MIN_LEN || length >= WRITE_CONTENT_MAX_LEN)
+ 		return WRITE_ERR_FORMAT_INVALID;
+-
+-	while ((token = strsep(&rest, SPLIT_DELIM)) != NULL) {
+-		m_pr(LTYPE_SCHED,
+-		     "[%s] idx:%d token:%s sizeof_token:%lu rest:%s \n",
+-		     __func__, idx, token, strnlen(token, CMDLINE_MAX_LEN),
+-		     rest);
+-		if (offset >= MONITOR_MAX_PID)
+-			break;
+-		if (idx == 1) {
+-			if (kstrtoint(token, 10, &cpumask))
+-				return WRITE_ERR_CPUMASK_INVALID;
+-			m_pr(LTYPE_SCHED, "[%s] cpumask:%d \n", __func__,
+-			     cpumask);
+-			if (cpumask > 255)
+-				return WRITE_ERR_CPUMASK_INVALID;
+-			if (cpumask == 0)
+-				break;
+-			goto __continue__;
+-		}
+-		if (idx == 2) {
+-			m_pr(LTYPE_SCHED, "[%s] token_len:%lu, %lu, %lu \n",
+-			     __func__, strlen(token), strlen(TISOT_ALLOW_STR),
+-			     strlen(TISOT_NRALLOW_STR));
+-			if (strnlen(token, TISOT_STR_LEN_MAX) >=
+-				    strlen(TISOT_ALLOW_STR) &&
+-			    strncmp(token, TISOT_ALLOW_STR,
+-				    strlen(TISOT_ALLOW_STR)) == 0) {
+-				tisot_flag = TISOT_ALLOW;
+-				goto __continue__;
+-			}
+-			if (strnlen(token, TISOT_STR_LEN_MAX) >=
+-				    strlen(TISOT_NRALLOW_STR) &&
+-			    strncmp(token, TISOT_NRALLOW_STR,
+-				    strlen(TISOT_NRALLOW_STR)) == 0) {
+-				tisot_flag = TISOT_NEVERALLOW;
+-				goto __continue__;
+-			}
+-			m_pr(LTYPE_SCHED, "[%s] tisot_flag:%X\n", __func__,
+-			     tisot_flag);
+-			break;
+-		}
+-		if (idx > 2) {
+-			token_len = strnlen(token, CMDLINE_MAX_LEN) - 1;
+-			if (token_len <= 0)
+-				goto __continue__;
+-			if ((pid_tmp = find_pid_cmdline(token)) < 0) {
+-				m_pr(LTYPE_SCHED, "[%s] token:%s pid:%d \n",
+-				     __func__, token, pid_tmp);
+-				goto __continue__;
+-			}
+-			m_pr(LTYPE_SCHED, "[%s] token:%s pid:%d \n", __func__,
+-			     token, pid_tmp);
+-			pids[offset++] = pid_tmp;
+-		}
+-__continue__:
+-		idx++;
+-	}
+-
+-	if (offset != 0) {
+-		for (i = 0; i < offset - 1; i++) {
+-			for (j = i + 1; j < offset; j++) {
+-				if (pids[i] < pids[j]) {
+-					pids[i] ^= pids[j];
+-					pids[j] ^= pids[i];
+-					pids[i] ^= pids[j];
+-				}
+-			}
++	strsep(&rest, SPLIT_DELIM);
++	token = strsep(&rest, SPLIT_DELIM);
++	if (!token || kstrtouint(token, 10, &mask) || mask >= BIT(CPU_NR))
++		return WRITE_ERR_CPUMASK_INVALID;
++	flag = TISOT_DEFAULT;
++	if (mask) {
++		token = strsep(&rest, SPLIT_DELIM);
++		if (token && sysfs_streq(token, TISOT_ALLOW_STR))
++			flag = TISOT_ALLOW;
++		else if (token && sysfs_streq(token, TISOT_NRALLOW_STR))
++			flag = TISOT_NEVERALLOW;
++		else
++			return WRITE_ERR_FORMAT_INVALID;
++		while ((token = strsep(&rest, SPLIT_DELIM))) {
++			if (!*token)
++				continue;
++			if (count == MONITOR_MAX_PID)
++				return WRITE_ERR_FORMAT_INVALID;
++			pid = find_pid_cmdline(token);
++			if (pid > 0)
++				pids[count++] = pid;
+ 		}
+ 	}
+-
+-	csdata_new = kmalloc(sizeof(struct cam_sched_data), GFP_KERNEL);
+-	if (csdata_new == NULL) {
++	for (i = 0; i < count; i++)
++		for (j = i + 1; j < count; j++)
++			if (pids[i] < pids[j])
++				swap(pids[i], pids[j]);
++	data = kzalloc(sizeof(*data), GFP_KERNEL);
++	if (!data)
+ 		return WRITE_ERR_CSCHED_MALLOC_FAILED;
+-	}
+-
+-	clear_cam_sched_data_entity(csdata_new);
+-
+-	if (cpumask != 0) {
+-		for_each_possible_cpu(cpu) {
+-			if (cpumask & (1 << cpu)) {
+-				cpumask_set_cpu(cpu, &ctl_cpus);
+-				csdata_new->flag[cpu] = tisot_flag;
+-			}
++	for (cpu = 0; cpu < CPU_NR; cpu++) {
++		if (!(mask & BIT(cpu)))
++			continue;
++		if (cpu >= nr_cpu_ids || !cpu_possible(cpu)) {
++			kfree(data);
++			return WRITE_ERR_CPUMASK_INVALID;
+ 		}
+-		memcpy(&(csdata_new->pids[0]), &(pids[0]),
+-		       sizeof(pid_t) * MONITOR_MAX_PID);
+-		csdata_new->offset = offset;
+-		cpumask_copy(&(csdata_new->ctl_cpus), &ctl_cpus);
+-		m_pr(LTYPE_SCHED, "[%s] ctl_cpus:%*pbl \n", __func__,
+-		     cpumask_pr_args(&ctl_cpus));
++		cpumask_set_cpu(cpu, &data->ctl_cpus);
++		data->flag[cpu] = flag;
+ 	}
+-
+-	csdata_bp = csdata;
+-	rcu_assign_pointer(csdata, csdata_new);
++	memcpy(data->pids, pids, sizeof(pids));
++	data->offset = count;
++	old = rcu_replace_pointer(csdata, data, true);
+ 	synchronize_rcu();
+-	kfree(csdata_bp);
++	kfree(old);
+ 	return length;
+ }
+-static bool effect_cpu_action(struct task_struct *p, int cpu, u8 *flag,
+-			      bool *ctl_proc, int *offset)
+-{
+-	bool ret = false;
+-	int i = 0;
+-	pid_t pids_tmp[MONITOR_MAX_PID] = { 0 };
+-
+-	if (!p || p->mm == NULL || !cpu_active(cpu) || p->nr_cpus_allowed <= 2)
+-		return ret;
+-
+-	rcu_read_lock();
+-	if (rcu_dereference(csdata)->flag[cpu] == TISOT_DEFAULT) {
+-		rcu_read_unlock();
+-		return ret;
+-	}
+-	*flag = rcu_dereference(csdata)->flag[cpu];
+-	*offset = rcu_dereference(csdata)->offset;
+-	memcpy(&(pids_tmp[0]), &(rcu_dereference(csdata)->pids[0]),
+-	       sizeof(pid_t) * MONITOR_MAX_PID);
+-	rcu_read_unlock();
+-
+-	if (*offset == 0) {
+-		*ctl_proc = true;
+-		ret = true;
+-		goto __func_done__;
+-	}
+-
+-	if ((*flag & TISOT_NEVERALLOW)) {
+-		if (p->tgid > pids_tmp[0] || p->tgid < pids_tmp[*offset - 1])
+-			goto __func_done__;
+-		for (i = 0; i < *offset; i++) {
+-			if (p->tgid == pids_tmp[i]) {
+-				*ctl_proc = true;
+-				ret = true;
+-				goto __func_done__;
+-			}
+-		}
+-	}
+ 
+-	if ((*flag & TISOT_ALLOW)) {
+-		ret = true;
+-		if (p->tgid > pids_tmp[0] || p->tgid < pids_tmp[*offset - 1])
+-			goto __func_done__;
+-		for (i = 0; i < *offset; i++) {
+-			if (p->tgid == pids_tmp[i]) {
+-				*ctl_proc = true;
+-				ret = false;
+-				goto __func_done__;
+-			}
+-		}
+-	}
+-
+-__func_done__:
+-	m_pr(LTYPE_SCHED, "[%s] %s:%d cpu:%d ret:%d \n", __func__, p->comm,
+-	     p->pid, cpu, ret);
+-	return ret;
++/* Never turn an existing core-scheduler rejection into an allowance. */
++static bool effect_cpu_action(const struct cam_sched_data *data,
++			      struct task_struct *p, int cpu)
++{
++	cpumask_t fallback;
++	bool listed = false;
++	int i;
++
++	if (!data || !p || !p->mm || cpu < 0 || cpu >= CPU_NR || cpu >= nr_cpu_ids ||
++	    !cpu_active(cpu) || p->nr_cpus_allowed <= 2 || !data->flag[cpu])
++		return false;
++	/* Keep a runnable CPU when the task affinity is entirely controlled. */
++	cpumask_andnot(&fallback, p->cpus_ptr, &data->ctl_cpus);
++	cpumask_and(&fallback, &fallback, cpu_active_mask);
++	if (cpumask_empty(&fallback))
++		return false;
++	if (!data->offset)
++		return true;
++	for (i = 0; i < data->offset; i++)
++		if (data->pids[i] == p->tgid)
++			listed = true;
++	return data->flag[cpu] == TISOT_ALLOW ? !listed : listed;
+ }
+-static void filter_cpu(struct task_struct *p, int prev_cpu, int *cpu,
+-		       bool ctl_proc, int flag, int offset)
++
++static void filter_cpu(const struct cam_sched_data *data, struct task_struct *p,
++		       int prev_cpu, int *cpu)
+ {
+-	int cpuidx = -1;
+-	bool is_ctl = false;
+-	cpumask_t allowed_cpus;
++	cpumask_t allowed;
+ 
+-	if (p == NULL)
++	cpumask_andnot(&allowed, p->cpus_ptr, &data->ctl_cpus);
++	cpumask_and(&allowed, &allowed, cpu_active_mask);
++	if (cpumask_empty(&allowed))
+ 		return;
+-	cpumask_clear(&(allowed_cpus));
+-
+-	m_pr(LTYPE_SCHED, "[%s] %s-%d cpu:%d ctl_proc:%d flag:%d offset:%d \n",
+-	     __func__, p->comm, p->pid, *cpu, ctl_proc, flag, offset);
++	if (prev_cpu >= 0 && prev_cpu < nr_cpu_ids && cpumask_test_cpu(prev_cpu, &allowed))
++		*cpu = prev_cpu;
++	else
++		*cpu = cpumask_first(&allowed);
++}
+ 
++static void xmi_rvh_is_cpu_allowed(void *unused, struct task_struct *p, int cpu,
++				   bool *allowed)
++{
++	if (!READ_ONCE(sched_ready) || !(READ_ONCE(msger_siwtches) & SCD_ENABLE))
++		return;
+ 	rcu_read_lock();
+-	is_ctl = cpumask_test_cpu(prev_cpu,
+-				  &(rcu_dereference(csdata)->ctl_cpus));
+-	cpumask_andnot(&(allowed_cpus), p->cpus_ptr,
+-		       &(rcu_dereference(csdata)->ctl_cpus));
++	if (effect_cpu_action(rcu_dereference(csdata), p, cpu))
++		*allowed = false;
+ 	rcu_read_unlock();
++}
+ 
+-	m_pr(LTYPE_SCHED, "[%s] %s-%d cpu:%d allowed_cpus:%*pbl\n", __func__,
+-	     p->comm, p->pid, *cpu, cpumask_pr_args(&(allowed_cpus)));
++static void xmi_select_task_rq_fair(void *unused, struct task_struct *p,
++				    int prev_cpu, int sd_flag, int wake_flags, int *new_cpu)
++{
++	struct cam_sched_data *data;
+ 
+-	if (cpumask_empty(&(allowed_cpus)))
++	if (!READ_ONCE(sched_ready) || !(READ_ONCE(msger_siwtches) & SCD_ENABLE))
+ 		return;
+-	cpuidx = prev_cpu;
+-	if (is_ctl) {
+-		cpuidx = cpumask_any(&(allowed_cpus));
+-	}
+-	if (offset == 0 || (flag == TISOT_ALLOW && !ctl_proc) ||
+-	    (flag == TISOT_NEVERALLOW && ctl_proc)) {
+-		*cpu = cpuidx;
+-	}
++	rcu_read_lock();
++	data = rcu_dereference(csdata);
++	if (effect_cpu_action(data, p, *new_cpu))
++		filter_cpu(data, p, prev_cpu, new_cpu);
++	rcu_read_unlock();
+ }
+-static void xmi_rvh_is_cpu_allowed(void *unused, struct task_struct *p, int cpu,
+-				   bool *allowed)
+-{
+-	u8 flag = TISOT_DEFAULT;
+-	int offset = 0;
+-	bool ctl_proc = false;
+-
+-	switch_disable_and_exec(SCD_ENABLE) return;
+ 
+-	if (effect_cpu_action(p, cpu, &flag, &ctl_proc, &offset)) {
+-		if (offset == 0) {
+-			*allowed = false;
+-			return;
+-		}
+-		*allowed = true;
+-		if ((flag == TISOT_ALLOW && !ctl_proc) ||
+-		    (flag == TISOT_NEVERALLOW && ctl_proc)) {
+-			*allowed = false;
+-		}
+-		m_pr(LTYPE_SCHED, "[%s] %s-%d cpu:%d allowed:%d\n", __func__,
+-		     p->comm, p->pid, cpu, *allowed);
+-	}
+-}
+-static void xmi_rvh_select_task_rq_fair(void *unused, struct task_struct *p,
+-					int prev_cpu, int sd_flag,
+-					int wake_flags, int *new_cpu)
++static void xmi_can_migrate_task(void *unused, struct task_struct *p, int dst_cpu,
++				 int *can_migrate)
+ {
+-	u8 flag = TISOT_DEFAULT;
+-	int offset = 0;
+-	bool ctl_proc = false;
+-
+-	switch_disable_and_exec(SCD_ENABLE) return;
+-
+-	if (effect_cpu_action(p, *new_cpu, &flag, &ctl_proc, &offset)) {
+-		m_pr(LTYPE_SCHED, "[%s-begin] %s-%d prev_cpu:%d new_cpu:%d\n",
+-		     __func__, p->comm, p->pid, prev_cpu, *new_cpu);
+-		filter_cpu(p, prev_cpu, new_cpu, ctl_proc, flag, offset);
+-		if (*new_cpu == -1)
+-			*new_cpu = prev_cpu;
+-		m_pr(LTYPE_SCHED, "[%s-finish] %s-%d prev_cpu:%d new_cpu:%d\n",
+-		     __func__, p->comm, p->pid, prev_cpu, *new_cpu);
+-	}
++	if (!READ_ONCE(sched_ready) || !(READ_ONCE(msger_siwtches) & SCD_ENABLE))
++		return;
++	rcu_read_lock();
++	if (effect_cpu_action(rcu_dereference(csdata), p, dst_cpu))
++		*can_migrate = 0;
++	rcu_read_unlock();
+ }
+-static void xmi_can_migrate_task(void *unused, struct task_struct *p,
+-				 int dst_cpu, int *can_migrate)
+-{
+-	u8 flag = TISOT_DEFAULT;
+-	int offset = 0;
+-	bool ctl_proc = false;
+-
+-	switch_disable_and_exec(SCD_ENABLE) return;
+-
+-	if (effect_cpu_action(p, dst_cpu, &flag, &ctl_proc, &offset)) {
+-		m_pr(LTYPE_SCHED,
+-		     "[%s-begin] %s-%d dest_cpu:%d cam_migrate:%d ctl_proc:%d flag:%d\n",
+-		     __func__, p->comm, p->pid, dst_cpu, *can_migrate, ctl_proc,
+-		     flag);
+-		if (offset == 0) {
+-			*can_migrate = 0;
+-			goto __func_done_;
+-		}
+-		*can_migrate = 1;
+-		if (flag == TISOT_ALLOW && !ctl_proc) {
+-			*can_migrate = 0;
+-			goto __func_done_;
+-		}
+-		if (flag == TISOT_NEVERALLOW && ctl_proc) {
+-			*can_migrate = 0;
+-		}
+ 
+-__func_done_:
+-		m_pr(LTYPE_SCHED,
+-		     "[%s-finish] %s-%d dest_cpu:%d cam_migrate:%d\n", __func__,
+-		     p->comm, p->pid, dst_cpu, *can_migrate);
+-	}
+-}
+-static void xmi_sched_newidle_balance(void *unused, struct rq *this_rq,
+-				      struct rq_flags *rf, int *pulled_task,
+-				      int *done)
++static void xmi_newidle_balance(void *unused, struct rq *this_rq,
++				struct rq_flags *rf, int *pulled_task, int *done)
+ {
+-	unsigned int this_cpu = get_cpu();
+-	put_cpu();
+-
+-	switch_disable_and_exec(SCD_ENABLE) return;
++	struct cam_sched_data *data;
++	unsigned int cpu = raw_smp_processor_id();
+ 
+-	if (*pulled_task == 1)
+-		return; //qcom already balance and pull the task.
+-	rcu_read_lock();
+-	if (rcu_dereference(csdata)->flag[this_cpu] == TISOT_DEFAULT) {
+-		rcu_read_unlock();
++	if (!READ_ONCE(sched_ready) || !(READ_ONCE(msger_siwtches) & SCD_ENABLE) ||
++	    *pulled_task == 1 || cpu >= CPU_NR)
+ 		return;
+-	}
+-	*done = 1;
++	rcu_read_lock();
++	data = rcu_dereference(csdata);
++	if (data && data->flag[cpu] != TISOT_DEFAULT)
++		*done = 1;
+ 	rcu_read_unlock();
+-	m_pr(LTYPE_SCHED, "[%s] this-cpu:%d done:%d pulled_task:%d \n",
+-	     __func__, this_cpu, *done, *pulled_task);
+ }
+ 
+-void cam_sched_init(void)
++int cam_sched_enable(void)
+ {
+-	csdata = kmalloc(sizeof(struct cam_sched_data), GFP_KERNEL);
+-	if (csdata == NULL) {
+-		m_pr(LTYPE_SCHED, "[%s] struct xmi_cam_sched init failed.\n",
+-		     __func__);
+-		return;
+-	}
+-	clear_cam_sched_data_entity(csdata);
++	int ret;
++
++	/* Restricted hooks cannot be unregistered. Retry only missing registrations. */
++	if (!(registered_hooks & BIT(0))) {
++		ret = register_trace_android_rvh_is_cpu_allowed(xmi_rvh_is_cpu_allowed, NULL);
++		if (ret)
++			return ret;
++		registered_hooks |= BIT(0);
++	}
++	if (!(registered_hooks & BIT(1))) {
++		ret = register_trace_android_rvh_can_migrate_task(xmi_can_migrate_task, NULL);
++		if (ret)
++			return ret;
++		registered_hooks |= BIT(1);
++	}
++	if (!(registered_hooks & BIT(2))) {
++		ret = register_trace_android_rvh_select_task_rq_fair(xmi_select_task_rq_fair, NULL);
++		if (ret)
++			return ret;
++		registered_hooks |= BIT(2);
++	}
++	if (!(registered_hooks & BIT(3))) {
++		ret = register_trace_android_rvh_sched_newidle_balance(xmi_newidle_balance, NULL);
++		if (ret)
++			return ret;
++		registered_hooks |= BIT(3);
++	}
++	WRITE_ONCE(sched_ready, true);
++	return 0;
++}
+ 
+-	register_trace_android_rvh_is_cpu_allowed(xmi_rvh_is_cpu_allowed, NULL);
+-	register_trace_android_rvh_can_migrate_task(xmi_can_migrate_task, NULL);
+-	register_trace_android_rvh_select_task_rq_fair(
+-		xmi_rvh_select_task_rq_fair, NULL);
+-	register_trace_android_rvh_sched_newidle_balance(
+-		xmi_sched_newidle_balance, NULL);
+-	m_pr(LTYPE_SCHED, " %s finish. \n", __func__);
++int cam_sched_init(void)
++{
++	struct cam_sched_data *data;
++	int ret;
++
++	data = kzalloc(sizeof(*data), GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++	rcu_assign_pointer(csdata, data);
++	ret = cam_sched_enable();
++	if (ret && !registered_hooks) {
++		RCU_INIT_POINTER(csdata, NULL);
++		kfree(data);
++		return ret;
++	}
++	/* Keep resident callbacks valid after a partial failure. swh can retry. */
++	if (ret)
++		pr_err("camera scheduler hooks incomplete: %d; enable command may retry\n", ret);
++	return 0;
+ }
+-// END Camera_CameraOpt
+diff --git a/qcom/opensource/camera-kernel/drivers/cam_msger/cam_sched.h b/qcom/opensource/camera-kernel/drivers/cam_msger/cam_sched.h
+index 0adb1a3..4a704a0 100644
+--- a/qcom/opensource/camera-kernel/drivers/cam_msger/cam_sched.h
++++ b/qcom/opensource/camera-kernel/drivers/cam_msger/cam_sched.h
+@@ -31,7 +31,8 @@ struct cam_sched_data {
+ 	struct rcu_head rcu;
+ };
+ 
+-void cam_sched_init(void);
++int cam_sched_init(void);
++int cam_sched_enable(void);
+ int cam_sched_w_pids(struct file *fp, char *buff, int length, u8 *hit);
+ void cam_sched_ioctl(struct file *filp, unsigned int cmd, unsigned long arg,
+ 		     u8 *hit);

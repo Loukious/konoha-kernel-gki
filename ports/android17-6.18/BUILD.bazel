@@ -3506,6 +3506,36 @@ ddk_module(
     visibility = ["//visibility:public"],
 )
 
+ddk_headers(
+    name = "camera_aux_headers",
+    hdrs = ["qcom/opensource/camera-kernel/drivers/cam_log/cam_log.h", "qcom/opensource/camera-kernel/drivers/cam_msger/cam_binder.h", "qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger.h", "qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger_common.h", "qcom/opensource/camera-kernel/drivers/cam_msger/cam_pid.h", "qcom/opensource/camera-kernel/drivers/cam_msger/cam_sched.h"],
+    includes = ["qcom/opensource/camera-kernel/drivers/cam_log", "qcom/opensource/camera-kernel/drivers/cam_msger"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "cameralog",
+    srcs = ["qcom/opensource/camera-kernel/drivers/cam_log/cam_log.c"],
+    out = "cameralog.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":camera_aux_headers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "cameramsger",
+    srcs = ["qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger.c", "qcom/opensource/camera-kernel/drivers/cam_msger/cam_sched.c", "qcom/opensource/camera-kernel/drivers/cam_msger/cam_pid.c", "qcom/opensource/camera-kernel/drivers/cam_msger/cam_binder.c", "qcom/opensource/camera-kernel/drivers/cam_msger/cam_msger_common.c"],
+    out = "cameramsger.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":camera_aux_headers"],
+    visibility = ["//visibility:public"],
+)
+
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3759,6 +3789,8 @@ kernel_module_group(
         ":leds_qti_flash",
         ":msm_video",
         ":frpc_adsprpc",
+        ":cameralog",
+        ":cameramsger",
     ],
 )
 
