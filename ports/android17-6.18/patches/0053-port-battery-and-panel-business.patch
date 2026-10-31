@@ -1,0 +1,1665 @@
+--- a/drivers/power/supply/mca/mca_business/business_battery/mca_business_battery.c
++++ b/drivers/power/supply/mca/mca_business/business_battery/mca_business_battery.c
+@@ -43,8 +43,6 @@
+ #define MCA_LOG_TAG "mca_business_battery"
+ #endif
+ 
+-static struct business_battery *g_mca_business_battery;
+-
+ /*
+ static void battery_event_process_work(struct work_struct *work)
+ {
+@@ -68,7 +66,9 @@
+ 		power_supply_changed(battery->batt_psy_info->batt_psy);
+ 		break;
+ 	case MCA_EVENT_BATTERY_FAKE_POWER:
+-		battery->batt_psy_info->fake_power = *(int *)data;
++		if (!data)
++			return NOTIFY_BAD;
++		WRITE_ONCE(battery->batt_psy_info->fake_power, !!*(int *)data);
+ 		mca_log_err("reviced fake_power event %d ",
+ 			    battery->batt_psy_info->fake_power);
+ 		break;
+@@ -112,9 +112,9 @@
+ 	}
+ 
+ 	battery->batt_psy_info = business_battery_psy_init(battery->dev);
+-	if (!battery->batt_psy_info) {
++	if (IS_ERR(battery->batt_psy_info)) {
+ 		mca_log_err("Couldn't init battery psy\n");
+-		return -1;
++		return PTR_ERR(battery->batt_psy_info);
+ 	}
+ 
+ 	//INIT_WORK(&battery->event_process_work, battery_event_process_work);
+@@ -122,12 +122,10 @@
+ 	rc = mca_event_block_notify_register(MCA_EVENT_TYPE_BATTERY_INFO,
+ 					     &battery->batt_info_nb);
+ 	if (rc) {
+-		rc = -EPROBE_DEFER;
+ 		mca_log_err("register notify failed\n");
+ 		goto error;
+ 	}
+ 
+-	g_mca_business_battery = battery;
+ 	// business_battery_sysfs_create_files();
+ 
+ 	mca_log_err("probe ok");
+@@ -139,13 +137,13 @@
+ 	return rc;
+ }
+ 
+-static int business_battery_remove(struct platform_device *pdev)
++static void business_battery_remove(struct platform_device *pdev)
+ {
+-	//struct business_battery *battery = platform_get_drvdata(pdev);
++	struct business_battery *battery = platform_get_drvdata(pdev);
+ 
+-	//cancel_work_sync(&battery->event_process_work);
+-
+-	return 0;
++	mca_event_block_notify_unregister(MCA_EVENT_TYPE_BATTERY_INFO,
++					  &battery->batt_info_nb);
++	business_battery_psy_deinit(battery->batt_psy_info);
+ }
+ 
+ static void business_battery_shutdown(struct platform_device *pdev)
+--- a/drivers/power/supply/mca/mca_business/business_battery/mca_battery_psy.c
++++ b/drivers/power/supply/mca/mca_business/business_battery/mca_battery_psy.c
+@@ -1,101 +1,223 @@
+-/*
+ // SPDX-License-Identifier: GPL-2.0
+- * mca_battery_psy.c
+- *
+- * mca battery psy driver
+- *
+- * Copyright (c) 2023-2023 Xiaomi Technologies Co., Ltd.
+- *
+- * This software is licensed under the terms of the GNU General Public
+- * License version 2, as published by the Free Software Foundation, and
+- * may be copied, distributed, and modified under those terms.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+- * GNU General Public License for more details.
+- *
+- */
++/* Xiaomi MCA battery power_supply and battery thermal-zone interface. */
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/overflow.h>
++#include <linux/power_supply.h>
+ #include <linux/slab.h>
+-#include <linux/module.h>
+-#include <linux/kernel.h>
+-#include <linux/string.h>
+-#include <linux/delay.h>
+-#include <linux/device.h>
+-#include <linux/init.h>
+-#include <linux/of.h>
+-#include <linux/of_device.h>
+-#include <linux/power_supply.h>
+ #include <linux/thermal.h>
+-#include <linux/version.h>
+ #include <mca/common/mca_log.h>
+ #include <mca/platform/platform_buckchg_class.h>
+ #include <mca/strategy/strategy_fg_class.h>
+ #include "inc/mca_battery_psy.h"
+ 
+-#ifndef MCA_LOG_TAG
+-#define MCA_LOG_TAG "mca_battery_psy"
+-#endif
+-
+-static bool battery_psy_is_wls_available(struct batt_psy_info *info)
+-{
+-	if (!info->wls_psy)
+-		info->wls_psy = power_supply_get_by_name("wireless");
+-
+-	if (!info->wls_psy)
+-		return false;
+-
+-	return true;
+-}
+-
+-static bool battery_psy_is_usb_available(struct batt_psy_info *info)
+-{
+-	if (!info->usb_psy)
+-		info->usb_psy = power_supply_get_by_name("usb");
+-
+-	if (!info->usb_psy)
+-		return false;
+-
+-	return true;
+-}
+-
+-static int get_prop_batt_health(struct batt_psy_info *info,
+-				union power_supply_propval *val)
+-{
+-	int ret = 0;
+-
+-	ret = strategy_class_fg_get_health(&val->intval);
+-	if (ret) {
+-		val->intval = POWER_SUPPLY_HEALTH_GOOD;
+-		return 0;
+-	}
++static int battery_supply_property(const char *name,
++				   enum power_supply_property property,
++				   union power_supply_propval *value)
++{
++	struct power_supply *supply = power_supply_get_by_name(name);
++	int ret;
++
++	if (!supply)
++		return -ENODEV;
++	ret = power_supply_get_property(supply, property, value);
++	power_supply_put(supply);
++	return ret;
++}
++
++static int battery_scale_value(int ret, int value, int scale,
++			       union power_supply_propval *out)
++{
++	if (ret)
++		return ret;
++	if (check_mul_overflow(value, scale, &out->intval))
++		return -ERANGE;
+ 	return 0;
+ }
+ 
+-static int get_prop_batt_capacity_level(struct batt_psy_info *info,
+-					union power_supply_propval *val)
+-{
+-	union power_supply_propval pval = {
+-		0,
+-	};
+-
+-	power_supply_get_property(info->batt_psy, POWER_SUPPLY_PROP_CAPACITY,
+-				  &pval);
+-
+-	if (pval.intval == 0) {
+-		val->intval = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
+-		mca_log_info(
+-			"Trigger Android shutdown for CAPACITY_LEVEL_CRITICAL\n");
+-	} else if (pval.intval > 0 && pval.intval <= 20)
+-		val->intval = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
+-	else if (pval.intval > 20 && pval.intval <= 80)
+-		val->intval = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
+-	else if (pval.intval > 80 && pval.intval <= 99)
+-		val->intval = POWER_SUPPLY_CAPACITY_LEVEL_HIGH;
+-	else if (pval.intval == 100)
+-		val->intval = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
+-
++static int battery_capacity_level(int soc, union power_supply_propval *value)
++{
++	if (soc < 0)
++		return soc;
++	if (soc > 100)
++		return -ERANGE;
++	if (!soc)
++		value->intval = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
++	else if (soc <= 20)
++		value->intval = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
++	else if (soc <= 80)
++		value->intval = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
++	else if (soc < 100)
++		value->intval = POWER_SUPPLY_CAPACITY_LEVEL_HIGH;
++	else
++		value->intval = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
+ 	return 0;
++}
++
++static int battery_status(union power_supply_propval *value)
++{
++	union power_supply_propval usb = {}, wireless = {};
++	int ret, soc;
++
++	if (mca_get_named_client_vote("input_suspend", "micharge") > 0) {
++		value->intval = POWER_SUPPLY_STATUS_DISCHARGING;
++		return 0;
++	}
++	ret = battery_supply_property("usb", POWER_SUPPLY_PROP_ONLINE, &usb);
++	if (ret)
++		return ret;
++	if (!usb.intval) {
++		ret = battery_supply_property(
++			"wireless", POWER_SUPPLY_PROP_ONLINE, &wireless);
++		/* A wired-only system has no wireless power supply. */
++		if (ret && ret != -ENODEV)
++			return ret;
++	}
++	if (!usb.intval && !wireless.intval) {
++		value->intval = POWER_SUPPLY_STATUS_DISCHARGING;
++		return 0;
++	}
++	soc = strategy_class_fg_ops_get_soc();
++	if (soc < 0)
++		return soc;
++	if (soc > 100)
++		return -ERANGE;
++	value->intval =
++		soc == 100 && strategy_class_fg_ops_get_charging_done() ?
++			POWER_SUPPLY_STATUS_FULL :
++			POWER_SUPPLY_STATUS_CHARGING;
++	return 0;
++}
++
++/* The existing explicit factory event selects this mode; never a read fallback. */
++static int fake_batt_psy_get_prop(struct batt_psy_info *info,
++				  enum power_supply_property property,
++				  union power_supply_propval *value)
++{
++	int ret;
++
++	switch (property) {
++	case POWER_SUPPLY_PROP_PRESENT:
++		value->intval = 1;
++		return 0;
++	case POWER_SUPPLY_PROP_STATUS:
++		ret = battery_supply_property("usb", POWER_SUPPLY_PROP_ONLINE,
++					      value);
++		if (!ret)
++			value->intval = value->intval ?
++						POWER_SUPPLY_STATUS_CHARGING :
++						POWER_SUPPLY_STATUS_DISCHARGING;
++		return ret;
++	case POWER_SUPPLY_PROP_CHARGE_TYPE:
++		return platform_class_buckchg_ops_get_chg_type(
++			MAIN_BUCK_CHARGER, &value->intval);
++	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
++		return battery_capacity_level(15, value);
++	case POWER_SUPPLY_PROP_CAPACITY:
++		value->intval = 15;
++		return 0;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
++		value->intval = 3700000;
++		return 0;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		value->intval = -500000;
++		return 0;
++	case POWER_SUPPLY_PROP_TEMP:
++		value->intval = 250;
++		return 0;
++	default:
++		return -ENODATA;
++	}
++}
++
++static int batt_psy_get_prop(struct power_supply *psy,
++			     enum power_supply_property property,
++			     union power_supply_propval *value)
++{
++	struct batt_psy_info *info = power_supply_get_drvdata(psy);
++	int result = 0, ret;
++
++	if (!info || !value)
++		return -EINVAL;
++	if (READ_ONCE(info->fake_power))
++		return fake_batt_psy_get_prop(info, property, value);
++	ret = strategy_class_fg_ops_is_init_ok();
++	if (ret <= 0)
++		return ret < 0 ? ret : -ENODATA;
++	switch (property) {
++	case POWER_SUPPLY_PROP_STATUS:
++		return battery_status(value);
++	case POWER_SUPPLY_PROP_HEALTH:
++		return strategy_class_fg_get_health(&value->intval);
++	case POWER_SUPPLY_PROP_PRESENT:
++		ret = strategy_class_fg_is_chip_ok();
++		if (ret < 0)
++			return ret;
++		value->intval = !!ret;
++		return 0;
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++		ret = platform_class_buckchg_ops_get_input_curr_lmt(
++			MAIN_BUCK_CHARGER, &result);
++		return battery_scale_value(ret, result, 1000, value);
++	case POWER_SUPPLY_PROP_CHARGE_TYPE:
++		return platform_class_buckchg_ops_get_chg_type(
++			MAIN_BUCK_CHARGER, &value->intval);
++	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
++		return battery_capacity_level(strategy_class_fg_ops_get_soc(),
++					      value);
++	case POWER_SUPPLY_PROP_CAPACITY:
++		ret = strategy_class_fg_ops_get_soc();
++		if (ret < 0)
++			return ret;
++		if (ret > 100)
++			return -ERANGE;
++		value->intval = ret;
++		return 0;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
++		ret = strategy_class_fg_ops_get_voltage(&result);
++		return battery_scale_value(ret, result, 1000, value);
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
++		return battery_supply_property("usb", property, value);
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		return strategy_class_fg_ops_get_current(&value->intval);
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
++		return battery_supply_property(
++			"usb", POWER_SUPPLY_PROP_CURRENT_MAX, value);
++	case POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT:
++		ret = platform_class_buckchg_ops_get_term_curr(
++			MAIN_BUCK_CHARGER, &result);
++		return battery_scale_value(ret, result, 1000, value);
++	case POWER_SUPPLY_PROP_TEMP:
++		return strategy_class_fg_ops_get_temperature(&value->intval);
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		value->intval = POWER_SUPPLY_TECHNOLOGY_LIPO;
++		return 0;
++	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
++		return strategy_class_fg_get_rm(&value->intval);
++	case POWER_SUPPLY_PROP_CYCLE_COUNT:
++		return strategy_class_fg_ops_get_cyclecount(&value->intval);
++	case POWER_SUPPLY_PROP_CHARGE_FULL:
++		return strategy_class_fg_get_fcc(&value->intval);
++	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
++		return strategy_class_fg_get_dc(&value->intval);
++	case POWER_SUPPLY_PROP_MODEL_NAME: {
++		/* Publish an immutable device-owned copy, independent of FG teardown. */
++		guard(mutex)(&info->model_lock);
++		if (!info->model_valid) {
++			ret = strategy_class_fg_copy_model_name(
++				info->model_name, sizeof(info->model_name));
++			if (ret)
++				return ret;
++			info->model_valid = true;
++		}
++		value->strval = info->model_name;
++		return 0;
++	}
++	default:
++		return -ENODATA;
++	}
+ }
+ 
+ static enum power_supply_property batt_psy_props[] = {
+@@ -106,13 +228,10 @@
+ 	POWER_SUPPLY_PROP_CHARGE_TYPE,
+ 	POWER_SUPPLY_PROP_CAPACITY,
+ 	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
+-	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT,
+-	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT_MAX,
+ 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+ 	POWER_SUPPLY_PROP_VOLTAGE_MAX,
+ 	POWER_SUPPLY_PROP_CURRENT_NOW,
+ 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+-	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
+ 	POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT,
+ 	POWER_SUPPLY_PROP_TEMP,
+ 	POWER_SUPPLY_PROP_TECHNOLOGY,
+@@ -121,402 +240,115 @@
+ 	POWER_SUPPLY_PROP_CHARGE_FULL,
+ 	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+ 	POWER_SUPPLY_PROP_MODEL_NAME,
++	POWER_SUPPLY_PROP_VOLTAGE_OCV,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT_MAX,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
+ 	POWER_SUPPLY_PROP_TIME_TO_FULL_NOW,
+ 	POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW,
+-	POWER_SUPPLY_PROP_VOLTAGE_OCV,
+ };
+ 
+-#define BATT_SOC_DEFAULT 15
+-#define BATT_VOLTAGE_DEFAULT 3700000
+-#define BATT_CURRENT_DEFAULT -500000
+-#define BATT_TEMP_DEFAULT 250
+-
+-static int fake_batt_psy_get_prop(struct batt_psy_info *info,
+-				  enum power_supply_property psp,
+-				  union power_supply_propval *pval)
+-{
+-	int main_chg_type = 0;
+-
+-	switch (psp) {
+-	case POWER_SUPPLY_PROP_PRESENT:
+-		pval->intval = 1;
+-		break;
+-	case POWER_SUPPLY_PROP_STATUS:
+-		if (battery_psy_is_usb_available(info)) {
+-			power_supply_get_property(
+-				info->usb_psy, POWER_SUPPLY_PROP_ONLINE, pval);
+-			pval->intval = pval->intval ?
+-					       POWER_SUPPLY_STATUS_CHARGING :
+-					       POWER_SUPPLY_STATUS_DISCHARGING;
+-		} else
+-			pval->intval = POWER_SUPPLY_STATUS_UNKNOWN;
+-		break;
+-	case POWER_SUPPLY_PROP_CHARGE_TYPE:
+-		(void)platform_class_buckchg_ops_get_chg_type(MAIN_BUCK_CHARGER,
+-							      &main_chg_type);
+-		pval->intval = main_chg_type;
+-		break;
+-	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
+-		pval->intval = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
+-		break;
+-	case POWER_SUPPLY_PROP_CAPACITY:
+-		pval->intval = BATT_SOC_DEFAULT;
+-		break;
+-	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+-	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
+-		pval->intval = BATT_VOLTAGE_DEFAULT;
+-		break;
+-	case POWER_SUPPLY_PROP_CURRENT_NOW:
+-		pval->intval = BATT_CURRENT_DEFAULT;
+-		break;
+-	case POWER_SUPPLY_PROP_TEMP:
+-		pval->intval = BATT_TEMP_DEFAULT;
+-		break;
+-	default:
+-		mca_log_info("Get prop %d is not supported in battery\n", psp);
+-		break;
+-	}
+-
+-	return 0;
+-}
+-
+-static int batt_psy_get_prop(struct power_supply *psy,
+-			     enum power_supply_property psp,
+-			     union power_supply_propval *pval)
+-{
+-	struct batt_psy_info *info = power_supply_get_drvdata(psy);
+-	int rc = 0;
+-	int uisoc;
+-	int main_chg_type = 0;
+-	bool charging_done = false;
+-
+-	if (!info || !info->batt_psy)
+-		return 0;
+-
+-	if (info->fake_power) {
+-		fake_batt_psy_get_prop(info, psp, pval);
+-		return 0;
+-	}
+-
+-	if (!strategy_class_fg_ops_is_init_ok()) {
+-		//mca_log_info("fg ic is not ok\n");
+-		return -ENODATA;
+-	}
+-
+-	if (!battery_psy_is_usb_available(info)) {
+-		//mca_log_err("get usb psy fail\n");
+-		return 0;
+-	}
+-
+-	if (!battery_psy_is_wls_available(info)) {
+-		//mca_log_err("get wireless psy fail\n");
+-		return 0;
+-	}
+-
+-	switch (psp) {
+-	case POWER_SUPPLY_PROP_STATUS:
+-		// mishow app need report discharging status
+-		if (!info->input_suppend_voter)
+-			info->input_suppend_voter =
+-				mca_find_votable("input_suspend");
+-		if (info->input_suppend_voter &&
+-		    mca_get_client_vote(info->input_suppend_voter,
+-					"micharge")) {
+-			pval->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+-			break;
+-		}
+-
+-		rc = power_supply_get_property(info->usb_psy,
+-					       POWER_SUPPLY_PROP_ONLINE, pval);
+-		charging_done = strategy_class_fg_ops_get_charging_done();
+-		if (pval->intval) {
+-			uisoc = strategy_class_fg_ops_get_soc();
+-			if (uisoc == 100 && charging_done)
+-				pval->intval = POWER_SUPPLY_STATUS_FULL;
+-			else
+-				pval->intval = POWER_SUPPLY_STATUS_CHARGING;
+-
+-		} else {
+-			rc = power_supply_get_property(
+-				info->wls_psy, POWER_SUPPLY_PROP_ONLINE, pval);
+-			if (pval->intval) {
+-				uisoc = strategy_class_fg_ops_get_soc();
+-				if (uisoc == 100 && charging_done)
+-					pval->intval = POWER_SUPPLY_STATUS_FULL;
+-				else
+-					pval->intval =
+-						POWER_SUPPLY_STATUS_CHARGING;
+-			} else {
+-				pval->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+-			}
+-		}
+-		break;
+-	case POWER_SUPPLY_PROP_HEALTH:
+-		get_prop_batt_health(info, pval);
+-		break;
+-	case POWER_SUPPLY_PROP_PRESENT:
+-		pval->intval = 1;
+-		break;
+-	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+-		break;
+-	case POWER_SUPPLY_PROP_CHARGE_TYPE:
+-		(void)platform_class_buckchg_ops_get_chg_type(MAIN_BUCK_CHARGER,
+-							      &main_chg_type);
+-		pval->intval = main_chg_type;
+-		break;
+-	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
+-		rc = get_prop_batt_capacity_level(info, pval);
+-		break;
+-	case POWER_SUPPLY_PROP_CAPACITY:
+-		pval->intval = strategy_class_fg_ops_get_soc();
+-		if (pval->intval < 0 || pval->intval > 100)
+-			pval->intval = 15;
+-		break;
+-	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
+-		break;
+-	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT_MAX:
+-		pval->intval = 16;
+-		break;
+-	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+-	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
+-		rc = strategy_class_fg_ops_get_voltage(&pval->intval);
+-		pval->intval *= 1000;
+-		break;
+-	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
+-		rc = power_supply_get_property(info->usb_psy, psp, pval);
+-		break;
+-	case POWER_SUPPLY_PROP_CURRENT_NOW:
+-		strategy_class_fg_ops_get_current(&pval->intval);
+-		break;
+-	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
+-		rc = power_supply_get_property(
+-			info->usb_psy, POWER_SUPPLY_PROP_CURRENT_MAX, pval);
+-		break;
+-	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+-		break;
+-	case POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT:
+-		break;
+-	case POWER_SUPPLY_PROP_TEMP:
+-		rc = strategy_class_fg_ops_get_temperature(&pval->intval);
+-		break;
+-	case POWER_SUPPLY_PROP_TECHNOLOGY:
+-		pval->intval = POWER_SUPPLY_TECHNOLOGY_LIPO;
+-		break;
+-	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
+-		rc = strategy_class_fg_get_rm(&pval->intval);
+-		break;
+-	case POWER_SUPPLY_PROP_CYCLE_COUNT:
+-		rc = strategy_class_fg_ops_get_cyclecount(&pval->intval);
+-		break;
+-	case POWER_SUPPLY_PROP_CHARGE_FULL:
+-		rc = strategy_class_fg_get_fcc(&pval->intval);
+-		break;
+-	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
+-		rc = strategy_class_fg_get_dc(&pval->intval);
+-		break;
+-	case POWER_SUPPLY_PROP_TIME_TO_FULL_NOW:
+-		break;
+-	case POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW:
+-		break;
+-	case POWER_SUPPLY_PROP_MODEL_NAME:
+-		rc = strategy_class_fg_get_model_name(&pval->strval);
+-		break;
+-	default:
+-		mca_log_err("Get prop %d is not supported in battery\n", psp);
+-		rc = -EINVAL;
+-		break;
+-	}
+-
+-	if (rc < 0) {
+-		mca_log_err("Couldn't get prop %d rc = %d\n", psp, rc);
+-		return -ENODATA;
+-	}
+-
+-	return 0;
+-}
+-
+-static int batt_psy_set_prop(struct power_supply *psy,
+-			     enum power_supply_property psp,
+-			     const union power_supply_propval *val)
+-{
+-	struct batt_psy_info *info = power_supply_get_drvdata(psy);
+-	int rc = 0;
+-
+-	if (!battery_psy_is_usb_available(info)) {
+-		mca_log_err("get usb psy fail\n");
+-		return 0;
+-	}
+-
+-	switch (psp) {
+-	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
+-		break;
+-	case POWER_SUPPLY_PROP_CAPACITY:
+-		break;
+-	case POWER_SUPPLY_PROP_TEMP:
+-		break;
+-	default:
+-		mca_log_err("set prop %d is not supported in battery\n", psp);
+-		rc = -EINVAL;
+-		break;
+-	}
+-
+-	if (rc < 0) {
+-		mca_log_err("Couldn't set prop %d rc = %d\n", psp, rc);
+-		return -ENODATA;
+-	}
+-
+-	return 0;
+-}
+-
+-static int batt_psy_prop_is_writeable(struct power_supply *psy,
+-				      enum power_supply_property psp)
+-{
+-	switch (psp) {
+-	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
+-	case POWER_SUPPLY_PROP_CAPACITY:
+-	case POWER_SUPPLY_PROP_TEMP:
+-		return 1;
+-	default:
+-		break;
+-	}
+-
+-	return 0;
+-}
+-
+-static const struct power_supply_desc _batt_psy_desc = {
++static const struct power_supply_desc batt_psy_desc = {
+ 	.name = "battery",
+ 	.type = POWER_SUPPLY_TYPE_BATTERY,
+ 	.properties = batt_psy_props,
+ 	.num_properties = ARRAY_SIZE(batt_psy_props),
+ 	.get_property = batt_psy_get_prop,
+-	.set_property = batt_psy_set_prop,
+-	.property_is_writeable = batt_psy_prop_is_writeable,
++	/* The separate thermal zone uses the FG's thermal-adjusted temperature. */
++	.no_thermal = true,
+ };
+ 
+ static int power_supply_read_temp(struct thermal_zone_device *tzd, int *temp)
+ {
+-	static int last_temp;
+-	int t = 0;
+-
+-	strategy_class_fg_ops_get_thermal_temperature(&t);
+-	*temp = t * 100;
+-	if (t != last_temp) {
+-		last_temp = t;
+-		pr_info("batt_thermal temp:%d\n", t);
+-	}
+-
++	int value, ret;
++
++	ret = strategy_class_fg_ops_get_thermal_temperature(&value);
++	if (ret)
++		return ret;
++	if (check_mul_overflow(value, 100, temp))
++		return -ERANGE;
+ 	return 0;
+ }
+ 
+-static struct thermal_zone_device_ops psy_tzd_ops = {
++static const struct thermal_zone_device_ops psy_tzd_ops = {
+ 	.get_temp = power_supply_read_temp,
+ };
+ 
+-static int battery_psy_init(struct batt_psy_info *info)
+-{
+-	struct power_supply_config batt_cfg = {};
+-	struct thermal_zone_params tzp = {};
+-	int rc = 0;
+-
+-	batt_cfg.drv_data = info;
+-	batt_cfg.of_node = info->dev->of_node;
+-	info->batt_psy = devm_power_supply_register(info->dev, &_batt_psy_desc,
+-						    &batt_cfg);
+-	if (IS_ERR(info->batt_psy)) {
+-		mca_log_err("Couldn't register battery power supply\n");
+-		return PTR_ERR(info->batt_psy);
+-	}
+-
+-	info->tzd = thermal_tripless_zone_device_register(
+-			info->batt_psy->desc->name, info->batt_psy, &psy_tzd_ops, &tzp);
+-
+-	return rc;
+-}
+-
+ static int business_battery_dump_log_head(void *data, char *buf, int size)
+ {
+-	return snprintf(buf, size,
+-			"ChargeStatus uiSoc uiSoh F_Volt F_Curr  F_temp ");
++	return scnprintf(buf, size,
++			 "ChargeStatus uiSoc uiSoh F_Volt F_Curr F_temp ");
+ }
+ 
+ static int business_battery_dump_log_context(void *data, char *buf, int size)
+ {
+-	struct batt_psy_info *info = (struct batt_psy_info *)data;
+-	union power_supply_propval status;
+-	union power_supply_propval soc;
+-	union power_supply_propval volt;
+-	union power_supply_propval curr;
+-	union power_supply_propval temp;
+-	int soh = 0;
+-
+-	if (!info || !info->batt_psy)
+-		return snprintf(buf, size, "%-13d%-6d%-6d%-7d%-8d%-7d", -1, -1,
+-				-1, -1, -1, -1);
+-
+-	(void)batt_psy_get_prop(info->batt_psy, POWER_SUPPLY_PROP_STATUS,
+-				&status);
+-	(void)batt_psy_get_prop(info->batt_psy, POWER_SUPPLY_PROP_CAPACITY,
+-				&soc);
+-	(void)batt_psy_get_prop(info->batt_psy, POWER_SUPPLY_PROP_VOLTAGE_NOW,
+-				&volt);
+-	(void)batt_psy_get_prop(info->batt_psy, POWER_SUPPLY_PROP_CURRENT_NOW,
+-				&curr);
+-	(void)batt_psy_get_prop(info->batt_psy, POWER_SUPPLY_PROP_TEMP, &temp);
+-
+-	return snprintf(buf, size, "%-13d%-6d%-6d%-7d%-8d%-7d", status.intval,
+-			soc.intval, soh, volt.intval / 1000, curr.intval / 1000,
+-			temp.intval);
+-}
+-
+-static struct mca_log_charge_log_ops g_business_battery_log_ops = {
++	struct batt_psy_info *info = data;
++	static const enum power_supply_property properties[] = {
++		POWER_SUPPLY_PROP_STATUS,      POWER_SUPPLY_PROP_CAPACITY,
++		POWER_SUPPLY_PROP_VOLTAGE_NOW, POWER_SUPPLY_PROP_CURRENT_NOW,
++		POWER_SUPPLY_PROP_TEMP,
++	};
++	union power_supply_propval values[ARRAY_SIZE(properties)];
++	int i, ret, soh;
++
++	for (i = 0; i < ARRAY_SIZE(properties); i++) {
++		ret = batt_psy_get_prop(info->batt_psy, properties[i],
++					&values[i]);
++		if (ret)
++			return ret;
++	}
++	ret = strategy_class_fg_get_soh(&soh);
++	if (ret)
++		return ret;
++	return scnprintf(buf, size, "%-13d%-6d%-6d%-7d%-8d%-7d",
++			 values[0].intval, values[1].intval, soh,
++			 values[2].intval / 1000, values[3].intval / 1000,
++			 values[4].intval);
++}
++
++static struct mca_log_charge_log_ops battery_log_ops = {
+ 	.dump_log_head = business_battery_dump_log_head,
+ 	.dump_log_context = business_battery_dump_log_context,
+ };
+ 
+ struct batt_psy_info *business_battery_psy_init(struct device *dev)
+ {
++	struct power_supply_config config = { .fwnode = dev_fwnode(dev) };
++	struct thermal_zone_params params = {};
+ 	struct batt_psy_info *info;
+-	int rc = 0;
++	int ret;
+ 
+ 	info = devm_kzalloc(dev, sizeof(*info), GFP_KERNEL);
+ 	if (!info)
+-		return NULL;
+-
++		return ERR_PTR(-ENOMEM);
+ 	info->dev = dev;
+-	rc = battery_psy_init(info);
+-	if (rc < 0) {
+-		mca_log_err("Couldn't init battery psy rc=%d\n", rc);
+-		return NULL;
+-	}
+-
+-	info->usb_psy = power_supply_get_by_name("usb");
+-	if (!info->usb_psy)
+-		mca_log_err("get usb psy fail\n");
+-
+-	info->wls_psy = power_supply_get_by_name("wireless");
+-	if (!info->wls_psy)
+-		mca_log_err("get wls psy fail\n");
+-
++	mutex_init(&info->model_lock);
++	config.drv_data = info;
++	info->batt_psy = power_supply_register(dev, &batt_psy_desc, &config);
++	if (IS_ERR(info->batt_psy))
++		return ERR_CAST(info->batt_psy);
++	info->tzd = thermal_tripless_zone_device_register(
++		"battery", info, &psy_tzd_ops, &params);
++	if (IS_ERR(info->tzd)) {
++		ret = PTR_ERR(info->tzd);
++		goto unregister_psy;
++	}
++	ret = thermal_zone_device_enable(info->tzd);
++	if (ret) {
++		thermal_zone_device_unregister(info->tzd);
++		goto unregister_psy;
++	}
+ 	mca_log_charge_log_register(MCA_CHARGE_LOG_ID_BATTERY_INFO,
+-				    &g_business_battery_log_ops, info);
+-
++				    &battery_log_ops, info);
+ 	return info;
++unregister_psy:
++	power_supply_unregister(info->batt_psy);
++	return ERR_PTR(ret);
+ }
+ 
+ void business_battery_psy_deinit(struct batt_psy_info *info)
+ {
+-	if (!info || !info->batt_psy)
+-		return;
+-
++	mca_log_charge_log_unregister(MCA_CHARGE_LOG_ID_BATTERY_INFO, info);
++	thermal_zone_device_unregister(info->tzd);
+ 	power_supply_unregister(info->batt_psy);
+ }
+-
+-/*
+-void business_battery_psy_event_process(struct batt_psy_info *info)
+-{
+-	if (!info)
+-		return;
+-
+-	power_supply_changed(info->batt_psy);
+-}
+-*/
+--- a/drivers/power/supply/mca/mca_strategy/strategy_fg/mca_strategy_fg_class.c
++++ b/drivers/power/supply/mca/mca_strategy/strategy_fg/mca_strategy_fg_class.c
+@@ -17,35 +17,52 @@
+  *
+  */
+ #include <linux/module.h>
++#include <linux/srcu.h>
++#include <linux/slab.h>
+ #include <linux/platform_device.h>
+ #include <mca/strategy/strategy_fg_class.h>
+ 
+-static struct strategy_fg_class_info g_stg_fg_class_info;
+-
+-#define is_invalid_ops(name) \
+-	(!g_stg_fg_class_info.ops || !(g_stg_fg_class_info.ops->name))
+-#define strategy_fg_class_ops_no_para(name) \
+-	(g_stg_fg_class_info.ops->name(g_stg_fg_class_info.data))
++static struct strategy_fg_class_info __rcu *g_stg_fg_class_info;
++static DEFINE_MUTEX(fg_ops_lock);
++DEFINE_STATIC_SRCU(fg_ops_srcu);
++
++#define is_invalid_ops(name) (!entry || !entry->ops || !(entry->ops->name))
++#define strategy_fg_class_ops_no_para(name) (entry->ops->name(entry->data))
+ #define strategy_fg_class_ops_with_one_para(name, para1) \
+-	(g_stg_fg_class_info.ops->name(g_stg_fg_class_info.data, para1))
++	(entry->ops->name(entry->data, para1))
+ 
+ int strategy_class_fg_ops_register(void *data,
+ 				   struct strategy_fg_class_ops *ops)
+ {
+-	if (!ops)
+-		return -1;
+-
+-	g_stg_fg_class_info.data = data;
+-	g_stg_fg_class_info.ops = ops;
+-
++	struct strategy_fg_class_info *entry;
++
++	if (!ops || !data)
++		return -EINVAL;
++	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++	entry->ops = ops;
++	entry->data = data;
++	mutex_lock(&fg_ops_lock);
++	if (rcu_access_pointer(g_stg_fg_class_info)) {
++		mutex_unlock(&fg_ops_lock);
++		kfree(entry);
++		return -EEXIST;
++	}
++	rcu_assign_pointer(g_stg_fg_class_info, entry);
++	mutex_unlock(&fg_ops_lock);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(strategy_class_fg_ops_register);
+ 
+ int strategy_class_fg_ops_is_init_ok(void)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
+ 	if (is_invalid_ops(strategy_fg_is_init_ok))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_no_para(strategy_fg_is_init_ok);
+ }
+@@ -53,8 +70,15 @@
+ 
+ int strategy_class_fg_ops_get_rsoc(int *rsoc)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!rsoc)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_rsoc))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(strategy_fg_get_rsoc, rsoc);
+ }
+@@ -62,8 +86,12 @@
+ 
+ int strategy_class_fg_ops_get_soc(void)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
+ 	if (is_invalid_ops(strategy_fg_get_soc))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_no_para(strategy_fg_get_soc);
+ }
+@@ -71,8 +99,15 @@
+ 
+ int strategy_class_fg_ops_get_temperature(int *temp)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!temp)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_temp))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(strategy_fg_get_temp, temp);
+ }
+@@ -80,8 +115,15 @@
+ 
+ int strategy_class_fg_ops_get_current(int *curr)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!curr)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_current))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(strategy_fg_get_current,
+ 						   curr);
+@@ -90,8 +132,15 @@
+ 
+ int strategy_class_fg_ops_get_voltage(int *volt)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!volt)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_voltage))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(strategy_fg_get_voltage,
+ 						   volt);
+@@ -100,8 +149,15 @@
+ 
+ int strategy_class_fg_ops_get_cyclecount(int *cycle)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!cycle)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_cycle))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(strategy_fg_get_cycle,
+ 						   cycle);
+@@ -110,8 +166,15 @@
+ 
+ int strategy_class_fg_get_voltage_mean(int *vol_mean)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!vol_mean)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_voltage_mean))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(strategy_fg_get_voltage_mean,
+ 						   vol_mean);
+@@ -120,18 +183,29 @@
+ 
+ int strategy_class_fg_ops_get_soc_decimal(int *soc_decimal, int *rate)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!soc_decimal || !rate)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_soc_decimal_info))
+-		return -1;
+-
+-	return g_stg_fg_class_info.ops->strategy_fg_get_soc_decimal_info(
+-		g_stg_fg_class_info.data, soc_decimal, rate);
++		return -ENODEV;
++
++	return entry->ops->strategy_fg_get_soc_decimal_info(entry->data,
++							    soc_decimal, rate);
+ }
+ EXPORT_SYMBOL(strategy_class_fg_ops_get_soc_decimal);
+ 
+ bool strategy_class_fg_ops_get_charging_done(void)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
+ 	if (is_invalid_ops(strategy_fg_get_charging_done))
+-		return -1;
++		return false;
+ 
+ 	return strategy_fg_class_ops_no_para(strategy_fg_get_charging_done);
+ }
+@@ -139,8 +213,12 @@
+ 
+ int strategy_class_fg_ops_set_charging_done(bool charging_done)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
+ 	if (is_invalid_ops(strategy_fg_set_charging_done))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(
+ 		strategy_fg_set_charging_done, charging_done);
+@@ -149,8 +227,15 @@
+ 
+ int strategy_class_fg_get_model_name(const char **model_name)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!model_name)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_model_name))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(strategy_fg_get_model_name,
+ 						   model_name);
+@@ -159,8 +244,12 @@
+ 
+ int strategy_class_fg_set_fastcharge(bool en)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
+ 	if (is_invalid_ops(strategy_fg_set_fastcharge))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(strategy_fg_set_fastcharge,
+ 						   en);
+@@ -169,8 +258,12 @@
+ 
+ int strategy_class_fg_get_fastcharge(void)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
+ 	if (is_invalid_ops(strategy_fg_get_fastcharge))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_no_para(strategy_fg_get_fastcharge);
+ }
+@@ -178,8 +271,15 @@
+ 
+ int strategy_class_fg_get_authentic(bool *authentic)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!authentic)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_authentic))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(strategy_fg_get_authentic,
+ 						   authentic);
+@@ -188,8 +288,15 @@
+ 
+ int strategy_class_fg_get_dc(int *dc)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!dc)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_dc))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(strategy_fg_get_dc, dc);
+ }
+@@ -197,8 +304,15 @@
+ 
+ int strategy_class_fg_get_rm(int *rm)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!rm)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_rm))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(strategy_fg_get_rm, rm);
+ }
+@@ -206,8 +320,15 @@
+ 
+ int strategy_class_fg_get_fcc(int *fcc)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!fcc)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_fcc))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(strategy_fg_get_fcc, fcc);
+ }
+@@ -215,8 +336,12 @@
+ 
+ int strategy_class_fg_is_chip_ok(void)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
+ 	if (is_invalid_ops(strategy_fg_is_chip_ok))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_no_para(strategy_fg_is_chip_ok);
+ }
+@@ -224,8 +349,15 @@
+ 
+ int strategy_class_fg_get_health(int *health)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!health)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_health))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(strategy_fg_get_health,
+ 						   health);
+@@ -234,8 +366,15 @@
+ 
+ int strategy_class_fg_get_first_termination(int *value)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!value)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_first_termination))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(
+ 		strategy_fg_get_first_termination, value);
+@@ -244,35 +383,63 @@
+ 
+ int strategy_class_fg_get_pack_vendor_id(int *vendor_id)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!vendor_id)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_pack_vendor_id))
+-		return -1;
+-
+-	return strategy_fg_class_ops_with_one_para(strategy_fg_get_pack_vendor_id, vendor_id);
++		return -ENODEV;
++
++	return strategy_fg_class_ops_with_one_para(
++		strategy_fg_get_pack_vendor_id, vendor_id);
+ }
+ EXPORT_SYMBOL(strategy_class_fg_get_pack_vendor_id);
+ 
+ int strategy_class_fg_dual_is_chip_ok(int index)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
+ 	if (is_invalid_ops(strategy_fg_dual_is_chip_ok))
+-		return -1;
+-
+-	return strategy_fg_class_ops_with_one_para(strategy_fg_dual_is_chip_ok, index);
++		return -ENODEV;
++
++	return strategy_fg_class_ops_with_one_para(strategy_fg_dual_is_chip_ok,
++						   index);
+ }
+ EXPORT_SYMBOL(strategy_class_fg_dual_is_chip_ok);
+ 
+ int strategy_class_fg_ops_get_thermal_temperature(int *temp)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!temp)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_thermal_temperature))
+-		return -1;
+-
+-	return strategy_fg_class_ops_with_one_para(strategy_fg_get_thermal_temperature, temp);
++		return -ENODEV;
++
++	return strategy_fg_class_ops_with_one_para(
++		strategy_fg_get_thermal_temperature, temp);
+ }
+ EXPORT_SYMBOL(strategy_class_fg_ops_get_thermal_temperature);
+ 
+ int strategy_class_fg_get_soh(int *soh)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!soh)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_soh))
+-		return -1;
++		return -ENODEV;
+ 
+ 	return strategy_fg_class_ops_with_one_para(strategy_fg_get_soh, soh);
+ }
+@@ -280,13 +447,60 @@
+ 
+ int strategy_class_fg_get_temp_offset_flag(int *flag)
+ {
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++
++	if (!flag)
++		return -EINVAL;
++
+ 	if (is_invalid_ops(strategy_fg_get_temp_offset_flag))
+-		return -1;
+-
+-	return strategy_fg_class_ops_with_one_para(strategy_fg_get_temp_offset_flag,
+-						   flag);
++		return -ENODEV;
++
++	return strategy_fg_class_ops_with_one_para(
++		strategy_fg_get_temp_offset_flag, flag);
+ }
+ EXPORT_SYMBOL(strategy_class_fg_get_temp_offset_flag);
++
++void strategy_class_fg_ops_unregister(void *data)
++{
++	struct strategy_fg_class_info *entry;
++
++	mutex_lock(&fg_ops_lock);
++	entry = rcu_dereference_protected(g_stg_fg_class_info,
++					  lockdep_is_held(&fg_ops_lock));
++	if (!entry || entry->data != data) {
++		mutex_unlock(&fg_ops_lock);
++		return;
++	}
++	rcu_assign_pointer(g_stg_fg_class_info, NULL);
++	mutex_unlock(&fg_ops_lock);
++	synchronize_srcu(&fg_ops_srcu);
++	kfree(entry);
++}
++EXPORT_SYMBOL(strategy_class_fg_ops_unregister);
++
++int strategy_class_fg_copy_model_name(char *buf, size_t len)
++{
++	guard(srcu)(&fg_ops_srcu);
++	struct strategy_fg_class_info *entry =
++		srcu_dereference(g_stg_fg_class_info, &fg_ops_srcu);
++	const char *name;
++	int ret;
++
++	if (!buf || !len)
++		return -EINVAL;
++	if (is_invalid_ops(strategy_fg_get_model_name))
++		return -ENODEV;
++	ret = entry->ops->strategy_fg_get_model_name(entry->data, &name);
++	if (ret)
++		return ret;
++	if (!name)
++		return -ENODATA;
++	ret = strscpy(buf, name, len);
++	return ret < 0 ? ret : 0;
++}
++EXPORT_SYMBOL(strategy_class_fg_copy_model_name);
+ 
+ static struct platform_driver strategy_fg_class_driver = {
+ 	.driver	= {
+--- a/drivers/power/supply/mca/mca_common/mca_qcom_panel.c
++++ b/drivers/power/supply/mca/mca_common/mca_qcom_panel.c
+@@ -17,6 +17,7 @@
+  *
+  */
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/platform_device.h>
+ #include <linux/device.h>
+ #include <linux/delay.h>
+@@ -41,6 +42,7 @@
+ #if defined(CONFIG_OF) && defined(CONFIG_DRM_PANEL)
+ 	struct delayed_work panel_notify_register_work;
+ 	void *notifier_cookie;
++	unsigned int retries;
+ #endif
+ 
+ 	int screen_state;
+@@ -48,9 +50,12 @@
+ };
+ 
+ static struct mca_panel_dev *g_panel;
++static DEFINE_MUTEX(panel_state_lock);
+ 
+ int mca_panel_get_screen_state(void)
+ {
++	guard(mutex)(&panel_state_lock);
++
+ 	if (!g_panel)
+ 		return 0;
+ 	return g_panel->screen_state;
+@@ -59,6 +64,8 @@
+ 
+ int mca_panel_get_hbm_state(void)
+ {
++	guard(mutex)(&panel_state_lock);
++
+ 	if (!g_panel)
+ 		return 0;
+ 	return g_panel->hbm_state;
+@@ -72,115 +79,81 @@
+ 				  void *data)
+ {
+ 	struct mca_panel_dev *panel_dev = data;
+-
+-	(void)tag;
+-
+-	if (!notification) {
+-		mca_log_debug("Invalid panel notification\n");
++	unsigned int event;
++	int value;
++
++	if (!notification)
+ 		return;
+-	}
+-
+-	mca_log_info("panel event received, type: %d\n", notification->notif_type);
++	mutex_lock(&panel_state_lock);
+ 	switch (notification->notif_type) {
+ 	case DRM_PANEL_EVENT_BLANK:
+ 	case DRM_PANEL_EVENT_UNBLANK:
+-		panel_dev->screen_state =
+-			notification->notif_type == DRM_PANEL_EVENT_BLANK ? 0 : 1;
+-		mca_event_block_notify(MCA_EVENT_TYPE_PANEL,
+-				       MCA_EVENT_PANEL_SCREEN_STATE_CHANGE,
+-				       &panel_dev->screen_state);
++		value = notification->notif_type == DRM_PANEL_EVENT_UNBLANK;
++		panel_dev->screen_state = value;
++		event = MCA_EVENT_PANEL_SCREEN_STATE_CHANGE;
+ 		break;
+ 	case DRM_PANEL_EVENT_HBM_ON:
+ 	case DRM_PANEL_EVENT_HBM_OFF:
+-		panel_dev->hbm_state =
+-			notification->notif_type == DRM_PANEL_EVENT_HBM_ON ? 1 : 0;
+-		mca_event_block_notify(MCA_EVENT_TYPE_PANEL,
+-				       MCA_EVENT_PANEL_HBM_STATE_CHANGE,
+-				       &panel_dev->hbm_state);
++		value = notification->notif_type == DRM_PANEL_EVENT_HBM_ON;
++		panel_dev->hbm_state = value;
++		event = MCA_EVENT_PANEL_HBM_STATE_CHANGE;
+ 		break;
+ 	default:
+-		mca_log_debug("Ignore panel event: %d\n", notification->notif_type);
+-		break;
+-	}
++		mutex_unlock(&panel_state_lock);
++		return;
++	}
++	mutex_unlock(&panel_state_lock);
++	/* Listener callbacks may query this bridge again. */
++	mca_event_block_notify(MCA_EVENT_TYPE_PANEL, event, &value);
+ }
+ 
+ static int mca_panel_register_panel_notifier(struct mca_panel_dev *panel_dev)
+ {
+-	struct device_node *node;
+-	struct device_node *pnode;
+-	struct drm_panel *panel = NULL;
+-	void *cookie = NULL;
+-	int i, count;
+-	int rc = -ENODEV;
++	struct device_node *node, *pnode;
++	struct drm_panel *panel;
++	void *cookie;
++	int i, count, ret = -ENODEV;
+ 
+ 	node = of_find_node_by_name(NULL, "charge-screen");
+-	if (!node) {
+-		of_node_put(node);
+-		mca_log_err("ERROR: Cannot find node with panel!");
++	if (!node)
+ 		return -ENODEV;
+-	}
+-
+ 	count = of_count_phandle_with_args(node, "panel", NULL);
+-	if (count <= 0) {
+-		of_node_put(node);
+-		return -ENODEV;
+-	}
+-
+ 	for (i = 0; i < count; i++) {
+ 		pnode = of_parse_phandle(node, "panel", i);
++		if (!pnode)
++			continue;
+ 		panel = of_drm_find_panel(pnode);
+-		if (!IS_ERR_OR_NULL(panel))
+-			break;
+-
+-		rc = PTR_ERR(panel);
+-		if (!rc)
+-			rc = -ENODEV;
+-		mca_log_err("Failed to find active panel, rc=%d\n", rc);
+-		panel = NULL;
+ 		of_node_put(pnode);
+-	}
+-
+-	if (pnode && panel) {
++		if (IS_ERR_OR_NULL(panel)) {
++			ret = panel ? PTR_ERR(panel) : -ENODEV;
++			continue;
++		}
+ 		cookie = panel_event_notifier_register(
+ 			PANEL_EVENT_NOTIFICATION_PRIMARY,
+ 			PANEL_EVENT_NOTIFIER_CLIENT_BATTERY_CHARGER, panel,
+-			mca_panel_event_notifier_callback, (void *)panel_dev);
+-
++			mca_panel_event_notifier_callback, panel_dev);
+ 		if (IS_ERR_OR_NULL(cookie)) {
+-			rc = IS_ERR(cookie) ? PTR_ERR(cookie) : -EINVAL;
+-			mca_log_err(
+-				"Failed to register panel event notifier, rc=%d\n",
+-				rc);
+-			of_node_put(node);
+-			of_node_put(pnode);
+-			return rc;
++			ret = cookie ? PTR_ERR(cookie) : -EINVAL;
++			break;
+ 		}
+-
+ 		panel_dev->notifier_cookie = cookie;
+-		of_node_put(node);
+-		of_node_put(pnode);
+-		mca_log_info("register panel notifier successful\n");
+-		return 0;
+-	}
+-
++		ret = 0;
++		break;
++	}
+ 	of_node_put(node);
+-	return -ENODEV;
++	return ret;
+ }
+ 
+ static void mca_panel_register_panel_notifier_work(struct work_struct *work)
+ {
+-	struct mca_panel_dev *panel_dev = container_of(
+-		work, struct mca_panel_dev, panel_notify_register_work.work);
+-	static int retry_count = 3;
+-
+-	mca_panel_register_panel_notifier(panel_dev);
+-
+-	if (retry_count-- && !panel_dev->notifier_cookie) {
+-		mca_log_err("retry register panel notifier, retry_count = %d\n",
+-			    retry_count);
++	struct mca_panel_dev *panel_dev =
++		container_of(to_delayed_work(work), struct mca_panel_dev,
++			     panel_notify_register_work);
++
++	if (mca_panel_register_panel_notifier(panel_dev) &&
++	    panel_dev->retries++ < 3)
+ 		schedule_delayed_work(&panel_dev->panel_notify_register_work,
+ 				      msecs_to_jiffies(5000));
+-	}
+ }
+ #endif
+ 
+@@ -201,7 +174,13 @@
+ 	panel_dev->screen_state = 0;
+ 	panel_dev->hbm_state = 0;
+ 	platform_set_drvdata(pdev, panel_dev);
++	mutex_lock(&panel_state_lock);
++	if (g_panel) {
++		mutex_unlock(&panel_state_lock);
++		return -EBUSY;
++	}
+ 	g_panel = panel_dev;
++	mutex_unlock(&panel_state_lock);
+ 
+ #if defined(CONFIG_OF) && defined(CONFIG_DRM_PANEL)
+ 	INIT_DELAYED_WORK(&panel_dev->panel_notify_register_work,
+@@ -219,21 +198,19 @@
+ 	{},
+ };
+ 
+-static int mca_panel_remove(struct platform_device *pdev)
++static void mca_panel_remove(struct platform_device *pdev)
+ {
+ 	struct mca_panel_dev *panel_dev = platform_get_drvdata(pdev);
+ 
+ #if defined(CONFIG_OF) && defined(CONFIG_DRM_PANEL)
+-	cancel_delayed_work_sync(&panel_dev->panel_notify_register_work);
+-	if (!IS_ERR(panel_dev->notifier_cookie))
++	disable_delayed_work_sync(&panel_dev->panel_notify_register_work);
++	if (panel_dev->notifier_cookie)
+ 		panel_event_notifier_unregister(panel_dev->notifier_cookie);
+ #endif
+-
++	mutex_lock(&panel_state_lock);
+ 	if (g_panel == panel_dev)
+ 		g_panel = NULL;
+-
+-	devm_kfree(&pdev->dev, panel_dev);
+-	return 0;
++	mutex_unlock(&panel_state_lock);
+ }
+ 
+ static void mca_panel_shutdown(struct platform_device *pdev)
+--- a/drivers/power/supply/mca/mca_business/business_battery/inc/mca_battery_psy.h
++++ b/drivers/power/supply/mca/mca_business/business_battery/inc/mca_battery_psy.h
+@@ -20,6 +20,7 @@
+ #define __MCA_BATTERY_PSY_H__
+ 
+ #include <mca/common/mca_voter.h>
++#include <linux/mutex.h>
+ 
+ #define BATT_OVERHEAT_THRESHOLD 580
+ #define BATT_WARM_THRESHOLD 480
+@@ -28,15 +29,12 @@
+ 
+ struct batt_psy_info {
+ 	struct device *dev;
+-	struct power_supply_desc batt_psy_desc;
+-	struct power_supply *usb_psy;
+ 	struct power_supply *batt_psy;
+-	struct power_supply *wls_psy;
+-	int present;
+-	int chg_status;
++	struct thermal_zone_device *tzd;
+ 	int fake_power;
+-	struct mca_votable *input_suppend_voter;
+-	struct thermal_zone_device *tzd;
++	struct mutex model_lock;
++	bool model_valid;
++	char model_name[64];
+ };
+ 
+ struct batt_psy_info *business_battery_psy_init(struct device *dev);

@@ -1,0 +1,2060 @@
+--- a/drivers/soc/qcom/panel_event_notifier.c
++++ b/drivers/soc/qcom/panel_event_notifier.c
+@@ -7,6 +7,8 @@
+ #include <linux/list.h>
+ #include <linux/mutex.h>
+ #include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/srcu.h>
+ #include <linux/soc/qcom/panel_event_notifier.h>
+ 
+ struct panel_event_notifier_entry {
+@@ -17,7 +19,8 @@
+ };
+ 
+ static DEFINE_MUTEX(panel_event_notifier_entries_lock);
+-static struct panel_event_notifier_entry
++DEFINE_STATIC_SRCU(panel_event_notifier_srcu);
++static struct panel_event_notifier_entry __rcu *
+ 		panel_event_notifier_entries[PANEL_EVENT_NOTIFIER_CLIENT_MAX];
+ 
+ static bool panel_event_notifier_tag_valid(enum panel_event_notifier_tag tag)
+@@ -71,16 +74,20 @@
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+-	mutex_lock(&panel_event_notifier_entries_lock);
+-	entry = &panel_event_notifier_entries[client_handle];
+-	if (entry->handler) {
+-		mutex_unlock(&panel_event_notifier_entries_lock);
+-		return ERR_PTR(-EEXIST);
+-	}
++	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return ERR_PTR(-ENOMEM);
+ 	entry->panel = panel;
+ 	entry->handler = handler;
+ 	entry->pvt_data = pvt_data;
+ 	entry->tag = tag;
++	mutex_lock(&panel_event_notifier_entries_lock);
++	if (rcu_access_pointer(panel_event_notifier_entries[client_handle])) {
++		mutex_unlock(&panel_event_notifier_entries_lock);
++		kfree(entry);
++		return ERR_PTR(-EEXIST);
++	}
++	rcu_assign_pointer(panel_event_notifier_entries[client_handle], entry);
+ 	mutex_unlock(&panel_event_notifier_entries_lock);
+ 
+ 	pr_debug("client %d registered successfully\n", client_handle);
+@@ -95,17 +102,24 @@
+  */
+ void panel_event_notifier_unregister(void *cookie)
+ {
+-	struct panel_event_notifier_entry *entry = cookie;
++	struct panel_event_notifier_entry *entry = NULL;
++	int i;
+ 
+-	if (!cookie)
++	if (IS_ERR_OR_NULL(cookie))
+ 		return;
+-
+ 	mutex_lock(&panel_event_notifier_entries_lock);
+-	entry->panel = NULL;
+-	entry->handler = NULL;
+-	entry->pvt_data = NULL;
+-	entry->tag = PANEL_EVENT_NOTIFICATION_NONE;
++	for (i = 0; i < PANEL_EVENT_NOTIFIER_CLIENT_MAX; i++) {
++		if (rcu_access_pointer(panel_event_notifier_entries[i]) == cookie) {
++			entry = cookie;
++			rcu_assign_pointer(panel_event_notifier_entries[i], NULL);
++			break;
++		}
++	}
+ 	mutex_unlock(&panel_event_notifier_entries_lock);
++	if (entry) {
++		synchronize_srcu(&panel_event_notifier_srcu);
++		kfree(entry);
++	}
+ }
+ EXPORT_SYMBOL(panel_event_notifier_unregister);
+ 
+@@ -127,42 +141,20 @@
+ 		 struct panel_event_notification *notification)
+ {
+ 	struct panel_event_notifier_entry *entry;
+-	panel_event_notifier_handler handler = NULL;
+-	void *pvt_data;
+-	int i;
++	int i, idx;
+ 
+-	if (!panel_event_notifier_tag_valid(tag)) {
+-		pr_err("Invalid panel notifier tag\n");
++	if (!panel_event_notifier_tag_valid(tag) || !notification ||
++	    notification->notif_type <= DRM_PANEL_EVENT_NONE ||
++	    notification->notif_type >= DRM_PANEL_EVENT_MAX)
+ 		return;
++	idx = srcu_read_lock(&panel_event_notifier_srcu);
++	for (i = 0; i < PANEL_EVENT_NOTIFIER_CLIENT_MAX; i++) {
++		entry = srcu_dereference(panel_event_notifier_entries[i],
++					 &panel_event_notifier_srcu);
++		if (entry && entry->panel == notification->panel && entry->tag == tag)
++			entry->handler(tag, notification, entry->pvt_data);
+ 	}
+-
+-	for (i = 0; i < PANEL_EVENT_NOTIFIER_CLIENT_MAX; i++) {
+-		mutex_lock(&panel_event_notifier_entries_lock);
+-		entry = &panel_event_notifier_entries[i];
+-		if (notification->panel != entry->panel) {
+-			pr_debug("invalid panel found notification_panel\n");
+-			mutex_unlock(&panel_event_notifier_entries_lock);
+-			continue;
+-		}
+-
+-		/* skip client entries not subscribed to tag */
+-		if (entry->tag != tag) {
+-			pr_err("tag mismatch entry->tag:%d tag:%d\n", entry->tag, tag);
+-			mutex_unlock(&panel_event_notifier_entries_lock);
+-			continue;
+-		}
+-
+-		handler = entry->handler;
+-		pvt_data = entry->pvt_data;
+-		mutex_unlock(&panel_event_notifier_entries_lock);
+-
+-		pr_debug("triggering notification for tag:%d, type:%d\n",
+-				tag, notification->notif_type);
+-
+-		if (handler)
+-			handler(tag, notification, pvt_data);
+-
+-	}
++	srcu_read_unlock(&panel_event_notifier_srcu, idx);
+ }
+ EXPORT_SYMBOL(panel_event_notification_trigger);
+ 
+@@ -175,7 +167,11 @@
+ 
+ static void __exit panel_event_notifier_exit(void)
+ {
+-	pr_debug("Panel event notifier exited\n");
++	int i;
++
++	for (i = 0; i < PANEL_EVENT_NOTIFIER_CLIENT_MAX; i++)
++		panel_event_notifier_unregister(
++			rcu_access_pointer(panel_event_notifier_entries[i]));
+ }
+ module_exit(panel_event_notifier_exit);
+ 
+--- a/include/linux/soc/qcom/panel_event_notifier.h
++++ b/include/linux/soc/qcom/panel_event_notifier.h
+@@ -58,6 +58,7 @@
+ 				struct panel_event_notification *notification,
+ 					void *pvt_data);
+ 
++/* Callbacks may sleep. Unregister drains them and must not run inside a callback. */
+ #if IS_ENABLED(CONFIG_QCOM_PANEL_EVENT_NOTIFIER)
+ void *panel_event_notifier_register(enum panel_event_notifier_tag tag,
+ 		enum panel_event_notifier_client client_handle,
+--- a/drivers/input/misc/pm8941-pwrkey.c
++++ b/drivers/input/misc/pm8941-pwrkey.c
+@@ -21,6 +21,8 @@
+ #include <linux/sched/debug.h>
+ #include <linux/sched.h>
+ #include <linux/printk.h>
++#include <linux/srcu.h>
++#include <linux/mutex.h>
+ 
+ #define PON_REV2			0x01
+ 
+@@ -87,6 +89,7 @@
+ 	u32 sw_debounce_time_us;
+ 	ktime_t sw_debounce_end_time;
+ 	bool last_status;
++	bool wake_enabled;
+ 	const struct pm8941_data *data;
+ };
+ 
+@@ -155,17 +158,33 @@
+ }
+ 
+ typedef int (*mi_display_pwrkey_callback)(int);
+-mi_display_pwrkey_callback mi_display_pwrkey_cb = NULL;
+-
++static mi_display_pwrkey_callback __rcu mi_display_pwrkey_cb;
++static DEFINE_MUTEX(mi_display_pwrkey_lock);
++DEFINE_STATIC_SRCU(mi_display_pwrkey_srcu);
++
++/* Clear the callback before releasing its owner; do not call from the callback. */
++void mi_display_pwrkey_callback_set(mi_display_pwrkey_callback cb);
+ void mi_display_pwrkey_callback_set(mi_display_pwrkey_callback cb)
+ {
+-	mi_display_pwrkey_cb = cb;
+-	printk(KERN_INFO "%s: func %pF is set.\n", __func__, cb);
+-	return;
++	mutex_lock(&mi_display_pwrkey_lock);
++	rcu_assign_pointer(mi_display_pwrkey_cb, cb);
++	mutex_unlock(&mi_display_pwrkey_lock);
++	synchronize_srcu(&mi_display_pwrkey_srcu);
+ }
+ EXPORT_SYMBOL(mi_display_pwrkey_callback_set);
+ 
+-void show_state_filter_single(unsigned long state_filter)
++static void mi_display_pwrkey_notify(int event)
++{
++	mi_display_pwrkey_callback cb;
++	int idx = srcu_read_lock(&mi_display_pwrkey_srcu);
++
++	cb = srcu_dereference(mi_display_pwrkey_cb, &mi_display_pwrkey_srcu);
++	if (cb)
++		cb(event);
++	srcu_read_unlock(&mi_display_pwrkey_srcu, idx);
++}
++
++static void show_state_filter_single(unsigned long state_filter)
+ {
+ 	struct task_struct *g, *p;
+ 
+@@ -187,7 +206,7 @@
+ 		 */
+ 		touch_nmi_watchdog();
+ 		//touch_all_softlockup_watchdogs();
+-		if (p->__state == state_filter)
++		if (READ_ONCE(p->__state) == state_filter)
+ 			sched_show_task(p);
+ 	}
+ 	rcu_read_unlock();
+@@ -206,9 +225,7 @@
+ 			return IRQ_HANDLED;
+ 		sts &= pwrkey->data->status_bit;
+ 		if (sts) {
+-			if (mi_display_pwrkey_cb != NULL) {
+-				mi_display_pwrkey_cb(PMIC_PWRKEY_BARK_TRIGGER);
+-			}
++			mi_display_pwrkey_notify(PMIC_PWRKEY_BARK_TRIGGER);
+ 			raw_notifier_call_chain(&pwrkey_irq_notifier_list, 0,
+ 						NULL);
+ 		}
+@@ -222,9 +239,7 @@
+ 		sts &= pwrkey->data->status_bit;
+ 		if (sts) {
+ 			int tmp_console = console_loglevel;
+-			if (mi_display_pwrkey_cb != NULL) {
+-				mi_display_pwrkey_cb(PMIC_PWRKEY_BARK_TRIGGER);
+-			}
++			mi_display_pwrkey_notify(PMIC_PWRKEY_BARK_TRIGGER);
+ 			pr_info("pwrkey_resin_bark_irq trigger, start D&R task info");
+ 			console_loglevel = 15;
+ 			pr_info("------ collect D&R-state processes info before long comb key ------\n");
+@@ -268,9 +283,7 @@
+ 	input_sync(pwrkey->input);
+ 
+ 	if (pwrkey->code == KEY_POWER && !sts) {
+-		if (mi_display_pwrkey_cb != NULL) {
+-			mi_display_pwrkey_cb(PMIC_PWRKEY_TRIGGER);
+-		}
++		mi_display_pwrkey_notify(PMIC_PWRKEY_TRIGGER);
+ 	}
+ 
+ 	return IRQ_HANDLED;
+@@ -313,8 +326,14 @@
+ {
+ 	struct pm8941_pwrkey *pwrkey = dev_get_drvdata(dev);
+ 
+-	if (device_may_wakeup(dev))
+-		enable_irq_wake(pwrkey->irq);
++	int ret;
++
++	if (device_may_wakeup(dev) && !pwrkey->wake_enabled) {
++		ret = enable_irq_wake(pwrkey->irq);
++		if (ret)
++			return ret;
++		pwrkey->wake_enabled = true;
++	}
+ 
+ 	return 0;
+ }
+@@ -323,14 +342,28 @@
+ {
+ 	struct pm8941_pwrkey *pwrkey = dev_get_drvdata(dev);
+ 
+-	if (device_may_wakeup(dev))
+-		disable_irq_wake(pwrkey->irq);
++	int ret;
++
++	if (pwrkey->wake_enabled) {
++		ret = disable_irq_wake(pwrkey->irq);
++		if (ret)
++			return ret;
++		pwrkey->wake_enabled = false;
++	}
+ 
+ 	return 0;
+ }
+ 
+ static DEFINE_SIMPLE_DEV_PM_OPS(pm8941_pwr_key_pm_ops,
+ 				pm8941_pwrkey_suspend, pm8941_pwrkey_resume);
++
++static u32 pm8941_debounce_code(u32 delay_us, u32 shift)
++{
++	u64 cycles = (u64)delay_us << shift;
++
++	cycles = div_u64(cycles, USEC_PER_SEC);
++	return cycles ? ilog2(cycles) : 0;
++}
+ 
+ static int pm8941_pwrkey_probe(struct platform_device *pdev)
+ {
+@@ -364,6 +397,8 @@
+ 	}
+ 
+ 	parent = pdev->dev.parent;
++	if (!parent)
++		return -ENODEV;
+ 	regmap_node = pdev->dev.of_node;
+ 	pwrkey->regmap = dev_get_regmap(parent, NULL);
+ 	if (!pwrkey->regmap) {
+@@ -373,6 +408,8 @@
+ 		 * a child of pon node and read regmap and reg from its
+ 		 * parent.
+ 		 */
++		if (!parent->parent)
++			return -ENODEV;
+ 		pwrkey->regmap = dev_get_regmap(parent->parent, NULL);
+ 		if (!pwrkey->regmap) {
+ 			dev_err(&pdev->dev, "failed to locate regmap\n");
+@@ -419,6 +456,9 @@
+ 			"no linux,code assuming power (%d)\n", error);
+ 		pwrkey->code = KEY_POWER;
+ 	}
++
++	if (pwrkey->code > KEY_MAX)
++		return -EINVAL;
+ 
+ 	pwrkey->input = devm_input_allocate_device(&pdev->dev);
+ 	if (!pwrkey->input) {
+@@ -440,8 +480,7 @@
+ 			delay_shift = PON_DBC_SHIFT_GEN1;
+ 		}
+ 
+-		req_delay = (req_delay << delay_shift) / USEC_PER_SEC;
+-		req_delay = ilog2(req_delay);
++		req_delay = pm8941_debounce_code(req_delay, delay_shift);
+ 
+ 		error = regmap_update_bits(pwrkey->regmap,
+ 					   pwrkey->baseaddr + PON_DBC_CTL,
+@@ -472,7 +511,7 @@
+ 
+ 	error = devm_request_threaded_irq(&pdev->dev, pwrkey->irq,
+ 					  NULL, pm8941_pwrkey_irq,
+-					  IRQF_ONESHOT,
++					  IRQF_ONESHOT | IRQF_NO_AUTOEN,
+ 					  pwrkey->data->name, pwrkey);
+ 	if (error) {
+ 		dev_err(&pdev->dev, "failed requesting IRQ: %d\n", error);
+@@ -497,19 +536,28 @@
+ 	}
+ 
+ 	platform_set_drvdata(pdev, pwrkey);
+-	device_init_wakeup(&pdev->dev, 1);
++	error = device_init_wakeup(&pdev->dev, 1);
++	if (error) {
++		if (pwrkey->data->supports_ps_hold_poff_config)
++			unregister_reboot_notifier(&pwrkey->reboot_notifier);
++		return error;
++	}
++	enable_irq(pwrkey->irq);
+ 
+ 	return 0;
+ }
+ 
+-static int pm8941_pwrkey_remove(struct platform_device *pdev)
++static void pm8941_pwrkey_remove(struct platform_device *pdev)
+ {
+ 	struct pm8941_pwrkey *pwrkey = platform_get_drvdata(pdev);
+ 
+ 	if (pwrkey->data->supports_ps_hold_poff_config)
+ 		unregister_reboot_notifier(&pwrkey->reboot_notifier);
+ 
+-	return 0;
++	if (pwrkey->wake_enabled)
++		disable_irq_wake(pwrkey->irq);
++	devm_free_irq(&pdev->dev, pwrkey->irq, pwrkey);
++	device_init_wakeup(&pdev->dev, false);
+ }
+ 
+ static const struct pm8941_data pwrkey_data = {
+--- a/drivers/input/fingerprint/mi_fp/fp_driver.c
++++ b/drivers/input/fingerprint/mi_fp/fp_driver.c
+@@ -41,6 +41,12 @@
+ static struct wakeup_source *fp_wakesrc = NULL;
+ struct work_struct fp_display_work;
+ static struct fp_device fp;
++static DEFINE_MUTEX(fp_io_lock);
++static bool fp_present;
++static unsigned int fp_users;
++static unsigned int fp_main_users;
++#define FP_MINOR_COUNT 2
++
+ 
+ #ifndef XIAOMI_DRM_INTERFACE_WA
+ 
+@@ -53,64 +59,29 @@
+ 
+ static int fp_check_panel(struct device_node *np)
+ {
+-	int i;
+-	int count;
+ 	struct device_node *node;
+ 	struct drm_panel *panel;
+-
+-	if (!np) {
+-		pr_err("device is null,failed to find active panel\n");
++	int i, count, ret = -ENODEV;
++
++	if (!np)
+ 		return -ENODEV;
+-	}
+ 	count = of_count_phandle_with_args(np, "panel", NULL);
+-	pr_info("%s:of_count_phandle_with_args:count=%d\n", __func__, count);
+-	if (count <= 0) {
+-#if IS_ENABLED(CONFIG_FP_HAVE_MULTI_SCREEN)
+-		goto find_sec_panel;
+-#endif
+-		return -ENODEV;
+-	}
++	if (count < 0)
++		return count;
+ 	for (i = 0; i < count; i++) {
+ 		node = of_parse_phandle(np, "panel", i);
++		if (!node)
++			continue;
+ 		panel = of_drm_find_panel(node);
+ 		of_node_put(node);
+ 		if (!IS_ERR(panel)) {
+ 			prim_panel = panel;
+-			pr_info("%s:prim_panel = panel\n", __func__);
+-			break;
+-		} else {
+-			prim_panel = NULL;
+-			pr_info("%s:prim_panel = NULL\n", __func__);
+-		}
+-	}
+-	if (PTR_ERR(prim_panel) == -EPROBE_DEFER) {
+-		pr_err("%s ERROR: Cannot find prim_panel of node!", __func__);
+-	}
+-
+-#if IS_ENABLED(CONFIG_FP_HAVE_MULTI_SCREEN)
+-find_sec_panel:
+-	count = of_count_phandle_with_args(np, "panel1", NULL);
+-	pr_info("%s:of_count_phandle_with_args:count=%d\n", __func__, count);
+-	if (count <= 0)
+-		return -ENODEV;
+-	for (i = 0; i < count; i++) {
+-		node = of_parse_phandle(np, "panel1", i);
+-		panel = of_drm_find_panel(node);
+-		of_node_put(node);
+-		if (!IS_ERR(panel)) {
+-			sec_panel = panel;
+-			pr_info("%s:sec_panel = panel\n", __func__);
+-			break;
+-		} else {
+-			sec_panel = NULL;
+-			pr_info("%s:sec_panel = NULL\n", __func__);
+-		}
+-	}
+-	if (PTR_ERR(sec_panel) == -EPROBE_DEFER) {
+-		pr_err("%s ERROR: Cannot find sec_panel of node!", __func__);
+-	}
+-#endif
+-	return PTR_ERR(panel);
++			return 0;
++		}
++		if (PTR_ERR(panel) == -EPROBE_DEFER)
++			ret = -EPROBE_DEFER;
++	}
++	return ret;
+ }
+ 
+ static void fp_screen_state_for_fingerprint_callback(
+@@ -118,7 +89,7 @@
+ 	struct panel_event_notification *notification, void *client_data)
+ {
+ 	struct fp_device *fp_dev = client_data;
+-	if (!fp_dev)
++	if (!fp_dev || !READ_ONCE(fp_present))
+ 		return;
+ 
+ 	if (!notification) {
+@@ -134,19 +105,19 @@
+ 		switch (notification->notif_type) {
+ 		case DRM_PANEL_EVENT_UNBLANK:
+ 			pr_debug("%s:DRM_PANEL_EVENT_UNBLANK\n", __func__);
+-			if (fp_dev->device_available == 1) {
+-				fp_dev->fb_black = 0;
+-				if (fp_dev->fp_netlink_enabled)
++			if (READ_ONCE(fp_dev->device_available) == 1) {
++				WRITE_ONCE(fp_dev->fb_black, 0);
++				if (READ_ONCE(fp_dev->fp_netlink_enabled))
+ 					fp_netlink_send(fp_dev,
+ 							FP_NETLINK_SCREEN_ON);
+ 			}
+ 			break;
+ 		case DRM_PANEL_EVENT_BLANK:
+ 			pr_debug("%s:DRM_PANEL_EVENT_BLANK\n", __func__);
+-			if (fp_dev->device_available == 1) {
+-				fp_dev->fb_black = 1;
+-				fp_dev->wait_finger_down = true;
+-				if (fp_dev->fp_netlink_enabled)
++			if (READ_ONCE(fp_dev->device_available) == 1) {
++				WRITE_ONCE(fp_dev->fb_black, 1);
++				WRITE_ONCE(fp_dev->wait_finger_down, true);
++				if (READ_ONCE(fp_dev->fp_netlink_enabled))
+ 					fp_netlink_send(fp_dev,
+ 							FP_NETLINK_SCREEN_OFF);
+ 			}
+@@ -159,73 +130,30 @@
+ 
+ static void fp_register_panel_notifier_work(struct work_struct *work)
+ {
+-	struct fp_device *fp_dev =
+-		container_of(work, struct fp_device, screen_state_dw.work);
+-	int error = 0;
+-	static int retry_count = 0;
++	struct fp_device *fp_dev = container_of(work, struct fp_device, screen_state_dw.work);
+ 	struct device_node *node;
++	int ret;
++
++	if (!READ_ONCE(fp_present) || cookie)
++		return;
+ 	node = of_find_node_by_name(NULL, "fingerprint-screen");
+-	if (!node) {
+-		pr_err("%s ERROR: Cannot find node with panel!", __func__);
++	if (!node)
+ 		return;
+-	}
+-
+-	error = fp_check_panel(node);
+-	if (prim_panel) {
+-		pr_info("success to get primary panel, retry times = %d",
+-			retry_count);
+-		if (!cookie) {
+-			cookie = panel_event_notifier_register(
+-				PANEL_EVENT_NOTIFICATION_PRIMARY,
+-				PANEL_EVENT_NOTIFIER_CLIENT_FINGERPRINT,
+-				prim_panel,
+-				fp_screen_state_for_fingerprint_callback,
+-				(void *)fp_dev);
+-			if (IS_ERR(cookie))
+-				pr_err("%s:Failed to register for prim_panel events\n",
+-				       __func__);
+-			else
+-				pr_info("%s:prim_panel_event_notifier_register register succeed\n",
+-					__func__);
+-		}
+-	} else {
+-		pr_err("Failed to register primary panel notifier, try again\n");
+-		if (retry_count++ < 5) {
+-			queue_delayed_work(fp_dev->screen_state_wq,
+-					   &fp_dev->screen_state_dw, 5 * HZ);
+-		} else {
+-			pr_err("Failed to register primary panel notifier, not try\n");
+-		}
+-	}
+-
+-#if IS_ENABLED(CONFIG_FP_HAVE_MULTI_SCREEN)
+-	if (sec_panel) {
+-		pr_info("success to get second panel, retry times = %d",
+-			retry_count);
+-		if (!cookie_sec) {
+-			cookie_sec = panel_event_notifier_register(
+-				PANEL_EVENT_NOTIFICATION_SECONDARY,
+-				PANEL_EVENT_NOTIFIER_CLIENT_FINGERPRINT_SECOND,
+-				sec_panel,
+-				fp_screen_state_for_fingerprint_callback,
+-				(void *)fp_dev);
+-			if (IS_ERR(cookie_sec))
+-				pr_err("%s:Failed to register for sec_panel events\n",
+-				       __func__);
+-			else
+-				pr_info("%s:sec_panel_event_notifier_register register succeed\n",
+-					__func__);
+-		}
+-	} else {
+-		pr_err("Failed to register second panel notifier, try again\n");
+-		if (retry_count++ < 5) {
+-			queue_delayed_work(fp_dev->screen_state_wq,
+-					   &fp_dev->screen_state_dw, 5 * HZ);
+-		} else {
+-			pr_err("Failed to register second panel notifier, not try\n");
+-		}
+-	}
+-#endif
++	ret = fp_check_panel(node);
++	of_node_put(node);
++	if (!ret) {
++		cookie = panel_event_notifier_register(PANEL_EVENT_NOTIFICATION_PRIMARY,
++			PANEL_EVENT_NOTIFIER_CLIENT_FINGERPRINT, prim_panel,
++			fp_screen_state_for_fingerprint_callback, fp_dev);
++		if (!IS_ERR(cookie))
++			return;
++		ret = PTR_ERR(cookie);
++		cookie = NULL;
++	}
++	if (READ_ONCE(fp_present) && fp_dev->panel_retry++ < 5)
++		queue_delayed_work(fp_dev->screen_state_wq, &fp_dev->screen_state_dw, 5 * HZ);
++	else
++		dev_err(&fp_dev->driver_device->dev, "panel notifier unavailable: %d\n", ret);
+ }
+ #endif /*XIAOMI_DRM_INTERFACE_WA*/
+ 
+@@ -553,8 +481,11 @@
+ 		       char *buf)
+ {
+ 	struct fp_device *fp_dev = &fp;
+-	int irq = gpio_get_value(fp_dev->irq_gpio);
+-
++	int irq;
++
++	if (!READ_ONCE(fp_present))
++		return -ENODEV;
++	irq = gpio_get_value(fp_dev->irq_gpio);
+ 	return scnprintf(buf, PAGE_SIZE, "%i\n", irq);
+ }
+ 
+@@ -627,14 +558,18 @@
+ static irqreturn_t fp_irq(int irq, void *handle)
+ {
+ 	struct fp_device *fp_dev = (struct fp_device *)handle;
++
++	if (!READ_ONCE(fp_present))
++		return IRQ_HANDLED;
+ #ifdef CONFIG_SIDE_FINGERPRINT
+ 	sysfs_notify(&fp_dev->driver_device->dev.kobj, NULL,
+ 		     dev_attr_irq.attr.name);
+ #endif
+ 	__pm_wakeup_event(fp_wakesrc, WAKELOCK_HOLD_TIME);
+ 	fp_netlink_send(fp_dev, FP_NETLINK_IRQ);
+-	if ((fp_dev->wait_finger_down == true) && (fp_dev->fb_black == 1)) {
+-		fp_dev->wait_finger_down = false;
++	if ((READ_ONCE(fp_dev->wait_finger_down) == true) &&
++	    (READ_ONCE(fp_dev->fb_black) == 1)) {
++		WRITE_ONCE(fp_dev->wait_finger_down, false);
+ 	}
+ 	return IRQ_HANDLED;
+ }
+@@ -643,7 +578,7 @@
+ /* file operation function                                              */
+ /* -------------------------------------------------------------------- */
+ 
+-static long fp_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++static long fp_ioctl_locked(struct file *filp, unsigned int cmd, unsigned long arg)
+ {
+ 	struct fp_device *fp_dev = &fp;
+ 	struct fp_key fp_key;
+@@ -651,7 +586,8 @@
+ 	u8 buf = 0;
+ 	u8 netlink_route = fp_dev->fp_netlink_num;
+ 	struct fp_ioc_chip_info info;
+-	char vendor_name[10];
++	char vendor_name[11] = { 0 };
++	char device_info[30] = { 0 };
+ 	u_int32_t rst_time[2];
+ 
+ 	FUNC_ENTRY();
+@@ -684,28 +620,27 @@
+ 			retval = -EFAULT;
+ 			break;
+ 		}
+-		fp_dev->fp_netlink_enabled = 1;
++		WRITE_ONCE(fp_dev->fp_netlink_enabled, 1);
+ 		break;
+ 
+ 	case FP_IOC_EXIT:
+ 		pr_debug("FP_IOC_EXIT ======\n");
+ 		fp_disable_irq(fp_dev);
+-		if (fp_dev->fp_netlink_enabled)
++		if (READ_ONCE(fp_dev->fp_netlink_enabled))
+ 			fp_netlink_destroy(fp_dev);
+-		fp_dev->fp_netlink_enabled = 0;
+-		fp_dev->device_available = 0;
++		WRITE_ONCE(fp_dev->fp_netlink_enabled, 0);
++		WRITE_ONCE(fp_dev->device_available, 0);
+ 		break;
+ 
+ 	case FP_IOC_ENABLE_IRQ:
+ 		pr_debug("FP_IOC_ENABLE_IRQ ======\n");
+-		fp_enable_irq(fp_dev);
++		retval = fp_enable_irq(fp_dev);
+ 		break;
+ 
+ 	case FP_IOC_DEV_INFO:
+ 		pr_debug("FP_IOC_DEV_INFO ======\n");
+-		if (copy_to_user((char __user *)arg,
+-				 (char *)fp_dev->vendor_names,
+-				 30 * sizeof(char))) {
++		strscpy(device_info, fp_dev->vendor_names, sizeof(device_info));
++		if (copy_to_user((char __user *)arg, device_info, sizeof(device_info))) {
+ 			pr_debug("FP_IOC_DEV_INFO failed!\n");
+ 			retval = -EFAULT;
+ 			break;
+@@ -714,12 +649,12 @@
+ 
+ 	case FP_IOC_DISABLE_IRQ:
+ 		pr_debug("FP_IOC_DISABLE_IRQ ======\n");
+-		fp_disable_irq(fp_dev);
++		retval = fp_disable_irq(fp_dev);
+ 		break;
+ 
+ 	case FP_IOC_RESET:
+ 		pr_debug("FP_IOC_RESET  ======\n");
+-		fp_hw_reset(fp_dev);
++		retval = fp_hw_reset(fp_dev);
+ 		break;
+ 
+ 	case FP_IOC_RESET_TIME_MS:
+@@ -735,13 +670,13 @@
+ 			retval = -EFAULT;
+ 			break;
+ 		} else {
+-			fp_hw_reset_delay(fp_dev, rst_time[0], rst_time[1]);
++			retval = fp_hw_reset_delay(fp_dev, rst_time[0], rst_time[1]);
+ 		}
+ 		break;
+ 
+ 	case FP_IOC_RESET_OUT_LOW:
+ 		pr_debug("FP_IOC_RESET_OUT_LOW  ======\n");
+-		pinctrl_select_state(fp_dev->pinctrl, fp_dev->pins_reset_low);
++		retval = pinctrl_select_state(fp_dev->pinctrl, fp_dev->pins_reset_low);
+ 		break;
+ 
+ 	case FP_IOC_ENABLE_POWER:
+@@ -753,11 +688,11 @@
+ 			break;
+ 		}
+ 		if (!strcmp(vendor_name, POWER_LDO_3V3)) {
+-			fp_power_on(&fp_dev->vreg_3v3);
++			retval = fp_power_on(&fp_dev->vreg_3v3);
+ 		} else if (!strcmp(vendor_name, POWER_LDO_1V8)) {
+-			fp_power_on(&fp_dev->vreg_1v8);
++			retval = fp_power_on(&fp_dev->vreg_1v8);
+ 		} else if (!strcmp(vendor_name, POWER_VDDIO)) {
+-			fp_power_on(&fp_dev->vreg_gpio);
++			retval = fp_power_on(&fp_dev->vreg_gpio);
+ 		} else {
+ 			pr_err("%s is unknown vendor name", vendor_name);
+ 			retval = -EPERM;
+@@ -773,11 +708,11 @@
+ 			break;
+ 		}
+ 		if (!strcmp(vendor_name, "vreg3v3")) {
+-			fp_power_off(&fp_dev->vreg_3v3);
++			retval = fp_power_off(&fp_dev->vreg_3v3);
+ 		} else if (!strcmp(vendor_name, "vreg1v8")) {
+-			fp_power_off(&fp_dev->vreg_1v8);
++			retval = fp_power_off(&fp_dev->vreg_1v8);
+ 		} else if (!strcmp(vendor_name, "pwr_gpio")) {
+-			fp_power_off(&fp_dev->vreg_gpio);
++			retval = fp_power_off(&fp_dev->vreg_gpio);
+ 		} else {
+ 			pr_err("%s is unknown vendor name", vendor_name);
+ 			retval = -EPERM;
+@@ -843,7 +778,6 @@
+ 	case FP_IOC_REQUEST_RESOURCE:
+ 		pr_debug("FP_IOC_REQUEST_RESOURCE ======\n");
+ 		if (!fp_dev->irq_request) {
+-			gpio_direction_input(fp_dev->irq_gpio);
+ 			int ret = request_threaded_irq(
+ 				fp_dev->irq_num, NULL, fp_irq,
+ 				IRQF_TRIGGER_RISING | IRQF_ONESHOT,
+@@ -851,9 +785,9 @@
+ 			if (!ret) {
+ 				pr_debug("irq thread request success!\n");
+ 				fp_dev->irq_request = true;
+-				//fp_disable_irq(fp_dev);
++				fp_dev->irq_enabled = true;
+ 			} else {
+-				retval = -EFAULT;
++				retval = ret;
+ 				pr_err("irq thread request failed, status = %d\n",
+ 				       ret);
+ 			}
+@@ -1019,6 +953,17 @@
+ 	return retval;
+ }
+ 
++static long fp_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++	long ret = -ENODEV;
++
++	mutex_lock(&fp_io_lock);
++	if (fp_present && filp->private_data == &fp)
++		ret = fp_ioctl_locked(filp, cmd, arg);
++	mutex_unlock(&fp_io_lock);
++	return ret;
++}
++
+ #ifdef CONFIG_COMPAT
+ static long fp_compat_ioctl(struct file *filp, unsigned int cmd,
+ 			    unsigned long arg)
+@@ -1035,167 +980,57 @@
+ /* -------------------------------------------------------------------- */
+ static int fp_open(struct inode *inode, struct file *filp)
+ {
+-	struct fp_device *fp_dev = NULL;
+-	int status = -ENXIO;
+-	int minor_no = -1;
+-#ifdef FP_ULTRA_QCOM
+-	int rc = 0;
+-#endif
+-
+-	FUNC_ENTRY();
+-
+-	if (!inode || (!inode->i_cdev && !inode->i_rdev) || !filp) {
+-		pr_err("NULL pointer passed\n");
+-		return -EINVAL;
+-	}
+-	minor_no = iminor(inode);
+-
+-	if (minor_no == MINOR_NUM_MIFP) {
+-		mutex_lock(&device_list_lock);
+-		list_for_each_entry(fp_dev, &device_list, device_entry) {
+-			if (fp_dev->devt == inode->i_rdev) {
+-				pr_debug("Found MIFP\n");
+-				status = 0;
+-				break;
++	int ret = -ENODEV;
++	unsigned int minor = iminor(inode);
++
++	mutex_lock(&fp_io_lock);
++	if (!fp_present || MAJOR(inode->i_rdev) != MAJOR(fp.devt) ||
++	    minor >= FP_MINOR_COUNT)
++		goto out;
++	/* A stale open may hold the old cdev across remove and rebind. */
++	if (inode->i_cdev != (minor == MINOR_NUM_MIFP ? fp.cdev : fp.fpid_cdev))
++		goto out;
++	ret = nonseekable_open(inode, filp);
++	if (ret)
++		goto out;
++	filp->private_data = &fp;
++	fp_users++;
++	if (minor == MINOR_NUM_MIFP) {
++		fp_main_users++;
++		WRITE_ONCE(fp.device_available, 1);
++#ifndef XIAOMI_DRM_INTERFACE_WA
++		queue_delayed_work(fp.screen_state_wq, &fp.screen_state_dw, 5 * HZ);
++#endif
++	}
++out:
++	mutex_unlock(&fp_io_lock);
++	return ret;
++}
++
++static int fp_release(struct inode *inode, struct file *filp)
++{
++	mutex_lock(&fp_io_lock);
++	if (filp->private_data != &fp)
++		goto out;
++	filp->private_data = NULL;
++	if (fp_users)
++		fp_users--;
++	if (iminor(inode) == MINOR_NUM_MIFP && fp_main_users) {
++		fp_main_users--;
++		if (fp_present && !fp_main_users) {
++			if (fp.irq_request) {
++				free_irq(fp.irq_num, &fp);
++				fp.irq_request = false;
++				fp.irq_enabled = false;
+ 			}
+-		}
+-		mutex_unlock(&device_list_lock);
+-
+-		if (status == 0) {
+-			filp->private_data = fp_dev;
+-			nonseekable_open(inode, filp);
+ #ifndef XIAOMI_DRM_INTERFACE_WA
+-			if (fp_dev->screen_state_wq) {
+-				queue_delayed_work(fp_dev->screen_state_wq,
+-						   &fp_dev->screen_state_dw,
+-						   5 * HZ);
+-				pr_info("%s:queue_delayed_work\n", __func__);
+-			}
+-#endif
+-			fp_dev->device_available = 1;
+-		}
+-	}
+-
+-	else if (minor_no == MINOR_NUM_MIFP_ID) {
+-		pr_debug("Found MIFP_ID\n");
+-
+-		fp_dev = container_of(inode->i_cdev, struct fp_device,
+-				      fpid_cdev);
+-
+-		filp->private_data = fp_dev;
+-
+-		status = 0;
+-	}
+-#ifdef FP_ULTRA_QCOM
+-	else if (minor_no == MINOR_NUM_IPC) {
+-		pr_debug("Found QBT_IPC\n");
+-		fp_dev = container_of(inode->i_cdev, struct fp_device,
+-				      qbt_ipc_cdev);
+-
+-		filp->private_data = fp_dev;
+-		status = 0;
+-
+-		pr_debug("entry fd_available=%d\n",
+-			 atomic_read(&fp_dev->fd_available));
+-
+-		/* disallowing concurrent opens */
+-		if (!atomic_dec_and_test(&fp_dev->ipc_available)) {
+-			atomic_inc(&fp_dev->ipc_available);
+-			rc = -EBUSY;
+-		}
+-
+-		pr_debug("exit rc = %d, fd_available=%d\n", rc,
+-			 atomic_read(&fp_dev->fd_available));
+-	}
+-
+-	else if (minor_no == MINOR_NUM_FD) {
+-		pr_debug("Found QBT_FD\n");
+-		fp_dev = container_of(inode->i_cdev, struct fp_device,
+-				      qbt_fd_cdev);
+-
+-		filp->private_data = fp_dev;
+-		status = 0;
+-
+-		pr_debug("entry fd_available=%d\n",
+-			 atomic_read(&fp_dev->fd_available));
+-
+-		/* disallowing concurrent opens */
+-		if (!atomic_dec_and_test(&fp_dev->fd_available)) {
+-			atomic_inc(&fp_dev->fd_available);
+-			rc = -EBUSY;
+-		}
+-		pr_debug("exit rc = %d, fd_available=%d\n", rc,
+-			 atomic_read(&fp_dev->fd_available));
+-	}
+-#endif
+-
+-	else {
+-		pr_err("Invalid minor number %d\n", minor_no);
+-		return -EINVAL;
+-	}
+-
+-	return status;
+-}
+-
+-static int fp_release(struct inode *inode, struct file *filp)
+-{
+-	struct fp_device *fp_dev = NULL;
+-	int minor_no = -1;
+-
+-	FUNC_ENTRY();
+-
+-	if (!filp || !filp->private_data || !inode) {
+-		pr_err("NULL pointer passed\n");
+-		return -EINVAL;
+-	}
+-
+-	fp_dev = filp->private_data;
+-	minor_no = iminor(inode);
+-
+-	if (minor_no == MINOR_NUM_MIFP) {
+-		pr_debug("Found MIFP\n");
+-		if (fp_dev->irq_request && fp_dev->irq_num) {
+-			fp_disable_irq(fp_dev);
+-			free_irq(fp_dev->irq_num, fp_dev);
+-			fp_dev->irq_request = false;
+-		}
+-#ifndef XIAOMI_DRM_INTERFACE_WA
+-		if (fp_dev->screen_state_wq) {
+-			cancel_delayed_work_sync(&fp_dev->screen_state_dw);
+-			pr_info("%s:cancel_delayed_work_sync\n", __func__);
+-		}
+-#endif
+-		fp_dev->device_available = 0;
+-	} else if (minor_no == MINOR_NUM_MIFP_ID) {
+-		pr_debug("Found MIFP_ID\n");
+-	}
+-#ifdef FP_ULTRA_QCOM
+-	else if (minor_no == MINOR_NUM_IPC || minor_no == MINOR_NUM_FD) {
+-		pr_debug("entry fd_available=%d\n",
+-			 atomic_read(&fp_dev->fd_available));
+-		if (minor_no == MINOR_NUM_FD) {
+-			pr_debug("Found QBT_FD\n");
+-			atomic_inc(&fp_dev->fd_available);
+-		} else if (minor_no == MINOR_NUM_IPC) {
+-			pr_debug("Found QBT_IPC\n");
+-			atomic_inc(&fp_dev->ipc_available);
+-			if (fp_dev->fw_ipc.work_init) {
+-				free_ipc_irq(fp_dev);
+-			}
+-		}
+-
+-		if (atomic_read(&fp_dev->wakelock_acquired) != 0) {
+-			pr_debug("Releasing wakelock\n");
+-			pm_relax(fp_dev->device);
+-			atomic_set(&fp_dev->wakelock_acquired, 0);
+-		}
+-		pr_debug("exit fd_available=%d\n",
+-			 atomic_read(&fp_dev->fd_available));
+-	}
+-#endif
+-	else {
+-		pr_err("Invalid minor number %d\n", minor_no);
+-	}
++			cancel_delayed_work_sync(&fp.screen_state_dw);
++#endif
++			WRITE_ONCE(fp.device_available, 0);
++		}
++	}
++out:
++	mutex_unlock(&fp_io_lock);
+ 	return 0;
+ }
+ 
+@@ -1426,7 +1261,7 @@
+ 	{ EV_KEY, FP_KEY_DOUBLE_CLICK },
+ };
+ 
+-int fp_create_input_device(void)
++static int fp_create_input_device(void)
+ {
+ 	struct fp_device *fp_dev = &fp;
+ 	int status = 0;
+@@ -1447,11 +1282,13 @@
+ 		input_set_capability(fp_dev->input, maps[i].type, maps[i].code);
+ 	}
+ 
+-	if (input_register_device(fp_dev->input)) {
++	status = input_register_device(fp_dev->input);
++	if (status) {
+ 		pr_debug("Failed to register input device.\n");
+ 		status = -ENODEV;
+ 		goto err_input_2;
+ 	}
++	fp_dev->input_registered = true;
+ 	return 0;
+ 
+ err_input_2:
+@@ -1464,288 +1301,205 @@
+ 	return status;
+ }
+ 
+-void fp_free_input_device(void)
++static void fp_free_input_device(void)
++{
++	if (fp.input) {
++		if (fp.input_registered)
++			input_unregister_device(fp.input);
++		else
++			input_free_device(fp.input);
++		fp.input = NULL;
++		fp.input_registered = false;
++	}
++}
++
++static void fp_cleanup(struct fp_device *fp_dev)
++{
++	if (fp_dev->sysfs_registered) {
++		sysfs_remove_group(&fp_dev->driver_device->dev.kobj, &attribute_group);
++		fp_dev->sysfs_registered = false;
++	}
++	if (fp_dev->cdev) {
++		if (fp_dev->cdev_registered)
++			cdev_del(fp_dev->cdev);
++		else
++			kobject_put(&fp_dev->cdev->kobj);
++		fp_dev->cdev = NULL;
++		fp_dev->cdev_registered = false;
++	}
++	if (fp_dev->fpid_cdev) {
++		if (fp_dev->id_cdev_registered)
++			cdev_del(fp_dev->fpid_cdev);
++		else
++			kobject_put(&fp_dev->fpid_cdev->kobj);
++		fp_dev->fpid_cdev = NULL;
++		fp_dev->id_cdev_registered = false;
++	}
++	if (fp_dev->irq_request) {
++		free_irq(fp_dev->irq_num, fp_dev);
++		fp_dev->irq_request = false;
++		fp_dev->irq_enabled = false;
++	}
++#ifndef XIAOMI_DRM_INTERFACE_WA
++	if (fp_dev->screen_state_wq) {
++		cancel_delayed_work_sync(&fp_dev->screen_state_dw);
++		destroy_workqueue(fp_dev->screen_state_wq);
++		fp_dev->screen_state_wq = NULL;
++	}
++	panel_event_notifier_unregister(cookie);
++	cookie = NULL;
++	prim_panel = NULL;
++#endif
++	fp_netlink_destroy(fp_dev);
++	WRITE_ONCE(fp_dev->fp_netlink_enabled, 0);
++	wakeup_source_unregister(fp_wakesrc);
++	fp_wakesrc = NULL;
++	fp_free_input_device();
++	if (fp_dev->listed) {
++		mutex_lock(&device_list_lock);
++		list_del_init(&fp_dev->device_entry);
++		mutex_unlock(&device_list_lock);
++		fp_dev->listed = false;
++	}
++	if (fp_dev->device) {
++		device_destroy(fp_dev->class, fp_dev->devt);
++		fp_dev->device = NULL;
++	}
++	if (fp_dev->id_device) {
++		device_destroy(fp_dev->class, MKDEV(MAJOR(fp_dev->devt), MINOR_NUM_MIFP_ID));
++		fp_dev->id_device = NULL;
++	}
++	if (fp_dev->region_registered) {
++		unregister_chrdev_region(fp_dev->devt, FP_MINOR_COUNT);
++		fp_dev->region_registered = false;
++	}
++	if (fp_dev->class) {
++		class_destroy(fp_dev->class);
++		fp_dev->class = NULL;
++	}
++	if (fp_power_off(&fp_dev->vreg_gpio))
++		dev_err(&fp_dev->driver_device->dev, "failed to disable fingerprint GPIO power\n");
++	if (fp_power_off(&fp_dev->vreg_1v8))
++		dev_err(&fp_dev->driver_device->dev, "failed to disable fingerprint 1.8V supply\n");
++	if (fp_power_off(&fp_dev->vreg_3v3))
++		dev_err(&fp_dev->driver_device->dev, "failed to disable fingerprint 3.3V supply\n");
++}
++
++static int fp_probe(struct platform_device *driver_device)
+ {
+ 	struct fp_device *fp_dev = &fp;
+-
+-	if (fp_dev->input != NULL) {
+-		input_free_device(fp_dev->input);
+-		fp_dev->input = NULL;
+-	}
+-}
+-
+-#ifdef CONFIG_FP_MTK_PLATFORM
+-static int fp_probe(struct spi_device *driver_device)
+-#else
+-static int fp_probe(struct platform_device *driver_device)
+-#endif
+-{
+-	struct fp_device *fp_dev = &fp;
+-	int status = -EINVAL;
+-	int ret = 0;
+-	struct device *device;
+-	FUNC_ENTRY();
+-
++	int ret;
++
++	mutex_lock(&fp_io_lock);
++	/* Outstanding files retain this singleton; do not reuse it on rebind. */
++	if (fp_present || fp_users || fp_dev->driver_device) {
++		mutex_unlock(&fp_io_lock);
++		return -EBUSY;
++	}
++	memset(fp_dev, 0, sizeof(*fp_dev));
++	fp_dev->driver_device = driver_device;
++	fp_dev->irq_gpio = -EINVAL;
+ 	INIT_LIST_HEAD(&fp_dev->device_entry);
+-
+-	/* setup fp configurations. */
+-	fp_dev->irq_gpio = -EINVAL;
+-	fp_dev->irq_enabled = 1;
+-	fp_dev->device_available = 0;
+-	fp_dev->fb_black = 0;
+-	fp_dev->wait_finger_down = false;
+-	fp_dev->fp_netlink_enabled = 0;
+-	fp_dev->fingerdown = 0;
+-	fp_dev->irq_request = false;
+-	fp_dev->driver_device = driver_device;
+-	/* config fp power. */
++	init_waitqueue_head(&fp_dev->fp_wait_queue);
+ 	fp_power_config(fp_dev);
+-	/* get gpio info from dts or defination */
+-	status = fp_parse_dts(fp_dev);
+-	if (status) {
+-		goto err_dts;
+-	}
+-#ifdef CONFIG_FP_MTK_PLATFORM
+-	if (!IS_ERR(fp_dev->pins_eint_default)) {
+-		pinctrl_select_state(fp_dev->pinctrl,
+-				     fp_dev->pins_eint_default);
+-	}
+-
+-	if (IS_ERR(fp_dev->pins_spiio_spi_mode)) {
+-		ret = PTR_ERR(fp_dev->pins_spiio_spi_mode);
+-		pr_debug("%s fingerprint pinctrl spiio_spi_mode NULL\n",
+-			 __func__);
+-		return ret;
+-	} else {
+-		pinctrl_select_state(fp_dev->pinctrl,
+-				     fp_dev->pins_spiio_spi_mode);
+-	}
+-#endif
+-	/* create class */
++	ret = fp_parse_dts(fp_dev);
++	if (ret)
++		goto fail;
++#ifndef XIAOMI_DRM_INTERFACE_WA
++	INIT_DELAYED_WORK(&fp_dev->screen_state_dw, fp_register_panel_notifier_work);
++	fp_dev->screen_state_wq = alloc_ordered_workqueue("fp_screen_state", 0);
++	if (!fp_dev->screen_state_wq) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++#endif
++	ret = fp_create_input_device();
++	if (ret)
++		goto fail;
++	fp_wakesrc = wakeup_source_register(&driver_device->dev, "fp_wakesrc");
++	if (!fp_wakesrc) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++	ret = fp_netlink_init(fp_dev);
++	if (ret)
++		goto fail;
++	WRITE_ONCE(fp_dev->fp_netlink_enabled, true);
+ 	fp_dev->class = class_create(FP_CLASS_NAME);
+ 	if (IS_ERR(fp_dev->class)) {
+-		pr_debug("Failed to create class.\n");
+-		status = -ENODEV;
+-		goto err_class;
+-	}
+-	/* get device no */
+-	status = alloc_chrdev_region(&fp_dev->devt, 0, 1, FP_DEV_NAME);
+-	if (status < 0) {
+-		pr_debug("Failed to alloc devt.\n");
+-		goto err_devno;
+-	}
+-
+-	/* cdev init and add */
+-	cdev_init(&fp_dev->cdev, &fp_fops);
+-	fp_dev->cdev.owner = THIS_MODULE;
+-	status = cdev_add(&fp_dev->cdev,
+-			  MKDEV(MAJOR(fp_dev->devt), MINOR_NUM_MIFP), 1);
+-	if (status) {
+-		pr_debug("Failed to add cdev.\n");
+-		goto err_cdev;
+-	}
+-
+-	/* mifp_vendor cdev init and add */
+-	cdev_init(&fp_dev->fpid_cdev, &fp_fops);
+-	fp_dev->fpid_cdev.owner = THIS_MODULE;
+-	status = cdev_add(&fp_dev->fpid_cdev,
+-			  MKDEV(MAJOR(fp_dev->devt), MINOR_NUM_MIFP_ID), 1);
+-	if (status) {
+-		pr_debug("Failed to add fpid cdev.\n");
+-		goto err_fpid_cdev;
+-	}
+-
+-	/* create mifp_vendor device */
+-	device = device_create(fp_dev->class, NULL, fp_dev->fpid_cdev.dev,
+-			       fp_dev, FP_ID_DEV_NAME);
+-	if (IS_ERR(device)) {
+-		ret = PTR_ERR(device);
+-		pr_err("fpid device create failed %d\n", ret);
+-		goto err_fpid_device;
+-	}
+-
+-#ifdef FP_ULTRA_QCOM
+-	if (fp_ultra_dev_register() != 0) {
+-		goto err_register_ultra_dev;
+-	}
+-#endif
+-
+-	/* create device */
++		ret = PTR_ERR(fp_dev->class);
++		fp_dev->class = NULL;
++		goto fail;
++	}
++	ret = alloc_chrdev_region(&fp_dev->devt, 0, FP_MINOR_COUNT, FP_DEV_NAME);
++	if (ret)
++		goto fail;
++	fp_dev->region_registered = true;
++	fp_dev->cdev = cdev_alloc();
++	if (!fp_dev->cdev) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++	fp_dev->cdev->ops = &fp_fops;
++	fp_dev->cdev->owner = THIS_MODULE;
++	ret = cdev_add(fp_dev->cdev, fp_dev->devt, 1);
++	if (ret)
++		goto fail;
++	fp_dev->cdev_registered = true;
++	fp_dev->fpid_cdev = cdev_alloc();
++	if (!fp_dev->fpid_cdev) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++	fp_dev->fpid_cdev->ops = &fp_fops;
++	fp_dev->fpid_cdev->owner = THIS_MODULE;
++	ret = cdev_add(fp_dev->fpid_cdev,
++		       MKDEV(MAJOR(fp_dev->devt), MINOR_NUM_MIFP_ID), 1);
++	if (ret)
++		goto fail;
++	fp_dev->id_cdev_registered = true;
++	fp_dev->id_device = device_create(fp_dev->class, &driver_device->dev,
++			MKDEV(MAJOR(fp_dev->devt), MINOR_NUM_MIFP_ID), fp_dev, FP_ID_DEV_NAME);
++	if (IS_ERR(fp_dev->id_device)) {
++		ret = PTR_ERR(fp_dev->id_device);
++		fp_dev->id_device = NULL;
++		goto fail;
++	}
+ 	fp_dev->device = device_create(fp_dev->class, &driver_device->dev,
+ 				       fp_dev->devt, fp_dev, FP_DEV_NAME);
+ 	if (IS_ERR(fp_dev->device)) {
+-		pr_debug("  Failed to create device.\n");
+-		status = -ENODEV;
+-		goto err_device;
+-	} else {
+-		mutex_lock(&device_list_lock);
+-		list_add(&fp_dev->device_entry, &device_list);
+-		mutex_unlock(&device_list_lock);
+-	}
+-
+-	/* create input device */
+-	if (fp_create_input_device() != 0) {
+-		goto err_input_device;
+-	}
+-#ifdef FP_ULTRA_QCOM
+-	INIT_KFIFO(fp_dev->fd_events);
+-	INIT_KFIFO(fp_dev->ipc_events);
+-	init_waitqueue_head(&fp_dev->read_wait_queue_fd);
+-	init_waitqueue_head(&fp_dev->read_wait_queue_ipc);
+-#endif
+-	init_waitqueue_head(&fp_dev->fp_wait_queue);
+-#ifndef XIAOMI_DRM_INTERFACE_WA
+-	fp_dev->screen_state_wq =
+-		create_singlethread_workqueue("screen_state_wq");
+-	if (fp_dev->screen_state_wq) {
+-		INIT_DELAYED_WORK(&fp_dev->screen_state_dw,
+-				  fp_register_panel_notifier_work);
+-	}
+-#endif
+-	/* netlink interface init */
+-	status = fp_netlink_init(fp_dev);
+-	if (status == -1) {
+-		goto err_netlink;
+-	}
+-	fp_dev->fp_netlink_enabled = 1;
+-	fp_wakesrc = wakeup_source_register(&fp_dev->driver_device->dev,
+-					    "fp_wakesrc");
+-#ifndef CONFIG_SIDE_FINGERPRINT
+-	if (device_may_wakeup(fp_dev->device)) {
+-		pr_debug("device_may_wakeup\n");
+-		disable_irq_wake(fp_dev->irq_num);
+-	}
+-	pr_debug("Is FOD project\n");
+-#else
+-	enable_irq_wake(fp_dev->irq_num);
+-	pr_debug("Is sidecap fingerprint project\n");
+-#endif
+-	status = sysfs_create_group(&fp_dev->driver_device->dev.kobj,
+-				    &attribute_group);
+-	if (status) {
+-		pr_debug("could not create sysfs\n");
+-	}
+-#ifdef FP_ULTRA_QCOM
+-	xiaomifp_evdev_init(fp_dev);
+-#endif
+-	pr_debug("fp probe success");
+-	FUNC_EXIT();
++		ret = PTR_ERR(fp_dev->device);
++		fp_dev->device = NULL;
++		goto fail;
++	}
++	mutex_lock(&device_list_lock);
++	list_add(&fp_dev->device_entry, &device_list);
++	fp_dev->listed = true;
++	mutex_unlock(&device_list_lock);
++	ret = sysfs_create_group(&driver_device->dev.kobj, &attribute_group);
++	if (ret)
++		goto fail;
++	fp_dev->sysfs_registered = true;
++	WRITE_ONCE(fp_present, true);
++	mutex_unlock(&fp_io_lock);
+ 	return 0;
+-
+-err_netlink:
+-	fp_free_input_device();
+-
+-err_input_device:
+-	device_destroy(fp_dev->class, fp_dev->devt);
+-	list_del(&fp_dev->device_entry);
+-
+-err_device:
+-#ifdef FP_ULTRA_QCOM
+-	fp_ultra_dev_unregister();
+-
+-err_register_ultra_dev:
+-#endif
+-	device_destroy(fp_dev->class, fp_dev->fpid_cdev.dev);
+-
+-err_fpid_device:
+-	cdev_del(&fp_dev->fpid_cdev);
+-
+-err_fpid_cdev:
+-	cdev_del(&fp_dev->cdev);
+-
+-err_cdev:
+-	unregister_chrdev_region(fp_dev->devt, 1);
+-
+-err_devno:
+-	class_destroy(fp_dev->class);
+-
+-err_class:
+-#ifdef CONFIG_FP_MTK_PLATFORM
+-	fp_spi_clk_disable(fp_dev->driver_device);
+-#endif
+-
+-err_dts:
++fail:
++	fp_cleanup(fp_dev);
+ 	fp_dev->driver_device = NULL;
+-	fp_dev->device_available = 0;
+-	pr_debug("fp probe fail\n");
+-	FUNC_EXIT();
+-	return status;
+-}
+-
+-#ifdef CONFIG_FP_MTK_PLATFORM
+-static int fp_remove(struct spi_device *driver_device)
+-#else
+-static int fp_remove(struct platform_device *driver_device)
+-#endif
+-{
+-	struct fp_device *fp_dev = &fp;
+-	FUNC_ENTRY();
+-	wakeup_source_unregister(fp_wakesrc);
+-	fp_wakesrc = NULL;
+-	/* make sure ops on existing fds can abort cleanly */
+-	if (fp_dev->irq_num) {
+-		free_irq(fp_dev->irq_num, fp_dev);
+-		fp_dev->irq_enabled = 0;
+-		fp_dev->irq_num = 0;
+-	}
+-	fp_dev->device_available = 0;
+-
+-#ifndef XIAOMI_DRM_INTERFACE_WA
+-	if (fp_dev->screen_state_wq) {
+-		destroy_workqueue(fp_dev->screen_state_wq);
+-	}
+-
+-	if (prim_panel && !IS_ERR(cookie)) {
+-		panel_event_notifier_unregister(cookie);
+-	} else {
+-		pr_err("%s:prim_panel_event_notifier_unregister falt\n",
+-		       __func__);
+-	}
+-#if IS_ENABLED(CONFIG_FP_HAVE_MULTI_SCREEN)
+-	if (sec_panel && !IS_ERR(cookie_sec)) {
+-		panel_event_notifier_unregister(cookie_sec);
+-	} else {
+-		pr_err("%s:sec_panel_event_notifier_unregister falt\n",
+-		       __func__);
+-	}
+-#endif
+-#endif
+-
+-	fp_free_input_device();
+-	fp_netlink_destroy(fp_dev);
+-	fp_dev->fp_netlink_enabled = 0;
+-#ifdef FP_ULTRA_QCOM
+-	fp_ultra_dev_unregister();
+-	fp_dev->fd_gpio.work_init = false;
+-	fp_dev->fw_ipc.work_init = false;
+-#endif
+-	cdev_del(&fp_dev->fpid_cdev);
+-	device_destroy(fp_dev->class, fp_dev->fpid_cdev.dev);
+-	cdev_del(&fp_dev->cdev);
+-	device_destroy(fp_dev->class, fp_dev->devt);
+-	list_del(&fp_dev->device_entry);
+-
+-	unregister_chrdev_region(fp_dev->devt, 1);
+-	class_destroy(fp_dev->class);
+-#ifdef CONFIG_FP_MTK_PLATFORM
+-	if (!IS_ERR(fp_dev->pins_spiio_spi_mode)) {
+-		pinctrl_select_state(fp_dev->pinctrl,
+-				     fp_dev->pins_spiio_gpio_mode);
+-	}
+-	if (!IS_ERR(fp_dev->pins_reset_low)) {
+-		pinctrl_select_state(fp_dev->pinctrl, fp_dev->pins_reset_low);
+-	}
+-	if (!IS_ERR(fp_dev->pins_eint_default)) {
+-		pinctrl_select_state(fp_dev->pinctrl,
+-				     fp_dev->pins_eint_default);
+-	}
+-#endif
+-	fp_dev->driver_device = NULL;
+-#ifdef FP_ULTRA_QCOM
+-	xiaomifp_evdev_remove();
+-#endif
+-	FUNC_EXIT();
+-	return 0;
++	mutex_unlock(&fp_io_lock);
++	return ret;
++}
++
++static void fp_remove(struct platform_device *driver_device)
++{
++	mutex_lock(&fp_io_lock);
++	WRITE_ONCE(fp_present, false);
++	WRITE_ONCE(fp.device_available, 0);
++	mutex_unlock(&fp_io_lock);
++	fp_cleanup(&fp);
++	mutex_lock(&fp_io_lock);
++	fp.driver_device = NULL;
++	mutex_unlock(&fp_io_lock);
+ }
+ 
+ #ifdef FP_ULTRA_QCOM
+--- a/drivers/input/fingerprint/mi_fp/fp_driver.h
++++ b/drivers/input/fingerprint/mi_fp/fp_driver.h
+@@ -12,6 +12,7 @@
+ #include <linux/cdev.h>
+ #include <linux/input.h>
+ #include <linux/device.h>
++#include <linux/platform_device.h>
+ #include <linux/mutex.h>
+ #include <linux/io.h>
+ #include <linux/gpio.h>
+@@ -200,9 +201,17 @@
+ };
+ 
+ struct fp_device {
++	bool input_registered;
++	bool region_registered;
++	bool cdev_registered;
++	bool id_cdev_registered;
++	bool sysfs_registered;
++	bool listed;
++	struct device *id_device;
++	unsigned int panel_retry;
+ 	dev_t devt;
+-	struct cdev cdev;
+-	struct cdev fpid_cdev; //mfpca open device, read chip-id ioctl
++	struct cdev *cdev;
++	struct cdev *fpid_cdev; //mfpca open device, read chip-id ioctl
+ 	struct device *device;
+ 	struct class *class;
+ 	struct list_head device_entry;
+@@ -294,11 +303,11 @@
+ int fp_power_on(struct fp_vreg *vreg);
+ int fp_power_off(struct fp_vreg *vreg);
+ void fp_power_config(struct fp_device *fp_dev);
+-void fp_hw_reset(struct fp_device *fp_dev);
+-void fp_hw_reset_delay(struct fp_device *fp_dev, u_int32_t rst_low_delay,
++int fp_hw_reset(struct fp_device *fp_dev);
++int fp_hw_reset_delay(struct fp_device *fp_dev, u_int32_t rst_low_delay,
+ 		       u_int32_t rst_high_delay);
+-void fp_enable_irq(struct fp_device *fp_dev);
+-void fp_disable_irq(struct fp_device *fp_dev);
++int fp_enable_irq(struct fp_device *fp_dev);
++int fp_disable_irq(struct fp_device *fp_dev);
+ void fp_kernel_key_input(struct fp_device *fp_dev, struct fp_key *fp_key);
+ void fp_local_time_printk(const char *format, ...);
+ 
+--- a/drivers/input/fingerprint/mi_fp/fp_platform.c
++++ b/drivers/input/fingerprint/mi_fp/fp_platform.c
+@@ -20,11 +20,19 @@
+ 		/* get irq resource */
+ 		fp_dev->irq_gpio = of_get_named_gpio(node, DTS_IRQ_GPIO, 0);
+ 		pr_debug("fp::irq_gpio:%d\n", fp_dev->irq_gpio);
++		if (fp_dev->irq_gpio < 0)
++			return fp_dev->irq_gpio;
+ 		if (!gpio_is_valid(fp_dev->irq_gpio)) {
+ 			pr_debug("IRQ GPIO is invalid.\n");
+ 			return -EPERM;
+ 		}
++		ret = devm_gpio_request_one(&fp_dev->driver_device->dev,
++					    fp_dev->irq_gpio, GPIOF_IN, "fingerprint-irq");
++		if (ret)
++			return ret;
+ 		fp_dev->irq_num = gpio_to_irq(fp_dev->irq_gpio);
++		if (fp_dev->irq_num < 0)
++			return fp_dev->irq_num;
+ 
+ 		/* get reset pin info */
+ 		ret = of_property_read_u32(node, DTS_RST_HIGH_TIME,
+@@ -40,13 +48,16 @@
+ 		pr_debug("rst_high_delay = %u, rst_low_delay = %u\n",
+ 			 fp_dev->rst_high_delay, fp_dev->rst_low_delay);
+ 
+-		/* get netlink-event */
+-		of_property_read_u32(node, DTS_NETLINK_NUM,
+-				     &fp_dev->fp_netlink_num);
++		if (fp_dev->rst_low_delay > 1000 || fp_dev->rst_high_delay > 1000)
++			return -EINVAL;
++		ret = of_property_read_u32(node, DTS_NETLINK_NUM, &fp_dev->fp_netlink_num);
++		if (ret || !fp_dev->fp_netlink_num || fp_dev->fp_netlink_num >= MAX_LINKS)
++			return ret ? ret : -EINVAL;
+ 
+ 		/* get fingerprint vendor info */
+-		of_property_read_string(node, DTS_VENDOR_NAME,
+-					&fp_dev->vendor_names);
++		ret = of_property_read_string(node, DTS_VENDOR_NAME, &fp_dev->vendor_names);
++		if (ret)
++			return ret;
+ 		pr_debug("fp::vendor_names:%s\n", fp_dev->vendor_names);
+ 
+ #ifdef FP_ULTRA_QCOM
+@@ -91,12 +102,33 @@
+ 		fp_dev->fd_gpio.work_init = false;
+ 		fp_dev->fw_ipc.work_init = false;
+ #endif
+-		fp_dev->vreg_3v3.mRegulator = regulator_get(
++		fp_dev->vreg_3v3.mRegulator = devm_regulator_get_optional(
+ 			&fp_dev->driver_device->dev, DTS_VOlT_REGULATER_3V3);
+-		fp_dev->vreg_1v8.mRegulator = regulator_get(
++		fp_dev->vreg_1v8.mRegulator = devm_regulator_get_optional(
+ 			&fp_dev->driver_device->dev, DTS_VOlT_REGULATER_1V8);
+ 		fp_dev->vreg_gpio.mPwrGpio =
+ 			of_get_named_gpio(node, DTS_VOlT_REGULATER_GPIO, 0);
++		if (IS_ERR(fp_dev->vreg_3v3.mRegulator)) {
++			ret = PTR_ERR(fp_dev->vreg_3v3.mRegulator);
++			if (ret != -ENODEV)
++				return ret;
++			fp_dev->vreg_3v3.mRegulator = NULL;
++		}
++		if (IS_ERR(fp_dev->vreg_1v8.mRegulator)) {
++			ret = PTR_ERR(fp_dev->vreg_1v8.mRegulator);
++			if (ret != -ENODEV)
++				return ret;
++			fp_dev->vreg_1v8.mRegulator = NULL;
++		}
++		if (fp_dev->vreg_gpio.mPwrGpio == -EPROBE_DEFER)
++			return -EPROBE_DEFER;
++		if (gpio_is_valid(fp_dev->vreg_gpio.mPwrGpio)) {
++			ret = devm_gpio_request_one(&fp_dev->driver_device->dev,
++				fp_dev->vreg_gpio.mPwrGpio, GPIOF_OUT_INIT_LOW,
++				"fingerprint-power");
++			if (ret)
++				return ret;
++		}
+ 	} else {
+ 		pr_debug("device node is null\n");
+ 		return -EPERM;
+@@ -125,8 +157,9 @@
+ 			pr_debug("can't find  pinctrl reset_low\n");
+ 			return ret;
+ 		} else {
+-			pinctrl_select_state(fp_dev->pinctrl,
+-					     fp_dev->pins_reset_low);
++			ret = pinctrl_select_state(fp_dev->pinctrl, fp_dev->pins_reset_low);
++			if (ret)
++				return ret;
+ 		}
+ 
+ 		pr_debug("get pinctrl success!\n");
+@@ -155,153 +188,96 @@
+ 
+ int fp_power_on(struct fp_vreg *vreg)
+ {
+-	int status = 0;
+-	int retval = 0;
+-
+-	FUNC_ENTRY();
+-
+-	if (!vreg->IsGpio) {
+-		if (vreg->mRegulator != NULL) {
+-			if (!vreg->enable) {
+-#ifdef CONFIG_FP_MTK_PLATFORM
+-				regulator_set_voltage(vreg->mRegulator, 3300000,
+-						      3300000);
+-#endif
+-				status = regulator_enable(vreg->mRegulator);
+-				mdelay(1);
+-				status =
+-					regulator_get_voltage(vreg->mRegulator);
+-				vreg->enable = true;
+-				pr_debug(
+-					"power on Ldo regulator value is %d!!\n",
+-					status);
+-			} else {
+-				pr_err("mRegulator is already power-on.");
+-			}
+-		} else {
+-			pr_err("mRegulator is NULL.");
+-			retval = -ENXIO;
+-		}
+-	} else {
+-		if (vreg->mPwrGpio != -EINVAL) {
+-			if (!vreg->enable) {
+-				if (!gpio_is_valid(vreg->mPwrGpio)) {
+-					pr_debug("mPwrGpio is invalid.\n");
+-					retval = -EINVAL;
+-				} else {
+-					gpio_direction_output(vreg->mPwrGpio,
+-							      0);
+-					mdelay(1);
+-					gpio_direction_output(vreg->mPwrGpio,
+-							      1);
+-					mdelay(1);
+-
+-					vreg->enable = true;
+-					pr_debug(
+-						"mPwrGpio power-on success.\n");
+-				}
+-			} else {
+-				pr_err("mPwrGpio is already power-on.");
+-			}
+-		} else {
+-			pr_err("mPwrGpio is NULL.");
+-			retval = -ENXIO;
+-		}
+-	}
+-
+-	return retval;
++	int ret;
++
++	if (vreg->enable)
++		return 0;
++	if (vreg->IsGpio) {
++		if (!gpio_is_valid(vreg->mPwrGpio))
++			return -ENODEV;
++		ret = gpio_direction_output(vreg->mPwrGpio, 0);
++		if (ret)
++			return ret;
++		usleep_range(1000, 1100);
++		ret = gpio_direction_output(vreg->mPwrGpio, 1);
++	} else {
++		if (IS_ERR_OR_NULL(vreg->mRegulator))
++			return -ENODEV;
++		ret = regulator_enable(vreg->mRegulator);
++	}
++	if (ret)
++		return ret;
++	usleep_range(1000, 1100);
++	vreg->enable = true;
++	return 0;
+ }
+ 
+ int fp_power_off(struct fp_vreg *vreg)
+ {
+-	int status = 0;
+-	int retval = 0;
+-
+-	FUNC_ENTRY();
+-
+-	if (!vreg->IsGpio) {
+-		if (vreg->mRegulator != NULL) {
+-			if (vreg->enable) {
+-				status = regulator_disable(vreg->mRegulator);
+-				mdelay(1);
+-				status =
+-					regulator_get_voltage(vreg->mRegulator);
+-				vreg->enable = false;
+-				pr_debug("power off Ldo regulator_value %d!!\n",
+-					 status);
+-			} else {
+-				pr_err("mRegulator is already power-off.");
+-			}
+-		} else {
+-			pr_err("mRegulator is NULL.");
+-			retval = -ENXIO;
+-		}
+-	} else {
+-		if (vreg->mPwrGpio != -EINVAL) {
+-			if (vreg->enable) {
+-				if (!gpio_is_valid(vreg->mPwrGpio)) {
+-					pr_debug("mPwrGpio is invalid.\n");
+-					retval = -EINVAL;
+-				} else {
+-					gpio_direction_output(vreg->mPwrGpio,
+-							      0);
+-					mdelay(1);
+-					vreg->enable = false;
+-					pr_debug(
+-						"mPwrGpio power-off success.\n");
+-				}
+-			} else {
+-				pr_err("mPwrGpio is already power-off.");
+-			}
+-		} else {
+-			pr_err("mPwrGpio is NULL.");
+-			retval = -ENXIO;
+-		}
+-	}
+-
+-	return retval;
+-}
+-
+-void fp_hw_reset(struct fp_device *fp_dev)
+-{
+-	pinctrl_select_state(fp_dev->pinctrl, fp_dev->pins_reset_low);
+-	mdelay(fp_dev->rst_low_delay);
+-	pinctrl_select_state(fp_dev->pinctrl, fp_dev->pins_reset_high);
+-	mdelay(fp_dev->rst_high_delay);
+-}
+-
+-/* Delay adjustable time before and after reset */
+-void fp_hw_reset_delay(struct fp_device *fp_dev, u_int32_t rst_low_delay,
+-		       u_int32_t rst_high_delay)
+-{
+-	pr_debug("rst_low time = %u, rst_high time = %u.\n", rst_low_delay,
+-		 rst_high_delay);
+-	pinctrl_select_state(fp_dev->pinctrl, fp_dev->pins_reset_low);
+-	mdelay(rst_low_delay);
+-	pinctrl_select_state(fp_dev->pinctrl, fp_dev->pins_reset_high);
+-	mdelay(rst_high_delay);
+-}
+-
+-void fp_enable_irq(struct fp_device *fp_dev)
+-{
+-	if (1 == fp_dev->irq_enabled) {
+-		pr_debug("irq already enabled\n");
+-	} else {
++	int ret;
++
++	if (!vreg->enable)
++		return 0;
++	if (vreg->IsGpio) {
++		if (!gpio_is_valid(vreg->mPwrGpio))
++			return -ENODEV;
++		ret = gpio_direction_output(vreg->mPwrGpio, 0);
++	} else {
++		if (IS_ERR_OR_NULL(vreg->mRegulator))
++			return -ENODEV;
++		ret = regulator_disable(vreg->mRegulator);
++	}
++	if (ret)
++		return ret;
++	usleep_range(1000, 1100);
++	vreg->enable = false;
++	return 0;
++}
++
++int fp_hw_reset_delay(struct fp_device *fp_dev, u_int32_t rst_low_delay,
++		      u_int32_t rst_high_delay)
++{
++	int ret;
++
++	/* Bound user-controlled waits while the device operation lock is held. */
++	if (!rst_low_delay || !rst_high_delay || rst_low_delay > 1000 || rst_high_delay > 1000)
++		return -EINVAL;
++	ret = pinctrl_select_state(fp_dev->pinctrl, fp_dev->pins_reset_low);
++	if (ret)
++		return ret;
++	msleep(rst_low_delay);
++	ret = pinctrl_select_state(fp_dev->pinctrl, fp_dev->pins_reset_high);
++	if (ret)
++		return ret;
++	msleep(rst_high_delay);
++	return 0;
++}
++
++int fp_hw_reset(struct fp_device *fp_dev)
++{
++	return fp_hw_reset_delay(fp_dev, fp_dev->rst_low_delay, fp_dev->rst_high_delay);
++}
++
++int fp_enable_irq(struct fp_device *fp_dev)
++{
++	if (!fp_dev->irq_request)
++		return -ENODEV;
++	if (!fp_dev->irq_enabled) {
+ 		enable_irq(fp_dev->irq_num);
+ 		fp_dev->irq_enabled = 1;
+-		pr_debug("enable irq!\n");
+-	}
+-}
+-
+-void fp_disable_irq(struct fp_device *fp_dev)
+-{
+-	if (0 == fp_dev->irq_enabled) {
+-		pr_debug("irq already disabled\n");
+-	} else {
++	}
++	return 0;
++}
++
++int fp_disable_irq(struct fp_device *fp_dev)
++{
++	if (!fp_dev->irq_request)
++		return -ENODEV;
++	if (fp_dev->irq_enabled) {
+ 		disable_irq(fp_dev->irq_num);
+ 		fp_dev->irq_enabled = 0;
+-		pr_debug("disable irq!\n");
+-	}
++	}
++	return 0;
+ }
+ 
+ void fp_kernel_key_input(struct fp_device *fp_dev, struct fp_key *fp_key)
+--- a/drivers/input/fingerprint/mi_fp/fp_netlink.c
++++ b/drivers/input/fingerprint/mi_fp/fp_netlink.c
+@@ -1,100 +1,95 @@
+ #include "fp_driver.h"
+-/* -------------------------------------------------------------------- */
+-/* netlink functions                                                    */
+-/* -------------------------------------------------------------------- */
++#include <linux/srcu.h>
+ 
+-/* for netlink use */
+ #define MAX_NL_MSG_LEN 16
+-int pid = -1;
+-static struct sock *nl_sk;
++static u32 fp_nl_portid;
++static struct sock __rcu *nl_sk;
++static DEFINE_MUTEX(fp_nl_lock);
++DEFINE_STATIC_SRCU(fp_nl_srcu);
++
+ void fp_netlink_send(struct fp_device *fp_dev, const int command)
+ {
+-	struct nlmsghdr *nlh = NULL;
+-	struct sk_buff *skb = NULL;
+-	int ret;
++	struct nlmsghdr *nlh;
++	struct sk_buff *skb;
++	struct sock *sk;
++	u32 portid;
++	int idx;
+ 
+-	fp_local_time_printk("enter, send command %d\n", command);
+-	if (NULL == nl_sk) {
+-		pr_debug("invalid socket\n");
++	if (command < 0 || command > U8_MAX)
+ 		return;
+-	}
+-
+-	if (0 == pid) {
+-		pr_debug("invalid native process pid\n");
+-		return;
+-	}
+-
+-	/*alloc data buffer for sending to native */
+-	/*malloc data space at least 1500 bytes, which is ethernet data length */
+-	skb = alloc_skb(MAX_NL_MSG_LEN, GFP_ATOMIC);
+-	if (skb == NULL) {
+-		return;
+-	}
+-
++	idx = srcu_read_lock(&fp_nl_srcu);
++	sk = srcu_dereference(nl_sk, &fp_nl_srcu);
++	portid = READ_ONCE(fp_nl_portid);
++	if (!sk || !portid)
++		goto out;
++	skb = nlmsg_new(MAX_NL_MSG_LEN, GFP_ATOMIC);
++	if (!skb)
++		goto out;
+ 	nlh = nlmsg_put(skb, 0, 0, 0, MAX_NL_MSG_LEN, 0);
+ 	if (!nlh) {
+-		pr_debug("nlmsg_put failed\n");
+ 		kfree_skb(skb);
+-		return;
++		goto out;
+ 	}
+-
++	memset(nlmsg_data(nlh), 0, MAX_NL_MSG_LEN);
++	*(u8 *)nlmsg_data(nlh) = command;
+ 	NETLINK_CB(skb).portid = 0;
+ 	NETLINK_CB(skb).dst_group = 0;
+-
+-	*(char *)NLMSG_DATA(nlh) = command;
+-	ret = netlink_unicast(nl_sk, skb, pid, MSG_DONTWAIT);
+-	if (ret == 0) {
+-		pr_debug("send failed\n");
+-		return;
+-	}
++	netlink_unicast(sk, skb, portid, MSG_DONTWAIT);
++out:
++	srcu_read_unlock(&fp_nl_srcu, idx);
+ }
+ 
+-void fp_netlink_recv(struct sk_buff *__skb)
++void fp_netlink_recv(struct sk_buff *skb)
+ {
+-	struct sk_buff *skb = NULL;
+-	struct nlmsghdr *nlh = NULL;
+-	char str[128];
+-	FUNC_ENTRY();
+-	skb = skb_get(__skb);
+-	if (skb == NULL) {
+-		pr_debug("skb_get return NULL\n");
++	struct nlmsghdr *nlh;
++	struct sock *sk;
++	int idx;
++
++	if (!skb || skb->len < NLMSG_HDRLEN)
+ 		return;
+-	}
+-
+-	/* presume there is 5byte payload at leaset */
+-	if (skb->len >= NLMSG_SPACE(0)) {
+-		nlh = nlmsg_hdr(skb);
+-		memcpy(str, NLMSG_DATA(nlh), sizeof(str));
+-		pid = nlh->nlmsg_pid;
+-		pr_debug("pid: %d, msg: %s\n", pid, str);
+-	} else {
+-		pr_debug("[not enough data length\n");
+-	}
+-	kfree_skb(skb);
++	nlh = nlmsg_hdr(skb);
++	if (!nlmsg_ok(nlh, skb->len))
++		return;
++	idx = srcu_read_lock(&fp_nl_srcu);
++	sk = srcu_dereference(nl_sk, &fp_nl_srcu);
++	/* Ignore an old socket callback delayed across destroy and reinit. */
++	if (sk && skb->sk == sk)
++		WRITE_ONCE(fp_nl_portid, NETLINK_CB(skb).portid);
++	srcu_read_unlock(&fp_nl_srcu, idx);
+ }
+ 
+ int fp_netlink_init(struct fp_device *fp_dev)
+ {
+-	struct netlink_kernel_cfg cfg;
+-	memset(&cfg, 0, sizeof(struct netlink_kernel_cfg));
+-	cfg.input = fp_netlink_recv;
+-	pr_debug("netlink num is %d", fp_dev->fp_netlink_num);
+-	nl_sk = netlink_kernel_create(&init_net, fp_dev->fp_netlink_num, &cfg);
+-	if (nl_sk == NULL) {
+-		pr_debug("netlink create failed\n");
+-		return -1;
++	struct netlink_kernel_cfg cfg = { .input = fp_netlink_recv };
++	struct sock *sk;
++	int ret = 0;
++
++	mutex_lock(&fp_nl_lock);
++	if (rcu_access_pointer(nl_sk))
++		goto out;
++	WRITE_ONCE(fp_nl_portid, 0);
++	sk = netlink_kernel_create(&init_net, fp_dev->fp_netlink_num, &cfg);
++	if (!sk) {
++		ret = -ENOMEM;
++		goto out;
+ 	}
+-	pr_debug("netlink create success\n");
+-	return 0;
++	rcu_assign_pointer(nl_sk, sk);
++out:
++	mutex_unlock(&fp_nl_lock);
++	return ret;
+ }
+ 
+ int fp_netlink_destroy(struct fp_device *fp_dev)
+ {
+-	FUNC_ENTRY();
+-	if (nl_sk != NULL) {
+-		netlink_kernel_release(nl_sk);
+-		nl_sk = NULL;
+-		return 0;
++	struct sock *sk;
++
++	mutex_lock(&fp_nl_lock);
++	sk = rcu_replace_pointer(nl_sk, NULL, lockdep_is_held(&fp_nl_lock));
++	if (sk) {
++		synchronize_srcu(&fp_nl_srcu);
++		netlink_kernel_release(sk);
+ 	}
+-	return -1;
++	WRITE_ONCE(fp_nl_portid, 0);
++	mutex_unlock(&fp_nl_lock);
++	return 0;
+ }

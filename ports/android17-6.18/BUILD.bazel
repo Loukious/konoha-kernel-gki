@@ -2125,9 +2125,91 @@ ddk_module(
     visibility = ["//visibility:public"],
 )
 
+ddk_headers(
+    name = "input_headers",
+    hdrs = ["include/linux/soc/qcom/panel_event_notifier.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "panel_event_notifier",
+    srcs = ["drivers/soc/qcom/panel_event_notifier.c"],
+    out = "panel_event_notifier.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":input_headers", ":platform_headers"],
+)
+
+ddk_module(
+    name = "pm8941_pwrkey",
+    srcs = ["drivers/input/misc/pm8941-pwrkey.c"],
+    out = "pm8941-pwrkey.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":input_headers", ":platform_headers"],
+)
+
+ddk_module(
+    name = "mi_fp",
+    srcs = ["drivers/input/fingerprint/mi_fp/fp_driver.c", "drivers/input/fingerprint/mi_fp/fp_driver.h", "drivers/input/fingerprint/mi_fp/fp_platform.c", "drivers/input/fingerprint/mi_fp/fp_netlink.c", "drivers/input/fingerprint/mi_fp/fp_input.c", "drivers/input/fingerprint/mi_fp/fp_ultra.h"],
+    out = "mi_fp.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":input_headers", ":platform_headers", ":panel_event_notifier"],
+)
+
+ddk_headers(
+    name = "chargebusiness_headers",
+    hdrs = glob(["drivers/power/supply/mca/**/*.h"]),
+    includes = ["drivers/power/supply/mca/include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_business_battery_comp",
+    srcs = ["drivers/power/supply/mca/mca_business/business_battery/mca_business_battery.c", "drivers/power/supply/mca/mca_business/business_battery/mca_battery_psy.c"],
+    out = "mca_business_battery_comp.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargebusiness_headers", ":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_common", ":mca_strategy_fg_class", ":mca_platform_buckchg_class"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_strategy_fg_class",
+    srcs = ["drivers/power/supply/mca/mca_strategy/strategy_fg/mca_strategy_fg_class.c"],
+    out = "mca_strategy_fg_class.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargebusiness_headers", ":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_common"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_qcom_panel",
+    srcs = ["drivers/power/supply/mca/mca_common/mca_qcom_panel.c"],
+    out = "mca_qcom_panel.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargebusiness_headers", ":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_common", ":input_headers", ":panel_event_notifier"],
+    visibility = ["//visibility:public"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
+        ":panel_event_notifier",
+        ":pm8941_pwrkey",
+        ":mi_fp",
+        ":mca_business_battery_comp",
+        ":mca_strategy_fg_class",
+        ":mca_qcom_panel",
         ":mca_protocol_class",
         ":mca_protocol_pd_class",
         ":mca_protocol_qc_class",

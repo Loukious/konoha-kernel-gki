@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 166 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 172 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 166 platform `.ko` files, their symbol tables and DDK configurations.
+- 172 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 7509
-imported symbol CRCs across all 166 modules.
+used. The current [validation report](validation-20261031.json) checks 7740
+imported symbol CRCs across all 172 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -832,3 +832,45 @@ remain to assess or port, including alternative hardware. This is module
 coverage, not overall completion or ZIP readiness. The extracted host tests
 use simulated kernel services and do not establish firmware, charging, live
 SRCU/IRQ/workqueue behavior or device boot. No flashable 6.18 ZIP exists yet.
+
+
+Panel events, PM8941 power keys and Xiaomi fingerprint add three input modules.
+Panel callbacks use immutable SRCU entries with validated inputs and drained
+unregister. The power-key display callback setter drains prior callbacks; its
+exported raw notifier head remains the original API. Debounce arithmetic uses
+64-bit cycles, IRQs start after input/wakeup registration, and wake errors retain
+accurate state. Checkpatch has one advisory for the explicit prototype of the
+existing exported display setter, whose consumer declares it directly.
+
+Fingerprint preserves the Onyx FOD/primary-display path and 30-byte device-info
+ABI. Netlink allocates header plus payload, zeroes all payload bytes, validates
+headers, uses the socket sender ID and rejects delayed callbacks from old
+sockets. Device operations serialize with removal. Separately allocated cdevs
+and identity checks reject stale opens; outstanding files prevent singleton
+reuse, and registered input devices unregister correctly. GPIO/regulator/IRQ
+errors propagate, reset waits are bounded, and staged cleanup drains callbacks,
+work and IRQs before releasing resources. The absent side/ultrasonic paths are
+not part of this configured port. `verify_input.py` passes four million debounce
+cases, power/reset/wake errors, 4,096 netlink header cases, 256 payload commands,
+14 probe failure points, callback draining and file/removal/rebind scenarios
+with ASan/UBSan and simulated kernel services.
+
+Battery business, FG strategy interface and MCA panel bridge add three modules.
+Battery properties propagate provider errors, support USB without a wireless
+supply, bound SOC/unit conversions and own model-name copies. The FG callback
+registry drains before removal. Named vote queries use SRCU; legacy callers
+retaining raw voter pointers still require owner coordination. Battery events,
+log callbacks, the thermal zone and power supply unwind in order. Panel bridge
+notifications permit listeners to query state again and balance OF references.
+`verify_chargebusiness.py` passes property/registration failures, 101 SOC values,
+wireless-absent paths, callback draining and panel reentry with ASan/UBSan. The
+actual FG strategy and charger policies remain required to provide readings
+and charging behavior; these interfaces do not establish functioning charging.
+
+The 172-module combined build passes 7,740 imported-symbol CRC checks with no
+compiler or modpost warnings. Device-tree verification passes with the same
+1,084 existing vendor DTC warnings. Coverage is 171/466 distinct vendor module
+names (36.7%); 295 remain to assess or port, including alternative hardware.
+Host tests do not establish live kernel/VFS/IRQ/SRCU, hardware or boot behavior.
+Matching images, remaining drivers and installer verification are still needed
+before a flashable ZIP exists.

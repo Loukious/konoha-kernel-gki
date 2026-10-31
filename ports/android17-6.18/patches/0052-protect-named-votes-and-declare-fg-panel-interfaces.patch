@@ -1,0 +1,80 @@
+--- a/drivers/power/supply/mca/mca_common/mca_voter.c
++++ b/drivers/power/supply/mca/mca_common/mca_voter.c
+@@ -31,6 +31,7 @@
+ 
+ static DEFINE_SPINLOCK(votable_list_slock);
+ static LIST_HEAD(votable_list);
++DEFINE_STATIC_SRCU(votable_lookup_srcu);
+ 
+ static struct dentry *debug_root;
+ 
+@@ -714,6 +715,20 @@
+ }
+ EXPORT_SYMBOL(mca_find_votable);
+ 
++int mca_get_named_client_vote(const char *name, const char *client)
++{
++	guard(srcu)(&votable_lookup_srcu);
++	struct mca_votable *votable;
++
++	if (!name || !client)
++		return -EINVAL;
++	votable = mca_find_votable(name);
++	if (!votable)
++		return -ENODEV;
++	return mca_get_client_vote(votable, client);
++}
++EXPORT_SYMBOL(mca_get_named_client_vote);
++
+ static int mca_force_active_get(void *data, u64 *val)
+ {
+ 	struct mca_votable *votable = data;
+@@ -925,6 +940,7 @@
+ 	spin_lock_irqsave(&votable_list_slock, flags);
+ 	list_del(&votable->list);
+ 	spin_unlock_irqrestore(&votable_list_slock, flags);
++	synchronize_srcu(&votable_lookup_srcu);
+ 
+ 	debugfs_remove_recursive(votable->root);
+ 
+--- a/drivers/power/supply/mca/include/mca/common/mca_voter.h
++++ b/drivers/power/supply/mca/include/mca/common/mca_voter.h
+@@ -41,4 +41,7 @@
+ 	int default_value, void *data);
+ void mca_destroy_votable(struct mca_votable *votable);
+ 
++/* Safe one-shot lookup; no raw pointer survives this call. */
++int mca_get_named_client_vote(const char *name, const char *client);
++
+ #endif /* _MCA_COMMON_MCA_VOTER_H_ */
+--- a/drivers/power/supply/mca/include/mca/strategy/strategy_fg_class.h
++++ b/drivers/power/supply/mca/include/mca/strategy/strategy_fg_class.h
+@@ -60,10 +60,15 @@
+ int strategy_class_fg_is_chip_ok(void);
+ int strategy_class_fg_get_health(int *health);
+ int strategy_class_fg_get_first_termination(int *value);
+-int strategy_class_fg_get_pack_vendor_id(int * vendor_id);
++int strategy_class_fg_get_pack_vendor_id(int *vendor_id);
+ int strategy_class_fg_dual_is_chip_ok(int index);
+-int strategy_class_fg_ops_get_thermal_temperature(int * temp);
+-int strategy_class_fg_get_soh(int * soh);
++int strategy_class_fg_ops_get_thermal_temperature(int *temp);
++int strategy_class_fg_get_soh(int *soh);
+ int strategy_class_fg_get_temp_offset_flag(int *flag);
+ 
++/* Drain all calls before freeing provider data; not callable from a callback. */
++void strategy_class_fg_ops_unregister(void *data);
++/* Copy string while holding the provider lifetime guard. */
++int strategy_class_fg_copy_model_name(char *buf, size_t len);
++
+ #endif /* _MCA_STRATEGY_STRATEGY_FG_CLASS_H_ */
+--- a/drivers/power/supply/mca/include/mca/common/mca_panel.h
++++ b/drivers/power/supply/mca/include/mca/common/mca_panel.h
+@@ -3,4 +3,7 @@
+ 
+ #include <mca/common/mca_event.h>
+ 
++int mca_panel_get_screen_state(void);
++int mca_panel_get_hbm_state(void);
++
+ #endif /* _MCA_COMMON_MCA_PANEL_H_ */
