@@ -3388,6 +3388,51 @@ ddk_module(
     copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
 )
 
+ddk_headers(
+    name = "slimbus_headers",
+    hdrs = ["include/linux/slimbus.h", "drivers/slimbus/slimbus.h", "drivers/slimbus/trace.h"],
+    linux_includes = ["include"],
+    includes = ["drivers/slimbus"],
+)
+
+ddk_headers(
+    name = "btfm_slim_headers",
+    hdrs = ["qcom/opensource/bt-kernel/slimbus/btfm_slim.h", "qcom/opensource/bt-kernel/slimbus/btfm_slim_hw_interface.h", "qcom/opensource/bt-kernel/slimbus/btfm_slim_slave.h"],
+    includes = ["qcom/opensource/bt-kernel/slimbus"],
+)
+
+ddk_module(
+    name = "slimbus",
+    srcs = ["drivers/slimbus/core.c", "drivers/slimbus/messaging.c", "drivers/slimbus/sched.c", "drivers/slimbus/stream.c"],
+    out = "slimbus.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":slimbus_headers", ":platform_headers", ":qcom_ipc_logging"],
+)
+
+ddk_module(
+    name = "slim_qcom_ngd_ctrl",
+    srcs = ["drivers/slimbus/qcom-ngd-ctrl.c"],
+    out = "slim-qcom-ngd-ctrl.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":slimbus_headers", ":slimbus", ":platform_headers", ":qcom_ipc_logging", ":remote_headers", ":qmi_helpers", ":pdr_interface", ":rproc_qcom_common"],
+)
+
+ddk_module(
+    name = "btfm_slim_codec",
+    srcs = ["qcom/opensource/bt-kernel/slimbus/btfm_slim.c", "qcom/opensource/bt-kernel/slimbus/btfm_slim_hw_interface.c", "qcom/opensource/bt-kernel/slimbus/btfm_slim_slave.c"],
+    out = "btfm_slim_codec.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":btfm_slim_headers", ":slimbus_headers", ":slimbus", ":btpower_headers", ":btpower", ":btfmcodec", ":btfmcodec_headers"],
+    copts = ["-DCONFIG_SLIM_BTFM_CODEC"],
+)
+
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3634,6 +3679,9 @@ kernel_module_group(
         ":wcd_core_dlkm",
         ":lpass_bt_swr_dlkm",
         ":typec_analog_acc_dlkm",
+        ":slimbus",
+        ":slim_qcom_ngd_ctrl",
+        ":btfm_slim_codec",
     ],
 )
 

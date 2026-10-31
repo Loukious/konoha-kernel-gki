@@ -1,0 +1,4210 @@
+--- a/drivers/slimbus/core.c
++++ b/drivers/slimbus/core.c
+@@ -13,13 +13,19 @@
+ #include <linux/of_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/slimbus.h>
++#include <linux/srcu.h>
+ #include "slimbus.h"
++
++DEFINE_STATIC_SRCU(slim_creation_srcu);
++DEFINE_STATIC_SRCU(slim_status_srcu);
+ 
+ static DEFINE_IDA(ctrl_ida);
+ 
+ static const struct slim_device_id *slim_match(const struct slim_device_id *id,
+ 					       const struct slim_device *sbdev)
+ {
++	if (!id)
++		return NULL;
+ 	while (id->manf_id != 0 || id->prod_code != 0) {
+ 		if (id->manf_id == sbdev->e_addr.manf_id &&
+ 		    id->prod_code == sbdev->e_addr.prod_code &&
+@@ -31,10 +37,10 @@
+ 	return NULL;
+ }
+ 
+-static int slim_device_match(struct device *dev, struct device_driver *drv)
++static int slim_device_match(struct device *dev, const struct device_driver *drv)
+ {
+ 	struct slim_device *sbdev = to_slim_device(dev);
+-	struct slim_driver *sbdrv = to_slim_driver(drv);
++	const struct slim_driver *sbdrv = to_slim_driver(drv);
+ 
+ 	/* Attempt an OF style match first */
+ 	if (of_driver_match_device(dev, drv))
+@@ -46,18 +52,17 @@
+ static void slim_device_update_status(struct slim_device *sbdev,
+ 				      enum slim_device_status status)
+ {
+-	struct slim_driver *sbdrv;
+-
+-	if (sbdev->status == status)
++	struct slim_driver *driver;
++	int idx;
++
++	if (READ_ONCE(sbdev->status) == status)
+ 		return;
+-
+-	sbdev->status = status;
+-	if (!sbdev->dev.driver)
+-		return;
+-
+-	sbdrv = to_slim_driver(sbdev->dev.driver);
+-	if (sbdrv->device_status)
+-		sbdrv->device_status(sbdev, sbdev->status);
++	WRITE_ONCE(sbdev->status, status);
++	idx = srcu_read_lock(&slim_status_srcu);
++	driver = srcu_dereference(sbdev->status_driver, &slim_status_srcu);
++	if (driver && driver->device_status)
++		driver->device_status(sbdev, READ_ONCE(sbdev->status));
++	srcu_read_unlock(&slim_status_srcu, idx);
+ }
+ 
+ static int slim_device_probe(struct device *dev)
+@@ -73,9 +78,13 @@
+ 	/* try getting the logical address after probe */
+ 	ret = slim_get_logical_addr(sbdev);
+ 	if (!ret) {
+-		slim_device_update_status(sbdev, SLIM_DEVICE_STATUS_UP);
++		rcu_assign_pointer(sbdev->status_driver, sbdrv);
++		if (sbdrv->device_status)
++			sbdrv->device_status(sbdev, READ_ONCE(sbdev->status));
+ 	} else {
+ 		dev_err(&sbdev->dev, "Failed to get logical address\n");
++		if (sbdrv->remove)
++			sbdrv->remove(sbdev);
+ 		ret = -EPROBE_DEFER;
+ 	}
+ 
+@@ -87,6 +96,8 @@
+ 	struct slim_device *sbdev = to_slim_device(dev);
+ 	struct slim_driver *sbdrv;
+ 
++	RCU_INIT_POINTER(sbdev->status_driver, NULL);
++	synchronize_srcu(&slim_status_srcu);
+ 	if (dev->driver) {
+ 		sbdrv = to_slim_driver(dev->driver);
+ 		if (sbdrv->remove)
+@@ -146,14 +157,22 @@
+ static void slim_dev_release(struct device *dev)
+ {
+ 	struct slim_device *sbdev = to_slim_device(dev);
+-
++	struct slim_controller *ctrl = sbdev->ctrl;
++
++	of_node_put(sbdev->dev.of_node);
+ 	kfree(sbdev);
++	if (refcount_dec_and_test(&ctrl->device_refs))
++		complete(&ctrl->devices_gone);
+ }
+ 
+ static int slim_add_device(struct slim_controller *ctrl,
+ 			   struct slim_device *sbdev,
+ 			   struct device_node *node)
+ {
++	int ret;
++
++	refcount_inc(&ctrl->device_refs);
++	device_initialize(&sbdev->dev);
+ 	sbdev->dev.bus = &slimbus_bus;
+ 	sbdev->dev.parent = ctrl->dev;
+ 	sbdev->dev.release = slim_dev_release;
+@@ -161,17 +180,18 @@
+ 	sbdev->ctrl = ctrl;
+ 	INIT_LIST_HEAD(&sbdev->stream_list);
+ 	spin_lock_init(&sbdev->stream_list_lock);
+-	mutex_init(&ctrl->stream_lock);
+ 	sbdev->dev.of_node = of_node_get(node);
+ 	sbdev->dev.fwnode = of_fwnode_handle(node);
+ 
+-	dev_set_name(&sbdev->dev, "%x:%x:%x:%x%s",
+-				  sbdev->e_addr.manf_id,
++	ret = dev_set_name(&sbdev->dev, "%x:%x:%x:%x%s",
++			   sbdev->e_addr.manf_id,
+ 				  sbdev->e_addr.prod_code,
+ 				  sbdev->e_addr.dev_index,
+ 				  sbdev->e_addr.instance, EXTRA_CHAR);
+ 
+-	return device_register(&sbdev->dev);
++	if (ret)
++		return ret;
++	return device_add(&sbdev->dev);
+ }
+ 
+ static struct slim_device *slim_alloc_device(struct slim_controller *ctrl,
+@@ -203,7 +223,7 @@
+ 	if (!ctrl->dev->of_node)
+ 		return;
+ 
+-	for_each_child_of_node(ctrl->dev->of_node, node) {
++	for_each_available_child_of_node(ctrl->dev->of_node, node) {
+ 		struct slim_device *sbdev;
+ 		struct slim_eaddr e_addr;
+ 		const char *compat = NULL;
+@@ -228,6 +248,10 @@
+ 			continue;
+ 		}
+ 
++		if (reg[0] > U8_MAX || reg[1] > U8_MAX ||
++		    manf_id > U16_MAX || prod_code > U16_MAX)
++			continue;
++
+ 		e_addr.dev_index = reg[0];
+ 		e_addr.instance = reg[1];
+ 		e_addr.manf_id = manf_id;
+@@ -257,6 +281,10 @@
+ 		return id;
+ 
+ 	ctrl->id = id;
++	mutex_init(&ctrl->devices_lock);
++	refcount_set(&ctrl->device_refs, 1);
++	init_completion(&ctrl->devices_gone);
++	WRITE_ONCE(ctrl->removing, false);
+ 
+ 	if (!ctrl->min_cg)
+ 		ctrl->min_cg = SLIM_MIN_CLK_GEAR;
+@@ -266,6 +294,7 @@
+ 	ida_init(&ctrl->laddr_ida);
+ 	idr_init(&ctrl->tid_idr);
+ 	mutex_init(&ctrl->lock);
++	mutex_init(&ctrl->stream_lock);
+ 	mutex_init(&ctrl->sched.m_reconf);
+ 	init_completion(&ctrl->sched.pause_comp);
+ 	spin_lock_init(&ctrl->txn_lock);
+@@ -282,7 +311,6 @@
+ /* slim_remove_device: Remove the effect of slim_add_device() */
+ static void slim_remove_device(struct slim_device *sbdev)
+ {
+-	of_node_put(sbdev->dev.of_node);
+ 	device_unregister(&sbdev->dev);
+ }
+ 
+@@ -299,10 +327,26 @@
+  */
+ int slim_unregister_controller(struct slim_controller *ctrl)
+ {
+-	/* Remove all clients */
++	int tid;
++	unsigned long flags;
++
++	mutex_lock(&ctrl->devices_lock);
++	spin_lock_irqsave(&ctrl->txn_lock, flags);
++	WRITE_ONCE(ctrl->removing, true);
++	spin_unlock_irqrestore(&ctrl->txn_lock, flags);
++	mutex_unlock(&ctrl->devices_lock);
++	synchronize_srcu(&slim_creation_srcu);
++	/* The controller must stop its notification and DMA producers first. */
++	for (tid = 1; tid < SLIM_MAX_TIDS; tid++)
++		slim_msg_response(ctrl, NULL, tid, 0);
+ 	device_for_each_child(ctrl->dev, NULL, slim_ctrl_remove_device);
++	if (refcount_dec_and_test(&ctrl->device_refs))
++		complete(&ctrl->devices_gone);
++	/* Lookup and stream users must drop their retained device references. */
++	wait_for_completion(&ctrl->devices_gone);
++	idr_destroy(&ctrl->tid_idr);
++	ida_destroy(&ctrl->laddr_ida);
+ 	ida_free(&ctrl_ida, ctrl->id);
+-
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(slim_unregister_controller);
+@@ -322,15 +366,19 @@
+ 
+ 	/* invalidate logical addresses */
+ 	mutex_lock(&ctrl->lock);
++	if (!sbdev->is_laddr_valid) {
++		mutex_unlock(&ctrl->lock);
++		return;
++	}
+ 	sbdev->is_laddr_valid = false;
+-	mutex_unlock(&ctrl->lock);
+ 	if (!ctrl->get_laddr)
+ 		ida_free(&ctrl->laddr_ida, sbdev->laddr);
++	mutex_unlock(&ctrl->lock);
+ 	slim_device_update_status(sbdev, SLIM_DEVICE_STATUS_DOWN);
+ }
+ EXPORT_SYMBOL_GPL(slim_report_absent);
+ 
+-static bool slim_eaddr_equal(struct slim_eaddr *a, struct slim_eaddr *b)
++static bool slim_eaddr_equal(const struct slim_eaddr *a, const struct slim_eaddr *b)
+ {
+ 	return (a->manf_id == b->manf_id &&
+ 		a->prod_code == b->prod_code &&
+@@ -338,9 +386,9 @@
+ 		a->instance == b->instance);
+ }
+ 
+-static int slim_match_dev(struct device *dev, void *data)
+-{
+-	struct slim_eaddr *e_addr = data;
++static int slim_match_dev(struct device *dev, const void *data)
++{
++	const struct slim_eaddr *e_addr = data;
+ 	struct slim_device *sbdev = to_slim_device(dev);
+ 
+ 	return slim_eaddr_equal(&sbdev->e_addr, e_addr);
+@@ -374,23 +422,33 @@
+ 				    struct slim_eaddr *e_addr)
+ {
+ 	struct slim_device *sbdev;
+-
++	int idx = srcu_read_lock(&slim_creation_srcu);
++
++	mutex_lock(&ctrl->devices_lock);
++	if (ctrl->removing) {
++		sbdev = ERR_PTR(-ESHUTDOWN);
++		mutex_unlock(&ctrl->devices_lock);
++		goto out;
++	}
+ 	sbdev = find_slim_device(ctrl, e_addr);
++	mutex_unlock(&ctrl->devices_lock);
+ 	if (!sbdev) {
++		/* device_add can synchronously probe and recursively look up peers. */
+ 		sbdev = slim_alloc_device(ctrl, e_addr, NULL);
+-		if (!sbdev)
+-			return ERR_PTR(-ENOMEM);
+-
+-		get_device(&sbdev->dev);
+-	}
+-
++		if (sbdev)
++			get_device(&sbdev->dev);
++		else
++			sbdev = ERR_PTR(-ENOMEM);
++	}
++out:
++	srcu_read_unlock(&slim_creation_srcu, idx);
+ 	return sbdev;
+ }
+ EXPORT_SYMBOL_GPL(slim_get_device);
+ 
+-static int of_slim_match_dev(struct device *dev, void *data)
+-{
+-	struct device_node *np = data;
++static int of_slim_match_dev(struct device *dev, const void *data)
++{
++	const struct device_node *np = data;
+ 	struct slim_device *sbdev = to_slim_device(dev);
+ 
+ 	return (sbdev->dev.of_node == np);
+@@ -423,7 +481,13 @@
+ struct slim_device *of_slim_get_device(struct slim_controller *ctrl,
+ 				       struct device_node *np)
+ {
+-	return of_find_slim_device(ctrl, np);
++	struct slim_device *sbdev = NULL;
++
++	mutex_lock(&ctrl->devices_lock);
++	if (!ctrl->removing)
++		sbdev = of_find_slim_device(ctrl, np);
++	mutex_unlock(&ctrl->devices_lock);
++	return sbdev;
+ }
+ EXPORT_SYMBOL_GPL(of_slim_get_device);
+ 
+@@ -441,6 +505,10 @@
+ 	}
+ 
+ 	mutex_lock(&ctrl->lock);
++	if (sbdev->is_laddr_valid) {
++		mutex_unlock(&ctrl->lock);
++		return 0;
++	}
+ 	if (ctrl->get_laddr) {
+ 		ret = ctrl->get_laddr(ctrl, &sbdev->e_addr, &laddr);
+ 		if (ret < 0)
+@@ -460,7 +528,8 @@
+ 	if (ctrl->set_laddr) {
+ 		ret = ctrl->set_laddr(ctrl, &sbdev->e_addr, laddr);
+ 		if (ret) {
+-			ret = -EINVAL;
++			if (!ctrl->get_laddr)
++				ida_free(&ctrl->laddr_ida, laddr);
+ 			goto err;
+ 		}
+ 	}
+@@ -514,6 +583,7 @@
+ 	if (ctrl->sched.clk_state != SLIM_CLK_ACTIVE) {
+ 		dev_err(ctrl->dev, "slim ctrl not active,state:%d, ret:%d\n",
+ 				    ctrl->sched.clk_state, ret);
++		ret = -EHOSTDOWN;
+ 		goto out_put_rpm;
+ 	}
+ 
+@@ -528,6 +598,8 @@
+ 		ret = 0;
+ 	} else {
+ 		ret = slim_device_alloc_laddr(sbdev, true);
++		if (!ret)
++			*laddr = sbdev->laddr;
+ 	}
+ 
+ 	put_device(&sbdev->dev);
+@@ -548,6 +620,8 @@
+  */
+ int slim_get_logical_addr(struct slim_device *sbdev)
+ {
++	if (READ_ONCE(sbdev->ctrl->removing))
++		return -ESHUTDOWN;
+ 	if (!sbdev->is_laddr_valid)
+ 		return slim_device_alloc_laddr(sbdev, false);
+ 
+--- a/drivers/slimbus/messaging.c
++++ b/drivers/slimbus/messaging.c
+@@ -23,34 +23,46 @@
+  * to manage 1 more table other than the one managed by framework mapping TID
+  * with buffers
+  */
++static void slim_put_async_txn(struct slim_msg_txn *txn)
++{
++	if (refcount_dec_and_test(&txn->refs))
++		kfree(txn);
++}
++
+ void slim_msg_response(struct slim_controller *ctrl, u8 *reply, u8 tid, u8 len)
+ {
+ 	struct slim_msg_txn *txn;
+-	struct slim_val_inf *msg;
++	struct completion *comp;
+ 	unsigned long flags;
++	bool async;
+ 
+ 	spin_lock_irqsave(&ctrl->txn_lock, flags);
+ 	txn = idr_find(&ctrl->tid_idr, tid);
++	if (!txn) {
++		spin_unlock_irqrestore(&ctrl->txn_lock, flags);
++		return;
++	}
++	idr_remove(&ctrl->tid_idr, tid);
++	txn->tid = 0;
++	txn->result = -EMSGSIZE;
++	if (reply && len && txn->msg && txn->msg->rbuf && len <= txn->reply_len &&
++	    (!slim_tid_txn(txn->mt, txn->mc) || len == txn->reply_len)) {
++		memcpy_fromio(txn->msg->rbuf, reply, len);
++		txn->result = 0;
++	}
++	if (txn->pm_held) {
++		txn->pm_held = false;
++		pm_runtime_mark_last_busy(ctrl->dev);
++		pm_runtime_put_autosuspend(ctrl->dev);
++	}
++	comp = txn->comp;
++	async = txn->async;
++	/* Completion and removal remain atomic with timeout cancellation. */
++	if (comp)
++		complete(comp);
+ 	spin_unlock_irqrestore(&ctrl->txn_lock, flags);
+-
+-	if (txn == NULL)
+-		return;
+-
+-	msg = txn->msg;
+-	if (msg == NULL || msg->rbuf == NULL) {
+-		dev_err(ctrl->dev, "Got response to invalid TID:%d, len:%d\n",
+-				tid, len);
+-		return;
+-	}
+-
+-	slim_free_txn_tid(ctrl, txn);
+-	memcpy_fromio(msg->rbuf, reply, len);
+-	if (txn->comp)
+-		complete(txn->comp);
+-
+-	/* Remove runtime-pm vote now that response was received for TID txn */
+-	pm_runtime_mark_last_busy(ctrl->dev);
+-	pm_runtime_put_autosuspend(ctrl->dev);
++	if (async)
++		slim_put_async_txn(txn);
+ }
+ EXPORT_SYMBOL_GPL(slim_msg_response);
+ 
+@@ -68,6 +80,10 @@
+ 	int ret = 0;
+ 
+ 	spin_lock_irqsave(&ctrl->txn_lock, flags);
++	if (READ_ONCE(ctrl->removing)) {
++		spin_unlock_irqrestore(&ctrl->txn_lock, flags);
++		return -ESHUTDOWN;
++	}
+ 	ret = idr_alloc_cyclic(&ctrl->tid_idr, txn, 1,
+ 				SLIM_MAX_TIDS, GFP_ATOMIC);
+ 	if (ret < 0) {
+@@ -75,6 +91,8 @@
+ 		return ret;
+ 	}
+ 	txn->tid = ret;
++	if (txn->async)
++		refcount_inc(&txn->refs);
+ 	spin_unlock_irqrestore(&ctrl->txn_lock, flags);
+ 	return 0;
+ }
+@@ -89,10 +107,17 @@
+ void slim_free_txn_tid(struct slim_controller *ctrl, struct slim_msg_txn *txn)
+ {
+ 	unsigned long flags;
++	bool release = false;
+ 
+ 	spin_lock_irqsave(&ctrl->txn_lock, flags);
+-	idr_remove(&ctrl->tid_idr, txn->tid);
++	if (txn->tid && idr_find(&ctrl->tid_idr, txn->tid) == txn) {
++		idr_remove(&ctrl->tid_idr, txn->tid);
++		txn->tid = 0;
++		release = txn->async;
++	}
+ 	spin_unlock_irqrestore(&ctrl->txn_lock, flags);
++	if (release)
++		slim_put_async_txn(txn);
+ }
+ EXPORT_SYMBOL_GPL(slim_free_txn_tid);
+ 
+@@ -112,86 +137,77 @@
+ int slim_do_transfer(struct slim_controller *ctrl, struct slim_msg_txn *txn)
+ {
+ 	DECLARE_COMPLETION_ONSTACK(done);
+-	bool need_tid = false, clk_pause_msg = false;
+-	int ret, timeout;
+-	struct completion *comp;
+-
+-	/*
+-	 * do not vote for runtime-PM if the transactions are part of clock
+-	 * pause sequence
+-	 */
+-	if (ctrl->sched.clk_state == SLIM_CLK_ENTERING_PAUSE &&
+-		(txn->mt == SLIM_MSG_MT_CORE &&
+-		 txn->mc >= SLIM_MSG_MC_BEGIN_RECONFIGURATION &&
+-		 txn->mc <= SLIM_MSG_MC_RECONFIGURE_NOW))
+-		clk_pause_msg = true;
+-
+-	/* Initialize tid to invalid value */
++	struct completion *saved_comp = txn->comp;
++	bool need_tid = slim_tid_txn(txn->mt, txn->mc);
++	bool clk_pause_msg = ctrl->sched.clk_state == SLIM_CLK_ENTERING_PAUSE &&
++		txn->mt == SLIM_MSG_MT_CORE &&
++		txn->mc >= SLIM_MSG_MC_BEGIN_RECONFIGURATION &&
++		txn->mc <= SLIM_MSG_MC_RECONFIGURE_NOW;
++	int ret;
++
++	if (READ_ONCE(ctrl->removing))
++		return -ESHUTDOWN;
++	if (!ctrl->xfer_msg || (need_tid && (!txn->msg || !txn->msg->rbuf)))
++		return -EINVAL;
++	/* Async callers retain their buffers until completion, not this stack. */
++	if (need_tid && txn->msg->comp) {
++		txn = kmemdup(txn, sizeof(*txn), GFP_KERNEL);
++		if (!txn)
++			return -ENOMEM;
++		txn->async_msg = *txn->msg;
++		txn->msg = &txn->async_msg;
++		txn->comp = txn->msg->comp;
++		txn->async = true;
++		refcount_set(&txn->refs, 1);
++	} else {
++		txn->async = false;
++		if (need_tid)
++			txn->comp = &done;
++	}
+ 	txn->tid = 0;
+-	need_tid = slim_tid_txn(txn->mt, txn->mc);
+-
++	txn->result = 0;
++	txn->pm_held = false;
++	if (need_tid)
++		txn->reply_len = txn->msg->num_bytes;
++	if (!clk_pause_msg) {
++		ret = pm_runtime_resume_and_get(ctrl->dev);
++		if (ret < 0)
++			goto out;
++		txn->pm_held = true;
++		if (ctrl->sched.clk_state != SLIM_CLK_ACTIVE) {
++			ret = -EHOSTDOWN;
++			goto out;
++		}
++	}
+ 	if (need_tid) {
+ 		ret = slim_alloc_txn_tid(ctrl, txn);
+ 		if (ret)
+-			return ret;
+-
+-		if (!txn->msg->comp) {
+-			comp = txn->comp;
+-			txn->comp = &done;
++			goto out;
++	}
++	ret = ctrl->xfer_msg(ctrl, txn);
++	if (!ret && need_tid) {
++		if (txn->async) {
++			slim_put_async_txn(txn);
++			return 0;
+ 		}
+-	}
+-
+-	if (!clk_pause_msg) {
+-		ret = pm_runtime_get_sync(ctrl->dev);
+-		if (ret < 0) {
+-			dev_err(ctrl->dev, "runtime resume failed ret:%d\n",
+-				ret);
+-			slim_free_txn_tid(ctrl, txn);
+-			pm_runtime_put_noidle(ctrl->dev);
+-			/* Set device in suspended since resume failed */
+-			pm_runtime_set_suspended(ctrl->dev);
+-			if (need_tid && !txn->msg->comp)
+-				txn->comp = comp;
+-			return ret;
+-		}
+-
+-		if (ctrl->sched.clk_state != SLIM_CLK_ACTIVE) {
+-			dev_err(ctrl->dev, "ctrl wrong state:%d, ret:%d\n",
+-				ctrl->sched.clk_state, ret);
+-			if (need_tid && !txn->msg->comp)
+-				txn->comp = comp;
+-			goto slim_xfer_err;
+-		}
+-	}
+-
+-	ret = ctrl->xfer_msg(ctrl, txn);
+-	if (ret == -ETIMEDOUT) {
+-		slim_free_txn_tid(ctrl, txn);
+-	} else if (!ret && need_tid && !txn->msg->comp) {
+-		unsigned long ms = txn->rl + HZ;
+-
+-		timeout = wait_for_completion_timeout(txn->comp,
+-						      msecs_to_jiffies(ms));
+-		if (!timeout) {
++		if (!wait_for_completion_timeout(&done,
++						 msecs_to_jiffies(txn->rl + HZ)))
+ 			ret = -ETIMEDOUT;
+-			txn->comp = NULL;
+-			slim_free_txn_tid(ctrl, txn);
+-		}
+-	}
+-
+-	if (ret)
+-		dev_err(ctrl->dev, "Tx:MT:0x%x, MC:0x%x, LA:0x%x failed:%d\n",
+-			txn->mt, txn->mc, txn->la, ret);
+-
+-slim_xfer_err:
+-	if (!clk_pause_msg && (txn->tid == 0  || ret == -ETIMEDOUT)) {
+-		/*
+-		 * remove runtime-pm vote if this was TX only, or
+-		 * if there was error during this transaction
+-		 */
++		else
++			ret = txn->result;
++	}
++out:
++	/* Removal waits for any response that has already acquired txn_lock. */
++	slim_free_txn_tid(ctrl, txn);
++	if (txn->pm_held) {
++		txn->pm_held = false;
+ 		pm_runtime_mark_last_busy(ctrl->dev);
+ 		pm_runtime_put_autosuspend(ctrl->dev);
+ 	}
++	if (txn->async)
++		slim_put_async_txn(txn);
++	else
++		txn->comp = saved_comp;
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(slim_do_transfer);
+@@ -199,7 +215,7 @@
+ static int slim_val_inf_sanity(struct slim_controller *ctrl,
+ 			       struct slim_val_inf *msg, u8 mc)
+ {
+-	if (!msg || msg->num_bytes > 16 ||
++	if (!msg || !msg->num_bytes || msg->num_bytes > 16 ||
+ 	    (msg->start_offset + msg->num_bytes) > 0xC00)
+ 		goto reterr;
+ 	switch (mc) {
+@@ -317,6 +333,10 @@
+ {
+ 	struct slim_val_inf msg;
+ 
++	if (!sdev || !val || !count || count > 16 || addr >= 0xC00 ||
++	    count > 0xC00 - addr)
++		return -EINVAL;
++
+ 	slim_fill_msg(&msg, addr, count, val, NULL);
+ 
+ 	return slim_xfer_msg(sdev, &msg, SLIM_MSG_MC_REQUEST_VALUE);
+@@ -360,6 +380,10 @@
+ {
+ 	struct slim_val_inf msg;
+ 
++	if (!sdev || !val || !count || count > 16 || addr >= 0xC00 ||
++	    count > 0xC00 - addr)
++		return -EINVAL;
++
+ 	slim_fill_msg(&msg, addr, count,  NULL, val);
+ 
+ 	return slim_xfer_msg(sdev, &msg, SLIM_MSG_MC_CHANGE_VALUE);
+--- a/drivers/slimbus/stream.c
++++ b/drivers/slimbus/stream.c
+@@ -66,6 +66,10 @@
+ {
+ 	struct slim_stream_runtime *rt;
+ 
++	if (!dev || !dev->ctrl || !name)
++		return ERR_PTR(-EINVAL);
++	if (READ_ONCE(dev->ctrl->removing))
++		return ERR_PTR(-ESHUTDOWN);
+ 	rt = kzalloc(sizeof(*rt), GFP_KERNEL);
+ 	if (!rt)
+ 		return ERR_PTR(-ENOMEM);
+@@ -76,6 +80,7 @@
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
++	get_device(&dev->dev);
+ 	rt->dev = dev;
+ 	spin_lock(&dev->stream_list_lock);
+ 	list_add_tail(&rt->node, &dev->stream_list);
+@@ -89,6 +94,7 @@
+ 				     struct slim_port *port)
+ {
+ 	struct slim_device *sdev = stream->dev;
++	int ret;
+ 	u8 wbuf[2];
+ 	struct slim_val_inf msg = {0, 2, NULL, wbuf, NULL};
+ 	u8 mc = SLIM_MSG_MC_CONNECT_SOURCE;
+@@ -99,26 +105,35 @@
+ 
+ 	wbuf[0] = port->id;
+ 	wbuf[1] = port->ch.id;
+-	port->ch.state = SLIM_CH_STATE_ASSOCIATED;
+-	port->state = SLIM_PORT_UNCONFIGURED;
+-
+-	return slim_do_transfer(sdev->ctrl, &txn);
++
++	ret = slim_do_transfer(sdev->ctrl, &txn);
++	if (!ret) {
++		port->ch.state = SLIM_CH_STATE_ASSOCIATED;
++		port->state = SLIM_PORT_UNCONFIGURED;
++	}
++	return ret;
+ }
+ 
+ static int slim_disconnect_port(struct slim_stream_runtime *stream,
+ 				struct slim_port *port)
+ {
+ 	struct slim_device *sdev = stream->dev;
++	int ret;
+ 	u8 wbuf[1];
+ 	struct slim_val_inf msg = {0, 1, NULL, wbuf, NULL};
+ 	u8 mc = SLIM_MSG_MC_DISCONNECT_PORT;
+ 	DEFINE_SLIM_LDEST_TXN(txn, mc, 5, stream->dev->laddr, &msg);
+ 
++	if (port->state == SLIM_PORT_DISCONNECTED)
++		return 0;
+ 	wbuf[0] = port->id;
+-	port->ch.state = SLIM_CH_STATE_DISCONNECTED;
+-	port->state = SLIM_PORT_DISCONNECTED;
+-
+-	return slim_do_transfer(sdev->ctrl, &txn);
++
++	ret = slim_do_transfer(sdev->ctrl, &txn);
++	if (!ret) {
++		port->ch.state = SLIM_CH_STATE_DISCONNECTED;
++		port->state = SLIM_PORT_DISCONNECTED;
++	}
++	return ret;
+ }
+ 
+ static int slim_deactivate_remove_channel(struct slim_stream_runtime *stream,
+@@ -137,9 +152,11 @@
+ 		return ret;
+ 
+ 	txn.mc = SLIM_MSG_MC_NEXT_REMOVE_CHANNEL;
+-	port->ch.state = SLIM_CH_STATE_REMOVED;
+-
+-	return slim_do_transfer(sdev->ctrl, &txn);
++
++	ret = slim_do_transfer(sdev->ctrl, &txn);
++	if (!ret)
++		port->ch.state = SLIM_CH_STATE_REMOVED;
++	return ret;
+ }
+ 
+ static int slim_get_prate_code(int rate)
+@@ -147,6 +164,8 @@
+ 	int ratem, ratefam, pr, exp = 0;
+ 	bool done = false, exact = true;
+ 
++	if (rate < SLIM_BASE_FREQ_4)
++		return -EINVAL;
+ 	ratem = ((rate == SLIM_FREQ_441) || (rate == SLIM_FREQ_882)) ?
+ 			(rate/SLIM_BASE_FREQ_11) : (rate/SLIM_BASE_FREQ_4);
+ 
+@@ -199,12 +218,12 @@
+  * return zero on success and error code on failure. From ASoC DPCM framework,
+  * this state is linked to hw_params() operation.
+  */
+-int slim_stream_prepare(struct slim_stream_runtime *rt,
+-			struct slim_stream_config *cfg)
++static int slim_stream_prepare_locked(struct slim_stream_runtime *rt,
++				      struct slim_stream_config *cfg)
+ {
+ 	struct slim_controller *ctrl;
+ 	struct slim_port *port;
+-	int num_ports, i, port_id, prrate;
++	int num_ports, i, port_id, prrate, ret;
+ 
+ 	if (!rt || !cfg) {
+ 		pr_err("%s: Stream or cfg is NULL, Check from client side\n", __func__);
+@@ -217,22 +236,29 @@
+ 		return -EINVAL;
+ 	}
+ 
++	if (!ctrl->a_framer || ctrl->a_framer->superfreq <= 0 ||
++	    !cfg->port_mask || cfg->port_mask & ~GENMASK(31, 0) ||
++	    !cfg->chs || !cfg->ch_count || cfg->ch_count > SLIM_DEVICE_MAX_PORTS ||
++	    !cfg->bps || cfg->bps > 32 || cfg->bps % SLIM_SLOT_LEN_BITS ||
++	    cfg->direction < SNDRV_PCM_STREAM_PLAYBACK ||
++	    cfg->direction > SNDRV_PCM_STREAM_CAPTURE)
++		return -EINVAL;
+ 	num_ports = hweight32(cfg->port_mask);
++	if (cfg->ch_count != num_ports)
++		return -EINVAL;
++	for (i = 0; i < num_ports; i++)
++		if (cfg->chs[i] >= SLIM_DEVICE_MAX_CHANNELS)
++			return -EINVAL;
++	prrate = slim_get_prate_code(cfg->rate);
++	if (prrate < 0)
++		return prrate;
+ 	rt->ports = kcalloc(num_ports, sizeof(*port), GFP_KERNEL);
+ 	if (!rt->ports)
+ 		return -ENOMEM;
+-
+ 	rt->num_ports = num_ports;
+ 	rt->rate = cfg->rate;
+ 	rt->bps = cfg->bps;
+ 	rt->direction = cfg->direction;
+-
+-	prrate = slim_get_prate_code(cfg->rate);
+-	if (prrate < 0) {
+-		dev_err(&rt->dev->dev, "Cannot get presence rate for rate %d Hz\n",
+-			cfg->rate);
+-		return prrate;
+-	}
+ 
+ 	if (cfg->rate % ctrl->a_framer->superfreq) {
+ 		/*
+@@ -265,11 +291,43 @@
+ 		else
+ 			port->direction = SLIM_PORT_SOURCE;
+ 
+-		slim_connect_port_channel(rt, port);
++		ret = slim_connect_port_channel(rt, port);
++		if (ret)
++			goto disconnect;
+ 		i++;
+ 	}
+ 
+ 	return 0;
++disconnect:
++	/* Preserve any connection whose rollback failed so teardown can retry. */
++	for (i = 0; i < rt->num_ports; i++)
++		slim_disconnect_port(rt, &rt->ports[i]);
++	for (i = 0; i < rt->num_ports; i++)
++		if (rt->ports[i].state != SLIM_PORT_DISCONNECTED)
++			return ret;
++	kfree(rt->ports);
++	rt->ports = NULL;
++	rt->num_ports = 0;
++	return ret;
++}
++
++int slim_stream_prepare(struct slim_stream_runtime *stream, struct slim_stream_config *cfg)
++{
++	struct slim_controller *ctrl;
++	struct slim_device *dev;
++	int ret;
++
++	if (!stream || !stream->dev || !stream->dev->ctrl)
++		return -EINVAL;
++	dev = stream->dev;
++	ctrl = dev->ctrl;
++	mutex_lock(&ctrl->stream_lock);
++	if (READ_ONCE(ctrl->removing))
++		ret = -ESHUTDOWN;
++	else
++		ret = slim_stream_prepare_locked(stream, cfg);
++	mutex_unlock(&ctrl->stream_lock);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(slim_stream_prepare);
+ 
+@@ -277,6 +335,7 @@
+ 				       struct slim_port *port)
+ {
+ 	struct slim_device *sdev = stream->dev;
++	int ret;
+ 	u8 wbuf[4];
+ 	struct slim_val_inf msg = {0, 4, NULL, wbuf, NULL};
+ 	u8 mc = SLIM_MSG_MC_NEXT_DEFINE_CONTENT;
+@@ -291,9 +350,11 @@
+ 
+ 	wbuf[2] = port->ch.data_fmt | (port->ch.aux_fmt << 4);
+ 	wbuf[3] = stream->bps/SLIM_SLOT_LEN_BITS;
+-	port->ch.state = SLIM_CH_STATE_CONTENT_DEFINED;
+-
+-	return slim_do_transfer(sdev->ctrl, &txn);
++
++	ret = slim_do_transfer(sdev->ctrl, &txn);
++	if (!ret)
++		port->ch.state = SLIM_CH_STATE_CONTENT_DEFINED;
++	return ret;
+ }
+ 
+ static int slim_get_segdist_code(int ratem)
+@@ -312,12 +373,16 @@
+ 				       struct slim_port *port)
+ {
+ 	struct slim_device *sdev = stream->dev;
++	int ret;
+ 	u8 wbuf[4];
+ 	struct slim_val_inf msg = {0, 4, NULL, wbuf, NULL};
+ 	u8 mc = SLIM_MSG_MC_NEXT_DEFINE_CHANNEL;
+ 	DEFINE_SLIM_LDEST_TXN(txn, mc, 8, stream->dev->laddr, &msg);
+ 
+-	port->ch.seg_dist = slim_get_segdist_code(stream->ratem);
++	ret = slim_get_segdist_code(stream->ratem);
++	if (ret < 0)
++		return ret;
++	port->ch.seg_dist = ret;
+ 
+ 	wbuf[0] = port->ch.id;
+ 	wbuf[1] = port->ch.seg_dist & 0xFF;
+@@ -327,15 +392,17 @@
+ 	else
+ 		wbuf[3] = stream->bps/SLIM_SLOT_LEN_BITS + 1;
+ 
+-	port->ch.state = SLIM_CH_STATE_DEFINED;
+-
+-	return slim_do_transfer(sdev->ctrl, &txn);
++	ret = slim_do_transfer(sdev->ctrl, &txn);
++	if (!ret)
++		port->ch.state = SLIM_CH_STATE_DEFINED;
++	return ret;
+ }
+ 
+ static int slim_activate_channel(struct slim_stream_runtime *stream,
+ 				 struct slim_port *port)
+ {
+ 	struct slim_device *sdev = stream->dev;
++	int ret;
+ 	u8 wbuf[1];
+ 	struct slim_val_inf msg = {0, 1, NULL, wbuf, NULL};
+ 	u8 mc = SLIM_MSG_MC_NEXT_ACTIVATE_CHANNEL;
+@@ -344,9 +411,11 @@
+ 	txn.msg->num_bytes = 1;
+ 	txn.msg->wbuf = wbuf;
+ 	wbuf[0] = port->ch.id;
+-	port->ch.state = SLIM_CH_STATE_ACTIVE;
+-
+-	return slim_do_transfer(sdev->ctrl, &txn);
++
++	ret = slim_do_transfer(sdev->ctrl, &txn);
++	if (!ret)
++		port->ch.state = SLIM_CH_STATE_ACTIVE;
++	return ret;
+ }
+ 
+ /**
+@@ -360,7 +429,7 @@
+  * Return: zero on success and error code on failure. From ASoC DPCM framework,
+  * this state is linked to trigger() start operation.
+  */
+-int slim_stream_enable(struct slim_stream_runtime *stream)
++static int slim_stream_enable_locked(struct slim_stream_runtime *stream)
+ {
+ 	DEFINE_SLIM_BCAST_TXN(txn, SLIM_MSG_MC_BEGIN_RECONFIGURATION,
+ 				3, SLIM_LA_MANAGER, NULL);
+@@ -372,19 +441,18 @@
+ 		return -EINVAL;
+ 	}
+ 
++	if (!stream->ports || !stream->num_ports)
++		return -EINVAL;
+ 	ctrl = stream->dev->ctrl;
+ 	if (ctrl->enable_stream) {
+-		mutex_lock(&ctrl->stream_lock);
+ 		ret = ctrl->enable_stream(stream);
+ 		if (ret) {
+-			mutex_unlock(&ctrl->stream_lock);
+ 			return ret;
+ 		}
+ 
+ 		for (i = 0; i < stream->num_ports; i++)
+ 			stream->ports[i].ch.state = SLIM_CH_STATE_ACTIVE;
+ 
+-		mutex_unlock(&ctrl->stream_lock);
+ 		return ret;
+ 	}
+ 
+@@ -396,19 +464,44 @@
+ 	for (i = 0; i < stream->num_ports; i++) {
+ 		struct slim_port *port = &stream->ports[i];
+ 
+-		slim_define_channel(stream, port);
+-		slim_define_channel_content(stream, port);
++		ret = slim_define_channel(stream, port);
++		if (ret)
++			return ret;
++		ret = slim_define_channel_content(stream, port);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	for (i = 0; i < stream->num_ports; i++) {
+ 		struct slim_port *port = &stream->ports[i];
+ 
+-		slim_activate_channel(stream, port);
++		ret = slim_activate_channel(stream, port);
++		if (ret)
++			return ret;
+ 		port->state = SLIM_PORT_CONFIGURED;
+ 	}
+ 	txn.mc = SLIM_MSG_MC_RECONFIGURE_NOW;
+ 
+ 	return slim_do_transfer(ctrl, &txn);
++}
++
++int slim_stream_enable(struct slim_stream_runtime *stream)
++{
++	struct slim_controller *ctrl;
++	struct slim_device *dev;
++	int ret;
++
++	if (!stream || !stream->dev || !stream->dev->ctrl)
++		return -EINVAL;
++	dev = stream->dev;
++	ctrl = dev->ctrl;
++	mutex_lock(&ctrl->stream_lock);
++	if (READ_ONCE(ctrl->removing))
++		ret = -ESHUTDOWN;
++	else
++		ret = slim_stream_enable_locked(stream);
++	mutex_unlock(&ctrl->stream_lock);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(slim_stream_enable);
+ 
+@@ -423,7 +516,7 @@
+  * Return: zero on success and error code on failure. From ASoC DPCM framework,
+  * this state is linked to trigger() pause operation.
+  */
+-int slim_stream_disable(struct slim_stream_runtime *stream)
++static int slim_stream_disable_locked(struct slim_stream_runtime *stream)
+ {
+ 	DEFINE_SLIM_BCAST_TXN(txn, SLIM_MSG_MC_BEGIN_RECONFIGURATION,
+ 				3, SLIM_LA_MANAGER, NULL);
+@@ -442,25 +535,44 @@
+ 
+ 	ctrl = stream->dev->ctrl;
+ 	if (ctrl->disable_stream) {
+-		mutex_lock(&ctrl->stream_lock);
+ 		ret = ctrl->disable_stream(stream);
+ 		if (ret) {
+-			mutex_unlock(&ctrl->stream_lock);
+ 			return ret;
+ 		}
+-		mutex_unlock(&ctrl->stream_lock);
+ 	}
+ 
+ 	ret = slim_do_transfer(ctrl, &txn);
+ 	if (ret)
+ 		return ret;
+ 
+-	for (i = 0; i < stream->num_ports; i++)
+-		slim_deactivate_remove_channel(stream, &stream->ports[i]);
++	for (i = 0; i < stream->num_ports; i++) {
++		ret = slim_deactivate_remove_channel(stream, &stream->ports[i]);
++		if (ret)
++			return ret;
++	}
+ 
+ 	txn.mc = SLIM_MSG_MC_RECONFIGURE_NOW;
+ 
+ 	return slim_do_transfer(ctrl, &txn);
++}
++
++int slim_stream_disable(struct slim_stream_runtime *stream)
++{
++	struct slim_controller *ctrl;
++	struct slim_device *dev;
++	int ret;
++
++	if (!stream || !stream->dev || !stream->dev->ctrl)
++		return -EINVAL;
++	dev = stream->dev;
++	ctrl = dev->ctrl;
++	mutex_lock(&ctrl->stream_lock);
++	if (READ_ONCE(ctrl->removing))
++		ret = -ESHUTDOWN;
++	else
++		ret = slim_stream_disable_locked(stream);
++	mutex_unlock(&ctrl->stream_lock);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(slim_stream_disable);
+ 
+@@ -475,22 +587,23 @@
+  * Return: zero on success and error code on failure. From ASoC DPCM framework,
+  * this state is linked to trigger() stop operation.
+  */
+-int slim_stream_unprepare(struct slim_stream_runtime *stream)
+-{
+-	int i;
++static int slim_stream_unprepare_locked(struct slim_stream_runtime *stream)
++{
++	int i, ret;
+ 
+ 	if (!stream) {
+ 		pr_err("%s: Stream is NULL, Check from client side\n", __func__);
+ 		return -EINVAL;
+ 	}
+ 
+-	if (!stream->ports || !stream->num_ports) {
+-		pr_err("%s: Stream port is NULL %d\n", __func__, stream->num_ports);
+-		return -EINVAL;
+-	}
+-
+-	for (i = 0; i < stream->num_ports; i++)
+-		slim_disconnect_port(stream, &stream->ports[i]);
++	if (!stream->ports || !stream->num_ports)
++		return 0;
++
++	for (i = 0; i < stream->num_ports; i++) {
++		ret = slim_disconnect_port(stream, &stream->ports[i]);
++		if (ret)
++			return ret;
++	}
+ 
+ 	kfree(stream->ports);
+ 	stream->ports = NULL;
+@@ -498,6 +611,25 @@
+ 
+ 	return 0;
+ }
++
++int slim_stream_unprepare(struct slim_stream_runtime *stream)
++{
++	struct slim_controller *ctrl;
++	struct slim_device *dev;
++	int ret;
++
++	if (!stream || !stream->dev || !stream->dev->ctrl)
++		return -EINVAL;
++	dev = stream->dev;
++	ctrl = dev->ctrl;
++	mutex_lock(&ctrl->stream_lock);
++	if (READ_ONCE(ctrl->removing))
++		ret = -ESHUTDOWN;
++	else
++		ret = slim_stream_unprepare_locked(stream);
++	mutex_unlock(&ctrl->stream_lock);
++	return ret;
++}
+ EXPORT_SYMBOL_GPL(slim_stream_unprepare);
+ 
+ /**
+@@ -514,27 +646,32 @@
+  * Return: zero on success and error code on failure. From ASoC DPCM framework,
+  * this state is linked to trigger() stop operation.
+  */
+-int slim_stream_unprepare_disconnect_port(struct slim_stream_runtime *stream,
+-		bool disconnect_ports, bool is_session_completed)
+-{
+-	int i;
++static int slim_stream_unprepare_disconnect_port_locked(struct slim_stream_runtime *stream,
++							bool disconnect_ports,
++							bool is_session_completed)
++{
++	int i, ret;
+ 
+ 	if (!stream) {
+ 		pr_err("%s: Stream is NULL, Check from client side\n", __func__);
+ 		return -EINVAL;
+ 	}
+ 
+-	if (!stream->ports || !stream->num_ports) {
+-		pr_err("%s: Stream port is NULL %d\n", __func__, stream->num_ports);
+-		return -EINVAL;
+-	}
++	if (!stream->ports || !stream->num_ports)
++		return 0;
+ 
+ 	if (disconnect_ports) {
++		for (i = 0; i < stream->num_ports; i++) {
++			ret = slim_disconnect_port(stream, &stream->ports[i]);
++			if (ret)
++				return ret;
++		}
++	}
++
++	if (is_session_completed) {
+ 		for (i = 0; i < stream->num_ports; i++)
+-			slim_disconnect_port(stream, &stream->ports[i]);
+-	}
+-
+-	if (is_session_completed) {
++			if (stream->ports[i].state != SLIM_PORT_DISCONNECTED)
++				return -EBUSY;
+ 		kfree(stream->ports);
+ 		stream->ports = NULL;
+ 		stream->num_ports = 0;
+@@ -542,6 +679,27 @@
+ 
+ 	return 0;
+ }
++
++int slim_stream_unprepare_disconnect_port(struct slim_stream_runtime *stream,
++					  bool disconnect_ports, bool is_session_completed)
++{
++	struct slim_controller *ctrl;
++	struct slim_device *dev;
++	int ret;
++
++	if (!stream || !stream->dev || !stream->dev->ctrl)
++		return -EINVAL;
++	dev = stream->dev;
++	ctrl = dev->ctrl;
++	mutex_lock(&ctrl->stream_lock);
++	if (READ_ONCE(ctrl->removing))
++		ret = -ESHUTDOWN;
++	else
++		ret = slim_stream_unprepare_disconnect_port_locked(stream, disconnect_ports,
++								   is_session_completed);
++	mutex_unlock(&ctrl->stream_lock);
++	return ret;
++}
+ EXPORT_SYMBOL_GPL(slim_stream_unprepare_disconnect_port);
+ 
+ /**
+@@ -556,7 +714,7 @@
+  * Return: zero on success and error code on failure. From ASoC DPCM framework,
+  * this state is linked to shutdown() operation.
+  */
+-int slim_stream_free(struct slim_stream_runtime *stream)
++static int slim_stream_free_locked(struct slim_stream_runtime *stream)
+ {
+ 	struct slim_device *sdev;
+ 
+@@ -566,6 +724,8 @@
+ 	}
+ 
+ 	sdev = stream->dev;
++	/* Final release also abandons state after a failed hardware cleanup. */
++	kfree(stream->ports);
+ 	spin_lock(&sdev->stream_list_lock);
+ 	list_del(&stream->node);
+ 	spin_unlock(&sdev->stream_list_lock);
+@@ -575,4 +735,22 @@
+ 
+ 	return 0;
+ }
++
++int slim_stream_free(struct slim_stream_runtime *stream)
++{
++	struct slim_controller *ctrl;
++	struct slim_device *dev;
++	int ret;
++
++	if (!stream || !stream->dev || !stream->dev->ctrl)
++		return -EINVAL;
++	dev = stream->dev;
++	ctrl = dev->ctrl;
++	mutex_lock(&ctrl->stream_lock);
++	ret = slim_stream_free_locked(stream);
++	mutex_unlock(&ctrl->stream_lock);
++	if (!ret)
++		put_device(&dev->dev);
++	return ret;
++}
+ EXPORT_SYMBOL_GPL(slim_stream_free);
+--- a/drivers/slimbus/qcom-ngd-ctrl.c
++++ b/drivers/slimbus/qcom-ngd-ctrl.c
+@@ -11,6 +11,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/dmaengine.h>
++#include <linux/unaligned.h>
+ #include <linux/slimbus.h>
+ #include <linux/delay.h>
+ #include <linux/pm_runtime.h>
+@@ -229,6 +230,10 @@
+ 	unsigned int irq;
+ 	bool irq_disabled;
+ 	bool capability_timeout;
++	bool stopping;
++	bool dma_stopping;
++	bool restart_vote;
++	resource_size_t regs_size;
+ };
+ 
+ enum slimbus_mode_enum_type_v01 {
+@@ -467,19 +472,23 @@
+ 	rc = qmi_txn_init(ctrl->qmi.handle, &txn,
+ 				slimbus_power_resp_msg_v01_ei, &resp);
+ 
++	if (rc < 0) {
++		mutex_unlock(&ctrl->qmi_handle_lock);
++		return rc;
++	}
+ 	rc = qmi_send_request(ctrl->qmi.handle, NULL, &txn,
+ 				SLIMBUS_QMI_POWER_REQ_V01,
+ 				SLIMBUS_QMI_POWER_REQ_MAX_MSG_LEN,
+ 				slimbus_power_req_msg_v01_ei, req);
+ 	if (rc < 0) {
+ 		SLIM_ERR(ctrl, "QMI send req fail %d\n", rc);
++		qmi_txn_cancel(&txn);
+ 		mutex_unlock(&ctrl->qmi_handle_lock);
+-		qmi_txn_cancel(&txn);
+ 		return rc;
+ 	}
++
++	rc = qmi_txn_wait(&txn, SLIMBUS_QMI_RESP_TOUT);
+ 	mutex_unlock(&ctrl->qmi_handle_lock);
+-
+-	rc = qmi_txn_wait(&txn, SLIMBUS_QMI_RESP_TOUT);
+ 	if (rc < 0) {
+ 		SLIM_ERR(ctrl, "QMI TXN wait fail: %d\n", rc);
+ 		return rc;
+@@ -514,14 +523,18 @@
+ 	struct qmi_handle *handle;
+ 	int rc;
+ 
++	mutex_lock(&ctrl->qmi_handle_lock);
+ 	if (ctrl->qmi.handle) {
+ 		SLIM_INFO(ctrl, "qmi handle already allocated\n");
++		mutex_unlock(&ctrl->qmi_handle_lock);
+ 		return 0;
+ 	}
+ 
+ 	handle = devm_kzalloc(ctrl->dev, sizeof(*handle), GFP_KERNEL);
+-	if (!handle)
++	if (!handle) {
++		mutex_unlock(&ctrl->qmi_handle_lock);
+ 		return -ENOMEM;
++	}
+ 
+ 	rc = qmi_handle_init(handle, SLIMBUS_QMI_POWER_REQ_MAX_MSG_LEN,
+ 				NULL, qcom_slim_qmi_msg_handlers);
+@@ -556,6 +569,7 @@
+ 		goto qmi_select_instance_failed;
+ 	}
+ 
++	mutex_unlock(&ctrl->qmi_handle_lock);
+ 	return 0;
+ 
+ qmi_select_instance_failed:
+@@ -564,6 +578,7 @@
+ 	qmi_handle_release(handle);
+ qmi_handle_init_failed:
+ 	devm_kfree(ctrl->dev, handle);
++	mutex_unlock(&ctrl->qmi_handle_lock);
+ 	return rc;
+ }
+ 
+@@ -624,20 +639,11 @@
+ 	struct qcom_slim_ngd_ctrl *ctrl = desc->ctrl;
+ 	unsigned long flags;
+ 
+-	/* Return if capability exchange is not successful due to timeout */
+-	if (ctrl->capability_timeout) {
+-		ctrl->capability_timeout = false;
+-		SLIM_WARN(ctrl, "Timedout due to delayed interrupt\n");
+-		desc->comp = NULL;
+-		return;
+-	}
+ 	spin_lock_irqsave(&ctrl->tx_buf_lock, flags);
+-
+ 	if (desc->comp) {
+ 		complete(desc->comp);
+ 		desc->comp = NULL;
+ 	}
+-
+ 	ctrl->tx_head = (ctrl->tx_head + 1) % QCOM_SLIM_NGD_DESC_NUM;
+ 	spin_unlock_irqrestore(&ctrl->tx_buf_lock, flags);
+ }
+@@ -646,50 +652,54 @@
+ 				     void *buf, int len)
+ {
+ 	struct qcom_slim_ngd_dma_desc *desc;
+-	unsigned long flags;
+-	int ret, index, offset;
+-
+-	spin_lock_irqsave(&ctrl->tx_buf_lock, flags);
+-	offset = buf - ctrl->tx_base;
+-	index = offset/SLIM_MSGQ_BUF_LEN;
+-
+-	desc = &ctrl->txdesc[index];
++	int offset = buf - ctrl->tx_base;
++	int ret;
++
++	if (!ctrl->dma_tx_channel || len <= 0 || len > SLIM_MSGQ_BUF_LEN ||
++	    offset < 0 || offset % SLIM_MSGQ_BUF_LEN ||
++	    offset / SLIM_MSGQ_BUF_LEN >= QCOM_SLIM_NGD_DESC_NUM)
++		return -EINVAL;
++	desc = &ctrl->txdesc[offset / SLIM_MSGQ_BUF_LEN];
+ 	desc->phys = ctrl->tx_phys_base + offset;
+-	desc->base = ctrl->tx_base + offset;
++	desc->base = buf;
+ 	desc->ctrl = ctrl;
+-	len = (len + 3) & 0xfc;
+-
+-	for (ret = 0; ret < ((len) >> 2); ret++)
+-		SLIM_INFO(ctrl, "BAM TX len = %d buf[%d]:0x%x\n", len, ret, ((u32 *)buf)[ret]);
+-
+-	if (!ctrl->dma_tx_channel)
+-		SLIM_WARN(ctrl, " tx channel not available\n");
+-
+ 	desc->desc = dmaengine_prep_slave_single(ctrl->dma_tx_channel,
+-						desc->phys, len,
+-						DMA_MEM_TO_DEV,
+-						DMA_PREP_INTERRUPT);
+-	if (!desc->desc) {
+-		dev_err(ctrl->dev, "unable to prepare channel\n");
+-		spin_unlock_irqrestore(&ctrl->tx_buf_lock, flags);
+-		return -EINVAL;
+-	}
+-
++				desc->phys, ALIGN(len, 4), DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT);
++	if (!desc->desc)
++		return -ENOMEM;
+ 	desc->desc->callback = qcom_slim_ngd_tx_msg_dma_cb;
+ 	desc->desc->callback_param = desc;
+-	desc->desc->cookie = dmaengine_submit(desc->desc);
++	desc->cookie = dmaengine_submit(desc->desc);
++	ret = dma_submit_error(desc->cookie);
++	if (ret)
++		return ret;
+ 	dma_async_issue_pending(ctrl->dma_tx_channel);
++	return 0;
++}
++
++static void qcom_slim_ngd_tx_msg_cancel(struct qcom_slim_ngd_ctrl *ctrl,
++					void *buf, bool submitted)
++{
++	unsigned int index = (buf - ctrl->tx_base) / SLIM_MSGQ_BUF_LEN;
++	unsigned long flags;
++
++	spin_lock_irqsave(&ctrl->tx_buf_lock, flags);
++	ctrl->txdesc[index].comp = NULL;
++	if (!submitted)
++		ctrl->tx_tail = index;
+ 	spin_unlock_irqrestore(&ctrl->tx_buf_lock, flags);
+-
+-	return 0;
+ }
+ 
+ static void qcom_slim_ngd_rx(struct qcom_slim_ngd_ctrl *ctrl, u8 *buf)
+ {
+ 	u8 mc, mt, len;
+ 
++	if (READ_ONCE(ctrl->stopping))
++		return;
+ 	mt = SLIM_HEADER_GET_MT(buf[0]);
+ 	len = SLIM_HEADER_GET_RL(buf[0]);
++	if (len < 2 || len > SLIM_MSGQ_BUF_LEN)
++		return;
+ 	mc = SLIM_HEADER_GET_MC(buf[1]);
+ 
+ 	SLIM_INFO(ctrl, "BAM RX len = %d buf[0]:0x%x buf[1]:0x%x\n", len, buf[0], buf[1]);
+@@ -702,6 +712,8 @@
+ 	    mt == SLIM_MSG_MT_SRC_REFERRED_USER) ||
+ 		(mc == SLIM_USR_MC_GENERIC_ACK &&
+ 		 mt == SLIM_MSG_MT_SRC_REFERRED_USER)) {
++		if (len < 4 || (mc == SLIM_USR_MC_ADDR_REPLY && len != 11))
++			return;
+ 		slim_msg_response(&ctrl->ctrl, &buf[4], buf[3], len - 4);
+ 		pm_runtime_mark_last_busy(ctrl->ctrl.dev);
+ 	}
+@@ -711,11 +723,20 @@
+ {
+ 	struct qcom_slim_ngd_dma_desc *desc = args;
+ 	struct qcom_slim_ngd_ctrl *ctrl;
++	u8 frame[SLIM_MSGQ_BUF_LEN];
+ 
+ 	if (!desc)
+ 		return;
+ 	ctrl = desc->ctrl;
+-	qcom_slim_ngd_rx(ctrl, (u8 *)desc->base);
++	if (READ_ONCE(ctrl->dma_stopping))
++		return;
++	if (ctrl->r_mem.is_r_mem)
++		memcpy_fromio(frame, desc->base, sizeof(frame));
++	else
++		memcpy(frame, desc->base, sizeof(frame));
++	qcom_slim_ngd_rx(ctrl, frame);
++	if (READ_ONCE(ctrl->dma_stopping))
++		return;
+ 	/* Add descriptor back to the queue */
+ 	desc->desc = dmaengine_prep_slave_single(ctrl->dma_rx_channel,
+ 					desc->phys, SLIM_MSGQ_BUF_LEN,
+@@ -728,7 +749,9 @@
+ 
+ 	desc->desc->callback = qcom_slim_ngd_rx_msgq_cb;
+ 	desc->desc->callback_param = desc;
+-	desc->desc->cookie = dmaengine_submit(desc->desc);
++	desc->cookie = dmaengine_submit(desc->desc);
++	if (dma_submit_error(desc->cookie))
++		return;
+ 	dma_async_issue_pending(ctrl->dma_rx_channel);
+ }
+ 
+@@ -737,6 +760,7 @@
+ 	struct qcom_slim_ngd_dma_desc *desc;
+ 	int i;
+ 
++	WRITE_ONCE(ctrl->dma_stopping, false);
+ 	for (i = 0; i < QCOM_SLIM_NGD_DESC_NUM; i++) {
+ 		desc = &ctrl->rx_desc[i];
+ 		desc->phys = ctrl->rx_phys_base + i * SLIM_MSGQ_BUF_LEN;
+@@ -753,7 +777,9 @@
+ 
+ 		desc->desc->callback = qcom_slim_ngd_rx_msgq_cb;
+ 		desc->desc->callback_param = desc;
+-		desc->desc->cookie = dmaengine_submit(desc->desc);
++		desc->cookie = dmaengine_submit(desc->desc);
++		if (dma_submit_error(desc->cookie))
++			return dma_submit_error(desc->cookie);
+ 	}
+ 	dma_async_issue_pending(ctrl->dma_rx_channel);
+ 
+@@ -775,7 +801,7 @@
+ 	}
+ 
+ 	size = QCOM_SLIM_NGD_DESC_NUM * SLIM_MSGQ_BUF_LEN;
+-	ctrl->rx_base = ctrl->r_mem.is_r_mem ? ctrl->r_mem.r_vbase :
++	ctrl->rx_base = ctrl->r_mem.is_r_mem ? ctrl->r_mem.r_vsbase :
+ 			dma_alloc_coherent(dev, size, &phys, GFP_KERNEL);
+ 	if (!ctrl->rx_base) {
+ 		ret = -ENOMEM;
+@@ -783,11 +809,9 @@
+ 	}
+ 
+ 	ctrl->rx_phys_base = ctrl->r_mem.is_r_mem ?
+-		(unsigned long long)ctrl->r_mem.r_res->start : phys;
++		ctrl->r_mem.r_pbase : phys;
+ 	if (ctrl->r_mem.is_r_mem) {
+ 		memset_io(ctrl->rx_base, 0x00, size);
+-		ctrl->r_mem.r_vbase = ctrl->r_mem.r_vbase + size;
+-		ctrl->r_mem.r_res->start = ctrl->r_mem.r_res->start + size;
+ 	}
+ 
+ 	ret = qcom_slim_ngd_post_rx_msgq(ctrl);
+@@ -799,10 +823,14 @@
+ 	return 0;
+ 
+ rx_post_err:
++	WRITE_ONCE(ctrl->dma_stopping, true);
++	dmaengine_terminate_sync(ctrl->dma_rx_channel);
+ 	if (!ctrl->r_mem.is_r_mem)
+ 		dma_free_coherent(dev, size, ctrl->rx_base, ctrl->rx_phys_base);
+ rel_rx:
++	ctrl->rx_base = NULL;
+ 	dma_release_channel(ctrl->dma_rx_channel);
++	ctrl->dma_rx_channel = NULL;
+ 	return ret;
+ }
+ 
+@@ -823,7 +851,8 @@
+ 	}
+ 
+ 	size = ((QCOM_SLIM_NGD_DESC_NUM + 1) * SLIM_MSGQ_BUF_LEN);
+-	ctrl->tx_base = ctrl->r_mem.is_r_mem ? ctrl->r_mem.r_vbase :
++	ctrl->tx_base = ctrl->r_mem.is_r_mem ?
++		ctrl->r_mem.r_vsbase + QCOM_SLIM_NGD_DESC_NUM * SLIM_MSGQ_BUF_LEN :
+ 			dma_alloc_coherent(dev, size, &phys, GFP_KERNEL);
+ 	if (!ctrl->tx_base) {
+ 		ret = -EINVAL;
+@@ -831,11 +860,9 @@
+ 	}
+ 
+ 	ctrl->tx_phys_base = ctrl->r_mem.is_r_mem ?
+-		(unsigned long long)ctrl->r_mem.r_res->start : phys;
++		ctrl->r_mem.r_pbase + QCOM_SLIM_NGD_DESC_NUM * SLIM_MSGQ_BUF_LEN : phys;
+ 	if (ctrl->r_mem.is_r_mem) {
+ 		memset_io(ctrl->tx_base, 0x00, size);
+-		ctrl->r_mem.r_vbase = ctrl->r_mem.r_vbase + size;
+-		ctrl->r_mem.r_res->start = ctrl->r_mem.r_res->start + size;
+ 	}
+ 
+ 	spin_lock_irqsave(&ctrl->tx_buf_lock, flags);
+@@ -846,24 +873,25 @@
+ 	return 0;
+ rel_tx:
+ 	dma_release_channel(ctrl->dma_tx_channel);
++	ctrl->dma_tx_channel = NULL;
+ 	return ret;
+ }
+ 
++static int qcom_slim_ngd_exit_dma(struct qcom_slim_ngd_ctrl *ctrl);
++
+ static int qcom_slim_ngd_init_dma(struct qcom_slim_ngd_ctrl *ctrl)
+ {
+-	int ret = 0;
+-
+-	SLIM_INFO(ctrl, "SLIM: NGD init dma\n");
+-	ret = qcom_slim_ngd_init_rx_msgq(ctrl);
+-	if (ret) {
+-		dev_err(ctrl->dev, "rx dma init failed\n");
+-		return ret;
+-	}
+-
++	int ret;
++
++	if (ctrl->dma_tx_channel || ctrl->dma_rx_channel)
++		qcom_slim_ngd_exit_dma(ctrl);
++	/* RX may immediately schedule the capability worker, which needs TX. */
+ 	ret = qcom_slim_ngd_init_tx_msgq(ctrl);
+ 	if (ret)
+-		dev_err(ctrl->dev, "tx dma init failed\n");
+-
++		return ret;
++	ret = qcom_slim_ngd_init_rx_msgq(ctrl);
++	if (ret)
++		qcom_slim_ngd_exit_dma(ctrl);
+ 	return ret;
+ }
+ 
+@@ -888,8 +916,12 @@
+ static irqreturn_t qcom_slim_ngd_interrupt(int irq, void *d)
+ {
+ 	struct qcom_slim_ngd_ctrl *ctrl = d;
+-	void __iomem *base = ctrl->ngd->base;
++	void __iomem *base;
+ 	u32 stat;
++
++	if (READ_ONCE(ctrl->stopping) || !ctrl->ngd || !ctrl->ctrl.dev)
++		return IRQ_NONE;
++	base = ctrl->ngd->base;
+ 
+ 	if (pm_runtime_suspended(ctrl->ctrl.dev)) {
+ 		SLIM_INFO(ctrl, "Slimbus is in suspend state %d\n",
+@@ -971,206 +1003,144 @@
+ {
+ 	struct qcom_slim_ngd_ctrl *ctrl = dev_get_drvdata(sctrl->dev);
+ 	DECLARE_COMPLETION_ONSTACK(tx_sent);
+-	int ret, timeout, i;
+-	u8 wbuf[SLIM_MSGQ_BUF_LEN];
+-	u8 rbuf[SLIM_MSGQ_BUF_LEN];
+-	u32 *pbuf;
+-	u8 *puc;
+-	u8 la = txn->la;
+-	bool usr_msg = false;
+-
+-	reinit_completion(&ctrl->xfer_done);
+-
++	DECLARE_COMPLETION_ONSTACK(reply_done);
++	struct slim_msg_txn converted = { 0 };
++	struct slim_val_inf reply = { 0 };
++	u8 frame[SLIM_MSGQ_BUF_LEN] = { 0 }, payload[4], rbuf[SLIM_MSGQ_BUF_LEN];
++	const u8 *data;
++	u8 mt, mc, la;
++	u32 word;
++	unsigned int len, header, count;
++	void *buffer = NULL;
++	bool user = false, submitted = false;
++	int ret;
++
++	if (!ctrl || !txn || READ_ONCE(ctrl->stopping))
++		return -ESHUTDOWN;
+ 	if (txn->mt == SLIM_MSG_MT_CORE &&
+-		(txn->mc >= SLIM_MSG_MC_BEGIN_RECONFIGURATION &&
+-		 txn->mc <= SLIM_MSG_MC_RECONFIGURE_NOW))
++	    txn->mc >= SLIM_MSG_MC_BEGIN_RECONFIGURATION &&
++	    txn->mc <= SLIM_MSG_MC_RECONFIGURE_NOW)
+ 		return 0;
+-
+-	if (txn->dt == SLIM_MSG_DEST_ENUMADDR)
++	if (!txn->msg)
++		return -EINVAL;
++	if (txn->dt != SLIM_MSG_DEST_LOGICALADDR && txn->dt != SLIM_MSG_DEST_BROADCAST)
+ 		return -EPROTONOSUPPORT;
+-
+-	if (txn->msg->num_bytes > SLIM_MSGQ_BUF_LEN ||
+-			txn->rl > SLIM_MSGQ_BUF_LEN) {
+-		SLIM_ERR(ctrl, "msg exceeds HW limit\n");
+-		return -EINVAL;
+-	}
+-
+-	/*
+-	 * As part of SSR/PDR notify when ngd is going down tx_lock is
+-	 * acquired and is waiting for ctrl_lock. While in parallel for
+-	 * slim_get_logical_addr request from codecs ctrl_lock is acquired
+-	 * first followed by qcom_slim_ngd_xfer_msg.
+-	 * mutex_trylock will not wait to aquire lock if it is already been
+-	 * acquired by SSR sequence hence it will unblock SSR to finish
+-	 * gracefully
+-	 */
+-	if (!mutex_trylock(&ctrl->tx_lock)) {
+-		SLIM_ERR(ctrl, "ngd going down due SSR/PDR, try again! skipping check hw state\n");
++	mt = txn->mt;
++	mc = txn->mc;
++	la = txn->la;
++	data = txn->msg->wbuf;
++	count = data ? txn->msg->num_bytes : 0;
++	if (mt == SLIM_MSG_MT_CORE &&
++	    (mc == SLIM_MSG_MC_CONNECT_SOURCE || mc == SLIM_MSG_MC_CONNECT_SINK ||
++	     mc == SLIM_MSG_MC_DISCONNECT_PORT)) {
++		unsigned int needed = mc == SLIM_MSG_MC_DISCONNECT_PORT ? 1 : 2;
++
++		if (!data || count != needed)
++			return -EINVAL;
++		user = true;
++		mt = SLIM_MSG_MT_DEST_REFERRED_USER;
++		mc = mc == SLIM_MSG_MC_CONNECT_SOURCE ? SLIM_USR_MC_CONNECT_SRC :
++		     mc == SLIM_MSG_MC_CONNECT_SINK ? SLIM_USR_MC_CONNECT_SINK :
++		     SLIM_USR_MC_DISCONNECT_PORT;
++		payload[0] = la;
++		memcpy(payload + 1, data, needed);
++		count = needed + 2;
++		data = payload;
++		la = SLIM_LA_MGR;
++	}
++	header = txn->dt == SLIM_MSG_DEST_LOGICALADDR ? 3 : 2;
++	if (slim_tid_txn(mt, mc))
++		header++;
++	if (slim_ec_txn(mt, mc))
++		header += 2;
++	len = header + count;
++	if (len > SLIM_MSGQ_BUF_LEN || len > SLIM_MSG_RL_MASK ||
++	    (!user && txn->rl != len + 1))
++		return -EMSGSIZE;
++	if (!mutex_trylock(&ctrl->tx_lock))
+ 		return -EAGAIN;
+-	}
+-	ret = check_hw_state(ctrl, txn);
+-	if (ret) {
+-		SLIM_WARN(ctrl, "ADSP slimbus not up MC:0x%x,mt:0x%x ret:%d\n",
+-						txn->mc, txn->mt, ret);
+-		mutex_unlock(&ctrl->tx_lock);
+-		return ret;
+-	}
+-
+-	pbuf = qcom_slim_ngd_tx_msg_get(ctrl, txn->rl, &tx_sent);
+-	if (!pbuf) {
+-		SLIM_ERR(ctrl, "Message buffer unavailable\n");
+-		mutex_unlock(&ctrl->tx_lock);
+-		return -ENOMEM;
+-	}
++	ret = READ_ONCE(ctrl->stopping) ? -ESHUTDOWN : check_hw_state(ctrl, txn);
++	if (ret)
++		goto out;
++	if (user) {
++		reply.rbuf = rbuf;
++		converted.msg = &reply;
++		converted.comp = &reply_done;
++		converted.reply_len = sizeof(rbuf);
++		ret = slim_alloc_txn_tid(sctrl, &converted);
++		if (ret)
++			goto out;
++		payload[count - 1] = converted.tid;
++	}
++	word = SLIM_MSG_ASM_FIRST_WORD(len, mt, mc,
++				       txn->dt != SLIM_MSG_DEST_LOGICALADDR, la);
++	put_unaligned_le32(word, frame);
++	header = txn->dt == SLIM_MSG_DEST_LOGICALADDR ? 3 : 2;
++	if (slim_tid_txn(mt, mc))
++		frame[header++] = txn->tid;
++	if (slim_ec_txn(mt, mc)) {
++		frame[header++] = txn->ec & 0xff;
++		frame[header++] = txn->ec >> 8;
++	}
++	if (count)
++		memcpy(frame + header, data, count);
++	buffer = qcom_slim_ngd_tx_msg_get(ctrl, len, &tx_sent);
++	if (!buffer) {
++		ret = -ENOMEM;
++		goto cancel;
++	}
++	if (ctrl->r_mem.is_r_mem)
++		memcpy_toio(buffer, frame, ALIGN(len, 4));
++	else
++		memcpy(buffer, frame, ALIGN(len, 4));
++	ret = qcom_slim_ngd_tx_msg_post(ctrl, buffer, len);
++	if (ret)
++		goto cancel;
++	submitted = true;
++	if (!wait_for_completion_timeout(&tx_sent, 2 * HZ)) {
++		ret = -ETIMEDOUT;
++		goto cancel;
++	}
++	if (user) {
++		if (!wait_for_completion_timeout(&reply_done, HZ))
++			ret = -ETIMEDOUT;
++		else
++			ret = converted.result;
++	}
++cancel:
++	if (buffer)
++		qcom_slim_ngd_tx_msg_cancel(ctrl, buffer, submitted);
++	if (user)
++		slim_free_txn_tid(sctrl, &converted);
++out:
+ 	mutex_unlock(&ctrl->tx_lock);
+-
+-	if (txn->mt == SLIM_MSG_MT_CORE &&
+-		(txn->mc == SLIM_MSG_MC_CONNECT_SOURCE ||
+-		txn->mc == SLIM_MSG_MC_CONNECT_SINK ||
+-		txn->mc == SLIM_MSG_MC_DISCONNECT_PORT)) {
+-		txn->mt = SLIM_MSG_MT_DEST_REFERRED_USER;
+-		switch (txn->mc) {
+-		case SLIM_MSG_MC_CONNECT_SOURCE:
+-			txn->mc = SLIM_USR_MC_CONNECT_SRC;
+-			break;
+-		case SLIM_MSG_MC_CONNECT_SINK:
+-			txn->mc = SLIM_USR_MC_CONNECT_SINK;
+-			break;
+-		case SLIM_MSG_MC_DISCONNECT_PORT:
+-			txn->mc = SLIM_USR_MC_DISCONNECT_PORT;
+-			break;
+-		default:
+-			return -EINVAL;
+-		}
+-
+-		usr_msg = true;
+-		i = 0;
+-		wbuf[i++] = txn->la;
+-		la = SLIM_LA_MGR;
+-		wbuf[i++] = txn->msg->wbuf[0];
+-		if (txn->mc != SLIM_USR_MC_DISCONNECT_PORT)
+-			wbuf[i++] = txn->msg->wbuf[1];
+-
+-		txn->comp = &ctrl->xfer_done;
+-		ret = slim_alloc_txn_tid(sctrl, txn);
+-		if (ret) {
+-			SLIM_ERR(ctrl, "Unable to allocate TID\n");
+-			return ret;
+-		}
+-
+-		wbuf[i++] = txn->tid;
+-
+-		txn->msg->num_bytes = i;
+-		txn->msg->wbuf = wbuf;
+-		txn->msg->rbuf = rbuf;
+-		txn->rl = txn->msg->num_bytes + 4;
+-	}
+-
+-	/* HW expects length field to be excluded */
+-	txn->rl--;
+-	puc = (u8 *)pbuf;
+-	*pbuf = 0;
+-	if (txn->dt == SLIM_MSG_DEST_LOGICALADDR) {
+-		*pbuf = SLIM_MSG_ASM_FIRST_WORD(txn->rl, txn->mt, txn->mc, 0,
+-				la);
+-		puc += 3;
+-	} else {
+-		*pbuf = SLIM_MSG_ASM_FIRST_WORD(txn->rl, txn->mt, txn->mc, 1,
+-				la);
+-		puc += 2;
+-	}
+-
+-	if (slim_tid_txn(txn->mt, txn->mc))
+-		*(puc++) = txn->tid;
+-
+-	if (slim_ec_txn(txn->mt, txn->mc)) {
+-		*(puc++) = (txn->ec & 0xFF);
+-		*(puc++) = (txn->ec >> 8) & 0xFF;
+-	}
+-
+-	if (txn->msg && txn->msg->wbuf) {
+-		if (ctrl->r_mem.is_r_mem)
+-			memcpy_toio(puc, txn->msg->wbuf, txn->msg->num_bytes);
+-		else
+-			memcpy(puc, txn->msg->wbuf, txn->msg->num_bytes);
+-	}
+-
+-	if (!mutex_trylock(&ctrl->tx_lock)) {
+-		SLIM_ERR(ctrl, "ngd going down due SSR/PDR, try again! skipping tx msg post\n");
+-		return -EAGAIN;
+-	}
+-	ret = qcom_slim_ngd_tx_msg_post(ctrl, pbuf, txn->rl);
+-	if (ret) {
+-		mutex_unlock(&ctrl->tx_lock);
+-		return ret;
+-	}
+-
+-	timeout = wait_for_completion_timeout(&tx_sent, 2*HZ);
+-	if (!timeout) {
+-		SLIM_WARN(ctrl, "TX timed out:MC:0x%x,mt:0x%x", txn->mc,
+-					txn->mt);
+-		mutex_unlock(&ctrl->tx_lock);
+-		ctrl->capability_timeout = true;
+-		return -ETIMEDOUT;
+-	}
+-
+-	if (usr_msg) {
+-		timeout = wait_for_completion_timeout(&ctrl->xfer_done, HZ);
+-		if (!timeout) {
+-			SLIM_WARN(ctrl, "TX usr_msg timed out:MC:0x%x,mt:0x%x",
+-				txn->mc, txn->mt);
+-			ctrl->capability_timeout = true;
+-			txn->comp = NULL;
+-			mutex_unlock(&ctrl->tx_lock);
+-			return -ETIMEDOUT;
+-		}
+-	}
+-
+-	mutex_unlock(&ctrl->tx_lock);
+-	return 0;
++	return ret;
+ }
+ 
+ static int qcom_slim_ngd_xfer_msg_sync(struct slim_controller *ctrl,
+ 				       struct slim_msg_txn *txn)
+ {
+-	struct qcom_slim_ngd_ctrl *dev =
+-		container_of(ctrl, struct qcom_slim_ngd_ctrl, ctrl);
+-	int ret, timeout;
+-
+-	reinit_completion(&dev->sync_done);
+-
+-	ret = pm_runtime_get_sync(ctrl->dev);
+-	if (ret < 0) {
+-		SLIM_ERR(dev, "SLIM %s: PM get_sync failed ret :%d count:%d TID:%d\n",
+-		__func__, ret, atomic_read(&ctrl->dev->power.usage_count), txn->tid);
+-		goto pm_put;
+-	}
+-
+-	SLIM_INFO(dev, "SLIM %s: PM get_sync count:%d TID:%d\n",
+-		__func__, atomic_read(&ctrl->dev->power.usage_count), txn->tid);
+-
+-	txn->comp = &dev->sync_done;
+-
++	int ret;
++
++	ret = pm_runtime_resume_and_get(ctrl->dev);
++	if (ret < 0)
++		goto cancel;
++	txn->pm_held = true;
++	txn->result = 0;
+ 	ret = qcom_slim_ngd_xfer_msg(ctrl, txn);
+-	if (ret) {
+-		SLIM_INFO(dev, "SLIM %s: xfer_msg failed PM put count:%d TID:%d\n",
+-			  __func__, atomic_read(&ctrl->dev->power.usage_count), txn->tid);
+-		goto pm_put;
+-	}
+-
+-	timeout = wait_for_completion_timeout(&dev->sync_done, HZ);
+-	if (!timeout) {
+-		SLIM_WARN(dev, "TX sync timed out:MC:0x%x,mt:0x%x", txn->mc,
+-				txn->mt);
+-		ret = -ETIMEDOUT;
+-		goto pm_put;
+-	}
+-	return 0;
+-
+-pm_put:
+-	pm_runtime_put_noidle(ctrl->dev);
+-	/* Set device in suspended since resume failed */
+-	pm_runtime_set_suspended(ctrl->dev);
++	if (!ret) {
++		if (!wait_for_completion_timeout(txn->comp, HZ))
++			ret = -ETIMEDOUT;
++		else
++			ret = txn->result;
++	}
++cancel:
++	slim_free_txn_tid(ctrl, txn);
++	if (txn->pm_held) {
++		txn->pm_held = false;
++		pm_runtime_mark_last_busy(ctrl->dev);
++		pm_runtime_put_autosuspend(ctrl->dev);
++	}
+ 	return ret;
+ }
+ 
+@@ -1228,13 +1198,18 @@
+ 	struct slim_controller *ctrl = sdev->ctrl;
+ 	struct qcom_slim_ngd_ctrl *dev =
+ 		container_of(ctrl, struct qcom_slim_ngd_ctrl, ctrl);
++	DECLARE_COMPLETION_ONSTACK(done);
+ 	struct slim_val_inf msg =  {0};
+ 	u8 wbuf[SLIM_MSGQ_BUF_LEN];
+ 	u8 rbuf[SLIM_MSGQ_BUF_LEN];
+ 	struct slim_msg_txn txn = {0,};
+ 	int i, ret;
+ 
++	if (!rt->ports || !rt->num_ports || rt->num_ports > 23)
++		return -EINVAL;
++
+ 	SLIM_INFO(dev, "%s start %d\n", __func__, true);
++	txn.comp = &done;
+ 	txn.mt = SLIM_MSG_MT_DEST_REFERRED_USER;
+ 	txn.dt = SLIM_MSG_DEST_LOGICALADDR;
+ 	txn.la = SLIM_LA_MGR;
+@@ -1243,6 +1218,7 @@
+ 	txn.msg->num_bytes = 0;
+ 	txn.msg->wbuf = wbuf;
+ 	txn.msg->rbuf = rbuf;
++	txn.reply_len = sizeof(rbuf);
+ 
+ 	for (i = 0; i < rt->num_ports; i++) {
+ 		struct slim_port *port = &rt->ports[i];
+@@ -1297,6 +1273,7 @@
+ 		return ret;
+ 	}
+ 
++	reinit_completion(&done);
+ 	txn.mc = SLIM_USR_MC_RECONFIG_NOW;
+ 	txn.msg->num_bytes = 2;
+ 	wbuf[1] = sdev->laddr;
+@@ -1326,13 +1303,18 @@
+ 	struct slim_controller *ctrl = sdev->ctrl;
+ 	struct qcom_slim_ngd_ctrl *dev =
+ 		container_of(ctrl, struct qcom_slim_ngd_ctrl, ctrl);
++	DECLARE_COMPLETION_ONSTACK(done);
+ 	struct slim_val_inf msg =  {0};
+ 	u8 wbuf[SLIM_MSGQ_BUF_LEN];
+ 	u8 rbuf[SLIM_MSGQ_BUF_LEN];
+ 	struct slim_msg_txn txn = {0,};
+ 	int i, ret;
+ 
++	if (!rt->ports || !rt->num_ports || rt->num_ports > 26)
++		return -EINVAL;
++
+ 	SLIM_INFO(dev, "%s start %d\n", __func__, true);
++	txn.comp = &done;
+ 	txn.mt = SLIM_MSG_MT_DEST_REFERRED_USER;
+ 	txn.dt = SLIM_MSG_DEST_LOGICALADDR;
+ 	txn.la = SLIM_LA_MGR;
+@@ -1341,6 +1323,7 @@
+ 	txn.msg->num_bytes = 0;
+ 	txn.msg->wbuf = wbuf;
+ 	txn.msg->rbuf = rbuf;
++	txn.reply_len = sizeof(rbuf);
+ 
+ 	for (i = 0; i < rt->num_ports; i++) {
+ 		struct slim_port *port = &rt->ports[i];
+@@ -1371,6 +1354,7 @@
+ 		return ret;
+ 	}
+ 
++	reinit_completion(&done);
+ 	txn.mc = SLIM_USR_MC_RECONFIG_NOW;
+ 	txn.msg->num_bytes = 2;
+ 	wbuf[1] = sdev->laddr;
+@@ -1397,15 +1381,17 @@
+ static int qcom_slim_ngd_get_laddr(struct slim_controller *ctrl,
+ 				   struct slim_eaddr *ea, u8 *laddr)
+ {
++	DECLARE_COMPLETION_ONSTACK(done);
+ 	struct slim_val_inf msg =  {0};
+ 	u8 failed_ea[6] = {0, 0, 0, 0, 0, 0};
+-	struct slim_msg_txn txn;
++	struct slim_msg_txn txn = { 0 };
+ 	struct qcom_slim_ngd_ctrl *dev =
+ 		container_of(ctrl, struct qcom_slim_ngd_ctrl, ctrl);
+ 	u8 wbuf[10] = {0};
+ 	u8 rbuf[10] = {0};
+ 	int ret;
+ 
++	txn.comp = &done;
+ 	txn.mt = SLIM_MSG_MT_DEST_REFERRED_USER;
+ 	txn.dt = SLIM_MSG_DEST_LOGICALADDR;
+ 	txn.la = SLIM_LA_MGR;
+@@ -1417,6 +1403,7 @@
+ 	txn.msg->num_bytes = 7;
+ 	txn.msg->wbuf = wbuf;
+ 	txn.msg->rbuf = rbuf;
++	txn.reply_len = 7;
+ 
+ 	ret = slim_alloc_txn_tid(ctrl, &txn);
+ 	if (ret < 0)
+@@ -1431,7 +1418,8 @@
+ 		return ret;
+ 	}
+ 
+-	if (!memcmp(rbuf, failed_ea, 6))
++	if (!memcmp(rbuf, failed_ea, 6) || memcmp(rbuf, ea, sizeof(*ea)) ||
++	    rbuf[6] == SLIM_LA_MGR)
+ 		return -ENXIO;
+ 
+ 	*laddr = rbuf[6];
+@@ -1442,44 +1430,49 @@
+ 
+ static int qcom_slim_ngd_exit_dma(struct qcom_slim_ngd_ctrl *ctrl)
+ {
+-	struct device *dev = ctrl->dev;
+-	int size;
+-
+-	SLIM_INFO(ctrl, "SLIM: NGD exit dma\n");
++	int i;
++
++	WRITE_ONCE(ctrl->dma_stopping, true);
+ 	if (ctrl->dma_rx_channel) {
+ 		dmaengine_terminate_sync(ctrl->dma_rx_channel);
+ 		dma_release_channel(ctrl->dma_rx_channel);
+ 	}
+-
+ 	if (ctrl->dma_tx_channel) {
+ 		dmaengine_terminate_sync(ctrl->dma_tx_channel);
+ 		dma_release_channel(ctrl->dma_tx_channel);
+ 	}
+-
+ 	if (!ctrl->r_mem.is_r_mem) {
+-		size = QCOM_SLIM_NGD_DESC_NUM * SLIM_MSGQ_BUF_LEN;
+-		dma_free_coherent(dev, size, ctrl->rx_base, ctrl->rx_phys_base);
+-		size = ((QCOM_SLIM_NGD_DESC_NUM + 1) * SLIM_MSGQ_BUF_LEN);
+-		dma_free_coherent(dev, size, ctrl->tx_base, ctrl->tx_phys_base);
+-		ctrl->tx_base = ctrl->rx_base = NULL;
+-	} else {
+-		ctrl->r_mem.r_vbase = ctrl->r_mem.r_vsbase;
+-		ctrl->r_mem.r_res->start = ctrl->r_mem.r_pbase;
+-	}
+-
+-	ctrl->dma_tx_channel = ctrl->dma_rx_channel = NULL;
+-
++		if (ctrl->rx_base)
++			dma_free_coherent(ctrl->dev, QCOM_SLIM_NGD_DESC_NUM * SLIM_MSGQ_BUF_LEN,
++					  ctrl->rx_base, ctrl->rx_phys_base);
++		if (ctrl->tx_base)
++			dma_free_coherent(ctrl->dev,
++					  (QCOM_SLIM_NGD_DESC_NUM + 1) * SLIM_MSGQ_BUF_LEN,
++					  ctrl->tx_base, ctrl->tx_phys_base);
++	}
++	ctrl->dma_tx_channel = NULL;
++	ctrl->dma_rx_channel = NULL;
++	ctrl->tx_base = NULL;
++	ctrl->rx_base = NULL;
++	for (i = 0; i < QCOM_SLIM_NGD_DESC_NUM; i++)
++		ctrl->txdesc[i].comp = NULL;
++	ctrl->tx_head = 0;
++	ctrl->tx_tail = 0;
+ 	return 0;
+ }
+ 
+-static void qcom_slim_ngd_setup(struct qcom_slim_ngd_ctrl *ctrl)
++static int qcom_slim_ngd_setup(struct qcom_slim_ngd_ctrl *ctrl)
+ {
+ 	u32 cfg = readl_relaxed(ctrl->ngd->base);
++	int ret;
+ 
+ 	SLIM_INFO(ctrl, "SLIM: NGD setup\n");
+ 	if ((ctrl->state == QCOM_SLIM_NGD_CTRL_DOWN) ||
+-		(ctrl->state == QCOM_SLIM_NGD_CTRL_ASLEEP))
+-		qcom_slim_ngd_init_dma(ctrl);
++		(ctrl->state == QCOM_SLIM_NGD_CTRL_ASLEEP)) {
++		ret = qcom_slim_ngd_init_dma(ctrl);
++		if (ret)
++			return ret;
++	}
+ 
+ 	/* By default enable message queues */
+ 	cfg |= NGD_CFG_RX_MSGQ_EN;
+@@ -1490,6 +1483,7 @@
+ 		cfg |= NGD_CFG_ENABLE;
+ 
+ 	writel_relaxed(cfg, ctrl->ngd->base);
++	return 0;
+ }
+ 
+ static int qcom_slim_ngd_power_up(struct qcom_slim_ngd_ctrl *ctrl)
+@@ -1533,8 +1527,7 @@
+ 			SLIM_INFO(ctrl, "Subsys restart: ADSP active framer\n");
+ 			return 0;
+ 		}
+-		qcom_slim_ngd_setup(ctrl);
+-		return 0;
++		return qcom_slim_ngd_setup(ctrl);
+ 	}
+ 
+ 	/*
+@@ -1548,7 +1541,9 @@
+ 
+ 	writel_relaxed(rx_msgq|SLIM_RX_MSGQ_TIMEOUT_VAL,
+ 				ngd->base + NGD_RX_MSGQ_CFG);
+-	qcom_slim_ngd_setup(ctrl);
++	ret = qcom_slim_ngd_setup(ctrl);
++	if (ret)
++		return ret;
+ 
+ 	timeout = wait_for_completion_timeout(&ctrl->reconf, 10*HZ);
+ 	if (!timeout) {
+@@ -1589,13 +1584,15 @@
+ static void qcom_slim_ngd_master_worker(struct work_struct *work)
+ {
+ 	struct qcom_slim_ngd_ctrl *ctrl;
+-	struct slim_msg_txn txn;
++	struct slim_msg_txn txn = { 0 };
+ 	struct slim_val_inf msg = {0};
+ 	int retries = 0;
+ 	u8 wbuf[8];
+ 	int ret = 0;
+ 
+ 	ctrl = container_of(work, struct qcom_slim_ngd_ctrl, m_work);
++	if (READ_ONCE(ctrl->stopping))
++		return;
+ 	txn.dt = SLIM_MSG_DEST_LOGICALADDR;
+ 	txn.ec = 0;
+ 	txn.mc = SLIM_USR_MC_REPORT_SATELLITE;
+@@ -1652,10 +1649,9 @@
+ 	SLIM_INFO(ctrl, "Slim runtime resume\n");
+ 
+ 	mutex_lock(&ctrl->suspend_resume_lock);
+-	if (!ctrl->qmi.handle) {
+-		SLIM_WARN(ctrl, "%s QMI handle is NULL\n", __func__);
++	if (READ_ONCE(ctrl->stopping) || !READ_ONCE(ctrl->qmi.handle)) {
+ 		mutex_unlock(&ctrl->suspend_resume_lock);
+-		return 0;
++		return -ENODEV;
+ 	}
+ 	if (ctrl->state == QCOM_SLIM_NGD_CTRL_SSR_GOING_DOWN) {
+ 		SLIM_WARN(ctrl, "%s: Cannot resume as pdr/ssr is initiated\n", __func__);
+@@ -1707,7 +1703,12 @@
+ 			pm_runtime_resume(ctrl->ctrl.dev);
+ 
+ 		pm_runtime_mark_last_busy(ctrl->ctrl.dev);
+-		pm_runtime_put(ctrl->ctrl.dev);
++		mutex_lock(&ctrl->suspend_resume_lock);
++		if (ctrl->restart_vote) {
++			ctrl->restart_vote = false;
++			pm_runtime_put(ctrl->ctrl.dev);
++		}
++		mutex_unlock(&ctrl->suspend_resume_lock);
+ 		SLIM_INFO(ctrl, "SLIM %s: PM put count:%d\n",
+ 			__func__, atomic_read(&ctrl->ctrl.dev->power.usage_count));
+ 		SLIM_INFO(ctrl, "SLIM NGD Enable\n");
+@@ -1728,9 +1729,11 @@
+ 		container_of(qmi, struct qcom_slim_ngd_ctrl, qmi);
+ 
+ 	SLIM_INFO(ctrl, "Slimbus QMI new server event received\n");
++	mutex_lock(&ctrl->qmi_handle_lock);
+ 	qmi->svc_info.sq_family = AF_QIPCRTR;
+ 	qmi->svc_info.sq_node = service->node;
+ 	qmi->svc_info.sq_port = service->port;
++	mutex_unlock(&ctrl->qmi_handle_lock);
+ 
+ 	complete(&ctrl->qmi_up);
+ 
+@@ -1747,8 +1750,10 @@
+ 
+ 	SLIM_INFO(ctrl, "Slimbus QMI del server event received\n");
+ 	reinit_completion(&ctrl->qmi_up);
++	mutex_lock(&ctrl->qmi_handle_lock);
+ 	qmi->svc_info.sq_node = 0;
+ 	qmi->svc_info.sq_port = 0;
++	mutex_unlock(&ctrl->qmi_handle_lock);
+ }
+ 
+ static const struct qmi_ops qcom_slim_ngd_qmi_svc_event_ops = {
+@@ -1810,22 +1815,27 @@
+ 	struct qcom_slim_ngd_ctrl *ctrl;
+ 
+ 	ctrl = container_of(work, struct qcom_slim_ngd_ctrl, ngd_up_work);
++	if (READ_ONCE(ctrl->stopping))
++		return;
+ 
+ 	/* Make sure qmi service is up before continuing */
+-	if (!wait_for_completion_interruptible_timeout(&ctrl->qmi_up,
+-		msecs_to_jiffies(SLIM_QMI_TIMEOUT_MS))) {
++	if (wait_for_completion_interruptible_timeout(&ctrl->qmi_up,
++						      msecs_to_jiffies(SLIM_QMI_TIMEOUT_MS)) <= 0) {
+ 		SLIM_INFO(ctrl, "QMI wait timeout\n");
+ 		return;
+ 	}
+ 
+ 	mutex_lock(&ctrl->ssr_lock);
+-	qcom_slim_ngd_enable(ctrl, true);
++	if (!READ_ONCE(ctrl->stopping))
++		qcom_slim_ngd_enable(ctrl, true);
+ 	mutex_unlock(&ctrl->ssr_lock);
+ }
+ 
+ static int qcom_slim_ngd_ssr_pdr_notify(struct qcom_slim_ngd_ctrl *ctrl,
+ 					unsigned long action)
+ {
++	if (READ_ONCE(ctrl->stopping))
++		return NOTIFY_DONE;
+ 	SLIM_INFO(ctrl, "SLIM DSP SSR/PDR notify cb:0x%lx\n", action);
+ 	switch (action) {
+ 	case SERVREG_SERVICE_STATE_EARLY_DOWN:
+@@ -1848,16 +1858,19 @@
+ 			 */
+ 			ctrl->capability_timeout = false;
+ 			SLIM_INFO(ctrl, "SLIM SSR going down\n");
+-			pm_runtime_get_noresume(ctrl->ctrl.dev);
++			if (!ctrl->restart_vote) {
++				pm_runtime_get_noresume(ctrl->ctrl.dev);
++				ctrl->restart_vote = true;
++			}
+ 			SLIM_INFO(ctrl, "SLIM %s: PM get_no_resume count:%d\n",
+ 				__func__, atomic_read(&ctrl->ctrl.dev->power.usage_count));
+-			device_for_each_child(ctrl->ctrl.dev, NULL,
+-					      qcom_slim_ngd_update_device_status);
+ 			qcom_slim_ngd_exit_dma(ctrl);
+ 			ctrl->state = QCOM_SLIM_NGD_CTRL_DOWN;
+ 			SLIM_INFO(ctrl, "SLIM SSR down\n");
+ 			mutex_unlock(&ctrl->tx_lock);
+ 			mutex_unlock(&ctrl->suspend_resume_lock);
++			device_for_each_child(ctrl->ctrl.dev, NULL,
++					      qcom_slim_ngd_update_device_status);
+ 		}
+ 
+ 		/* PDR must clean up everything as part of state down notification */
+@@ -1869,10 +1882,6 @@
+ 	case SERVREG_SERVICE_STATE_UP:
+ 		trace_rproc_qcom_event(dev_name(ctrl->dev),
+ 			"QCOM_SSR_AFTER_POWERUP", "slim_ngd_ssr_pdr-enter");
+-		if (ctrl->r_mem.is_r_mem) {
+-			ctrl->r_mem.r_vbase = ctrl->r_mem.r_vsbase;
+-			ctrl->r_mem.r_res->start = ctrl->r_mem.r_pbase;
+-		}
+ 
+ 		schedule_work(&ctrl->ngd_up_work);
+ 		SLIM_INFO(ctrl, "SLIM SSR up\n");
+@@ -1905,6 +1914,7 @@
+ 
+ 	qcom_slim_ngd_ssr_pdr_notify(ctrl, state);
+ }
++
+ static int of_qcom_slim_ngd_register(struct device *parent,
+ 				     struct qcom_slim_ngd_ctrl *ctrl)
+ {
+@@ -1933,32 +1943,37 @@
+ 			of_node_put(node);
+ 			return -ENOMEM;
+ 		}
++		if (!id || (u64)id * data->offset + (u64)(id - 1) * data->size +
++		    data->size > ctrl->regs_size) {
++			platform_device_put(ngd->pdev);
++			kfree(ngd);
++			of_node_put(node);
++			return -EINVAL;
++		}
+ 		ngd->id = id;
+ 		ngd->pdev->dev.parent = parent;
+ 
+-		ret = driver_set_override(&ngd->pdev->dev,
+-					  &ngd->pdev->driver_override,
+-					  QCOM_SLIM_NGD_DRV_NAME,
+-					  strlen(QCOM_SLIM_NGD_DRV_NAME));
++		ret = device_set_driver_override(&ngd->pdev->dev, QCOM_SLIM_NGD_DRV_NAME);
+ 		if (ret) {
+ 			platform_device_put(ngd->pdev);
+ 			kfree(ngd);
+ 			of_node_put(node);
+ 			return ret;
+ 		}
+-		ngd->pdev->dev.of_node = node;
++		ngd->pdev->dev.of_node = of_node_get(node);
++		ngd->base = ctrl->base + id * data->offset + (id - 1) * data->size;
+ 		ctrl->ngd = ngd;
+ 
+ 		ret = platform_device_add(ngd->pdev);
+ 		if (ret) {
+ 			platform_device_put(ngd->pdev);
++			ctrl->ngd = NULL;
+ 			kfree(ngd);
+ 			of_node_put(node);
+ 			return ret;
+ 		}
+-		ngd->base = ctrl->base + ngd->id * data->offset +
+-					(ngd->id - 1) * data->size;
+-
++
++		of_node_put(node);
+ 		return 0;
+ 	}
+ 
+@@ -1972,7 +1987,7 @@
+ 	struct platform_device *pdev = to_platform_device(device);
+ 	struct qcom_slim_ngd_ctrl *dev = platform_get_drvdata(pdev);
+ 
+-	return scnprintf(buf, sizeof(int), "%u\n", dev->ipc_log_mask);
++	return sysfs_emit(buf, "%u\n", READ_ONCE(dev->ipc_log_mask));
+ }
+ 
+ static ssize_t debug_mask_store(struct device *device,
+@@ -1982,9 +1997,12 @@
+ 	struct platform_device *pdev = to_platform_device(device);
+ 	struct qcom_slim_ngd_ctrl *dev = platform_get_drvdata(pdev);
+ 
+-	dev->ipc_log_mask = buf[0] - '0';
+-	if (dev->ipc_log_mask > DBG_LEV)
+-		dev->ipc_log_mask = DBG_LEV;
++	u32 value;
++	int ret = kstrtou32(buf, 0, &value);
++
++	if (ret || value > DBG_LEV)
++		return -EINVAL;
++	WRITE_ONCE(dev->ipc_log_mask, value);
+ 
+ 	return count;
+ }
+@@ -1995,47 +2013,71 @@
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct qcom_slim_ngd_ctrl *ctrl = dev_get_drvdata(dev->parent);
++	struct pdr_service *pds;
+ 	int ret;
+ 
+ 	ctrl->ctrl.dev = dev;
+-	ret = slim_register_controller(&ctrl->ctrl);
+-	if (ret) {
+-		dev_err(dev, "error adding slim controller\n");
+-		return ret;
+-	}
+-
+ 	platform_set_drvdata(pdev, ctrl);
++	WRITE_ONCE(ctrl->stopping, false);
++	ctrl->mwq = create_singlethread_workqueue("ngd_master");
++	if (!ctrl->mwq)
++		return -ENOMEM;
+ 	pm_runtime_use_autosuspend(dev);
+ 	pm_runtime_set_autosuspend_delay(dev, QCOM_SLIM_NGD_AUTOSUSPEND);
+ 	pm_runtime_set_suspended(dev);
+ 	pm_runtime_enable(dev);
+ 	pm_runtime_get_noresume(dev);
+-	SLIM_INFO(ctrl, "SLIM %s:PM get_noresume count:%d\n", __func__,
+-		atomic_read(&ctrl->ctrl.dev->power.usage_count));
+-
+-	INIT_WORK(&ctrl->m_work, qcom_slim_ngd_master_worker);
+-	INIT_WORK(&ctrl->ngd_up_work, qcom_slim_ngd_up_worker);
+-	ctrl->mwq = create_singlethread_workqueue("ngd_master");
+-	if (!ctrl->mwq) {
+-		dev_err(&pdev->dev, "Failed to start master worker\n");
+-		ret = -ENOMEM;
+-		goto wq_err;
+-	}
++	ctrl->restart_vote = true;
++	ret = slim_register_controller(&ctrl->ctrl);
++	if (ret)
++		goto pm;
+ 	ret = qcom_slim_ngd_qmi_svc_event_init(ctrl);
+-	if (ret) {
+-		dev_err(&pdev->dev,
+-			"QMI service registration failed:%d\n", ret);
+-		goto err;
+-	}
+-
++	if (ret)
++		goto controller;
++	ctrl->nb.notifier_call = qcom_slim_ngd_ssr_notify;
++	ctrl->notifier = qcom_register_ssr_notifier("lpass", &ctrl->nb);
++	if (IS_ERR(ctrl->notifier)) {
++		ret = PTR_ERR(ctrl->notifier);
++		goto qmi;
++	}
++	ctrl->pdr = pdr_handle_alloc(slim_pd_status, ctrl);
++	if (IS_ERR(ctrl->pdr)) {
++		ret = PTR_ERR(ctrl->pdr);
++		goto notifier;
++	}
++	pds = pdr_add_lookup(ctrl->pdr, "avs/audio", "msm/adsp/audio_pd");
++	if (IS_ERR(pds) && PTR_ERR(pds) != -EALREADY) {
++		ret = PTR_ERR(pds);
++		WRITE_ONCE(ctrl->stopping, true);
++		pdr_handle_release(ctrl->pdr);
++		goto notifier;
++	}
+ 	return 0;
+-wq_err:
++notifier:
++	WRITE_ONCE(ctrl->stopping, true);
++	qcom_unregister_ssr_notifier(ctrl->notifier, &ctrl->nb);
++qmi:
++	WRITE_ONCE(ctrl->stopping, true);
++	cancel_work_sync(&ctrl->ngd_up_work);
+ 	qcom_slim_ngd_qmi_svc_event_deinit(&ctrl->qmi);
+-	if (ctrl->mwq)
+-		destroy_workqueue(ctrl->mwq);
+-err:
++	pm_runtime_disable(dev);
++	qcom_slim_ngd_disable_irq(ctrl);
++	mutex_lock(&ctrl->tx_lock);
++	qcom_slim_ngd_exit_dma(ctrl);
++	mutex_unlock(&ctrl->tx_lock);
++	cancel_work_sync(&ctrl->m_work);
++	qcom_slim_qmi_exit(ctrl);
++controller:
++	WRITE_ONCE(ctrl->stopping, true);
+ 	slim_unregister_controller(&ctrl->ctrl);
+-
++pm:
++	pm_runtime_disable(dev);
++	if (ctrl->restart_vote) {
++		pm_runtime_put_noidle(dev);
++		ctrl->restart_vote = false;
++	}
++	destroy_workqueue(ctrl->mwq);
++	ctrl->mwq = NULL;
+ 	return ret;
+ }
+ 
+@@ -2043,31 +2085,47 @@
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct qcom_slim_ngd_ctrl *ctrl;
+-	struct resource *remote_res;
++	struct resource *remote_res, *regs;
+ 	char ipc_err_log_name[30];
+ 	int ret;
+-	struct pdr_service *pds;
+ 
+ 	ctrl = devm_kzalloc(dev, sizeof(*ctrl), GFP_KERNEL);
+ 	if (!ctrl)
+ 		return -ENOMEM;
+ 
+ 	dev_set_drvdata(dev, ctrl);
+-
+-	ctrl->base = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
++	ctrl->dev = dev;
++	ctrl->stopping = true;
++	mutex_init(&ctrl->tx_lock);
++	mutex_init(&ctrl->suspend_resume_lock);
++	mutex_init(&ctrl->ssr_lock);
++	mutex_init(&ctrl->qmi_handle_lock);
++	spin_lock_init(&ctrl->tx_buf_lock);
++	init_completion(&ctrl->reconf);
++	init_completion(&ctrl->ctrl_up);
++	init_completion(&ctrl->qmi.qmi_comp);
++	init_completion(&ctrl->qmi_up);
++	init_completion(&ctrl->xfer_done);
++	init_completion(&ctrl->sync_done);
++
++	INIT_WORK(&ctrl->m_work, qcom_slim_ngd_master_worker);
++	INIT_WORK(&ctrl->ngd_up_work, qcom_slim_ngd_up_worker);
++
++	ctrl->base = devm_platform_get_and_ioremap_resource(pdev, 0, &regs);
+ 	if (IS_ERR(ctrl->base))
+ 		return PTR_ERR(ctrl->base);
+ 
++	ctrl->regs_size = resource_size(regs);
+ 	ret = platform_get_irq(pdev, 0);
+ 	if (ret < 0)
+ 		return ret;
+ 
+ 	ctrl->irq = ret;
+ 	ret = devm_request_irq(dev, ctrl->irq, qcom_slim_ngd_interrupt,
+-			       IRQF_TRIGGER_HIGH, "slim-ngd", ctrl);
++			       IRQF_TRIGGER_HIGH | IRQF_NO_AUTOEN, "slim-ngd", ctrl);
+ 	if (ret)
+ 		return dev_err_probe(&pdev->dev, ret, "request IRQ failed\n");
+-	ctrl->irq_disabled = false;
++	ctrl->irq_disabled = true;
+ 
+ 	ctrl->r_mem.is_r_mem = false;
+ 	remote_res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+@@ -2080,6 +2138,9 @@
+ 	}
+ 
+ 	if (remote_res) {
++		if (upper_32_bits(remote_res->end) || resource_size(remote_res) <
++		    (2 * QCOM_SLIM_NGD_DESC_NUM + 1) * SLIM_MSGQ_BUF_LEN)
++			return -EINVAL;
+ 		ctrl->r_mem.is_r_mem = true;
+ 		ctrl->r_mem.r_pbase = (unsigned long long)remote_res->start;
+ 		ctrl->r_mem.r_vbase = devm_ioremap(&pdev->dev,
+@@ -2133,15 +2194,6 @@
+ 		ctrl->sysfs_created = true;
+ 	}
+ 
+-	ctrl->dev = dev;
+-	ctrl->nb.notifier_call = qcom_slim_ngd_ssr_notify;
+-	ctrl->notifier = qcom_register_ssr_notifier("lpass", &ctrl->nb);
+-	if (IS_ERR(ctrl->notifier)) {
+-		ret = PTR_ERR(ctrl->notifier);
+-		dev_err(dev, "Failed to register SSR notification: %d\n", ret);
+-		goto remove_ipc_sysfs;
+-	}
+-
+ 	ctrl->framer.rootfreq = SLIM_ROOT_FREQ >> 3;
+ 	ctrl->framer.superfreq =
+ 		ctrl->framer.rootfreq / SLIM_CL_PER_SUPERFRAME_DIV8;
+@@ -2155,48 +2207,18 @@
+ 	ctrl->ctrl.wakeup = NULL;
+ 	ctrl->state = QCOM_SLIM_NGD_CTRL_DOWN;
+ 
+-	mutex_init(&ctrl->tx_lock);
+-	mutex_init(&ctrl->suspend_resume_lock);
+-	mutex_init(&ctrl->ssr_lock);
+-	mutex_init(&ctrl->qmi_handle_lock);
+-	spin_lock_init(&ctrl->tx_buf_lock);
+-	init_completion(&ctrl->reconf);
+-	init_completion(&ctrl->ctrl_up);
+-	init_completion(&ctrl->qmi.qmi_comp);
+-	init_completion(&ctrl->qmi_up);
+-	init_completion(&ctrl->xfer_done);
+-	init_completion(&ctrl->sync_done);
+-
+-	ctrl->pdr = pdr_handle_alloc(slim_pd_status, ctrl);
+-	if (IS_ERR(ctrl->pdr)) {
+-		ret = dev_err_probe(dev, PTR_ERR(ctrl->pdr),
+-				    "Failed to init PDR handle ret:%d\n", ret);
+-		goto err_pdr_alloc;
+-	}
+-
+-	pds = pdr_add_lookup(ctrl->pdr, "avs/audio", "msm/adsp/audio_pd");
+-	if (IS_ERR(pds) && PTR_ERR(pds) != -EALREADY) {
+-		ret = dev_err_probe(dev, PTR_ERR(pds), "pdr add lookup failed ret:%d\n", ret);
+-		goto err_pdr_lookup;
+-	}
+-
+ 	ret = of_qcom_slim_ngd_register(dev, ctrl);
+ 	if (ret) {
+ 		SLIM_ERR(ctrl, "qcom_slim_ngd_register failed ret:%d\n", ret);
+-		goto err_pdr_lookup;
+-	}
+-
+-	platform_driver_register(&qcom_slim_ngd_driver);
++		goto remove_ipc_sysfs;
++	}
++
+ 	SLIM_INFO(ctrl, "NGD SB controller is up!\n");
+ 	return 0;
+ 
+-err_pdr_lookup:
+-	pdr_handle_release(ctrl->pdr);
+-
+-err_pdr_alloc:
+-	qcom_unregister_ssr_notifier(ctrl->notifier, &ctrl->nb);
+-
+ remove_ipc_sysfs:
++	if (ctrl->ipc_slimbus_log_err)
++		ipc_log_context_destroy(ctrl->ipc_slimbus_log_err);
+ 	if (ctrl->ipc_slimbus_log)
+ 		ipc_log_context_destroy(ctrl->ipc_slimbus_log);
+ 
+@@ -2207,37 +2229,46 @@
+ 	return ret;
+ }
+ 
+-static int qcom_slim_ngd_ctrl_remove(struct platform_device *pdev)
++static void qcom_slim_ngd_ctrl_remove(struct platform_device *pdev)
+ {
+ 	struct qcom_slim_ngd_ctrl *ctrl = platform_get_drvdata(pdev);
+ 
+-	platform_driver_unregister(&qcom_slim_ngd_driver);
++	platform_device_unregister(ctrl->ngd->pdev);
++	kfree(ctrl->ngd);
++	ctrl->ngd = NULL;
+ 	if (ctrl->sysfs_created)
+-		sysfs_remove_file(&pdev->dev.kobj,
+-				  &dev_attr_debug_mask.attr);
+-
+-	ipc_log_context_destroy(ctrl->ipc_slimbus_log);
+-	ctrl->ipc_slimbus_log = NULL;
+-
+-	return 0;
+-}
+-
+-static int qcom_slim_ngd_remove(struct platform_device *pdev)
++		sysfs_remove_file(&pdev->dev.kobj, &dev_attr_debug_mask.attr);
++	if (ctrl->ipc_slimbus_log)
++		ipc_log_context_destroy(ctrl->ipc_slimbus_log);
++	if (ctrl->ipc_slimbus_log_err)
++		ipc_log_context_destroy(ctrl->ipc_slimbus_log_err);
++}
++
++static void qcom_slim_ngd_remove(struct platform_device *pdev)
+ {
+ 	struct qcom_slim_ngd_ctrl *ctrl = platform_get_drvdata(pdev);
+ 
+-	pm_runtime_disable(&pdev->dev);
++	WRITE_ONCE(ctrl->stopping, true);
+ 	pdr_handle_release(ctrl->pdr);
+ 	qcom_unregister_ssr_notifier(ctrl->notifier, &ctrl->nb);
++	complete_all(&ctrl->qmi_up);
++	cancel_work_sync(&ctrl->ngd_up_work);
++	pm_runtime_disable(&pdev->dev);
++	qcom_slim_ngd_disable_irq(ctrl);
++	WRITE_ONCE(ctrl->dma_stopping, true);
++	mutex_lock(&ctrl->tx_lock);
++	qcom_slim_ngd_exit_dma(ctrl);
++	mutex_unlock(&ctrl->tx_lock);
++	cancel_work_sync(&ctrl->m_work);
++	qcom_slim_ngd_qmi_svc_event_deinit(&ctrl->qmi);
++	qcom_slim_qmi_exit(ctrl);
+ 	slim_unregister_controller(&ctrl->ctrl);
+-	qcom_slim_ngd_exit_dma(ctrl);
+-	qcom_slim_ngd_qmi_svc_event_deinit(&ctrl->qmi);
+-	if (ctrl->mwq)
+-		destroy_workqueue(ctrl->mwq);
+-
+-	kfree(ctrl->ngd);
+-	ctrl->ngd = NULL;
+-	return 0;
++	if (ctrl->restart_vote) {
++		pm_runtime_put_noidle(&pdev->dev);
++		ctrl->restart_vote = false;
++	}
++	destroy_workqueue(ctrl->mwq);
++	ctrl->mwq = NULL;
+ }
+ 
+ static int __maybe_unused qcom_slim_ngd_runtime_idle(struct device *dev)
+@@ -2311,10 +2342,29 @@
+ 	.remove = qcom_slim_ngd_remove,
+ 	.driver	= {
+ 		.name = QCOM_SLIM_NGD_DRV_NAME,
++		.suppress_bind_attrs = true,
+ 		.pm = &qcom_slim_ngd_dev_pm_ops,
+ 	},
+ };
+ 
+-module_platform_driver(qcom_slim_ngd_ctrl_driver);
++static int __init qcom_slim_ngd_init(void)
++{
++	int ret = platform_driver_register(&qcom_slim_ngd_driver);
++
++	if (ret)
++		return ret;
++	ret = platform_driver_register(&qcom_slim_ngd_ctrl_driver);
++	if (ret)
++		platform_driver_unregister(&qcom_slim_ngd_driver);
++	return ret;
++}
++module_init(qcom_slim_ngd_init);
++
++static void __exit qcom_slim_ngd_exit(void)
++{
++	platform_driver_unregister(&qcom_slim_ngd_ctrl_driver);
++	platform_driver_unregister(&qcom_slim_ngd_driver);
++}
++module_exit(qcom_slim_ngd_exit);
+ MODULE_LICENSE("GPL v2");
+ MODULE_DESCRIPTION("Qualcomm SLIMBus NGD controller");
+--- a/drivers/slimbus/slimbus.h
++++ b/drivers/slimbus/slimbus.h
+@@ -8,6 +8,7 @@
+ #define _DRIVERS_SLIMBUS_H
+ #include <linux/ipc_logging.h>
+ #include <linux/module.h>
++#include <linux/refcount.h>
+ #include <linux/device.h>
+ #include <linux/mutex.h>
+ #include <linux/completion.h>
+@@ -94,7 +95,6 @@
+ #define slimbus_dbg(fmt, ...)			\
+ 	__slimbus_dbg(__func__,			\
+ 		fmt, ##__VA_ARGS__)		\
+-
+ 
+ /* slimbus supported frequency values */
+ #define	SLIM_FREQ_441	44100
+@@ -167,6 +167,13 @@
+ 	u8			la;
+ 	struct slim_val_inf	*msg;
+ 	struct	completion	*comp;
++	/* Protected by txn_lock while the transaction is published. */
++	int result;
++	size_t reply_len;
++	bool pm_held;
++	bool async;
++	refcount_t refs;
++	struct slim_val_inf async_msg;
+ };
+ 
+ /* Frequently used message transaction structures */
+@@ -445,6 +452,11 @@
+  *	slot-collision.
+  */
+ struct slim_controller {
++	/* Serializes device publication against controller withdrawal. */
++	struct mutex devices_lock;
++	refcount_t device_refs;
++	struct completion devices_gone;
++	bool removing;
+ 	struct device		*dev;
+ 	unsigned int		id;
+ 	char			name[SLIMBUS_NAME_SIZE];
+--- a/drivers/slimbus/trace.h
++++ b/drivers/slimbus/trace.h
+@@ -26,7 +26,7 @@
+ 		__dynamic_array(char, msg, MAX_MSG_LEN)
+ 	),
+ 	TP_fast_assign(
+-		__assign_str(func, func);
++		__assign_str(func);
+ 		WARN_ON_ONCE(vsnprintf(__get_dynamic_array(msg),
+ 					MAX_MSG_LEN, vaf->fmt,
+ 					*vaf->va) >= MAX_MSG_LEN);
+--- a/include/linux/slimbus.h
++++ b/include/linux/slimbus.h
+@@ -50,6 +50,7 @@
+  * @is_laddr_valid: indicates if the laddr is valid or not
+  * @stream_list: List of streams on this device
+  * @stream_list_lock: lock to protect the stream list
++ * @status_driver: bound driver, protected by the core status SRCU domain
+  *
+  * This is the client/device handle returned when a SLIMbus
+  * device is registered with a controller.
+@@ -64,6 +65,7 @@
+ 	bool			is_laddr_valid;
+ 	struct list_head	stream_list;
+ 	spinlock_t stream_list_lock;
++	struct slim_driver __rcu *status_driver;
+ };
+ 
+ #define to_slim_device(d) container_of(d, struct slim_device, dev)
+--- a/qcom/opensource/bt-kernel/slimbus/btfm_slim.c
++++ b/qcom/opensource/bt-kernel/slimbus/btfm_slim.c
+@@ -32,13 +32,12 @@
+ #define BT_CMD_SLIM_TEST	0xbfac
+ 
+ struct class *btfm_slim_class;
+-static int btfm_slim_major;
+ 
+ struct btfmslim *btfm_slim_drv_data;
+ 
+ static int btfm_num_ports_open;
+ 
+-static bool is_registered;
++static DEFINE_MUTEX(btfm_slim_lifecycle_lock);
+ 
+ int btfm_slim_write(struct btfmslim *btfmslim,
+ 		uint16_t reg, uint8_t reg_val, uint8_t pgd)
+@@ -87,163 +86,55 @@
+ 				&btfmslim->slim_ifd, reg_addr);
+ 		BTFMSLIM_DBG("Read 0x%02x from reg 0x%x", ret, reg_addr);
+ 		mutex_unlock(&btfmslim->xfer_lock);
+-		if (ret > 0)
++		if (ret >= 0)
+ 			break;
+ 		usleep_range(5000, 5100);
+ 	}
+ 	return ret;
+ }
+ 
+-int btfm_slim_enable_ch(struct btfmslim *btfmslim, struct btfmslim_ch *ch,
+-	uint8_t rxport, uint32_t rates, uint8_t nchan)
+-{
+-	int ret = -1;
+-	int i = 0;
+-	struct btfmslim_ch *chan = ch;
+-	int chipset_ver;
+-
+-	if (!btfmslim || !ch)
+-		return -EINVAL;
+-
+-	BTFMSLIM_DBG("port: %d ch: %d", ch->port, ch->ch);
+-
+-	chan->dai.sruntime = slim_stream_allocate(btfmslim->slim_pgd, "BTFM_SLIM");
+-	if (chan->dai.sruntime == NULL) {
+-		BTFMSLIM_ERR("slim_stream_allocate failed");
+-		return -EINVAL;
+-	}
+-	chan->dai.sconfig.bps = btfmslim->bps;
+-	chan->dai.sconfig.direction = btfmslim->direction;
+-	chan->dai.sconfig.rate = rates;
+-	chan->dai.sconfig.ch_count = nchan;
+-	chan->dai.sconfig.chs = kcalloc(nchan, sizeof(unsigned int), GFP_KERNEL);
+-	if (!chan->dai.sconfig.chs)
+-		return -ENOMEM;
+-
+-	for (i = 0; i < nchan; i++, ch++) {
+-		/* Enable port through registration setting */
+-		if (btfmslim->vendor_port_en) {
+-			ret = btfmslim->vendor_port_en(btfmslim, ch->port,
+-					rxport, 1);
+-			if (ret < 0) {
+-				BTFMSLIM_ERR("vendor_port_en failed ret[%d]",
+-					ret);
+-				goto error;
+-			}
++/* io_lock serializes DAI state and retryable cleanup. */
++static int btfm_slim_cleanup_ch(struct btfmslim *priv, struct btfmslim_ch *ch)
++{
++	struct btfm_slim_codec_dai_data *dai = &ch->dai;
++	int i, ret, chipset_ver;
++
++	if (!dai->sruntime)
++		return 0;
++	if (dai->needs_disable) {
++		/* These rates require the native disconnect-before-remove order. */
++		if (dai->rxport && (dai->sconfig.rate == 44100 ||
++				    dai->sconfig.rate == 88200)) {
++			ret = slim_stream_unprepare_disconnect_port(dai->sruntime, true, false);
++			if (ret)
++				return ret;
+ 		}
+-		chan->dai.sconfig.chs[i] = ch->ch;
+-		chan->dai.sconfig.port_mask |= BIT(ch->port);
+-	}
+-
+-	/* Activate the channel immediately */
+-	BTFMSLIM_INFO("port: %d, ch: %d", chan->port, chan->ch);
+-	chipset_ver = btpower_get_chipset_version();
+-	BTFMSLIM_INFO("chipset soc version:%x", chipset_ver);
+-
+-	/* for feedback channel, PCM bit should not be set */
+-	if (btfm_feedback_ch_setting) {
+-		BTFMSLIM_DBG("port open for feedback ch, not setting PCM bit");
+-		//prop.dataf = SLIM_CH_DATAF_NOT_DEFINED;
+-		/* reset so that next port open sets the data format properly */
+-		btfm_feedback_ch_setting = 0;
+-	}
+-
+-	ret = slim_stream_prepare(chan->dai.sruntime, &chan->dai.sconfig);
+-	if (ret) {
+-		BTFMSLIM_ERR("slim_stream_prepare failed = %d", ret);
+-		goto error;
+-	}
+-
+-	ret = slim_stream_enable(chan->dai.sruntime);
+-	if (ret) {
+-		BTFMSLIM_ERR("slim_stream_enable failed = %d", ret);
+-		goto error;
+-	}
+-
+-	if (ret == 0)
+-		btfm_num_ports_open++;
+-	BTFMSLIM_INFO("btfm_num_ports_open: %d", btfm_num_ports_open);
+-	return ret;
+-error:
+-	BTFMSLIM_INFO("error %d while opening port, btfm_num_ports_open: %d",
+-			ret, btfm_num_ports_open);
+-	kfree(chan->dai.sconfig.chs);
+-	chan->dai.sconfig.chs = NULL;
+-	return ret;
+-}
+-
+-int btfm_slim_disable_ch(struct btfmslim *btfmslim, struct btfmslim_ch *ch,
+-			uint8_t rxport, uint8_t nchan)
+-{
+-	int ret = -1;
+-	int i = 0;
+-	struct btfmslim_ch *chan = ch;
+-	int chipset_ver = 0;
+-	if (!btfmslim || !ch)
+-		return -EINVAL;
+-
+-	BTFMSLIM_INFO("port:%d ", ch->port);
+-	if (ch->dai.sruntime == NULL) {
+-		BTFMSLIM_ERR("Channel not enabled yet. returning");
+-		return -EINVAL;
+-	}
+-
+-	if (rxport && (btfmslim->sample_rate == 44100 ||
+-		btfmslim->sample_rate == 88200)) {
+-		BTFMSLIM_INFO("disconnecting the ports, removing the channel");
+-		/* disconnect the ports of the stream */
+-		ret = slim_stream_unprepare_disconnect_port(ch->dai.sruntime,
+-				true, false);
+-		if (ret != 0)
+-			BTFMSLIM_ERR("slim_stream_unprepare failed %d", ret);
+-	}
+-
+-	ret = slim_stream_disable(ch->dai.sruntime);
+-	if (ret != 0) {
+-		BTFMSLIM_ERR("slim_stream_disable failed returned val = %d", ret);
+-		if ((btfmslim->sample_rate != 44100) && (btfmslim->sample_rate != 88200)) {
+-			/* disconnect the ports of the stream */
+-			ret = slim_stream_unprepare_disconnect_port(ch->dai.sruntime,
+-					true, false);
+-			if (ret != 0)
+-				BTFMSLIM_ERR("slim_stream_unprepare failed %d", ret);
+-		}
+-	}
+-
+-	/* free the ports allocated to the stream */
+-	ret = slim_stream_unprepare_disconnect_port(ch->dai.sruntime, false, true);
+-	if (ret != 0)
+-		BTFMSLIM_ERR("slim_stream_unprepare failed returned val = %d", ret);
+-
+-	/* Disable port through registration setting */
+-	for (i = 0; i < nchan; i++, chan++) {
+-		if (btfmslim->vendor_port_en) {
+-			ret = btfmslim->vendor_port_en(btfmslim, chan->port,
+-				rxport, 0);
+-			if (ret < 0) {
+-				BTFMSLIM_ERR("vendor_port_en failed [%d]", ret);
+-				break;
+-			}
+-		}
+-	}
+-	ch->dai.sconfig.port_mask = 0;
+-	if (ch->dai.sconfig.chs != NULL) {
+-		kfree(ch->dai.sconfig.chs);
+-		BTFMSLIM_INFO("setting ch->dai.sconfig.chs to NULL");
+-		ch->dai.sconfig.chs = NULL;
+-	} else
+-		BTFMSLIM_ERR("ch->dai.sconfig.chs is already NULL");
+-
+-	if (btfm_num_ports_open > 0)
++		ret = slim_stream_disable(dai->sruntime);
++		if (ret)
++			return ret;
++		dai->needs_disable = false;
++	}
++	if (dai->prepared) {
++		ret = slim_stream_unprepare_disconnect_port(dai->sruntime, true, true);
++		if (ret)
++			return ret;
++		dai->prepared = false;
++	}
++	for (i = 0; i < dai->channels; i++) {
++		if (!(dai->enabled_ports & BIT(i)))
++			continue;
++		ret = priv->vendor_port_en(priv, ch[i].port, dai->rxport, 0);
++		if (ret)
++			return ret;
++		dai->enabled_ports &= ~BIT(i);
++	}
++	ret = slim_stream_free(dai->sruntime);
++	if (ret)
++		return ret;
++	if (dai->active)
+ 		btfm_num_ports_open--;
+-
+-	if (ch->dai.sruntime != NULL) {
+-		slim_stream_free(ch->dai.sruntime);
+-		ch->dai.sruntime = NULL;
+-	}
+-
+-	BTFMSLIM_INFO("btfm_num_ports_open: %d", btfm_num_ports_open);
+-
++	kfree(dai->sconfig.chs);
++	memset(dai, 0, sizeof(*dai));
+ 	chipset_ver = btpower_get_chipset_version();
+ 
+ 	if (btfm_num_ports_open == 0 && (chipset_ver == QCA_HSP_SOC_ID_0200 ||
+@@ -263,7 +154,107 @@
+ 		msleep(DELAY_FOR_PORT_OPEN_MS);
+ 	}
+ 
++	return 0;
++}
++
++static int btfm_slim_check_channels(struct btfmslim *priv, struct btfmslim_ch *ch,
++				    u8 rxport, u8 count)
++{
++	struct btfmslim_ch *table;
++	unsigned int size, i, j;
++
++	if (!priv || !ch || rxport > 1 || !count || count > 2)
++		return -EINVAL;
++	table = rxport ? priv->rx_chs : priv->tx_chs;
++	size = rxport ? priv->num_rx_port : priv->num_tx_port;
++	for (i = 0; i < size; i++) {
++		if (&table[i] != ch)
++			continue;
++		if (count > size - i)
++			return -EINVAL;
++		for (j = 0; j < count; j++)
++			if (ch[j].port >= 32 || ch[j].id != ch->id)
++				return -EINVAL;
++		return 0;
++	}
++	return -EINVAL;
++}
++
++int btfm_slim_enable_ch(struct btfmslim *priv, struct btfmslim_ch *ch,
++			u8 rxport, u32 rates, u8 count)
++{
++	struct btfm_slim_codec_dai_data *dai;
++	int i, ret, cleanup;
++
++	ret = btfm_slim_check_channels(priv, ch, rxport, count);
++	if (ret)
++		return ret;
++	if (priv->stopping)
++		return -ENODEV;
++	dai = &ch->dai;
++	if (dai->sruntime) {
++		if (dai->active)
++			return -EISCONN;
++		ret = btfm_slim_cleanup_ch(priv, ch);
++		if (ret)
++			return ret;
++	}
++	dai->sconfig = (struct slim_stream_config) {
++		.bps = priv->bps, .direction = priv->direction,
++		.rate = rates, .ch_count = count,
++	};
++	dai->sconfig.chs = kcalloc(count, sizeof(*dai->sconfig.chs), GFP_KERNEL);
++	if (!dai->sconfig.chs)
++		return -ENOMEM;
++	dai->sruntime = slim_stream_allocate(priv->slim_pgd, "BTFM_SLIM");
++	if (IS_ERR(dai->sruntime)) {
++		ret = PTR_ERR(dai->sruntime);
++		dai->sruntime = NULL;
++		kfree(dai->sconfig.chs);
++		dai->sconfig.chs = NULL;
++		return ret;
++	}
++	dai->channels = count;
++	dai->rxport = rxport;
++	for (i = 0; i < count; i++) {
++		dai->sconfig.chs[i] = ch[i].ch;
++		dai->sconfig.port_mask |= BIT(ch[i].port);
++		if (priv->vendor_port_en) {
++			/* A failed multi-register enable may have changed hardware. */
++			dai->enabled_ports |= BIT(i);
++			ret = priv->vendor_port_en(priv, ch[i].port, rxport, 1);
++			if (ret)
++				goto error;
++		}
++	}
++	ret = slim_stream_prepare(dai->sruntime, &dai->sconfig);
++	/* Unprepare is idempotent, including partial connection rollback. */
++	dai->prepared = true;
++	if (ret)
++		goto error;
++	dai->needs_disable = true;
++	ret = slim_stream_enable(dai->sruntime);
++	if (ret)
++		goto error;
++	dai->active = true;
++	btfm_num_ports_open++;
++	WRITE_ONCE(btfm_feedback_ch_setting, 0);
++	return 0;
++error:
++	cleanup = btfm_slim_cleanup_ch(priv, ch);
++	if (cleanup)
++		BTFMSLIM_ERR("channel cleanup retained for retry: %d", cleanup);
+ 	return ret;
++}
++
++int btfm_slim_disable_ch(struct btfmslim *priv, struct btfmslim_ch *ch,
++			 u8 rxport, u8 count)
++{
++	int ret = btfm_slim_check_channels(priv, ch, rxport, count);
++
++	if (ret)
++		return ret;
++	return btfm_slim_cleanup_ch(priv, ch);
+ }
+ 
+ static int btfm_slim_alloc_port(struct btfmslim *btfmslim)
+@@ -281,6 +272,8 @@
+ 
+ 	rx_chs = btfmslim->rx_chs;
+ 	tx_chs = btfmslim->tx_chs;
++	if (!rx_chs || !tx_chs)
++		return -EINVAL;
+ 	if ((chipset_ver >=  QCA_CHEROKEE_SOC_ID_0310) &&
+ 		(chipset_ver <=  QCA_CHEROKEE_SOC_ID_0320_UMC)) {
+ 		for (i = 0; (tx_chs->port != BTFM_SLIM_PGD_PORT_LAST) &&
+@@ -331,20 +324,24 @@
+ 	if (!btfmslim)
+ 		return -EINVAL;
+ 
++	mutex_lock(&btfmslim->io_lock);
++	if (btfmslim->stopping) {
++		ret = -ENODEV;
++		goto error;
++	}
+ 	if (btfmslim->enabled) {
+ 		BTFMSLIM_DBG("Already enabled");
+-		return 0;
++		ret = 0;
++		goto error;
+ 	}
+ 
+ 	slim = btfmslim->slim_pgd;
+ 	slim_ifd = &btfmslim->slim_ifd;
+ 
+-	mutex_lock(&btfmslim->io_lock);
+ 	BTFMSLIM_INFO(
+ 		"PGD Enum Addr: mfr id:%.02x prod code:%.02x dev ind:%.02x ins:%.02x",
+ 		slim->e_addr.manf_id, slim->e_addr.prod_code,
+ 		slim->e_addr.dev_index, slim->e_addr.instance);
+-
+ 
+ 	chipset_ver = btpower_get_chipset_version();
+ 	BTFMSLIM_INFO("chipset soc version:%x", chipset_ver);
+@@ -490,37 +487,29 @@
+ 	/* Only when all registers read/write successfully, it set to
+ 	 * enabled status
+ 	 */
+-	btfmslim->enabled = 1;
++	if (!ret)
++		btfmslim->enabled = 1;
+ error:
+ 	mutex_unlock(&btfmslim->io_lock);
+ 	return ret;
+ }
+ 
+-
+-int btfm_slim_hw_deinit(struct btfmslim *btfmslim)
+-{
+-	int ret = 0;
+-
+-	BTFMSLIM_INFO("");
+-	if (!btfmslim)
++int btfm_slim_hw_deinit(struct btfmslim *priv)
++{
++	if (!priv)
+ 		return -EINVAL;
+-
+-	if (!btfmslim->enabled) {
+-		BTFMSLIM_DBG("Already disabled");
+-		return 0;
+-	}
+-	mutex_lock(&btfmslim->io_lock);
+-	btfmslim->enabled = 0;
+-	mutex_unlock(&btfmslim->io_lock);
+-	return ret;
++	mutex_lock(&priv->io_lock);
++	priv->enabled = false;
++	mutex_unlock(&priv->io_lock);
++	return 0;
+ }
+ 
+ #if IS_ENABLED (CONFIG_BTFM_SLIM)
+-void btfm_slim_get_hwep_details(struct slim_device *dev, struct btfmslim *btfm_slim)
++static void btfm_slim_get_hwep_details(struct slim_device *dev, struct btfmslim *btfm_slim)
+ {
+ }
+ #else
+-void btfm_slim_get_hwep_details(struct slim_device *slim, struct btfmslim *btfm_slim)
++static void btfm_slim_get_hwep_details(struct slim_device *slim, struct btfmslim *btfm_slim)
+ {
+ 	struct device_node *np = slim->dev.of_node;
+ 	const __be32 *prop;
+@@ -529,7 +518,7 @@
+ 	int len;
+ 
+ 	prop = of_get_property(np, "qcom,btslim-address", &len);
+-	if (prop) {
++	if (prop && len >= sizeof(*prop)) {
+ 		btfm_slim->device_id = be32_to_cpup(&prop[0]);
+ 		BTFMSLIM_DBG("hwep slim address define in dt %08x", btfm_slim->device_id);
+ 	} else {
+@@ -543,8 +532,8 @@
+ 	}
+ 
+ 	prop = of_get_property(np, "qcom,btslimrx-channels", &len);
+-	if (prop) {
+-		/* Check if we need any protection for index */
++	if (prop && len >= 2 * sizeof(*prop)) {
++		/* Native DT uses two channel numbers. */
+ 		rx_chs[0].ch = (uint8_t)be32_to_cpup(&prop[0]);
+ 		rx_chs[1].ch = (uint8_t)be32_to_cpup(&prop[1]);
+ 		BTFMSLIM_DBG("Rx: id\tname\tport\tch");
+@@ -559,8 +548,8 @@
+ 	}
+ 
+ 	prop = of_get_property(np, "qcom,btslimtx-channels", &len);
+-	if (prop) {
+-		/* Check if we need any protection for index */
++	if (prop && len >= 2 * sizeof(*prop)) {
++		/* Native DT uses two channel numbers. */
+ 		tx_chs[0].ch = (uint8_t)be32_to_cpup(&prop[0]);
+ 		tx_chs[1].ch = (uint8_t)be32_to_cpup(&prop[1]);
+ 		BTFMSLIM_DBG("Tx: id\tname\tport\tch");
+@@ -577,148 +566,213 @@
+ }
+ #endif
+ static int btfm_slim_status(struct slim_device *sdev,
+-				enum slim_device_status status)
+-{
+-	int ret = 0;
+-	struct device *dev = &sdev->dev;
+-	struct btfmslim *btfm_slim;
+-	btfm_slim = dev_get_drvdata(dev);
+-
+-#if IS_ENABLED(CONFIG_BTFM_SLIM)
+-	if (!is_registered) {
+-		ret = btfm_slim_register_codec(btfm_slim);
+-	}
+-#else
+-	if (!is_registered) {
+-		btfm_slim_get_hwep_details(sdev, btfm_slim);
+-		ret = btfm_slim_register_hw_ep(btfm_slim);
+-	}
+-#endif
+-	if (!ret)
+-		is_registered = true;
+-	else
+-		BTFMSLIM_ERR("error, registering slimbus codec failed");
+-
++			    enum slim_device_status status)
++{
++	struct btfmslim *priv = dev_get_drvdata(&sdev->dev);
++
++	if (status != SLIM_DEVICE_STATUS_DOWN)
++		return 0;
++	mutex_lock(&priv->io_lock);
++	priv->enabled = false;
++	mutex_unlock(&priv->io_lock);
++	return 0;
++}
++
++static void btfm_slim_free(struct kref *ref)
++{
++	struct btfmslim *priv = container_of(ref, struct btfmslim, ref);
++
++	kfree(priv->rx_chs);
++	kfree(priv->tx_chs);
++	kfree(priv);
++}
++
++static int btfm_slim_open(struct inode *inode, struct file *file)
++{
++	int ret = -ENODEV;
++
++	mutex_lock(&btfm_slim_lifecycle_lock);
++	if (btfm_slim_drv_data && !btfm_slim_drv_data->stopping &&
++	    inode->i_cdev == btfm_slim_drv_data->cdev) {
++		kref_get(&btfm_slim_drv_data->ref);
++		file->private_data = btfm_slim_drv_data;
++		ret = 0;
++	}
++	mutex_unlock(&btfm_slim_lifecycle_lock);
+ 	return ret;
+ }
+ 
++static int btfm_slim_release(struct inode *inode, struct file *file)
++{
++	struct btfmslim *priv = file->private_data;
++
++	kref_put(&priv->ref, btfm_slim_free);
++	return 0;
++}
++
+ static long btfm_slim_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ {
+-	int ret = 0;
+-
+-	switch (cmd) {
+-	case BT_CMD_SLIM_TEST:
+-		BTFMSLIM_INFO("cmd BT_CMD_SLIM_TEST, call btfm_slim_hw_init");
+-		ret = btfm_slim_hw_init(btfm_slim_drv_data);
+-		break;
+-	}
++	struct btfmslim *priv = file->private_data;
++	int ret = -ENOTTY;
++
++	mutex_lock(&btfm_slim_lifecycle_lock);
++	if (priv != btfm_slim_drv_data || priv->stopping)
++		ret = -ENODEV;
++	else if (cmd == BT_CMD_SLIM_TEST)
++		ret = btfm_slim_hw_init(priv);
++	mutex_unlock(&btfm_slim_lifecycle_lock);
+ 	return ret;
+ }
+ 
+ static const struct file_operations bt_dev_fops = {
++	.owner = THIS_MODULE,
++	.open = btfm_slim_open,
++	.release = btfm_slim_release,
+ 	.unlocked_ioctl = btfm_slim_ioctl,
+ 	.compat_ioctl = btfm_slim_ioctl,
+ };
+ 
+ static int btfm_slim_probe(struct slim_device *slim)
+ {
+-	int ret = 0;
+-	struct btfmslim *btfm_slim;
+-
+-	pr_info("%s: name = %s\n", __func__, dev_name(&slim->dev));
+-	/*this as true during the probe then slimbus won't check for logical address*/
+-	slim->is_laddr_valid = true;
+-	is_registered = false;
+-
+-	dev_set_name(&slim->dev, "%s", BTFMSLIM_DEV_NAME);
+-	pr_info("%s: name = %s\n", __func__, dev_name(&slim->dev));
+-
+-	BTFMSLIM_DBG("");
+-	BTFMSLIM_ERR("is_laddr_valid is true");
++	struct btfmslim *priv;
++	struct device *chardev;
++	int ret;
++
+ 	if (!slim->ctrl)
+ 		return -EINVAL;
+-
+-	/* Allocation btfmslim data pointer */
+-	btfm_slim = kzalloc(sizeof(struct btfmslim), GFP_KERNEL);
+-	if (btfm_slim == NULL) {
+-		BTFMSLIM_ERR("error, allocation failed");
++	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
++	if (!priv)
+ 		return -ENOMEM;
+-	}
+-	/* BTFM Slimbus driver control data configuration */
+-	btfm_slim->slim_pgd = slim;
+-	/* Assign vendor specific function */
+-	btfm_slim->rx_chs = SLIM_SLAVE_RXPORT;
+-	btfm_slim->tx_chs = SLIM_SLAVE_TXPORT;
+-	btfm_slim->vendor_init = SLIM_SLAVE_INIT;
+-	btfm_slim->vendor_port_en = SLIM_SLAVE_PORT_EN;
+-
+-	/* Created Mutex for slimbus data transfer */
+-	mutex_init(&btfm_slim->io_lock);
+-	mutex_init(&btfm_slim->xfer_lock);
+-	dev_set_drvdata(&slim->dev, btfm_slim);
+-
+-	/* Driver specific data allocation */
+-	btfm_slim->dev = &slim->dev;
++	kref_init(&priv->ref);
++	mutex_init(&priv->io_lock);
++	mutex_init(&priv->xfer_lock);
++	priv->slim_pgd = slim;
++	priv->dev = &slim->dev;
++	priv->stopping = true;
++	priv->rx_chs = kmemdup(slave_rxport, sizeof(slave_rxport), GFP_KERNEL);
++	priv->tx_chs = kmemdup(slave_txport, sizeof(slave_txport), GFP_KERNEL);
++	if (!priv->rx_chs || !priv->tx_chs) {
++		ret = -ENOMEM;
++		goto free;
++	}
++	priv->num_rx_port = ARRAY_SIZE(slave_rxport) - 1;
++	priv->num_tx_port = ARRAY_SIZE(slave_txport) - 1;
++	priv->vendor_init = SLIM_SLAVE_INIT;
++	priv->vendor_port_en = SLIM_SLAVE_PORT_EN;
++	mutex_lock(&btfm_slim_lifecycle_lock);
++	if (btfm_slim_drv_data) {
++		mutex_unlock(&btfm_slim_lifecycle_lock);
++		ret = -EBUSY;
++		goto free;
++	}
++	btfm_slim_drv_data = priv;
++	btfm_num_ports_open = 0;
++	dev_set_drvdata(&slim->dev, priv);
++	mutex_unlock(&btfm_slim_lifecycle_lock);
++	/* This legacy forwarding path is absent from the active ROM config. */
++#if IS_ENABLED(CONFIG_BT_SLIM)
+ 	ret = btpower_register_slimdev(&slim->dev);
+-	if (ret < 0) {
+-#if IS_ENABLED(CONFIG_BTFM_SLIM)
+-		btfm_slim_unregister_codec(&slim->dev);
+-#else
+-		btfm_slim_unregister_hwep();
++	if (ret)
++		goto clear;
+ #endif
+-		ret = -EPROBE_DEFER;
+-		goto dealloc;
+-	}
+-
+-	btfm_slim_drv_data = btfm_slim;
+-	btfm_slim_major = register_chrdev(0, "btfm_slim", &bt_dev_fops);
+-	if (btfm_slim_major < 0) {
+-		BTFMSLIM_ERR("%s: failed to allocate char dev\n", __func__);
+-		ret = -1;
+-		goto register_err;
+-	}
+-
++	btfm_slim_get_hwep_details(slim, priv);
++	ret = alloc_chrdev_region(&priv->devt, 0, 1, "btfm_slim");
++	if (ret)
++		goto clear;
++	priv->cdev = cdev_alloc();
++	if (!priv->cdev) {
++		ret = -ENOMEM;
++		goto unregister_region;
++	}
++	priv->cdev->owner = THIS_MODULE;
++	priv->cdev->ops = &bt_dev_fops;
++	ret = cdev_add(priv->cdev, priv->devt, 1);
++	if (ret) {
++		kobject_put(&priv->cdev->kobj);
++		goto unregister_region;
++	}
+ 	btfm_slim_class = class_create("btfmslim-dev");
+ 	if (IS_ERR(btfm_slim_class)) {
+-		BTFMSLIM_ERR("%s: coudn't create class\n", __func__);
+-		ret = -1;
+-		goto class_err;
+-	}
+-
+-	if (device_create(btfm_slim_class, NULL, MKDEV(btfm_slim_major, 0),
+-		NULL, "btfmslim") == NULL) {
+-		BTFMSLIM_ERR("%s: failed to allocate char dev\n", __func__);
+-		ret = -1;
+-		goto device_err;
+-	}
++		ret = PTR_ERR(btfm_slim_class);
++		goto unregister;
++	}
++	chardev = device_create(btfm_slim_class, NULL, priv->devt,
++				NULL, "btfmslim");
++	if (IS_ERR(chardev)) {
++		ret = PTR_ERR(chardev);
++		goto destroy_class;
++	}
++	ret = btfm_slim_register_hw_ep(priv);
++	if (ret)
++		goto destroy_device;
++	priv->endpoint_registered = true;
++	/* Native startup resolves PGD/IFD addresses after Bluetooth is powered. */
++	slim->is_laddr_valid = true;
++	mutex_lock(&btfm_slim_lifecycle_lock);
++	mutex_lock(&priv->io_lock);
++	priv->stopping = false;
++	mutex_unlock(&priv->io_lock);
++	mutex_unlock(&btfm_slim_lifecycle_lock);
++	return 0;
++destroy_device:
++	device_destroy(btfm_slim_class, priv->devt);
++destroy_class:
++	class_destroy(btfm_slim_class);
++unregister:
++	cdev_del(priv->cdev);
++unregister_region:
++	unregister_chrdev_region(priv->devt, 1);
++clear:
++	mutex_lock(&btfm_slim_lifecycle_lock);
++	btfm_slim_drv_data = NULL;
++	dev_set_drvdata(&slim->dev, NULL);
++	mutex_unlock(&btfm_slim_lifecycle_lock);
++free:
++	kref_put(&priv->ref, btfm_slim_free);
+ 	return ret;
+-
+-device_err:
++}
++
++static void btfm_slim_remove(struct slim_device *slim)
++{
++	struct btfmslim *priv = dev_get_drvdata(&slim->dev);
++	struct btfmslim_ch *tables[] = { priv->rx_chs, priv->tx_chs };
++	unsigned int counts[] = { priv->num_rx_port, priv->num_tx_port };
++	int table, i, ret;
++
++	mutex_lock(&btfm_slim_lifecycle_lock);
++	mutex_lock(&priv->io_lock);
++	priv->stopping = true;
++	mutex_unlock(&priv->io_lock);
++	mutex_unlock(&btfm_slim_lifecycle_lock);
++	device_destroy(btfm_slim_class, priv->devt);
++	cdev_del(priv->cdev);	unregister_chrdev_region(priv->devt, 1);
++	if (priv->endpoint_registered)
++		btfm_slim_unregister_hwep();
++	for (table = 0; table < ARRAY_SIZE(tables); table++) {
++		for (i = 0; i < counts[table]; i++) {
++			struct btfmslim_ch *ch = &tables[table][i];
++
++			if (!ch->dai.sruntime)
++				continue;
++			ret = btfm_slim_disable_ch(priv, ch, ch->dai.rxport,
++						   ch->dai.channels);
++			if (ret) {
++				BTFMSLIM_ERR("channel %d teardown failed: %d", ch->id, ret);
++				/* Controller teardown must quiesce outstanding bus traffic. */
++				slim_stream_free(ch->dai.sruntime);
++				ch->dai.sruntime = NULL;
++				kfree(ch->dai.sconfig.chs);
++				ch->dai.sconfig.chs = NULL;
++			}
++		}
++	}
++	mutex_lock(&btfm_slim_lifecycle_lock);
+ 	class_destroy(btfm_slim_class);
+-class_err:
+-	unregister_chrdev(btfm_slim_major, "btfm_slim");
+-register_err:
+-#if IS_ENABLED(CONFIG_BTFM_SLIM)
+-	btfm_slim_unregister_codec(&slim->dev);
+-#else
+-	btfm_slim_unregister_hwep();
+-#endif
+-dealloc:
+-	mutex_destroy(&btfm_slim->io_lock);
+-	mutex_destroy(&btfm_slim->xfer_lock);
+-	kfree(btfm_slim);
+-	return ret;
+-}
+-
+-static void btfm_slim_remove(struct slim_device *slim)
+-{
+-	struct device *dev = &slim->dev;
+-	struct btfmslim *btfm_slim = dev_get_drvdata(dev);
+-	BTFMSLIM_DBG("");
+-	mutex_destroy(&btfm_slim->io_lock);
+-	mutex_destroy(&btfm_slim->xfer_lock);
+-	snd_soc_unregister_component(&slim->dev);
+-	kfree(btfm_slim);
++	btfm_slim_drv_data = NULL;
++	btfm_num_ports_open = 0;
++	dev_set_drvdata(&slim->dev, NULL);
++	mutex_unlock(&btfm_slim_lifecycle_lock);
++	kref_put(&priv->ref, btfm_slim_free);
+ }
+ 
+ static const struct slim_device_id btfm_slim_id[] = {
+@@ -733,7 +787,8 @@
+ 	.prod_code = 0x220,
+ 	.dev_index = 0x1,
+ 	.instance = 0x0,
+-	}
++	},
++	{ }
+ };
+ 
+ MODULE_DEVICE_TABLE(slim, btfm_slim_id);
+@@ -741,6 +796,7 @@
+ static struct slim_driver btfm_slim_driver = {
+ 	.driver = {
+ 		.name = "btfmslim-driver",
++		.suppress_bind_attrs = true,
+ 		.owner = THIS_MODULE,
+ 	},
+ 	.probe = btfm_slim_probe,
+--- a/qcom/opensource/bt-kernel/slimbus/btfm_slim_hw_interface.c
++++ b/qcom/opensource/bt-kernel/slimbus/btfm_slim_hw_interface.c
+@@ -46,7 +46,7 @@
+ 					struct snd_ctl_elem_value *ucontrol)
+ {
+ 	BTFMSLIM_DBG("");
+-	ucontrol->value.integer.value[0] = bt_soc_enable_status;
++	ucontrol->value.integer.value[0] = READ_ONCE(bt_soc_enable_status);
+ 	return 1;
+ }
+ 
+@@ -61,7 +61,7 @@
+ 					struct snd_ctl_elem_value *ucontrol)
+ {
+ 	BTFMSLIM_DBG("");
+-	ucontrol->value.integer.value[0] = btfm_feedback_ch_setting;
++	ucontrol->value.integer.value[0] = READ_ONCE(btfm_feedback_ch_setting);
+ 	return 1;
+ }
+ 
+@@ -69,7 +69,10 @@
+ 					struct snd_ctl_elem_value *ucontrol)
+ {
+ 	BTFMSLIM_DBG("");
+-	btfm_feedback_ch_setting = ucontrol->value.integer.value[0];
++	if (ucontrol->value.integer.value[0] < 0 ||
++	    ucontrol->value.integer.value[0] > 1)
++		return -EINVAL;
++	WRITE_ONCE(btfm_feedback_ch_setting, ucontrol->value.integer.value[0]);
+ 	return 1;
+ }
+ 
+@@ -84,10 +87,14 @@
+ static int btfm_put_codec_type(struct snd_kcontrol *kcontrol,
+ 				struct snd_ctl_elem_value *ucontrol)
+ {
+-	usecase_codec = ucontrol->value.integer.value[0];
++	if (ucontrol->value.integer.value[0] < 0 ||
++	    ucontrol->value.integer.value[0] >= ARRAY_SIZE(codec_text))
++		return -EINVAL;
++	WRITE_ONCE(usecase_codec, ucontrol->value.integer.value[0]);
+ 	BTFMSLIM_DBG("codec type set to:%s", codec_text[usecase_codec]);
+ 	return 1;
+ }
++
+ static struct snd_kcontrol_new status_controls[] = {
+ 	SOC_SINGLE_EXT("BT SOC status", 0, 0, 1, 0,
+ 	btfm_soc_status_get, btfm_soc_status_put),
+@@ -98,7 +105,6 @@
+ 	btfm_get_codec_type, btfm_put_codec_type),
+ };
+ 
+-
+ static int btfm_slim_hwep_probe(struct snd_soc_component *codec)
+ {
+ 	BTFMSLIM_DBG("");
+@@ -121,323 +127,230 @@
+ 	return ret;
+ }
+ 
++static struct btfmslim_ch *btfm_slim_find_channel(struct btfmslim *priv, int id,
++						  u8 *rxport, u8 *count)
++{
++	struct btfmslim_ch *table;
++	unsigned int size, i;
++
++	if (id < 0 || id >= BTFM_SLIM_NUM_CODEC_DAIS)
++		return NULL;
++	*rxport = id == BTFM_BT_SCO_A2DP_SLIM_RX || id == BTFM_BT_SPLIT_A2DP_SLIM_RX;
++	*count = id == BTFM_FM_SLIM_TX ? 2 : 1;
++	table = *rxport ? priv->rx_chs : priv->tx_chs;
++	size = *rxport ? priv->num_rx_port : priv->num_tx_port;
++	for (i = 0; i < size; i++)
++		if (table[i].id == id && *count <= size - i)
++			return &table[i];
++	return NULL;
++}
++
+ static void btfm_slim_dai_shutdown(void *dai, int id)
+ {
+-	struct hwep_data *hwep_info = (struct hwep_data *)dai;
+-	struct btfmslim *btfmslim = dev_get_drvdata(hwep_info->dev);
++	struct hwep_data *ep = dai;
++	struct btfmslim *priv = dev_get_drvdata(ep->dev);
+ 	struct btfmslim_ch *ch;
+-	int i;
+-	uint8_t rxport, nchan = 1;
+-
+-	BTFMSLIM_DBG("");
+-	switch (id) {
+-	case BTFM_FM_SLIM_TX:
+-		nchan = 2;
+-		ch = btfmslim->tx_chs;
+-		rxport = 0;
+-		break;
+-	case BTFM_BT_SCO_SLIM_TX:
+-		ch = btfmslim->tx_chs;
+-		rxport = 0;
+-		break;
+-	case BTFM_BT_SCO_A2DP_SLIM_RX:
+-	case BTFM_BT_SPLIT_A2DP_SLIM_RX:
+-		ch = btfmslim->rx_chs;
+-		rxport = 1;
+-		break;
+-	case BTFM_SLIM_NUM_CODEC_DAIS:
+-	default:
+-		BTFMSLIM_ERR("id is invalid:%d", id);
+-		return;
+-	}
+-	/* Search for dai->id matched port handler */
+-	for (i = 0; (i < BTFM_SLIM_NUM_CODEC_DAIS) &&
+-		(ch->id != BTFM_SLIM_NUM_CODEC_DAIS) &&
+-		(ch->id != id); ch++, i++)
+-		;
+-
+-	if ((ch->port == BTFM_SLIM_PGD_PORT_LAST) ||
+-		(ch->id == BTFM_SLIM_NUM_CODEC_DAIS)) {
+-		BTFMSLIM_ERR("ch is invalid!!");
+-		return;
+-	}
+-
+-	btfm_slim_disable_ch(btfmslim, ch, rxport, nchan);
+-	btfm_slim_hw_deinit(btfmslim);
+-}
+-
+-static int btfm_slim_dai_hw_params(void *dai, uint32_t bps,
+-				   uint32_t direction,
+-				   uint8_t num_channels) {
+-	struct hwep_data *hwep_info = (struct hwep_data *)dai;
+-	struct btfmslim *btfmslim = dev_get_drvdata(hwep_info->dev);
+-
+-	BTFMSLIM_DBG("");
+-	btfmslim->bps = bps;
+-	btfmslim->direction = direction;
+-
+-	return 0;
+-}
+-
+-void btfm_get_sampling_rate(uint32_t *sampling_rate)
++	u8 rxport, count;
++	int ret;
++
++	mutex_lock(&priv->io_lock);
++	ch = btfm_slim_find_channel(priv, id, &rxport, &count);
++	if (ch) {
++		ret = btfm_slim_disable_ch(priv, ch, rxport, count);
++		if (ret)
++			BTFMSLIM_ERR("shutdown cleanup retained for retry: %d", ret);
++	}
++	mutex_unlock(&priv->io_lock);
++	btfm_slim_hw_deinit(priv);
++}
++
++static int btfm_slim_dai_hw_params(void *dai, u32 bps, u32 direction, u8 channels)
++{
++	struct hwep_data *ep = dai;
++	struct btfmslim *priv = dev_get_drvdata(ep->dev);
++	int ret = 0;
++
++	if (bps != 16 || direction > SNDRV_PCM_STREAM_CAPTURE ||
++	    !channels || channels > 2)
++		return -EINVAL;
++	mutex_lock(&priv->io_lock);
++	if (priv->stopping) {
++		ret = -ENODEV;
++	} else {
++		priv->bps = bps;
++		priv->direction = direction;
++	}
++	mutex_unlock(&priv->io_lock);
++	return ret;
++}
++
++static void btfm_get_sampling_rate(uint32_t *sampling_rate)
+ {
+ 	uint8_t codec_types_avb = ARRAY_SIZE(codec_text);
+-	if (usecase_codec > (codec_types_avb - 1)) {
++	u8 codec = READ_ONCE(usecase_codec);
++
++	if (codec > (codec_types_avb - 1)) {
+ 		BTFMSLIM_ERR("falling back to use default sampling_rate: %u",
+ 				*sampling_rate);
+ 		return;
+ 	}
+ 
+ 	if (*sampling_rate == 44100 || *sampling_rate == 48000) {
+-		if (usecase_codec == LDAC ||
+-		    usecase_codec == APTX_AD ||
+-		    usecase_codec == LHDC)
++		if (codec == LDAC ||
++		    codec == APTX_AD ||
++		    codec == LHDC)
+ 			*sampling_rate = (*sampling_rate) *2;
+ 	}
+ 
+-	if (usecase_codec == LC3_VOICE ||
+-	    usecase_codec == APTX_AD_SPEECH ||
+-	    usecase_codec == LC3 || usecase_codec == APTX_AD_R4 ||
+-	    usecase_codec == RVP) {
++	if (codec == LC3_VOICE ||
++	    codec == APTX_AD_SPEECH ||
++	    codec == LC3 || codec == APTX_AD_R4 ||
++	    codec == RVP) {
+ 		*sampling_rate = 96000;
+ 	}
+ 
+-	if (usecase_codec == APTX_AD_QLEA)
++	if (codec == APTX_AD_QLEA)
+ 		*sampling_rate = 192000;
+ 
+ 	BTFMSLIM_INFO("current usecase codec type %s and sampling rate:%u khz",
+-			codec_text[usecase_codec], *sampling_rate);
+-}
+-static int btfm_slim_dai_prepare(void *dai, uint32_t sampling_rate, uint32_t direction, int id)
+-{
+-	struct hwep_data *hwep_info = (struct hwep_data *)dai;
+-	struct btfmslim *btfmslim = dev_get_drvdata(hwep_info->dev);
++			codec_text[codec], *sampling_rate);
++}
++
++static int btfm_slim_dai_prepare(void *dai, u32 rate, u32 direction, int id)
++{
++	struct hwep_data *ep = dai;
++	struct btfmslim *priv = dev_get_drvdata(ep->dev);
+ 	struct btfmslim_ch *ch;
++	u8 rxport, count;
+ 	int ret = -EINVAL;
+-	int i = 0;
+-	uint8_t rxport, nchan = 1;
+-
+-	btfmslim->direction = direction;
+-	bt_soc_enable_status = 0;
+-
+-	btfm_get_sampling_rate(&sampling_rate);
+-	/* save sample rate */
+-	btfmslim->sample_rate = sampling_rate;
+-
+-	switch (id) {
+-	case BTFM_FM_SLIM_TX:
+-		nchan = 2;
+-		ch = btfmslim->tx_chs;
+-		rxport = 0;
+-		break;
+-	case BTFM_BT_SCO_SLIM_TX:
+-		ch = btfmslim->tx_chs;
+-		rxport = 0;
+-		break;
+-	case BTFM_BT_SCO_A2DP_SLIM_RX:
+-	case BTFM_BT_SPLIT_A2DP_SLIM_RX:
+-		ch = btfmslim->rx_chs;
+-		rxport = 1;
+-		break;
+-	case BTFM_SLIM_NUM_CODEC_DAIS:
+-	default:
+-		BTFMSLIM_ERR("id is invalid:%d", id);
+-		return ret;
+-	}
+-
+-	/* Search for dai->id matched port handler */
+-	for (i = 0; (i < BTFM_SLIM_NUM_CODEC_DAIS) &&
+-		(ch->id != BTFM_SLIM_NUM_CODEC_DAIS) &&
+-		(ch->id != id); ch++, i++)
+-		;
+-
+-	if ((ch->port == BTFM_SLIM_PGD_PORT_LAST) ||
+-		(ch->id == BTFM_SLIM_NUM_CODEC_DAIS)) {
+-		BTFMSLIM_ERR("ch is invalid!!");
+-		return ret;
+-	}
+-
+-	ret = btfm_slim_enable_ch(btfmslim, ch, rxport, sampling_rate, nchan);
+-
+-	/* save the enable channel status */
+-	if (ret == 0)
+-		bt_soc_enable_status = 1;
+-
+-	if (ret == -EISCONN) {
+-		BTFMSLIM_ERR("channel opened without closing, returning success");
++
++	if (direction > SNDRV_PCM_STREAM_CAPTURE)
++		return -EINVAL;
++	mutex_lock(&priv->io_lock);
++	if (priv->stopping) {
++		ret = -ENODEV;
++		goto out;
++	}
++	ch = btfm_slim_find_channel(priv, id, &rxport, &count);
++	if (!ch || direction != (rxport ? SNDRV_PCM_STREAM_PLAYBACK : SNDRV_PCM_STREAM_CAPTURE))
++		goto out;
++	btfm_get_sampling_rate(&rate);
++	priv->direction = direction;
++	priv->sample_rate = rate;
++	ret = btfm_slim_enable_ch(priv, ch, rxport, rate, count);
++	if (ret == -EISCONN)
+ 		ret = 0;
+-	}
+-	return ret;
+-}
+-
+-/* This function will be called once during boot up */
++	WRITE_ONCE(bt_soc_enable_status, !ret);
++out:
++	mutex_unlock(&priv->io_lock);
++	return ret;
++}
++
+ static int btfm_slim_dai_set_channel_map(void *dai,
+-				unsigned int tx_num, unsigned int *tx_slot,
+-				unsigned int rx_num, unsigned int *rx_slot)
+-{
+-
+-	struct hwep_data *hwep_info = (struct hwep_data *)dai;
+-	struct btfmslim *btfmslim = dev_get_drvdata(hwep_info->dev);
+-	struct btfmslim_ch *rx_chs;
+-	struct btfmslim_ch *tx_chs;
+-	int ret = 0, i;
+-
+-	BTFMSLIM_DBG("");
+-
+-	if (!btfmslim)
+-		return -EINVAL;
+-
+-	rx_chs = btfmslim->rx_chs;
+-	tx_chs = btfmslim->tx_chs;
+-
+-	if (!rx_chs || !tx_chs)
+-		return ret;
+-
+-	BTFMSLIM_DBG("Rx: id\tname\tport\tch");
+-	for (i = 0; (rx_chs->port != BTFM_SLIM_PGD_PORT_LAST) && (i < rx_num);
+-		i++, rx_chs++) {
+-		/* Set Rx Channel number from machine driver and
+-		 * get channel handler from slimbus driver
+-		*/
+-		rx_chs->ch = *(uint8_t *)(rx_slot + i);
+-		BTFMSLIM_DBG("    %d\t%s\t%d\t%x", rx_chs->id,
+-			rx_chs->name, rx_chs->port, rx_chs->ch);
+-	}
+-
+-	BTFMSLIM_DBG("Tx: id\tname\tport\tch");
+-	for (i = 0; (tx_chs->port != BTFM_SLIM_PGD_PORT_LAST) && (i < tx_num);
+-		i++, tx_chs++) {
+-		/* Set Tx Channel number from machine driver and
+-		 * get channel handler from slimbus driver
+-		*/
+-		tx_chs->ch = *(uint8_t *)(tx_slot + i);
+-	BTFMSLIM_DBG("    %d\t%s\t%d\t%x", tx_chs->id,
+-			tx_chs->name, tx_chs->port, tx_chs->ch);
+-	}
+-
++			unsigned int tx_num, unsigned int *tx_slot,
++			unsigned int rx_num, unsigned int *rx_slot)
++{
++	struct hwep_data *ep = dai;
++	struct btfmslim *priv = dev_get_drvdata(ep->dev);
++	unsigned int i;
++	int ret = 0;
++
++	if (tx_num > priv->num_tx_port || rx_num > priv->num_rx_port ||
++	    (tx_num && !tx_slot) || (rx_num && !rx_slot))
++		return -EINVAL;
++	for (i = 0; i < tx_num; i++)
++		if (tx_slot[i] > U8_MAX)
++			return -EINVAL;
++	for (i = 0; i < rx_num; i++)
++		if (rx_slot[i] > U8_MAX)
++			return -EINVAL;
++	mutex_lock(&priv->io_lock);
++	if (priv->stopping) {
++		ret = -ENODEV;
++		goto out;
++	}
++	for (i = 0; i < priv->num_tx_port; i++)
++		if (priv->tx_chs[i].dai.sruntime) {
++			ret = -EBUSY;
++			goto out;
++		}
++	for (i = 0; i < priv->num_rx_port; i++)
++		if (priv->rx_chs[i].dai.sruntime) {
++			ret = -EBUSY;
++			goto out;
++		}
++	for (i = 0; i < tx_num; i++)
++		priv->tx_chs[i].ch = tx_slot[i];
++	for (i = 0; i < rx_num; i++)
++		priv->rx_chs[i].ch = rx_slot[i];
++out:
++	mutex_unlock(&priv->io_lock);
+ 	return ret;
+ }
+ 
+ static int btfm_slim_dai_get_channel_map(void *dai,
+-				 unsigned int *tx_num, unsigned int *tx_slot,
+-				 unsigned int *rx_num, unsigned int *rx_slot, int id)
+-{
+-
+-	struct hwep_data *hwep_info = (struct hwep_data *)dai;
+-	struct btfmslim *btfmslim = dev_get_drvdata(hwep_info->dev);
+-	int i, ret = -EINVAL, *slot = NULL, j = 0, num = 1;
+-	struct btfmslim_ch *ch = NULL;
+-
+-	BTFMSLIM_DBG("");
+-	if (!btfmslim)
+-		return ret;
+-
+-	switch (id) {
+-	case BTFM_FM_SLIM_TX:
+-		num = 2;
+-		fallthrough;
+-	case BTFM_BT_SCO_SLIM_TX:
+-		if (!tx_slot || !tx_num) {
+-			BTFMSLIM_ERR("Invalid tx_slot %p or tx_num %p",
+-				tx_slot, tx_num);
+-			return -EINVAL;
+-		}
+-		ch = btfmslim->tx_chs;
+-		if (!ch)
+-			return -EINVAL;
+-		slot = tx_slot;
+-		*rx_slot = 0;
+-		*tx_num = num;
+-		*rx_num = 0;
+-		break;
+-	case BTFM_BT_SCO_A2DP_SLIM_RX:
+-	case BTFM_BT_SPLIT_A2DP_SLIM_RX:
+-		if (!rx_slot || !rx_num) {
+-			BTFMSLIM_ERR("Invalid rx_slot %p or rx_num %p",
+-				 rx_slot, rx_num);
+-			return -EINVAL;
+-		}
+-		ch = btfmslim->rx_chs;
+-		if (!ch)
+-			return -EINVAL;
+-		slot = rx_slot;
+-		*tx_slot = 0;
+-		*tx_num = 0;
+-		*rx_num = num;
+-		break;
+-	default:
+-		BTFMSLIM_ERR("Unsupported DAI %d", id);
+-		return -EINVAL;
+-	}
+-
+-	do {
+-		if (!ch)
+-			return -EINVAL;
+-		for (i = 0; (i < BTFM_SLIM_NUM_CODEC_DAIS) && (ch->id !=
+-			BTFM_SLIM_NUM_CODEC_DAIS) && (ch->id != id);
+-			ch++, i++)
+-			;
+-
+-		if (ch->id == BTFM_SLIM_NUM_CODEC_DAIS ||
+-			i == BTFM_SLIM_NUM_CODEC_DAIS) {
+-			BTFMSLIM_ERR(
+-				"No channel has been allocated for dai (%d)",
+-				id);
+-			return -EINVAL;
+-		}
+-		if (!slot)
+-			return -EINVAL;
+-		*(slot + j) = ch->ch;
+-		BTFMSLIM_DBG("id:%d, port:%d, ch:%d, slot: %d", ch->id,
+-			ch->port, ch->ch, *(slot + j));
+-
+-		/* In case it has mulitiple channels */
+-		if (++j < num)
+-			ch++;
+-	} while (j < num);
+-
+-	return 0;
+-}
+-
+-int btfm_slim_dai_get_configs(void *dai, void *config, uint8_t id)
+-{
+-	struct hwep_data *hwep_info = (struct hwep_data *)dai;
+-	struct btfmslim *btfmslim = dev_get_drvdata(hwep_info->dev);
+-	struct master_hwep_configurations *hwep_config;
+-	struct btfmslim_ch *ch = NULL;
+-	int i = 0;
+-
+-	BTFMSLIM_DBG("");
+-
+-	hwep_config = (struct master_hwep_configurations *) config;
+-	hwep_config->stream_id = id;
+-	hwep_config->device_id = btfmslim->device_id;
+-	hwep_config->sample_rate = btfmslim->sample_rate;
+-	hwep_config->bit_width = (uint8_t)btfmslim->bps;
+-	hwep_config->codectype = usecase_codec;
+-	hwep_config->direction = btfmslim->direction;
+-
+-	switch (id) {
+-		case BTFM_FM_SLIM_TX:
+-		case BTFM_BT_SCO_SLIM_TX:
+-			ch = btfmslim->tx_chs;
+-			break;
+-		case BTFM_BT_SCO_A2DP_SLIM_RX:
+-		case BTFM_BT_SPLIT_A2DP_SLIM_RX:
+-			ch = btfmslim->rx_chs;
+-			break;
+-	}
+-
+-	for (; i < id ; i++) {
+-		if (ch[i].id == id) {
+-			BTFMSLIM_DBG("id matched");
+-			hwep_config->num_channels = 1;
+-			hwep_config->chan_num = ch[i].ch;
+-			break;
+-		}
+-	}
+-
+-	return 1;
++			unsigned int *tx_num, unsigned int *tx_slot,
++			unsigned int *rx_num, unsigned int *rx_slot, int id)
++{
++	struct hwep_data *ep = dai;
++	struct btfmslim *priv = dev_get_drvdata(ep->dev);
++	struct btfmslim_ch *ch;
++	unsigned int *slot, i;
++	u8 rxport, count;
++	int ret = -EINVAL;
++
++	if (!tx_num || !rx_num)
++		return -EINVAL;
++	mutex_lock(&priv->io_lock);
++	if (priv->stopping) {
++		ret = -ENODEV;
++		goto out;
++	}
++	ch = btfm_slim_find_channel(priv, id, &rxport, &count);
++	if (!ch || (rxport ? !rx_slot : !tx_slot))
++		goto out;
++	*tx_num = rxport ? 0 : count;
++	*rx_num = rxport ? count : 0;
++	slot = rxport ? rx_slot : tx_slot;
++	for (i = 0; i < count; i++)
++		slot[i] = ch[i].ch;
++	ret = 0;
++out:
++	mutex_unlock(&priv->io_lock);
++	return ret;
++}
++
++static int btfm_slim_dai_get_configs(void *dai, void *config, u8 id)
++{
++	struct hwep_data *ep = dai;
++	struct btfmslim *priv = dev_get_drvdata(ep->dev);
++	struct master_hwep_configurations *cfg = config;
++	struct btfmslim_ch *ch;
++	u8 rxport, count;
++	int ret = -EINVAL;
++
++	if (!cfg)
++		return -EINVAL;
++	mutex_lock(&priv->io_lock);
++	if (priv->stopping) {
++		ret = -ENODEV;
++		goto out;
++	}
++	ch = btfm_slim_find_channel(priv, id, &rxport, &count);
++	if (!ch)
++		goto out;
++	cfg->stream_id = id;
++	cfg->device_id = priv->device_id;
++	cfg->sample_rate = ch->dai.sruntime ? ch->dai.sconfig.rate : priv->sample_rate;
++	cfg->bit_width = ch->dai.sruntime ? ch->dai.sconfig.bps : priv->bps;
++	cfg->codectype = READ_ONCE(usecase_codec);
++	cfg->direction = rxport ? SNDRV_PCM_STREAM_PLAYBACK : SNDRV_PCM_STREAM_CAPTURE;
++	cfg->num_channels = count;
++	cfg->chan_num = ch->ch;
++	ret = 1;
++out:
++	mutex_unlock(&priv->io_lock);
++	return ret;
+ }
+ 
+ static struct hwep_dai_ops  btfmslim_hw_dai_ops = {
+@@ -520,11 +433,11 @@
+ 	hwep_info->drv = &btfmslim_hw_driver;
+ 	hwep_info->dai_drv = btfmslim_dai_driver;
+ 	hwep_info->num_dai = ARRAY_SIZE(btfmslim_dai_driver);
+-	hwep_info->num_dai = 2;
+ 	hwep_info->num_mixer_ctrl = ARRAY_SIZE(status_controls);
+ 	hwep_info->mixer_ctrl = status_controls;
+ 	/* Register to hardware endpoint */
+ 	ret = btfmcodec_register_hw_ep(hwep_info);
++	kfree(hwep_info);
+ 	if (ret) {
+ 		BTFMSLIM_ERR("failed to register with btfmcodec driver hw interface (%d)", ret);
+ 		goto end;
+--- a/qcom/opensource/bt-kernel/slimbus/btfm_slim_slave.c
++++ b/qcom/opensource/bt-kernel/slimbus/btfm_slim_slave.c
+@@ -43,8 +43,10 @@
+ 	/* Get SB_SLAVE_HW_REV_MSB value*/
+ 	reg = SLAVE_SB_SLAVE_HW_REV_MSB;
+ 	ret = btfm_slim_read(btfmslim, reg, IFD);
+-	if (ret < 0)
++	if (ret < 0) {
+ 		BTFMSLIM_ERR("failed to read (%d) reg 0x%x", ret, reg);
++		return ret;
++	}
+ 
+ 	BTFMSLIM_DBG("Major Rev: 0x%x, Minor Rev: 0x%x",
+ 		(ret & 0xF0) >> 4, (ret & 0x0F));
+--- a/qcom/opensource/bt-kernel/slimbus/btfm_slim.h
++++ b/qcom/opensource/bt-kernel/slimbus/btfm_slim.h
+@@ -7,6 +7,8 @@
+ #ifndef BTFM_SLIM_H
+ #define BTFM_SLIM_H
+ #include <linux/slimbus.h>
++#include <linux/kref.h>
++#include <linux/cdev.h>
+ 
+ #define BTFMSLIM_DBG(fmt, arg...)  pr_debug("%s: " fmt "\n", __func__, ## arg)
+ #define BTFMSLIM_INFO(fmt, arg...) pr_info("%s: " fmt "\n", __func__, ## arg)
+@@ -45,6 +47,12 @@
+ };
+ 
+ struct btfm_slim_codec_dai_data {
++	bool active;
++	bool needs_disable;
++	bool prepared;
++	u8 enabled_ports;
++	u8 channels;
++	u8 rxport;
+ 	struct slim_stream_config sconfig;
+ 	struct slim_stream_runtime *sruntime;
+ };
+@@ -61,6 +69,11 @@
+ #define BTFM_SLIM_PGD_PORT_LAST				0xFF
+ 
+ struct btfmslim {
++	struct kref ref;
++	struct cdev *cdev;
++	dev_t devt;
++	bool stopping;
++	bool endpoint_registered;
+ 	struct device *dev;
+ 	struct slim_device *slim_pgd; //Physical address
+ 	struct slim_device slim_ifd; //Interface address
+@@ -113,8 +126,6 @@
+ int btfm_slim_write(struct btfmslim *btfmslim,
+ 	uint16_t reg, uint8_t reg_val, uint8_t pgd);
+ 
+-
+-
+ /**
+  * btfm_slim_read: read value from pgd or ifd device
+  * @btfmslim: slimbus slave device data pointer.
+@@ -127,7 +138,6 @@
+  */
+ int btfm_slim_read(struct btfmslim *btfmslim,
+ 	uint32_t reg, uint8_t pgd);
+-
+ 
+ /**
+  * btfm_slim_enable_ch: enable channel for slimbus slave port
+--- a/qcom/opensource/bt-kernel/slimbus/btfm_slim_slave.h
++++ b/qcom/opensource/bt-kernel/slimbus/btfm_slim_slave.h
+@@ -162,8 +162,8 @@
+ #endif
+ 
+ /* Assign vendor specific function */
+-extern struct btfmslim_ch slave_txport[];
+-extern struct btfmslim_ch slave_rxport[];
++extern struct btfmslim_ch slave_txport[4];
++extern struct btfmslim_ch slave_rxport[3];
+ 
+ #ifdef SLIM_SLAVE_RXPORT
+ #undef SLIM_SLAVE_RXPORT

@@ -1,0 +1,194 @@
+{
+  "tests": {
+    "transactions": {
+      "transaction_cases": 342,
+      "reply_bounds": true,
+      "all_error_paths_cancel_tid_and_balance_pm": true,
+      "async_immediate_and_delayed_ownership": true,
+      "late_reply_ignored": true,
+      "wrapper_truncation_rejected": true
+    },
+    "addresses": {
+      "report_failure_cases": 5,
+      "address_output_initialized": true,
+      "failed_assignment_frees_id": true,
+      "repeated_allocation_and_absence": true,
+      "pm_votes_balanced": true
+    },
+    "streams": {
+      "stream_input_and_failure_cases": 24,
+      "rollback_retry_ledger": true,
+      "transaction_errors_propagate": true,
+      "serialized_hooks": true,
+      "stream_retains_device": true,
+      "removal_releases_software_state": true
+    },
+    "ngd_transfer": {
+      "transfer_and_rx_cases": 82,
+      "late_dma_callback_safe": true,
+      "failed_post_ring_rollback": true,
+      "caller_transaction_unchanged": true,
+      "frame_padding_zero": true,
+      "address_reply_length_checked": true
+    },
+    "bluetooth": {
+      "fault_cases": 7,
+      "retryable_partial_cleanup": true,
+      "channel_map_and_config_bounds": true,
+      "all_four_native_dai_ids": true,
+      "allocation_errors_balanced": true
+    },
+    "ngd_lifecycle": {
+      "probe_failure_stages": 6,
+      "remove_quiesces_producers_before_controller": true,
+      "PM_votes_balanced": true
+    },
+    "ngd_dma": {
+      "allocation_and_descriptor_faults": 64,
+      "partial_dma_terminated_before_free": true,
+      "repeated_cleanup_safe": true,
+      "remote_buffer_offsets_stable": true
+    },
+    "core_lifetime": {
+      "status_remove_race_drained": true,
+      "creation_remove_race_drained": true,
+      "recursive_probe_lookup_unlocked": true,
+      "retained_device_delays_controller_release": true
+    },
+    "bt_lifetime": {
+      "probe_failures": 9,
+      "open_survives_remove": true,
+      "stale_file_ioctl_rejected": true,
+      "stale_inode_rebind_rejected": true
+    },
+    "transaction_race": {
+      "response_cancel_races": 200,
+      "async_caller_response_release_races": 200,
+      "completion_under_transaction_lock": true
+    }
+  },
+  "negative_controls": {
+    "async_registry_reference_lost_in_race": {
+      "rejected": true,
+      "diagnostic": "==3317631==ERROR: AddressSanitizer: heap-use-after-free on address 0x7027a01e00bc at pc 0x00000040241b bp 0x7fff844adfa0 sp 0x7fff844adf90"
+    },
+    "bt_stale_inode_guard_lost": {
+      "rejected": true,
+      "diagnostic": "bt_stale_inode_guard_lost: /tmp/slim-test-yzwcosav/bt_stale_inode_guard_lost.c:624: main: Assertion `btfm_slim_open(&ino,&stale)==-ENODEV' failed."
+    },
+    "bt_open_reference_lost": {
+      "rejected": true,
+      "diagnostic": "bt_open_reference_lost: /tmp/slim-test-yzwcosav/bt_open_reference_lost.c:624: main: Assertion `!btfm_slim_open(&ino,&file)&&old->ref.refs==2' failed."
+    },
+    "core_status_callback_drain_lost": {
+      "rejected": true,
+      "diagnostic": "core_status_callback_drain_lost: /tmp/slim-test-yzwcosav/core_status_callback_drain_lost.c:925: wait_sync: Assertion `s!=&slim_status_srcu||!READ_ONCE(removed)' failed."
+    },
+    "core_creation_drain_lost": {
+      "rejected": true,
+      "diagnostic": "core_creation_drain_lost: /tmp/slim-test-yzwcosav/core_creation_drain_lost.c:819: device_for_each_child: Assertion `!READ_ONCE(creating)' failed."
+    },
+    "ngd_partial_rx_termination_lost": {
+      "rejected": true,
+      "diagnostic": "ngd_partial_rx_termination_lost: /tmp/slim-test-yzwcosav/ngd_partial_rx_termination_lost.c:18: dma_release_channel: Assertion `!c->pending' failed."
+    },
+    "ngd_probe_pm_vote_leak": {
+      "rejected": true,
+      "diagnostic": "ngd_probe_pm_vote_leak: /tmp/slim-test-yzwcosav/ngd_probe_pm_vote_leak.c:134: main: Assertion `ret<0&&!controller_live&&!pm_enabled&&!pm_votes&&!notifier_live&&!pdr_live&&!svc_live&&!queues' failed."
+    },
+    "ngd_remove_dma_termination_missing": {
+      "rejected": true,
+      "diagnostic": "ngd_remove_dma_termination_missing: /tmp/slim-test-yzwcosav/ngd_remove_dma_termination_missing.c:20: slim_unregister_controller: Assertion `!notifier_live&&!pdr_live&&!dma_live&&!irq_live&&!handle_live' failed."
+    },
+    "ngd_stack_completion_unrevoked": {
+      "rejected": true,
+      "diagnostic": "ngd_stack_completion_unrevoked: /tmp/slim-test-yzwcosav/ngd_stack_completion_unrevoked.c:1184: main: Assertion `!c.txdesc[i].comp' failed."
+    },
+    "ngd_post_rollback_missing": {
+      "rejected": true,
+      "diagnostic": "ngd_post_rollback_missing: /tmp/slim-test-yzwcosav/ngd_post_rollback_missing.c:1184: main: Assertion `c.tx_head==c.tx_tail' failed."
+    },
+    "ngd_rx_short_frame_accepted": {
+      "rejected": true,
+      "diagnostic": "==3328980==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x6c38d9be0053 at pc 0x000000401a6a bp 0x7ffd47fee1f0 sp 0x7ffd47fee1e0"
+    },
+    "bt_failed_cleanup_state_discarded": {
+      "rejected": true,
+      "diagnostic": "bt_failed_cleanup_state_discarded: /tmp/slim-test-yzwcosav/bt_failed_cleanup_state_discarded.c:505: slim_stream_free: Assertion `!r->active&&!r->prepared' failed."
+    },
+    "bt_channel_map_truncation": {
+      "rejected": true,
+      "diagnostic": "bt_channel_map_truncation: /tmp/slim-test-yzwcosav/bt_channel_map_truncation.c:892: main: Assertion `btfm_slim_dai_set_channel_map(&ep,3,txslots,2,rxslots)==-EINVAL&&rx[1].ch==25' failed."
+    },
+    "reply_overflow": {
+      "rejected": true,
+      "diagnostic": "reply_overflow: /tmp/slim-test-yzwcosav/reply_overflow.c:1133: main: Assertion `native_done.done&&native_txn.result==-EMSGSIZE&&buffer[4]==0xa5' failed."
+    },
+    "async_response_ref_lost": {
+      "rejected": true,
+      "diagnostic": "async_response_ref_lost: /tmp/slim-test-yzwcosav/async_response_ref_lost.c:1135: main: Assertion `live==1&&pm_votes==1&&!done.done' failed."
+    },
+    "transaction_error_cleanup_lost": {
+      "rejected": true,
+      "diagnostic": "transaction_error_cleanup_lost: /tmp/slim-test-yzwcosav/transaction_error_cleanup_lost.c:1131: clean_idr: Assertion `!ctrl.tid_idr.slot[id]' failed."
+    },
+    "wide_read_count_truncated": {
+      "rejected": true,
+      "diagnostic": "wide_read_count_truncated: /tmp/slim-test-yzwcosav/wide_read_count_truncated.c:1137: main: Assertion `ret==(count>=1&&count<=16?0:-EINVAL)' failed."
+    },
+    "new_address_output_missing": {
+      "rejected": true,
+      "diagnostic": "new_address_output_missing: /tmp/slim-test-yzwcosav/new_address_output_missing.c:954: main: Assertion `!slim_device_report_present(&ctrl,&device.e_addr,&output)&&output==device.laddr' failed."
+    },
+    "address_rollback_leak": {
+      "rejected": true,
+      "diagnostic": "address_rollback_leak: /tmp/slim-test-yzwcosav/address_rollback_leak.c:953: main: Assertion `slim_device_alloc_laddr(&device,true)==-EIO&&!device.is_laddr_valid&&allocations==2&&frees==2' failed."
+    },
+    "stream_mask_bound_missing": {
+      "rejected": true,
+      "diagnostic": "stream_mask_bound_missing: /tmp/slim-test-yzwcosav/stream_mask_bound_missing.c:1478: main: Assertion `slim_stream_prepare(r,&bad)==-EINVAL&&!r->ports&&live==2&&!tx_count' failed."
+    },
+    "stream_device_reference_missing": {
+      "rejected": true,
+      "diagnostic": "stream_device_reference_missing: /tmp/slim-test-yzwcosav/stream_device_reference_missing.c:1478: main: Assertion `!IS_ERR(r)&&live==2&&dev.dev.refs==2' failed."
+    },
+    "stream_connect_error_ignored": {
+      "rejected": true,
+      "diagnostic": "stream_connect_error_ignored: /tmp/slim-test-yzwcosav/stream_connect_error_ignored.c:1479: main: Assertion `slim_stream_prepare(r,&config)==-EIO&&!r->ports&&live==2' failed."
+    }
+  },
+  "source_sha256": {
+    "drivers/slimbus/core.c": "786ebdacaa461aabc813e3ef606a653b412e6ce263922f496a73996e32619d51",
+    "drivers/slimbus/messaging.c": "3570de15335a92736c5a4dcc673a491be292c86cb2a146e857ace8c8996681e7",
+    "drivers/slimbus/sched.c": "13a2b94cc215de7fcf0bb220a3c511e069bc277466986d6eed1ebfc50e893568",
+    "drivers/slimbus/stream.c": "ac015848f59d9b6b146ef047cb809c9a1b597d41cdf720ec73760e9d734f84eb",
+    "drivers/slimbus/qcom-ngd-ctrl.c": "6a71b3bcd918429f9fedc70db2b9a9dfbaabf3cb921c5b60f37389150a82fb5b",
+    "drivers/slimbus/slimbus.h": "3e3ed4f8e82c5cbb20d517f1a1499f58dba09a97bebb574158682a9f55b44885",
+    "drivers/slimbus/trace.h": "19f81208036832c9131ba528ed9c261387d59b317c985f461a0f76ae2522f04a",
+    "drivers/slimbus/Makefile": "65aadcf62c18a1119d5ce57bc5d93ebaf68027709e2a9773167e3f47ba9197d0",
+    "drivers/slimbus/Kconfig": "48570462b7c53841b900da628988c68e16b7f8ee6a7b57558ecd1be2ff12acfb",
+    "include/linux/slimbus.h": "def61620af9d49494fc7efc22db53bfd4a3341708546ccfed9a7166ca71941c6",
+    "qcom/opensource/bt-kernel/slimbus/btfm_slim.c": "9cee232b69f500c22f0a24bd4cee3a7fca2b98f24094d3db9a11afa568f0a266",
+    "qcom/opensource/bt-kernel/slimbus/btfm_slim_hw_interface.c": "b0cff25bb6ba284794dbdfd1520a508d6b076e45d6799bd1eb4123ccd0ec474f",
+    "qcom/opensource/bt-kernel/slimbus/btfm_slim_slave.c": "19119101ef6f49b9503c321a06d1c8adc5e0a72ef1b51d6fa2871be2fabba4d6",
+    "qcom/opensource/bt-kernel/slimbus/btfm_slim.h": "d28466b7e16f20ab61462526704458b2e53346a165094553f51b913bd17c408b",
+    "qcom/opensource/bt-kernel/slimbus/btfm_slim_hw_interface.h": "72ab19f21745718c10231b15fe926be545ca59ff338f14a18cf8e9e57c047a12",
+    "qcom/opensource/bt-kernel/slimbus/btfm_slim_slave.h": "c7e8a5038d57c6383a18b49fb13e2e8b81b7a9ed9bbb1ff6544a2f3ce3af2d98",
+    "qcom/opensource/bt-kernel/slimbus/Makefile": "f34abebb4da514bda1df0d08052803e6a4d3995a63a835bab60873e94c2b76d7",
+    "qcom/opensource/bt-kernel/slimbus/Kconfig": "65fa111bc0deb0fe0704f0985410624c9103ff0a3c9f8503040d67933433d6f2"
+  },
+  "harness_sha256": {
+    "slim_addresses.c": "68f2d41c88c9331ac5601951b15fbd7dfb1ce42865dbc0f287f138c5a09ca918",
+    "slim_bluetooth.c": "b2b75a5478cc7bcfa26ea6a51cc66359cbf4aba68da6af4f08550e560fbc4395",
+    "slim_bt_lifetime.c": "8117c4783b2a8b890a5af50efdfc8eb6d2b283db6250c97852187c9df8ae90df",
+    "slim_core_lifetime.c": "fac878446a7c303f8780953b38f8d30d052fd2d482fc3d185b2245280799fdcb",
+    "slim_mock.h": "fd558c3407a492bd67c612b85fa71365bd8e01e2a68924265d326e5112a5cefb",
+    "slim_ngd_dma.c": "e7052355bc921dfaadc354a46be97d994cd9bdabad636493ecd2b41eda49b43e",
+    "slim_ngd_lifecycle.c": "7c46dd2fbccd9a6103e41cf943b62cc7365fbcf07123f15caa3b7a3ee706fa33",
+    "slim_ngd_transfer.c": "7da78923c8fbeb16f55ce082b8f1e33ef8e0ca783e73279f721174468edcfce9",
+    "slim_streams.c": "7124d6513a075323ceb0b30dd5f7c9a4aefa5629fb5a879c0f1532d918e49d35",
+    "slim_transaction_race.c": "2e07d5b4664befb74ebf52ba25426029958b030626dd61e5831b6def841525aa",
+    "slim_transactions.c": "996bd6d412bd45c515472f207d70c3acb6d6cae59dc519f7862bfe8fe0dce222"
+  },
+  "limits": "Extracted production functions, mocked kernel services. No hardware/firmware or actual IRQ/SRCU/workqueue proof."
+}
