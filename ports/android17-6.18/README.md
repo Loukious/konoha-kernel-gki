@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 91 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 93 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 91 platform `.ko` files, their symbol tables and DDK configurations.
+- 93 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 4027
-imported symbol CRCs across all 91 modules.
+used. The current [validation report](validation-20261031.json) checks 4116
+imported symbol CRCs across all 93 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -230,7 +230,7 @@ wake, receive threads stop, and queued memory work drains before descriptors
 are freed. The deferred-free worker also supports stop and drain. Unknown queue
 names fail cleanly, and receiver allocation/thread failures unwind registration.
 These adaptations pass checkpatch with no errors, warnings or style checks;
-the full build passes 4027 imported-symbol CRC checks without compiler/modpost
+the full build passes 4116 imported-symbol CRC checks without compiler/modpost
 warnings. Cross-VM sharing, secure-display allocation and memory pressure still
 require device testing. `ZONE_DEVICE` and reserved-IPA support remain disabled,
 matching the Onyx HLOS baseline; guest-only mapping paths are not validated.
@@ -366,3 +366,19 @@ result is in [minidump-validation-20261031.json](minidump-validation-20261031.js
 The harness also rejects the former pending-slot indexing bug. These checks
 cover table arithmetic, not locking, firmware, panic handling or phone operation.
 This adaptation passes checkpatch without errors, warnings or style checks.
+
+The watchdog group adds `qcom_wdt_core` and `gh_virt_wdt`, retaining the Onyx
+11,000 ms bark interval, 9,360 ms pet interval, CPU pings, IRQ statistics and
+panic bite behavior. Timer callbacks use current APIs. Both worker waits can
+be stopped, and failed setup unwinds only resources that were registered.
+Per-CPU IRQ data is initialized for every possible CPU; hotplug teardown runs
+before releasing IRQ storage. IRQ statistics initialize their ranking table
+and look up descriptors again under RCU before displaying names.
+
+Sysfs operations wait for completed setup, and suspend/resume serialize with
+permanent disable. The worker cannot reset hardware or rearm its timer during
+suspend. Firmware errors are propagated on enable/disable and PM operations;
+panic timeouts are bounded by the Gunyah protocol's 16-bit limit. The recovery
+service remains resident because firmware and minidump retain its data.
+The adaptation passes checkpatch without errors, warnings or style checks.
+Watchdog firing, suspend/resume and firmware behavior still require phone tests.

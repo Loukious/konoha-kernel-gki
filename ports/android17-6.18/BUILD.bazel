@@ -1215,6 +1215,32 @@ ddk_module(
     deps = [":minidump_headers", ":minidump"],
 )
 
+ddk_headers(
+    name = "watchdog_headers",
+    hdrs = ["include/soc/qcom/watchdog.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "qcom_wdt_core",
+    srcs = ["drivers/soc/qcom/qcom_wdt_core.c"],
+    out = "qcom_wdt_core.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":watchdog_headers", ":minidump_headers", ":scm_headers", ":minidump", ":qcom_scm"],
+)
+
+ddk_module(
+    name = "gh_virt_wdt",
+    srcs = ["drivers/virt/gunyah/gh_virt_wdt.c"],
+    out = "gh_virt_wdt.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":watchdog_headers", ":gunyah_headers", ":scm_headers", ":qcom_wdt_core"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1293,6 +1319,8 @@ kernel_module_group(
         ":qcom_logbuf_boot_log",
         ":qcom_logbuf_vendor_hooks",
         ":minidump",
+        ":qcom_wdt_core",
+        ":gh_virt_wdt",
         ":nvmem_qfprom",
         ":qcom_cpufreq_thermal",
         ":qcom_cpufreq_hw",
