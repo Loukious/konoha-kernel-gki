@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 108 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 110 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 108 platform `.ko` files, their symbol tables and DDK configurations.
+- 110 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 4957
-imported symbol CRCs across all 108 modules.
+used. The current [validation report](validation-20261031.json) checks 5025
+imported symbol CRCs across all 110 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -590,3 +590,27 @@ does not exercise the full scheduler, hardware counters, CPU hotplug or phone
 boot. Checkpatch and the 108-module build pass without warnings, with 4,957
 imported-symbol CRCs verified. WALT behavior and thermal coordination still
 require device testing before release.
+
+
+The CPU cooling group adds `thermal_pause` and `cpu_hotplug`, both used by
+Tuna's thermal device tree. Pause requests are combined before applying per-CPU
+WALT votes, so overlapping cooling groups cannot release each other's votes.
+State reads report actual applied cooling; failed operations retry a bounded
+number of times. Workqueue operations and notifier callbacks run outside the
+request mutex, and generation counters preserve requests received during work.
+
+Hotplug cooling vetoes online requests with `-EBUSY` while cooling is requested.
+It restores only CPUs it offlined, preserving CPUs already offline for another
+reason. Removal stops callback producers and drains work before releasing CPU
+votes, DT references and workqueues. WALT's drain thread uses a wait queue and
+captures pending requests before processing, preserving requests arriving during
+an earlier drain. Protected-CPU checks precede changes to the halt mask.
+
+`verify_cpu_thermal.py WORKSPACE` exercises the staged workers and drain helpers
+under AddressSanitizer and UndefinedBehaviorSanitizer: 65,025 overlapping mask
+pairs, 256 initial online masks, 65,536 drain-request pairs, plus operation
+failures, bounded retries, teardown and reentrant requests. The
+[recorded result](cpu-thermal-validation-20261031.json) uses simulated kernel
+services; it does not test real workqueues, thermal hardware or CPU hotplug.
+The full 110-module build and both adaptation patches pass without warnings.
+Build archives now include `boot-parameters.txt` for image assembly.

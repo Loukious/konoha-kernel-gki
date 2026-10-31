@@ -1416,6 +1416,32 @@ ddk_module(
     deps = [":walt_headers", ":minidump_headers", ":soc_headers", ":socinfo", ":qcom_cpufreq_hw", ":debug_symbol", ":debug_symbol_headers"],
 )
 
+ddk_headers(
+    name = "cpu_thermal_headers",
+    hdrs = ["include/linux/thermal_pause.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "thermal_pause",
+    srcs = ["drivers/thermal/qcom/thermal_pause.c"],
+    out = "thermal_pause.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":cpu_thermal_headers", ":walt_headers", ":sched_walt"],
+)
+
+ddk_module(
+    name = "cpu_hotplug",
+    srcs = ["drivers/thermal/qcom/cpu_hotplug.c"],
+    out = "cpu_hotplug.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":cpu_thermal_headers", ":walt_headers", ":sched_walt"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1511,6 +1537,8 @@ kernel_module_group(
         ":miev",
         ":boottime",
         ":sched_walt",
+        ":thermal_pause",
+        ":cpu_hotplug",
         ":nvmem_qfprom",
         ":qcom_cpufreq_thermal",
         ":qcom_cpufreq_hw",

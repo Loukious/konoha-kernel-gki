@@ -1280,7 +1280,71 @@
  
  		/*
  		 * Argh ... no iterator for tasks, we need to remove the
-@@ -274,7 +278,7 @@
+@@ -244,37 +248,49 @@
+ 	.cpus_to_drain = { CPU_BITS_NONE }
+ };
+ 
++static DECLARE_WAIT_QUEUE_HEAD(walt_drain_wait);
++
++static bool walt_drain_pending(cpumask_t *pending)
++{
++	unsigned long flags;
++	bool ready;
++
++	raw_spin_lock_irqsave(&walt_drain_pending_lock, flags);
++	ready = !cpumask_empty(pending);
++	raw_spin_unlock_irqrestore(&walt_drain_pending_lock, flags);
++	return ready;
++}
++
++static void walt_take_drain_requests(cpumask_t *pending, cpumask_t *batch)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&walt_drain_pending_lock, flags);
++	cpumask_copy(batch, pending);
++	/* Preserve requests arriving while this batch is being drained. */
++	cpumask_clear(pending);
++	raw_spin_unlock_irqrestore(&walt_drain_pending_lock, flags);
++}
++
+ static int __ref try_drain_rqs(void *data)
+ {
+-	cpumask_t *cpus_ptr = &((struct drain_thread_data *)data)->cpus_to_drain;
++	cpumask_t *pending = &((struct drain_thread_data *)data)->cpus_to_drain;
++	cpumask_t batch;
+ 	int cpu;
+-	unsigned long flags;
+ 
+ 	while (!kthread_should_stop()) {
+-		raw_spin_lock_irqsave(&walt_drain_pending_lock, flags);
+-		if (cpumask_weight(cpus_ptr)) {
+-			cpumask_t local_cpus;
+-
+-			cpumask_copy(&local_cpus, cpus_ptr);
+-			raw_spin_unlock_irqrestore(&walt_drain_pending_lock, flags);
+-
+-			for_each_cpu(cpu, &local_cpus)
+-				cpu_drain_rq(cpu);
+-
+-			raw_spin_lock_irqsave(&walt_drain_pending_lock, flags);
+-			cpumask_andnot(cpus_ptr, cpus_ptr, &local_cpus);
+-
+-		}
+-		raw_spin_unlock_irqrestore(&walt_drain_pending_lock, flags);
+-		set_current_state(TASK_INTERRUPTIBLE);
+-		schedule();
+-		set_current_state(TASK_RUNNING);
+-	}
+-
++		wait_event_interruptible(walt_drain_wait,
++			kthread_should_stop() || walt_drain_pending(pending));
++		if (kthread_should_stop())
++			break;
++		walt_take_drain_requests(pending, &batch);
++		for_each_cpu(cpu, &batch)
++			cpu_drain_rq(cpu);
++	}
  	return 0;
  }
  
@@ -1289,7 +1353,36 @@
  {
  	struct cpumask restrict_cpus;
  	int cpu = 0;
-@@ -522,6 +526,9 @@
+@@ -313,12 +329,15 @@
+ 
+ 	trace_halt_cpus_start(cpus, 1);
+ 
++	/* Validate the complete request before changing any CPU's halt state. */
++	cpu = cpumask_first(system_32bit_el0_cpumask());
++	if (cpu < nr_cpu_ids && cpumask_test_cpu(cpu, cpus)) {
++		ret = -EINVAL;
++		goto out;
++	}
++
+ 	/* add the cpus to the halt mask */
+ 	for_each_cpu(cpu, cpus) {
+-		if (cpu == cpumask_first(system_32bit_el0_cpumask())) {
+-			ret = -EINVAL;
+-			goto out;
+-		}
+ 
+ 		halt_cpu_state = per_cpu_ptr(&halt_state, cpu);
+ 
+@@ -340,7 +359,7 @@
+ 		cpumask_or(&drain_data.cpus_to_drain, &drain_data.cpus_to_drain, cpus);
+ 		raw_spin_unlock_irqrestore(&walt_drain_pending_lock, flags);
+ 
+-		wake_up_process(walt_drain_thread);
++		wake_up(&walt_drain_wait);
+ 	}
+ out:
+ 	trace_halt_cpus(cpus, start_time, 1, ret, client);
+@@ -522,6 +541,9 @@
  	int i, default_cpu = -1;
  	struct sched_domain *sd;
  	cpumask_t active_unhalted;
@@ -1299,7 +1392,7 @@
  
  	*done = true;
  	cpumask_andnot(&active_unhalted, cpu_active_mask, cpu_halt_mask);
-@@ -704,16 +711,17 @@
+@@ -704,16 +726,17 @@
  	walt_drain_thread = kthread_run(try_drain_rqs, &drain_data, "halt_drain_rqs");
  	if (IS_ERR(walt_drain_thread)) {
  		pr_err("Error creating walt drain thread\n");
