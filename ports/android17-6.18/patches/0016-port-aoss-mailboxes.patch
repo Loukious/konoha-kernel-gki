@@ -1,0 +1,332 @@
+--- a/drivers/soc/qcom/qcom_aoss.c
++++ b/drivers/soc/qcom/qcom_aoss.c
+@@ -256,7 +256,7 @@
+ 	/* Read back length to confirm data written in message RAM */
+ 	readl(qmp->msgram + qmp->offset);
+ 	qmp_kick(qmp);
+-	AOSS_INFO("msg: %.*s\n", min_t(int, len, QMP_MSG_LEN), (char *)fmt);
++	AOSS_INFO("msg: %.*s\n", min_t(int, len, QMP_MSG_LEN), buf);
+ 
+ 	time_left = wait_event_interruptible_timeout(qmp->event,
+ 						     qmp_message_empty(qmp), HZ);
+@@ -266,14 +266,14 @@
+ 
+ 		/* Clear message from buffer */
+ 		AOSS_INFO("timed out clearing msg: %.*s\n", min_t(int, len, QMP_MSG_LEN),
+-			  (char *)fmt);
++			  buf);
+ 		writel(0, qmp->msgram + qmp->offset);
+ 	} else if (time_left < 0) {
+ 		dev_err(qmp->dev, "wait error %ld\n", time_left);
+ 		ret = time_left;
+ 	} else {
+ 		ret = 0;
+-		AOSS_INFO("ack: %.*s\n", min_t(int, len, QMP_MSG_LEN), (char *)fmt);
++		AOSS_INFO("ack: %.*s\n", min_t(int, len, QMP_MSG_LEN), buf);
+ 	}
+ 
+ 	mutex_unlock(&qmp->tx_lock);
+@@ -287,7 +287,7 @@
+ 	static const char *buf = "{class: clock, res: qdss, val: 1}";
+ 	struct qmp *qmp = container_of(hw, struct qmp, qdss_clk);
+ 
+-	return qmp_send(qmp, buf);
++	return qmp_send(qmp, "%s", buf);
+ }
+ 
+ static void qmp_qdss_clk_unprepare(struct clk_hw *hw)
+@@ -295,7 +295,7 @@
+ 	static const char *buf = "{class: clock, res: qdss, val: 0}";
+ 	struct qmp *qmp = container_of(hw, struct qmp, qdss_clk);
+ 
+-	qmp_send(qmp, buf);
++	qmp_send(qmp, "%s", buf);
+ }
+ 
+ static const struct clk_ops qmp_qdss_clk_ops = {
+@@ -510,7 +510,7 @@
+ 	if (ret)
+ 		return -EFAULT;
+ 
+-	ret = qmp_send(qmp, strim(buf), QMP_MSG_LEN);
++	ret = qmp_send(qmp, "%s", strim(buf));
+ 
+ 	return ret ? ret : len;
+ }
+@@ -586,7 +586,7 @@
+ 	return ret;
+ }
+ 
+-static int qmp_remove(struct platform_device *pdev)
++static void qmp_remove(struct platform_device *pdev)
+ {
+ 	struct qmp *qmp = platform_get_drvdata(pdev);
+ 
+@@ -600,7 +600,6 @@
+ 	qmp_close(qmp);
+ 	mbox_free_channel(qmp->mbox_chan);
+ 
+-	return 0;
+ }
+ 
+ static const struct of_device_id qmp_dt_match[] = {
+--- a/drivers/mailbox/msm_qmp.c
++++ b/drivers/mailbox/msm_qmp.c
+@@ -153,6 +153,7 @@
+ 	void __iomem *desc;
+ 	bool rx_disabled;
+ 	bool tx_sent;
++	bool stopping; /* Protected by tx_lock. */
+ 	u32 idx_in_flight;
+ 	u32 mcore_mbox_offset;
+ 	u32 mcore_mbox_size;
+@@ -197,6 +198,8 @@
+ 
+ 	u32 irq_mask;
+ 	u32 rx_irq_line;
++	bool irq_requested;
++	bool irq_wake_enabled;
+ 	u32 tx_irq_count;
+ 	u32 rx_irq_count;
+ 
+@@ -387,6 +390,10 @@
+ 	mdev = mbox->mdev;
+ 
+ 	spin_lock_irqsave(&mbox->tx_lock, flags);
++	if (mbox->stopping) {
++		spin_unlock_irqrestore(&mbox->tx_lock, flags);
++		return -ESHUTDOWN;
++	}
+ 	addr = mbox->desc + mbox->mcore_mbox_offset;
+ 	if (mbox->tx_sent) {
+ 		spin_unlock_irqrestore(&mbox->tx_lock, flags);
+@@ -719,7 +726,10 @@
+ 		for (j = 0; j < i; j++) {
+ 			ret = of_parse_phandle_with_args(np, "mboxes",
+ 							"#mbox-cells", j, &p);
+-			if (!ret && p.np == node) {
++			if (ret)
++				continue;
++			of_node_put(p.np);
++			if (p.np == node) {
+ 				num_chans++;
+ 				break;
+ 			}
+@@ -778,7 +788,7 @@
+ 	struct qmp_pkt *pkt = &mbox->tx_pkt;
+ 	int rc;
+ 
+-	rc = qmp_send(mbox->mdev->qmp, pkt->data, pkt->size);
++	rc = qmp_send(mbox->mdev->qmp, "%.*s", (int)pkt->size, (char *)pkt->data);
+ 	mbox_chan_txdone(&mbox->ctrl.chans[mbox->idx_in_flight], rc);
+ }
+ 
+@@ -787,12 +797,19 @@
+ 	struct qmp_mbox *mbox = chan->con_priv;
+ 	struct qmp_pkt *pkt = (struct qmp_pkt *)data;
+ 	int i;
++	unsigned long flags;
+ 
+ 	if (!mbox || !mbox->mdev || !data)
+ 		return -EINVAL;
+ 
+-	if (pkt->size > SZ_4K)
++	if (!pkt->data || !pkt->size || pkt->size > SZ_4K)
+ 		return -EINVAL;
++
++	spin_lock_irqsave(&mbox->tx_lock, flags);
++	if (mbox->stopping) {
++		spin_unlock_irqrestore(&mbox->tx_lock, flags);
++		return -ESHUTDOWN;
++	}
+ 
+ 	for (i = 0; i < mbox->ctrl.num_chans; i++) {
+ 		if (chan == &mbox->ctrl.chans[i]) {
+@@ -804,6 +821,7 @@
+ 	mbox->tx_pkt.size = pkt->size;
+ 	memcpy(mbox->tx_pkt.data, pkt->data, pkt->size);
+ 	schedule_work(&mbox->tx_work);
++	spin_unlock_irqrestore(&mbox->tx_lock, flags);
+ 	return 0;
+ }
+ 
+@@ -873,12 +891,6 @@
+ 	mbox->ctrl.txdone_poll = false;
+ 	mbox->ctrl.of_xlate = qmp_mbox_of_xlate;
+ 
+-	rc = mbox_controller_register(&mbox->ctrl);
+-	if (rc) {
+-		pr_err("%s: failed to register mbox controller %d\n", __func__,
+-				rc);
+-		return rc;
+-	}
+ 	spin_lock_init(&mbox->tx_lock);
+ 	mutex_init(&mbox->state_lock);
+ 	mbox->local_state = LINK_DISCONNECTED;
+@@ -888,6 +900,12 @@
+ 	mbox->num_assigned = 0;
+ 	INIT_DELAYED_WORK(&mbox->dwork, qmp_notify_timeout);
+ 
++	rc = mbox_controller_register(&mbox->ctrl);
++	if (rc) {
++		pr_err("%s: failed to register mbox controller %d\n", __func__, rc);
++		return rc;
++	}
++
+ 	mdev_add_mbox(mdev, mbox);
+ 	return 0;
+ }
+@@ -921,6 +939,16 @@
+ 	return 0;
+ }
+ 
++static void qmp_shim_put(void *data)
++{
++	qmp_put(data);
++}
++
++static void qmp_free_channel(void *data)
++{
++	mbox_free_channel(data);
++}
++
+ static int qmp_shim_init(struct platform_device *pdev, struct qmp_device *mdev)
+ {
+ 	struct mbox_chan *chans;
+@@ -932,6 +960,9 @@
+ 	mdev->qmp = qmp_get(&pdev->dev);
+ 	if (IS_ERR(mdev->qmp))
+ 		return PTR_ERR(mdev->qmp);
++	rc = devm_add_action_or_reset(&pdev->dev, qmp_shim_put, mdev->qmp);
++	if (rc)
++		return rc;
+ 
+ 	mdev->name = of_get_property(pdev->dev.of_node, "label", NULL);
+ 	if (!mdev->name) {
+@@ -969,6 +1000,7 @@
+ 	mutex_init(&mbox->state_lock);
+ 	mbox->num_assigned = 0;
+ 	mbox->mdev = mdev;
++	spin_lock_init(&mbox->tx_lock);
+ 	INIT_WORK(&mbox->tx_work, qmp_shim_worker);
+ 
+ 	rc = mbox_controller_register(&mbox->ctrl);
+@@ -1053,6 +1085,12 @@
+ 			return rc;
+ 	}
+ 
++	if (mdev->mbox_chan) {
++		rc = devm_add_action_or_reset(&pdev->dev, qmp_free_channel, mdev->mbox_chan);
++		if (rc)
++			return rc;
++	}
++
+ 	mdev->rx_irq_line = irq_of_parse_and_map(node, 0);
+ 	if (!mdev->rx_irq_line) {
+ 		pr_err("%s: missing interrupts\n", __func__);
+@@ -1062,17 +1100,31 @@
+ 	return 0;
+ }
+ 
+-static int qmp_mbox_remove(struct platform_device *pdev)
++static void qmp_mbox_remove(struct platform_device *pdev)
+ {
+ 	struct qmp_device *mdev = platform_get_drvdata(pdev);
+-	struct qmp_mbox *mbox = NULL;
+-
+-	disable_irq(mdev->rx_irq_line);
++	struct qmp_mbox *mbox;
++	unsigned long flags;
++
++	if (mdev->irq_wake_enabled)
++		disable_irq_wake(mdev->rx_irq_line);
++	if (mdev->irq_requested)
++		devm_free_irq(&pdev->dev, mdev->rx_irq_line, mdev);
+ 
+ 	list_for_each_entry(mbox, &mdev->mboxes, list) {
++		spin_lock_irqsave(&mbox->tx_lock, flags);
++		mbox->stopping = true;
++		spin_unlock_irqrestore(&mbox->tx_lock, flags);
++		if (mdev->qmp)
++			cancel_work_sync(&mbox->tx_work);
++		else
++			cancel_delayed_work_sync(&mbox->dwork);
+ 		mbox_controller_unregister(&mbox->ctrl);
+ 	}
+-	return 0;
++	if (mdev->rx_irq_line)
++		irq_dispose_mapping(mdev->rx_irq_line);
++	if (mdev->ilc)
++		ipc_log_context_destroy(mdev->ilc);
+ }
+ 
+ static int qmp_mbox_probe(struct platform_device *pdev)
+@@ -1087,7 +1139,7 @@
+ 		return -ENOMEM;
+ 	platform_set_drvdata(pdev, mdev);
+ 
+-	if (of_parse_phandle(edge_node, "qcom,qmp", 0))
++	if (of_property_present(edge_node, "qcom,qmp"))
+ 		return qmp_shim_init(pdev, mdev);
+ 
+ 	ret = qmp_edge_init(pdev);
+@@ -1095,8 +1147,10 @@
+ 		return ret;
+ 
+ 	ret = qmp_mbox_init(edge_node, mdev);
+-	if (ret)
++	if (ret) {
++		qmp_mbox_remove(pdev);
+ 		return ret;
++	}
+ 
+ 	mdev->ilc = ipc_log_context_create(QMP_IPC_LOG_PAGE_CNT, mdev->name, 0);
+ 
+@@ -1105,12 +1159,14 @@
+ 					IRQF_TRIGGER_RISING,
+ 					edge_node->name, (void *)mdev);
+ 	if (ret < 0) {
+-		qmp_mbox_remove(pdev);
+ 		QMP_ERR(mdev->ilc, "request threaded irq on %d failed: %d\n",
+ 			mdev->rx_irq_line, ret);
++		qmp_mbox_remove(pdev);
+ 		return ret;
+ 	}
++	mdev->irq_requested = true;
+ 	ret = enable_irq_wake(mdev->rx_irq_line);
++	mdev->irq_wake_enabled = !ret;
+ 	if (ret < 0)
+ 		QMP_ERR(mdev->ilc, "enable_irq_wake on %d failed: %d\n",
+ 			mdev->rx_irq_line, ret);
+--- a/drivers/mailbox/qcom-ipcc.c
++++ b/drivers/mailbox/qcom-ipcc.c
+@@ -343,14 +343,15 @@
+ 	return ret;
+ }
+ 
+-static int qcom_ipcc_remove(struct platform_device *pdev)
++static void qcom_ipcc_remove(struct platform_device *pdev)
+ {
+ 	struct qcom_ipcc *ipcc = platform_get_drvdata(pdev);
+ 
+-	disable_irq_wake(ipcc->irq);
++	devm_free_irq(&pdev->dev, ipcc->irq, ipcc);
++	if (ipcc->num_chans)
++		mbox_controller_unregister(&ipcc->mbox);
+ 	irq_domain_remove(ipcc->irq_domain);
+ 
+-	return 0;
+ }
+ 
+ static const struct of_device_id qcom_ipcc_of_match[] = {
+--- a/include/linux/soc/qcom/qcom_aoss.h
++++ b/include/linux/soc/qcom/qcom_aoss.h
+@@ -13,7 +13,7 @@
+ 
+ #if IS_ENABLED(CONFIG_QCOM_AOSS_QMP)
+ 
+-int qmp_send(struct qmp *qmp, const char *fmt, ...);
++int __printf(2, 3) qmp_send(struct qmp *qmp, const char *fmt, ...);
+ struct qmp *qmp_get(struct device *dev);
+ void qmp_put(struct qmp *qmp);
+ 

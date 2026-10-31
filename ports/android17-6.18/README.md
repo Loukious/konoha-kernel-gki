@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 69 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 72 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 69 platform `.ko` files, their symbol tables and DDK configurations.
+- 72 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 2918
-imported symbol CRCs across all 69 modules.
+used. The current [validation report](validation-20261031.json) checks 3074
+imported symbol CRCs across all 72 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -195,6 +195,18 @@ hooks on failure, installs the permanent affinity hook last, and keeps the
 module resident. This group passes checkpatch without errors, warnings or
 style checks. Cache behavior, counter accuracy and IRQ balancing still require
 phone testing.
+
+The AOSS/mailbox group builds `qcom_aoss`, `msm_qmp` and `qcom-ipcc`.
+It preserves the Onyx shared-memory protocol and the QMP shim used by Tuna's
+AOP mailbox. Removal uses 6.18 callbacks, stops IRQ handlers before deleting
+IRQ mappings, and drains queued work before unregistering mailbox channels.
+The AOSS shim does not operate on the absent legacy RX IRQ. QMP handle/channel
+references are managed, and failed setup releases the resources it acquired.
+Transmit shutdown is synchronized with the submission lock to prevent work
+from being queued during cleanup. Literal message payloads use bounded string
+formatting, and logs show the formatted message. The adaptation passes
+checkpatch without errors, warnings or style checks. Firmware acknowledgments
+and power-state transitions require hardware validation.
 
 ## Baseline inventory
 

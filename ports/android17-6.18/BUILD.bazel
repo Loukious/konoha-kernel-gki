@@ -922,6 +922,46 @@ ddk_module(
     deps = [":cache_irq_headers"],
 )
 
+ddk_headers(
+    name = "mailbox_headers",
+    hdrs = [
+        "include/linux/mailbox/qmp.h",
+        "include/linux/soc/qcom/qcom_aoss.h",
+        "include/dt-bindings/mailbox/qcom-ipcc.h",
+    ],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "qcom_aoss",
+    srcs = ["drivers/soc/qcom/qcom_aoss.c"],
+    out = "qcom_aoss.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mailbox_headers", ":platform_headers", ":qcom_ipc_logging"],
+)
+
+ddk_module(
+    name = "msm_qmp",
+    srcs = ["drivers/mailbox/msm_qmp.c"],
+    out = "msm_qmp.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mailbox_headers", ":platform_headers", ":qcom_aoss", ":qcom_ipc_logging", ":smem"],
+)
+
+ddk_module(
+    name = "qcom_ipcc",
+    srcs = ["drivers/mailbox/qcom-ipcc.c"],
+    out = "qcom-ipcc.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mailbox_headers", ":platform_headers"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -981,6 +1021,9 @@ kernel_module_group(
         ":cpu_phys_log_map",
         ":qcom_llcc_pmu",
         ":gic_intr_routing",
+        ":qcom_aoss",
+        ":msm_qmp",
+        ":qcom_ipcc",
     ],
 )
 
