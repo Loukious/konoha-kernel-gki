@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 226 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 231 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 226 platform `.ko` files, their symbol tables and DDK configurations.
+- 231 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 12,244
-imported symbol CRCs across all 226 modules.
+used. The current [validation report](validation-20261031.json) checks 12,551
+imported symbol CRCs across all 231 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1338,6 +1338,49 @@ The combined 226-module archive `artifacts/20261031T140821184889Z` passes
 12,244 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
 and overlay checks pass with 1,084 existing vendor DTC warnings.
 ROM module build coverage is 224/466 (48.1%), leaving 242 names to assess or
+port, including alternative hardware. WLAN/Bluetooth, remaining audio,
+camera/video, device interfaces and image/installer work remain. No flashable
+6.18 ZIP or phone validation exists yet.
+
+
+## QMI files, USB functions and charging path
+
+CNSS QMI file transfers retain locked references through each response and drain
+active transfers during service shutdown. They validate peer, direction, segment
+index, lengths and completion metadata, preserve transport errors and advance
+only after successful replies. Callback withdrawal drains readers; configuration
+records publish after successful replies and remain immutable for retained
+callers. [QMI tests](wlan-qmi-validation-20261031.json) cover transfer boundaries,
+allocation errors, shutdown and concurrent callback/file withdrawal. Native QMI
+service schemas and exports are preserved. Main WLAN remains to be ported.
+
+GSI and QDSS retain the native USB descriptors and data layouts. GSI bounds its
+event queue, rolls back partial channel setup and retires callback tokens before
+provider teardown. QDSS drains requests before releasing clients; open files and
+clients retain removed instances. [USB tests](gsi-qdss-validation-20261031.json)
+cover malformed messages, endpoint failures, removal, provider withdrawal and
+late callbacks. The native IPA transport provider still needs completion.
+
+The audio buffer driver tracks DMA-buffer identity, shared mappings and each
+client's ownership. Failed secure release retains the mapping and provider
+references for retry. [Full-source tests](audio-ion-validation-20261031.json)
+pass fifteen ASan/UBSan groups; fourteen original-source controls reject their
+targeted faults. Real SCM transactions, IOMMU and DMA behavior remain untested.
+
+Charging path control validates the native DT schemas, distinguishes source
+ordinals from condition bitmasks and acts only on configured roles. Initial
+provider snapshots and failed changes preserve errors and allow retry. Stop
+drains exported setters, sysfs and workers. [Path tests](pathcontrol-validation-20261031.json)
+cover 192 probe failures, 27 invalid schemas and 31 provider/bitmask cases using
+the actual Onyx properties. The central integration keeps the existing API
+header and omits a comment-only handoff change. Live electrical and gate behavior
+remain untested. Three charger-business event types still lack native strategy
+handlers, as recorded in module coverage.
+
+The combined 231-module archive `artifacts/20261031T142154214564Z` passes
+12,551 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
+and overlay checks pass with 1,084 existing vendor DTC warnings.
+ROM module build coverage is 229/466 (49.1%), leaving 237 names to assess or
 port, including alternative hardware. WLAN/Bluetooth, remaining audio,
 camera/video, device interfaces and image/installer work remain. No flashable
 6.18 ZIP or phone validation exists yet.

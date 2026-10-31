@@ -1,0 +1,2937 @@
+--- a/drivers/usb/gadget/function/f_gsi.c
++++ b/drivers/usb/gadget/function/f_gsi.c
+@@ -5,6 +5,11 @@
+  */
+ 
+ #include <linux/module.h>
++#include <linux/compat.h>
++#include <linux/kref.h>
++#include <linux/notifier.h>
++#include <linux/overflow.h>
++#include <linux/unaligned.h>
+ #include "f_gsi.h"
+ #include "rndis.h"
+ 
+@@ -26,10 +31,170 @@
+ static struct class *gsi_class;
+ static DEFINE_IDA(gsi_ida);
+ static DECLARE_COMPLETION(wait_for_ipa_ready);
+-struct ipa_usb_ops ipa_ops;
++/* ipam imports ipa_ready_callback, so its COMING event follows our init. */
++struct gsi_ipa_token {
++	struct list_head list;
++	/* Protect the context pointer while callbacks take a reference. */
++	spinlock_t lock;
++	struct f_gsi *gsi;
++	struct module *owner;
++};
++
++struct gsi_ipa_module {
++	struct list_head list;
++	struct module *mod;
++};
++
++static LIST_HEAD(ipa_modules);
++static LIST_HEAD(ipa_tokens);
++static DEFINE_SPINLOCK(ipa_ops_lock);
++static struct ipa_usb_ops ipa_ops;
++static struct module *ipa_owner;
++
++static bool gsi_ipa_ops_valid(const struct ipa_usb_ops *ops)
++{
++	return ops && ops->init_teth_prot && ops->xdci_connect &&
++		ops->xdci_disconnect && ops->deinit_teth_prot &&
++		ops->xdci_suspend && ops->xdci_resume &&
++		ops->ipa_usb_is_teth_prot_connected;
++}
++
++static bool gsi_ipa_ops_in_module(const struct ipa_usb_ops *ops,
++				  const struct module *mod)
++{
++	return within_module_mem_type((unsigned long)ops->init_teth_prot,
++				      mod, MOD_TEXT) &&
++		within_module_mem_type((unsigned long)ops->xdci_connect,
++				       mod, MOD_TEXT) &&
++		within_module_mem_type((unsigned long)ops->xdci_disconnect,
++				       mod, MOD_TEXT) &&
++		within_module_mem_type((unsigned long)ops->deinit_teth_prot,
++				       mod, MOD_TEXT) &&
++		within_module_mem_type((unsigned long)ops->xdci_suspend,
++				       mod, MOD_TEXT) &&
++		within_module_mem_type((unsigned long)ops->xdci_resume,
++				       mod, MOD_TEXT) &&
++		within_module_mem_type((unsigned long)ops->ipa_usb_is_teth_prot_connected,
++				       mod, MOD_TEXT);
++}
++
++static int gsi_ipa_module_notify(struct notifier_block *nb,
++				 unsigned long state, void *data)
++{
++	struct module *mod = data;
++	struct gsi_ipa_module *entry, *tmp;
++	struct gsi_ipa_token *token, *token_tmp;
++	unsigned long flags;
++
++	if (state == MODULE_STATE_COMING) {
++		entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++		if (!entry)
++			return NOTIFY_DONE;
++		entry->mod = mod;
++		spin_lock_irqsave(&ipa_ops_lock, flags);
++		list_add_tail(&entry->list, &ipa_modules);
++		spin_unlock_irqrestore(&ipa_ops_lock, flags);
++	} else if (state == MODULE_STATE_GOING) {
++		spin_lock_irqsave(&ipa_ops_lock, flags);
++		if (ipa_owner == mod) {
++			ipa_owner = NULL;
++			memset(&ipa_ops, 0, sizeof(ipa_ops));
++			reinit_completion(&wait_for_ipa_ready);
++		}
++		list_for_each_entry_safe(entry, tmp, &ipa_modules, list) {
++			if (entry->mod == mod) {
++				list_del(&entry->list);
++				kfree(entry);
++			}
++		}
++		/* Module exit must retire its own callback producers first. */
++		list_for_each_entry_safe(token, token_tmp, &ipa_tokens, list) {
++			if (token->owner == mod) {
++				list_del(&token->list);
++				kfree(token);
++			}
++		}
++		spin_unlock_irqrestore(&ipa_ops_lock, flags);
++	}
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block ipa_module_notifier = {
++	.notifier_call = gsi_ipa_module_notify,
++};
++
++static void gsi_ipa_registry_clear(void)
++{
++	struct gsi_ipa_module *entry, *tmp;
++	struct gsi_ipa_token *token, *token_tmp;
++
++	list_for_each_entry_safe(entry, tmp, &ipa_modules, list) {
++		list_del(&entry->list);
++		kfree(entry);
++	}
++	list_for_each_entry_safe(token, token_tmp, &ipa_tokens, list) {
++		list_del(&token->list);
++		kfree(token);
++	}
++}
++
++static int gsi_ipa_get(struct f_gsi *gsi)
++{
++	struct gsi_ipa_token *token;
++	unsigned long flags;
++	int ret = -ENODEV;
++
++	token = kzalloc(sizeof(*token), GFP_KERNEL);
++	if (!token)
++		return -ENOMEM;
++	spin_lock_init(&token->lock);
++	spin_lock_irqsave(&ipa_ops_lock, flags);
++	/* A failed module init may free COMING code despite a reference. */
++	if (ipa_owner && ipa_owner->state == MODULE_STATE_LIVE &&
++	    gsi_ipa_ops_valid(&ipa_ops) && try_module_get(ipa_owner)) {
++		token->owner = ipa_owner;
++		list_add_tail(&token->list, &ipa_tokens);
++		gsi->ipa_token = token;
++		gsi->ipa_owner = ipa_owner;
++		gsi->ipa_ops = ipa_ops;
++		gsi->d_port.ipa_ops = &gsi->ipa_ops;
++		ret = 0;
++	}
++	spin_unlock_irqrestore(&ipa_ops_lock, flags);
++	if (ret)
++		kfree(token);
++	return ret;
++}
++
++static void gsi_ipa_put(struct f_gsi *gsi)
++{
++	module_put(gsi->ipa_owner);
++	gsi->ipa_owner = NULL;
++	gsi->d_port.ipa_ops = NULL;
++}
+ 
+ /* Deregister misc device and free instance structures */
+ static void gsi_inst_clean(struct gsi_opts *opts);
++static void gsi_put(struct f_gsi *gsi);
++static void gsi_ipa_token_activate(struct f_gsi *gsi)
++{
++	unsigned long flags;
++
++	kref_get(&gsi->ref);
++	spin_lock_irqsave(&gsi->ipa_token->lock, flags);
++	gsi->ipa_token->gsi = gsi;
++	spin_unlock_irqrestore(&gsi->ipa_token->lock, flags);
++}
++
++static void gsi_ipa_token_retire(struct f_gsi *gsi)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&gsi->ipa_token->lock, flags);
++	gsi->ipa_token->gsi = NULL;
++	spin_unlock_irqrestore(&gsi->ipa_token->lock, flags);
++}
++
+ static void gsi_rndis_ipa_reset_trigger(struct gsi_data_port *d_port);
+ static int gsi_ctrl_send_notification(struct f_gsi *gsi);
+ static struct gsi_ctrl_pkt *gsi_ctrl_pkt_alloc(unsigned int len, gfp_t flags);
+@@ -53,20 +218,20 @@
+ 	unsigned long flags;
+ 	struct f_gsi *gsi = d_port_to_gsi(port);
+ 
++	u8 next;
++
+ 	spin_lock_irqsave(&port->evt_q.q_lock, flags);
+-
+-	port->evt_q.tail++;
+-	/* Check for wraparound and make room */
+-	port->evt_q.tail = port->evt_q.tail % MAXQUEUELEN;
++	next = (port->evt_q.tail + 1) % MAXQUEUELEN;
+ 
+ 	/* Check for overflow */
+-	if (port->evt_q.tail == port->evt_q.head) {
++	if (next == port->evt_q.head) {
+ 		log_event_err("%s: event queue overflow error", __func__);
+ 		spin_unlock_irqrestore(&port->evt_q.q_lock, flags);
+ 		return;
+ 	}
+ 	/* Add event to queue */
+-	port->evt_q.event[port->evt_q.tail] = event;
++	port->evt_q.event[next] = event;
++	port->evt_q.tail = next;
+ 	spin_unlock_irqrestore(&port->evt_q.q_lock, flags);
+ }
+ 
+@@ -178,7 +343,7 @@
+ 
+ static void gsi_rw_timer_func(struct timer_list *t)
+ {
+-	struct f_gsi *gsi = from_timer(gsi, t, gsi_rw_timer);
++	struct f_gsi *gsi = timer_container_of(gsi, t, gsi_rw_timer);
+ 
+ 	if (!atomic_read(&gsi->connected)) {
+ 		log_event_dbg("%s: gsi not connected.. bail-out\n", __func__);
+@@ -198,26 +363,21 @@
+ 
+ static struct f_gsi *get_connected_gsi(void)
+ {
+-	struct f_gsi *connected_gsi;
+-	bool gsi_connected = false;
++	struct f_gsi *gsi = NULL;
+ 	int i;
+ 
+ 	for (i = 0; i < IPA_USB_MAX_TETH_PROT_SIZE; i++) {
+-		if (inst_status[i].opts)
+-			connected_gsi = inst_status[i].opts->gsi;
+-		else
+-			continue;
+-
+-		if (connected_gsi && atomic_read(&connected_gsi->connected)) {
+-			gsi_connected = true;
++		mutex_lock(&inst_status[i].gsi_lock);
++		if (inst_status[i].inst_exist && inst_status[i].opts &&
++		    atomic_read(&inst_status[i].opts->gsi->connected)) {
++			gsi = inst_status[i].opts->gsi;
++			kref_get(&gsi->ref);
++		}
++		mutex_unlock(&inst_status[i].gsi_lock);
++		if (gsi)
+ 			break;
+-		}
+-	}
+-
+-	if (!gsi_connected)
+-		connected_gsi = NULL;
+-
+-	return connected_gsi;
++	}
++	return gsi;
+ }
+ 
+ #define DEFAULT_RW_TIMER_INTERVAL 500 /* in ms */
+@@ -260,11 +420,13 @@
+ 			  msecs_to_jiffies(gsi->gsi_rw_timer_interval));
+ 		log_event_dbg("%s: timer initialized\n", __func__);
+ 	} else {
+-		del_timer_sync(&gsi->gsi_rw_timer);
++		timer_delete_sync(&gsi->gsi_rw_timer);
+ 		log_event_dbg("%s: timer deleted\n", __func__);
+ 	}
+ 
+ err:
++	if (gsi)
++		gsi_put(gsi);
+ 	return count;
+ }
+ 
+@@ -280,6 +442,7 @@
+ 	}
+ 
+ 	seq_printf(s, "%d\n", gsi->debugfs_rw_timer_enable);
++	gsi_put(gsi);
+ 
+ 	return 0;
+ }
+@@ -295,7 +458,7 @@
+ 	.write = usb_gsi_rw_write,
+ 	.owner = THIS_MODULE,
+ 	.llseek = seq_lseek,
+-	.release = seq_release,
++	.release = single_release,
+ };
+ 
+ static ssize_t usb_gsi_rw_timer_write(struct file *file,
+@@ -329,6 +492,8 @@
+ 
+ 	gsi->gsi_rw_timer_interval = timer_val;
+ err:
++	if (gsi)
++		gsi_put(gsi);
+ 	return count;
+ }
+ 
+@@ -343,6 +508,7 @@
+ 	}
+ 
+ 	seq_printf(s, "%ums\n", gsi->gsi_rw_timer_interval);
++	gsi_put(gsi);
+ 
+ 	return 0;
+ }
+@@ -358,7 +524,7 @@
+ 	.write = usb_gsi_rw_timer_write,
+ 	.owner = THIS_MODULE,
+ 	.llseek = seq_lseek,
+-	.release = seq_release,
++	.release = single_release,
+ };
+ 
+ static int usb_gsi_debugfs_init(void)
+@@ -389,8 +555,8 @@
+  * Callback for when network interface is up and userspace is ready
+  * to answer DHCP requests or remote wakeup.
+  */
+-static int ipa_usb_notify_cb(enum ipa_usb_notify_event event,
+-	void *driver_data)
++static int ipa_usb_notify_gsi(enum ipa_usb_notify_event event,
++			      void *driver_data)
+ {
+ 	struct f_gsi *gsi = driver_data;
+ 	unsigned long flags;
+@@ -402,6 +568,10 @@
+ 	}
+ 
+ 	spin_lock_irqsave(&gsi->d_port.lock, flags);
++	if (!gsi->bound) {
++		spin_unlock_irqrestore(&gsi->d_port.lock, flags);
++		return -ENODEV;
++	}
+ 
+ 	switch (event) {
+ 	case IPA_USB_DEVICE_READY:
+@@ -471,6 +641,27 @@
+ 	return 1;
+ }
+ 
++static int ipa_usb_notify_cb(enum ipa_usb_notify_event event, void *driver_data)
++{
++	struct gsi_ipa_token *token = driver_data;
++	struct f_gsi *gsi;
++	unsigned long flags;
++	int ret;
++
++	if (!token)
++		return -EINVAL;
++	spin_lock_irqsave(&token->lock, flags);
++	gsi = token->gsi;
++	if (gsi)
++		kref_get(&gsi->ref);
++	spin_unlock_irqrestore(&token->lock, flags);
++	if (!gsi)
++		return -ENODEV;
++	ret = ipa_usb_notify_gsi(event, gsi);
++	gsi_put(gsi);
++	return ret;
++}
++
+ static int ipa_connect_channels(struct gsi_data_port *d_port)
+ {
+ 	int ret;
+@@ -482,7 +673,7 @@
+ 	struct ipa_usb_xdci_connect_params *conn_params =
+ 				&d_port->ipa_conn_pms;
+ 	struct usb_composite_dev *cdev = gsi->function.config->cdev;
+-	struct gsi_channel_info gsi_channel_info;
++	struct gsi_channel_info gsi_channel_info = {0};
+ 	struct ipa_req_chan_out_params ipa_in_channel_out_params;
+ 	struct ipa_req_chan_out_params ipa_out_channel_out_params;
+ 
+@@ -493,7 +684,9 @@
+ 	 * Set DWC3 endpoint mode to GSI for cases where disconnect/connect
+ 	 * channels occurs w/o bind(). (i.e. RNDIS adapter enable/disable)
+ 	 */
+-	msm_ep_set_mode(d_port->in_ep, USB_EP_GSI);
++	ret = msm_ep_set_mode(d_port->in_ep, USB_EP_GSI);
++	if (ret)
++		return ret;
+ 
+ 	ret = usb_gsi_ep_op(d_port->in_ep, &d_port->in_request,
+ 			GSI_EP_OP_PREPARE_TRBS);
+@@ -511,13 +704,19 @@
+ 		goto free_trb_ep_in;
+ 	}
+ 
+-	d_port->in_xfer_rsc_index = usb_gsi_ep_op(d_port->in_ep, NULL,
+-			GSI_EP_OP_GET_XFER_IDX);
++	ret = usb_gsi_ep_op(d_port->in_ep, NULL, GSI_EP_OP_GET_XFER_IDX);
++	if (ret < 0 || ret > 127) {
++		ret = ret < 0 ? ret : -ERANGE;
++		goto end_xfer_ep_in;
++	}
++	d_port->in_xfer_rsc_index = ret;
+ 
+ 	memset(in_params, 0x0, sizeof(*in_params));
+ 	gsi_channel_info.ch_req = &d_port->in_request;
+-	usb_gsi_ep_op(d_port->in_ep, (void *)&gsi_channel_info,
+-			GSI_EP_OP_GET_CH_INFO);
++	ret = usb_gsi_ep_op(d_port->in_ep, &gsi_channel_info,
++			    GSI_EP_OP_GET_CH_INFO);
++	if (ret)
++		goto end_xfer_ep_in;
+ 
+ 	log_event_dbg("%s: USB GSI IN OPS Completed", __func__);
+ 	in_params->teth_prot = gsi->prot_id;
+@@ -554,7 +753,9 @@
+ 		 * Set DWC3 endpoint mode to GSI for cases where disconnect/connect
+ 		 * channels occurs w/o bind(). (i.e. RNDIS adapter enable/disable)
+ 		 */
+-		msm_ep_set_mode(d_port->out_ep, USB_EP_GSI);
++		ret = msm_ep_set_mode(d_port->out_ep, USB_EP_GSI);
++		if (ret)
++			goto end_xfer_ep_in;
+ 
+ 		ret = usb_gsi_ep_op(d_port->out_ep, &d_port->out_request,
+ 			GSI_EP_OP_PREPARE_TRBS);
+@@ -572,13 +773,20 @@
+ 			goto free_trb_ep_out;
+ 		}
+ 
+-		d_port->out_xfer_rsc_index =
+-			usb_gsi_ep_op(d_port->out_ep,
+-				NULL, GSI_EP_OP_GET_XFER_IDX);
++		ret = usb_gsi_ep_op(d_port->out_ep, NULL, GSI_EP_OP_GET_XFER_IDX);
++		if (ret < 0 || ret > 127) {
++			ret = ret < 0 ? ret : -ERANGE;
++			goto end_xfer_ep_out;
++		}
++		d_port->out_xfer_rsc_index = ret;
+ 		memset(out_params, 0x0, sizeof(*out_params));
+ 		gsi_channel_info.ch_req = &d_port->out_request;
+-		usb_gsi_ep_op(d_port->out_ep, (void *)&gsi_channel_info,
+-				GSI_EP_OP_GET_CH_INFO);
++		memset(&gsi_channel_info, 0, sizeof(gsi_channel_info));
++		gsi_channel_info.ch_req = &d_port->out_request;
++		ret = usb_gsi_ep_op(d_port->out_ep, &gsi_channel_info,
++				    GSI_EP_OP_GET_CH_INFO);
++		if (ret)
++			goto end_xfer_ep_out;
+ 		log_event_dbg("%s: USB GSI OUT OPS Completed", __func__);
+ 		out_params->teth_prot = gsi->prot_id;
+ 		out_params->gevntcount_low_addr =
+@@ -693,38 +901,37 @@
+ 	return ret;
+ }
+ 
+-static void ipa_data_path_enable(struct gsi_data_port *d_port)
+-{
+-	struct f_gsi *gsi = d_port_to_gsi(d_port);
++static int ipa_data_path_enable(struct gsi_data_port *d_port)
++{
+ 	bool block_db = false;
+-
+-	log_event_dbg("IN: db_reg_phs_addr_lsb = %x",
+-			gsi->d_port.in_request.db_reg_phs_addr_lsb);
+-	usb_gsi_ep_op(gsi->d_port.in_ep,
+-			&gsi->d_port.in_request,
+-			GSI_EP_OP_STORE_DBL_INFO);
+-
+-	if (gsi->d_port.out_ep) {
+-		log_event_dbg("OUT: db_reg_phs_addr_lsb = %x",
+-				gsi->d_port.out_request.db_reg_phs_addr_lsb);
+-		usb_gsi_ep_op(gsi->d_port.out_ep,
+-				&gsi->d_port.out_request,
+-				GSI_EP_OP_STORE_DBL_INFO);
+-
+-		usb_gsi_ep_op(gsi->d_port.out_ep, &gsi->d_port.out_request,
+-				GSI_EP_OP_ENABLE_GSI);
+-	}
+-
+-	/* Unblock doorbell to GSI */
+-	usb_gsi_ep_op(d_port->in_ep, (void *)&block_db,
+-				GSI_EP_OP_SET_CLR_BLOCK_DBL);
+-
+-	usb_gsi_ep_op(gsi->d_port.in_ep, &gsi->d_port.in_request,
+-						GSI_EP_OP_RING_DB);
+-
+-	if (gsi->d_port.out_ep)
+-		usb_gsi_ep_op(gsi->d_port.out_ep, &gsi->d_port.out_request,
+-						GSI_EP_OP_RING_DB);
++	int ret;
++
++	ret = usb_gsi_ep_op(d_port->in_ep, &d_port->in_request,
++			    GSI_EP_OP_STORE_DBL_INFO);
++	if (ret)
++		return ret;
++	if (d_port->out_ep) {
++		ret = usb_gsi_ep_op(d_port->out_ep, &d_port->out_request,
++				    GSI_EP_OP_STORE_DBL_INFO);
++		if (ret)
++			return ret;
++		ret = usb_gsi_ep_op(d_port->out_ep, &d_port->out_request,
++				    GSI_EP_OP_ENABLE_GSI);
++		if (ret)
++			return ret;
++	}
++	ret = usb_gsi_ep_op(d_port->in_ep, &block_db,
++			    GSI_EP_OP_SET_CLR_BLOCK_DBL);
++	if (ret)
++		return ret;
++	ret = usb_gsi_ep_op(d_port->in_ep, &d_port->in_request,
++			    GSI_EP_OP_RING_DB);
++	if (ret)
++		return ret;
++	if (d_port->out_ep)
++		return usb_gsi_ep_op(d_port->out_ep, &d_port->out_request,
++				     GSI_EP_OP_RING_DB);
++	return 0;
+ }
+ 
+ static void ipa_data_path_disable(struct gsi_data_port *d_port)
+@@ -972,7 +1179,14 @@
+ 					 __func__);
+ 				break;
+ 			}
+-			ipa_data_path_enable(d_port);
++			ret = ipa_data_path_enable(d_port);
++			if (ret) {
++				ipa_data_path_disable(d_port);
++				ipa_disconnect_channel(d_port);
++				d_port->sm_state = STATE_INITIALIZED;
++				usb_gadget_autopm_put_async(d_port->gadget);
++				break;
++			}
+ 			d_port->sm_state = STATE_CONNECTED;
+ 			log_event_dbg("%s: ST_WAIT_IPARDY_EVT_IPARDY %d",
+ 					__func__, __LINE__);
+@@ -1108,7 +1322,14 @@
+ 				break;
+ 			}
+ 
+-			ipa_data_path_enable(d_port);
++			ret = ipa_data_path_enable(d_port);
++			if (ret) {
++				ipa_data_path_disable(d_port);
++				ipa_disconnect_channel(d_port);
++				d_port->sm_state = STATE_INITIALIZED;
++				usb_gadget_autopm_put_async(d_port->gadget);
++				break;
++			}
+ 			d_port->sm_state = STATE_CONNECTED;
+ 			log_event_dbg("%s: ST_HOST_NRDY_EVT_HRDY_", __func__);
+ 		}
+@@ -1265,70 +1486,35 @@
+ {
+ 	struct gsi_ctrl_port *c_port = container_of(ip->i_cdev,
+ 						struct gsi_ctrl_port, cdev);
+-	struct f_gsi *gsi;
+-	struct gsi_inst_status *inst_cur;
+-
+-	if (!c_port) {
+-		pr_err_ratelimited("%s: gsi ctrl port %pK\n", __func__, c_port);
+-		return -ENODEV;
+-	}
+-
+-	gsi = container_of(c_port, struct f_gsi, c_port);
+-	inst_cur = &inst_status[gsi->prot_id];
+-	log_event_dbg("%s: open ctrl dev %s", __func__, c_port->name);
+-
+-	mutex_lock(&inst_cur->gsi_lock);
+-
+-	fp->private_data = &gsi->prot_id;
+-
+-	if (!inst_cur->inst_exist) {
+-		mutex_unlock(&inst_cur->gsi_lock);
+-		log_event_err("%s: [prot_id = %d], GSI instance freed already\n",
+-				__func__, gsi->prot_id);
+-		return -ENODEV;
+-	}
+-
+-	if (c_port->is_open) {
+-		mutex_unlock(&inst_cur->gsi_lock);
+-		log_event_dbg("%s: Already opened\n", __func__);
+-		return -EBUSY;
+-	}
+-
+-	c_port->is_open = true;
+-
+-	mutex_unlock(&inst_cur->gsi_lock);
+-
+-	return 0;
++	struct f_gsi *gsi = container_of(c_port, struct f_gsi, c_port);
++	unsigned long flags;
++	int ret = 0;
++
++	/* cdev_device_add keeps gsi alive until this racing open returns. */
++	spin_lock_irqsave(&c_port->lock, flags);
++	if (gsi->dying) {
++		ret = -ENODEV;
++	} else if (c_port->is_open) {
++		ret = -EBUSY;
++	} else {
++		kref_get(&gsi->ref);
++		c_port->is_open = true;
++		fp->private_data = gsi;
++	}
++	spin_unlock_irqrestore(&c_port->lock, flags);
++	return ret;
+ }
+ 
+ static int gsi_ctrl_dev_release(struct inode *ip, struct file *fp)
+ {
+-	enum ipa_usb_teth_prot prot_id =
+-		*(enum ipa_usb_teth_prot *)(fp->private_data);
+-	struct gsi_inst_status *inst_cur = &inst_status[prot_id];
+-	struct f_gsi *gsi;
+-
+-	mutex_lock(&inst_cur->gsi_lock);
+-
+-	if (unlikely(!inst_cur->inst_exist)) {
+-		if (inst_cur->opts) {
+-			/* GSI instance clean up */
+-			gsi_inst_clean(inst_cur->opts);
+-			inst_cur->opts = NULL;
+-		}
+-		mutex_unlock(&inst_cur->gsi_lock);
+-		pr_err_ratelimited("%s: prot_id:%d: delayed free memory\n",
+-			__func__, prot_id);
+-		return -ENODEV;
+-	}
+-
+-	inst_cur->opts->gsi->c_port.is_open = false;
+-	gsi = inst_cur->opts->gsi;
+-	mutex_unlock(&inst_cur->gsi_lock);
+-
+-	log_event_dbg("close ctrl dev %s\n",
+-			inst_cur->opts->gsi->c_port.name);
+-
++	struct f_gsi *gsi = fp->private_data;
++	unsigned long flags;
++
++	spin_lock_irqsave(&gsi->c_port.lock, flags);
++	gsi->c_port.is_open = false;
++	spin_unlock_irqrestore(&gsi->c_port.lock, flags);
++	fp->private_data = NULL;
++	gsi_put(gsi);
+ 	return 0;
+ }
+ 
+@@ -1337,26 +1523,16 @@
+ {
+ 	struct gsi_ctrl_port *c_port;
+ 	struct gsi_ctrl_pkt *cpkt = NULL;
+-	enum ipa_usb_teth_prot prot_id =
+-		*(enum ipa_usb_teth_prot *)(fp->private_data);
+-	struct gsi_inst_status *inst_cur = &inst_status[prot_id];
+-	struct f_gsi *gsi;
++	struct f_gsi *gsi = fp->private_data;
+ 	unsigned long flags;
+ 	int ret = 0;
+ 
+ 	pr_debug("%s: Enter %zu\n", __func__, count);
+ 
+-	mutex_lock(&inst_cur->gsi_lock);
+-	if (unlikely(!inst_cur->inst_exist)) {
+-		mutex_unlock(&inst_cur->gsi_lock);
+-		pr_err_ratelimited("%s: free_inst is called and being freed\n",
+-								__func__);
++	if (READ_ONCE(gsi->dying))
+ 		return -ENODEV;
+-	}
+-	mutex_unlock(&inst_cur->gsi_lock);
+-
+-	gsi = inst_cur->opts->gsi;
+-	c_port = &inst_cur->opts->gsi->c_port;
++
++	c_port = &gsi->c_port;
+ 	if (!c_port) {
+ 		log_event_err("%s: gsi ctrl port %pK", __func__, c_port);
+ 		return -ENODEV;
+@@ -1368,12 +1544,24 @@
+ 		return -EINVAL;
+ 	}
+ 
++	if (!count)
++		return 0;
++
+ 	/* block until a new packet is available */
+ 	spin_lock_irqsave(&c_port->lock, flags);
+ 	while (list_empty(&c_port->cpkt_req_q)) {
++		if (READ_ONCE(gsi->dying)) {
++			spin_unlock_irqrestore(&c_port->lock, flags);
++			return -ENODEV;
++		}
++		if (fp->f_flags & O_NONBLOCK) {
++			spin_unlock_irqrestore(&c_port->lock, flags);
++			return -EAGAIN;
++		}
+ 		log_event_dbg("Requests list is empty. Wait.");
+ 		spin_unlock_irqrestore(&c_port->lock, flags);
+ 		ret = wait_event_interruptible(c_port->read_wq,
++			READ_ONCE(gsi->dying) ||
+ 			!list_empty(&c_port->cpkt_req_q));
+ 		if (ret < 0) {
+ 			log_event_err("Waiting failed");
+@@ -1418,33 +1606,24 @@
+ 	return ret;
+ }
+ 
+-static ssize_t gsi_ctrl_dev_write(struct file *fp, const char __user *buf,
+-		size_t count, loff_t *pos)
++static ssize_t gsi_ctrl_dev_write_locked(struct file *fp, const char __user *buf,
++					 size_t count, loff_t *pos)
+ {
+ 	int ret = 0;
+ 	unsigned long flags;
+ 	struct gsi_ctrl_pkt *cpkt;
+ 	struct gsi_ctrl_port *c_port;
+-	enum ipa_usb_teth_prot prot_id =
+-		*(enum ipa_usb_teth_prot *)(fp->private_data);
+-	struct gsi_inst_status *inst_cur = &inst_status[prot_id];
+-	struct f_gsi *gsi;
++	struct f_gsi *gsi = fp->private_data;
++	enum ipa_usb_teth_prot prot_id = gsi->prot_id;
+ 
+ 	if (prot_id == IPA_USB_DIAG)
+ 		return -EINVAL;
+ 
+ 	pr_debug("Enter %zu\n", count);
+ 
+-	mutex_lock(&inst_cur->gsi_lock);
+-	if (unlikely(!inst_cur->inst_exist)) {
+-		mutex_unlock(&inst_cur->gsi_lock);
+-		pr_err_ratelimited("%s: free_inst is called and being freed\n",
+-								__func__);
++	if (READ_ONCE(gsi->dying))
+ 		return -ENODEV;
+-	}
+-	mutex_unlock(&inst_cur->gsi_lock);
+-
+-	gsi = inst_cur->opts->gsi;
++
+ 	c_port = &gsi->c_port;
+ 
+ 	if (!count || count > GSI_MAX_CTRL_PKT_SIZE) {
+@@ -1473,7 +1652,7 @@
+ 	if (ret) {
+ 		log_event_err("copy_from_user failed err:%d", ret);
+ 		gsi_ctrl_pkt_free(cpkt);
+-		return ret;
++		return -EFAULT;
+ 	}
+ 	cpkt->type = GSI_CTRL_NOTIFY_RESPONSE_AVAILABLE;
+ 	c_port->copied_from_modem++;
+@@ -1493,30 +1672,20 @@
+ 	return ret ? ret : count;
+ }
+ 
+-static long gsi_ctrl_dev_ioctl(struct file *fp, unsigned int cmd,
+-		unsigned long arg)
++static long gsi_ctrl_dev_ioctl_locked(struct file *fp, unsigned int cmd,
++				      unsigned long arg)
+ {
+ 	struct gsi_ctrl_port *c_port;
+-	struct f_gsi *gsi;
++	struct f_gsi *gsi = fp->private_data;
+ 	struct gsi_ctrl_pkt *cpkt;
+-	struct ep_info info;
++	struct ep_info info = {0};
+ 	struct data_buf_info data_info = {0};
+-	enum ipa_usb_teth_prot prot_id =
+-		*(enum ipa_usb_teth_prot *)(fp->private_data);
+-	struct gsi_inst_status *inst_cur = &inst_status[prot_id];
+ 	int val, ret = 0;
+ 	unsigned long flags;
+ 
+-	mutex_lock(&inst_cur->gsi_lock);
+-	if (unlikely(!inst_cur->inst_exist)) {
+-		mutex_unlock(&inst_cur->gsi_lock);
+-		pr_err_ratelimited("%s: free_inst is called and being freed\n",
+-								__func__);
++	if (READ_ONCE(gsi->dying))
+ 		return -ENODEV;
+-	}
+-	mutex_unlock(&inst_cur->gsi_lock);
+-
+-	gsi = inst_cur->opts->gsi;
++
+ 	c_port = &gsi->c_port;
+ 
+ 	if (!atomic_read(&gsi->connected)) {
+@@ -1669,28 +1838,49 @@
+ 	return ret;
+ }
+ 
++static ssize_t gsi_ctrl_dev_write(struct file *fp, const char __user *buf,
++				  size_t count, loff_t *pos)
++{
++	struct f_gsi *gsi = fp->private_data;
++	ssize_t ret;
++
++	mutex_lock(&gsi->ctrl_mutex);
++	ret = gsi_ctrl_dev_write_locked(fp, buf, count, pos);
++	mutex_unlock(&gsi->ctrl_mutex);
++	return ret;
++}
++
++static long gsi_ctrl_dev_ioctl(struct file *fp, unsigned int cmd,
++			       unsigned long arg)
++{
++	struct f_gsi *gsi = fp->private_data;
++	long ret;
++
++	mutex_lock(&gsi->ctrl_mutex);
++	ret = gsi_ctrl_dev_ioctl_locked(fp, cmd, arg);
++	mutex_unlock(&gsi->ctrl_mutex);
++	return ret;
++}
++
++#ifdef CONFIG_COMPAT
++static long gsi_ctrl_dev_compat_ioctl(struct file *fp, unsigned int cmd,
++				      unsigned long arg)
++{
++	return gsi_ctrl_dev_ioctl(fp, cmd, (unsigned long)compat_ptr(arg));
++}
++#endif
++
+ static __poll_t gsi_ctrl_dev_poll(struct file *fp, poll_table *wait)
+ {
+ 	struct gsi_ctrl_port *c_port;
+-	enum ipa_usb_teth_prot prot_id =
+-		*(enum ipa_usb_teth_prot *)(fp->private_data);
+-	struct gsi_inst_status *inst_cur = &inst_status[prot_id];
+-	struct f_gsi *gsi;
++	struct f_gsi *gsi = fp->private_data;
+ 	unsigned long flags;
+ 	__poll_t mask = 0;
+ 
+-	mutex_lock(&inst_cur->gsi_lock);
+-	if (unlikely(!inst_cur->inst_exist)) {
+-		mutex_unlock(&inst_cur->gsi_lock);
+-		pr_err_ratelimited("%s: free_inst is called and being freed\n",
+-								__func__);
+-		mask = EPOLLHUP;
+-		goto out;
+-	}
+-	mutex_unlock(&inst_cur->gsi_lock);
+-
+-	gsi = inst_cur->opts->gsi;
+-	c_port = &inst_cur->opts->gsi->c_port;
++	if (READ_ONCE(gsi->dying))
++		return EPOLLHUP;
++
++	c_port = &gsi->c_port;
+ 	if (!c_port) {
+ 		log_event_err("%s: gsi ctrl port %pK", __func__, c_port);
+ 		mask = EPOLLHUP;
+@@ -1719,7 +1909,7 @@
+ 	.write = gsi_ctrl_dev_write,
+ 	.unlocked_ioctl = gsi_ctrl_dev_ioctl,
+ #ifdef CONFIG_COMPAT
+-	.compat_ioctl = gsi_ctrl_dev_ioctl,
++	.compat_ioctl = gsi_ctrl_dev_compat_ioctl,
+ #endif
+ 	.poll = gsi_ctrl_dev_poll,
+ };
+@@ -1735,12 +1925,33 @@
+ 		return 19 * 64 * 1 * 1000 * 8;
+ }
+ 
++static void gsi_release(struct kref *ref)
++{
++	struct f_gsi *gsi = container_of(ref, struct f_gsi, ref);
++
++	gsi_ctrl_clear_cpkt_queues(gsi, false);
++	ipc_log_context_destroy(gsi->ipc_log_ctxt);
++	kfree(gsi);
++}
++
++static void gsi_put(struct f_gsi *gsi)
++{
++	kref_put(&gsi->ref, gsi_release);
++}
++
++static void gsi_device_release(struct device *dev)
++{
++	struct f_gsi *gsi = dev_get_drvdata(dev);
++
++	gsi_put(gsi);
++}
++
+ static int gsi_function_ctrl_port_init(struct f_gsi *gsi)
+ {
+ 	int ret;
+ 	int sz = GSI_CTRL_NAME_LEN;
+ 	int minor;
+-	struct device *dev;
++	struct device *dev = &gsi->c_port.dev;
+ 	bool ctrl_dev_create = true;
+ 
+ 	if (!gsi) {
+@@ -1756,47 +1967,43 @@
+ 	init_waitqueue_head(&gsi->c_port.read_wq);
+ 
+ 	if (gsi->prot_id == IPA_USB_RMNET)
+-		strlcat(gsi->c_port.name, GSI_RMNET_CTRL_NAME, sz);
++		strscpy(gsi->c_port.name, GSI_RMNET_CTRL_NAME, sz);
+ 	else if (gsi->prot_id == IPA_USB_MBIM)
+-		strlcat(gsi->c_port.name, GSI_MBIM_CTRL_NAME, sz);
++		strscpy(gsi->c_port.name, GSI_MBIM_CTRL_NAME, sz);
+ 	else if (gsi->prot_id == IPA_USB_DIAG)
+-		strlcat(gsi->c_port.name, GSI_DPL_CTRL_NAME, sz);
++		strscpy(gsi->c_port.name, GSI_DPL_CTRL_NAME, sz);
+ 	else
+ 		ctrl_dev_create = false;
+ 
+ 	if (!ctrl_dev_create)
+ 		return 0;
+ 
+-	minor = ida_simple_get(&gsi_ida, 0, MAX_CDEV_INSTANCES, GFP_KERNEL);
++	minor = ida_alloc_range(&gsi_ida, 0, MAX_CDEV_INSTANCES - 1, GFP_KERNEL);
+ 	if (minor < 0) {
+ 		pr_err("%s: No more minor numbers left! rc:%d\n", __func__,
+ 				minor);
+ 		return minor;
+ 	}
+ 
++	device_initialize(dev);
++	kref_get(&gsi->ref);
++	dev->release = gsi_device_release;
++	dev->class = gsi_class;
++	dev->devt = MKDEV(major, minor);
++	dev_set_drvdata(dev, gsi);
++	ret = dev_set_name(dev, "%s", gsi->c_port.name);
++	if (ret)
++		goto put;
+ 	cdev_init(&gsi->c_port.cdev, &gsi_ctrl_dev_fops);
+-	ret = cdev_add(&gsi->c_port.cdev, MKDEV(major, minor), 1);
+-	if (ret) {
+-		log_event_err("%s: Failed to add cdev for (%s)\n", __func__,
+-				gsi->c_port.name);
+-		goto err_cdev_add;
+-	}
+-
+-	dev = device_create(gsi_class, NULL, MKDEV(major, minor), NULL,
+-			gsi->c_port.name);
+-	if (IS_ERR(dev)) {
+-		log_event_err("%s: device_create failed for (%s)\n", __func__,
+-				gsi->c_port.name);
+-		ret = PTR_ERR(dev);
+-		goto err_create_dev;
+-	}
+-
++	gsi->c_port.cdev.owner = THIS_MODULE;
++	ret = cdev_device_add(&gsi->c_port.cdev, dev);
++	if (ret)
++		goto put;
++	gsi->cdev_registered = true;
+ 	return 0;
+-
+-err_create_dev:
+-	cdev_del(&gsi->c_port.cdev);
+-err_cdev_add:
+-	ida_simple_remove(&gsi_ida, minor);
++put:
++	ida_free(&gsi_ida, minor);
++	put_device(dev);
+ 	return ret;
+ }
+ 
+@@ -1808,11 +2015,6 @@
+ 	if (!net_dev)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	/*
+-	 * Decrement net_dev refcount as it was incremented in
+-	 * dev_get_by_name().
+-	 */
+-	dev_put(net_dev);
+ 	return net_dev;
+ }
+ 
+@@ -1866,12 +2068,17 @@
+ 
+ static int queue_notification_request(struct f_gsi *gsi)
+ {
+-	int ret;
+ 	unsigned long flags;
+-
++	int ret = -ENODEV;
++
++	spin_lock_irqsave(&gsi->c_port.lock, flags);
++	if (!atomic_read(&gsi->connected) || !gsi->c_port.notify_req)
++		goto clear;
+ 	if (!gsi->func_is_suspended) {
+ 		ret = usb_ep_queue(gsi->c_port.notify,
+ 				   gsi->c_port.notify_req, GFP_ATOMIC);
++		if (!ret)
++			goto out;
+ 	} else {
+ 		ret = -EOPNOTSUPP;
+ #if IS_ENABLED(CONFIG_USB_FUNC_WAKEUP_SUPPORTED)
+@@ -1879,16 +2086,10 @@
+ 			ret = usb_func_wakeup(&gsi->function);
+ #endif
+ 	}
+-
+-	if (ret < 0 || gsi->func_is_suspended) {
+-		spin_lock_irqsave(&gsi->c_port.lock, flags);
+-		gsi->c_port.notify_req_queued = false;
+-		spin_unlock_irqrestore(&gsi->c_port.lock, flags);
+-	}
+-
+-	log_event_dbg("%s: ret:%d req_queued:%d",
+-		__func__, ret, gsi->c_port.notify_req_queued);
+-
++clear:
++	gsi->c_port.notify_req_queued = false;
++out:
++	spin_unlock_irqrestore(&gsi->c_port.lock, flags);
+ 	return ret;
+ }
+ 
+@@ -1908,6 +2109,11 @@
+ 	}
+ 
+ 	spin_lock_irqsave(&gsi->c_port.lock, flags);
++	if (!atomic_read(&gsi->connected) || !gsi->c_port.notify_req) {
++		spin_unlock_irqrestore(&gsi->c_port.lock, flags);
++		return -ENODEV;
++	}
++	req = gsi->c_port.notify_req;
+ 	if (list_empty(&gsi->c_port.cpkt_resp_q)) {
+ 		spin_unlock_irqrestore(&gsi->c_port.lock, flags);
+ 		log_event_dbg("%s: cpkt_resp_q is empty\n", __func__);
+@@ -1997,6 +2203,7 @@
+ 		gsi_ctrl_pkt_free(cpkt);
+ 	}
+ 
++	req->length = sizeof(*event) + le16_to_cpu(event->wLength);
+ 	gsi->c_port.notify_req_queued = true;
+ 	spin_unlock_irqrestore(&gsi->c_port.lock, flags);
+ 	log_event_dbg("send Notify type %02x", event->bNotificationType);
+@@ -2052,6 +2259,55 @@
+ 	gsi_ctrl_send_notification(gsi);
+ }
+ 
++static bool gsi_rndis_message_valid(const void *data, size_t actual)
++{
++	const u8 *buf = data;
++	u32 type, len, size, offset;
++	size_t minimum;
++
++	if (!buf || actual < 8)
++		return false;
++	type = get_unaligned_le32(buf);
++	len = get_unaligned_le32(buf + 4);
++	switch (type) {
++	case RNDIS_MSG_INIT:
++		minimum = sizeof(rndis_init_msg_type);
++		break;
++	case RNDIS_MSG_QUERY:
++		minimum = sizeof(rndis_query_msg_type);
++		break;
++	case RNDIS_MSG_SET:
++		minimum = sizeof(rndis_set_msg_type);
++		break;
++	case RNDIS_MSG_HALT:
++		minimum = sizeof(rndis_halt_msg_type);
++		break;
++	case RNDIS_MSG_RESET:
++		minimum = sizeof(rndis_reset_msg_type);
++		break;
++	case RNDIS_MSG_KEEPALIVE:
++		minimum = sizeof(rndis_keepalive_msg_type);
++		break;
++	default:
++		return false;
++	}
++	if (len < minimum || len > actual)
++		return false;
++	if (type != RNDIS_MSG_QUERY && type != RNDIS_MSG_SET)
++		return true;
++	size = get_unaligned_le32(buf + 16);
++	offset = get_unaligned_le32(buf + 20);
++	if (offset > len - 8 || size > len - 8 - offset)
++		return false;
++	if (size && offset < minimum - 8)
++		return false;
++	if (type == RNDIS_MSG_SET &&
++	    get_unaligned_le32(buf + 12) == RNDIS_OID_GEN_CURRENT_PACKET_FILTER &&
++	    size < sizeof(__le32))
++		return false;
++	return true;
++}
++
+ static void gsi_rndis_command_complete(struct usb_ep *ep,
+ 		struct usb_request *req)
+ {
+@@ -2060,7 +2316,8 @@
+ 	int status;
+ 	u32 MsgType;
+ 
+-	if (!req->buf || !gsi->params)
++	if (req->status || !gsi->params ||
++	    !gsi_rndis_message_valid(req->buf, req->actual))
+ 		return;
+ 
+ 	MsgType = get_unaligned_le32((__le32 *)req->buf);
+@@ -2075,10 +2332,12 @@
+ 		return;
+ 	}
+ 
+-	status = rndis_msg_parser(gsi->params, (u8 *) req->buf);
+-	if (status < 0)
++	status = rndis_msg_parser(gsi->params, (u8 *)req->buf);
++	if (status < 0) {
+ 		log_event_err("RNDIS command error %d, %d/%d",
+ 			status, req->actual, req->length);
++		return;
++	}
+ 
+ 	if (MsgType == RNDIS_MSG_INIT) {
+ 		rndis_init_msg_type *buf = (rndis_init_msg_type *)req->buf;
+@@ -2151,7 +2410,8 @@
+ 	struct f_gsi *gsi = req->context;
+ 	struct usb_composite_dev *cdev = gsi->function.config->cdev;
+ 
+-	gsi_ctrl_send_cpkt_tomodem(gsi, req->buf, req->actual);
++	if (!req->status && req->actual <= req->length)
++		gsi_ctrl_send_cpkt_tomodem(gsi, req->buf, req->actual);
+ 	cdev->setup_pending = false;
+ }
+ 
+@@ -2213,7 +2473,8 @@
+ 			| USB_CDC_SEND_ENCAPSULATED_COMMAND:
+ 		log_event_dbg("USB_CDC_SEND_ENCAPSULATED_COMMAND");
+ 
+-		if (w_value || w_index != id)
++		if (w_value || w_index != id || !w_length ||
++		    w_length > USB_COMP_EP0_BUFSIZ)
+ 			goto invalid;
+ 		/* read the request; process it later */
+ 		value = w_length;
+@@ -2259,6 +2520,7 @@
+ 						DEFAULT_PKT_ALIGNMENT_FACTOR);
+ 			}
+ 
++			n = min_t(u32, n, min_t(u32, w_length, USB_COMP_EP0_BUFSIZ));
+ 			memcpy(req->buf, buf, n);
+ 			rndis_free_response(gsi->params, buf);
+ 			value = n;
+@@ -2278,7 +2540,8 @@
+ 		gsi->c_port.get_encap_cnt++;
+ 		spin_unlock(&gsi->c_port.lock);
+ 
+-		value = min_t(unsigned int, w_length, cpkt->len);
++		value = min_t(unsigned int, cpkt->len,
++			      min_t(unsigned int, w_length, USB_COMP_EP0_BUFSIZ));
+ 		memcpy(req->buf, cpkt->buf, value);
+ 		gsi_ctrl_pkt_free(cpkt);
+ 
+@@ -2485,6 +2748,9 @@
+ 
+ 				log_event_dbg("RNDIS RX/TX early activation");
+ 				gsi->d_port.cdc_filter = 0;
++				if (gsi->net)
++					dev_put(gsi->net);
++				gsi->net = net;
+ 				rndis_set_param_dev(gsi->params, net,
+ 						&gsi->d_port.cdc_filter);
+ 			}
+@@ -2536,8 +2802,11 @@
+ static void gsi_disable(struct usb_function *f)
+ {
+ 	struct f_gsi *gsi = func_to_gsi(f);
+-
++	unsigned long flags;
++
++	spin_lock_irqsave(&gsi->c_port.lock, flags);
+ 	atomic_set(&gsi->connected, 0);
++	spin_unlock_irqrestore(&gsi->c_port.lock, flags);
+ 
+ 	if (gsi->prot_id == IPA_USB_RNDIS)
+ 		rndis_uninit(gsi->params);
+@@ -2671,6 +2940,38 @@
+ 	return 0;
+ }
+ 
++static void gsi_clear_bind(struct f_gsi *gsi)
++{
++	struct usb_ep *ep;
++
++	if (gsi->c_port.notify_req) {
++		kfree(gsi->c_port.notify_req->buf);
++		usb_ep_free_request(gsi->c_port.notify, gsi->c_port.notify_req);
++		gsi->c_port.notify_req = NULL;
++	}
++	ep = gsi->c_port.notify;
++	if (ep) {
++		ep->driver_data = NULL;
++		ep->claimed = false;
++		gsi->c_port.notify = NULL;
++	}
++	ep = gsi->d_port.in_ep;
++	if (ep) {
++		msm_ep_set_mode(ep, USB_EP_NONE);
++		ep->driver_data = NULL;
++		ep->claimed = false;
++		gsi->d_port.in_ep = NULL;
++	}
++	ep = gsi->d_port.out_ep;
++	if (ep) {
++		msm_ep_set_mode(ep, USB_EP_NONE);
++		ep->driver_data = NULL;
++		ep->claimed = false;
++		gsi->d_port.out_ep = NULL;
++	}
++	usb_free_all_descriptors(&gsi->function);
++}
++
+ static int gsi_update_function_bind_params(struct f_gsi *gsi,
+ 	struct usb_composite_dev *cdev,
+ 	struct gsi_function_bind_info *info)
+@@ -2678,7 +2979,7 @@
+ 	struct usb_ep *ep;
+ 	struct usb_cdc_notification *event;
+ 	struct usb_function *f = &gsi->function;
+-	int status;
++	int status = -ENODEV;
+ 
+ 	if (info->ctrl_str_idx >= 0 && info->ctrl_desc) {
+ 		/* ctrl interface label */
+@@ -2739,7 +3040,9 @@
+ 		if (!ep)
+ 			goto fail;
+ 		gsi->d_port.in_ep = ep;
+-		msm_ep_set_mode(gsi->d_port.in_ep, USB_EP_GSI);
++		status = msm_ep_set_mode(ep, USB_EP_GSI);
++		if (status)
++			goto fail;
+ 		ep->driver_data = cdev;	/* claim */
+ 	}
+ 
+@@ -2748,7 +3051,9 @@
+ 		if (!ep)
+ 			goto fail;
+ 		gsi->d_port.out_ep = ep;
+-		msm_ep_set_mode(gsi->d_port.out_ep, USB_EP_GSI);
++		status = msm_ep_set_mode(ep, USB_EP_GSI);
++		if (status)
++			goto fail;
+ 		ep->driver_data = cdev;	/* claim */
+ 	}
+ 
+@@ -2762,12 +3067,12 @@
+ 		/* allocate notification request and buffer */
+ 		gsi->c_port.notify_req = usb_ep_alloc_request(ep, GFP_KERNEL);
+ 		if (!gsi->c_port.notify_req)
+-			goto fail;
++			goto nomem;
+ 
+ 		gsi->c_port.notify_req->buf =
+-			kmalloc(info->notify_buf_len, GFP_KERNEL);
++			kzalloc(info->notify_buf_len, GFP_KERNEL);
+ 		if (!gsi->c_port.notify_req->buf)
+-			goto fail;
++			goto nomem;
+ 
+ 		gsi->c_port.notify_req->length = info->notify_buf_len;
+ 		gsi->c_port.notify_req->context = gsi;
+@@ -2824,31 +3129,36 @@
+ 
+ 	return 0;
+ 
++nomem:
++	status = -ENOMEM;
+ fail:
+-	if (gsi->c_port.notify_req) {
+-		kfree(gsi->c_port.notify_req->buf);
+-		usb_ep_free_request(gsi->c_port.notify, gsi->c_port.notify_req);
+-	}
+-	/* we might as well release our claims on endpoints */
+-	if (gsi->c_port.notify)
+-		gsi->c_port.notify->driver_data = NULL;
+-	if (gsi->d_port.out_ep && gsi->d_port.out_ep->desc) {
+-		msm_ep_set_mode(gsi->d_port.out_ep, USB_EP_NONE);
+-		gsi->d_port.out_ep->driver_data = NULL;
+-	}
+-	if (gsi->d_port.in_ep && gsi->d_port.in_ep->desc) {
+-		msm_ep_set_mode(gsi->d_port.in_ep, USB_EP_NONE);
+-		gsi->d_port.in_ep->driver_data = NULL;
+-	}
+-	log_event_err("%s: bind failed for %s", __func__, f->name);
+-	return -ENOMEM;
+-}
+-
+-void ipa_ready_callback(void *ops)
+-{
+-	memcpy(&ipa_ops, ops, sizeof(struct ipa_usb_ops));
+-	complete_all(&wait_for_ipa_ready);
+-}
++	gsi_clear_bind(gsi);
++	return status;
++}
++
++void ipa_ready_callback(void *data)
++{
++	const struct ipa_usb_ops *ops = data;
++	struct gsi_ipa_module *entry;
++	unsigned long flags;
++
++	if (!gsi_ipa_ops_valid(ops))
++		return;
++	spin_lock_irqsave(&ipa_ops_lock, flags);
++	list_for_each_entry(entry, &ipa_modules, list) {
++		if (gsi_ipa_ops_in_module(ops, entry->mod)) {
++			/* Reject table replacement by a different live provider. */
++			if (ipa_owner && ipa_owner != entry->mod)
++				break;
++			ipa_ops = *ops;
++			ipa_owner = entry->mod;
++			complete_all(&wait_for_ipa_ready);
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&ipa_ops_lock, flags);
++}
++
+ EXPORT_SYMBOL(ipa_ready_callback);
+ 
+ static int gsi_bind(struct usb_configuration *c, struct usb_function *f)
+@@ -2857,11 +3167,14 @@
+ 	struct gsi_function_bind_info info = {0};
+ 	struct f_gsi *gsi = func_to_gsi(f);
+ 	struct rndis_params *params;
+-	int status;
++	int status = -EINVAL;
++	unsigned long flags;
+ 	__u8  class;
+ 	__u8  subclass;
+ 	__u8  proto;
+ 
++	if (gsi->ipa_owner)
++		return -EBUSY;
+ 
+ 	if (gsi->prot_id == IPA_USB_RMNET ||
+ 		gsi->prot_id == IPA_USB_DIAG)
+@@ -2909,8 +3222,10 @@
+ 		info.notify_buf_len = sizeof(struct usb_cdc_notification);
+ 
+ 		params = rndis_register(gsi_rndis_response_available, gsi);
+-		if (IS_ERR(params))
++		if (IS_ERR(params)) {
++			status = PTR_ERR(params);
+ 			goto fail;
++		}
+ 
+ 		gsi->params = params;
+ 
+@@ -2926,10 +3241,12 @@
+ 				ETH_ALEN);
+ 		rndis_set_host_mac(gsi->params, gsi->ethaddr);
+ 
+-		if (gsi->manufacturer && gsi->vendorID &&
+-			rndis_set_param_vendor(gsi->params, gsi->vendorID,
+-				gsi->manufacturer))
+-			goto dereg_rndis;
++		if (gsi->manufacturer && gsi->vendor_id) {
++			status = rndis_set_param_vendor(gsi->params, gsi->vendor_id,
++							gsi->manufacturer);
++			if (status)
++				goto dereg_rndis;
++		}
+ 
+ 		/* Windows7/Windows10 automatically loads RNDIS drivers for
+ 		 * class drivers which represents MISC_ACTIVE_SYNC,
+@@ -3166,14 +3483,28 @@
+ 		goto dereg_rndis;
+ 	}
+ 
+-	gsi->d_port.ipa_ops = &ipa_ops;
++	status = gsi_ipa_get(gsi);
++	if (status)
++		goto dereg_rndis;
++	/* A distinct token excludes stale callbacks after later rebinds. */
++	gsi_ipa_token_activate(gsi);
++	spin_lock_irqsave(&gsi->d_port.lock, flags);
++	gsi->bound = true;
++	spin_unlock_irqrestore(&gsi->d_port.lock, flags);
+ 	gsi->d_port.ipa_usb_notify_cb = ipa_usb_notify_cb;
+ 	status = gsi->d_port.ipa_ops->init_teth_prot(gsi->prot_id,
+ 		&gsi->d_port.ipa_init_params, gsi->d_port.ipa_usb_notify_cb,
+-		gsi);
++		gsi->ipa_token);
+ 	if (status) {
+ 		log_event_err("%s: failed to init teth prot(%d) with err:%d",
+ 					__func__, gsi->prot_id, status);
++		spin_lock_irqsave(&gsi->d_port.lock, flags);
++		gsi->bound = false;
++		spin_unlock_irqrestore(&gsi->d_port.lock, flags);
++		gsi_ipa_token_retire(gsi);
++		cancel_delayed_work_sync(&gsi->d_port.usb_ipa_w);
++		gsi_ipa_put(gsi);
++		gsi_put(gsi);
+ 		goto dereg_rndis;
+ 	}
+ 
+@@ -3193,6 +3524,8 @@
+ 
+ dereg_rndis:
+ 	rndis_deregister(gsi->params);
++	gsi->params = NULL;
++	gsi_clear_bind(gsi);
+ fail:
+ 	return status;
+ }
+@@ -3200,51 +3533,56 @@
+ static void gsi_unbind(struct usb_configuration *c, struct usb_function *f)
+ {
+ 	struct f_gsi *gsi = func_to_gsi(f);
+-
+-	log_event_dbg("%s:id:%d: dwq start", __func__, gsi->prot_id);
+-
+-	if (atomic_read(&gsi->connected))
+-		gsi_disable(f);
+-
+-	/*
+-	 * Use drain_workqueue to accomplish below conditions:
+-	 * 1. Make sure that any running work completed
+-	 * 2. Make sure to wait until all pending work completed i.e. workqueue
+-	 * is not having any pending work.
+-	 * Above conditions are making sure that deinit_teth_prot()
+-	 * with ipa driver shall not fail due to unexpected state.
+-	 */
+-	drain_workqueue(gsi->d_port.ipa_usb_wq);
+-	log_event_dbg("%s:id:%d: dwq end", __func__, gsi->prot_id);
+-
+-	gsi->d_port.ipa_ops->deinit_teth_prot(gsi->prot_id);
+-
+-	/* Reset string ids */
++	struct usb_request *req = c->cdev->req;
++	unsigned long flags;
++	int ret;
++
++	mutex_lock(&gsi->ctrl_mutex);
++	gsi_disable(f);
++	timer_delete_sync(&gsi->gsi_rw_timer);
++	if (req->context == gsi) {
++		usb_ep_dequeue(c->cdev->gadget->ep0, req);
++		req->context = NULL;
++		req->complete = NULL;
++	}
++	/* Process disconnect before closing the callback gate. */
++	flush_delayed_work(&gsi->d_port.usb_ipa_w);
++	spin_lock_irqsave(&gsi->d_port.lock, flags);
++	gsi->bound = false;
++	spin_unlock_irqrestore(&gsi->d_port.lock, flags);
++	gsi_ipa_token_retire(gsi);
++	cancel_delayed_work_sync(&gsi->d_port.usb_ipa_w);
++	ret = gsi->d_port.ipa_ops->deinit_teth_prot(gsi->prot_id);
++	if (ret) {
++		pr_err("GSI protocol %d deinit failed: %d; retaining IPA context\n",
++		       gsi->prot_id, ret);
++	} else {
++		gsi_ipa_put(gsi);
++		gsi_put(gsi);
++	}
++	gsi->d_port.sm_state = STATE_UNINITIALIZED;
++	rndis_deregister(gsi->params);
++	gsi->params = NULL;
++	if (gsi->net) {
++		dev_put(gsi->net);
++		gsi->net = NULL;
++	}
++	gsi_ctrl_clear_cpkt_queues(gsi, false);
++	gsi_clear_bind(gsi);
+ 	rndis_gsi_string_defs[0].id = 0;
+-	ecm_gsi_string_defs[0].id   = 0;
++	ecm_gsi_string_defs[0].id = 0;
+ 	rmnet_gsi_string_defs[0].id = 0;
+-	mbim_gsi_string_defs[0].id  = 0;
+-	qdss_gsi_string_defs[0].id  = 0;
+-
+-	if (gsi->prot_id == IPA_USB_RNDIS) {
+-		gsi->d_port.sm_state = STATE_UNINITIALIZED;
+-		rndis_deregister(gsi->params);
+-	}
+-
++	mbim_gsi_string_defs[0].id = 0;
++	qdss_gsi_string_defs[0].id = 0;
+ 	if (gsi->prot_id == IPA_USB_MBIM)
+ 		mbim_gsi_ext_config_desc.function.subCompatibleID[0] = 0;
+-
+-	usb_free_all_descriptors(f);
+-
+-	if (gsi->c_port.notify) {
+-		kfree(gsi->c_port.notify_req->buf);
+-		usb_ep_free_request(gsi->c_port.notify, gsi->c_port.notify_req);
+-	}
+-}
+-
++	mutex_unlock(&gsi->ctrl_mutex);
++}
+ 
+ static void gsi_free_func(struct usb_function *f)
+-{ }
++{
++	atomic_set(&func_to_gsi(f)->function_allocated, 0);
++}
+ 
+ static int gsi_bind_config(struct f_gsi *gsi)
+ {
+@@ -3312,7 +3650,10 @@
+ 		goto error;
+ 	}
+ 
++	kref_init(&gsi->ref);
++	mutex_init(&gsi->ctrl_mutex);
+ 	spin_lock_init(&gsi->d_port.lock);
++	spin_lock_init(&gsi->d_port.evt_q.q_lock);
+ 
+ 	INIT_DELAYED_WORK(&gsi->d_port.usb_ipa_w, ipa_work_handler);
+ 
+@@ -3325,7 +3666,7 @@
+ 
+ 	ret = gsi_function_ctrl_port_init(gsi);
+ 	if (ret) {
+-		kfree(gsi);
++		gsi_put(gsi);
+ 		goto error;
+ 	}
+ 	gsi->gsi_rw_timer_interval = DEFAULT_RW_TIMER_INTERVAL;
+@@ -3342,8 +3683,9 @@
+ 	struct f_gsi *gsi;
+ 
+ 	gsi = opts->gsi;
+-	log_event_dbg("%s: releasing %s instance\n",
+-			__func__, gsi->function.name);
++	if (gsi)
++		log_event_dbg("%s: releasing %s instance\n",
++			      __func__, gsi->function.name);
+ 	usb_put_function_instance(&opts->func_inst);
+ }
+ 
+@@ -3487,7 +3829,7 @@
+ 	if (len > PAGE_SIZE)
+ 		len = PAGE_SIZE;
+ 
+-	ret = scnprintf(page, len, buf);
++	ret = scnprintf(page, PAGE_SIZE, "%s", buf);
+ 
+ 	kfree(buf);
+ 
+@@ -3546,20 +3888,19 @@
+ 
+ static void gsi_inst_clean(struct gsi_opts *opts)
+ {
+-	if (!opts)
+-		return;
+-
+-	if (opts->gsi->c_port.cdev.dev) {
+-		struct cdev *cdev = &opts->gsi->c_port.cdev;
+-		int minor = MINOR(cdev->dev);
+-
+-		device_destroy(gsi_class, cdev->dev);
+-		cdev_del(cdev);
+-		cdev->dev = 0;
+-		ida_simple_remove(&gsi_ida, minor);
+-	}
+-
+-	kfree(opts->gsi);
++	struct f_gsi *gsi = opts->gsi;
++
++	if (gsi) {
++		if (gsi->cdev_registered) {
++			int minor = MINOR(gsi->c_port.dev.devt);
++
++			cdev_device_del(&gsi->c_port.cdev, &gsi->c_port.dev);
++			ida_free(&gsi_ida, minor);
++			gsi->cdev_registered = false;
++			put_device(&gsi->c_port.dev);
++		}
++		gsi_put(gsi);
++	}
+ 	kfree(opts);
+ }
+ 
+@@ -3593,7 +3934,6 @@
+ 						__func__, prot_id);
+ 		return -EBUSY;
+ 	}
+-	mutex_unlock(&inst_status[prot_id].gsi_lock);
+ 
+ 	if (prot_id == IPA_USB_RNDIS)
+ 		config_group_init_type_name(&opts->func_inst.group,
+@@ -3601,8 +3941,10 @@
+ 						&gsi_func_rndis_type);
+ 
+ 	gsi = gsi_function_init(prot_id);
+-	if (IS_ERR(gsi))
++	if (IS_ERR(gsi)) {
++		mutex_unlock(&inst_status[prot_id].gsi_lock);
+ 		return PTR_ERR(gsi);
++	}
+ 
+ 	opts->gsi = gsi;
+ 	/*
+@@ -3611,13 +3953,14 @@
+ 	 */
+ 	scnprintf(gsi_inst_name, sizeof(gsi_inst_name), "gsi.%s", name);
+ 	ipc_log_ctxt = ipc_log_context_create(NUM_LOG_PAGES, gsi_inst_name, 0);
+-	if (!ipc_log_ctxt)
++	if (IS_ERR_OR_NULL(ipc_log_ctxt)) {
++		ipc_log_ctxt = NULL;
+ 		pr_err("%s: Err allocating ipc_log_ctxt for prot:%s\n",
+ 						__func__, gsi_inst_name);
++	}
+ 	opts->gsi->ipc_log_ctxt = ipc_log_ctxt;
+ 
+ 	/* Set instance status */
+-	mutex_lock(&inst_status[prot_id].gsi_lock);
+ 	inst_status[prot_id].inst_exist = true;
+ 	inst_status[prot_id].opts = opts;
+ 	mutex_unlock(&inst_status[prot_id].gsi_lock);
+@@ -3628,31 +3971,27 @@
+ static void gsi_free_inst(struct usb_function_instance *f)
+ {
+ 	struct gsi_opts *opts = container_of(f, struct gsi_opts, func_inst);
+-	enum ipa_usb_teth_prot prot_id;
+-	struct f_gsi *gsi;
+-
+-	if (!opts || !opts->gsi)
++	struct f_gsi *gsi = opts->gsi;
++	unsigned long flags;
++
++	if (!gsi) {
++		kfree(opts);
+ 		return;
+-
+-	prot_id = opts->gsi->prot_id;
+-	gsi = opts->gsi;
+-	mutex_lock(&inst_status[prot_id].gsi_lock);
+-	if (opts->gsi->c_port.is_open) {
+-		/* Mark instance exist as false */
+-		inst_status[prot_id].inst_exist = false;
+-		mutex_unlock(&inst_status[prot_id].gsi_lock);
+-		log_event_err(
+-			"%s: [prot_id = %d] Dev is open, free mem when dev close\n",
+-			__func__, prot_id);
+-		return;
+-	}
+-
+-	ipc_log_context_destroy(opts->gsi->ipc_log_ctxt);
+-	/* Clear instance status */
++	}
++	mutex_lock(&inst_status[gsi->prot_id].gsi_lock);
++	inst_status[gsi->prot_id].inst_exist = false;
++	inst_status[gsi->prot_id].opts = NULL;
++	spin_lock_irqsave(&gsi->c_port.lock, flags);
++	gsi->dying = true;
++	spin_unlock_irqrestore(&gsi->c_port.lock, flags);
++	mutex_unlock(&inst_status[gsi->prot_id].gsi_lock);
++	wake_up_interruptible(&gsi->c_port.read_wq);
++	timer_shutdown_sync(&gsi->gsi_rw_timer);
++	cancel_delayed_work_sync(&gsi->d_port.usb_ipa_w);
++	mutex_lock(&gsi->ctrl_mutex);
++	gsi_ctrl_clear_cpkt_queues(gsi, false);
++	mutex_unlock(&gsi->ctrl_mutex);
+ 	gsi_inst_clean(opts);
+-	inst_status[prot_id].inst_exist = false;
+-	inst_status[prot_id].opts = NULL;
+-	mutex_unlock(&inst_status[prot_id].gsi_lock);
+ }
+ 
+ static struct usb_function_instance *gsi_alloc_inst(void)
+@@ -3678,9 +4017,13 @@
+ 
+ 	opts = container_of(fi, struct gsi_opts, func_inst);
+ 
++	if (!opts->gsi || atomic_cmpxchg(&opts->gsi->function_allocated, 0, 1))
++		return ERR_PTR(-EBUSY);
+ 	ret = gsi_bind_config(opts->gsi);
+-	if (ret)
++	if (ret) {
++		atomic_set(&opts->gsi->function_allocated, 0);
+ 		return ERR_PTR(ret);
++	}
+ 
+ 	return &opts->gsi->function;
+ }
+@@ -3689,57 +4032,61 @@
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("GSI function driver");
+ 
+-static int fgsi_init(void)
+-{
+-	int i;
+-	int ret;
++static int __init fgsi_init(void)
++{
++	int i, ret;
+ 	dev_t dev;
+ 
++	ret = register_module_notifier(&ipa_module_notifier);
++	if (ret)
++		return ret;
+ 	ipa_usb_wq = alloc_workqueue("k_ipa_usb",
+ 				WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_FREEZABLE, 1);
+ 	if (!ipa_usb_wq) {
+-		pr_err("%s(): Failed to create workqueue\n", __func__);
+-		return -ENOMEM;
+-	}
+-
++		ret = -ENOMEM;
++		goto unregister_notifier;
++	}
+ 	for (i = 0; i < IPA_USB_MAX_TETH_PROT_SIZE; i++)
+ 		mutex_init(&inst_status[i].gsi_lock);
+-
+ 	gsi_class = class_create("gsi_usb");
+ 	if (IS_ERR(gsi_class)) {
+ 		ret = PTR_ERR(gsi_class);
+ 		gsi_class = NULL;
+-		pr_err("%s: class_create() failed:%d\n", __func__, ret);
+-		return ret;
+-	}
+-
++		goto destroy_wq;
++	}
+ 	ret = alloc_chrdev_region(&dev, 0, MAX_CDEV_INSTANCES, "gsi_usb");
+-	if (ret) {
+-		pr_err("%s: alloc_chrdev_region() failed:%d\n", __func__, ret);
+-		class_destroy(gsi_class);
+-		gsi_class = NULL;
+-		return ret;
+-	}
+-
++	if (ret)
++		goto destroy_class;
+ 	major = MAJOR(dev);
+-
+ 	usb_gsi_debugfs_init();
+-	return usb_function_register(&gsiusb_func);
+-}
++	ret = usb_function_register(&gsiusb_func);
++	if (!ret)
++		return 0;
++	usb_gsi_debugfs_exit();
++	unregister_chrdev_region(dev, MAX_CDEV_INSTANCES);
++	major = 0;
++destroy_class:
++	class_destroy(gsi_class);
++destroy_wq:
++	destroy_workqueue(ipa_usb_wq);
++unregister_notifier:
++	unregister_module_notifier(&ipa_module_notifier);
++	gsi_ipa_registry_clear();
++	return ret;
++}
++
+ module_init(fgsi_init);
+ 
+ static void __exit fgsi_exit(void)
+ {
+-	if (ipa_usb_wq)
+-		destroy_workqueue(ipa_usb_wq);
+ 	usb_function_unregister(&gsiusb_func);
+-
+-	if (major) {
+-		unregister_chrdev_region(MKDEV(major, 0), MAX_CDEV_INSTANCES);
+-		major = 0;
+-	}
+-
++	usb_gsi_debugfs_exit();
++	destroy_workqueue(ipa_usb_wq);
++	unregister_module_notifier(&ipa_module_notifier);
++	gsi_ipa_registry_clear();
++	unregister_chrdev_region(MKDEV(major, 0), MAX_CDEV_INSTANCES);
+ 	class_destroy(gsi_class);
+-	usb_gsi_debugfs_exit();
+-}
++	ida_destroy(&gsi_ida);
++}
++
+ module_exit(fgsi_exit);
+--- a/drivers/usb/gadget/function/f_gsi.h
++++ b/drivers/usb/gadget/function/f_gsi.h
+@@ -8,6 +8,7 @@
+ #define _F_GSI_H
+ 
+ #include <linux/poll.h>
++#include <linux/kref.h>
+ #include <linux/cdev.h>
+ #include <uapi/linux/usb/cdc.h>
+ #include <linux/usb/ch9.h>
+@@ -190,6 +191,7 @@
+ struct gsi_ctrl_port {
+ 	char name[GSI_CTRL_NAME_LEN];
+ 	struct cdev cdev;
++	struct device dev;
+ 
+ 	struct usb_ep *notify;
+ 	struct usb_request *notify_req;
+@@ -258,10 +260,21 @@
+ 
+ struct f_gsi {
+ 	struct usb_function function;
++	struct kref ref;
++	/* Serialize VFS writes/ioctls against USB unbind. */
++	struct mutex ctrl_mutex;
++	struct gsi_ipa_token *ipa_token;
++	struct module *ipa_owner;
++	struct ipa_usb_ops ipa_ops;
++	struct net_device *net;
++	atomic_t function_allocated;
++	bool dying;
++	bool cdev_registered;
++	bool bound;
+ 	enum ipa_usb_teth_prot prot_id;
+ 	int ctrl_id;
+ 	int data_id;
+-	u32 vendorID;
++	u32 vendor_id;
+ 	u8 ethaddr[ETH_ADDR_STR_LEN];
+ 	const char *manufacturer;
+ 	struct rndis_params *params;
+--- a/drivers/usb/gadget/function/f_qdss.c
++++ b/drivers/usb/gadget/function/f_qdss.c
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/init.h>
+ #include <linux/module.h>
++#include <linux/kref.h>
+ #include <linux/kernel.h>
+ #include <linux/device.h>
+ #include <linux/usb/usb_qdss.h>
+@@ -220,6 +221,7 @@
+ };
+ 
+ static void qdss_disable(struct usb_function *f);
++static void qdss_eps_disable(struct usb_function *f);
+ 
+ static inline struct f_qdss *func_to_qdss(struct usb_function *f)
+ {
+@@ -240,77 +242,100 @@
+ 
+ /*----------------------------------------------------------------------*/
+ 
+-static void qdss_write_complete(struct usb_ep *ep,
+-	struct usb_request *req)
+-{
+-	struct f_qdss *qdss = ep->driver_data;
++static void qdss_release(struct kref *ref)
++{
++	struct f_qdss *qdss = container_of(ref, struct f_qdss, ref);
++
++	destroy_workqueue(qdss->wq);
++	kfree(qdss->ch.name);
++	kfree(qdss);
++}
++
++static void qdss_notify(struct f_qdss *qdss, unsigned int event,
++			struct qdss_request *req, struct usb_qdss_ch *ch)
++{
++	void (*notify)(void *priv, unsigned int event, struct qdss_request *req,
++		       struct usb_qdss_ch *ch);
++	void *priv;
++	unsigned long flags;
++
++	spin_lock_irqsave(&qdss->lock, flags);
++	notify = (qdss->opened ||
++		  (qdss->closing && event == USB_QDSS_DATA_WRITE_DONE)) ?
++		 qdss->ch.notify : NULL;
++	priv = qdss->ch.priv;
++	if (notify)
++		qdss->callbacks++;
++	spin_unlock_irqrestore(&qdss->lock, flags);
++	if (!notify)
++		return;
++	notify(priv, event, req, ch);
++	spin_lock_irqsave(&qdss->lock, flags);
++	qdss->callbacks--;
++	spin_unlock_irqrestore(&qdss->lock, flags);
++	wake_up_all(&qdss->callback_wait);
++}
++
++static void qdss_pm_put(struct f_qdss *qdss)
++{
++	unsigned long flags;
++	bool put;
++
++	spin_lock_irqsave(&qdss->lock, flags);
++	put = qdss->pm_held;
++	qdss->pm_held = false;
++	spin_unlock_irqrestore(&qdss->lock, flags);
++	if (put)
++		usb_gadget_autopm_put_async(qdss->gadget);
++}
++
++static void qdss_write_complete(struct usb_ep *ep, struct usb_request *req)
++{
+ 	struct qdss_req *qreq = req->context;
++	struct f_qdss *qdss = qreq->qdss;
+ 	struct qdss_request *d_req = qreq->qdss_req;
+-	struct usb_ep *in;
+-	enum qdss_state state;
+ 	unsigned long flags;
+-
+-	in = qdss->port.data;
+-	state = USB_QDSS_DATA_WRITE_DONE;
+-
+-	qdss_log("channel:%s ep:%s req:%pK req->status:%d req->length:%d\n",
+-		qdss->ch.name, ep->name, req, req->status, req->length);
++	bool done;
++
+ 	spin_lock_irqsave(&qdss->lock, flags);
+ 	list_move_tail(&qreq->list, &qdss->data_write_pool);
+-
+-	/*
+-	 * When channel is closed, we move all queued requests to
+-	 * dequeued_data_pool list and wait for it to be drained.
+-	 * Signal the completion here if the channel is closed
+-	 * and both queued & dequeued lists are empty.
+-	 */
+-	if (!qdss->opened && list_empty(&qdss->dequeued_data_pool) &&
+-			list_empty(&qdss->queued_data_pool))
++	d_req->actual = req->actual;
++	d_req->status = req->status;
++	done = !qdss->opened && list_empty(&qdss->dequeued_data_pool) &&
++		list_empty(&qdss->queued_data_pool);
++	spin_unlock_irqrestore(&qdss->lock, flags);
++	qdss_notify(qdss, USB_QDSS_DATA_WRITE_DONE, d_req, NULL);
++	if (done)
+ 		complete(&qdss->dequeue_done);
+-
+-	if (req->length != 0) {
+-		d_req->actual = req->actual;
+-		d_req->status = req->status;
+-	}
++}
++
++static void qdss_free_reqs(struct f_qdss *qdss)
++{
++	struct qdss_req *qreq, *tmp;
++	LIST_HEAD(free);
++	unsigned long flags;
++
++	lockdep_assert_held(&qdss->mutex);
++	spin_lock_irqsave(&qdss->lock, flags);
++	list_splice_init(&qdss->data_write_pool, &free);
+ 	spin_unlock_irqrestore(&qdss->lock, flags);
+-
+-	if (qdss->ch.notify)
+-		qdss->ch.notify(qdss->ch.priv, state, d_req, NULL);
+-}
+-
+-static void qdss_free_reqs(struct f_qdss *qdss)
+-{
+-	struct list_head *act, *tmp;
+-	struct qdss_req *qreq;
+-	int data_write_req = 0;
+-	unsigned long flags;
+-
+-	lockdep_assert_held(&qdss->mutex);
+-
+-	spin_lock_irqsave(&qdss->lock, flags);
+-
+-	list_for_each_safe(act, tmp, &qdss->data_write_pool) {
+-		qreq = list_entry(act, struct qdss_req, list);
++	list_for_each_entry_safe(qreq, tmp, &free, list) {
+ 		list_del(&qreq->list);
+ 		usb_ep_free_request(qdss->port.data, qreq->usb_req);
+ 		kfree(qreq);
+-		data_write_req++;
+-	}
+-
+-	qdss_log("channel:%s data_write_req:%d freed\n", qdss->ch.name,
+-							data_write_req);
+-	spin_unlock_irqrestore(&qdss->lock, flags);
++	}
+ }
+ 
+ void usb_qdss_free_req(struct usb_qdss_ch *ch)
+ {
+-	struct f_qdss *qdss = container_of(ch, struct f_qdss, ch);
++	struct f_qdss *qdss;
+ 
+ 	if (!ch) {
+ 		pr_err("%s: ch is NULL\n", __func__);
+ 		return;
+ 	}
+ 
++	qdss = container_of(ch, struct f_qdss, ch);
+ 	mutex_lock(&qdss->mutex);
+ 	if (!qdss->opened)
+ 		pr_err("%s: channel %s closed\n", __func__, ch->name);
+@@ -322,58 +347,51 @@
+ 
+ int usb_qdss_alloc_req(struct usb_qdss_ch *ch, int no_write_buf)
+ {
+-	struct f_qdss *qdss = container_of(ch, struct f_qdss, ch);
+-	struct usb_request *req;
+-	struct usb_ep *in;
+-	struct list_head *list_pool;
+-	int i;
+-	struct qdss_req *qreq;
++	struct f_qdss *qdss;
++	struct qdss_req *qreq, *tmp;
++	LIST_HEAD(new);
+ 	unsigned long flags;
+-
+-	if (!ch) {
+-		pr_err("%s: ch is NULL\n", __func__);
++	int i, ret = -ENOMEM;
++
++	if (!ch || no_write_buf <= 0)
+ 		return -EINVAL;
+-	}
+-
+-	qdss_log("channel:%s num_write_buf:%d\n", ch->name, no_write_buf);
+-
+-	if (!qdss) {
+-		pr_err("%s: %s closed\n", __func__, ch->name);
+-		return -ENODEV;
+-	}
+-
++	qdss = container_of(ch, struct f_qdss, ch);
+ 	mutex_lock(&qdss->mutex);
+-
+-	in = qdss->port.data;
+-	list_pool = &qdss->data_write_pool;
+-
++	if (!qdss->opened || qdss->dying || !qdss->bound ||
++	    !qdss->port.data || !qdss_uses_sw_path(qdss)) {
++		ret = -ENODEV;
++		goto out;
++	}
+ 	for (i = 0; i < no_write_buf; i++) {
+-		qreq = kzalloc(sizeof(struct qdss_req), GFP_KERNEL);
++		qreq = kzalloc(sizeof(*qreq), GFP_KERNEL);
+ 		if (!qreq)
+-			goto fail;
+-
+-		req = usb_ep_alloc_request(in, GFP_ATOMIC);
+-		if (!req) {
+-			pr_err("%s: ctrl_in allocation err\n", __func__);
++			goto free;
++		qreq->usb_req = usb_ep_alloc_request(qdss->port.data, GFP_KERNEL);
++		if (!qreq->usb_req) {
+ 			kfree(qreq);
+-			goto fail;
+-		}
+-		spin_lock_irqsave(&qdss->lock, flags);
+-		qreq->usb_req = req;
+-		req->context = qreq;
+-		req->complete = qdss_write_complete;
+-		list_add_tail(&qreq->list, list_pool);
+-		spin_unlock_irqrestore(&qdss->lock, flags);
+-	}
+-
++			goto free;
++		}
++		qreq->qdss = qdss;
++		qreq->usb_req->context = qreq;
++		qreq->usb_req->complete = qdss_write_complete;
++		list_add_tail(&qreq->list, &new);
++	}
++	spin_lock_irqsave(&qdss->lock, flags);
++	list_splice_tail_init(&new, &qdss->data_write_pool);
++	spin_unlock_irqrestore(&qdss->lock, flags);
++	ret = 0;
++	goto out;
++free:
++	list_for_each_entry_safe(qreq, tmp, &new, list) {
++		list_del(&qreq->list);
++		usb_ep_free_request(qdss->port.data, qreq->usb_req);
++		kfree(qreq);
++	}
++out:
+ 	mutex_unlock(&qdss->mutex);
+-	return 0;
+-
+-fail:
+-	qdss_free_reqs(qdss);
+-	mutex_unlock(&qdss->mutex);
+-	return -ENOMEM;
+-}
++	return ret;
++}
++
+ EXPORT_SYMBOL(usb_qdss_alloc_req);
+ 
+ static void clear_eps(struct usb_function *f)
+@@ -382,16 +400,24 @@
+ 
+ 	qdss_log("channel:%s\n", qdss->ch.name);
+ 
+-	if (qdss->port.ctrl_in)
++	if (qdss->port.ctrl_in) {
+ 		qdss->port.ctrl_in->driver_data = NULL;
+-	if (qdss->port.ctrl_out)
++		qdss->port.ctrl_in->claimed = false;
++		qdss->port.ctrl_in = NULL;
++	}
++	if (qdss->port.ctrl_out) {
+ 		qdss->port.ctrl_out->driver_data = NULL;
++		qdss->port.ctrl_out->claimed = false;
++		qdss->port.ctrl_out = NULL;
++	}
+ 	if (qdss->port.data) {
+ 		if (!qdss_uses_sw_path(qdss)) {
+ 			msm_ep_clear_ops(qdss->port.data);
+ 			msm_ep_set_mode(qdss->port.data, USB_EP_NONE);
+ 		}
+ 		qdss->port.data->driver_data = NULL;
++		qdss->port.data->claimed = false;
++		qdss->port.data = NULL;
+ 	}
+ }
+ 
+@@ -466,7 +492,9 @@
+ 		if (ret < 0)
+ 			goto clear_ep;
+ 
+-		msm_ep_update_ops(qdss->port.data);
++		ret = msm_ep_update_ops(qdss->port.data);
++		if (ret)
++			goto clear_ep;
+ 	}
+ 
+ 	if (qdss->debug_inface_enabled) {
+@@ -521,6 +549,7 @@
+ 	if (ret)
+ 		goto fail;
+ 
++	qdss->bound = true;
+ 	return 0;
+ 
+ fail:
+@@ -537,29 +566,35 @@
+ 	return -EOPNOTSUPP;
+ }
+ 
+-
+ static void qdss_unbind(struct usb_configuration *c, struct usb_function *f)
+ {
+-	struct f_qdss  *qdss = func_to_qdss(f);
+-	struct usb_gadget *gadget = c->cdev->gadget;
+-
+-	qdss_log("channel:%s\n", qdss->ch.name);
+-
++	struct f_qdss *qdss = func_to_qdss(f);
++	unsigned long flags;
++
++	mutex_lock(&qdss->mutex);
++	qdss->bound = false;
++	mutex_unlock(&qdss->mutex);
+ 	qdss_disable(f);
++	/* Partially enabled interfaces still own endpoints and a PM vote. */
++	qdss_eps_disable(f);
+ 	flush_workqueue(qdss->wq);
+-
++	qdss_pm_put(qdss);
++	mutex_lock(&qdss->io_mutex);
++	mutex_lock(&qdss->mutex);
++	qdss_free_reqs(qdss);
+ 	if (qdss->endless_req) {
+-		usb_ep_free_request(qdss->port.data,
+-				qdss->endless_req);
++		usb_ep_free_request(qdss->port.data, qdss->endless_req);
+ 		qdss->endless_req = NULL;
+ 	}
+-
+-	/* Reset string ids */
++	spin_lock_irqsave(&qdss->lock, flags);
++	qdss->hw_connected = false;
++	spin_unlock_irqrestore(&qdss->lock, flags);
+ 	qdss_string_defs[QDSS_DATA_IDX].id = 0;
+ 	qdss_string_defs[QDSS_CTRL_IDX].id = 0;
+-
+ 	clear_eps(f);
+-	clear_desc(gadget, f);
++	clear_desc(c->cdev->gadget, f);
++	mutex_unlock(&qdss->mutex);
++	mutex_unlock(&qdss->io_mutex);
+ }
+ 
+ static void qdss_eps_disable(struct usb_function *f)
+@@ -586,34 +621,18 @@
+ 
+ static void usb_qdss_disconnect_work(struct work_struct *work)
+ {
+-	struct f_qdss *qdss;
+-	int status;
+-
+-	qdss = container_of(work, struct f_qdss, disconnect_w);
+-	qdss_log("channel:%s\n", qdss->ch.name);
+-
+-	/* Notify qdss to cancel all active transfers */
+-	if (qdss->ch.notify)
+-		qdss->ch.notify(qdss->ch.priv,
+-			USB_QDSS_DISCONNECT,
+-			NULL,
+-			NULL);
+-
++	struct f_qdss *qdss = container_of(work, struct f_qdss, disconnect_w);
++
++	if (READ_ONCE(qdss->usb_connected))
++		return;
++	qdss_notify(qdss, USB_QDSS_DISCONNECT, NULL, NULL);
+ 	mutex_lock(&qdss->mutex);
+-
+-	/* Uninitialized init data i.e. ep specific operation */
+-	if (qdss->opened && !qdss_uses_sw_path(qdss)) {
+-		status = set_qdss_data_connection(qdss, 0);
+-		if (status)
+-			pr_err("qdss_disconnect error\n");
+-	}
+-
+-	/*
+-	 * Decrement usage count which was incremented
+-	 * before calling connect work
+-	 */
+-	usb_gadget_autopm_put_async(qdss->gadget);
+-
++	if (qdss->hw_connected) {
++		set_qdss_data_connection(qdss, 0);
++		qdss->hw_connected = false;
++	}
++	if (!qdss->usb_connected)
++		qdss_pm_put(qdss);
+ 	mutex_unlock(&qdss->mutex);
+ }
+ 
+@@ -638,55 +657,29 @@
+ 
+ static void usb_qdss_connect_work(struct work_struct *work)
+ {
+-	struct f_qdss *qdss;
+-	int status;
+-	struct usb_request *req = NULL;
+-	unsigned long flags;
+-
+-	qdss = container_of(work, struct f_qdss, connect_w);
+-
+-	/* If cable is already removed, discard connect_work */
+-	if (qdss->usb_connected == 0) {
+-		cancel_work_sync(&qdss->disconnect_w);
+-		usb_gadget_autopm_put_async(qdss->gadget);
+-		return;
+-	}
++	struct f_qdss *qdss = container_of(work, struct f_qdss, connect_w);
++	int ret;
+ 
+ 	mutex_lock(&qdss->mutex);
+-
+-	qdss_log("channel:%s opened:%d\n", qdss->ch.name, qdss->opened);
+-	if (!qdss->opened)
+-		goto unlock_out;
+-
+-	if (qdss_uses_sw_path(qdss))
+-		goto notify;
+-
+-	status = set_qdss_data_connection(qdss, 1);
+-	if (status) {
+-		pr_err("set_qdss_data_connection error(%d)\n", status);
+-		goto unlock_out;
+-	}
+-
+-	spin_lock_irqsave(&qdss->lock, flags);
+-	req = qdss->endless_req;
+-	spin_unlock_irqrestore(&qdss->lock, flags);
+-	if (!req)
+-		goto unlock_out;
+-
+-	status = usb_ep_queue(qdss->port.data, req, GFP_ATOMIC);
+-	if (status) {
+-		pr_err("%s: usb_ep_queue error (%d)\n", __func__, status);
+-		goto unlock_out;
+-	}
+-
+-notify:
++	if (!qdss->opened || !qdss->usb_connected || !qdss->bound || qdss->dying)
++		goto out;
++	if (!qdss_uses_sw_path(qdss) && !qdss->hw_connected) {
++		if (!qdss->endless_req)
++			goto out;
++		ret = set_qdss_data_connection(qdss, 1);
++		if (ret)
++			goto out;
++		ret = usb_ep_queue(qdss->port.data, qdss->endless_req, GFP_ATOMIC);
++		if (ret) {
++			set_qdss_data_connection(qdss, 0);
++			goto out;
++		}
++		qdss->hw_connected = true;
++	}
+ 	mutex_unlock(&qdss->mutex);
+-	if (qdss->ch.notify)
+-		qdss->ch.notify(qdss->ch.priv, USB_QDSS_CONNECT,
+-						NULL, &qdss->ch);
++	qdss_notify(qdss, USB_QDSS_CONNECT, NULL, &qdss->ch);
+ 	return;
+-
+-unlock_out:
++out:
+ 	mutex_unlock(&qdss->mutex);
+ }
+ 
+@@ -696,12 +689,15 @@
+ 	struct f_qdss  *qdss = func_to_qdss(f);
+ 	struct usb_gadget *gadget = f->config->cdev->gadget;
+ 	int ret = 0;
++	bool valid_control = qdss->debug_inface_enabled && intf == qdss->ctrl_iface_id;
+ 
+ 	qdss_log("qdss pointer = %pK\n", qdss);
+ 	qdss->gadget = gadget;
+ 
+-	if (alt != 0)
++	if (alt != 0 || (intf != qdss->data_iface_id && !valid_control)) {
++		ret = -EINVAL;
+ 		goto fail1;
++	}
+ 
+ 	if (gadget->speed < USB_SPEED_HIGH) {
+ 		pr_err("%s: qdss doesn't support USB full or low speed\n",
+@@ -713,6 +709,7 @@
+ 	if (intf == qdss->data_iface_id && !qdss->data_enabled) {
+ 		/* Increment usage count on connect */
+ 		usb_gadget_autopm_get_async(qdss->gadget);
++		qdss->pm_held = true;
+ 
+ 		ret = config_ep_by_speed(gadget, f, qdss->port.data);
+ 		if (ret) {
+@@ -731,14 +728,12 @@
+ 		qdss->port.data->driver_data = qdss;
+ 		qdss->data_enabled = 1;
+ 
+-
+ 	} else if ((intf == qdss->ctrl_iface_id) &&
+ 	(qdss->debug_inface_enabled)) {
+ 
+-		if (config_ep_by_speed(gadget, f, qdss->port.ctrl_in)) {
+-			ret = -EINVAL;
++		ret = config_ep_by_speed(gadget, f, qdss->port.ctrl_in);
++		if (ret)
+ 			goto fail1;
+-		}
+ 
+ 		ret = usb_ep_enable(qdss->port.ctrl_in);
+ 		if (ret)
+@@ -747,11 +742,9 @@
+ 		qdss->port.ctrl_in->driver_data = qdss;
+ 		qdss->ctrl_in_enabled = 1;
+ 
+-		if (config_ep_by_speed(gadget, f, qdss->port.ctrl_out)) {
+-			ret = -EINVAL;
++		ret = config_ep_by_speed(gadget, f, qdss->port.ctrl_out);
++		if (ret)
+ 			goto fail1;
+-		}
+-
+ 
+ 		ret = usb_ep_enable(qdss->port.ctrl_out);
+ 		if (ret)
+@@ -780,57 +773,29 @@
+ 	return 0;
+ fail:
+ 	/* Decrement usage count in case of failure */
+-	usb_gadget_autopm_put_async(qdss->gadget);
++	qdss_pm_put(qdss);
+ fail1:
+ 	pr_err("%s failed ret:%d\n", __func__, ret);
+ 	qdss_eps_disable(f);
++	qdss_pm_put(qdss);
+ 	return ret;
+ }
+ 
+ static struct f_qdss *alloc_usb_qdss(char *channel_name)
+ {
+ 	struct f_qdss *qdss;
+-	int found = 0;
+ 	struct usb_qdss_ch *ch;
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&channel_lock, flags);
+-	list_for_each_entry(ch, &usb_qdss_ch_list, list) {
+-		if (!strcmp(channel_name, ch->name)) {
+-			found = 1;
+-			break;
+-		}
+-	}
+-	spin_unlock_irqrestore(&channel_lock, flags);
+-
+-	if (found) {
+-		pr_err("%s: (%s) is already available.\n",
+-				__func__, channel_name);
+-		return ERR_PTR(-EEXIST);
+-	}
+-
+-	qdss = kzalloc(sizeof(struct f_qdss), GFP_KERNEL);
++	qdss = kzalloc(sizeof(*qdss), GFP_KERNEL);
+ 	if (!qdss)
+ 		return ERR_PTR(-ENOMEM);
+-
+ 	qdss->wq = create_singlethread_workqueue(channel_name);
+ 	if (!qdss->wq) {
+ 		kfree(qdss);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+-
+-	spin_lock_irqsave(&channel_lock, flags);
+-	ch = &qdss->ch;
+-	ch->name = channel_name;
+-
+-	if (!strcmp(ch->name, USB_QDSS_CH_EBC))
+-		ch->ch_type = USB_EP_EBC;
+-	else
+-		ch->ch_type = USB_EP_NONE;
+-
+-	list_add_tail(&ch->list, &usb_qdss_ch_list);
+-	spin_unlock_irqrestore(&channel_lock, flags);
+-
++	kref_init(&qdss->ref);
+ 	spin_lock_init(&qdss->lock);
+ 	INIT_LIST_HEAD(&qdss->data_write_pool);
+ 	INIT_LIST_HEAD(&qdss->queued_data_pool);
+@@ -838,14 +803,30 @@
+ 	INIT_WORK(&qdss->connect_w, usb_qdss_connect_work);
+ 	INIT_WORK(&qdss->disconnect_w, usb_qdss_disconnect_work);
+ 	mutex_init(&qdss->mutex);
++	mutex_init(&qdss->io_mutex);
+ 	init_completion(&qdss->dequeue_done);
+-
++	init_waitqueue_head(&qdss->callback_wait);
++	qdss->ch.name = channel_name;
++	qdss->ch.ch_type = !strcmp(channel_name, USB_QDSS_CH_EBC) ?
++		USB_EP_EBC : USB_EP_NONE;
++	spin_lock_irqsave(&channel_lock, flags);
++	list_for_each_entry(ch, &usb_qdss_ch_list, list) {
++		if (!strcmp(channel_name, ch->name)) {
++			spin_unlock_irqrestore(&channel_lock, flags);
++			destroy_workqueue(qdss->wq);
++			kfree(qdss);
++			return ERR_PTR(-EEXIST);
++		}
++	}
++	/* Publish only fully initialized channels. */
++	list_add_tail(&qdss->ch.list, &usb_qdss_ch_list);
++	spin_unlock_irqrestore(&channel_lock, flags);
+ 	return qdss;
+ }
+ 
+ int usb_qdss_write(struct usb_qdss_ch *ch, struct qdss_request *d_req)
+ {
+-	struct f_qdss *qdss = container_of(ch, struct f_qdss, ch);
++	struct f_qdss *qdss;
+ 	unsigned long flags;
+ 	struct usb_request *req = NULL;
+ 	struct qdss_req *qreq;
+@@ -855,12 +836,17 @@
+ 		return -EINVAL;
+ 	}
+ 
++	if (!d_req || d_req->length < 0 ||
++	    (!d_req->sg && (d_req->num_sgs || (d_req->length && !d_req->buf))) ||
++	    (d_req->sg && !d_req->num_sgs))
++		return -EINVAL;
++	qdss = container_of(ch, struct f_qdss, ch);
+ 	mutex_lock(&qdss->mutex);
+ 
+ 	qdss_log("channel:%s d_req:%pK\n", ch->name, d_req);
+ 	spin_lock_irqsave(&qdss->lock, flags);
+ 
+-	if (!qdss->opened || !qdss->usb_connected) {
++	if (!qdss->opened || !qdss->usb_connected || !qdss->bound || qdss->dying) {
+ 		spin_unlock_irqrestore(&qdss->lock, flags);
+ 		qdss_log("return -EIO\n");
+ 		mutex_unlock(&qdss->mutex);
+@@ -907,63 +893,61 @@
+ EXPORT_SYMBOL(usb_qdss_write);
+ 
+ struct usb_qdss_ch *usb_qdss_open(const char *name, void *priv,
+-	void (*notify)(void *priv, unsigned int event,
+-		struct qdss_request *d_req, struct usb_qdss_ch *))
++	void (*notify)(void *, unsigned int, struct qdss_request *,
++		       struct usb_qdss_ch *))
+ {
+ 	struct usb_qdss_ch *ch;
+ 	struct f_qdss *qdss = NULL;
+ 	unsigned long flags;
+ 
+-	qdss_log("called for channel:%s\n", name);
+-	if (!notify) {
+-		pr_err("%s: notification func is missing\n", __func__);
++	if (!name || !notify || !try_module_get(THIS_MODULE))
+ 		return NULL;
+-	}
+-
+ 	spin_lock_irqsave(&channel_lock, flags);
+ retry:
+-	/* Check if we already have a channel with this name */
+ 	list_for_each_entry(ch, &usb_qdss_ch_list, list) {
+ 		if (!strcmp(name, ch->name)) {
+ 			qdss = container_of(ch, struct f_qdss, ch);
+ 			break;
+ 		}
+ 	}
+-
+ 	if (!strcmp(name, USB_QDSS_CH_SW) &&
+-			(!qdss || !qdss->port.function.name)) {
+-		qdss_log("qdss_sw not added to config, fall back to qdss_mdm\n");
++	    (!qdss || !qdss->port.function.name)) {
+ 		name = USB_QDSS_CH_MDM;
+ 		qdss = NULL;
+ 		goto retry;
+ 	}
+-
++	if (qdss)
++		kref_get(&qdss->ref);
+ 	spin_unlock_irqrestore(&channel_lock, flags);
+-	if (!qdss) {
+-		qdss_log("failed to find channel:%s\n", name);
+-		return NULL;
+-	}
+-
++	if (!qdss)
++		goto put_module;
+ 	mutex_lock(&qdss->mutex);
+-	qdss_log("qdss ctx found for channel:%s\n", name);
++	if (qdss->dying || qdss->opened || qdss->closing) {
++		mutex_unlock(&qdss->mutex);
++		kref_put(&qdss->ref, qdss_release);
++		goto put_module;
++	}
++	spin_lock_irqsave(&qdss->lock, flags);
++	ch = &qdss->ch;
+ 	ch->priv = priv;
+ 	ch->notify = notify;
+ 	qdss->opened = true;
+ 	reinit_completion(&qdss->dequeue_done);
+-
+-	/* the case USB cabel was connected before qdss called qdss_open */
++	spin_unlock_irqrestore(&qdss->lock, flags);
+ 	if (qdss->usb_connected)
+ 		queue_work(qdss->wq, &qdss->connect_w);
+-
+ 	mutex_unlock(&qdss->mutex);
+ 	return ch;
+-}
++put_module:
++	module_put(THIS_MODULE);
++	return NULL;
++}
++
+ EXPORT_SYMBOL(usb_qdss_open);
+ 
+ void usb_qdss_close(struct usb_qdss_ch *ch)
+ {
+-	struct f_qdss *qdss = container_of(ch, struct f_qdss, ch);
+-	struct usb_gadget *gadget;
++	struct f_qdss *qdss;
+ 	unsigned long flags;
+ 	int status;
+ 	struct qdss_req *qreq;
+@@ -974,16 +958,24 @@
+ 		return;
+ 	}
+ 
++	qdss = container_of(ch, struct f_qdss, ch);
+ 	qdss_log("channel:%s\n", ch->name);
+ 
++	mutex_lock(&qdss->io_mutex);
+ 	mutex_lock(&qdss->mutex);
+ 	if (!qdss->opened) {
+ 		pr_err("%s: channel %s closed\n", __func__, ch->name);
+-		goto unlock_out;
++		mutex_unlock(&qdss->mutex);
++		mutex_unlock(&qdss->io_mutex);
++		return;
+ 	}
+ 
+ 	spin_lock_irqsave(&qdss->lock, flags);
+ 	qdss->opened = false;
++	qdss->closing = true;
++	spin_unlock_irqrestore(&qdss->lock, flags);
++	mutex_unlock(&qdss->mutex);
++	spin_lock_irqsave(&qdss->lock, flags);
+ 	/*
+ 	 * Some UDCs like DWC3 stop the endpoint transfer upon dequeue
+ 	 * of a request and retire all the previously *started* requests.
+@@ -1015,6 +1007,10 @@
+ 	do_wait = !list_empty(&qdss->dequeued_data_pool);
+ 	spin_unlock_irqrestore(&qdss->lock, flags);
+ 
++	if (current_work() != &qdss->connect_w)
++		cancel_work_sync(&qdss->connect_w);
++	if (current_work() != &qdss->disconnect_w)
++		cancel_work_sync(&qdss->disconnect_w);
+ 	if (do_wait) {
+ 		qdss_log("waiting for completion on dequeued requests\n");
+ 		wait_for_completion(&qdss->dequeue_done);
+@@ -1022,52 +1018,48 @@
+ 
+ 	WARN_ON(!list_empty(&qdss->dequeued_data_pool));
+ 
++	wait_event(qdss->callback_wait, READ_ONCE(qdss->callbacks) <=
++		(current_work() == &qdss->connect_w ||
++		 current_work() == &qdss->disconnect_w));
++	mutex_lock(&qdss->mutex);
+ 	qdss_free_reqs(qdss);
++	spin_lock_irqsave(&qdss->lock, flags);
+ 	ch->notify = NULL;
+-	if (!qdss->usb_connected || qdss_uses_sw_path(qdss))
++	ch->priv = NULL;
++	spin_unlock_irqrestore(&qdss->lock, flags);
++	if (!qdss->hw_connected)
+ 		goto unlock_out;
+ 
+-	if (qdss->endless_req)
++	if (qdss->endless_req && qdss->port.data)
+ 		usb_ep_dequeue(qdss->port.data, qdss->endless_req);
+-
+-	gadget = qdss->gadget;
+ 
+ 	status = set_qdss_data_connection(qdss, 0);
+ 	if (status)
+ 		pr_err("%s:qdss_disconnect error\n", __func__);
+-
++	qdss->hw_connected = false;
+ unlock_out:
++	if (!qdss->closing) {
++		mutex_unlock(&qdss->mutex);
++		mutex_unlock(&qdss->io_mutex);
++		return;
++	}
++	qdss->closing = false;
+ 	mutex_unlock(&qdss->mutex);
++	mutex_unlock(&qdss->io_mutex);
++	kref_put(&qdss->ref, qdss_release);
++	module_put(THIS_MODULE);
+ }
+ EXPORT_SYMBOL(usb_qdss_close);
+ 
+ static void qdss_cleanup(void)
+ {
+-	struct f_qdss *qdss;
+-	struct list_head *act, *tmp;
+-	struct usb_qdss_ch *_ch;
+-	unsigned long flags;
+-
+-	qdss_log("cleaning up channel resources.\n");
+-
+-	list_for_each_safe(act, tmp, &usb_qdss_ch_list) {
+-		_ch = list_entry(act, struct usb_qdss_ch, list);
+-		qdss = container_of(_ch, struct f_qdss, ch);
+-		destroy_workqueue(qdss->wq);
+-		spin_lock_irqsave(&channel_lock, flags);
+-		if (!_ch->priv) {
+-			list_del(&_ch->list);
+-			kfree(qdss);
+-		}
+-		spin_unlock_irqrestore(&channel_lock, flags);
+-	}
++	/* Instances and open clients each hold module references. */
++	WARN_ON(!list_empty(&usb_qdss_ch_list));
+ }
+ 
+ static void qdss_free_func(struct usb_function *f)
+ {
+-	struct f_qdss *qdss = func_to_qdss(f);
+-
+-	qdss->debug_inface_enabled = false;
++	atomic_set(&func_to_qdss(f)->function_allocated, 0);
+ }
+ 
+ static inline struct usb_qdss_opts *to_f_qdss_opts(struct config_item *item)
+@@ -1096,27 +1088,23 @@
+ }
+ 
+ static ssize_t qdss_enable_debug_inface_store(struct config_item *item,
+-			const char *page, size_t len)
++					     const char *page, size_t len)
+ {
+ 	struct f_qdss *qdss = to_f_qdss_opts(item)->usb_qdss;
+-	unsigned long flags;
+-	u8 stats;
+-
+-	if (page == NULL) {
+-		pr_err("Invalid buffer\n");
+-		return len;
+-	}
+-
+-	if (kstrtou8(page, 0, &stats) != 0 && !(stats == 0 || stats == 1)) {
+-		pr_err("(%u)Wrong value. enter 0 to disable or 1 to enable.\n",
+-			stats);
+-		return len;
+-	}
+-
+-	spin_lock_irqsave(&qdss->lock, flags);
+-	qdss->debug_inface_enabled = stats;
+-	spin_unlock_irqrestore(&qdss->lock, flags);
+-	return len;
++	u8 value;
++	int ret;
++
++	if (!qdss || kstrtou8(page, 0, &value) || value > 1)
++		return -EINVAL;
++	mutex_lock(&qdss->mutex);
++	if (atomic_read(&qdss->function_allocated)) {
++		ret = -EBUSY;
++	} else {
++		qdss->debug_inface_enabled = value;
++		ret = len;
++	}
++	mutex_unlock(&qdss->mutex);
++	return ret;
+ }
+ 
+ CONFIGFS_ATTR(qdss_, enable_debug_inface);
+@@ -1133,10 +1121,20 @@
+ 
+ static void usb_qdss_free_inst(struct usb_function_instance *fi)
+ {
+-	struct usb_qdss_opts *opts;
+-
+-	opts = container_of(fi, struct usb_qdss_opts, func_inst);
+-	kfree(opts->usb_qdss);
++	struct usb_qdss_opts *opts = container_of(fi, struct usb_qdss_opts, func_inst);
++	struct f_qdss *qdss = opts->usb_qdss;
++	unsigned long flags;
++
++	if (qdss) {
++		spin_lock_irqsave(&channel_lock, flags);
++		list_del_init(&qdss->ch.list);
++		spin_unlock_irqrestore(&channel_lock, flags);
++		mutex_lock(&qdss->mutex);
++		qdss->dying = true;
++		mutex_unlock(&qdss->mutex);
++		flush_workqueue(qdss->wq);
++		kref_put(&qdss->ref, qdss_release);
++	}
+ 	kfree(opts);
+ }
+ 
+@@ -1161,16 +1159,17 @@
+ 		return -ENOMEM;
+ 	}
+ 
++	if (opts->usb_qdss) {
++		kfree(ptr);
++		return -EBUSY;
++	}
++	usb_qdss = alloc_usb_qdss(ptr);
++	if (IS_ERR(usb_qdss)) {
++		kfree(ptr);
++		return PTR_ERR(usb_qdss);
++	}
++
+ 	opts->channel_name = ptr;
+-	qdss_log("qdss: channel_name:%s\n", opts->channel_name);
+-
+-	usb_qdss = alloc_usb_qdss(opts->channel_name);
+-	if (IS_ERR(usb_qdss)) {
+-		pr_err("Failed to create usb_qdss port(%s)\n",
+-				opts->channel_name);
+-		return -ENOMEM;
+-	}
+-
+ 	opts->usb_qdss = usb_qdss;
+ 	return 0;
+ }
+@@ -1196,6 +1195,8 @@
+ 	struct usb_qdss_opts *opts = to_fi_usb_qdss_opts(fi);
+ 	struct f_qdss *usb_qdss = opts->usb_qdss;
+ 
++	if (!usb_qdss || atomic_cmpxchg(&usb_qdss->function_allocated, 0, 1))
++		return ERR_PTR(-EBUSY);
+ 	usb_qdss->port.function.name = "usb_qdss";
+ 	usb_qdss->port.function.strings = qdss_strings;
+ 	usb_qdss->port.function.bind = qdss_bind;
+@@ -1221,6 +1222,7 @@
+ 	ret = usb_function_register(&qdssusb_func);
+ 	if (ret) {
+ 		pr_err("%s: failed to register diag %d\n", __func__, ret);
++		ipc_log_context_destroy(_qdss_ipc_log);
+ 		return ret;
+ 	}
+ 	return ret;
+@@ -1228,9 +1230,9 @@
+ 
+ static void __exit usb_qdss_exit(void)
+ {
+-	ipc_log_context_destroy(_qdss_ipc_log);
+ 	usb_function_unregister(&qdssusb_func);
+ 	qdss_cleanup();
++	ipc_log_context_destroy(_qdss_ipc_log);
+ }
+ 
+ module_init(usb_qdss_init);
+--- a/drivers/usb/gadget/function/f_qdss.h
++++ b/drivers/usb/gadget/function/f_qdss.h
+@@ -8,6 +8,7 @@
+ #define _F_QDSS_H
+ 
+ #include <linux/completion.h>
++#include <linux/kref.h>
+ #include <linux/kernel.h>
+ #include <linux/ipc_logging.h>
+ #include <linux/list.h>
+@@ -44,6 +45,15 @@
+ /* struct f_qdss - USB qdss function driver private structure */
+ struct f_qdss {
+ 	struct gqdss port;
++	struct kref ref;
++	atomic_t function_allocated;
++	bool dying;
++	bool closing;
++	bool bound;
++	bool pm_held;
++	bool hw_connected;
++	unsigned int callbacks;
++	wait_queue_head_t callback_wait;
+ 	struct usb_gadget *gadget;
+ 	short int port_num;
+ 	u8 ctrl_iface_id;
+@@ -67,6 +77,8 @@
+ 	struct workqueue_struct *wq;
+ 
+ 	struct mutex mutex;
++	/* Keep request storage alive during close/dequeue and unbind. */
++	struct mutex io_mutex;
+ 	bool opened;	/* protected by 'mutex' */
+ 	struct completion dequeue_done;
+ };
+@@ -78,6 +90,7 @@
+ };
+ 
+ struct qdss_req {
++	struct f_qdss *qdss;
+ 	struct usb_request *usb_req;
+ 	struct qdss_request *qdss_req;
+ 	struct list_head list;
+--- a/drivers/usb/gadget/function/u_qdss.c
++++ b/drivers/usb/gadget/function/u_qdss.c
+@@ -16,7 +16,13 @@
+ int alloc_hw_req(struct usb_ep *data_ep)
+ {
+ 	struct usb_request *req = NULL;
+-	struct f_qdss *qdss = data_ep->driver_data;
++	struct f_qdss *qdss;
++
++	if (!data_ep || !data_ep->driver_data)
++		return -EINVAL;
++	qdss = data_ep->driver_data;
++	if (qdss->endless_req)
++		return -EBUSY;
+ 
+ 	pr_debug("allocating EBC request\n");
+ 
+@@ -45,8 +51,6 @@
+ 
+ int set_qdss_data_connection(struct f_qdss *qdss, int enable)
+ {
+-	struct usb_gadget *gadget;
+-	struct device *dev;
+ 	int ret = 0;
+ 
+ 	if (!qdss) {
+@@ -54,8 +58,8 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	gadget = qdss->gadget;
+-	dev = gadget->dev.parent;
++	if (!qdss->port.data || (enable && !qdss->endless_req))
++		return -ENODEV;
+ 
+ 	pr_debug("%s ch_type:%d\n", __func__, qdss->ch.ch_type);
+ 	if (enable) {
+--- a/drivers/usb/gadget/function/rndis.c
++++ b/drivers/usb/gadget/function/rndis.c
+@@ -31,7 +31,7 @@
+ 
+ #include <asm/io.h>
+ #include <asm/byteorder.h>
+-#include <asm/unaligned.h>
++#include <linux/unaligned.h>
+ 
+ #include "u_rndis.h"
+ 
+@@ -169,7 +169,7 @@
+ static int gen_ndis_query_resp(struct rndis_params *params, u32 OID, u8 *buf,
+ 			       unsigned buf_len, rndis_resp_t *r)
+ {
+-	int retval = -ENOTSUPP;
++	int retval = -EOPNOTSUPP;
+ 	u32 length = 4;	/* usually */
+ 	__le32 *outbuf;
+ 	int i, count;
+@@ -485,7 +485,7 @@
+ 			     u8 *buf, u32 buf_len, rndis_resp_t *r)
+ {
+ 	rndis_set_cmplt_type *resp;
+-	int i, retval = -ENOTSUPP;
++	int retval = -EOPNOTSUPP;
+ 
+ 	if (!r)
+ 		return -ENOMEM;
+@@ -493,16 +493,8 @@
+ 	if (!resp)
+ 		return -ENOMEM;
+ 
+-	if (buf_len && rndis_debug > 1) {
+-		pr_debug("set OID %08x value, len %d:\n", OID, buf_len);
+-		for (i = 0; i < buf_len; i += 16) {
+-			pr_debug("%03d: %08x %08x %08x %08x\n", i,
+-				get_unaligned_le32(&buf[i]),
+-				get_unaligned_le32(&buf[i + 4]),
+-				get_unaligned_le32(&buf[i + 8]),
+-				get_unaligned_le32(&buf[i + 12]));
+-		}
+-	}
++	if (buf_len && rndis_debug > 1)
++		print_hex_dump_bytes("RNDIS SET: ", DUMP_PREFIX_OFFSET, buf, buf_len);
+ 
+ 	switch (OID) {
+ 	case RNDIS_OID_GEN_CURRENT_PACKET_FILTER:
+--- a/include/linux/usb/usb_qdss.h
++++ b/include/linux/usb/usb_qdss.h
+@@ -55,7 +55,7 @@
+ 	return -ENODEV;
+ }
+ 
+-static inline int usb_qdss_alloc_req(struct usb_qdss_ch *c, int n_wr, int n_rd)
++static inline int usb_qdss_alloc_req(struct usb_qdss_ch *c, int n_wr)
+ {
+ 	return -ENODEV;
+ }

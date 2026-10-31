@@ -1,0 +1,1001 @@
+--- a/platform/cnss_utils/cnss_plat_ipc_qmi.c
++++ b/platform/cnss_utils/cnss_plat_ipc_qmi.c
+@@ -16,6 +16,10 @@
+ #include <linux/slab.h>
+ #include <linux/delay.h>
+ #include <linux/workqueue.h>
++#include <linux/wait.h>
++#include <linux/srcu.h>
++#include <linux/list.h>
++#include <linux/err.h>
+ #include <linux/of.h>
+ #include "cnss_plat_ipc_qmi.h"
+ #include "cnss_plat_ipc_service_v01.h"
+@@ -50,6 +54,12 @@
+ 	u32 seg_index;
+ 	u32 seg_len;
+ 	u32 end;
++	u32 offset;
++	u32 expected_size;
++	int status;
++	bool upload;
++	bool peer_valid;
++	struct sockaddr_qrtr peer;
+ 	struct completion complete;
+ };
+ 
+@@ -61,14 +71,22 @@
+  * @cb_ctx: Context for registered user
+  * @num_user: Number of registered users
+  */
++struct cnss_plat_ipc_user {
++	cnss_plat_ipc_connection_update callback;
++	void *context;
++};
++
++struct cnss_plat_ipc_daemon_record {
++	struct list_head node;
++	struct cnss_plat_ipc_daemon_config config;
++};
++
+ struct cnss_plat_ipc_qmi_client_ctx {
+ 	struct sockaddr_qrtr client_sq;
+ 	bool client_connected;
+-
+-	cnss_plat_ipc_connection_update
+-		connection_update_cb[CNSS_PLAT_IPC_MAX_USER];
+-	void *cb_ctx[CNSS_PLAT_IPC_MAX_USER];
+-	u32 num_user;
++	struct cnss_plat_ipc_daemon_record *config;
++
++	struct cnss_plat_ipc_user __rcu *users[CNSS_PLAT_IPC_MAX_USER];
+ };
+ 
+ /**
+@@ -82,12 +100,17 @@
+ 	struct qmi_handle *svc_hdl;
+ 	struct idr file_idr;
+ 	struct mutex file_idr_lock; /* File ID generator usage lock */
++	wait_queue_head_t file_wait;
++	u32 active_files;
++	bool stopping;
+ 	struct cnss_plat_ipc_qmi_client_ctx
+ 		qmi_client_ctx[CNSS_PLAT_IPC_MAX_QMI_CLIENTS + 1];
+ };
+ 
+ static struct cnss_plat_ipc_qmi_svc_ctx plat_ipc_qmi_svc;
+-static struct cnss_plat_ipc_daemon_config daemon_cfg;
++static LIST_HEAD(cnss_plat_ipc_daemon_records);
++static DEFINE_MUTEX(cnss_plat_ipc_user_lock);
++DEFINE_STATIC_SRCU(cnss_plat_ipc_user_srcu);
+ 
+ #if IS_ENABLED(CONFIG_IPC_LOGGING)
+ static void *cnss_plat_ipc_log_context;
+@@ -182,16 +205,19 @@
+ {
+ 	struct cnss_plat_ipc_qmi_svc_ctx *svc = &plat_ipc_qmi_svc;
+ 	struct cnss_plat_ipc_file_data *fd;
+-
+-	fd = kmalloc(sizeof(*fd), GFP_KERNEL);
++	int id; /* IDR errors must remain signed until checked. */
++
++	fd = kzalloc(sizeof(*fd), GFP_KERNEL);
+ 	if (!fd)
+-		goto end;
++		return ERR_PTR(-ENOMEM);
+ 	fd->name = name;
+ 	fd->buf = buf;
+ 	fd->buf_size = buf_size;
+ 	fd->file_size = file_size;
+ 	fd->seg_index = 0;
+ 	fd->end = 0;
++	fd->status = -EINPROGRESS;
++	fd->upload = file_size != 0;
+ 	if (file_size)
+ 		fd->seg_len =
+ 			(file_size / CNSS_PLAT_IPC_QMI_MAX_DATA_SIZE_V01) +
+@@ -200,13 +226,20 @@
+ 		fd->seg_len = 0;
+ 	init_completion(&fd->complete);
+ 	mutex_lock(&svc->file_idr_lock);
+-	fd->id = idr_alloc_cyclic(&svc->file_idr, fd, 0, U32_MAX, GFP_KERNEL);
+-	if (fd->id < 0) {
++	if (svc->stopping) {
++		mutex_unlock(&svc->file_idr_lock);
+ 		kfree(fd);
+-		fd = NULL;
+-	}
+-	mutex_unlock(&svc->file_idr_lock);
+-end:
++		return ERR_PTR(-ESHUTDOWN);
++	}
++	id = idr_alloc_cyclic(&svc->file_idr, fd, 0, 0, GFP_KERNEL);
++	if (id < 0) {
++		kfree(fd);
++		fd = ERR_PTR(id);
++	} else {
++		fd->id = id;
++		svc->active_files++;
++	}
++	mutex_unlock(&svc->file_idr_lock);
+ 	return fd;
+ }
+ 
+@@ -219,19 +252,38 @@
+ static int cnss_plat_ipc_deinit_file_data(struct cnss_plat_ipc_file_data *fd)
+ {
+ 	struct cnss_plat_ipc_qmi_svc_ctx *svc = &plat_ipc_qmi_svc;
+-	int ret = 0;
+-
+-	if (unlikely(!fd))
++	int ret;
++
++	if (IS_ERR_OR_NULL(fd))
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&svc->file_idr_lock);
+ 	idr_remove(&svc->file_idr, fd->id);
+-	mutex_unlock(&svc->file_idr_lock);
+-
+-	if (!fd->end)
+-		ret = -EINVAL;
++	ret = fd->status;
++	svc->active_files--;
++	wake_up_all(&svc->file_wait);
++	mutex_unlock(&svc->file_idr_lock);
++
+ 	kfree(fd);
+ 	return ret;
++}
++
++/* Called with file_idr_lock held, including all borrowed-buffer accesses. */
++static void cnss_plat_ipc_finish_file(struct cnss_plat_ipc_file_data *fd,
++				      int status)
++{
++	if (fd->status != -EINPROGRESS)
++		return;
++	fd->status = status;
++	fd->end = true;
++	complete(&fd->complete);
++}
++
++static bool cnss_plat_ipc_file_peer(struct cnss_plat_ipc_file_data *fd,
++				    struct sockaddr_qrtr *sq)
++{
++	return fd->peer_valid && sq && fd->peer.sq_family == sq->sq_family &&
++		fd->peer.sq_node == sq->sq_node && fd->peer.sq_port == sq->sq_port;
+ }
+ 
+ /**
+@@ -248,14 +300,21 @@
+ 	struct cnss_plat_ipc_qmi_svc_ctx *svc = &plat_ipc_qmi_svc;
+ 	struct cnss_plat_ipc_qmi_client_ctx *qmi_client =
+ 			&svc->qmi_client_ctx[client_id];
+-	int i;
+-
+-	for (i = 0; i < qmi_client->num_user; i++) {
+-		if (qmi_client->connection_update_cb[i])
+-			qmi_client->connection_update_cb[i]
+-						(qmi_client->cb_ctx[i],
+-						qmi_client->client_connected);
+-	}
++	struct cnss_plat_ipc_user *user;
++	bool connected;
++	int i, idx;
++
++	mutex_lock(&svc->file_idr_lock);
++	connected = qmi_client->client_connected && !svc->stopping;
++	mutex_unlock(&svc->file_idr_lock);
++	idx = srcu_read_lock(&cnss_plat_ipc_user_srcu);
++	for (i = 0; i < CNSS_PLAT_IPC_MAX_USER; i++) {
++		user = srcu_dereference(qmi_client->users[i],
++					&cnss_plat_ipc_user_srcu);
++		if (user)
++			user->callback(user->context, connected);
++	}
++	srcu_read_unlock(&cnss_plat_ipc_user_srcu, idx);
+ }
+ 
+ /**
+@@ -272,20 +331,22 @@
+ 				  client_id, char *file_name, u8 *file_buf,
+ 				  u32 file_size)
+ {
+-	struct cnss_plat_ipc_qmi_file_upload_ind_msg_v01 ind;
++	struct cnss_plat_ipc_qmi_file_upload_ind_msg_v01 ind = {0};
+ 	struct cnss_plat_ipc_qmi_svc_ctx *svc = &plat_ipc_qmi_svc;
+ 	struct cnss_plat_ipc_qmi_client_ctx *qmi_client;
+ 	int ret;
++	unsigned long timeout = msecs_to_jiffies(CNSS_PLAT_IPC_QMI_FILE_TXN_TIMEOUT);
+ 	struct cnss_plat_ipc_file_data *fd;
+ 
+-	if (client_id > CNSS_PLAT_IPC_MAX_QMI_CLIENTS) {
++	if ((u32)client_id > CNSS_PLAT_IPC_MAX_QMI_CLIENTS) {
+ 		cnss_plat_ipc_err("Invalid Client ID: %d\n", client_id);
+ 		return -EINVAL;
+ 	}
+ 
+ 	qmi_client = &svc->qmi_client_ctx[client_id];
+ 
+-	if (!qmi_client->client_connected || !file_name || !file_buf)
++	if (!file_name || !file_buf ||
++	    strnlen(file_name, sizeof(ind.file_name)) >= sizeof(ind.file_name))
+ 		return -EINVAL;
+ 
+ 	cnss_plat_ipc_info("File name: %s Size: %d\n", file_name, file_size);
+@@ -295,32 +356,39 @@
+ 
+ 	fd = cnss_plat_ipc_init_file_data(file_name, file_buf, file_size,
+ 					  file_size);
+-	if (!fd) {
++	if (IS_ERR(fd)) {
+ 		cnss_plat_ipc_err("Unable to initialize file transfer data\n");
+-		return -EINVAL;
+-	}
+-	scnprintf(ind.file_name, CNSS_PLAT_IPC_QMI_MAX_FILE_NAME_LEN_V01, "%s",
++		return PTR_ERR(fd);
++	}
++	scnprintf(ind.file_name, sizeof(ind.file_name), "%s",
+ 		  fd->name);
+ 	ind.file_size = fd->file_size;
+ 	ind.file_id = fd->id;
+ 
++	mutex_lock(&svc->file_idr_lock);
++	if (svc->stopping || !svc->svc_hdl || !qmi_client->client_connected) {
++		ret = -ENOTCONN;
++		goto unlock_upload;
++	}
++	fd->peer = qmi_client->client_sq;
++	fd->peer_valid = true;
+ 	ret = qmi_send_indication
+-			(svc->svc_hdl, &qmi_client->client_sq,
++			(svc->svc_hdl, &fd->peer,
+ 			 CNSS_PLAT_IPC_QMI_FILE_UPLOAD_IND_V01,
+ 			 CNSS_PLAT_IPC_QMI_FILE_UPLOAD_IND_MSG_V01_MAX_MSG_LEN,
+ 			 cnss_plat_ipc_qmi_file_upload_ind_msg_v01_ei, &ind);
+ 
+-	if (ret < 0) {
+-		cnss_plat_ipc_err("QMI failed: %d\n", ret);
+-		goto end;
+-	}
+-	ret = wait_for_completion_timeout(&fd->complete,
+-					  msecs_to_jiffies
+-					  (CNSS_PLAT_IPC_QMI_FILE_TXN_TIMEOUT));
+-	if (!ret)
+-		cnss_plat_ipc_err("Timeout Uploading file: %s\n", fd->name);
+-
+-end:
++unlock_upload:
++	if (ret < 0)
++		cnss_plat_ipc_finish_file(fd, ret);
++	mutex_unlock(&svc->file_idr_lock);
++	if (ret >= 0) {
++		ret = wait_for_completion_timeout(&fd->complete, timeout);
++		mutex_lock(&svc->file_idr_lock);
++		if (!ret)
++			cnss_plat_ipc_finish_file(fd, -ETIMEDOUT);
++		mutex_unlock(&svc->file_idr_lock);
++	}
+ 	ret = cnss_plat_ipc_deinit_file_data(fd);
+ 	cnss_plat_ipc_dbg("Status: %d\n", ret);
+ 
+@@ -347,7 +415,7 @@
+ 					  const void *decoded_msg)
+ {
+ 	struct cnss_plat_ipc_qmi_file_upload_req_msg_v01 *req_msg;
+-	struct cnss_plat_ipc_qmi_file_upload_resp_msg_v01 *resp;
++	struct cnss_plat_ipc_qmi_file_upload_resp_msg_v01 *resp = NULL;
+ 	struct cnss_plat_ipc_qmi_svc_ctx *svc = &plat_ipc_qmi_svc;
+ 	int ret = 0;
+ 	struct cnss_plat_ipc_file_data *fd;
+@@ -360,29 +428,38 @@
+ 			  req_msg->seg_index);
+ 
+ 	mutex_lock(&svc->file_idr_lock);
+-	fd = idr_find(&svc->file_idr, req_msg->file_id);
+-	mutex_unlock(&svc->file_idr_lock);
+-	if (!fd) {
++	fd = req_msg->file_id <= INT_MAX ?
++		idr_find(&svc->file_idr, req_msg->file_id) : NULL;
++	/* Keep the IDR owner locked until all borrowed buffer access ends. */
++	if (!fd || handle != svc->svc_hdl || !fd->upload ||
++	    !cnss_plat_ipc_file_peer(fd, sq)) {
++		mutex_unlock(&svc->file_idr_lock);
+ 		cnss_plat_ipc_err("Invalid File ID %d\n", req_msg->file_id);
+ 		return;
+ 	}
+ 
+-	if (req_msg->seg_index != fd->seg_index) {
++	if (fd->status != -EINPROGRESS)
++		goto end;
++	if (fd->seg_index >= fd->seg_len || fd->offset >= fd->file_size ||
++	    req_msg->seg_index != fd->seg_index) {
+ 		cnss_plat_ipc_err("File %s transfer segment failure\n", fd->name);
+-		complete(&fd->complete);
++		cnss_plat_ipc_finish_file(fd, -EPROTO);
++		goto end;
+ 	}
+ 
+ 	resp = kzalloc(sizeof(*resp), GFP_KERNEL);
+-	if (!resp)
+-		return;
++	if (!resp) {
++		cnss_plat_ipc_finish_file(fd, -ENOMEM);
++		goto end;
++	}
+ 
+ 	resp->file_id = fd->id;
+-	resp->seg_index = fd->seg_index++;
++	resp->seg_index = fd->seg_index;
+ 	resp->seg_buf_len =
+-		(fd->buf_size > CNSS_PLAT_IPC_QMI_MAX_DATA_SIZE_V01 ?
+-		 CNSS_PLAT_IPC_QMI_MAX_DATA_SIZE_V01 : fd->buf_size);
+-	resp->end = (fd->seg_index == fd->seg_len);
+-	memcpy(resp->seg_buf, fd->buf, resp->seg_buf_len);
++		min_t(u32, fd->file_size - fd->offset,
++		      CNSS_PLAT_IPC_QMI_MAX_DATA_SIZE_V01);
++	resp->end = (fd->seg_index + 1 == fd->seg_len);
++	memcpy(resp->seg_buf, fd->buf + fd->offset, resp->seg_buf_len);
+ 
+ 	cnss_plat_ipc_dbg("ID: %d Seg ID: %d Len: %d End: %d\n", resp->file_id,
+ 			  resp->seg_index, resp->seg_buf_len, resp->end);
+@@ -396,17 +473,17 @@
+ 
+ 	if (ret < 0) {
+ 		cnss_plat_ipc_err("QMI failed: %d\n", ret);
++		cnss_plat_ipc_finish_file(fd, ret);
+ 		goto end;
+ 	}
+ 
+-	fd->buf_size -= resp->seg_buf_len;
+-	fd->buf += resp->seg_buf_len;
+-	if (resp->end) {
+-		fd->end = true;
+-		complete(&fd->complete);
+-	}
++	fd->seg_index++;
++	fd->offset += resp->seg_buf_len;
++	if (resp->end)
++		cnss_plat_ipc_finish_file(fd, 0);
+ end:
+ 	kfree(resp);
++	mutex_unlock(&svc->file_idr_lock);
+ }
+ 
+ /**
+@@ -422,50 +499,64 @@
+ 				    client_id, char *file_name, char *buf,
+ 				    u32 *size)
+ {
+-	struct cnss_plat_ipc_qmi_file_download_ind_msg_v01 ind;
++	struct cnss_plat_ipc_qmi_file_download_ind_msg_v01 ind = {0};
+ 	struct cnss_plat_ipc_qmi_svc_ctx *svc = &plat_ipc_qmi_svc;
+ 	struct cnss_plat_ipc_qmi_client_ctx *qmi_client;
+ 	int ret;
++	unsigned long timeout = msecs_to_jiffies(CNSS_PLAT_IPC_QMI_FILE_TXN_TIMEOUT);
+ 	struct cnss_plat_ipc_file_data *fd;
+ 
+-	if (client_id > CNSS_PLAT_IPC_MAX_QMI_CLIENTS) {
++	if ((u32)client_id > CNSS_PLAT_IPC_MAX_QMI_CLIENTS) {
+ 		cnss_plat_ipc_err("Invalid Client ID: %d\n", client_id);
+ 		return -EINVAL;
+ 	}
+ 
+ 	qmi_client = &svc->qmi_client_ctx[client_id];
+ 
+-	if (!qmi_client->client_connected || !file_name || !buf)
++	if (!file_name || !buf || !size ||
++	    strnlen(file_name, sizeof(ind.file_name)) >= sizeof(ind.file_name))
+ 		return -EINVAL;
++	if (!*size || *size > CNSS_MAX_FILE_SIZE)
++		return -EINVAL;
+ 
+ 	fd = cnss_plat_ipc_init_file_data(file_name, buf, *size, 0);
+-	if (!fd) {
++	if (IS_ERR(fd)) {
+ 		cnss_plat_ipc_err("Unable to initialize file transfer data\n");
+-		return -EINVAL;
+-	}
+-
+-	scnprintf(ind.file_name, CNSS_PLAT_IPC_QMI_MAX_FILE_NAME_LEN_V01, "%s",
++		return PTR_ERR(fd);
++	}
++
++	scnprintf(ind.file_name, sizeof(ind.file_name), "%s",
+ 		  file_name);
+ 	ind.file_id = fd->id;
+ 
++	mutex_lock(&svc->file_idr_lock);
++	if (svc->stopping || !svc->svc_hdl || !qmi_client->client_connected) {
++		ret = -ENOTCONN;
++		goto unlock_download;
++	}
++	fd->peer = qmi_client->client_sq;
++	fd->peer_valid = true;
+ 	ret = qmi_send_indication
+-		(svc->svc_hdl, &qmi_client->client_sq,
++		(svc->svc_hdl, &fd->peer,
+ 		 CNSS_PLAT_IPC_QMI_FILE_DOWNLOAD_IND_V01,
+ 		 CNSS_PLAT_IPC_QMI_FILE_DOWNLOAD_IND_MSG_V01_MAX_MSG_LEN,
+ 		 cnss_plat_ipc_qmi_file_download_ind_msg_v01_ei, &ind);
+ 
+-	if (ret < 0) {
+-		cnss_plat_ipc_err("QMI failed: %d\n", ret);
+-		goto end;
+-	}
+-	ret = wait_for_completion_timeout(&fd->complete,
+-					  msecs_to_jiffies
+-					  (CNSS_PLAT_IPC_QMI_FILE_TXN_TIMEOUT));
+-	if (!ret)
+-		cnss_plat_ipc_err("Timeout downloading file:%s\n", fd->name);
+-
+-end:
+-	*size = fd->file_size;
++unlock_download:
++	if (ret < 0)
++		cnss_plat_ipc_finish_file(fd, ret);
++	mutex_unlock(&svc->file_idr_lock);
++	if (ret >= 0) {
++		ret = wait_for_completion_timeout(&fd->complete, timeout);
++		mutex_lock(&svc->file_idr_lock);
++		if (!ret)
++			cnss_plat_ipc_finish_file(fd, -ETIMEDOUT);
++		mutex_unlock(&svc->file_idr_lock);
++	}
++	mutex_lock(&svc->file_idr_lock);
++	if (!fd->status)
++		*size = fd->file_size;
++	mutex_unlock(&svc->file_idr_lock);
+ 	ret = cnss_plat_ipc_deinit_file_data(fd);
+ 	cnss_plat_ipc_dbg("Status: %d Size: %d\n", ret, *size);
+ 
+@@ -508,37 +599,45 @@
+ 			  req_msg->end);
+ 
+ 	mutex_lock(&svc->file_idr_lock);
+-	fd = idr_find(&svc->file_idr, req_msg->file_id);
+-	mutex_unlock(&svc->file_idr_lock);
+-	if (!fd) {
++	fd = req_msg->file_id <= INT_MAX ?
++		idr_find(&svc->file_idr, req_msg->file_id) : NULL;
++	/* Keep the IDR owner locked until all borrowed buffer access ends. */
++	if (!fd || handle != svc->svc_hdl || fd->upload ||
++	    !cnss_plat_ipc_file_peer(fd, sq)) {
++		mutex_unlock(&svc->file_idr_lock);
+ 		cnss_plat_ipc_err("Invalid File ID: %d\n", req_msg->file_id);
+ 		return;
+ 	}
+ 
+-	if (req_msg->file_size > fd->buf_size) {
++	if (fd->status != -EINPROGRESS) {
++		mutex_unlock(&svc->file_idr_lock);
++		return;
++	}
++	if (req_msg->end > 1 || req_msg->file_size > fd->buf_size ||
++	    req_msg->file_size > CNSS_MAX_FILE_SIZE ||
++	    (fd->seg_index && req_msg->file_size != fd->expected_size)) {
+ 		cnss_plat_ipc_err("File %s size %d larger than buffer size %d\n",
+ 				  fd->name, req_msg->file_size, fd->buf_size);
+ 		goto file_error;
+ 	}
+ 	if (req_msg->seg_buf_len > CNSS_PLAT_IPC_QMI_MAX_DATA_SIZE_V01 ||
+-	    ((req_msg->seg_buf_len + fd->file_size) > fd->buf_size)) {
++	    req_msg->seg_buf_len > fd->buf_size - fd->offset) {
+ 		cnss_plat_ipc_err("Segment buf ID: %d buffer size %d not allowed\n",
+ 				  req_msg->seg_index, req_msg->seg_buf_len);
+ 		goto file_error;
+ 	}
+-	if (req_msg->seg_index != fd->seg_index) {
++	if ((!req_msg->seg_buf_len && !req_msg->end) ||
++	    req_msg->file_size < fd->offset + req_msg->seg_buf_len ||
++	    (!!req_msg->end !=
++	     (req_msg->file_size == fd->offset + req_msg->seg_buf_len)) ||
++	    req_msg->seg_index != fd->seg_index) {
+ 		cnss_plat_ipc_err("File %s transfer segment failure\n",
+ 				  fd->name);
+ 		goto file_error;
+ 	}
+ 
+-	memcpy(fd->buf, req_msg->seg_buf, req_msg->seg_buf_len);
+-	fd->seg_index++;
+-	fd->buf += req_msg->seg_buf_len;
+-	fd->file_size += req_msg->seg_buf_len;
+-
+ 	resp.file_id = fd->id;
+-	resp.seg_index = fd->seg_index;
++	resp.seg_index = fd->seg_index + 1;
+ 	ret = qmi_send_response
+ 		(svc->svc_hdl, sq, txn,
+ 		CNSS_PLAT_IPC_QMI_FILE_DOWNLOAD_RESP_V01,
+@@ -546,17 +645,25 @@
+ 		cnss_plat_ipc_qmi_file_download_resp_msg_v01_ei,
+ 		&resp);
+ 
+-	if (ret < 0)
++	if (ret < 0) {
+ 		cnss_plat_ipc_err("QMI failed: %d\n", ret);
+-
+-	if (req_msg->end) {
+-		fd->end = true;
+-		complete(&fd->complete);
+-	}
+-
++		cnss_plat_ipc_finish_file(fd, ret);
++		goto unlock;
++	}
++
++	memcpy(fd->buf + fd->offset, req_msg->seg_buf, req_msg->seg_buf_len);
++	fd->offset += req_msg->seg_buf_len;
++	fd->file_size = fd->offset;
++	fd->expected_size = req_msg->file_size;
++	fd->seg_index++;
++	if (req_msg->end)
++		cnss_plat_ipc_finish_file(fd, 0);
++unlock:
++	mutex_unlock(&svc->file_idr_lock);
+ 	return;
+ file_error:
+-	complete(&fd->complete);
++	cnss_plat_ipc_finish_file(fd, -EPROTO);
++	mutex_unlock(&svc->file_idr_lock);
+ }
+ 
+ /**
+@@ -580,28 +687,53 @@
+ 	struct cnss_plat_ipc_qmi_init_setup_req_msg_v01 *req_msg;
+ 	struct cnss_plat_ipc_qmi_init_setup_resp_msg_v01 resp = {0};
+ 	struct cnss_plat_ipc_qmi_svc_ctx *svc = &plat_ipc_qmi_svc;
+-	struct cnss_plat_ipc_daemon_config *cfg = &daemon_cfg;
++	struct cnss_plat_ipc_qmi_client_ctx *client =
++		&svc->qmi_client_ctx[CNSS_PLAT_IPC_DAEMON_QMI_CLIENT_V01];
++	struct cnss_plat_ipc_daemon_record *record;
+ 	int ret = 0;
+ 
+ 	req_msg =
+ 		(struct cnss_plat_ipc_qmi_init_setup_req_msg_v01 *)decoded_msg;
++	if (!req_msg)
++		return;
+ 	cnss_plat_ipc_dbg("MAC: %d HW_TRC: %d CAL: %d\n",
+ 			  req_msg->dms_mac_addr_supported,
+ 			  req_msg->qdss_hw_trace_override,
+ 			  req_msg->cal_file_available_bitmask);
+ 
+-	cfg->dms_mac_addr_supported = req_msg->dms_mac_addr_supported;
+-	cfg->qdss_hw_trace_override = req_msg->qdss_hw_trace_override;
+-	cfg->cal_file_available_bitmask = req_msg->cal_file_available_bitmask;
+-	cfg->initialized = 1;
++	record = kzalloc(sizeof(*record), GFP_KERNEL);
++	if (!record)
++		return;
++	record->config.dms_mac_addr_supported = req_msg->dms_mac_addr_supported;
++	record->config.qdss_hw_trace_override = req_msg->qdss_hw_trace_override;
++	record->config.cal_file_available_bitmask = req_msg->cal_file_available_bitmask;
++	record->config.initialized = 1;
++	mutex_lock(&svc->file_idr_lock);
++	if (svc->stopping || handle != svc->svc_hdl || !sq ||
++	    !client->client_connected ||
++	    client->client_sq.sq_family != sq->sq_family ||
++	    client->client_sq.sq_node != sq->sq_node ||
++	    client->client_sq.sq_port != sq->sq_port) {
++		mutex_unlock(&svc->file_idr_lock);
++		kfree(record);
++		return;
++	}
+ 
+ 	ret = qmi_send_response
+ 		(svc->svc_hdl, sq, txn,
+ 		 CNSS_PLAT_IPC_QMI_INIT_SETUP_RESP_V01,
+ 		 CNSS_PLAT_IPC_QMI_INIT_SETUP_RESP_MSG_V01_MAX_MSG_LEN,
+ 		 cnss_plat_ipc_qmi_init_setup_resp_msg_v01_ei, &resp);
+-	if (ret < 0)
++	if (ret < 0) {
+ 		cnss_plat_ipc_err("%s: QMI failed: %d\n", __func__, ret);
++	} else {
++		/* Returned config pointers stay immutable until module teardown. */
++		list_add_tail(&record->node, &cnss_plat_ipc_daemon_records);
++		client->config = record;
++		record = NULL;
++	}
++	mutex_unlock(&svc->file_idr_lock);
++	kfree(record);
+ }
+ 
+ /**
+@@ -629,23 +761,25 @@
+ 
+ 	req_msg =
+ 		(struct cnss_plat_ipc_qmi_reg_client_req_msg_v01 *)decoded_msg;
++	if (!req_msg || !sq)
++		return;
+ 
+ 	if (req_msg->client_id_valid) {
+-		if (req_msg->client_id <= CNSS_PLAT_IPC_MAX_QMI_CLIENTS &&
++		mutex_lock(&svc->file_idr_lock);
++		if ((u32)req_msg->client_id <= CNSS_PLAT_IPC_MAX_QMI_CLIENTS &&
++		    !svc->stopping && handle == svc->svc_hdl &&
+ 		    !qmi_client[req_msg->client_id].client_connected) {
+ 			cnss_plat_ipc_info
+ 				("%s: QMI Client Connected. QMI Socket Node: %d Port: %d ID: %d\n",
+ 				 __func__, sq->sq_node, sq->sq_port,
+ 				 req_msg->client_id);
+-			qmi_client[req_msg->client_id].client_sq = *sq;
+-			qmi_client[req_msg->client_id].client_connected = true;
+-			cnss_plat_ipc_qmi_update_user
+-					((enum cnss_plat_ipc_qmi_client_id_v01)
+-					req_msg->client_id);
+ 		} else {
+ 			cnss_plat_ipc_err("QMI client already connected or Invalid client id\n");
++			mutex_unlock(&svc->file_idr_lock);
+ 			return;
+ 		}
++	} else {
++		return;
+ 	}
+ 
+ 	ret = qmi_send_response
+@@ -654,8 +788,15 @@
+ 		 CNSS_PLAT_IPC_QMI_REG_CLIENT_RESP_MSG_V01_MAX_MSG_LEN,
+ 		 cnss_plat_ipc_qmi_reg_client_resp_msg_v01_ei, &resp);
+ 
+-	if (ret < 0)
++	if (ret < 0) {
+ 		cnss_plat_ipc_err("QMI failed: %d\n", ret);
++	} else {
++		qmi_client[req_msg->client_id].client_sq = *sq;
++		WRITE_ONCE(qmi_client[req_msg->client_id].client_connected, true);
++	}
++	mutex_unlock(&svc->file_idr_lock);
++	if (ret >= 0)
++		cnss_plat_ipc_qmi_update_user(req_msg->client_id);
+ }
+ 
+ /**
+@@ -678,12 +819,16 @@
+ 	u32 file_id;
+ 	int i;
+ 
++	mutex_lock(&svc->file_idr_lock);
+ 	if (svc->svc_hdl != handle) {
+ 		cnss_plat_ipc_err("Invalid QMI Handle\n");
+-		return;
+-	}
++		mutex_unlock(&svc->file_idr_lock);
++		return;
++	}
++	mutex_unlock(&svc->file_idr_lock);
+ 
+ 	for (i = 0; i <= CNSS_PLAT_IPC_MAX_QMI_CLIENTS; i++) {
++		mutex_lock(&svc->file_idr_lock);
+ 		if (qmi_client[i].client_connected &&
+ 		    qmi_client[i].client_sq.sq_node == node &&
+ 		    qmi_client[i].client_sq.sq_port == port) {
+@@ -693,16 +838,21 @@
+ 			qmi_client[i].client_sq.sq_node = 0;
+ 			qmi_client[i].client_sq.sq_port = 0;
+ 			qmi_client[i].client_sq.sq_family = 0;
+-			qmi_client[i].client_connected = false;
++			WRITE_ONCE(qmi_client[i].client_connected, false);
++			qmi_client[i].config = NULL;
+ 
+ 			/* Daemon killed. Fail any download / upload in progress. This
+ 			 * will also free stale fd
+ 			 */
+-			mutex_lock(&svc->file_idr_lock);
+-			idr_for_each_entry(&svc->file_idr, fd, file_id)
+-				complete(&fd->complete);
++			idr_for_each_entry(&svc->file_idr, fd, file_id) {
++				if (fd->peer_valid && fd->peer.sq_node == node &&
++				    fd->peer.sq_port == port)
++					cnss_plat_ipc_finish_file(fd, -ENOTCONN);
++			}
+ 			mutex_unlock(&svc->file_idr_lock);
+ 			cnss_plat_ipc_qmi_update_user(i);
++		} else {
++			mutex_unlock(&svc->file_idr_lock);
+ 		}
+ 	}
+ }
+@@ -722,11 +872,14 @@
+ 	struct cnss_plat_ipc_qmi_client_ctx *qmi_client =
+ 					svc->qmi_client_ctx;
+ 	int i;
++	u32 port;
+ 
+ 	for (i = 0; i <= CNSS_PLAT_IPC_MAX_QMI_CLIENTS; i++) {
++		mutex_lock(&svc->file_idr_lock);
++		port = qmi_client[i].client_sq.sq_port;
++		mutex_unlock(&svc->file_idr_lock);
+ 		cnss_plat_ipc_qmi_disconnect_cb
+-					(handle, node,
+-					 qmi_client[i].client_sq.sq_port);
++					(handle, node, port);
+ 	}
+ }
+ 
+@@ -783,18 +936,22 @@
+ 	struct cnss_plat_ipc_qmi_svc_ctx *svc = &plat_ipc_qmi_svc;
+ 	struct cnss_plat_ipc_qmi_client_ctx *qmi_client =
+ 		&svc->qmi_client_ctx[CNSS_PLAT_IPC_DAEMON_QMI_CLIENT_V01];
+-
+-	if (!qmi_client->client_connected)
+-		return NULL;
++	struct cnss_plat_ipc_daemon_record *record;
+ 
+ 	for (i = 0; i < CNSS_DAEMON_CFG_WAIT_RETRY; i++) {
+-		if (daemon_cfg.initialized == 1)
+-			break;
+-
++		mutex_lock(&svc->file_idr_lock);
++		if (svc->stopping || !qmi_client->client_connected) {
++			mutex_unlock(&svc->file_idr_lock);
++			return NULL;
++		}
++		record = qmi_client->config;
++		mutex_unlock(&svc->file_idr_lock);
++		if (record)
++			return &record->config;
+ 		msleep(CNSS_DAEMON_CFG_WAIT_MS);
+ 	}
+ 
+-	return &daemon_cfg;
++	return NULL;
+ }
+ EXPORT_SYMBOL(cnss_plat_ipc_qmi_daemon_config);
+ 
+@@ -813,26 +970,39 @@
+ {
+ 	struct cnss_plat_ipc_qmi_svc_ctx *svc = &plat_ipc_qmi_svc;
+ 	struct cnss_plat_ipc_qmi_client_ctx *qmi_client;
+-	int num_user;
+-
+-	if (client_id > CNSS_PLAT_IPC_MAX_QMI_CLIENTS) {
++	struct cnss_plat_ipc_user *user;
++	int i, ret = -ENOSPC;
++
++	if ((u32)client_id > CNSS_PLAT_IPC_MAX_QMI_CLIENTS ||
++	    !connection_update_cb) {
+ 		cnss_plat_ipc_err("Invalid Client ID: %d\n", client_id);
+ 		return -EINVAL;
+ 	}
+ 
+ 	qmi_client = &svc->qmi_client_ctx[client_id];
+-	num_user = qmi_client->num_user;
+-
+-	if (num_user >= CNSS_PLAT_IPC_MAX_USER) {
+-		cnss_plat_ipc_err("Max Service users reached\n");
+-		return -EINVAL;
+-	}
+-
+-	qmi_client->connection_update_cb[num_user] = connection_update_cb;
+-	qmi_client->cb_ctx[num_user] = cb_ctx;
+-	qmi_client->num_user++;
+-
+-	return 0;
++	user = kzalloc(sizeof(*user), GFP_KERNEL);
++	if (!user)
++		return -ENOMEM;
++	user->callback = connection_update_cb;
++	user->context = cb_ctx;
++	mutex_lock(&cnss_plat_ipc_user_lock);
++	if (READ_ONCE(svc->stopping)) {
++		ret = -ESHUTDOWN;
++		goto unlock;
++	}
++
++	for (i = 0; i < CNSS_PLAT_IPC_MAX_USER; i++) {
++		if (rcu_access_pointer(qmi_client->users[i]))
++			continue;
++		rcu_assign_pointer(qmi_client->users[i], user);
++		user = NULL;
++		ret = 0;
++		break;
++	}
++unlock:
++	mutex_unlock(&cnss_plat_ipc_user_lock);
++	kfree(user);
++	return ret;
+ }
+ EXPORT_SYMBOL(cnss_plat_ipc_register);
+ 
+@@ -849,26 +1019,56 @@
+ {
+ 	struct cnss_plat_ipc_qmi_svc_ctx *svc = &plat_ipc_qmi_svc;
+ 	struct cnss_plat_ipc_qmi_client_ctx *qmi_client;
++	struct cnss_plat_ipc_user *user = NULL;
+ 	int i;
+ 
+-	if (client_id > CNSS_PLAT_IPC_MAX_QMI_CLIENTS) {
++	if ((u32)client_id > CNSS_PLAT_IPC_MAX_QMI_CLIENTS) {
+ 		cnss_plat_ipc_err("Invalid Client ID: %d\n", client_id);
+ 		return;
+ 	}
+ 
+ 	qmi_client = &svc->qmi_client_ctx[client_id];
+ 
+-	for (i = 0; i < qmi_client->num_user; i++) {
+-		if (qmi_client->cb_ctx[i] == cb_ctx) {
+-			qmi_client->cb_ctx[i] = NULL;
+-			qmi_client->connection_update_cb[i] = NULL;
+-			qmi_client->num_user--;
++	mutex_lock(&cnss_plat_ipc_user_lock);
++	for (i = 0; i < CNSS_PLAT_IPC_MAX_USER; i++) {
++		user = rcu_dereference_protected(qmi_client->users[i],
++						 lockdep_is_held(&cnss_plat_ipc_user_lock));
++		if (user && user->context == cb_ctx) {
++			RCU_INIT_POINTER(qmi_client->users[i], NULL);
+ 			break;
+ 		}
++		user = NULL;
++	}
++	mutex_unlock(&cnss_plat_ipc_user_lock);
++	if (user) {
++		synchronize_srcu(&cnss_plat_ipc_user_srcu);
++		kfree(user);
+ 	}
+ }
+ EXPORT_SYMBOL(cnss_plat_ipc_unregister);
+ 
++static void cnss_plat_ipc_clear_users(void)
++{
++	struct cnss_plat_ipc_user *user;
++	struct cnss_plat_ipc_qmi_client_ctx *qmi_client;
++	int client, i;
++
++	for (client = 0; client <= CNSS_PLAT_IPC_MAX_QMI_CLIENTS; client++) {
++		qmi_client = &plat_ipc_qmi_svc.qmi_client_ctx[client];
++		for (i = 0; i < CNSS_PLAT_IPC_MAX_USER; i++) {
++			mutex_lock(&cnss_plat_ipc_user_lock);
++			user = rcu_dereference_protected(qmi_client->users[i],
++							 lockdep_is_held(&cnss_plat_ipc_user_lock));
++			RCU_INIT_POINTER(qmi_client->users[i], NULL);
++			mutex_unlock(&cnss_plat_ipc_user_lock);
++			if (user) {
++				synchronize_srcu(&cnss_plat_ipc_user_srcu);
++				kfree(user);
++			}
++		}
++	}
++}
++
+ /**
+  * cnss_plat_ipc_init_fn() - CNSS Platform qmi service init function
+  *
+@@ -880,13 +1080,19 @@
+ {
+ 	int ret = 0, retry = 0;
+ 	struct cnss_plat_ipc_qmi_svc_ctx *svc = &plat_ipc_qmi_svc;
+-
+-	svc->svc_hdl = kzalloc(sizeof(*svc->svc_hdl), GFP_KERNEL);
+-	if (!svc->svc_hdl)
++	struct qmi_handle *handle;
++	struct cnss_plat_ipc_file_data *fd;
++	u32 id;
++	int i;
++
++	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
++	if (!handle)
+ 		return;
+ 
+ retry:
+-	ret = qmi_handle_init(svc->svc_hdl,
++	if (READ_ONCE(svc->stopping))
++		goto free_svc_hdl;
++	ret = qmi_handle_init(handle,
+ 			      CNSS_PLAT_IPC_QMI_MAX_MSG_SIZE_V01,
+ 			      &cnss_plat_ipc_qmi_ops,
+ 			      cnss_plat_ipc_qmi_req_handlers);
+@@ -903,8 +1109,14 @@
+ 				  QMI_INIT_RETRY_MAX_TIMES, ret);
+ 		goto free_svc_hdl;
+ 	}
+-
+-	ret = qmi_add_server(svc->svc_hdl,
++	if (READ_ONCE(svc->stopping))
++		goto release_svc_hdl;
++
++	mutex_lock(&svc->file_idr_lock);
++	svc->svc_hdl = handle;
++	mutex_unlock(&svc->file_idr_lock);
++
++	ret = qmi_add_server(handle,
+ 			     CNSS_PLATFORM_SERVICE_ID_V01,
+ 			     CNSS_PLATFORM_SERVICE_VERS_V01, 0);
+ 	if (ret < 0) {
+@@ -913,14 +1125,22 @@
+ 	}
+ 
+ 	cnss_plat_ipc_info("CNSS Platform IPC QMI Service is started\n");
+-	idr_init(&svc->file_idr);
+-	mutex_init(&svc->file_idr_lock);
+ 	return;
+ 
+ release_svc_hdl:
+-	qmi_handle_release(svc->svc_hdl);
++	mutex_lock(&svc->file_idr_lock);
++	if (svc->svc_hdl == handle)
++		svc->svc_hdl = NULL;
++	for (i = 0; i <= CNSS_PLAT_IPC_MAX_QMI_CLIENTS; i++) {
++		WRITE_ONCE(svc->qmi_client_ctx[i].client_connected, false);
++		svc->qmi_client_ctx[i].config = NULL;
++	}
++	idr_for_each_entry(&svc->file_idr, fd, id)
++		cnss_plat_ipc_finish_file(fd, -ENOTCONN);
++	mutex_unlock(&svc->file_idr_lock);
++	qmi_handle_release(handle);
+ free_svc_hdl:
+-	kfree(svc->svc_hdl);
++	kfree(handle);
+ }
+ 
+ /**
+@@ -941,8 +1161,10 @@
+ 			break;
+ 	}
+ 
+-	if (dn)
++	if (dn) {
++		of_node_put(dn);
+ 		return true;
++	}
+ 
+ 	return false;
+ }
+@@ -953,6 +1175,10 @@
+ {
+ 	if (!cnss_plat_ipc_is_valid_dt_node_found())
+ 		return -ENODEV;
++
++	idr_init(&plat_ipc_qmi_svc.file_idr);
++	mutex_init(&plat_ipc_qmi_svc.file_idr_lock);
++	init_waitqueue_head(&plat_ipc_qmi_svc.file_wait);
+ 
+ 	/* Schedule a work to do real init to avoid blocking here */
+ 	cnss_plat_ipc_logging_init();
+@@ -970,13 +1196,33 @@
+ static void __exit cnss_plat_ipc_qmi_svc_exit(void)
+ {
+ 	struct cnss_plat_ipc_qmi_svc_ctx *svc = &plat_ipc_qmi_svc;
++	struct cnss_plat_ipc_file_data *fd;
++	struct qmi_handle *handle;
++	u32 id;
++	struct cnss_plat_ipc_daemon_record *record, *tmp;
++
++	mutex_lock(&svc->file_idr_lock);
++	WRITE_ONCE(svc->stopping, true);
++	idr_for_each_entry(&svc->file_idr, fd, id)
++		cnss_plat_ipc_finish_file(fd, -ESHUTDOWN);
++	mutex_unlock(&svc->file_idr_lock);
+ 
+ 	cancel_work_sync(&cnss_plat_ipc_init_work);
+ 
+-	if (svc->svc_hdl) {
+-		qmi_handle_release(svc->svc_hdl);
+-		kfree(svc->svc_hdl);
+-		idr_destroy(&svc->file_idr);
++	mutex_lock(&svc->file_idr_lock);
++	handle = svc->svc_hdl;
++	svc->svc_hdl = NULL;
++	mutex_unlock(&svc->file_idr_lock);
++	if (handle) {
++		qmi_handle_release(handle);
++		kfree(handle);
++	}
++	wait_event(svc->file_wait, !READ_ONCE(svc->active_files));
++	idr_destroy(&svc->file_idr);
++	cnss_plat_ipc_clear_users();
++	list_for_each_entry_safe(record, tmp, &cnss_plat_ipc_daemon_records, node) {
++		list_del(&record->node);
++		kfree(record);
+ 	}
+ 
+ 	cnss_plat_ipc_logging_deinit();
+--- a/platform/cnss_utils/cnss_plat_ipc_qmi.h
++++ b/platform/cnss_utils/cnss_plat_ipc_qmi.h
+@@ -42,6 +42,7 @@
+ 			   connection_update_cb, void *cb_ctx);
+ void cnss_plat_ipc_unregister(enum cnss_plat_ipc_qmi_client_id_v01 client_id,
+ 			      void *cb_ctx);
++/* Unregister drains callbacks; invoke it outside a connection callback. */
+ int cnss_plat_ipc_qmi_file_download(enum cnss_plat_ipc_qmi_client_id_v01
+ 				    client_id, char *file_name, char *buf,
+ 				    u32 *size);

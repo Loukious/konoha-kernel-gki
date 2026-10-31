@@ -2903,6 +2903,84 @@ ddk_module(
 )
 
 
+ddk_headers(
+    name = "wlan_qmi_headers",
+    hdrs = ["platform/cnss_utils/cnss_plat_ipc_qmi.h", "platform/cnss_utils/cnss_plat_ipc_service_v01.h"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "cnss_plat_ipc_qmi_svc",
+    srcs = ["platform/cnss_utils/cnss_plat_ipc_qmi.c", "platform/cnss_utils/cnss_plat_ipc_service_v01.c"],
+    out = "cnss_plat_ipc_qmi_svc.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":wlan_qmi_headers", ":remote_headers", ":platform_headers", ":qmi_helpers", ":qcom_ipc_logging"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_headers(
+    name = "gsi_qdss_headers",
+    hdrs = ["include/linux/ipa_usb.h", "include/linux/usb/usb_qdss.h", "include/uapi/linux/usb/usb_ctrl_qti.h"],
+    linux_includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "usb_f_gsi",
+    srcs = ["drivers/usb/gadget/function/f_gsi.c", "drivers/usb/gadget/function/f_gsi.h", "drivers/usb/gadget/function/rndis.c", "drivers/usb/gadget/function/rndis.h", "drivers/usb/gadget/function/u_rndis.h", "drivers/usb/gadget/function/u_ether.h", "drivers/usb/gadget/function/ndis.h"],
+    out = "usb_f_gsi.ko",
+    kconfig = "Kconfig", defconfig = "platform_defconfig", kernel_build = "//common:kernel_aarch64",
+    deps = [":gsi_qdss_headers", ":usb_phy_headers", ":platform_headers", ":qcom_ipc_logging", ":dwc3_msm"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "usb_f_qdss",
+    srcs = ["drivers/usb/gadget/function/f_qdss.c", "drivers/usb/gadget/function/f_qdss.h", "drivers/usb/gadget/function/u_qdss.c"],
+    out = "usb_f_qdss.ko",
+    kconfig = "Kconfig", defconfig = "platform_defconfig", kernel_build = "//common:kernel_aarch64",
+    deps = [":gsi_qdss_headers", ":usb_phy_headers", ":platform_headers", ":qcom_ipc_logging", ":dwc3_msm"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_headers(
+    name = "audio_ion_headers",
+    hdrs = ["qcom/opensource/audio-kernel/include/dsp/msm_audio_ion.h", "qcom/opensource/audio-kernel/include/uapi/audio/linux/msm_audio.h"],
+    includes = ["qcom/opensource/audio-kernel/include", "qcom/opensource/audio-kernel/include/uapi/audio"],
+)
+
+ddk_module(
+    name = "audpkt_ion_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/dsp/msm_audio_ion.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "audpkt_ion_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_ion_headers", ":scm_headers", ":iommu_headers", ":qcom_scm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_headers(
+    name = "pathcontrol_headers",
+    hdrs = ["drivers/power/supply/mca/include/mca/hardware/hw_path_control.h"],
+    includes = ["drivers/power/supply/mca/include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_path_control",
+    srcs = ["drivers/power/supply/mca/mca_hardware_monitor/mca_path_control.c", "drivers/power/supply/mca/mca_hardware_monitor/inc/mca_path_control.h"],
+    out = "mca_path_control.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":pathcontrol_headers", ":mca_headers", ":chargebusiness_headers", ":mca_strategy_fg_class", ":chargehw_headers", ":chargepolicy_headers", ":mca_platform_cp_class", ":mca_common", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_sysfs", ":mca_hwid", ":mca_workqueue", ":mca_charge_mievent", ":mca_platform_buckchg_class", ":mca_strategy_class", ":mca_protocol_class", ":mca_protocol_pd_class"],
+    visibility = ["//visibility:public"],
+)
+
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3119,6 +3197,11 @@ kernel_module_group(
         ":mca_bmd",
         ":mca_pd_auth",
         ":mca_charger_thermal",
+        ":cnss_plat_ipc_qmi_svc",
+        ":usb_f_gsi",
+        ":usb_f_qdss",
+        ":audpkt_ion_dlkm",
+        ":mca_path_control",
     ],
 )
 

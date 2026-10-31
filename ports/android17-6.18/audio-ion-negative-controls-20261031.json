@@ -1,0 +1,84 @@
+{
+  "tests": {
+    "basic": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-ion-tests-5bkmlq46/test.c:1191: basic: Assertion `msm_audio_get_phy_addr(0,&addr,&len)==-ENOENT' failed."
+    },
+    "identity": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-ion-tests-5bkmlq46/test.c:1192: identity: Assertion `msm_audio_get_phy_addr(0,&addr,&len)==-ENOENT' failed."
+    },
+    "sharing": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-ion-tests-5bkmlq46/test.c:1193: sharing: Assertion `maps==1' failed."
+    },
+    "ranges": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-ion-tests-5bkmlq46/test.c:155: qcom_scm_assign_mem: Assertion `b' failed."
+    },
+    "secure": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-ion-tests-5bkmlq46/test.c:155: qcom_scm_assign_mem: Assertion `!b->secure' failed."
+    },
+    "quarantine": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-ion-tests-5bkmlq46/test.c:1196: quarantine: Assertion `buffers[0].secure&&attachments==1&&module_pins==1' failed."
+    },
+    "faults": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-ion-tests-5bkmlq46/test.c:1197: faults: Assertion `ioctl_fd(0,IOCTL_MAP_PHYS_ADDR,0)==-ENOMEM&&buffers[0].refs==1&&!attachments' failed."
+    },
+    "cleanup": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-ion-tests-5bkmlq46/test.c:91: unregister_chrdev_region: Assertion `d' failed."
+    },
+    "crash_secure": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-ion-tests-5bkmlq46/test.c:1199: crash_secure: Assertion `buffers[0].secure&&attachments==1&&buffers[0].refs==2' failed."
+    },
+    "shared_secure": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-ion-tests-5bkmlq46/test.c:155: qcom_scm_assign_mem: Assertion `b->secure' failed."
+    },
+    "providers": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-ion-tests-5bkmlq46/test.c:1201: providers: Assertion `ioctl_fd(1,IOCTL_MAP_PHYS_ADDR,0)==-EBUSY' failed."
+    },
+    "boundaries": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-ion-tests-5bkmlq46/test.c:1202: boundaries: Assertion `ioctl_fd(0,IOCTL_MAP_PHYS_ADDR,0)==-EINVAL' failed."
+    },
+    "open_remove": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "==1985086==ERROR: AddressSanitizer: heap-use-after-free on address 0x70e9111e0050 at pc 0x5c129015b508 bp 0x7ffcd1e57ab0 sp 0x7ffcd1e57aa0"
+    },
+    "removal": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-ion-tests-5bkmlq46/test.c:1209: removal: Assertion `!atomic_load(&removal_done)' failed."
+    }
+  },
+  "source_sha256": {
+    "qcom/opensource/audio-kernel/dsp/msm_audio_ion.c": "11de6707e4201d8198b7be5828de77ffde5379ccf69c53dbb1941395ffab20f5",
+    "qcom/opensource/audio-kernel/include/uapi/audio/linux/msm_audio.h": "2a4734576a3697e1540e59c409c1d5dde615fbcbf428a40b12c01a1ad7c97c66"
+  },
+  "harness_sha256": "7efca9fb4f664887e3bc4bfeae675ff82faed51f2f3a2a830bab4288a0a16f0f",
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Full native audio DMA-buffer source and exact UAPI with simulated dma-buf/scatter-gather/SCM/device/cdev behavior, fault injection and real pthread map/remove contention; no real IOMMU, SCM firmware, DMA cache behavior, cdev core scheduling or hardware verification."
+}

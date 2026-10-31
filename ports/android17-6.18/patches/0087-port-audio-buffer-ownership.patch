@@ -1,0 +1,1545 @@
+--- a/qcom/opensource/audio-kernel/dsp/msm_audio_ion.c
++++ b/qcom/opensource/audio-kernel/dsp/msm_audio_ion.c
+@@ -4,988 +4,579 @@
+  * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
+-#include <linux/init.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+-#include <linux/err.h>
+-#include <linux/delay.h>
+ #include <linux/slab.h>
+ #include <linux/mutex.h>
+ #include <linux/list.h>
++#include <linux/dma-buf.h>
+ #include <linux/dma-mapping.h>
+-#include <linux/dma-buf.h>
+-#include <linux/iosys-map.h>
++#include <linux/scatterlist.h>
+ #include <linux/platform_device.h>
+-#include <linux/of_platform.h>
+-#include <linux/of_device.h>
+-#include <linux/export.h>
+-#include <linux/ioctl.h>
++#include <linux/of.h>
+ #include <linux/cdev.h>
+ #include <linux/fs.h>
+ #include <linux/device.h>
+-#include <linux/version.h>
+-#ifndef CONFIG_SPF_CORE
+-#include <ipc/apr.h>
+-#endif
+-#include <dsp/msm_audio_ion.h>
++#include <linux/overflow.h>
++#include <linux/sizes.h>
+ #include <linux/msm_audio.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
+ #include <soc/qcom/secure_buffer.h>
+-#include <linux/of.h>
+-
+-MODULE_IMPORT_NS(DMA_BUF);
+-
+-#define MSM_AUDIO_ION_PROBED (1 << 0)
+-
+-#define MSM_AUDIO_ION_PHYS_ADDR(alloc_data) \
+-	alloc_data->table->sgl->dma_address
+-
+-#define MSM_AUDIO_SMMU_SID_OFFSET 32
+-
+-#define TZ_PIL_PROTECT_MEM_SUBSYS_ID 0x0C
+-#define TZ_PIL_CLEAR_PROTECT_MEM_SUBSYS_ID 0x0D
+-#define MSM_AUDIO_ION_DRIVER_NAME "msm_audio_ion"
+-#define MINOR_NUMBER_COUNT 1
++#include <dsp/msm_audio_ion.h>
++
++MODULE_IMPORT_NS("DMA_BUF");
++
+ struct msm_audio_ion_private {
++	struct device chardev;
++	struct device *cb_dev;
++	struct class *class;
++	struct cdev cdev;
++	dev_t devt;
+ 	bool smmu_enabled;
+-	struct device *cb_dev;
+-	u8 device_status;
+-	struct list_head alloc_list;
+-	struct mutex list_mutex;
+-	u64 smmu_sid_bits;
+-	u32 smmu_version;
+-	bool is_non_hypervisor;
+-	char *driver_name;
+-	/*char dev related data */
+-	dev_t ion_major;
+-	struct class *ion_class;
+-	struct device *chardev;
+-	struct cdev cdev;
++	bool stopping;
++	u64 sid_bits;
+ };
+ 
++struct msm_audio_map_ref {
++	struct list_head node;
++	struct file *file;
++};
++
+ struct msm_audio_alloc_data {
+-	size_t len;
+-	struct iosys_map *vmap;
+-	struct dma_buf *dma_buf;
++	struct list_head node;
++	struct list_head files;
++	struct msm_audio_ion_private *priv;
++	struct dma_buf *buffer;
+ 	struct dma_buf_attachment *attach;
+ 	struct sg_table *table;
+-	struct list_head list;
++	dma_addr_t address;
++	phys_addr_t physical;
++	size_t length;
++	bool hyp_assigned;
+ };
+ 
+-struct msm_audio_ion_fd_list_private {
+-	struct mutex list_mutex;
+-	/*list to store fd, phy. addr and handle data */
+-	struct list_head fd_list;
+-};
+-
+-static struct msm_audio_ion_fd_list_private msm_audio_ion_fd_list = {0,};
+-static bool msm_audio_ion_fd_list_init = false;
+-
+-struct msm_audio_fd_data {
+-	int fd;
+-	size_t plen;
+-	void *handle;
+-	dma_addr_t paddr;
+-	struct device *dev;
+-	struct list_head list;
+-	bool hyp_assign;
+-};
+-
+-static void msm_audio_ion_add_allocation(
+-	struct msm_audio_ion_private *msm_audio_ion_data,
+-	struct msm_audio_alloc_data *alloc_data)
+-{
+-	/*
+-	 * Since these APIs can be invoked by multiple
+-	 * clients, there is need to make sure the list
+-	 * of allocations is always protected
+-	 */
+-	mutex_lock(&(msm_audio_ion_data->list_mutex));
+-	list_add_tail(&(alloc_data->list),
+-		      &(msm_audio_ion_data->alloc_list));
+-	mutex_unlock(&(msm_audio_ion_data->list_mutex));
+-}
+-
+-/* This function is called with ion_data list mutex lock */
+-static int msm_audio_ion_map_kernel(struct dma_buf *dma_buf,
+-	struct msm_audio_ion_private *ion_data, struct iosys_map *iosys_vmap)
+-{
+-	int rc = 0;
+-	struct msm_audio_alloc_data *alloc_data = NULL;
+-
+-	rc = dma_buf_begin_cpu_access(dma_buf, DMA_BIDIRECTIONAL);
+-	if (rc) {
+-		pr_err("%s: kmap dma_buf_begin_cpu_access fail\n", __func__);
+-		goto exit;
+-	}
+-
+-#if (KERNEL_VERSION(6, 2, 0) <= LINUX_VERSION_CODE)
+-	rc = dma_buf_vmap_unlocked(dma_buf, iosys_vmap);
+-#else
+-	rc = dma_buf_vmap(dma_buf, iosys_vmap);
+-#endif
+-	if (rc) {
+-		pr_err("%s: kernel mapping of dma_buf failed\n",
+-		       __func__);
+-		dma_buf_end_cpu_access(dma_buf, DMA_BIDIRECTIONAL);
+-		goto exit;
+-	}
+-
+-	/*
+-	 * TBD: remove the below section once new API
+-	 * for mapping kernel virtual address is available.
+-	 */
+-	mutex_lock(&(ion_data->list_mutex));
+-	list_for_each_entry(alloc_data, &(ion_data->alloc_list),
+-			    list) {
+-		if (alloc_data->dma_buf == dma_buf) {
+-			alloc_data->vmap = iosys_vmap;
+-			break;
+-		}
+-	}
+-	mutex_unlock(&(ion_data->list_mutex));
+-
+-exit:
+-	return rc;
+-}
+-
+-/* This function is called with ion_data list mutex lock */
+-static int msm_audio_dma_buf_map(struct dma_buf *dma_buf,
+-				 dma_addr_t *addr, size_t *len, bool is_iova,
+-				 struct msm_audio_ion_private *ion_data)
+-{
+-
+-	struct msm_audio_alloc_data *alloc_data = NULL;
+-	int rc = 0;
+-	struct iosys_map *iosys_vmap = NULL;
+-	struct device *cb_dev = ion_data->cb_dev;
+-
+-	iosys_vmap = kzalloc(sizeof(*iosys_vmap), GFP_KERNEL);
+-	if (!iosys_vmap)
+-		return -ENOMEM;
+-	/* Data required per buffer mapping */
+-	alloc_data = kzalloc(sizeof(*alloc_data), GFP_KERNEL);
+-	if (!alloc_data) {
+-		kfree(iosys_vmap);
+-		return -ENOMEM;
+-	}
+-	alloc_data->dma_buf = dma_buf;
+-	alloc_data->len = dma_buf->size;
+-	*len = dma_buf->size;
+-
+-	/* Attach the dma_buf to context bank device */
+-	alloc_data->attach = dma_buf_attach(alloc_data->dma_buf,
+-					    cb_dev);
+-	if (IS_ERR(alloc_data->attach)) {
+-		rc = PTR_ERR(alloc_data->attach);
+-		dev_err(cb_dev,
+-			"%s: Fail to attach dma_buf to CB, rc = %d\n",
+-			__func__, rc);
+-		goto free_alloc_data;
+-	}
+-
+-	/*
+-	 * Get the scatter-gather list.
+-	 * There is no info as this is a write buffer or
+-	 * read buffer, hence the request is bi-directional
+-	 * to accommodate both read and write mappings.
+-	 */
+-#if (KERNEL_VERSION(6, 2, 0) <= LINUX_VERSION_CODE)
+-	alloc_data->table = dma_buf_map_attachment_unlocked(alloc_data->attach,
+-				DMA_BIDIRECTIONAL);
+-#else
+-	alloc_data->table = dma_buf_map_attachment(alloc_data->attach,
+-				DMA_BIDIRECTIONAL);
+-#endif
+-	if (IS_ERR(alloc_data->table)) {
+-		rc = PTR_ERR(alloc_data->table);
+-		dev_err(cb_dev,
+-			"%s: Fail to map attachment, rc = %d[TF-NOSOUND][ION]\n",
+-			__func__, rc);
+-		goto detach_dma_buf;
+-	}
+-
+-	/* physical address from mapping */
+-	if (!is_iova) {
+-		*addr = sg_phys(alloc_data->table->sgl);
+-		rc = msm_audio_ion_map_kernel((void *)dma_buf, ion_data, iosys_vmap);
+-		if (rc) {
+-			pr_err("%s: ION memory mapping for AUDIO failed, err:%d\n",
+-				__func__, rc);
+-			rc = -ENOMEM;
+-			goto detach_dma_buf;
+-		}
+-		alloc_data->vmap = iosys_vmap;
++/* Protect the registry, DMA/SCM transitions, file owners and provider removal. */
++static DEFINE_MUTEX(msm_audio_ion_lock);
++static LIST_HEAD(msm_audio_allocations);
++
++static struct msm_audio_alloc_data *msm_audio_find_buffer(struct dma_buf *buffer)
++{
++	struct msm_audio_alloc_data *data;
++
++	list_for_each_entry(data, &msm_audio_allocations, node)
++		if (data->buffer == buffer)
++			return data;
++	return NULL;
++}
++
++static struct msm_audio_map_ref *
++msm_audio_find_file(struct msm_audio_alloc_data *data, struct file *file)
++{
++	struct msm_audio_map_ref *ref;
++
++	list_for_each_entry(ref, &data->files, node)
++		if (ref->file == file)
++			return ref;
++	return NULL;
++}
++
++/* A single address may be advertised only for a contiguous mapped span. */
++static int msm_audio_dma_span(struct sg_table *table, size_t length,
++			      dma_addr_t *address)
++{
++	struct scatterlist *sg;
++	dma_addr_t base, next;
++	size_t covered = 0;
++	unsigned int i;
++
++	if (!table || !table->sgl || !table->nents || !length)
++		return -EINVAL;
++	base = sg_dma_address(table->sgl);
++	for_each_sgtable_dma_sg(table, sg, i) {
++		if (check_add_overflow(base, (dma_addr_t)covered, &next) ||
++		    sg_dma_address(sg) != next || !sg_dma_len(sg) ||
++		    check_add_overflow(covered, (size_t)sg_dma_len(sg), &covered))
++			return -EINVAL;
++		if (covered >= length) {
++			if (check_add_overflow(base, (dma_addr_t)length - 1, &next))
++				return -EOVERFLOW;
++			*address = base;
++			return 0;
++		}
++	}
++	return -EINVAL;
++}
++
++static int msm_audio_physical_span(struct sg_table *table, size_t length,
++				   phys_addr_t *address)
++{
++	struct scatterlist *sg;
++	phys_addr_t base, next;
++	size_t covered = 0;
++	unsigned int i;
++
++	if (!table->orig_nents)
++		return -EINVAL;
++	base = sg_phys(table->sgl);
++	for_each_sgtable_sg(table, sg, i) {
++		if (check_add_overflow(base, (phys_addr_t)covered, &next) ||
++		    sg_phys(sg) != next || !sg->length ||
++		    check_add_overflow(covered, (size_t)sg->length, &covered))
++			return -EINVAL;
++		if (covered >= length) {
++			if (check_add_overflow(base, (phys_addr_t)length - 1, &next))
++				return -EOVERFLOW;
++			*address = base;
++			return 0;
++		}
++	}
++	return -EINVAL;
++}
++
++static int msm_audio_hyp_unassign(struct msm_audio_alloc_data *data)
++{
++	struct qcom_scm_vmperm destinations[] = {
++		{ QCOM_SCM_VMID_HLOS, PERM_READ | PERM_WRITE | PERM_EXEC },
++	};
++	u64 sources = BIT_ULL(VMID_LPASS) | BIT_ULL(VMID_ADSP_HEAP);
++	int ret;
++
++	if (!data->hyp_assigned)
++		return 0;
++	ret = qcom_scm_assign_mem(data->physical, data->length, &sources,
++				  destinations, ARRAY_SIZE(destinations));
++	if (!ret)
++		data->hyp_assigned = false;
++	return ret;
++}
++
++/* Do not release a mapping while its memory remains assigned to the DSP. */
++static int msm_audio_destroy_mapping(struct msm_audio_alloc_data *data)
++{
++	struct msm_audio_map_ref *ref, *next;
++	struct device *dev = &data->priv->chardev;
++	int ret;
++
++	ret = msm_audio_hyp_unassign(data);
++	if (ret)
++		return ret;
++	list_for_each_entry_safe(ref, next, &data->files, node) {
++		list_del(&ref->node);
++		kfree(ref);
++	}
++	list_del(&data->node);
++	dma_buf_unmap_attachment_unlocked(data->attach, data->table, DMA_BIDIRECTIONAL);
++	dma_buf_detach(data->buffer, data->attach);
++	dma_buf_put(data->buffer);
++	kfree(data);
++	put_device(dev);
++	module_put(THIS_MODULE);
++	return 0;
++}
++
++static int msm_audio_map_fd(struct msm_audio_ion_private *priv,
++			    struct file *file, int fd)
++{
++	struct msm_audio_alloc_data *data;
++	struct msm_audio_map_ref *ref;
++	struct dma_buf *buffer;
++	int ret;
++
++	buffer = dma_buf_get(fd);
++	if (IS_ERR(buffer))
++		return PTR_ERR(buffer);
++	data = msm_audio_find_buffer(buffer);
++	if (data) {
++		if (data->priv != priv || list_empty(&data->files)) {
++			ret = -EBUSY;
++			goto put_buffer;
++		}
++		if (msm_audio_find_file(data, file)) {
++			ret = 0;
++			goto put_buffer;
++		}
++		ref = kzalloc(sizeof(*ref), GFP_KERNEL);
++		if (!ref) {
++			ret = -ENOMEM;
++			goto put_buffer;
++		}
++		ref->file = file;
++		list_add_tail(&ref->node, &data->files);
++		ret = 0;
++		goto put_buffer;
++	}
++	ref = kzalloc(sizeof(*ref), GFP_KERNEL);
++	if (!ref) {
++		ret = -ENOMEM;
++		goto put_buffer;
++	}
++	data = kzalloc(sizeof(*data), GFP_KERNEL);
++	if (!data) {
++		ret = -ENOMEM;
++		goto free_ref;
++	}
++	data->priv = priv;
++	data->buffer = buffer;
++	data->length = buffer->size;
++	INIT_LIST_HEAD(&data->files);
++	data->attach = dma_buf_attach(buffer, priv->cb_dev);
++	if (IS_ERR(data->attach)) {
++		ret = PTR_ERR(data->attach);
++		goto free_data;
++	}
++	data->table = dma_buf_map_attachment_unlocked(data->attach, DMA_BIDIRECTIONAL);
++	if (IS_ERR(data->table)) {
++		ret = PTR_ERR(data->table);
++		goto detach;
++	}
++	ret = msm_audio_dma_span(data->table, data->length, &data->address);
++	if (ret)
++		goto unmap;
++	if (priv->smmu_enabled) {
++		if (data->address >> 32 || (data->length - 1) >> 32 ||
++		    data->address + data->length - 1 > U32_MAX) {
++			ret = -EOVERFLOW;
++			goto unmap;
++		}
++		data->address |= priv->sid_bits;
+ 	} else {
+-		*addr = MSM_AUDIO_ION_PHYS_ADDR(alloc_data);
+-		kfree(iosys_vmap);
+-	}
+-
+-	msm_audio_ion_add_allocation(ion_data, alloc_data);
+-	return rc;
+-
+-detach_dma_buf:
+-	dma_buf_detach(alloc_data->dma_buf,
+-		       alloc_data->attach);
+-free_alloc_data:
+-	kfree(iosys_vmap);
+-	kfree(alloc_data);
+-	alloc_data = NULL;
+-
+-	return rc;
+-}
+-
+-static int msm_audio_dma_buf_unmap(struct dma_buf *dma_buf, struct msm_audio_ion_private *ion_data)
+-{
+-	int rc = 0;
+-	struct msm_audio_alloc_data *alloc_data = NULL;
+-	struct list_head *ptr, *next;
+-	bool found = false;
+-	struct device *cb_dev = ion_data->cb_dev;
+-
+-	/*
+-	 * Though list_for_each_safe is delete safe, lock
+-	 * should be explicitly acquired to avoid race condition
+-	 * on adding elements to the list.
+-	 */
+-	list_for_each_safe(ptr, next,
+-			    &(ion_data->alloc_list)) {
+-
+-		alloc_data = list_entry(ptr, struct msm_audio_alloc_data,
+-					list);
+-
+-		if (alloc_data->dma_buf == dma_buf) {
+-			found = true;
+-#if (KERNEL_VERSION(6, 2, 0) <= LINUX_VERSION_CODE)
+-			dma_buf_unmap_attachment_unlocked(alloc_data->attach,
+-					alloc_data->table, DMA_BIDIRECTIONAL);
+-#else
+-			dma_buf_unmap_attachment(alloc_data->attach,
+-						 alloc_data->table,
+-						 DMA_BIDIRECTIONAL);
+-#endif
+-			dma_buf_detach(alloc_data->dma_buf,
+-				       alloc_data->attach);
+-
+-			dma_buf_put(alloc_data->dma_buf);
+-
+-			list_del(&(alloc_data->list));
+-			kfree(alloc_data->vmap);
+-			kfree(alloc_data);
+-			alloc_data = NULL;
+-			break;
+-		}
+-	}
+-
+-	if (!found) {
+-		dev_err(cb_dev,
+-			"%s: cannot find allocation, dma_buf %pK",
+-			__func__, dma_buf);
+-		rc = -EINVAL;
+-	}
+-
+-	return rc;
+-}
+-
+-static int msm_audio_ion_get_phys(struct dma_buf *dma_buf,
+-				  dma_addr_t *addr, size_t *len, bool is_iova,
+-				  struct msm_audio_ion_private *ion_data)
+-{
+-	int rc = 0;
+-
+-	rc = msm_audio_dma_buf_map(dma_buf, addr, len, is_iova, ion_data);
+-	if (rc) {
+-		pr_err("%s: failed to map DMA buf, err = %d\n",
+-			__func__, rc);
+-		goto err;
+-	}
+-	if (ion_data->smmu_enabled && is_iova) {
+-		/* Append the SMMU SID information to the IOVA address */
+-		*addr |= ion_data->smmu_sid_bits;
+-	}
+-
+-	pr_debug("phys=%pK, len=%zd, rc=%d\n", &(*addr), *len, rc);
+-err:
+-	return rc;
+-}
+-
+-static int msm_audio_ion_unmap_kernel(struct dma_buf *dma_buf, struct msm_audio_ion_private *ion_data)
+-{
+-	int rc = 0;
+-	struct iosys_map *iosys_vmap = NULL;
+-	struct msm_audio_alloc_data *alloc_data = NULL;
+-	struct device *cb_dev = ion_data->cb_dev;
+-
+-	/*
+-	 * TBD: remove the below section once new API
+-	 * for unmapping kernel virtual address is available.
+-	 */
+-	list_for_each_entry(alloc_data, &(ion_data->alloc_list),
+-			    list) {
+-		if (alloc_data->dma_buf == dma_buf) {
+-			iosys_vmap = alloc_data->vmap;
+-			break;
+-		}
+-	}
+-
+-	if (!iosys_vmap) {
+-		dev_err(cb_dev,
+-			"%s: cannot find allocation for dma_buf %pK",
+-			__func__, dma_buf);
+-		rc = -ENOENT;
+-		goto err;
+-	}
+-
+-#if (KERNEL_VERSION(6, 2, 0) <= LINUX_VERSION_CODE)
+-	dma_buf_vunmap_unlocked(dma_buf, iosys_vmap);
+-#else
+-	dma_buf_vunmap(dma_buf, iosys_vmap);
+-
+-#endif
+-	rc = dma_buf_end_cpu_access(dma_buf, DMA_BIDIRECTIONAL);
+-	if (rc) {
+-		dev_err(cb_dev, "%s: kmap dma_buf_end_cpu_access fail\n",
+-			__func__);
+-		goto err;
+-	}
+-
+-err:
+-	return rc;
+-}
+-
+-/* This function is called with ion_data list mutex lock */
+-static int msm_audio_ion_buf_map(struct dma_buf *dma_buf, dma_addr_t *paddr,
+-				 size_t *plen, struct iosys_map *iosys_vmap,
+-				 struct msm_audio_ion_private *ion_data)
+-{
+-	int rc = 0;
+-	bool is_iova = true;
+-
+-	if (!dma_buf || !paddr || !plen) {
+-		pr_err("%s: Invalid params\n", __func__);
++		ret = msm_audio_physical_span(data->table, data->length, &data->physical);
++		if (ret)
++			goto unmap;
++	}
++	if (!try_module_get(THIS_MODULE)) {
++		ret = -ENODEV;
++		goto unmap;
++	}
++	get_device(&priv->chardev);
++	ref->file = file;
++	list_add_tail(&ref->node, &data->files);
++	list_add_tail(&data->node, &msm_audio_allocations);
++	return 0;
++unmap:
++	dma_buf_unmap_attachment_unlocked(data->attach, data->table, DMA_BIDIRECTIONAL);
++detach:
++	dma_buf_detach(buffer, data->attach);
++free_data:
++	kfree(data);
++free_ref:
++	kfree(ref);
++put_buffer:
++	dma_buf_put(buffer);
++	return ret;
++}
++
++static int msm_audio_unmap_fd(struct msm_audio_ion_private *priv,
++			      struct file *file, int fd)
++{
++	struct msm_audio_alloc_data *data;
++	struct msm_audio_map_ref *ref;
++	struct dma_buf *buffer;
++	int ret = -ENOENT;
++
++	buffer = dma_buf_get(fd);
++	if (IS_ERR(buffer))
++		return PTR_ERR(buffer);
++	data = msm_audio_find_buffer(buffer);
++	if (!data || data->priv != priv)
++		goto put_buffer;
++	ref = msm_audio_find_file(data, file);
++	if (!ref)
++		goto put_buffer;
++	if (list_is_singular(&data->files)) {
++		ret = msm_audio_destroy_mapping(data);
++	} else {
++		list_del(&ref->node);
++		kfree(ref);
++		ret = 0;
++	}
++put_buffer:
++	dma_buf_put(buffer);
++	return ret;
++}
++
++static int msm_audio_hyp_fd(struct msm_audio_ion_private *priv,
++			    struct file *file, int fd, bool assign)
++{
++	struct qcom_scm_vmperm destinations[] = {
++		{ VMID_LPASS, PERM_READ | PERM_WRITE },
++		{ VMID_ADSP_HEAP, PERM_READ | PERM_WRITE },
++	};
++	struct msm_audio_alloc_data *data;
++	struct dma_buf *buffer;
++	u64 sources = BIT_ULL(QCOM_SCM_VMID_HLOS);
++	int ret = -ENOENT;
++
++	buffer = dma_buf_get(fd);
++	if (IS_ERR(buffer))
++		return PTR_ERR(buffer);
++	data = msm_audio_find_buffer(buffer);
++	if (!data || data->priv != priv || !msm_audio_find_file(data, file))
++		goto put_buffer;
++	if (!assign) {
++		ret = msm_audio_hyp_unassign(data);
++		goto put_buffer;
++	}
++	if (priv->smmu_enabled || !IS_ALIGNED(data->physical, SZ_4K) ||
++	    !IS_ALIGNED(data->length, SZ_4K)) {
++		ret = -EINVAL;
++		goto put_buffer;
++	}
++	if (data->hyp_assigned) {
++		ret = 0;
++		goto put_buffer;
++	}
++	ret = qcom_scm_assign_mem(data->physical, data->length, &sources,
++				  destinations, ARRAY_SIZE(destinations));
++	if (!ret)
++		data->hyp_assigned = true;
++put_buffer:
++	dma_buf_put(buffer);
++	return ret;
++}
++
++int msm_audio_get_phy_addr(int fd, dma_addr_t *paddr, size_t *pa_len)
++{
++	struct msm_audio_alloc_data *data;
++	struct dma_buf *buffer;
++	int ret = -ENOENT;
++
++	if (fd < 0 || !paddr || !pa_len)
+ 		return -EINVAL;
+-	}
+-
+-	rc = msm_audio_ion_get_phys(dma_buf, paddr, plen, is_iova, ion_data);
+-	if (rc) {
+-		pr_err("%s: ION Get Physical for AUDIO failed, rc = %d\n",
+-				__func__, rc);
+-		dma_buf_put(dma_buf);
+-		goto err;
+-	}
+-
+-	rc = msm_audio_ion_map_kernel(dma_buf, ion_data, iosys_vmap);
+-	if (rc) {
+-		pr_err("%s: ION memory mapping for AUDIO failed, err:%d\n",
+-			__func__, rc);
+-		rc = -ENOMEM;
+-		mutex_lock(&(ion_data->list_mutex));
+-		msm_audio_dma_buf_unmap(dma_buf, ion_data);
+-		mutex_unlock(&(ion_data->list_mutex));
+-		goto err;
+-	}
+-
+-err:
+-	return rc;
+-}
+-
+-void msm_audio_fd_list_debug(void)
+-{
+-	struct msm_audio_fd_data *msm_audio_fd_data = NULL;
+-
+-	list_for_each_entry(msm_audio_fd_data,
+-			&msm_audio_ion_fd_list.fd_list, list) {
+-		pr_debug("%s fd %d handle %pK phy. addr %pK\n", __func__,
+-			msm_audio_fd_data->fd, msm_audio_fd_data->handle,
+-			(void *)msm_audio_fd_data->paddr);
+-	}
+-}
+-
+-void msm_audio_update_fd_list(struct msm_audio_fd_data *msm_audio_fd_data)
+-{
+-	struct msm_audio_fd_data *msm_audio_fd_data1 = NULL;
+-
+-	mutex_lock(&(msm_audio_ion_fd_list.list_mutex));
+-	list_for_each_entry(msm_audio_fd_data1,
+-			&msm_audio_ion_fd_list.fd_list, list) {
+-		if (msm_audio_fd_data1->fd == msm_audio_fd_data->fd) {
+-			pr_err("%s fd already present, not updating the list",
+-				__func__);
+-			mutex_unlock(&(msm_audio_ion_fd_list.list_mutex));
+-			return;
+-		}
+-	}
+-	list_add_tail(&msm_audio_fd_data->list, &msm_audio_ion_fd_list.fd_list);
+-	mutex_unlock(&(msm_audio_ion_fd_list.list_mutex));
+-}
+-
+-void msm_audio_delete_fd_entry(void *handle, int handle_fd)
+-{
+-	struct msm_audio_fd_data *msm_audio_fd_data = NULL;
+-	struct list_head *ptr, *next;
+-
+-	if (!handle || !handle_fd) {
+-		pr_err("%s Invalid handle or fd\n", __func__);
+-		return;
+-	}
+-
+-	mutex_lock(&(msm_audio_ion_fd_list.list_mutex));
+-	list_for_each_safe(ptr, next,
+-			&msm_audio_ion_fd_list.fd_list) {
+-		msm_audio_fd_data = list_entry(ptr, struct msm_audio_fd_data,
+-					list);
+-		if (msm_audio_fd_data->handle == handle
+-				&& msm_audio_fd_data->fd == handle_fd) {
+-			pr_debug("%s deleting handle %pK with fd = %d entry from list\n",
+-				__func__, handle, handle_fd);
+-			list_del(&(msm_audio_fd_data->list));
+-			kfree(msm_audio_fd_data);
+-			break;
+-		}
+-	}
+-	mutex_unlock(&(msm_audio_ion_fd_list.list_mutex));
+-}
+-
+-int msm_audio_get_phy_addr(int fd, dma_addr_t *paddr, size_t *pa_len)
+-{
+-	struct msm_audio_fd_data *msm_audio_fd_data = NULL;
+-	int status = -EINVAL;
+-
+-	if (!paddr) {
+-		pr_err("%s Invalid paddr param status %d\n", __func__, status);
+-		return status;
+-	}
+-	pr_debug("%s, fd %d\n", __func__, fd);
+-	mutex_lock(&(msm_audio_ion_fd_list.list_mutex));
+-	list_for_each_entry(msm_audio_fd_data,
+-			&msm_audio_ion_fd_list.fd_list, list) {
+-		if (msm_audio_fd_data->fd == fd) {
+-			*paddr = msm_audio_fd_data->paddr;
+-			*pa_len = msm_audio_fd_data->plen;
+-			status = 0;
+-			pr_debug("%s Found fd %d paddr %pK\n",
+-				__func__, fd, paddr);
+-			mutex_unlock(&(msm_audio_ion_fd_list.list_mutex));
+-			return status;
+-		}
+-	}
+-	mutex_unlock(&(msm_audio_ion_fd_list.list_mutex));
+-	return status;
++	buffer = dma_buf_get(fd);
++	if (IS_ERR(buffer))
++		return PTR_ERR(buffer);
++	mutex_lock(&msm_audio_ion_lock);
++	data = msm_audio_find_buffer(buffer);
++	if (data && !data->priv->stopping && !list_empty(&data->files)) {
++		*paddr = data->address;
++		*pa_len = data->length;
++		ret = 0;
++	}
++	mutex_unlock(&msm_audio_ion_lock);
++	dma_buf_put(buffer);
++	return ret;
+ }
+ EXPORT_SYMBOL(msm_audio_get_phy_addr);
+ 
+-static int msm_audio_set_hyp_assign(int fd, bool assign)
+-{
+-	struct msm_audio_fd_data *msm_audio_fd_data = NULL;
+-	int status = -EINVAL;
+-	pr_debug("%s, fd %d\n", __func__, fd);
+-
+-	mutex_lock(&(msm_audio_ion_fd_list.list_mutex));
+-	list_for_each_entry(msm_audio_fd_data,
+-			&msm_audio_ion_fd_list.fd_list, list) {
+-		if (msm_audio_fd_data->fd == fd) {
+-			status = 0;
+-			pr_debug("%s Found fd %d\n", __func__, fd);
+-			msm_audio_fd_data->hyp_assign = assign;
+-			mutex_unlock(&(msm_audio_ion_fd_list.list_mutex));
+-			return status;
+-		}
+-	}
+-	mutex_unlock(&(msm_audio_ion_fd_list.list_mutex));
+-	return status;
+-}
+-
+-void msm_audio_get_handle(int fd, void **handle)
+-{
+-	struct msm_audio_fd_data *msm_audio_fd_data = NULL;
+-
+-	pr_debug("%s fd %d\n", __func__, fd);
+-	mutex_lock(&(msm_audio_ion_fd_list.list_mutex));
+-	*handle = NULL;
+-	list_for_each_entry(msm_audio_fd_data,
+-			&msm_audio_ion_fd_list.fd_list, list) {
+-		if (msm_audio_fd_data->fd == fd) {
+-			*handle = (struct dma_buf *)msm_audio_fd_data->handle;
+-			pr_debug("%s handle %pK\n", __func__, *handle);
+-			break;
+-		}
+-	}
+-	mutex_unlock(&(msm_audio_ion_fd_list.list_mutex));
+-}
+-
+-/**
+- * msm_audio_ion_import-
+- *        Import ION buffer with given file descriptor
+- *
+- * @dma_buf: dma_buf for the ION memory
+- * @fd: file descriptor for the ION memory
+- * @ionflag: flags associated with ION buffer
+- * @bufsz: buffer size
+- * @paddr: Physical address to be assigned with allocated region
+- * @plen: length of allocated region to be assigned
+- * @iosys_vmap: Virtual mapping vmap pointer to be assigned
+- *
+- * Returns 0 on success or error on failure
+- */
+-static int msm_audio_ion_import(struct dma_buf **dma_buf, int fd,
+-			unsigned long *ionflag, size_t bufsz,
+-			dma_addr_t *paddr, size_t *plen, struct iosys_map *iosys_vmap,
+-			struct msm_audio_ion_private *ion_data)
+-{
+-	int rc = 0;
+-
+-	if (!(ion_data->device_status & MSM_AUDIO_ION_PROBED)) {
+-		pr_debug("%s: probe is not done, deferred\n", __func__);
+-		return -EPROBE_DEFER;
+-	}
+-
+-	if (!dma_buf || !paddr || !plen) {
+-		pr_err("%s: Invalid params\n", __func__);
++void msm_audio_ion_crash_handler(void)
++{
++	struct msm_audio_alloc_data *data, *next;
++	int ret;
++
++	mutex_lock(&msm_audio_ion_lock);
++	list_for_each_entry_safe(data, next, &msm_audio_allocations, node) {
++		ret = msm_audio_destroy_mapping(data);
++		if (ret)
++			dev_err(&data->priv->chardev, "secure buffer retained: %d\n", ret);
++	}
++	mutex_unlock(&msm_audio_ion_lock);
++}
++EXPORT_SYMBOL(msm_audio_ion_crash_handler);
++
++static int msm_audio_ion_open(struct inode *inode, struct file *file)
++{
++	struct msm_audio_ion_private *priv =
++		container_of(inode->i_cdev, struct msm_audio_ion_private, cdev);
++	int ret = 0;
++
++	mutex_lock(&msm_audio_ion_lock);
++	if (priv->stopping) {
++		ret = -ENODEV;
++	} else {
++		get_device(&priv->chardev);
++		file->private_data = priv;
++	}
++	mutex_unlock(&msm_audio_ion_lock);
++	return ret;
++}
++
++static int msm_audio_ion_release(struct inode *inode, struct file *file)
++{
++	struct msm_audio_ion_private *priv = file->private_data;
++	struct msm_audio_alloc_data *data, *next;
++	struct msm_audio_map_ref *ref;
++	int ret;
++
++	mutex_lock(&msm_audio_ion_lock);
++	list_for_each_entry_safe(data, next, &msm_audio_allocations, node) {
++		ref = msm_audio_find_file(data, file);
++		if (!ref)
++			continue;
++		if (list_is_singular(&data->files)) {
++			ret = msm_audio_destroy_mapping(data);
++			if (!ret)
++				continue;
++			dev_err(&priv->chardev, "secure buffer retained on close: %d\n", ret);
++		}
++		list_del(&ref->node);
++		kfree(ref);
++	}
++	mutex_unlock(&msm_audio_ion_lock);
++	file->private_data = NULL;
++	put_device(&priv->chardev);
++	return 0;
++}
++
++static long msm_audio_ion_ioctl(struct file *file, unsigned int command,
++				unsigned long argument)
++{
++	struct msm_audio_ion_private *priv = file->private_data;
++	int fd = (int)argument;
++	long ret;
++
++	if (fd < 0 || (unsigned long)fd != argument)
+ 		return -EINVAL;
+-	}
+-
+-	/* bufsz should be 0 and fd shouldn't be 0 as of now */
+-	*dma_buf = dma_buf_get(fd);
+-	pr_debug("%s: dma_buf =%pK, fd=%d\n", __func__, *dma_buf, fd);
+-	if (IS_ERR_OR_NULL((void *)(*dma_buf))) {
+-		pr_err("%s: dma_buf_get failed\n", __func__);
+-		rc = -EINVAL;
+-		goto err;
+-	}
+-
+-	if (ionflag != NULL) {
+-		rc = dma_buf_get_flags(*dma_buf, ionflag);
+-		if (rc) {
+-			pr_err("%s: could not get flags for the dma_buf\n",
+-				__func__);
+-			goto err_ion_flag;
+-		}
+-	}
+-	if (ion_data->smmu_enabled) {
+-		rc = msm_audio_ion_buf_map(*dma_buf, paddr, plen, iosys_vmap, ion_data);
+-		if (rc) {
+-			pr_err("%s: failed to map ION buf, rc = %d [TF-NOSOUND]\n", __func__, rc);
+-			goto err;
+-		}
+-		pr_debug("%s: mapped address = %pK, size=%zd\n", __func__,
+-				iosys_vmap->vaddr, bufsz);
+-	} else {
+-		msm_audio_dma_buf_map(*dma_buf, paddr, plen, true, ion_data);
+-	}
+-	return 0;
+-
+-err_ion_flag:
+-	dma_buf_put(*dma_buf);
+-err:
+-	*dma_buf = NULL;
+-	return rc;
+-}
+-
+-/**
+- * msm_audio_ion_free -
+- *        fress ION memory for given client and handle
+- *
+- * @dma_buf: dma_buf for the ION memory
+- *
+- * Returns 0 on success or error on failure
+- */
+-/* This funtion is called with ion_data list mutex lock */
+-static int msm_audio_ion_free(struct dma_buf *dma_buf, struct msm_audio_ion_private *ion_data)
+-{
+-	int ret = 0;
+-
+-	if (!dma_buf) {
+-		pr_err("%s: dma_buf invalid\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	mutex_lock(&(ion_data->list_mutex));
+-	if (ion_data->smmu_enabled) {
+-		ret = msm_audio_ion_unmap_kernel(dma_buf, ion_data);
+-		if (ret) {
+-			mutex_unlock(&(ion_data->list_mutex));
+-			return ret;
+-		}
+-	}
+-
+-	msm_audio_dma_buf_unmap(dma_buf, ion_data);
+-
+-	mutex_unlock(&(ion_data->list_mutex));
+-	return 0;
+-}
+-
+-static int msm_audio_hyp_unassign(struct msm_audio_fd_data *msm_audio_fd_data)
+-{
+-	int ret = 0;
+-	u64 src_vmid_unmap_list = BIT(VMID_LPASS) | BIT(VMID_ADSP_HEAP);
+-	struct qcom_scm_vmperm dst_vmids_unmap[] = {{QCOM_SCM_VMID_HLOS,
+-		PERM_READ | PERM_WRITE | PERM_EXEC}};
+-
+-	if (msm_audio_fd_data->hyp_assign) {
+-		ret = qcom_scm_assign_mem(msm_audio_fd_data->paddr, msm_audio_fd_data->plen,
+-			&src_vmid_unmap_list, dst_vmids_unmap, ARRAY_SIZE(dst_vmids_unmap));
+-		if (ret < 0) {
+-			pr_err("%s: qcom assign unmap failed result = %d addr = 0x%llx size = %zu\n",
+-			__func__, ret, msm_audio_fd_data->paddr, msm_audio_fd_data->plen);
+-		}
+-		msm_audio_fd_data->hyp_assign = false;
+-		pr_debug("%s: qcom scm unmap success\n", __func__);
+-	}
+-	return ret;
+-}
+-
+-/**
+- * msm_audio_ion_crash_handler -
+- *        handles cleanup after userspace crashes.
+- *
+- * To be called from machine driver.
+- */
+-void msm_audio_ion_crash_handler(void)
+-{
+-	struct msm_audio_fd_data *msm_audio_fd_data = NULL;
+-	struct list_head *ptr, *next;
+-	void *handle = NULL;
+-	struct msm_audio_ion_private *ion_data = NULL;
+-
+-	pr_debug("Inside %s\n", __func__);
+-	if(!msm_audio_ion_fd_list_init) {
+-		pr_err("%s: list not initialized yet, hence returning .... ", __func__);
+-		return;
+-	}
+-	mutex_lock(&(msm_audio_ion_fd_list.list_mutex));
+-	list_for_each_entry(msm_audio_fd_data,
+-		&msm_audio_ion_fd_list.fd_list, list) {
+-		if(msm_audio_fd_data) {
+-			handle = msm_audio_fd_data->handle;
+-			ion_data = dev_get_drvdata(msm_audio_fd_data->dev);
+-			/*  clean if CMA was used*/
+-			if (msm_audio_fd_data->hyp_assign)
+-				msm_audio_hyp_unassign(msm_audio_fd_data);
+-			if(handle)
+-				msm_audio_ion_free(handle, ion_data);
+-		}
+-	}
+-	list_for_each_safe(ptr, next,
+-		&msm_audio_ion_fd_list.fd_list) {
+-		if(ptr) {
+-			msm_audio_fd_data = list_entry(ptr, struct msm_audio_fd_data,
+-							list);
+-			if(msm_audio_fd_data) {
+-				list_del(&(msm_audio_fd_data->list));
+-				kfree(msm_audio_fd_data);
+-			}
+-		}
+-	}
+-	mutex_unlock(&(msm_audio_ion_fd_list.list_mutex));
+-}
+-EXPORT_SYMBOL(msm_audio_ion_crash_handler);
+-
+-static int msm_audio_ion_open(struct inode *inode, struct file *file)
+-{
+-	int ret = 0;
+-	struct msm_audio_ion_private *ion_data = container_of(inode->i_cdev,
+-						struct msm_audio_ion_private,
+-						cdev);
+-	struct device *dev = ion_data->chardev;
+-
+-	pr_debug("Inside %s\n", __func__);
+-	get_device(dev);
+-	return ret;
+-}
+-
+-static int msm_audio_ion_release(struct inode *inode, struct file *file)
+-{
+-	struct msm_audio_ion_private *ion_data = container_of(inode->i_cdev,
+-						struct msm_audio_ion_private,
+-						cdev);
+-	struct device *dev = ion_data->chardev;
+-
+-	pr_debug("Inside %s\n", __func__);
+-	put_device(dev);
+-	return 0;
+-}
+-
+-static long msm_audio_ion_ioctl(struct file *file, unsigned int ioctl_num,
+-				unsigned long __user ioctl_param)
+-{
+-	void *mem_handle;
+-	dma_addr_t paddr;
+-	size_t pa_len = 0;
+-	struct iosys_map *iosys_vmap = NULL;
+-	int ret = 0;
+-	u64 src_vmid_map_list = BIT(QCOM_SCM_VMID_HLOS);
+-	struct qcom_scm_vmperm dst_vmids_map[] = {{VMID_LPASS, PERM_READ | PERM_WRITE},
+-		{VMID_ADSP_HEAP, PERM_READ | PERM_WRITE}};
+-	u64 src_vmid_unmap_list = BIT(VMID_LPASS) | BIT(VMID_ADSP_HEAP);
+-	struct qcom_scm_vmperm dst_vmids_unmap[] = {{QCOM_SCM_VMID_HLOS,
+-		PERM_READ | PERM_WRITE | PERM_EXEC}};
+-	struct msm_audio_fd_data *msm_audio_fd_data = NULL;
+-	struct msm_audio_ion_private *ion_data =
+-			container_of(file->f_inode->i_cdev, struct msm_audio_ion_private, cdev);
+-
+-	pr_debug("%s ioctl num %u\n", __func__, ioctl_num);
+-	switch (ioctl_num) {
++	mutex_lock(&msm_audio_ion_lock);
++	if (priv->stopping && command != IOCTL_UNMAP_PHYS_ADDR &&
++	    command != IOCTL_UNMAP_HYP_ASSIGN) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	switch (command) {
+ 	case IOCTL_MAP_PHYS_ADDR:
+-		iosys_vmap = kzalloc(sizeof(struct msm_audio_fd_data), GFP_KERNEL);
+-		if (!iosys_vmap)
+-			return -ENOMEM;
+-		msm_audio_fd_data = kzalloc((sizeof(struct msm_audio_fd_data)),
+-					GFP_KERNEL);
+-		if (!msm_audio_fd_data) {
+-			kfree(iosys_vmap);
+-			return -ENOMEM;
+-		}
+-		ret = msm_audio_ion_import((struct dma_buf **)&mem_handle, (int)ioctl_param,
+-					NULL, 0, &paddr, &pa_len, iosys_vmap, ion_data);
+-		if (ret < 0) {
+-			pr_err("%s Memory map Failed %d\n", __func__, ret);
+-			kfree(iosys_vmap);
+-			kfree(msm_audio_fd_data);
+-			return ret;
+-		}
+-		msm_audio_fd_data->fd = (int)ioctl_param;
+-		msm_audio_fd_data->handle = mem_handle;
+-		msm_audio_fd_data->paddr = paddr;
+-		msm_audio_fd_data->plen = pa_len;
+-		msm_audio_fd_data->dev = ion_data->cb_dev;
+-		msm_audio_update_fd_list(msm_audio_fd_data);
++		ret = msm_audio_map_fd(priv, file, fd);
+ 		break;
+ 	case IOCTL_UNMAP_PHYS_ADDR:
+-		msm_audio_get_handle((int)ioctl_param, &mem_handle);
+-		ret = msm_audio_ion_free(mem_handle, ion_data);
+-		if (ret < 0) {
+-                        pr_err("%s Ion free failed %d\n", __func__, ret);
+-			if (ret == -ENOENT)
+-				msm_audio_delete_fd_entry(mem_handle, (int)ioctl_param);
+-			return 0;
+-		}
+-		msm_audio_delete_fd_entry(mem_handle, (int)ioctl_param);
++		ret = msm_audio_unmap_fd(priv, file, fd);
+ 		break;
+ 	case IOCTL_MAP_HYP_ASSIGN:
+-	    ret = msm_audio_get_phy_addr((int)ioctl_param, &paddr, &pa_len);
+-		if (ret < 0) {
+-			pr_err("%s get phys addr failed %d\n", __func__, ret);
+-			return ret;
+-		}
+-		ret = qcom_scm_assign_mem(paddr, pa_len, &src_vmid_map_list,
+-		                      dst_vmids_map, ARRAY_SIZE(dst_vmids_map));
+-		if (ret < 0) {
+-			pr_err("%s: qcom_assign failed result = %d addr = 0x%llx size = %lu\n",
+-					__func__, ret, paddr, pa_len);
+-			return ret;
+-		}
+-		pr_debug("%s: qcom scm assign success\n", __func__);
+-		msm_audio_set_hyp_assign((int)ioctl_param, true);
++		ret = msm_audio_hyp_fd(priv, file, fd, true);
+ 		break;
+ 	case IOCTL_UNMAP_HYP_ASSIGN:
+-	    ret = msm_audio_get_phy_addr((int)ioctl_param, &paddr, &pa_len);
+-		if (ret < 0) {
+-			pr_err("%s get phys addr failed %d\n", __func__, ret);
+-			return ret;
+-		}
+-		ret = qcom_scm_assign_mem(paddr, pa_len, &src_vmid_unmap_list,
+-		                      dst_vmids_unmap, ARRAY_SIZE(dst_vmids_unmap));
+-		if (ret < 0) {
+-			pr_err("%s: qcom scm unassign failed result = %d addr = 0x%llx size = %lu\n",
+-					__func__, ret, paddr, pa_len);
+-			return ret;
+-		}
+-		pr_debug("%s: qcom scm unassign success\n", __func__);
+-		msm_audio_set_hyp_assign((int)ioctl_param, false);
+-	    break;
++		ret = msm_audio_hyp_fd(priv, file, fd, false);
++		break;
+ 	default:
+-		pr_err("%s Entered default. Invalid ioctl num %u",
+-			__func__, ioctl_num);
+ 		ret = -EINVAL;
+ 		break;
+ 	}
+-	return ret;
+-}
+-
+-static const struct of_device_id msm_audio_ion_dt_match[] = {
+-	{ .compatible = "qcom,msm-audio-ion" },
+-	{ .compatible = "qcom,msm-audio-ion-cma"},
+-	{ }
+-};
+-MODULE_DEVICE_TABLE(of, msm_audio_ion_dt_match);
++unlock:
++	mutex_unlock(&msm_audio_ion_lock);
++	return ret;
++}
+ 
+ static const struct file_operations msm_audio_ion_fops = {
+ 	.owner = THIS_MODULE,
+ 	.open = msm_audio_ion_open,
+ 	.release = msm_audio_ion_release,
+ 	.unlocked_ioctl = msm_audio_ion_ioctl,
++	.compat_ioctl = msm_audio_ion_ioctl,
+ };
+ 
+-static int msm_audio_ion_reg_chrdev(struct msm_audio_ion_private *ion_data)
+-{
+-	int ret = 0;
+-
+-	ret = alloc_chrdev_region(&ion_data->ion_major, 0,
+-				MINOR_NUMBER_COUNT, ion_data->driver_name);
+-	if (ret < 0) {
+-		pr_err("%s alloc_chr_dev_region failed ret : %d\n",
+-			__func__, ret);
+-		return ret;
+-	}
+-	pr_debug("%s major number %d", __func__, MAJOR(ion_data->ion_major));
+-	ion_data->ion_class = class_create(ion_data->driver_name);
+-	if (IS_ERR(ion_data->ion_class)) {
+-		ret = PTR_ERR(ion_data->ion_class);
+-		pr_err("%s class create failed. ret : %d", __func__, ret);
+-		goto err_class;
+-	}
+-	ion_data->chardev = device_create(ion_data->ion_class, NULL,
+-				ion_data->ion_major, NULL,
+-				ion_data->driver_name);
+-	if (IS_ERR(ion_data->chardev)) {
+-		ret = PTR_ERR(ion_data->chardev);
+-		pr_err("%s device create failed ret : %d\n", __func__, ret);
+-		goto err_device;
+-	}
+-	cdev_init(&ion_data->cdev, &msm_audio_ion_fops);
+-	ret = cdev_add(&ion_data->cdev, ion_data->ion_major, 1);
++static void msm_audio_ion_device_release(struct device *dev)
++{
++	struct msm_audio_ion_private *priv =
++		container_of(dev, struct msm_audio_ion_private, chardev);
++
++	put_device(priv->cb_dev);
++	kfree(priv);
++}
++
++static int msm_audio_ion_probe(struct platform_device *pdev)
++{
++	struct msm_audio_ion_private *priv;
++	struct of_phandle_args spec;
++	const char *name;
++	u64 mask = U64_MAX, sid;
++	u32 version;
++	int ret;
++
++	if (!pdev->dev.of_node)
++		return -EINVAL;
++	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++	priv->cb_dev = get_device(&pdev->dev);
++	priv->smmu_enabled = of_property_read_bool(pdev->dev.of_node, "qcom,smmu-enabled");
++	device_initialize(&priv->chardev);
++	priv->chardev.release = msm_audio_ion_device_release;
++	priv->chardev.parent = &pdev->dev;
++	if (priv->smmu_enabled) {
++		ret = of_property_read_u32(pdev->dev.of_node, "qcom,smmu-version", &version);
++		if (ret)
++			goto put_device;
++		of_property_read_u64(pdev->dev.of_node, "qcom,smmu-sid-mask", &mask);
++		ret = of_parse_phandle_with_args(pdev->dev.of_node, "iommus",
++						 "#iommu-cells", 0, &spec);
++		if (ret)
++			goto put_device;
++		if (!spec.args_count) {
++			of_node_put(spec.np);
++			ret = -EINVAL;
++			goto put_device;
++		}
++		sid = spec.args[0] & mask;
++		of_node_put(spec.np);
++		priv->sid_bits = sid << 32;
++	}
++	name = priv->smmu_enabled ? "msm_audio_ion" : "msm_audio_ion_cma";
++	ret = alloc_chrdev_region(&priv->devt, 0, 1, name);
++	if (ret)
++		goto put_device;
++	priv->class = class_create(name);
++	if (IS_ERR(priv->class)) {
++		ret = PTR_ERR(priv->class);
++		goto unregister;
++	}
++	priv->chardev.class = priv->class;
++	priv->chardev.devt = priv->devt;
++	ret = dev_set_name(&priv->chardev, "%s", name);
++	if (ret)
++		goto destroy_class;
++	cdev_init(&priv->cdev, &msm_audio_ion_fops);
++	priv->cdev.owner = THIS_MODULE;
++	ret = cdev_device_add(&priv->cdev, &priv->chardev);
+ 	if (ret) {
+-		pr_err("%s cdev add failed, ret : %d\n", __func__, ret);
+-		goto err_cdev;
+-	}
+-	return ret;
+-
+-err_cdev:
+-	device_destroy(ion_data->ion_class, ion_data->ion_major);
+-err_device:
+-	class_destroy(ion_data->ion_class);
+-err_class:
+-	unregister_chrdev_region(0, MINOR_NUMBER_COUNT);
+-	return ret;
+-}
+-
+-static int msm_audio_ion_unreg_chrdev(struct msm_audio_ion_private *ion_data)
+-{
+-	cdev_del(&ion_data->cdev);
+-	device_destroy(ion_data->ion_class, ion_data->ion_major);
+-	class_destroy(ion_data->ion_class);
+-	unregister_chrdev_region(0, MINOR_NUMBER_COUNT);
++		struct msm_audio_alloc_data *data, *next;
++
++		mutex_lock(&msm_audio_ion_lock);
++		priv->stopping = true;
++		list_for_each_entry_safe(data, next, &msm_audio_allocations, node)
++			if (data->priv == priv)
++				msm_audio_destroy_mapping(data);
++		mutex_unlock(&msm_audio_ion_lock);
++		goto destroy_class;
++	}
++	platform_set_drvdata(pdev, priv);
+ 	return 0;
+-}
+-static int msm_audio_ion_probe(struct platform_device *pdev)
+-{
+-	int rc = 0;
+-	u64 smmu_sid = 0;
+-	u64 smmu_sid_mask = 0;
+-	const char *msm_audio_ion_dt = "qcom,smmu-enabled";
+-	const char *msm_audio_ion_non_hyp = "qcom,non-hyp-assign";
+-	const char *msm_audio_ion_smmu = "qcom,smmu-version";
+-	const char *msm_audio_ion_smmu_sid_mask = "qcom,smmu-sid-mask";
+-	bool smmu_enabled;
+-	bool is_non_hypervisor_en;
+-	struct device *dev = &pdev->dev;
+-	struct of_phandle_args iommuspec;
+-	struct msm_audio_ion_private *msm_audio_ion_data = NULL;
+-
+-#ifndef CONFIG_SPF_CORE
+-	enum apr_subsys_state q6_state;
+-#endif
+-
+-	dev_err(dev, "%s: msm_audio_ion_probe\n", __func__);
+-	if (dev->of_node == NULL) {
+-		dev_err(dev,
+-			"%s: device tree is not found\n",
+-			__func__);
+-		return 0;
+-	}
+-
+-	msm_audio_ion_data = devm_kzalloc(&pdev->dev, (sizeof(struct msm_audio_ion_private)),
+-                                          GFP_KERNEL);
+-	if (!msm_audio_ion_data)
+-		return -ENOMEM;
+-
+-	is_non_hypervisor_en = of_property_read_bool(dev->of_node,
+-					     msm_audio_ion_non_hyp);
+-	msm_audio_ion_data->is_non_hypervisor = is_non_hypervisor_en;
+-
+-	smmu_enabled = of_property_read_bool(dev->of_node,
+-					     msm_audio_ion_dt);
+-	msm_audio_ion_data->smmu_enabled = smmu_enabled;
+-
+-	if (!smmu_enabled)
+-		dev_dbg(dev, "%s: SMMU is Disabled\n", __func__);
+-
+-#ifndef CONFIG_SPF_CORE
+-	q6_state = apr_get_q6_state();
+-	if (q6_state == APR_SUBSYS_DOWN) {
+-		dev_info(dev,
+-			"defering %s, adsp_state %d\n",
+-			__func__, q6_state);
+-		return -EPROBE_DEFER;
+-	}
+-#endif
+-	dev_dbg(dev, "%s: adsp is ready\n", __func__);
+-	if (smmu_enabled) {
+-		msm_audio_ion_data->driver_name = "msm_audio_ion";
+-		rc = of_property_read_u32(dev->of_node,
+-					msm_audio_ion_smmu,
+-					&(msm_audio_ion_data->smmu_version));
+-		if (rc) {
+-			dev_err(dev,
+-				"%s: qcom,smmu_version missing in DT node\n",
+-				__func__);
+-		return rc;
+-		}
+-		dev_dbg(dev, "%s: SMMU is Enabled. SMMU version is (%d)",
+-			__func__, msm_audio_ion_data->smmu_version);
+-		/* Get SMMU SID information from Devicetree */
+-		rc = of_property_read_u64(dev->of_node,
+-					msm_audio_ion_smmu_sid_mask,
+-					&smmu_sid_mask);
+-		if (rc) {
+-			dev_err(dev,
+-				"%s: qcom,smmu-sid-mask missing in DT node, using default\n",
+-				__func__);
+-			smmu_sid_mask = 0xFFFFFFFFFFFFFFFF;
+-		}
+-
+-		rc = of_parse_phandle_with_args(dev->of_node, "iommus",
+-						"#iommu-cells", 0, &iommuspec);
+-		if (rc)
+-			dev_err(dev, "%s: could not get smmu SID, ret = %d\n",
+-				__func__, rc);
+-		else
+-			smmu_sid = (iommuspec.args[0] & smmu_sid_mask);
+-
+-		msm_audio_ion_data->smmu_sid_bits =
+-			smmu_sid << MSM_AUDIO_SMMU_SID_OFFSET;
+-	} else {
+-		msm_audio_ion_data->driver_name = "msm_audio_ion_cma";
+-	}
+-
+-	if (!rc)
+-		msm_audio_ion_data->device_status |= MSM_AUDIO_ION_PROBED;
+-
+-	msm_audio_ion_data->cb_dev = dev;
+-	dev_set_drvdata(dev, msm_audio_ion_data);
+-	if (!msm_audio_ion_fd_list_init) {
+-		INIT_LIST_HEAD(&msm_audio_ion_fd_list.fd_list);
+-		mutex_init(&(msm_audio_ion_fd_list.list_mutex));
+-		msm_audio_ion_fd_list_init = true;
+-	}
+-	INIT_LIST_HEAD(&msm_audio_ion_data->alloc_list);
+-	mutex_init(&(msm_audio_ion_data->list_mutex));
+-	rc = msm_audio_ion_reg_chrdev(msm_audio_ion_data);
+-	if (rc) {
+-		pr_err("%s register char dev failed, rc : %d", __func__, rc);
+-		return rc;
+-	}
+-	return rc;
+-}
+-
+-static int msm_audio_ion_remove(struct platform_device *pdev)
+-{
+-	struct msm_audio_ion_private *ion_data = dev_get_drvdata(&pdev->dev);
+-	ion_data->smmu_enabled = 0;
+-	ion_data->device_status = 0;
+-	msm_audio_ion_unreg_chrdev(ion_data);
+-	return 0;
+-}
++destroy_class:
++	class_destroy(priv->class);
++unregister:
++	unregister_chrdev_region(priv->devt, 1);
++put_device:
++	put_device(&priv->chardev);
++	return ret;
++}
++
++static void msm_audio_ion_remove(struct platform_device *pdev)
++{
++	struct msm_audio_ion_private *priv = platform_get_drvdata(pdev);
++	struct msm_audio_alloc_data *data, *next;
++	int ret;
++
++	mutex_lock(&msm_audio_ion_lock);
++	priv->stopping = true;
++	list_for_each_entry_safe(data, next, &msm_audio_allocations, node) {
++		if (data->priv != priv)
++			continue;
++		ret = msm_audio_destroy_mapping(data);
++		if (ret)
++			dev_err(&priv->chardev, "secure buffer retained on remove: %d\n", ret);
++	}
++	platform_set_drvdata(pdev, NULL);
++	mutex_unlock(&msm_audio_ion_lock);
++	cdev_device_del(&priv->cdev, &priv->chardev);
++	class_destroy(priv->class);
++	unregister_chrdev_region(priv->devt, 1);
++	put_device(&priv->chardev);
++}
++
++static const struct of_device_id msm_audio_ion_dt_match[] = {
++	{ .compatible = "qcom,msm-audio-ion" },
++	{ .compatible = "qcom,msm-audio-ion-cma" },
++	{},
++};
++MODULE_DEVICE_TABLE(of, msm_audio_ion_dt_match);
+ 
+ static struct platform_driver msm_audio_ion_driver = {
+ 	.driver = {
+@@ -998,18 +589,6 @@
+ 	.remove = msm_audio_ion_remove,
+ };
+ 
+-int __init msm_audio_ion_init(void)
+-{
+-	pr_debug("%s: msm_audio_ion_init called \n",__func__);
+-	return platform_driver_register(&msm_audio_ion_driver);
+-}
+-
+-void msm_audio_ion_exit(void)
+-{
+-	platform_driver_unregister(&msm_audio_ion_driver);
+-}
+-
+-module_init(msm_audio_ion_init);
+-module_exit(msm_audio_ion_exit);
++module_platform_driver(msm_audio_ion_driver);
+ MODULE_DESCRIPTION("MSM Audio ION module");
+ MODULE_LICENSE("GPL v2");
+--- a/qcom/opensource/audio-kernel/include/dsp/msm_audio_ion.h
++++ b/qcom/opensource/audio-kernel/include/dsp/msm_audio_ion.h
+@@ -6,7 +6,6 @@
+ #ifndef _LINUX_MSM_AUDIO_ION_H
+ #define _LINUX_MSM_AUDIO_ION_H
+ #include <sound/pcm.h>
+-#include <linux/msm_ion.h>
+ #include <linux/dma-mapping.h>
+ 
+ enum {
