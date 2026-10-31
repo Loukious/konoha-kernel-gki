@@ -1261,6 +1261,22 @@ ddk_module(
     deps = [],
 )
 
+ddk_headers(
+    name = "thermal_headers",
+    hdrs = glob(["drivers/thermal/*.h", "drivers/thermal/qcom/*.h"]),
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "qcom_tsens",
+    srcs = ["drivers/thermal/qcom/tsens.c", "drivers/thermal/qcom/tsens-v2.c", "drivers/thermal/qcom/tsens-v1.c", "drivers/thermal/qcom/tsens-v0_1.c", "drivers/thermal/qcom/tsens-8960.c"],
+    out = "qcom_tsens.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":thermal_headers", ":platform_headers", ":qcom_ipc_logging"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1343,6 +1359,7 @@ kernel_module_group(
         ":gh_virt_wdt",
         ":qcom_cpu_vendor_hooks",
         ":qti_thermal_vendor_hooks",
+        ":qcom_tsens",
         ":nvmem_qfprom",
         ":qcom_cpufreq_thermal",
         ":qcom_cpufreq_hw",
