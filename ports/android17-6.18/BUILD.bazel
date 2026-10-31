@@ -2363,6 +2363,31 @@ ddk_module(
     kconfig = "Kconfig", defconfig = "platform_defconfig", kernel_build = "//common:kernel_aarch64", deps = [":platform_headers", ":qcom_ipc_logging"], visibility = ["//visibility:public"],
 )
 
+ddk_headers(
+    name = "altmode_headers",
+    hdrs = ["include/linux/soc/qcom/altmode-glink.h", "include/linux/soc/qcom/fsa4480-i2c.h"],
+    linux_includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "altmode_glink",
+    srcs = ["drivers/soc/qcom/altmode-glink.c"],
+    out = "altmode-glink.ko", kconfig = "Kconfig", defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":altmode_headers", ":platform_headers", ":pmic_glink_headers", ":qti_pmic_glink", ":qcom_ipc_logging"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "fsa4480_i2c",
+    srcs = ["drivers/soc/qcom/fsa4480-i2c.c"],
+    out = "fsa4480-i2c.ko", kconfig = "Kconfig", defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":altmode_headers", ":platform_headers", ":soc_headers", ":ucsi_glink_headers", ":ucsi_qti_glink", ":qti_regmap_debugfs"],
+    visibility = ["//visibility:public"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -2540,6 +2565,8 @@ kernel_module_group(
         ":usb_f_ccid",
         ":usb_f_cdev",
         ":f_fs_ipc_log",
+        ":altmode_glink",
+        ":fsa4480_i2c",
     ],
 )
 

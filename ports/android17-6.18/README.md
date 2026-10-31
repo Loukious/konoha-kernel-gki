@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 176 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 189 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 176 platform `.ko` files, their symbol tables and DDK configurations.
+- 189 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 8034
-imported symbol CRCs across all 176 modules.
+used. The current [validation report](validation-20261031.json) checks 9,242
+imported symbol CRCs across all 189 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -992,3 +992,26 @@ checks pass with 1,084 existing vendor DTC warnings. ROM module build coverage
 is 186/466 (39.9%), leaving 280 names to assess or port. This is build coverage
 including alternative hardware, not working-device or ZIP completion. No
 flashable 6.18 ZIP exists.
+
+
+## Type-C alternate mode and switch
+
+The port builds `altmode-glink.ko` and `fsa4480-i2c.ko` from exact Onyx
+source pins. GLINK requests serialize their response state before transmission;
+notifications use an owned FIFO. Replies validate frame bounds, port, owner,
+opcode and session. A timed-out request requires a new GLINK UP session before
+another request because the vendor wire format has no transaction IDs. Client
+withdrawal drains callbacks before freeing state. FSA register operations
+serialize and propagate errors; UCSI work balances wake references and retries
+unchanged modes after failed register operations. Provider teardown withdraws
+public access and drains callbacks/work before managed resources disappear.
+The DIO4485 register range includes its retained initialization table at 0x51.
+
+[Integrated host validation](altmode-validation-20261031.json) passes ASan/UBSan
+transport, allocation, concurrent request, immediate reply, timeout/restart,
+FIFO, switch-register fault, notifier reentry and wake-balance cases. Four
+pinned inputs replay exactly, with both public headers and switch tables
+unchanged. These tests mock kernel services; firmware, Type-C/DP electrical
+behavior and phone operation remain untested.
+
+The combined 189-module archive `artifacts/20261031T120312428524Z` passes 9,242 imported-symbol CRC checks with no compiler/modpost warnings. Device-tree checks pass with 1,084 existing vendor DTC warnings. ROM module build coverage is 188/466 (40.3%), leaving 278 names to assess or port. No flashable 6.18 ZIP exists.

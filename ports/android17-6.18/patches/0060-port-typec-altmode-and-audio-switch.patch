@@ -1,0 +1,1449 @@
+--- a/drivers/soc/qcom/altmode-glink.c
++++ b/drivers/soc/qcom/altmode-glink.c
+@@ -11,8 +11,9 @@
+ #include <linux/idr.h>
+ #include <linux/ipc_logging.h>
+ #include <linux/ktime.h>
++#include <linux/kref.h>
+ #include <linux/module.h>
+-#include <linux/of_platform.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+ #include <linux/soc/qcom/altmode-glink.h>
+@@ -20,6 +21,7 @@
+ 
+ #define MSG_OWNER_USBC_PAN	32780
+ #define MSG_TYPE_REQ_RESP	1
++#define MSG_TYPE_NOTIFY		2
+ 
+ #define NOTIFY_PAYLOAD_SIZE	16
+ #define USBC_WRITE_BUFFER_SIZE	8
+@@ -37,7 +39,7 @@
+ 
+ #define altmode_dbg(fmt, ...) \
+ 	do { \
+-		ipc_log_string(altmode_ipc_log, fmt, ##__VA_ARGS__); \
++		ipc_log_string(amdev->ipc_log, fmt, ##__VA_ARGS__); \
+ 		pr_debug(fmt, ##__VA_ARGS__); \
+ 	} while (0)
+ 
+@@ -71,6 +73,14 @@
+  * @ack_port_index:	Port index to ack for a nonexistent client
+  */
+ struct altmode_dev {
++	struct kref ref;
++	struct mutex write_lock;
++	bool removing;
++	bool response_pending;
++	bool resync_required;
++	atomic_t link_generation;
++	unsigned long ack_ports;
++	void *ipc_log;
+ 	struct device			*dev;
+ 	struct pmic_glink_client	*pgclient;
+ 	struct idr			client_idr;
+@@ -100,7 +110,15 @@
+  * @client_cb_work:	Work to run client callback
+  * @msg:		Latest notify msg stashed to be retrieved in cb_work
+  */
++struct altmode_message {
++	struct list_head node;
++	u8 payload[NOTIFY_PAYLOAD_SIZE];
++};
++
+ struct altmode_client {
++	struct kref ref;
++	struct list_head messages;
++	bool closing;
+ 	struct altmode_dev		*amdev;
+ 	struct altmode_client_data	data;
+ 	struct list_head		c_node;
+@@ -135,44 +153,93 @@
+ static DEFINE_MUTEX(notify_lock);
+ 
+ static void altmode_send_pan_ack(struct work_struct *work);
+-static void *altmode_ipc_log;
+-
++static LIST_HEAD(altmode_devices);
++static DEFINE_MUTEX(altmode_registry_lock);
++
++static void altmode_release(struct kref *ref)
++{
++	struct altmode_dev *amdev = container_of(ref, struct altmode_dev, ref);
++
++	idr_destroy(&amdev->client_idr);
++	put_device(amdev->dev);
++	kfree(amdev);
++}
++
++static void altmode_client_release(struct kref *ref)
++{
++	struct altmode_client *client = container_of(ref, struct altmode_client, ref);
++	struct altmode_message *msg, *tmp;
++
++	list_for_each_entry_safe(msg, tmp, &client->messages, node) {
++		list_del(&msg->node);
++		kfree(msg);
++	}
++	kfree(client->data.name);
++	kref_put(&client->amdev->ref, altmode_release);
++	kfree(client);
++}
++
++/* Returns an owned reference; device drvdata is never read without a guard. */
+ static struct altmode_dev *to_altmode_device(struct device_node *amdev_node)
+ {
+-	struct platform_device *altmode_pdev;
+-
+-	altmode_pdev = of_find_device_by_node(amdev_node);
+-	if (altmode_pdev)
+-		return platform_get_drvdata(altmode_pdev);
+-
+-	return NULL;
++	struct altmode_dev *amdev, *found = NULL;
++
++	mutex_lock(&altmode_registry_lock);
++	list_for_each_entry(amdev, &altmode_devices, d_node) {
++		if (amdev->dev->of_node == amdev_node && !amdev->removing) {
++			kref_get(&amdev->ref);
++			found = amdev;
++			break;
++		}
++	}
++	mutex_unlock(&altmode_registry_lock);
++	return found;
+ }
+ 
+ #define ALTMODE_WAIT_MS	1000
+ static int altmode_write(struct altmode_dev *amdev, void *data, size_t len)
+ {
+-	int rc;
+-
++	int rc, generation;
++
++	mutex_lock(&amdev->write_lock);
++	if (READ_ONCE(amdev->removing)) {
++		rc = -ENODEV;
++		goto unlock;
++	}
++	if (READ_ONCE(amdev->resync_required)) {
++		rc = -ENOTCONN;
++		goto unlock;
++	}
+ 	reinit_completion(&amdev->response_received);
++	generation = atomic_read(&amdev->link_generation);
++	WRITE_ONCE(amdev->response_pending, true);
+ 	rc = pmic_glink_write(amdev->pgclient, data, len);
+ 	if (!rc) {
+-		rc = wait_for_completion_timeout(&amdev->response_received,
+-				msecs_to_jiffies(ALTMODE_WAIT_MS));
+-		rc = rc ? 0 : -ETIMEDOUT;
+-	}
+-
+-	if (rc)
+-		pr_err("Error in sending message: %d\n", rc);
+-
++		if (!wait_for_completion_timeout(&amdev->response_received,
++				msecs_to_jiffies(ALTMODE_WAIT_MS))) {
++			/* The wire format has no transaction ID: a late response cannot
++			 * be reused by another command before a new GLINK session.
++			 */
++			WRITE_ONCE(amdev->resync_required, true);
++			rc = -ETIMEDOUT;
++		}
++	}
++	WRITE_ONCE(amdev->response_pending, false);
++	if (!rc && generation != atomic_read(&amdev->link_generation))
++		rc = -ENOTCONN;
++	if (READ_ONCE(amdev->removing))
++		rc = -ENODEV;
++unlock:
++	mutex_unlock(&amdev->write_lock);
+ 	return rc;
+ }
+ 
+ static int __altmode_send_data(struct altmode_dev *amdev, void *data,
+ 			       size_t len)
+ {
+-	struct usbc_write_buffer_req_msg msg = { { 0 } };
+-
+-	if (len > sizeof(msg.buf)) {
++	struct usbc_write_buffer_req_msg msg = { };
++
++	if ((!data && len) || len > sizeof(msg.buf)) {
+ 		pr_err("len %zu exceeds msg buf's size: %d\n",
+ 				len, USBC_WRITE_BUFFER_SIZE);
+ 		return -EINVAL;
+@@ -182,7 +249,8 @@
+ 	msg.hdr.type = MSG_TYPE_REQ_RESP;
+ 	msg.hdr.opcode = USBC_CMD_WRITE_REQ;
+ 
+-	memcpy(msg.buf, data, len);
++	if (len)
++		memcpy(msg.buf, data, len);
+ 
+ 	return altmode_write(amdev, &msg, sizeof(msg));
+ }
+@@ -204,6 +272,7 @@
+ {
+ 	int rc;
+ 	struct probe_notify_node *notify_node;
++	struct probe_notify_node *pos;
+ 	struct device_node *amdev_node;
+ 	struct of_phandle_args pargs;
+ 	struct altmode_dev *amdev;
+@@ -220,8 +289,19 @@
+ 	}
+ 
+ 	amdev_node = pargs.np;
++	if (pargs.args_count != 1 || pargs.args[0] >= MAX_NUM_PORTS) {
++		of_node_put(amdev_node);
++		return -EINVAL;
++	}
+ 
+ 	mutex_lock(&notify_lock);
++	list_for_each_entry(pos, &probe_notify_list, node) {
++		if (pos->amdev_node == amdev_node && pos->priv == priv) {
++			mutex_unlock(&notify_lock);
++			of_node_put(amdev_node);
++			return -EEXIST;
++		}
++	}
+ 	amdev = to_altmode_device(amdev_node);
+ 	if (amdev) {
+ 		/*
+@@ -230,10 +310,12 @@
+ 		 */
+ 		of_node_put(amdev_node);
+ 		cb(priv);
++		kref_put(&amdev->ref, altmode_release);
+ 	} else {
+ 		notify_node = kzalloc(sizeof(*notify_node), GFP_KERNEL);
+ 		if (!notify_node) {
+ 			mutex_unlock(&notify_lock);
++			of_node_put(amdev_node);
+ 			return -ENOMEM;
+ 		}
+ 
+@@ -306,22 +388,35 @@
+  * Returns:		0 upon success, -EINVAL if len exceeds message buffer's
+  *			capacity, and other negative error codes as appropriate.
+  */
+-int altmode_send_data(struct altmode_client *client, void *data,
+-			     size_t len)
+-{
++int altmode_send_data(struct altmode_client *client, void *data, size_t len)
++{
++	if (IS_ERR_OR_NULL(client) || READ_ONCE(client->closing))
++		return -ENODEV;
++	return __altmode_send_data(client->amdev, data, len);
++}
++EXPORT_SYMBOL(altmode_send_data);
++
++static void client_cb_work(struct work_struct *work)
++{
++	struct altmode_client *client = container_of(work,
++			struct altmode_client, client_cb_work);
+ 	struct altmode_dev *amdev = client->amdev;
+-
+-	return __altmode_send_data(amdev, data, len);
+-}
+-EXPORT_SYMBOL(altmode_send_data);
+-
+-static void client_cb_work(struct work_struct *work)
+-{
+-	struct altmode_client *amclient = container_of(work,
+-			struct altmode_client, client_cb_work);
+-
+-	amclient->data.callback(amclient->data.priv, amclient->msg,
+-			sizeof(amclient->msg));
++	struct altmode_message *msg;
++
++	for (;;) {
++		mutex_lock(&amdev->client_lock);
++		if (client->closing || READ_ONCE(amdev->removing) ||
++		    list_empty(&client->messages)) {
++			mutex_unlock(&amdev->client_lock);
++			return;
++		}
++		msg = list_first_entry(&client->messages, struct altmode_message, node);
++		list_del(&msg->node);
++		mutex_unlock(&amdev->client_lock);
++		client->data.callback(client->data.priv, msg->payload,
++				     sizeof(msg->payload));
++		kfree(msg);
++	}
+ }
+ 
+ /**
+@@ -363,12 +458,14 @@
+ 
+ 	if (pargs.args_count != 1) {
+ 		dev_err(client_dev, "Error in port_index specification\n");
++		of_node_put(pargs.np);
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+ 	if (pargs.args[0] >= MAX_NUM_PORTS) {
+ 		dev_err(client_dev, "Invalid port_index: %d, max is %d\n",
+ 				pargs.args[0], MAX_NUM_PORTS - 1);
++		of_node_put(pargs.np);
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+@@ -380,8 +477,12 @@
+ 		return ERR_PTR(-EPROBE_DEFER);
+ 
+ 	amclient = kzalloc(sizeof(*amclient), GFP_KERNEL);
+-	if (!amclient)
++	if (!amclient) {
++		kref_put(&amdev->ref, altmode_release);
+ 		return ERR_PTR(-ENOMEM);
++	}
++	kref_init(&amclient->ref);
++	INIT_LIST_HEAD(&amclient->messages);
+ 
+ 	amclient->amdev = amdev;
+ 	amclient->port_index = pargs.args[0];
+@@ -391,30 +492,34 @@
+ 	INIT_WORK(&amclient->client_cb_work, client_cb_work);
+ 	amclient->data.name = kstrdup(client_data->name, GFP_KERNEL);
+ 	if (!amclient->data.name) {
+-		kfree(amclient);
++		kref_put(&amclient->ref, altmode_client_release);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+ 	mutex_lock(&amdev->client_lock);
++	if (READ_ONCE(amdev->removing)) {
++		rc = -ENODEV;
++		goto free_client;
++	}
+ 	key = IDR_KEY(amclient);
+ 	rc = idr_alloc(&amdev->client_idr, amclient, key, key + 1, GFP_KERNEL);
+ 	if (rc < 0) {
+ 		pr_err("Error in allocating idr for client %s: %d\n",
+ 				client_data->name, rc);
+-		mutex_unlock(&amdev->client_lock);
+-		kfree(amclient->data.name);
+-		kfree(amclient);
+-		return ERR_PTR(rc);
++		goto free_client;
+ 	}
+ 
+ 	list_add(&amclient->c_node, &amdev->client_list);
+-	mutex_unlock(&amdev->client_lock);
+-
+ 	if (!atomic_read(&amdev->pan_en_sent))
+ 		schedule_delayed_work(&amdev->send_pan_en_work,
+ 				msecs_to_jiffies(20));
+ 
++	mutex_unlock(&amdev->client_lock);
+ 	return amclient;
++free_client:
++	mutex_unlock(&amdev->client_lock);
++	kref_put(&amclient->ref, altmode_client_release);
++	return ERR_PTR(rc);
+ }
+ EXPORT_SYMBOL(altmode_register_client);
+ 
+@@ -434,53 +539,51 @@
+ int altmode_deregister_client(struct altmode_client *client)
+ {
+ 	struct altmode_dev *amdev;
+-	struct altmode_client *pos, *tmp;
+-
+-	if (!client || !client->amdev)
++
++	if (IS_ERR_OR_NULL(client))
+ 		return -ENODEV;
+-
+ 	amdev = client->amdev;
+-
++	mutex_lock(&amdev->client_lock);
++	client->closing = true;
++	if (idr_find(&amdev->client_idr, IDR_KEY(client)) == client)
++		idr_remove(&amdev->client_idr, IDR_KEY(client));
++	list_del_init(&client->c_node);
++	mutex_unlock(&amdev->client_lock);
++	/* Withdraw from lookup before draining so transport cannot requeue it. */
+ 	cancel_work_sync(&client->client_cb_work);
+-
+-	mutex_lock(&amdev->client_lock);
+-	idr_remove(&amdev->client_idr, IDR_KEY(client));
+-
+-	list_for_each_entry_safe(pos, tmp, &amdev->client_list, c_node) {
+-		if (pos == client)
+-			list_del(&pos->c_node);
+-	}
+-	mutex_unlock(&amdev->client_lock);
+-
+-	kfree(client->data.name);
+-	kfree(client);
+-
++	kref_put(&client->ref, altmode_client_release);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(altmode_deregister_client);
+ 
+ static void altmode_send_pan_en(struct work_struct *work)
+ {
+-	int rc;
++	int rc, generation;
+ 	u32 enable_msg = ALTMODE_PAN_EN;
+ 	struct altmode_dev *amdev = container_of(work, struct altmode_dev,
+ 			send_pan_en_work.work);
+ 
++	generation = atomic_read(&amdev->link_generation);
+ 	rc = __altmode_send_data(amdev, &enable_msg, sizeof(enable_msg));
+ 	if (rc < 0) {
+ 		pr_err("Failed to send PAN EN: %d\n", rc);
+ 		return;
+ 	}
+ 
+-	atomic_set(&amdev->pan_en_sent, 1);
++	mutex_lock(&amdev->client_lock);
++	if (!READ_ONCE(amdev->removing) && generation == atomic_read(&amdev->link_generation))
++		atomic_set(&amdev->pan_en_sent, 1);
++	mutex_unlock(&amdev->client_lock);
+ 	altmode_dbg("Sent PAN EN\n");
+ }
+ 
+ static int altmode_send_ack(struct altmode_dev *amdev, u8 port_index)
+ {
+ 	int rc;
+-	struct altmode_pan_ack_msg ack;
+-
++	struct altmode_pan_ack_msg ack = { };
++
++	if (port_index >= MAX_NUM_PORTS)
++		return -EINVAL;
+ 	ack.cmd_type = ALTMODE_PAN_ACK;
+ 	ack.port_index = port_index;
+ 
+@@ -499,30 +602,36 @@
+ {
+ 	struct altmode_dev *amdev = priv;
+ 
+-	altmode_dbg("state: %d\n", state);
+-
+-	switch (state) {
+-	case PMIC_GLINK_STATE_DOWN:
+-		/* As of now, nothing to do */
+-		break;
+-	case PMIC_GLINK_STATE_UP:
+-		mutex_lock(&amdev->client_lock);
++	mutex_lock(&amdev->client_lock);
++	if (READ_ONCE(amdev->removing))
++		goto unlock;
++	if (state == PMIC_GLINK_STATE_DOWN) {
++		atomic_inc(&amdev->link_generation);
++		atomic_set(&amdev->pan_en_sent, 0);
++		WRITE_ONCE(amdev->resync_required, true);
++		complete_all(&amdev->response_received);
++	} else if (state == PMIC_GLINK_STATE_UP) {
++		WRITE_ONCE(amdev->resync_required, false);
+ 		if (!list_empty(&amdev->client_list))
+-			schedule_delayed_work(&amdev->send_pan_en_work,
+-						msecs_to_jiffies(20));
+-		mutex_unlock(&amdev->client_lock);
+-		break;
+-	default:
+-		return;
+-	}
++			schedule_delayed_work(&amdev->send_pan_en_work, msecs_to_jiffies(20));
++	}
++unlock:
++	mutex_unlock(&amdev->client_lock);
+ }
+ 
+ static void altmode_send_pan_ack(struct work_struct *work)
+ {
+ 	struct altmode_dev *amdev = container_of(work, struct altmode_dev,
+ 			send_pan_ack_work.work);
+-
+-	altmode_send_ack(amdev, amdev->ack_port_index);
++	unsigned long ports;
++	unsigned int port;
++
++	mutex_lock(&amdev->client_lock);
++	ports = amdev->ack_ports;
++	amdev->ack_ports = 0;
++	mutex_unlock(&amdev->client_lock);
++	for_each_set_bit(port, &ports, MAX_NUM_PORTS)
++		altmode_send_ack(amdev, port);
+ }
+ 
+ #define USBC_NOTIFY_IND_MASK	GENMASK(7, 0)
+@@ -531,84 +640,75 @@
+ 
+ static int altmode_callback(void *priv, void *data, size_t len)
+ {
+-	u16 svid, op;
+-	struct usbc_notify_ind_msg *notify_msg;
++	struct altmode_dev *amdev = priv;
+ 	struct pmic_glink_hdr *hdr = data;
+-	struct altmode_dev *amdev = priv;
+-	struct altmode_client *amclient;
+-	u8 port_index;
+-
+-	altmode_dbg("len: %zu owner: %u type: %u opcode %04x\n", len, hdr->owner,
+-			hdr->type, hdr->opcode);
+-
+-	/*
+-	 * For DisplayPort alt mode, the hdr->opcode is designed as follows:
+-	 *
+-	 *	hdr->opcode = (svid << 16) | USBC_NOTIFY_IND
+-	 */
++	struct usbc_notify_ind_msg *notify_msg = data;
++	struct altmode_client *client;
++	struct altmode_message *msg;
++	u16 op, svid;
++	u8 port;
++	int ret = 0;
++
++	if (!data || len < sizeof(*hdr) || hdr->owner != MSG_OWNER_USBC_PAN)
++		return -EINVAL;
+ 	op = GET_OP(hdr->opcode);
+ 	svid = GET_SVID(hdr->opcode);
+-
+-	switch (op) {
+-	case USBC_CMD_WRITE_REQ:
+-		complete(&amdev->response_received);
+-		break;
+-	case USBC_NOTIFY_IND:
+-		if (len != sizeof(*notify_msg)) {
+-			altmode_dbg("Expected length %zu, got: %zu\n",
+-					sizeof(*notify_msg), len);
++	if (op == USBC_CMD_WRITE_REQ) {
++		if (hdr->opcode != USBC_CMD_WRITE_REQ || hdr->type != MSG_TYPE_REQ_RESP)
+ 			return -EINVAL;
+-		}
+-
+-		notify_msg = data;
+-		port_index = notify_msg->payload[0];
+-
+-		mutex_lock(&amdev->client_lock);
+-		amclient = idr_find(&amdev->client_idr, IDR_KEY_GEN(svid,
+-					port_index));
+-		mutex_unlock(&amdev->client_lock);
+-
+-		altmode_dbg("Payload: %*ph\n", NOTIFY_PAYLOAD_SIZE,
+-				notify_msg->payload);
+-
+-		if (!amclient) {
+-			altmode_dbg("No client associated with SVID %#x port %u\n",
+-					svid, port_index);
+-			amdev->ack_port_index = port_index;
+-			schedule_delayed_work(&amdev->send_pan_ack_work,
+-					msecs_to_jiffies(20));
+-			return 0;
+-		}
+-
+-		cancel_work_sync(&amclient->client_cb_work);
+-		memcpy(&amclient->msg, notify_msg->payload,
+-				sizeof(amclient->msg));
+-		schedule_work(&amclient->client_cb_work);
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	return 0;
++		if (READ_ONCE(amdev->response_pending))
++			complete(&amdev->response_received);
++		return 0;
++	}
++	if (op != USBC_NOTIFY_IND)
++		return -EOPNOTSUPP;
++	if (hdr->type != MSG_TYPE_REQ_RESP && hdr->type != MSG_TYPE_NOTIFY)
++		return -EINVAL;
++	if (len != sizeof(*notify_msg))
++		return -EINVAL;
++	port = notify_msg->payload[0];
++	if (port >= MAX_NUM_PORTS || !svid)
++		return -EINVAL;
++	mutex_lock(&amdev->client_lock);
++	if (READ_ONCE(amdev->removing)) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	client = idr_find(&amdev->client_idr, IDR_KEY_GEN(svid, port));
++	if (!client) {
++		set_bit(port, &amdev->ack_ports);
++		schedule_delayed_work(&amdev->send_pan_ack_work, msecs_to_jiffies(20));
++		goto unlock;
++	}
++	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
++	if (!msg) {
++		ret = -ENOMEM;
++		goto unlock;
++	}
++	memcpy(msg->payload, notify_msg->payload, sizeof(msg->payload));
++	list_add_tail(&msg->node, &client->messages);
++	schedule_work(&client->client_cb_work);
++	/* Never wait here for a callback that may itself wait for a GLINK reply. */
++unlock:
++	mutex_unlock(&amdev->client_lock);
++	return ret;
+ }
+ 
+ static void altmode_notify_clients(struct altmode_dev *amdev)
+ {
+-	struct altmode_dev *pos_amdev;
+ 	struct probe_notify_node *pos, *tmp;
+ 
++	/* Also drains against deregistration. Callbacks may register a client,
++	 * but must not recursively change this probe notifier list.
++	 */
+ 	mutex_lock(&notify_lock);
+ 	list_for_each_entry_safe(pos, tmp, &probe_notify_list, node) {
+-		pos_amdev = to_altmode_device(pos->amdev_node);
+-		if (!pos_amdev)
++		if (pos->amdev_node != amdev->dev->of_node)
+ 			continue;
+-
+-		if (pos_amdev == amdev) {
+-			pos->cb(pos->priv);
+-			of_node_put(pos->amdev_node);
+-			list_del(&pos->node);
+-			kfree(pos);
+-		}
++		pos->cb(pos->priv);
++		of_node_put(pos->amdev_node);
++		list_del(&pos->node);
++		kfree(pos);
+ 	}
+ 	mutex_unlock(&notify_lock);
+ }
+@@ -628,7 +728,7 @@
+ {
+ 	int rc;
+ 	struct altmode_dev *amdev = data;
+-	struct altmode_pan_ack_msg ack;
++	struct altmode_pan_ack_msg ack = { };
+ 
+ 	if (val >= MAX_NUM_PORTS)
+ 		return -EINVAL;
+@@ -662,7 +762,7 @@
+ 		return rc;
+ 	}
+ 
+-	file = debugfs_create_file_unsafe("send_pan_en", 0200, am_dir, amdev,
++	file = debugfs_create_file("send_pan_en", 0200, am_dir, amdev,
+ 					  &pan_en_fops);
+ 	if (IS_ERR(file)) {
+ 		rc = PTR_ERR(file);
+@@ -670,7 +770,7 @@
+ 		goto error;
+ 	}
+ 
+-	file = debugfs_create_file_unsafe("send_pan_ack", 0200, am_dir,
++	file = debugfs_create_file("send_pan_ack", 0200, am_dir,
+ 					  amdev, &send_ack_fops);
+ 	if (IS_ERR(file)) {
+ 		rc = PTR_ERR(file);
+@@ -695,100 +795,94 @@
+ 
+ static int altmode_probe(struct platform_device *pdev)
+ {
+-	int rc;
+ 	struct altmode_dev *amdev;
+ 	struct pmic_glink_client_data pgclient_data = { };
+ 	struct device *dev = &pdev->dev;
+-
+-	amdev = devm_kzalloc(&pdev->dev, sizeof(*amdev), GFP_KERNEL);
++	int rc;
++
++	amdev = kzalloc(sizeof(*amdev), GFP_KERNEL);
+ 	if (!amdev)
+ 		return -ENOMEM;
+-
+-	amdev->dev = dev;
+-
++	kref_init(&amdev->ref);
++	amdev->dev = get_device(dev);
+ 	mutex_init(&amdev->client_lock);
++	mutex_init(&amdev->write_lock);
+ 	idr_init(&amdev->client_idr);
+ 	init_completion(&amdev->response_received);
+ 	INIT_DELAYED_WORK(&amdev->send_pan_en_work, altmode_send_pan_en);
+ 	INIT_DELAYED_WORK(&amdev->send_pan_ack_work, altmode_send_pan_ack);
+ 	INIT_LIST_HEAD(&amdev->d_node);
+ 	INIT_LIST_HEAD(&amdev->client_list);
+-
++	amdev->ipc_log = ipc_log_context_create(NUM_LOG_PAGES, "altmode", 0);
++	if (IS_ERR(amdev->ipc_log))
++		amdev->ipc_log = NULL;
+ 	pgclient_data.id = MSG_OWNER_USBC_PAN;
+ 	pgclient_data.name = "altmode";
+ 	pgclient_data.msg_cb = altmode_callback;
+ 	pgclient_data.priv = amdev;
+ 	pgclient_data.state_cb = altmode_state_cb;
+-
+-	amdev->pgclient = pmic_glink_register_client(amdev->dev,
+-			&pgclient_data);
++	amdev->pgclient = pmic_glink_register_client(dev, &pgclient_data);
+ 	if (IS_ERR(amdev->pgclient)) {
+ 		rc = PTR_ERR(amdev->pgclient);
+-		if (rc != -EPROBE_DEFER)
+-			dev_err(dev, "Error in pmic_glink registration: %d\n",
+-				rc);
+-		goto error_register;
+-	}
+-
++		goto release;
++	}
++	rc = altmode_setup_debugfs(amdev);
++	if (rc)
++		goto unregister;
+ 	platform_set_drvdata(pdev, amdev);
+-
+-	rc = altmode_setup_debugfs(amdev);
+-	if (rc < 0) {
+-		dev_err(amdev->dev, "Failed to create debugfs: %d\n", rc);
+-		goto unreg_pmic_glink;
+-	}
+-
+-	altmode_ipc_log = ipc_log_context_create(NUM_LOG_PAGES, "altmode", 0);
+-	if (!altmode_ipc_log)
+-		dev_warn(dev, "Error in creating ipc_log_context\n");
+-
++	mutex_lock(&altmode_registry_lock);
++	list_add_tail(&amdev->d_node, &altmode_devices);
++	mutex_unlock(&altmode_registry_lock);
+ 	altmode_notify_clients(amdev);
+-
+ 	return 0;
+-
+-unreg_pmic_glink:
++unregister:
++	WRITE_ONCE(amdev->removing, true);
+ 	pmic_glink_unregister_client(amdev->pgclient);
+-error_register:
+-	idr_destroy(&amdev->client_idr);
+-	return rc;
+-}
+-
+-static int altmode_remove(struct platform_device *pdev)
+-{
+-	int rc;
+-	struct altmode_dev *amdev = platform_get_drvdata(pdev);
+-	struct altmode_client *client, *tmp;
+-	struct probe_notify_node *npos, *ntmp;
+-
+-	debugfs_remove_recursive(amdev->debugfs_dir);
+-
+ 	cancel_delayed_work_sync(&amdev->send_pan_en_work);
+ 	cancel_delayed_work_sync(&amdev->send_pan_ack_work);
+-	idr_destroy(&amdev->client_idr);
+-	atomic_set(&amdev->pan_en_sent, 0);
+-
+-	mutex_lock(&notify_lock);
+-	list_for_each_entry_safe(npos, ntmp, &probe_notify_list, node) {
+-		of_node_put(npos->amdev_node);
+-		list_del(&npos->node);
+-		kfree(npos);
+-	}
+-	mutex_unlock(&notify_lock);
+-
+-	mutex_lock(&amdev->client_lock);
+-	list_for_each_entry_safe(client, tmp, &amdev->client_list, c_node)
+-		list_del(&client->c_node);
+-	mutex_unlock(&amdev->client_lock);
+-
+-	ipc_log_context_destroy(altmode_ipc_log);
+-	altmode_ipc_log = NULL;
+-
+-	rc = pmic_glink_unregister_client(amdev->pgclient);
+-	if (rc < 0)
+-		dev_err(amdev->dev, "Error in pmic_glink de-registration: %d\n",
+-				rc);
+-
++release:
++	ipc_log_context_destroy(amdev->ipc_log);
++	kref_put(&amdev->ref, altmode_release);
+ 	return rc;
++}
++
++static void altmode_remove(struct platform_device *pdev)
++{
++	struct altmode_dev *amdev = platform_get_drvdata(pdev);
++	struct altmode_client *client;
++	int key = 0;
++
++	mutex_lock(&altmode_registry_lock);
++	WRITE_ONCE(amdev->removing, true);
++	list_del_init(&amdev->d_node);
++	mutex_unlock(&altmode_registry_lock);
++	complete_all(&amdev->response_received);
++	debugfs_remove_recursive(amdev->debugfs_dir);
++	/* Drain transport users before freeing pgclient; unregister drains RX. */
++	mutex_lock(&amdev->write_lock);
++	pmic_glink_unregister_client(amdev->pgclient);
++	mutex_unlock(&amdev->write_lock);
++	cancel_delayed_work_sync(&amdev->send_pan_en_work);
++	cancel_delayed_work_sync(&amdev->send_pan_ack_work);
++	for (;;) {
++		mutex_lock(&amdev->client_lock);
++		client = idr_get_next(&amdev->client_idr, &key);
++		if (client) {
++			kref_get(&client->ref);
++			idr_remove(&amdev->client_idr, key);
++		}
++		mutex_unlock(&amdev->client_lock);
++		if (!client)
++			break;
++		cancel_work_sync(&client->client_cb_work);
++		kref_put(&client->ref, altmode_client_release);
++		key++;
++	}
++	/* Callers retain offline client handles until explicit deregistration. */
++	ipc_log_context_destroy(amdev->ipc_log);
++	amdev->ipc_log = NULL;
++	platform_set_drvdata(pdev, NULL);
++	kref_put(&amdev->ref, altmode_release);
+ }
+ 
+ static const struct of_device_id altmode_match_table[] = {
+--- a/drivers/soc/qcom/fsa4480-i2c.c
++++ b/drivers/soc/qcom/fsa4480-i2c.c
+@@ -8,6 +8,8 @@
+ #include <linux/regmap.h>
+ #include <linux/i2c.h>
+ #include <linux/mutex.h>
++#include <linux/list.h>
++#include <linux/srcu.h>
+ #include <linux/usb/typec.h>
+ #include <linux/usb/ucsi_glink.h>
+ #include <linux/soc/qcom/fsa4480-i2c.h>
+@@ -38,6 +40,11 @@
+ #define DIO4485_POWER_UP_51 	0x51
+ 
+ struct fsa4480_priv {
++	struct list_head registry_node;
++	bool removing;
++	spinlock_t work_lock;
++	bool work_active;
++	int last_error;
+ 	struct regmap *regmap;
+ 	struct device *dev;
+ 	struct notifier_block ucsi_nb;
+@@ -55,7 +62,7 @@
+ static const struct regmap_config fsa4480_regmap_config = {
+ 	.reg_bits = 8,
+ 	.val_bits = 8,
+-	.max_register = FSA4480_RESET,
++	.max_register = DIO4485_POWER_UP_51,
+ };
+ 
+ static const struct fsa4480_reg_val fsa_reg_i2c_defaults[] = {
+@@ -84,111 +91,104 @@
+ 	{ DIO4485_FUNCTION_ENABLE, 0x08 },
+ };
+ 
+-static void fsa4480_usbc_update_settings(struct fsa4480_priv *fsa_priv,
++static LIST_HEAD(fsa4480_devices);
++static DEFINE_MUTEX(fsa4480_registry_lock);
++DEFINE_STATIC_SRCU(fsa4480_ops_srcu);
++
++/* The caller holds fsa4480_ops_srcu until it stops using this instance. */
++static struct fsa4480_priv *fsa4480_find(struct device_node *node)
++{
++	struct fsa4480_priv *priv, *found = NULL;
++
++	mutex_lock(&fsa4480_registry_lock);
++	list_for_each_entry(priv, &fsa4480_devices, registry_node) {
++		if (priv->dev->of_node == node && !priv->removing) {
++			found = priv;
++			break;
++		}
++	}
++	mutex_unlock(&fsa4480_registry_lock);
++	return found;
++}
++
++/* notification_lock serializes the read/disable/control/enable sequence. */
++static int fsa4480_usbc_update_settings(struct fsa4480_priv *fsa_priv,
+ 		u32 switch_control, u32 switch_enable)
+ {
+ 	u32 prev_control, prev_enable;
+-
+-	if (!fsa_priv->regmap) {
+-		dev_err(fsa_priv->dev, "%s: regmap invalid\n", __func__);
+-		return;
+-	}
+-
+-	regmap_read(fsa_priv->regmap, FSA4480_SWITCH_CONTROL, &prev_control);
+-	regmap_read(fsa_priv->regmap, FSA4480_SWITCH_SETTINGS, &prev_enable);
+-	if (prev_control == switch_control && prev_enable == switch_enable) {
+-		dev_dbg(fsa_priv->dev, "%s: settings unchanged\n", __func__);
+-		return;
+-	}
+-
+-	regmap_write(fsa_priv->regmap, FSA4480_SWITCH_SETTINGS, 0x80);
+-	regmap_write(fsa_priv->regmap, FSA4480_SWITCH_CONTROL, switch_control);
++	int rc;
++
++	rc = regmap_read(fsa_priv->regmap, FSA4480_SWITCH_CONTROL, &prev_control);
++	if (rc)
++		return rc;
++	rc = regmap_read(fsa_priv->regmap, FSA4480_SWITCH_SETTINGS, &prev_enable);
++	if (rc)
++		return rc;
++	if (prev_control == switch_control && prev_enable == switch_enable)
++		return 0;
++	rc = regmap_write(fsa_priv->regmap, FSA4480_SWITCH_SETTINGS, 0x80);
++	if (rc)
++		return rc;
++	rc = regmap_write(fsa_priv->regmap, FSA4480_SWITCH_CONTROL, switch_control);
++	if (rc)
++		return rc;
+ 	/* FSA4480 chip hardware requirement */
+ 	usleep_range(50, 55);
+-	regmap_write(fsa_priv->regmap, FSA4480_SWITCH_SETTINGS, switch_enable);
++	return regmap_write(fsa_priv->regmap, FSA4480_SWITCH_SETTINGS, switch_enable);
+ }
+ 
+ static int fsa4480_usbc_event_changed(struct notifier_block *nb,
+ 				      unsigned long evt, void *ptr)
+ {
+-	struct fsa4480_priv *fsa_priv =
+-			container_of(nb, struct fsa4480_priv, ucsi_nb);
+-	struct device *dev;
+-	enum typec_accessory acc = ((struct ucsi_glink_constat_info *)ptr)->acc;
+-
+-	if (!fsa_priv)
+-		return -EINVAL;
+-
+-	dev = fsa_priv->dev;
+-	if (!dev)
+-		return -EINVAL;
+-
+-	dev_dbg(dev, "%s: USB change event received, supply mode %d, usbc mode %d, expected %d\n",
+-			__func__, acc, fsa_priv->usbc_mode.counter,
+-			TYPEC_ACCESSORY_AUDIO);
+-
+-	switch (acc) {
+-	case TYPEC_ACCESSORY_AUDIO:
+-	case TYPEC_ACCESSORY_NONE:
+-		if (atomic_read(&(fsa_priv->usbc_mode)) == acc)
+-			break; /* filter notifications received before */
+-		atomic_set(&(fsa_priv->usbc_mode), acc);
+-
+-		dev_dbg(dev, "%s: queueing usbc_analog_work\n",
+-			__func__);
+-		pm_stay_awake(fsa_priv->dev);
+-		queue_work(system_freezable_wq, &fsa_priv->usbc_analog_work);
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	return 0;
+-}
+-
+-static int fsa4480_usbc_analog_setup_switches(struct fsa4480_priv *fsa_priv)
+-{
+-	int rc = 0;
+-	int mode;
+-	struct device *dev;
+-
+-	if (!fsa_priv)
+-		return -EINVAL;
+-	dev = fsa_priv->dev;
+-	if (!dev)
+-		return -EINVAL;
+-
+-	mutex_lock(&fsa_priv->notification_lock);
+-	/* get latest mode again within locked context */
+-	mode = atomic_read(&(fsa_priv->usbc_mode));
+-
+-	dev_dbg(dev, "%s: setting GPIOs active = %d\n",
+-		__func__, mode != TYPEC_ACCESSORY_NONE);
+-
+-	switch (mode) {
+-	/* add all modes FSA should notify for in here */
+-	case TYPEC_ACCESSORY_AUDIO:
+-		/* activate switches */
+-		fsa4480_usbc_update_settings(fsa_priv, 0x00, 0x9F);
+-
+-		/* notify call chain on event */
+-		blocking_notifier_call_chain(&fsa_priv->fsa4480_notifier,
+-					     mode, NULL);
+-		break;
+-	case TYPEC_ACCESSORY_NONE:
+-		/* notify call chain on event */
+-		blocking_notifier_call_chain(&fsa_priv->fsa4480_notifier,
+-				TYPEC_ACCESSORY_NONE, NULL);
+-
+-		/* deactivate switches */
+-		fsa4480_usbc_update_settings(fsa_priv, 0x18, 0x98);
+-		break;
+-	default:
+-		/* ignore other usb connection modes */
+-		break;
+-	}
+-
+-	mutex_unlock(&fsa_priv->notification_lock);
++	struct fsa4480_priv *priv = container_of(nb, struct fsa4480_priv, ucsi_nb);
++	enum typec_accessory acc;
++	unsigned long flags;
++
++	if (!ptr)
++		return NOTIFY_BAD;
++	acc = ((struct ucsi_glink_constat_info *)ptr)->acc;
++	if (acc != TYPEC_ACCESSORY_AUDIO && acc != TYPEC_ACCESSORY_NONE)
++		return NOTIFY_DONE;
++	spin_lock_irqsave(&priv->work_lock, flags);
++	if (READ_ONCE(priv->removing))
++		goto unlock;
++	if (atomic_read(&priv->usbc_mode) == acc && !priv->last_error)
++		goto unlock;
++	atomic_set(&priv->usbc_mode, acc);
++	if (!priv->work_active) {
++		priv->work_active = true;
++		pm_stay_awake(priv->dev);
++		queue_work(system_freezable_wq, &priv->usbc_analog_work);
++	}
++unlock:
++	spin_unlock_irqrestore(&priv->work_lock, flags);
++	return NOTIFY_OK;
++}
++
++static int fsa4480_usbc_analog_setup_switches(struct fsa4480_priv *priv)
++{
++	int mode = atomic_read(&priv->usbc_mode);
++	int rc;
++
++	if (READ_ONCE(priv->removing))
++		return -ENODEV;
++	/* Notifiers may configure the switch themselves: never call them while
++	 * holding notification_lock. Preserve disconnect-before-disable ordering.
++	 */
++	if (mode == TYPEC_ACCESSORY_NONE)
++		blocking_notifier_call_chain(&priv->fsa4480_notifier, mode, NULL);
++	mutex_lock(&priv->notification_lock);
++	if (READ_ONCE(priv->removing))
++		rc = -ENODEV;
++	else if (mode == TYPEC_ACCESSORY_AUDIO)
++		rc = fsa4480_usbc_update_settings(priv, 0x00, 0x9F);
++	else if (mode == TYPEC_ACCESSORY_NONE)
++		rc = fsa4480_usbc_update_settings(priv, 0x18, 0x98);
++	else
++		rc = -EINVAL;
++	mutex_unlock(&priv->notification_lock);
++	if (!rc && mode == TYPEC_ACCESSORY_AUDIO)
++		blocking_notifier_call_chain(&priv->fsa4480_notifier, mode, NULL);
+ 	return rc;
+ }
+ 
+@@ -200,38 +200,29 @@
+  *
+  * Returns 0 on success, or error code
+  */
+-int fsa4480_reg_notifier(struct notifier_block *nb,
+-			 struct device_node *node)
+-{
+-	int rc = 0;
+-	struct i2c_client *client = of_find_i2c_device_by_node(node);
+-	struct fsa4480_priv *fsa_priv;
+-
+-	if (!client)
++int fsa4480_reg_notifier(struct notifier_block *nb, struct device_node *node)
++{
++	struct fsa4480_priv *priv;
++	int idx, rc;
++
++	if (!nb || !node)
+ 		return -EINVAL;
+-
+-	fsa_priv = (struct fsa4480_priv *)i2c_get_clientdata(client);
+-	if (!fsa_priv)
+-		return -EINVAL;
+-
+-	rc = blocking_notifier_chain_register
+-				(&fsa_priv->fsa4480_notifier, nb);
+-
+-	dev_dbg(fsa_priv->dev, "%s: registered notifier for %s\n",
+-		__func__, node->name);
+-	if (rc)
+-		return rc;
+-
+-	/*
+-	 * as part of the init sequence check if there is a connected
+-	 * USB C analog adapter
+-	 */
+-	if (atomic_read(&(fsa_priv->usbc_mode)) == TYPEC_ACCESSORY_AUDIO) {
+-		dev_dbg(fsa_priv->dev, "%s: analog adapter already inserted\n",
+-			__func__);
+-		rc = fsa4480_usbc_analog_setup_switches(fsa_priv);
+-	}
+-
++	idx = srcu_read_lock(&fsa4480_ops_srcu);
++	priv = fsa4480_find(node);
++	if (!priv) {
++		rc = -EPROBE_DEFER;
++		goto unlock;
++	}
++	rc = blocking_notifier_chain_register(&priv->fsa4480_notifier, nb);
++	if (rc)
++		goto unlock;
++	if (atomic_read(&priv->usbc_mode) == TYPEC_ACCESSORY_AUDIO) {
++		rc = fsa4480_usbc_analog_setup_switches(priv);
++		if (rc)
++			blocking_notifier_chain_unregister(&priv->fsa4480_notifier, nb);
++	}
++unlock:
++	srcu_read_unlock(&fsa4480_ops_srcu, idx);
+ 	return rc;
+ }
+ EXPORT_SYMBOL_GPL(fsa4480_reg_notifier);
+@@ -244,22 +235,29 @@
+  *
+  * Returns 0 on pass, or error code
+  */
+-int fsa4480_unreg_notifier(struct notifier_block *nb,
+-			     struct device_node *node)
+-{
+-	struct i2c_client *client = of_find_i2c_device_by_node(node);
+-	struct fsa4480_priv *fsa_priv;
+-
+-	if (!client)
++int fsa4480_unreg_notifier(struct notifier_block *nb, struct device_node *node)
++{
++	struct fsa4480_priv *priv;
++	int idx, rc;
++
++	if (!nb || !node)
+ 		return -EINVAL;
+-
+-	fsa_priv = (struct fsa4480_priv *)i2c_get_clientdata(client);
+-	if (!fsa_priv)
+-		return -EINVAL;
+-
+-	fsa4480_usbc_update_settings(fsa_priv, 0x18, 0x98);
+-	return blocking_notifier_chain_unregister
+-					(&fsa_priv->fsa4480_notifier, nb);
++	idx = srcu_read_lock(&fsa4480_ops_srcu);
++	priv = fsa4480_find(node);
++	if (!priv) {
++		rc = -ENODEV;
++		goto unlock;
++	}
++	rc = blocking_notifier_chain_unregister(&priv->fsa4480_notifier, nb);
++	if (!rc) {
++		mutex_lock(&priv->notification_lock);
++		if (!priv->removing)
++			rc = fsa4480_usbc_update_settings(priv, 0x18, 0x98);
++		mutex_unlock(&priv->notification_lock);
++	}
++unlock:
++	srcu_read_unlock(&fsa4480_ops_srcu, idx);
++	return rc;
+ }
+ EXPORT_SYMBOL_GPL(fsa4480_unreg_notifier);
+ 
+@@ -267,7 +265,10 @@
+ {
+ 	u32 switch_status = 0;
+ 
+-	regmap_read(fsa_priv->regmap, FSA4480_SWITCH_STATUS1, &switch_status);
++	int rc = regmap_read(fsa_priv->regmap, FSA4480_SWITCH_STATUS1, &switch_status);
++
++	if (rc)
++		return rc;
+ 
+ 	if ((switch_status != 0x23) && (switch_status != 0x1C)) {
+ 		pr_err("AUX SBU1/2 switch status is invalid = %u\n",
+@@ -285,151 +286,169 @@
+  *
+  * Returns int on whether the switch happened or not
+  */
+-int fsa4480_switch_event(struct device_node *node,
+-			 enum fsa_function event)
+-{
+-	int switch_control = 0;
+-	struct i2c_client *client = of_find_i2c_device_by_node(node);
+-	struct fsa4480_priv *fsa_priv;
+-
+-	if (!client)
++int fsa4480_switch_event(struct device_node *node, enum fsa_function event)
++{
++	struct fsa4480_priv *priv;
++	u32 control;
++	int idx, rc;
++
++	if (!node || event < 0 || event >= FSA_EVENT_MAX)
+ 		return -EINVAL;
+-
+-	fsa_priv = (struct fsa4480_priv *)i2c_get_clientdata(client);
+-	if (!fsa_priv)
+-		return -EINVAL;
+-	if (!fsa_priv->regmap)
+-		return -EINVAL;
+-
++	idx = srcu_read_lock(&fsa4480_ops_srcu);
++	priv = fsa4480_find(node);
++	if (!priv) {
++		rc = -ENODEV;
++		goto unlock_srcu;
++	}
++	mutex_lock(&priv->notification_lock);
++	if (READ_ONCE(priv->removing)) {
++		rc = -ENODEV;
++		goto unlock;
++	}
+ 	switch (event) {
+ 	case FSA_MIC_GND_SWAP:
+-		regmap_read(fsa_priv->regmap, FSA4480_SWITCH_CONTROL,
+-				&switch_control);
+-		if ((switch_control & 0x07) == 0x07)
+-			switch_control = 0x0;
+-		else
+-			switch_control = 0x7;
+-		fsa4480_usbc_update_settings(fsa_priv, switch_control, 0x9F);
++		rc = regmap_read(priv->regmap, FSA4480_SWITCH_CONTROL, &control);
++		if (!rc)
++			rc = fsa4480_usbc_update_settings(priv,
++				(control & 0x07) == 0x07 ? 0x00 : 0x07, 0x9F);
+ 		break;
+ 	case FSA_USBC_ORIENTATION_CC1:
+-		fsa4480_usbc_update_settings(fsa_priv, 0x18, 0xF8);
+-		return fsa4480_validate_display_port_settings(fsa_priv);
+ 	case FSA_USBC_ORIENTATION_CC2:
+-		fsa4480_usbc_update_settings(fsa_priv, 0x78, 0xF8);
+-		return fsa4480_validate_display_port_settings(fsa_priv);
++		rc = fsa4480_usbc_update_settings(priv,
++			event == FSA_USBC_ORIENTATION_CC1 ? 0x18 : 0x78, 0xF8);
++		if (!rc)
++			rc = fsa4480_validate_display_port_settings(priv);
++		break;
+ 	case FSA_USBC_DISPLAYPORT_DISCONNECTED:
+-		fsa4480_usbc_update_settings(fsa_priv, 0x18, 0x98);
++		rc = fsa4480_usbc_update_settings(priv, 0x18, 0x98);
+ 		break;
+ 	case FSA_USBC_SBU_LPD_SENSE:
+-		fsa4480_usbc_update_settings(fsa_priv, 0x19, 0xd9);
++		rc = fsa4480_usbc_update_settings(priv, 0x19, 0xD9);
+ 		break;
+ 	case FSA_USBC_SBU_LPD_ISOLATE:
+-		fsa4480_usbc_update_settings(fsa_priv, 0x78, 0xd9);
++		rc = fsa4480_usbc_update_settings(priv, 0x78, 0xD9);
+ 		break;
+ 	default:
+-		break;
+-	}
+-
++		rc = -EINVAL;
++	}
++unlock:
++	mutex_unlock(&priv->notification_lock);
++unlock_srcu:
++	srcu_read_unlock(&fsa4480_ops_srcu, idx);
++	return rc;
++}
++EXPORT_SYMBOL_GPL(fsa4480_switch_event);
++
++static void fsa4480_usbc_analog_work_fn(struct work_struct *work)
++{
++	struct fsa4480_priv *priv = container_of(work,
++			struct fsa4480_priv, usbc_analog_work);
++	unsigned long flags;
++	int mode, rc;
++
++	for (;;) {
++		mode = atomic_read(&priv->usbc_mode);
++		rc = fsa4480_usbc_analog_setup_switches(priv);
++		spin_lock_irqsave(&priv->work_lock, flags);
++		priv->last_error = rc;
++		if (READ_ONCE(priv->removing) || mode == atomic_read(&priv->usbc_mode)) {
++			priv->work_active = false;
++			pm_relax(priv->dev);
++			spin_unlock_irqrestore(&priv->work_lock, flags);
++			return;
++		}
++		spin_unlock_irqrestore(&priv->work_lock, flags);
++	}
++}
++
++static int fsa4480_update_reg_defaults(struct regmap *regmap)
++{
++	const struct fsa4480_reg_val *table;
++	u32 type;
++	size_t count, i;
++	int rc;
++
++	rc = regmap_read(regmap, DIO4485_DEVICE_ID, &type);
++	if (rc)
++		return rc;
++	if (type == 0xF6) {
++		table = dio_reg_i2c_defaults;
++		count = ARRAY_SIZE(dio_reg_i2c_defaults);
++	} else {
++		table = fsa_reg_i2c_defaults;
++		count = ARRAY_SIZE(fsa_reg_i2c_defaults);
++	}
++	for (i = 0; i < count; i++) {
++		rc = regmap_write(regmap, table[i].reg, table[i].val);
++		if (rc)
++			return rc;
++	}
+ 	return 0;
+ }
+-EXPORT_SYMBOL_GPL(fsa4480_switch_event);
+-
+-static void fsa4480_usbc_analog_work_fn(struct work_struct *work)
+-{
+-	struct fsa4480_priv *fsa_priv =
+-		container_of(work, struct fsa4480_priv, usbc_analog_work);
+-
+-	if (!fsa_priv) {
+-		pr_err("%s: fsa container invalid\n", __func__);
+-		return;
+-	}
+-	fsa4480_usbc_analog_setup_switches(fsa_priv);
+-	pm_relax(fsa_priv->dev);
+-}
+-
+-static void fsa4480_update_reg_defaults(struct regmap *regmap)
+-{
+-	u8 i;
+-	u32 fsa_type = 0;
+-
+-	regmap_read(regmap, DIO4485_DEVICE_ID, &fsa_type);
+-	if (fsa_type == 0xF6) {
+-		pr_info("%s: audioswitch type is dio4485\n", __func__);
+-		for (i = 0; i < ARRAY_SIZE(dio_reg_i2c_defaults); i++)
+-			regmap_write(regmap, dio_reg_i2c_defaults[i].reg,
+-				     dio_reg_i2c_defaults[i].val);
+-	} else {
+-		pr_info("%s: audioswitch type is default\n", __func__);
+-		for (i = 0; i < ARRAY_SIZE(fsa_reg_i2c_defaults); i++)
+-			regmap_write(regmap, fsa_reg_i2c_defaults[i].reg,
+-				     fsa_reg_i2c_defaults[i].val);
+-	}
+-}
+ 
+ static int fsa4480_probe(struct i2c_client *i2c)
+ {
+-	struct fsa4480_priv *fsa_priv;
+-	int rc = 0;
+-
+-	fsa_priv = devm_kzalloc(&i2c->dev, sizeof(*fsa_priv),
+-				GFP_KERNEL);
+-	if (!fsa_priv)
++	struct fsa4480_priv *priv;
++	int rc;
++
++	priv = devm_kzalloc(&i2c->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
+ 		return -ENOMEM;
+-
+-	fsa_priv->dev = &i2c->dev;
+-
+-	fsa_priv->regmap = devm_regmap_init_i2c(i2c, &fsa4480_regmap_config);
+-	if (IS_ERR_OR_NULL(fsa_priv->regmap)) {
+-		dev_err(fsa_priv->dev, "%s: Failed to initialize regmap: %d\n",
+-			__func__, rc);
+-		if (!fsa_priv->regmap) {
+-			rc = -EINVAL;
+-			goto err_data;
+-		}
+-		rc = PTR_ERR(fsa_priv->regmap);
+-		goto err_data;
+-	}
+-
+-	fsa4480_update_reg_defaults(fsa_priv->regmap);
+-	devm_regmap_qti_debugfs_register(fsa_priv->dev, fsa_priv->regmap);
+-
+-	fsa_priv->ucsi_nb.notifier_call = fsa4480_usbc_event_changed;
+-	fsa_priv->ucsi_nb.priority = 0;
+-	rc = register_ucsi_glink_notifier(&fsa_priv->ucsi_nb);
++	priv->dev = &i2c->dev;
++	mutex_init(&priv->notification_lock);
++	spin_lock_init(&priv->work_lock);
++	INIT_LIST_HEAD(&priv->registry_node);
++	INIT_WORK(&priv->usbc_analog_work, fsa4480_usbc_analog_work_fn);
++	BLOCKING_INIT_NOTIFIER_HEAD(&priv->fsa4480_notifier);
++	priv->regmap = devm_regmap_init_i2c(i2c, &fsa4480_regmap_config);
++	if (IS_ERR(priv->regmap))
++		return PTR_ERR(priv->regmap);
++	rc = fsa4480_update_reg_defaults(priv->regmap);
++	if (rc)
++		return rc;
++	rc = devm_regmap_qti_debugfs_register(priv->dev, priv->regmap);
++	if (rc)
++		return rc;
++	rc = device_init_wakeup(priv->dev, true);
++	if (rc)
++		return rc;
++	priv->ucsi_nb.notifier_call = fsa4480_usbc_event_changed;
++	rc = register_ucsi_glink_notifier(&priv->ucsi_nb);
+ 	if (rc) {
+-		dev_err(fsa_priv->dev, "%s: ucsi glink notifier registration failed: %d\n",
+-			__func__, rc);
+-		goto err_data;
+-	}
+-
+-	mutex_init(&fsa_priv->notification_lock);
+-	i2c_set_clientdata(i2c, fsa_priv);
+-
+-	INIT_WORK(&fsa_priv->usbc_analog_work,
+-		  fsa4480_usbc_analog_work_fn);
+-
+-	BLOCKING_INIT_NOTIFIER_HEAD(&fsa_priv->fsa4480_notifier);
+-
++		WRITE_ONCE(priv->removing, true);
++		cancel_work_sync(&priv->usbc_analog_work);
++		pm_relax(priv->dev);
++		device_init_wakeup(priv->dev, false);
++		return rc;
++	}
++	i2c_set_clientdata(i2c, priv);
++	mutex_lock(&fsa4480_registry_lock);
++	list_add_tail(&priv->registry_node, &fsa4480_devices);
++	mutex_unlock(&fsa4480_registry_lock);
+ 	return 0;
+-
+-err_data:
+-	return rc;
+ }
+ 
+ static void fsa4480_remove(struct i2c_client *i2c)
+ {
+-	struct fsa4480_priv *fsa_priv =
+-			(struct fsa4480_priv *)i2c_get_clientdata(i2c);
+-
+-	if (!fsa_priv)
+-		return;
+-
+-	unregister_ucsi_glink_notifier(&fsa_priv->ucsi_nb);
+-	fsa4480_usbc_update_settings(fsa_priv, 0x18, 0x98);
+-	cancel_work_sync(&fsa_priv->usbc_analog_work);
+-	pm_relax(fsa_priv->dev);
+-	mutex_destroy(&fsa_priv->notification_lock);
+-	dev_set_drvdata(&i2c->dev, NULL);
++	struct fsa4480_priv *priv = i2c_get_clientdata(i2c);
++	unsigned long flags;
++
++	mutex_lock(&fsa4480_registry_lock);
++	WRITE_ONCE(priv->removing, true);
++	list_del_init(&priv->registry_node);
++	mutex_unlock(&fsa4480_registry_lock);
++	unregister_ucsi_glink_notifier(&priv->ucsi_nb);
++	cancel_work_sync(&priv->usbc_analog_work);
++	synchronize_srcu(&fsa4480_ops_srcu);
++	mutex_lock(&priv->notification_lock);
++	fsa4480_usbc_update_settings(priv, 0x18, 0x98);
++	mutex_unlock(&priv->notification_lock);
++	spin_lock_irqsave(&priv->work_lock, flags);
++	priv->work_active = false;
++	pm_relax(priv->dev);
++	spin_unlock_irqrestore(&priv->work_lock, flags);
++	device_init_wakeup(priv->dev, false);
++	i2c_set_clientdata(i2c, NULL);
+ }
+ 
+ static const struct of_device_id fsa4480_i2c_dt_match[] = {
