@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 173 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 176 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 173 platform `.ko` files, their symbol tables and DDK configurations.
+- 176 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 7949
-imported symbol CRCs across all 173 modules.
+used. The current [validation report](validation-20261031.json) checks 8034
+imported symbol CRCs across all 176 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -900,3 +900,29 @@ symbol CRCs with no compiler/modpost warnings; device-tree verification passes
 with the existing 1,084 DTC warnings. Coverage is 172/466 vendor names (36.9%),
 with 294 remaining to assess or port. Image assembly and the remaining driver
 stack are still required for a flashable ZIP.
+
+
+Smart charging, SOC limiter and charging MIEV telemetry add three modules.
+SOC failures retain the active limit for retry; wired/wireless state is independent,
+DT current tables use their actual row counts, and control/voltage bounds and
+provider failures are checked. Immutable provider callbacks drain before removal.
+Voters publish after initialization, reject duplicate ownership, and retry failed
+election callbacks. Telemetry uses real MIEV exports and only consumes an allowance
+after successful report delivery. `verify_smartcharge.py` passes ASan/UBSan control,
+SOC, telemetry, callback and eight probe-failure scenarios; the battery interface
+checks were rerun against the changed voter support.
+
+**BASP remains an unresolved configured feature.** Onyx enables the binary aging/
+spec override, but its pinned header explicitly labels its layout as inferred and
+unverified. `smart_charge_cdev` currently returns EOPNOTSUPP. Ordinary policy
+remains implemented; this rejection is not equivalent functionality. The source/
+DT evidence is in [smartcharge-compatibility-20261031.json](smartcharge-compatibility-20261031.json).
+A verified producer ABI is required before this feature can be completed.
+
+The 176-module combined build passes 8,034 imported-symbol CRCs with no compiler/
+modpost warnings; device-tree checks pass with 1,084 existing vendor DTC warnings.
+[Module build coverage](module-coverage-20261031.json) is 175/466 vendor names
+(37.6%), leaving 291 names to assess or port. The report preserves the exact
+remaining names and hashes of its ROM load-list inputs. This counts built names,
+including alternative hardware and modules with limitations above; it does not
+measure working hardware or overall ZIP completion. No flashable ZIP exists.

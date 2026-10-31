@@ -2213,9 +2213,53 @@ ddk_module(
     deps = [":usb_phy_headers", ":platform_headers", ":qcom_ipc_logging", ":clock_headers", ":clk_qcom", ":usb_repeater", ":mca_headers", ":mca_sysfs", ":wcd_headers", ":wcd_usbss_i2c", ":redriver_headers", ":redriver"],
 )
 
+ddk_headers(
+    name = "smartcharge_headers",
+    hdrs = glob(["drivers/power/supply/mca/**/*.h"]) + ["include/miev/mievent.h"],
+    includes = ["drivers/power/supply/mca/include", "include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_charge_mievent",
+    srcs = ["drivers/power/supply/mca/mca_common/mca_charge_mievent.c"],
+    out = "mca_charge_mievent.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":smartcharge_headers", ":chargebusiness_headers", ":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_common", ":mca_sysfs", ":miev"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_smart_charge",
+    srcs = ["drivers/power/supply/mca/mca_smart_charge/mca_smart_charge.c"],
+    out = "mca_smart_charge.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":smartcharge_headers", ":chargebusiness_headers", ":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_common", ":mca_sysfs", ":mca_charge_mievent", ":mca_soc_limit", ":mca_strategy_fg_class", ":mca_strategy_class", ":mca_hwid", ":charger_partition"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_soc_limit",
+    srcs = ["drivers/power/supply/mca/mca_strategy/strategy_fg/mca_soc_limit.c"],
+    out = "mca_soc_limit.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":smartcharge_headers", ":chargebusiness_headers", ":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_common", ":mca_sysfs", ":mca_strategy_fg_class"],
+    visibility = ["//visibility:public"],
+)
+
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
+        ":mca_charge_mievent",
+        ":mca_smart_charge",
+        ":mca_soc_limit",
         ":dwc3_msm",
         ":panel_event_notifier",
         ":pm8941_pwrkey",
