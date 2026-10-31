@@ -1,0 +1,1645 @@
+--- a/qcom/opensource/data-kernel/drivers/smem-mailbox/include/smem-mailbox.h
++++ b/qcom/opensource/data-kernel/drivers/smem-mailbox/include/smem-mailbox.h
+@@ -4,6 +4,7 @@
+  */
+ 
+ #ifndef __SMEM_MAILBOX_H__
++#define __SMEM_MAILBOX_H__
+ 
+ #include <linux/types.h>
+ 
+@@ -12,7 +13,11 @@
+ 
+ typedef void (*smem_mailbox_urgent_cb)(u16 pending_bytes);
+ 
+-/* API's Exposed to External Modules */
++/* Stop drains urgent callbacks and must run outside an urgent callback.
++ * Successful start/stop return 1. Read returns remaining queued bytes and owns
++ * a kmalloc payload for the caller to kfree. Write returns remaining ring space.
++ * A failed urgent signal can occur after the payload has already been queued.
++ */
+ int smem_mailbox_start(int id, smem_mailbox_urgent_cb urgent_cb);
+ int smem_mailbox_stop(int id);
+ int smem_mailbox_read(int id, u8 **data, u16 *data_length, unsigned long long *xo_time);
+--- a/qcom/opensource/data-kernel/drivers/smem-mailbox/smem-mailbox.c
++++ b/qcom/opensource/data-kernel/drivers/smem-mailbox/smem-mailbox.c
+@@ -1,80 +1,37 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/*
+- * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+- */
+-
+-#include <linux/cdev.h>
+-#include <linux/device.h>
+-#include <linux/errno.h>
+-#include <linux/fs.h>
+-#include <linux/kernel.h>
++/* Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved. */
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/kref.h>
++#include <linux/limits.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of_irq.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+ #include <linux/soc/qcom/smem.h>
+ #include <linux/soc/qcom/smem_state.h>
+-#include <linux/types.h>
+-#include <linux/version.h>
+-#include <net/genetlink.h>
+-
++#include <linux/srcu.h>
++#include <asm/arch_timer.h>
+ #include "smem-mailbox.h"
+ 
+-#define SMEM_VERSION 0x00000001 // v0.1
++#define SMEM_VERSION 0x00000001
+ #define START_COOKIE 0xbeefcafe
+ #define END_COOKIE 0x0fed0fed
+-
+ #define DEVICE_NAME "smem_mailbox"
+-
+-#define HEAD_PTR_SIZE 4
+-#define TAIL_PTR_SIZE 4
+-#define BUF_IO_PTR_SIZE HEAD_PTR_SIZE + TAIL_PTR_SIZE
+-
+-#define GET_READ_HEAD(smem, entry) *(u32 *)(smem + entry->start_loc)
+-#define GET_READ_TAIL(smem, entry) *(u32 *)(smem + entry->start_loc + HEAD_PTR_SIZE)
+-#define GET_READ_BUF(smem, entry) smem + entry->start_loc + BUF_IO_PTR_SIZE
+-
+-#define GET_WRITE_HEAD(smem, entry) \
+-	*(u32 *)(smem + entry->start_loc + BUF_IO_PTR_SIZE + entry->read_size)
+-#define GET_WRITE_TAIL(smem, entry) \
+-	*(u32 *)(smem + entry->start_loc + BUF_IO_PTR_SIZE + entry->read_size + HEAD_PTR_SIZE)
+-#define GET_WRITE_BUF(smem, entry) \
+-	smem + entry->start_loc + BUF_IO_PTR_SIZE + entry->read_size + BUF_IO_PTR_SIZE
+-
+-#define UPDATE_WRITE_HEAD(smem, value) \
+-	memcpy_toio(smem + entry->start_loc + BUF_IO_PTR_SIZE + entry->read_size, &value, \
+-		sizeof(value));
+-#define UPDATE_READ_TAIL(smem, value) \
+-	memcpy_toio(smem + entry->start_loc + HEAD_PTR_SIZE, &value, sizeof(value));
+-
+-// This list must match the configured names in the device tree for the smp2p in (IRQ).
++#define SMEM_DESCRIPTOR 655
++#define QCOM_SMEM_HOST_MODEM 1
+ #define IRQ_NUM_NAMES 4
+-static char *IRQ_NAMES[] = {"smem-mailbox-smp2p-1-in", "smem-mailbox-smp2p-2-in",
+-			"smem-mailbox-smp2p-3-in", "smem-mailbox-smp2p-4-in"};
+-
+-#define SMEM_DESCRIPTOR 655
+-/* SMEM host id representing the modem. */
+-#define QCOM_SMEM_HOST_MODEM 1
+-
+-struct smem_client_channel {
+-	struct list_head list;
+-	u32 id;
+-	u32 start_loc;
+-	u32 read_size;
+-	u32 write_size;
+-	bool client_connected;
+-	char irq_name[24];
+-	smem_mailbox_urgent_cb urgent_cb;
+-};
+-static LIST_HEAD(smem_client_channel_list_head);
+-
+-struct mailbox_smp2p {
+-	struct qcom_smem_state *smem_state;
+-	u32 smem_bit;
+-};
+-struct mailbox_smp2p *mailbox;
+-struct device *dev;
+-
++#define BUF_IO_PTR_SIZE 8
++#define TLV_TYPE_TIME 0
++#define TLV_TYPE_DATA 1
++
++static const char * const IRQ_NAMES[] = {
++	"smem-mailbox-smp2p-1-in", "smem-mailbox-smp2p-2-in",
++	"smem-mailbox-smp2p-3-in", "smem-mailbox-smp2p-4-in",
++};
++
++/* Keep descriptor and TLV layouts identical to the modem protocol. */
+ struct client_info {
+ 	u32 id;
+ 	u32 start_loc;
+@@ -86,483 +43,533 @@
+ 	u32 start_cookie;
+ 	u32 version;
+ 	u32 num_of_clients;
+-	struct client_info clients[4];
++	struct client_info clients[IRQ_NUM_NAMES];
+ 	u32 end_cookie;
+ };
+-bool info_validated;
+-
+-#define TLV_TYPE_TIME 0
+-#define TLV_TYPE_DATA 1
+-#define TLV_TYPE_MODULE_MAX 32767
+-// TLV range of 32,768 - 65,535 is reserved for client use.
+ 
+ struct tlv {
+ 	u16 type;
+ 	u16 length;
+ };
+ 
+-int free_bytes(u32 head, u32 tail, u32 max) {
+-	int free_bytes = 0;
+-
+-	if (head >= tail) {
+-		free_bytes = max - head + tail;
+-	} else {
+-		free_bytes = tail - head;
+-	}
+-	return free_bytes;
+-}
+-
+-static irqreturn_t smem_read_ready(int irq, void *channel)
+-{
+-	int id = 0;
+-	int pending_bytes = 0;
++struct smem_mailbox_provider;
++struct smem_client_channel {
++	struct smem_mailbox_provider *provider;
++	struct client_info info;
++	smem_mailbox_urgent_cb urgent_cb;
++	struct task_struct *callback_task;
++	int irq;
++	bool connected;
++	bool stopping;
++};
++
++struct smem_mailbox_provider {
++	struct kref ref;
++	struct device *dev;
++	struct qcom_smem_state *state;
++	u32 state_bit;
++	u32 signal_value;
++	struct smem_info info;
++	struct smem_client_channel channels[IRQ_NUM_NAMES];
++	bool mapped;
++	bool removing;
++};
++
++static DEFINE_MUTEX(mailbox_lock);
++DEFINE_STATIC_SRCU(mailbox_callbacks);
++static struct smem_mailbox_provider *mailbox_provider;
++static bool mailbox_retiring;
++
++static void mailbox_release(struct kref *ref)
++{
++	struct smem_mailbox_provider *p;
++
++	p = container_of(ref, struct smem_mailbox_provider, ref);
++	kfree(p);
++}
++
++static u32 ring_used(u32 head, u32 tail, u32 size)
++{
++	return head >= tail ? head - tail : size - tail + head;
++}
++
++static int mailbox_validate_info(const struct smem_info *info, size_t size,
++				 u32 state_bit)
++{
++	u64 end, other_end;
++	u32 i, j;
++
++	if (size < sizeof(*info) || info->start_cookie != START_COOKIE ||
++	    info->end_cookie != END_COOKIE || info->version != SMEM_VERSION ||
++	    !info->num_of_clients || info->num_of_clients > IRQ_NUM_NAMES ||
++	    state_bit >= 32)
++		return -EPROTO;
++	for (i = 0; i < info->num_of_clients; i++) {
++		const struct client_info *c = &info->clients[i];
++
++		if (c->id >= 32 - state_bit || c->start_loc < sizeof(*info) ||
++		    (c->start_loc & 3) || (c->read_size & 3) || (c->write_size & 3) ||
++		    c->read_size < 4 || c->read_size > U16_MAX ||
++		    c->write_size < 4 || c->write_size > INT_MAX)
++			return -EPROTO;
++		end = (u64)c->start_loc + 2 * BUF_IO_PTR_SIZE +
++			c->read_size + c->write_size;
++		if (end > size)
++			return -EPROTO;
++		for (j = 0; j < i; j++) {
++			const struct client_info *other = &info->clients[j];
++
++			other_end = (u64)other->start_loc + 2 * BUF_IO_PTR_SIZE +
++				other->read_size + other->write_size;
++			if (c->id == other->id ||
++			    (c->start_loc < other_end && other->start_loc < end))
++				return -EPROTO;
++		}
++	}
++	return 0;
++}
++
++/* Caller holds mailbox_lock. Publish only a complete checked descriptor. */
++static int mailbox_memory(struct smem_mailbox_provider *p, void __iomem **memory)
++{
++	struct smem_info info;
+ 	void *smem;
+ 	size_t size;
+-	struct smem_client_channel *entry = NULL;
+-
+-	id = ((struct smem_client_channel *)channel)->id;
+-
+-	list_for_each_entry(entry, &smem_client_channel_list_head, list) {
+-		if (entry->id == id) break;
+-	}
+-
+-	if (entry == NULL || entry->id != id) {
+-		pr_err(KERN_ALERT "smem: ID does not match any smem sub allocation %d\n", id);
+-		return IRQ_HANDLED;
+-	}
+-
+-	if (!entry->client_connected) {
+-		pr_err(KERN_ALERT "smem: there is no connected client for ID %d, ignore\n", id);
+-		return IRQ_HANDLED;
+-	}
++	u32 i;
++	int ret;
+ 
+ 	smem = qcom_smem_get(QCOM_SMEM_HOST_MODEM, SMEM_DESCRIPTOR, &size);
+-	if (IS_ERR(smem)) {
+-		pr_err("%s: smem qcom_smem_get fail.\n", __func__);
+-		return IRQ_HANDLED;
+-	}
+-
+-	pending_bytes = entry->read_size -
+-			free_bytes(GET_READ_HEAD(smem, entry), GET_READ_TAIL(smem, entry), entry->read_size);
+-	entry->urgent_cb(pending_bytes);
+-
++	if (IS_ERR(smem))
++		return PTR_ERR(smem);
++	if (!smem || size < sizeof(info))
++		return -EPROTO;
++	memcpy_fromio(&info, (void __iomem *)smem, sizeof(info));
++	ret = mailbox_validate_info(&info, size, p->state_bit);
++	if (ret)
++		return ret;
++	if (p->mapped) {
++		if (memcmp(&info, &p->info, sizeof(info)))
++			return -ESTALE;
++	} else {
++		p->info = info;
++		for (i = 0; i < info.num_of_clients; i++)
++			p->channels[i].info = info.clients[i];
++		p->mapped = true;
++	}
++	*memory = (void __iomem *)smem;
++	return 0;
++}
++
++static struct smem_client_channel *mailbox_channel(struct smem_mailbox_provider *p,
++						   int id)
++{
++	u32 i;
++
++	if (!p || p->removing || !p->mapped || id < 0)
++		return NULL;
++	for (i = 0; i < p->info.num_of_clients; i++)
++		if (p->channels[i].info.id == (u32)id)
++			return &p->channels[i];
++	return NULL;
++}
++
++static int mailbox_indices(void __iomem *ring, u32 size, u32 *head, u32 *tail)
++{
++	*head = readl(ring);
++	*tail = readl(ring + sizeof(u32));
++	if (*head >= size || *tail >= size || (*head & 3) || (*tail & 3))
++		return -EPROTO;
++	/* The peer publishes its head after writing the payload. */
++	rmb();
++	return 0;
++}
++
++static void mailbox_copy_from(void *dest, void __iomem *ring, u32 size,
++			      u32 index, u32 length)
++{
++	u32 first = min(length, size - index);
++
++	if (first)
++		memcpy_fromio(dest, ring + BUF_IO_PTR_SIZE + index, first);
++	if (length > first)
++		memcpy_fromio((u8 *)dest + first, ring + BUF_IO_PTR_SIZE, length - first);
++}
++
++static void mailbox_copy_to(void __iomem *ring, u32 size, u32 index,
++			    const void *source, u32 length)
++{
++	u32 first = min(length, size - index);
++
++	memcpy_toio(ring + BUF_IO_PTR_SIZE + index, source, first);
++	if (length > first)
++		memcpy_toio(ring + BUF_IO_PTR_SIZE, (const u8 *)source + first,
++			    length - first);
++}
++
++static irqreturn_t smem_read_ready(int irq, void *channel)
++{
++	struct smem_client_channel *c = channel;
++	struct smem_mailbox_provider *p = c->provider;
++	smem_mailbox_urgent_cb callback = NULL;
++	void __iomem *memory;
++	u32 head, tail;
++	u16 pending = 0;
++	int idx;
++
++	idx = srcu_read_lock(&mailbox_callbacks);
++	mutex_lock(&mailbox_lock);
++	if (!p->removing && c->connected && c->urgent_cb &&
++	    !mailbox_memory(p, &memory) &&
++	    !mailbox_indices(memory + c->info.start_loc, c->info.read_size, &head, &tail)) {
++		pending = ring_used(head, tail, c->info.read_size);
++		callback = c->urgent_cb;
++		c->callback_task = current;
++	}
++	mutex_unlock(&mailbox_lock);
++	if (callback) {
++		callback(pending);
++		mutex_lock(&mailbox_lock);
++		c->callback_task = NULL;
++		mutex_unlock(&mailbox_lock);
++	}
++	srcu_read_unlock(&mailbox_callbacks, idx);
+ 	return IRQ_HANDLED;
+ }
+ 
+-static bool read_client_info_map(void) {
+-	int ret = 0;
+-	int irq;
+-	size_t info_size;
+-	struct smem_info smem_info;
+-	struct device_node *node = dev->of_node;
+-	struct smem_client_channel *entry = NULL;
+-
+-	void *smem = qcom_smem_get(QCOM_SMEM_HOST_MODEM, SMEM_DESCRIPTOR, &info_size);
+-	if (IS_ERR(smem)) {
+-		pr_err("%s: smem qcom_smem_get fail.\n", __func__);
+-		return -1;
+-	}
+-
+-	memcpy_fromio(&smem_info, smem, sizeof(struct smem_info));
+-	info_validated = false;
+-
+-	if (smem_info.start_cookie != START_COOKIE) {
+-		pr_err(KERN_ALERT "smem: start cookie does not match %d\n", smem_info.start_cookie);
+-		return false;
+-	}
+-
+-	if (smem_info.version != SMEM_VERSION) {
+-		pr_err(KERN_ALERT "smem: version does not match %d\n", smem_info.version);
+-		return false;
+-	}
+-
+-	for (u32 i = 0; i < smem_info.num_of_clients && i < IRQ_NUM_NAMES; i++) {
+-		struct client_info client = smem_info.clients[i];
+-		u32 id = client.id;
+-		u32 start_loc = client.start_loc;
+-		u32 read_size = client.read_size;
+-		u32 write_size = client.write_size;
+-
+-		struct smem_client_channel *new_entry;
+-		new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+-		new_entry->id = id;
+-		new_entry->start_loc = start_loc;
+-		new_entry->read_size = read_size;
+-		new_entry->write_size = write_size;
+-
+-		// IRQ name is hardcoded
+-		strscpy(new_entry->irq_name, IRQ_NAMES[i], sizeof(new_entry->irq_name));
+-
+-		INIT_LIST_HEAD(&new_entry->list);
+-		list_add_tail(&new_entry->list, &smem_client_channel_list_head);
+-	}
+-
+-	if (smem_info.end_cookie != END_COOKIE) {
+-		pr_err(KERN_ALERT "smem: end cookie does not match %d\n", smem_info.end_cookie);
+-		return false;
+-	}
+-	info_validated = true;
+-
+-	list_for_each_entry(entry, &smem_client_channel_list_head, list) {
+-		irq = ret = of_irq_get_byname(node, entry->irq_name);
+-		if (ret < 0) {
+-			pr_err("%s: smem platform_get_irq_byname fail. %d %s\n", __func__, ret,
+-				   entry->irq_name);
+-			return 1;
++int smem_mailbox_start(int id, smem_mailbox_urgent_cb urgent_cb)
++{
++	struct smem_mailbox_provider *p;
++	struct smem_client_channel *c;
++	void __iomem *memory;
++	int ret;
++
++	mutex_lock(&mailbox_lock);
++	p = mailbox_provider;
++	if (!p) {
++		ret = -ENODEV;
++		goto out;
++	}
++	ret = mailbox_memory(p, &memory);
++	if (ret)
++		goto out;
++	c = mailbox_channel(p, id);
++	if (!c) {
++		ret = -EINVAL;
++		goto out;
++	}
++	if (c->connected || c->stopping) {
++		ret = -EBUSY;
++		goto out;
++	}
++	c->urgent_cb = urgent_cb;
++	c->connected = true;
++	ret = 1;
++out:
++	mutex_unlock(&mailbox_lock);
++	return ret;
++}
++EXPORT_SYMBOL(smem_mailbox_start);
++
++int smem_mailbox_stop(int id)
++{
++	struct smem_mailbox_provider *p;
++	struct smem_client_channel *c;
++	void __iomem *memory, *ring;
++	u32 head, tail, i;
++	int ret = 1, error;
++
++	mutex_lock(&mailbox_lock);
++	p = mailbox_provider;
++	c = mailbox_channel(p, id);
++	if (!c) {
++		ret = p ? -EINVAL : -ENODEV;
++		goto out;
++	}
++	/* Withdrawal must run outside callbacks in this SRCU domain. */
++	for (i = 0; i < IRQ_NUM_NAMES; i++)
++		if (p->channels[i].callback_task == current) {
++			ret = -EDEADLK;
++			goto out;
+ 		}
+-
+-		ret = devm_request_threaded_irq(dev, irq, NULL, smem_read_ready,
+-										IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, entry->irq_name,
+-										entry);
+-		if (ret < 0) {
+-			pr_err("%s: smem request_threaded_irq fail. %d\n", __func__, ret);
+-			return 1;
++	if (c->stopping || !c->connected) {
++		ret = c->stopping ? -EBUSY : -EPERM;
++		goto out;
++	}
++	c->connected = false;
++	c->stopping = true;
++	c->urgent_cb = NULL;
++	kref_get(&p->ref);
++	error = mailbox_memory(p, &memory);
++	if (!error) {
++		ring = memory + c->info.start_loc;
++		error = mailbox_indices(ring, c->info.read_size, &head, &tail);
++		if (!error) {
++			/* Release consumed data before the peer reuses it. */
++			wmb();
++			writel(head, ring + sizeof(u32));
++			ring += BUF_IO_PTR_SIZE + c->info.read_size;
++			error = mailbox_indices(ring, c->info.write_size, &head, &tail);
++			if (!error)
++				writel(tail, ring);
+ 		}
+ 	}
+-
+-	return true;
+-}
+-
+-static int smem_probe(struct platform_device *pdev) {
+-	dev = &pdev->dev;
+-
+-	if (mailbox == NULL) {
+-		mailbox = kzalloc(sizeof(struct mailbox_smp2p), GFP_KERNEL);
+-	}
+-
+-	mailbox->smem_state = qcom_smem_state_get(dev, "smem-mailbox-smp2p-out", &mailbox->smem_bit);
+-	if (IS_ERR(mailbox->smem_state)) {
+-		pr_err("%s: smem fail to get smp2p clk resp bit %ld\n", __func__,
+-			   PTR_ERR(mailbox->smem_state));
+-		return 1;
+-	}
+-
+-	// Attempt to read client map. This should fail at boot since modem is not up. Retry at first
+-	// client connection.
+-	read_client_info_map();
++	if (error)
++		ret = error;
++	mutex_unlock(&mailbox_lock);
++	synchronize_srcu(&mailbox_callbacks);
++	mutex_lock(&mailbox_lock);
++	c->stopping = false;
++	mutex_unlock(&mailbox_lock);
++	kref_put(&p->ref, mailbox_release);
++	return ret;
++out:
++	mutex_unlock(&mailbox_lock);
++	return ret;
++}
++EXPORT_SYMBOL(smem_mailbox_stop);
++
++int smem_mailbox_read(int id, u8 **data, u16 *data_length,
++		      unsigned long long *xo_time)
++{
++	struct smem_mailbox_provider *p;
++	struct smem_client_channel *c;
++	struct tlv item;
++	void __iomem *memory, *ring;
++	unsigned long long timestamp = 0;
++	u8 *buffer = NULL;
++	u32 head, tail, cursor, remaining, length, payload;
++	int ret;
++
++	if (!data || !data_length || !xo_time)
++		return -EINVAL;
++	*data = NULL;
++	*data_length = 0;
++	*xo_time = 0;
++	mutex_lock(&mailbox_lock);
++	p = mailbox_provider;
++	c = mailbox_channel(p, id);
++	if (!c || !c->connected) {
++		ret = !p ? -ENODEV : !p->mapped ? -EAGAIN : !c ? -EINVAL : -EPERM;
++		goto out;
++	}
++	ret = mailbox_memory(p, &memory);
++	if (ret)
++		goto out;
++	ring = memory + c->info.start_loc;
++	ret = mailbox_indices(ring, c->info.read_size, &head, &tail);
++	if (ret)
++		goto out;
++	remaining = ring_used(head, tail, c->info.read_size);
++	if (!remaining) {
++		ret = -ENOMSG;
++		goto out;
++	}
++	cursor = tail;
++	while (remaining >= sizeof(item)) {
++		mailbox_copy_from(&item, ring, c->info.read_size, cursor, sizeof(item));
++		length = ALIGN((u32)item.length, 4);
++		if (item.length < sizeof(item) || length > remaining)
++			break;
++		payload = item.length - sizeof(item);
++		if (item.type == TLV_TYPE_TIME && payload == sizeof(timestamp)) {
++			mailbox_copy_from(&timestamp, ring, c->info.read_size,
++					  (cursor + sizeof(item)) % c->info.read_size,
++					  sizeof(timestamp));
++			cursor = (cursor + length) % c->info.read_size;
++			remaining -= length;
++			continue;
++		}
++		if (item.type != TLV_TYPE_DATA)
++			break;
++		if (payload) {
++			buffer = kmalloc(payload, GFP_KERNEL);
++			if (!buffer) {
++				ret = -ENOMEM;
++				goto out;
++			}
++			mailbox_copy_from(buffer, ring, c->info.read_size,
++					  (cursor + sizeof(item)) % c->info.read_size, payload);
++		}
++		cursor = (cursor + length) % c->info.read_size;
++		/* Release consumed data before the peer reuses it. */
++		wmb();
++		writel(cursor, ring + sizeof(u32));
++		*data = buffer;
++		*data_length = payload;
++		*xo_time = timestamp;
++		ret = remaining - length;
++		goto out;
++	}
++	/* Partial or malformed messages never advance the consumer pointer. */
++	ret = -EPROTO;
++out:
++	mutex_unlock(&mailbox_lock);
++	return ret;
++}
++EXPORT_SYMBOL(smem_mailbox_read);
++
++int smem_mailbox_write(int id, int flags, __u8 *data, u16 data_length)
++{
++	struct smem_mailbox_provider *p;
++	struct smem_client_channel *c;
++	struct tlv time_tlv = { TLV_TYPE_TIME, sizeof(struct tlv) + sizeof(u64) };
++	struct tlv data_tlv;
++	void __iomem *memory, *ring;
++	u64 timestamp;
++	u8 *buffer;
++	u32 head, tail, length, available, signal;
++	int ret;
++
++	if ((flags & ~FLAG_URGENT) || (data_length && !data) ||
++	    data_length > U16_MAX - sizeof(struct tlv))
++		return -EINVAL;
++	length = sizeof(time_tlv) + sizeof(timestamp) +
++		ALIGN(sizeof(data_tlv) + (u32)data_length, 4);
++	mutex_lock(&mailbox_lock);
++	p = mailbox_provider;
++	c = mailbox_channel(p, id);
++	if (!c || !c->connected) {
++		ret = !p ? -ENODEV : !p->mapped ? -EAGAIN : !c ? -EINVAL : -EPERM;
++		goto out;
++	}
++	ret = mailbox_memory(p, &memory);
++	if (ret)
++		goto out;
++	ring = memory + c->info.start_loc + BUF_IO_PTR_SIZE + c->info.read_size;
++	ret = mailbox_indices(ring, c->info.write_size, &head, &tail);
++	if (ret)
++		goto out;
++	available = c->info.write_size - ring_used(head, tail, c->info.write_size) - 4;
++	if (length > available) {
++		ret = -ENOSPC;
++		goto out;
++	}
++	buffer = kzalloc(length, GFP_KERNEL);
++	if (!buffer) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	timestamp = arch_timer_read_cntvct_el0();
++	data_tlv.type = TLV_TYPE_DATA;
++	data_tlv.length = sizeof(data_tlv) + data_length;
++	memcpy(buffer, &time_tlv, sizeof(time_tlv));
++	memcpy(buffer + sizeof(time_tlv), &timestamp, sizeof(timestamp));
++	memcpy(buffer + sizeof(time_tlv) + sizeof(timestamp), &data_tlv, sizeof(data_tlv));
++	if (data_length)
++		memcpy(buffer + sizeof(time_tlv) + sizeof(timestamp) + sizeof(data_tlv),
++		       data, data_length);
++	mailbox_copy_to(ring, c->info.write_size, head, buffer, length);
++	kfree(buffer);
++	head = (head + length) % c->info.write_size;
++	/* Publish the new head only after every payload and padding write. */
++	wmb();
++	writel(head, ring);
++	ret = available - length + 4;
++	if (flags & FLAG_URGENT) {
++		signal = p->signal_value ^ BIT(p->state_bit + c->info.id);
++		ret = qcom_smem_state_update_bits(p->state,
++						  BIT(p->state_bit + c->info.id), signal);
++		if (ret)
++			goto out;
++		p->signal_value = signal;
++		ret = available - length + 4;
++	}
++out:
++	mutex_unlock(&mailbox_lock);
++	return ret;
++}
++EXPORT_SYMBOL(smem_mailbox_write);
++
++static int smem_probe(struct platform_device *pdev)
++{
++	struct smem_mailbox_provider *p;
++	u32 i;
++	int ret;
++
++	p = kzalloc(sizeof(*p), GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++	kref_init(&p->ref);
++	p->dev = &pdev->dev;
++	p->state = qcom_smem_state_get(p->dev, "smem-mailbox-smp2p-out", &p->state_bit);
++	if (IS_ERR(p->state)) {
++		ret = PTR_ERR(p->state);
++		goto free;
++	}
++	if (p->state_bit >= 32) {
++		ret = -EINVAL;
++		goto put_state;
++	}
++	for (i = 0; i < IRQ_NUM_NAMES; i++) {
++		p->channels[i].provider = p;
++		ret = of_irq_get_byname(p->dev->of_node, IRQ_NAMES[i]);
++		if (ret <= 0) {
++			if (!ret)
++				ret = -EINVAL;
++			goto free_irqs;
++		}
++		p->channels[i].irq = ret;
++		ret = devm_request_threaded_irq(p->dev, ret, NULL, smem_read_ready,
++						IRQF_ONESHOT | IRQF_TRIGGER_RISING |
++						IRQF_TRIGGER_FALLING, IRQ_NAMES[i],
++						&p->channels[i]);
++		if (ret)
++			goto free_irqs;
++	}
++	mutex_lock(&mailbox_lock);
++	if (mailbox_provider || mailbox_retiring) {
++		mutex_unlock(&mailbox_lock);
++		ret = -EBUSY;
++		goto free_irqs;
++	}
++	/* The modem may publish its descriptor only after this driver probes. */
++	mailbox_provider = p;
++	platform_set_drvdata(pdev, p);
++	mutex_unlock(&mailbox_lock);
+ 	return 0;
+-}
+-
+-static int smem_remove(struct platform_device *pdev) {
+-	return 0;
+-}
+-
+-int smem_mailbox_start(int id, smem_mailbox_urgent_cb urgent_cb) {
+-	struct smem_client_channel *entry = NULL;
+-
+-	if (!info_validated && !read_client_info_map()) {
+-		pr_err(KERN_ALERT "smem: client info map has not been setup by modem.\n");
+-		return -EAGAIN;
+-	}
+-
+-	list_for_each_entry(entry, &smem_client_channel_list_head, list) {
+-		if (entry->id == id) break;
+-	}
+-
+-	if (entry == NULL || entry->id != id) {
+-		pr_err(KERN_ALERT "smem: ID does not match any smem sub allocation %d\n", id);
+-		return -EINVAL;
+-	}
+-
+-	if (entry->client_connected) {
+-		pr_err(KERN_ALERT "smem: there is already a client connected to this ID %d\n", id);
+-		return -EPERM;
+-	}
+-
+-	entry->urgent_cb = urgent_cb;
+-	entry->client_connected = true;
+-	return 1;
+-}
+-EXPORT_SYMBOL(smem_mailbox_start);
+-
+-int smem_mailbox_stop(int id) {
+-	void *smem;
+-	size_t size;
+-	u32 read_head_index;
+-	u32 read_tail_index;
+-	u32 write_head_index;
+-	u32 write_tail_index;
+-	struct smem_client_channel *entry = NULL;
+-
+-	list_for_each_entry(entry, &smem_client_channel_list_head, list) {
+-		if (entry->id == id) break;
+-	}
+-
+-	if (entry == NULL || entry->id != id) {
+-		pr_err(KERN_ALERT "smem: ID does not match any smem sub allocation %d\n", id);
+-		return -EINVAL;
+-	}
+-
+-	if (!entry->client_connected) {
+-		pr_err(KERN_ALERT "smem: client never started this ID %d\n", id);
+-		return -EPERM;
+-	}
+-
+-	smem = qcom_smem_get(QCOM_SMEM_HOST_MODEM, SMEM_DESCRIPTOR, &size);
+-	if (IS_ERR(smem)) {
+-		pr_err("%s: smem qcom_smem_get fail.\n", __func__);
+-		return -ENOMEM;
+-	}
+-
+-	read_head_index = GET_READ_HEAD(smem, entry);
+-	read_tail_index = GET_READ_TAIL(smem, entry);
+-	if (read_head_index != read_tail_index) {
+-		pr_err("%s: smem read_head_index %d does not equal read_tail_index %d.\n", __func__,
+-			   read_head_index, read_tail_index);
+-		UPDATE_READ_TAIL(smem, read_head_index);
+-	}
+-
+-	write_head_index = GET_WRITE_HEAD(smem, entry);
+-	write_tail_index = GET_WRITE_TAIL(smem, entry);
+-	if (write_head_index != write_tail_index) {
+-		pr_err("%s: smem write_head_index %d does not equal write_tail_index %d.\n", __func__,
+-			   write_head_index, write_tail_index);
+-		UPDATE_WRITE_HEAD(smem, write_tail_index);
+-	}
+-
+-	entry->client_connected = false;
+-	return 1;
+-}
+-EXPORT_SYMBOL(smem_mailbox_stop);
+-
+-bool read_item(struct smem_client_channel *entry, void *item, u16 item_size) {
+-	int offset;
+-	void *smem;
+-	void *read_buf;
+-	size_t size;
+-	u32 head_index;
+-	u32 tail_index;
+-
+-	smem = qcom_smem_get(QCOM_SMEM_HOST_MODEM, SMEM_DESCRIPTOR, &size);
+-	if (IS_ERR(smem)) {
+-		pr_err("%s: smem qcom_smem_get fail.\n", __func__);
+-		return false;
+-	}
+-
+-	head_index = GET_READ_HEAD(smem, entry);
+-	tail_index = GET_READ_TAIL(smem, entry);
+-	offset = tail_index + item_size - entry->read_size;
+-	read_buf = GET_READ_BUF(smem, entry);
+-
+-	if (offset > 0) {
+-		if (offset > head_index) {
+-			pr_err("%s: smem item size is greater than remaining buffer. head %d\n", __func__,
+-				   head_index);
+-			tail_index = head_index;
+-			UPDATE_READ_TAIL(smem, tail_index);
+-			return false;
+-		}
+-
+-		memcpy_fromio(item, read_buf + tail_index, item_size - offset);
+-		memcpy_fromio(item + (item_size - offset), read_buf, offset);
+-		UPDATE_READ_TAIL(smem, offset);
+-	} else {
+-		if ((tail_index + item_size) > head_index) {
+-			pr_err("%s: smem item size is greater than remaining buffer. head %d\n", __func__,
+-				   head_index);
+-			tail_index = head_index;
+-			UPDATE_READ_TAIL(smem, tail_index);
+-			return false;
+-		}
+-
+-		memcpy_fromio(item, read_buf + tail_index, item_size);
+-		tail_index = tail_index + item_size;
+-		UPDATE_READ_TAIL(smem, tail_index);
+-	}
+-	return true;
+-}
+-
+-int smem_mailbox_read(int id, u8 **data, u16 *data_length, unsigned long long *xo_time) {
+-	bool ret;
+-	size_t size;
+-	void *smem;
+-	struct smem_client_channel *entry = NULL;
+-	u32 head_index;
+-	u32 tail_index;
+-	int word_offset;
+-
+-	list_for_each_entry(entry, &smem_client_channel_list_head, list) {
+-		if (entry->id == id) break;
+-	}
+-
+-	if (entry == NULL || entry->id != id) {
+-		pr_err(KERN_ALERT "smem: incorrect ID %d\n", id);
+-		return -EINVAL;
+-	}
+-
+-	if (!entry->client_connected) {
+-		pr_err(KERN_ALERT "smem: client never started this ID %d\n", id);
+-		return -EPERM;
+-	}
+-
+-	smem = qcom_smem_get(QCOM_SMEM_HOST_MODEM, SMEM_DESCRIPTOR, &size);
+-	if (IS_ERR(smem)) {
+-		pr_err("%s: smem qcom_smem_get fail.\n", __func__);
+-		return -ENOMEM;
+-	}
+-
+-	head_index = GET_READ_HEAD(smem, entry);
+-	tail_index = GET_READ_TAIL(smem, entry);
+-
+-	if (head_index == tail_index) {
+-		pr_err("%s: smem qcom_smem_get nothing to read for this client %d. %d %d \n", __func__, id,
+-			   head_index, tail_index);
+-		return -ENOMSG;
+-	}
+-
+-	while (true) {
+-		struct tlv temp_tlv;
+-		ret = read_item(entry, &temp_tlv, sizeof(struct tlv));
+-		if (!ret) goto exit_loop;
+-
+-		switch (temp_tlv.type) {
+-			case TLV_TYPE_TIME:
+-				ret = read_item(entry, xo_time, sizeof(unsigned long long));
+-				if (!ret) goto exit_loop;
+-				break;
+-			case TLV_TYPE_DATA:
+-				*data_length = temp_tlv.length - sizeof(struct tlv);
+-				*data = kmalloc(*data_length, GFP_KERNEL);
+-				ret = read_item(entry, *data, *data_length);
+-				if (!ret) goto exit_loop;
+-
+-				// Round to next word.
+-				word_offset = 4 - (*data_length % 4);
+-				if (word_offset > 0) {
+-					tail_index = GET_READ_TAIL(smem, entry) + word_offset;
+-					UPDATE_READ_TAIL(smem, tail_index);
+-				}
+-				goto exit_loop;
+-				break;
+-			default:
+-				pr_err(KERN_ALERT "smem: invalid TLV type %d.\n", temp_tlv.type);
+-				return -ENOMSG;
+-				break;
+-		}
+-	}
+-exit_loop:
+-	return (entry->read_size -
+-			free_bytes(GET_READ_HEAD(smem, entry), GET_READ_TAIL(smem, entry), entry->read_size));
+-}
+-EXPORT_SYMBOL(smem_mailbox_read);
+-
+-int smem_mailbox_write(int id, int flags, __u8 *data, u16 data_length) {
+-	size_t size;
+-	void *smem;
+-	void *write_buf;
+-	u32 head_index;
+-	u32 tail_index;
+-	u8 *buf;
+-	struct tlv time_tlv;
+-	struct tlv data_tlv;
+-	struct smem_client_channel *entry = NULL;
+-	unsigned long long xo_time = 0;
+-	int overflow_bytes;
+-	int buf_length;
+-	int word_offset;
+-
+-	list_for_each_entry(entry, &smem_client_channel_list_head, list) {
+-		if (entry->id == id) break;
+-	}
+-
+-	if (entry == NULL || entry->id != id) {
+-		pr_err(KERN_ALERT "smem: incorrect ID %d\n", id);
+-		return -EINVAL;
+-	}
+-
+-	if (!entry->client_connected) {
+-		pr_err(KERN_ALERT "smem: client never started this ID %d\n", id);
+-		return -EPERM;
+-	}
+-
+-	// Size of u32 in subtracted from max size because a full buffer would be the same as an emtpy
+-	// buffer.
+-	if (data_length > (entry->write_size - sizeof(u32))) {
+-		pr_err(KERN_ALERT
+-			   "smem: data size is larger than write buffer size %d, smem allocation %d\n",
+-			   data_length, entry->write_size);
+-		return -ENOSPC;
+-	}
+-
+-	smem = qcom_smem_get(QCOM_SMEM_HOST_MODEM, SMEM_DESCRIPTOR, &size);
+-	if (IS_ERR(smem)) {
+-		pr_err("%s: smem qcom_smem_get fail.\n", __func__);
+-		return -ENOMEM;
+-	}
+-
+-	head_index = GET_WRITE_HEAD(smem, entry);
+-	tail_index = GET_WRITE_TAIL(smem, entry);
+-	buf_length = sizeof(struct tlv) + sizeof(xo_time) + sizeof(struct tlv) + data_length;
+-
+-	// Not enough space in circular buffer, exit.
+-	// Subtract u32 from max size so a full buffer does not have head == tail.
+-	if (head_index > tail_index) {
+-		if ((tail_index + (entry->write_size - head_index)) < (buf_length - sizeof(u32))) {
+-			pr_err("%s: smem qcom_smem_get fail, not enough room in write buffer. %d %d\n",
+-				   __func__, (tail_index - head_index), buf_length);
+-			return -ENOSPC;
+-		}
+-	} else if (head_index != tail_index) {
+-		if ((tail_index - head_index) < (buf_length - sizeof(u32))) {
+-			pr_err("%s: smem qcom_smem_get2 fail, not enough room in write buffer. %d %d\n",
+-				   __func__, (tail_index - head_index), buf_length);
+-			return -ENOSPC;
+-		}
+-	}
+-
+-	buf = kmalloc(buf_length, GFP_KERNEL);
+-	if (!buf) {
+-		pr_err("%s: smem kmalloc fail.\n", __func__);
+-		return -ENOMEM;
+-	}
+-
+-	xo_time = arch_timer_read_cntvct_el0();
+-	time_tlv.type = TLV_TYPE_TIME;
+-	time_tlv.length = sizeof(xo_time) + sizeof(struct tlv);
+-	memcpy(buf, &time_tlv, sizeof(time_tlv));
+-	memcpy(buf + sizeof(time_tlv), &xo_time, sizeof(xo_time));
+-
+-	data_tlv.type = TLV_TYPE_DATA;
+-	data_tlv.length = data_length + sizeof(struct tlv);
+-	memcpy(buf + sizeof(time_tlv) + sizeof(xo_time), &data_tlv, sizeof(data_tlv));
+-	memcpy(buf + sizeof(time_tlv) + sizeof(xo_time) + sizeof(data_tlv), data, data_length);
+-
+-	// Read/Write must always be word aligned for modem.
+-	word_offset = (~4 & (4 - (buf_length % 4)));
+-	write_buf = GET_WRITE_BUF(smem, entry);
+-
+-	overflow_bytes = head_index + buf_length - entry->write_size;
+-	if (overflow_bytes < 0) {
+-		memcpy_toio(write_buf + head_index, buf, buf_length);
+-		head_index = head_index + buf_length + word_offset;
+-		UPDATE_WRITE_HEAD(smem, head_index);
+-	} else {
+-		memcpy_toio(write_buf + head_index, buf, buf_length - overflow_bytes);
+-		memcpy_toio(write_buf, buf + buf_length - overflow_bytes, overflow_bytes);
+-		head_index = overflow_bytes + word_offset;
+-		UPDATE_WRITE_HEAD(smem, head_index);
+-	}
+-
+-	if ((flags & FLAG_URGENT) == FLAG_URGENT) {
+-		if (mailbox->smem_state) {
+-			// FIFO 1 client ID range starts at 16 (0xF).
+-			mailbox->smem_bit = mailbox->smem_bit ^ (1 << id);
+-			qcom_smem_state_update_bits(mailbox->smem_state, 0xff, mailbox->smem_bit);
+-		} else {
+-			pr_err("%s: smem smem_state is not setup.\n", __func__);
+-		}
+-	}
+-
+-	return (free_bytes(GET_WRITE_HEAD(smem, entry), GET_WRITE_TAIL(smem, entry), entry->read_size));
+-}
+-EXPORT_SYMBOL(smem_mailbox_write);
++free_irqs:
++	while (i--)
++		devm_free_irq(p->dev, p->channels[i].irq, &p->channels[i]);
++put_state:
++	qcom_smem_state_put(p->state);
++free:
++	kref_put(&p->ref, mailbox_release);
++	return ret;
++}
++
++static void smem_remove(struct platform_device *pdev)
++{
++	struct smem_mailbox_provider *p = platform_get_drvdata(pdev);
++	u32 i;
++
++	if (!p)
++		return;
++	mutex_lock(&mailbox_lock);
++	p->removing = true;
++	mailbox_retiring = true;
++	if (mailbox_provider == p)
++		mailbox_provider = NULL;
++	for (i = 0; i < IRQ_NUM_NAMES; i++) {
++		p->channels[i].connected = false;
++		p->channels[i].urgent_cb = NULL;
++	}
++	mutex_unlock(&mailbox_lock);
++	for (i = 0; i < IRQ_NUM_NAMES; i++)
++		devm_free_irq(p->dev, p->channels[i].irq, &p->channels[i]);
++	synchronize_srcu(&mailbox_callbacks);
++	qcom_smem_state_put(p->state);
++	platform_set_drvdata(pdev, NULL);
++	mutex_lock(&mailbox_lock);
++	mailbox_retiring = false;
++	mutex_unlock(&mailbox_lock);
++	kref_put(&p->ref, mailbox_release);
++}
+ 
+ static const struct of_device_id qcm_smem_match[] = {
+ 	{ .compatible = "qcom,smem_mailbox", },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, qcm_smem_match);
+-
+ static struct platform_driver qcom_smem_driver = {
+ 	.probe = smem_probe,
+ 	.remove = smem_remove,
+@@ -572,6 +579,5 @@
+ 	},
+ };
+ module_platform_driver(qcom_smem_driver);
+-
+ MODULE_DESCRIPTION("QCOM SMEM Mailbox Driver");
+ MODULE_LICENSE("GPL v2");
+--- a/platform/cnss_utils/cnss_utils.c
++++ b/platform/cnss_utils/cnss_utils.c
+@@ -12,6 +12,9 @@
+ #include <linux/etherdevice.h>
+ #include <linux/debugfs.h>
+ #include <linux/of.h>
++#include <linux/limits.h>
++#include <linux/srcu.h>
++#include <linux/atomic.h>
+ #ifdef CONFIG_CNSS_OUT_OF_TREE
+ #include "cnss_utils.h"
+ #else
+@@ -46,12 +49,19 @@
+ };
+ 
+ #define CNSS_UTILS_NOTIFIER_MAX_USER	2
++struct cnss_utils_status_registration {
++	cnss_utils_status_update callback;
++	void *context;
++};
++
+ struct cnss_utils_status_notifier {
+-	cnss_utils_status_update
+-	status_update_cb[CNSS_UTILS_NOTIFIER_MAX_USER];
+-	void *cb_ctx[CNSS_UTILS_NOTIFIER_MAX_USER];
+-	u32 num_user;
++	struct cnss_utils_status_registration __rcu
++		*users[CNSS_UTILS_NOTIFIER_MAX_USER];
+ };
++
++static DEFINE_MUTEX(utils_notifier_lock);
++DEFINE_STATIC_SRCU(utils_notifier_srcu);
++
+ 
+ static struct cnss_utils_priv {
+ 	struct cnss_unsafe_channel_list unsafe_channel_list;
+@@ -60,9 +70,11 @@
+ 	struct mutex unsafe_channel_list_lock;
+ 	/* generic spin-lock for dfs_nol info */
+ 	spinlock_t dfs_nol_info_lock;
+-	int driver_load_cnt;
++	atomic_t driver_load_cnt;
+ 	struct cnss_wlan_mac_addr wlan_mac_addr;
+ 	struct cnss_wlan_mac_addr wlan_der_mac_addr;
++	/* Serializes the first immutable MAC publication. */
++	struct mutex mac_lock;
+ 	enum cnss_utils_cc_src cc_source;
+ 	struct dentry *root_dentry;
+ 	/* generic mutex for device_id */
+@@ -71,6 +83,8 @@
+ 			notifier_ctx[CNSS_UTILS_MAX_STATUS_TYPE];
+ 	enum cnss_utils_device_type cnss_device_type;
+ #ifdef CONFIG_FEATURE_SMEM_MAILBOX
++	/* Serializes mailbox start, writes and provider retry state. */
++	struct mutex mailbox_lock;
+ 	bool smem_mailbox_initialized;
+ 	int smem_mailbox_id;
+ #endif
+@@ -139,6 +153,7 @@
+ 			enum cnss_utils_device_type  device_type)
+ {
+ 	struct cnss_utils_priv *priv = cnss_utils_priv;
++	enum cnss_utils_device_type result;
+ 
+ 	if (!priv)
+ 		return -EINVAL;
+@@ -153,26 +168,28 @@
+ 		pr_info("cnss_utils: device type already set :%d\n",
+ 			priv->cnss_device_type);
+ 	}
++	result = priv->cnss_device_type;
+ 	mutex_unlock(&priv->cnss_device_id_lock);
+-	return priv->cnss_device_type;
++	return result;
+ }
+ EXPORT_SYMBOL(cnss_utils_update_device_type);
+-
+-static void
+-cnss_utils_status_update_user(enum cnss_status_type status_type,
+-			      bool status)
+-{
+-	struct cnss_utils_priv *priv = cnss_utils_priv;
+-	struct cnss_utils_status_notifier *notifier_ctx;
+-	int i;
+-
+-	notifier_ctx = &priv->notifier_ctx[status_type];
+-	for (i = 0; i < notifier_ctx->num_user; i++) {
+-		if (notifier_ctx->status_update_cb[i])
+-			notifier_ctx->status_update_cb[i]
+-					(notifier_ctx->cb_ctx[i],
+-					status);
+-	}
++static void cnss_utils_status_update_user(enum cnss_status_type status_type,
++					  bool status)
++{
++	struct cnss_utils_priv *priv = cnss_utils_priv;
++	struct cnss_utils_status_registration *entry;
++	int i, idx;
++
++	if (!priv || status_type < 0 || status_type >= CNSS_UTILS_MAX_STATUS_TYPE)
++		return;
++	idx = srcu_read_lock(&utils_notifier_srcu);
++	for (i = 0; i < CNSS_UTILS_NOTIFIER_MAX_USER; i++) {
++		entry = srcu_dereference(priv->notifier_ctx[status_type].users[i],
++					 &utils_notifier_srcu);
++		if (entry)
++			entry->callback(entry->context, status);
++	}
++	srcu_read_unlock(&utils_notifier_srcu, idx);
+ }
+ 
+ int cnss_utils_fmd_status(int is_enabled)
+@@ -189,35 +206,78 @@
+ 	return 0;
+ }
+ EXPORT_SYMBOL(cnss_utils_fmd_status);
+-
+-int
+-cnss_utils_register_status_notifier(enum cnss_status_type status_type,
+-				    cnss_utils_status_update status_update_cb,
+-				    void *cb_ctx)
+-{
+-	struct cnss_utils_priv *priv = cnss_utils_priv;
+-	struct cnss_utils_status_notifier *notifier_ctx;
+-	int num_user;
+-
+-	if (!priv)
+-		return -EINVAL;
+-
+-	if (status_type >= CNSS_UTILS_MAX_STATUS_TYPE)
+-		return -EINVAL;
+-
+-	notifier_ctx = &priv->notifier_ctx[status_type];
+-	num_user = notifier_ctx->num_user;
+-
+-	if (num_user >= CNSS_UTILS_NOTIFIER_MAX_USER)
+-		return -EINVAL;
+-
+-	notifier_ctx->status_update_cb[num_user] = status_update_cb;
+-	notifier_ctx->cb_ctx[num_user] = cb_ctx;
+-	notifier_ctx->num_user++;
+-
++int cnss_utils_register_status_notifier(enum cnss_status_type status_type,
++					cnss_utils_status_update status_update_cb,
++				       void *cb_ctx)
++{
++	struct cnss_utils_priv *priv = cnss_utils_priv;
++	struct cnss_utils_status_registration *entry, *new_entry;
++	struct cnss_utils_status_notifier *notifier;
++	int i, slot = -1, ret = 0;
++
++	if (!priv || !status_update_cb || status_type < 0 ||
++	    status_type >= CNSS_UTILS_MAX_STATUS_TYPE)
++		return -EINVAL;
++	new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
++	if (!new_entry)
++		return -ENOMEM;
++	new_entry->callback = status_update_cb;
++	new_entry->context = cb_ctx;
++	notifier = &priv->notifier_ctx[status_type];
++	mutex_lock(&utils_notifier_lock);
++	for (i = 0; i < CNSS_UTILS_NOTIFIER_MAX_USER; i++) {
++		entry = rcu_dereference_protected(notifier->users[i],
++						  lockdep_is_held(&utils_notifier_lock));
++		if (!entry) {
++			if (slot < 0)
++				slot = i;
++		} else if (entry->callback == status_update_cb && entry->context == cb_ctx) {
++			ret = -EEXIST;
++			goto out;
++		}
++	}
++	if (slot < 0) {
++		ret = -ENOSPC;
++		goto out;
++	}
++	rcu_assign_pointer(notifier->users[slot], new_entry);
++	new_entry = NULL;
++out:
++	mutex_unlock(&utils_notifier_lock);
++	kfree(new_entry);
++	return ret;
++}
++EXPORT_SYMBOL(cnss_utils_register_status_notifier);
++
++int cnss_utils_unregister_status_notifier(enum cnss_status_type status_type,
++					  cnss_utils_status_update callback,
++					 void *context)
++{
++	struct cnss_utils_priv *priv = cnss_utils_priv;
++	struct cnss_utils_status_registration *entry = NULL, *candidate;
++	int i;
++
++	if (!priv || !callback || status_type < 0 ||
++	    status_type >= CNSS_UTILS_MAX_STATUS_TYPE)
++		return -EINVAL;
++	mutex_lock(&utils_notifier_lock);
++	for (i = 0; i < CNSS_UTILS_NOTIFIER_MAX_USER; i++) {
++		candidate = rcu_dereference_protected(priv->notifier_ctx[status_type].users[i],
++						      lockdep_is_held(&utils_notifier_lock));
++		if (candidate && candidate->callback == callback && candidate->context == context) {
++			entry = candidate;
++			RCU_INIT_POINTER(priv->notifier_ctx[status_type].users[i], NULL);
++			break;
++		}
++	}
++	mutex_unlock(&utils_notifier_lock);
++	if (!entry)
++		return -ENOENT;
++	synchronize_srcu(&utils_notifier_srcu);
++	kfree(entry);
+ 	return 0;
+ }
+-EXPORT_SYMBOL(cnss_utils_register_status_notifier);
++EXPORT_SYMBOL(cnss_utils_unregister_status_notifier);
+ 
+ int cnss_utils_wlan_set_dfs_nol(struct device *dev,
+ 				const void *info, u16 info_len)
+@@ -286,7 +346,7 @@
+ 	if (!priv)
+ 		return;
+ 
+-	++(priv->driver_load_cnt);
++	atomic_inc(&priv->driver_load_cnt);
+ }
+ EXPORT_SYMBOL(cnss_utils_increment_driver_load_cnt);
+ 
+@@ -297,7 +357,7 @@
+ 	if (!priv)
+ 		return -EINVAL;
+ 
+-	return priv->driver_load_cnt;
++	return atomic_read(&priv->driver_load_cnt);
+ }
+ EXPORT_SYMBOL(cnss_utils_get_driver_load_cnt);
+ 
+@@ -313,7 +373,7 @@
+ 	if (!priv)
+ 		return -EINVAL;
+ 
+-	if (len == 0 || (len % ETH_ALEN) != 0) {
++	if (!mac_list || len == 0 || (len % ETH_ALEN) != 0) {
+ 		pr_err("Invalid length %d\n", len);
+ 		return -EINVAL;
+ 	}
+@@ -325,18 +385,23 @@
+ 		return -EINVAL;
+ 	}
+ 
++	if (type != CNSS_MAC_PROVISIONED && type != CNSS_MAC_DERIVED)
++		return -EINVAL;
++
++	mutex_lock(&priv->mac_lock);
+ 	if (type == CNSS_MAC_PROVISIONED)
+ 		addr = &priv->wlan_mac_addr;
+ 	else
+ 		addr = &priv->wlan_der_mac_addr;
+ 
+-	if (addr->no_of_mac_addr_set) {
++	/* Pair with the first publisher before reading immutable MAC bytes. */
++	if (smp_load_acquire(&addr->no_of_mac_addr_set)) {
+ 		pr_err("WLAN MAC address is already set, num %d type %d\n",
+ 		       addr->no_of_mac_addr_set, type);
++		mutex_unlock(&priv->mac_lock);
+ 		return 0;
+ 	}
+ 
+-	addr->no_of_mac_addr_set = no_of_mac_addr;
+ 	temp = &addr->mac_addr[0][0];
+ 
+ 	for (iter = 0; iter < no_of_mac_addr;
+@@ -346,6 +411,9 @@
+ 			 temp[0], temp[1], temp[2],
+ 			 temp[3], temp[4], temp[5]);
+ 	}
++	/* Publish all MAC bytes before readers observe a nonzero count. */
++	smp_store_release(&addr->no_of_mac_addr_set, no_of_mac_addr);
++	mutex_unlock(&priv->mac_lock);
+ 	return 0;
+ }
+ 
+@@ -368,6 +436,8 @@
+ 	struct cnss_utils_priv *priv = cnss_utils_priv;
+ 	struct cnss_wlan_mac_addr *addr = NULL;
+ 
++	if (!num)
++		return NULL;
+ 	if (!priv)
+ 		goto out;
+ 
+@@ -376,11 +446,12 @@
+ 	else
+ 		addr = &priv->wlan_der_mac_addr;
+ 
+-	if (!addr->no_of_mac_addr_set) {
++	/* Pair with the one-time MAC publication. */
++	*num = smp_load_acquire(&addr->no_of_mac_addr_set);
++	if (!*num) {
+ 		pr_err("WLAN MAC address is not set, type %d\n", type);
+ 		goto out;
+ 	}
+-	*num = addr->no_of_mac_addr_set;
+ 	return &addr->mac_addr[0][0];
+ 
+ out:
+@@ -409,7 +480,7 @@
+ 	if (!priv)
+ 		return;
+ 
+-	priv->cc_source = cc_source;
++	WRITE_ONCE(priv->cc_source, cc_source);
+ }
+ EXPORT_SYMBOL(cnss_utils_set_cc_source);
+ 
+@@ -419,8 +490,7 @@
+ 
+ 	if (!priv)
+ 		return -EINVAL;
+-
+-	return priv->cc_source;
++	return READ_ONCE(priv->cc_source);
+ }
+ EXPORT_SYMBOL(cnss_utils_get_cc_source);
+ 
+@@ -429,18 +499,25 @@
+ 				  const __u8 *data, uint32_t len)
+ {
+ 	struct cnss_utils_priv *priv = cnss_utils_priv;
+-
+-	if (!priv)
+-		return -EINVAL;
++	int ret;
++
++	if (!priv)
++		return -EINVAL;
++	if ((!data && len) || len > U16_MAX)
++		return -EMSGSIZE;
++	mutex_lock(&priv->mailbox_lock);
+ 	if (!priv->smem_mailbox_initialized) {
+-		if (smem_mailbox_start(priv->smem_mailbox_id, NULL) != 1) {
+-			pr_err("Didn't init smem mailbox properly\n");
+-			return -EINVAL;
+-		} else
+-			priv->smem_mailbox_initialized = true;
+-	}
+-	return smem_mailbox_write(priv->smem_mailbox_id, flags, (__u8 *)data,
+-				  len);
++		ret = smem_mailbox_start(priv->smem_mailbox_id, NULL);
++		if (ret != 1)
++			goto out;
++		priv->smem_mailbox_initialized = true;
++	}
++	ret = smem_mailbox_write(priv->smem_mailbox_id, flags, (__u8 *)data, len);
++	if (ret == -ENODEV || ret == -EAGAIN || ret == -EPERM)
++		priv->smem_mailbox_initialized = false;
++out:
++	mutex_unlock(&priv->mailbox_lock);
++	return ret;
+ }
+ EXPORT_SYMBOL(cnss_utils_smem_mailbox_write);
+ #endif
+@@ -449,19 +526,22 @@
+ 				    const char __user *user_buf,
+ 				    size_t count, loff_t *off)
+ {
+-	struct cnss_utils_priv *priv =
+-		((struct seq_file *)fp->private_data)->private;
+ 	char buf[128];
+ 	char *input, *mac_type, *mac_address;
+-	u8 *dest_mac;
++	u8 parsed[MAX_NO_OF_MAC_ADDR * ETH_ALEN];
++	u8 *dest_mac = parsed;
+ 	u8 val;
++	enum mac_type type;
++	int ret;
+ 	const char *delim = "\n";
+ 	size_t len = 0;
+ 	char temp[3] = "";
+ 
+-	len = min_t(size_t, count, sizeof(buf) - 1);
++	if (!count || count >= sizeof(buf))
++		return -EINVAL;
++	len = count;
+ 	if (copy_from_user(buf, user_buf, len))
+-		return -EINVAL;
++		return -EFAULT;
+ 	buf[len] = '\0';
+ 
+ 	input = buf;
+@@ -475,7 +555,7 @@
+ 	mac_address = strsep(&input, delim);
+ 	if (!mac_address)
+ 		return -EINVAL;
+-	if (strcmp("0x", mac_address)) {
++	if (strncmp("0x", mac_address, MAC_PREFIX_LEN)) {
+ 		pr_err("Invalid MAC prefix\n");
+ 		return -EINVAL;
+ 	}
+@@ -490,38 +570,42 @@
+ 	}
+ 
+ 	if (!strcmp("provisioned", mac_type)) {
+-		dest_mac = &priv->wlan_mac_addr.mac_addr[0][0];
+-		priv->wlan_mac_addr.no_of_mac_addr_set = len / (ETH_ALEN * 2);
++		type = CNSS_MAC_PROVISIONED;
+ 	} else if (!strcmp("derived", mac_type)) {
+-		dest_mac = &priv->wlan_der_mac_addr.mac_addr[0][0];
+-		priv->wlan_der_mac_addr.no_of_mac_addr_set =
+-			len / (ETH_ALEN * 2);
++		type = CNSS_MAC_DERIVED;
+ 	} else {
+ 		pr_err("Invalid MAC address type %s\n", mac_type);
+ 		return -EINVAL;
+ 	}
+ 
+-	while (len--) {
++	len /= 2;
++	for (size_t i = 0; i < len; i++) {
+ 		temp[0] = *mac_address++;
+ 		temp[1] = *mac_address++;
+ 		if (kstrtou8(temp, 16, &val))
+ 			return -EINVAL;
+ 		*dest_mac++ = val;
+ 	}
++	ret = set_wlan_mac_address(parsed, len, type);
++	if (ret)
++		return ret;
+ 	return count;
+ }
+ 
+ static int cnss_utils_mac_show(struct seq_file *s, void *data)
+ {
+ 	u8 mac[6];
++	u32 count;
+ 	int i;
+ 	struct cnss_utils_priv *priv = s->private;
+ 	struct cnss_wlan_mac_addr *addr = NULL;
+ 
+ 	addr = &priv->wlan_mac_addr;
+-	if (addr->no_of_mac_addr_set) {
++	/* Pair with the one-time MAC publication. */
++	count = smp_load_acquire(&addr->no_of_mac_addr_set);
++	if (count) {
+ 		seq_puts(s, "\nProvisioned MAC addresseses\n");
+-		for (i = 0; i < addr->no_of_mac_addr_set; i++) {
++		for (i = 0; i < count; i++) {
+ 			ether_addr_copy(mac, addr->mac_addr[i]);
+ 			seq_printf(s, "MAC_ADDR:%02x:%02x:%02x:%02x:%02x:%02x\n",
+ 				   mac[0], mac[1], mac[2],
+@@ -530,9 +614,11 @@
+ 	}
+ 
+ 	addr = &priv->wlan_der_mac_addr;
+-	if (addr->no_of_mac_addr_set) {
++	/* Pair with the one-time MAC publication. */
++	count = smp_load_acquire(&addr->no_of_mac_addr_set);
++	if (count) {
+ 		seq_puts(s, "\nDerived MAC addresseses\n");
+-		for (i = 0; i < addr->no_of_mac_addr_set; i++) {
++		for (i = 0; i < count; i++) {
+ 			ether_addr_copy(mac, addr->mac_addr[i]);
+ 			seq_printf(s, "MAC_ADDR:%02x:%02x:%02x:%02x:%02x:%02x\n",
+ 				   mac[0], mac[1], mac[2],
+@@ -593,8 +679,10 @@
+ 			break;
+ 	}
+ 
+-	if (dn)
++	if (dn) {
++		of_node_put(dn);
+ 		return true;
++	}
+ 
+ 	return false;
+ }
+@@ -604,6 +692,7 @@
+ {
+ 	struct cnss_utils_priv *priv = cnss_utils_priv;
+ 
++	mutex_init(&priv->mailbox_lock);
+ 	priv->smem_mailbox_id = 0;
+ 	priv->smem_mailbox_initialized = false;
+ }
+@@ -641,18 +730,26 @@
+ 
+ 	mutex_init(&priv->unsafe_channel_list_lock);
+ 	mutex_init(&priv->cnss_device_id_lock);
++	mutex_init(&priv->mac_lock);
+ 	spin_lock_init(&priv->dfs_nol_info_lock);
+-	cnss_utils_debugfs_create(priv);
++	atomic_set(&priv->driver_load_cnt, 0);
+ 	cnss_utils_priv = priv;
+ 	cnss_utils_smem_mailbox_init();
++	/* Native getters publish raw MAC storage; retain it for this boot. */
++	__module_get(THIS_MODULE);
++	cnss_utils_debugfs_create(priv);
+ 	return 0;
+ }
+ 
+ static void __exit cnss_utils_exit(void)
+ {
++	struct cnss_utils_priv *priv = cnss_utils_priv;
++
++	debugfs_remove_recursive(priv->root_dentry);
+ 	cnss_utils_smem_mailbox_deinit();
+-	kfree(cnss_utils_priv);
+ 	cnss_utils_priv = NULL;
++	kfree(priv->dfs_nol_info.dfs_nol_info);
++	kfree(priv);
+ }
+ 
+ module_init(cnss_utils_init);
+--- a/platform/inc/cnss_utils.h
++++ b/platform/inc/cnss_utils.h
+@@ -169,6 +169,10 @@
+ cnss_utils_register_status_notifier(enum cnss_status_type status_type,
+ 				    cnss_utils_status_update status_update_cb,
+ 				    void *cb_ctx);
++/* Call outside a status callback before freeing its context or owner. */
++int cnss_utils_unregister_status_notifier(enum cnss_status_type status_type,
++					  cnss_utils_status_update callback,
++					void *context);
+ extern int cnss_utils_wlan_set_dfs_nol(struct device *dev,
+ 				       const void *info, u16 info_len);
+ extern int cnss_utils_wlan_get_dfs_nol(struct device *dev,

@@ -1,0 +1,99 @@
+{
+  "tests": {
+    "tx_lengths": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-pkt-tests-l6ffergs/test.c:1374: tx_lengths: Assertion `write_file(0,p,4097)==-EINVAL&&duplicates==before' failed."
+    },
+    "tx_headers": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-pkt-tests-l6ffergs/test.c:1375: tx_headers: Assertion `write_file(0,p,40)==-EINVAL&&!sends' failed."
+    },
+    "rx_headers": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-pkt-tests-l6ffergs/test.c:1377: rx_headers: Assertion `model_rx(p)==-EINVAL' failed."
+    },
+    "rx_basic": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "==2640236==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x7a9cd8de0238 at pc 0x60b1b7d49275 bp 0x7ffe5ae31890 sp 0x7ffe5ae31880"
+    },
+    "regions_multiple": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-pkt-tests-l6ffergs/test.c:1380: regions_multiple: Assertion `write_file(0,p,68)==68&&translations==3&&!memcmp(p,original,68)' failed."
+    },
+    "regions_bounds": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-pkt-tests-l6ffergs/test.c:1381: regions_bounds: Assertion `write_file(0,p,44)==-EINVAL&&!translations&&!sends' failed."
+    },
+    "regions_invalid": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-pkt-tests-l6ffergs/test.c:1382: regions_invalid: Assertion `write_file(0,p,44)==-EINVAL&&!translations' failed."
+    },
+    "reads": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-pkt-tests-l6ffergs/test.c:1383: reads: Assertion `read_file(0,out,24)==-EMSGSIZE' failed."
+    },
+    "sessions": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-pkt-tests-l6ffergs/test.c:1386: sessions: Assertion `!close_alls&&!ion_crashes&&read_file(1,out,32)==32' failed."
+    },
+    "withdrawal": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-pkt-tests-l6ffergs/test.c:1390: withdrawal: Assertion `!pthread_join(t,NULL)&&reader_result==-ENETRESET' failed."
+    },
+    "old_file": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "==2645497==ERROR: AddressSanitizer: heap-use-after-free on address 0x6effe07e00a0 at pc 0x61547fa08001 bp 0x7ffffeb7cbe0 sp 0x7ffffeb7cbd0"
+    },
+    "open_remove": {
+      "rejected": true,
+      "returncode": 1,
+      "diagnostic": "==2645523==ERROR: AddressSanitizer: heap-use-after-free on address 0x7290691e00a0 at pc 0x5bfaba079ded bp 0x7ffddc4feff0 sp 0x7ffddc4fefe0"
+    },
+    "failure_paths": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-pkt-tests-l6ffergs/test.c:1394: failure_paths: Assertion `!regions&&!classes&&!cdevs&&!loggers&&!skb_live&&!live&&!pending_work&&platform.dev.refs==1' failed."
+    },
+    "logger": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-pkt-tests-l6ffergs/test.c:1395: logger: Assertion `audio_pkt_platform_driver_probe(&platform)==-ENOMEM' failed."
+    },
+    "sync_callback": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-pkt-tests-l6ffergs/test.c:127: ipc_log_string: Assertion `!require_logger' failed."
+    },
+    "send_unbind": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-pkt-tests-l6ffergs/test.c:1411: send_unbind: Assertion `!atomic_load(&unbind_done)' failed."
+    }
+  },
+  "mutation": null,
+  "source_sha256": {
+    "qcom/opensource/audio-kernel/ipc/audio-pkt.c": "2db0953a1af5d87393dfab97ea9f57d347f99b2c7283ad1ad211f1dd539e6947"
+  },
+  "provider_header_sha256": {
+    "qcom/opensource/audio-kernel/include/bindings/qcom,gpr.h": "6071cbde9db5820c0c2611b9789a8823725e0d54a9782d40e45bcb8318df8916",
+    "qcom/opensource/audio-kernel/include/soc/audio_mod_devicetable.h": "1b5bd7024846b7744a3dc50a9121ffe2c8b13d80105ddda8fef022a6df26823f",
+    "qcom/opensource/audio-kernel/include/ipc/gpr-lite.h": "9751f7a79efd5eff7ec3e926887dce9d6c8fd6200fe1b4b318f72ec8e843d3b1"
+  },
+  "harness_sha256": "c97f6bd411bb8f50ae87a1b6fa8d904923ea872a266fd37214751b42cc8c49db",
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Full packet source and frozen GPR wire headers with simulated cdev/device references, real allocated SKB storage/queues, private logger, synchronous GPR probe/callback, ION FD translation, copy/allocation failures and pthread read/send/withdraw contention. Work execution is explicit; no kernel VFS/workqueue scheduling, DMA, DSP or hardware verification."
+}

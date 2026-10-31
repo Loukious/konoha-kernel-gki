@@ -1,0 +1,24 @@
+{
+  "tests": {
+    "cleanup_remove": {
+      "rejected": true,
+      "returncode": -6,
+      "diagnostic": "test: /tmp/onyx-audio-pkt-tests-7rqupfak/test.c:542: spf_core_apm_close_all: Assertion `!atomic_fetch_add(&close_inflight,1)' failed."
+    }
+  },
+  "mutation": "remove platform cleanup mutex",
+  "source_sha256": {
+    "qcom/opensource/audio-kernel/ipc/audio-pkt.c": "b30227531550e8c8d1a749172c62a3a50f6b9d889939b063fe0f8474a3df40c7"
+  },
+  "provider_header_sha256": {
+    "qcom/opensource/audio-kernel/include/bindings/qcom,gpr.h": "6071cbde9db5820c0c2611b9789a8823725e0d54a9782d40e45bcb8318df8916",
+    "qcom/opensource/audio-kernel/include/soc/audio_mod_devicetable.h": "1b5bd7024846b7744a3dc50a9121ffe2c8b13d80105ddda8fef022a6df26823f",
+    "qcom/opensource/audio-kernel/include/ipc/gpr-lite.h": "9751f7a79efd5eff7ec3e926887dce9d6c8fd6200fe1b4b318f72ec8e843d3b1"
+  },
+  "harness_sha256": "c97f6bd411bb8f50ae87a1b6fa8d904923ea872a266fd37214751b42cc8c49db",
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Full packet source and frozen GPR wire headers with simulated cdev/device references, real allocated SKB storage/queues, private logger, synchronous GPR probe/callback, ION FD translation, copy/allocation failures and pthread read/send/withdraw contention. Work execution is explicit; no kernel VFS/workqueue scheduling, DMA, DSP or hardware verification."
+}

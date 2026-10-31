@@ -2981,6 +2981,69 @@ ddk_module(
 )
 
 
+ddk_headers(
+    name = "wlan_utils_headers",
+    hdrs = ["qcom/opensource/data-kernel/drivers/smem-mailbox/include/smem-mailbox.h", "platform/cnss_utils/device_management_service_v01.h", "platform/cnss_utils/ip_multimedia_subsystem_private_service_v01.h", "platform/cnss_utils/wlan_firmware_service_v01.h", "platform/inc/cnss_utils.h"],
+    includes = ["platform/inc", "platform/cnss_utils", "qcom/opensource/data-kernel/drivers/smem-mailbox/include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "smem_mailbox",
+    srcs = ["qcom/opensource/data-kernel/drivers/smem-mailbox/smem-mailbox.c"],
+    out = "smem-mailbox.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":wlan_utils_headers", ":soc_headers", ":smem", ":remote_headers", ":smp2p"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "cnss_utils",
+    srcs = ["platform/cnss_utils/cnss_utils.c"],
+    out = "cnss_utils.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":wlan_utils_headers", ":smem_mailbox"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wlan_firmware_service",
+    srcs = ["platform/cnss_utils/wlan_firmware_service_v01.c", "platform/cnss_utils/device_management_service_v01.c", "platform/cnss_utils/ip_multimedia_subsystem_private_service_v01.c"],
+    out = "wlan_firmware_service.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":wlan_utils_headers", ":remote_headers", ":qmi_helpers"],
+    visibility = ["//visibility:public"],
+)
+
+
+ddk_module(
+    name = "audio_pkt_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/ipc/audio-pkt.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "audio_pkt_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_gpr_headers", ":audio_spf_headers", ":audio_ion_headers", ":platform_headers", ":qcom_ipc_logging", ":gpr_dlkm", ":spf_core_dlkm", ":audpkt_ion_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "aw8697_haptic",
+    srcs = ["drivers/input/misc/aw86927_haptic/aw_haptic.c", "drivers/input/misc/aw86927_haptic/aw_haptic.h", "drivers/input/misc/aw86927_haptic/aw86927.c", "drivers/input/misc/aw86927_haptic/aw86927.h", "drivers/input/misc/aw86927_haptic/aw8697.c", "drivers/input/misc/aw86927_haptic/aw8697.h", "drivers/input/misc/aw86927_haptic/aw_config.h", "drivers/input/misc/aw86927_haptic/xm-haptic.h", "drivers/input/misc/aw86927_haptic/ringbuffer.c", "drivers/input/misc/aw86927_haptic/ringbuffer.h"],
+    out = "aw8697-haptic.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":smartcharge_headers", ":miev"],
+    visibility = ["//visibility:public"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3202,6 +3265,11 @@ kernel_module_group(
         ":usb_f_qdss",
         ":audpkt_ion_dlkm",
         ":mca_path_control",
+        ":smem_mailbox",
+        ":cnss_utils",
+        ":wlan_firmware_service",
+        ":audio_pkt_dlkm",
+        ":aw8697_haptic",
     ],
 )
 

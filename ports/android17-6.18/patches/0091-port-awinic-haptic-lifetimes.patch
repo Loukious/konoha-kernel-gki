@@ -1,0 +1,3053 @@
+--- a/drivers/input/misc/aw86927_haptic/aw_haptic.c
++++ b/drivers/input/misc/aw86927_haptic/aw_haptic.c
+@@ -875,702 +875,330 @@
+ 
+  ******************************************************/
+ 
++static void awinic_cleanup(struct awinic *awinic)
++{
++	struct input_dev *input_dev = awinic->input_dev;
++
++	if (awinic->backend_initialized) {
++		if (awinic->name == AW8697) {
++			WRITE_ONCE(awinic->aw8697->stopping, true);
++			atomic_set(&awinic->aw8697->exit_in_rtp_loop, 1);
++			wake_up_interruptible(&awinic->aw8697->wait_q);
++			wake_up_interruptible(&awinic->aw8697->stop_wait_q);
++		} else {
++			WRITE_ONCE(awinic->aw86927->stopping, true);
++			atomic_set(&awinic->aw86927->exit_in_rtp_loop, 1);
++			wake_up_interruptible(&awinic->aw86927->wait_q);
++			wake_up_interruptible(&awinic->aw86927->stop_wait_q);
++		}
++	}
++	if (awinic->ring_owned)
++		rb_force_exit();
++	if (awinic->sysfs_registered) {
++		sysfs_remove_group(&awinic->i2c->dev.kobj,
++			awinic->name == AW8697 ? &aw8697_vibrator_attribute_group :
++						 &aw86927_vibrator_attribute_group);
++		awinic->sysfs_registered = false;
++	}
++	if (awinic->input_registered) {
++		input_unregister_device(input_dev);
++		awinic->input_registered = false;
++	}
++	if (awinic->misc_registered) {
++		aw8697_misc_unregister();
++		awinic->misc_registered = false;
++	}
++	/* An admitted threaded handler can hold a pointer into the RTP buffer. */
++	if (awinic->irq_registered)
++		synchronize_irq(awinic->irq);
++	if (awinic->backend_initialized) {
++		if (awinic->name == AW8697)
++			aw8697_shutdown(awinic->aw8697);
++		else
++			aw86927_shutdown(awinic->aw86927);
++		awinic->backend_initialized = false;
++	}
++	if (awinic->irq_registered) {
++		devm_free_irq(awinic->dev, awinic->irq,
++			awinic->name == AW8697 ? (void *)awinic->aw8697 :
++						 (void *)awinic->aw86927);
++		awinic->irq_registered = false;
++	}
++	if (awinic->ring_owned) {
++		release_rb();
++		awinic->ring_owned = false;
++	}
++	device_init_wakeup(awinic->dev, false);
++}
++
+ static int awinic_i2c_probe(struct i2c_client *i2c)
+-
+ {
+ 	struct awinic *awinic;
+-
+ 	struct input_dev *input_dev;
+-
+-	struct ff_device *ff;
+-
+ 	struct device_node *np = i2c->dev.of_node;
+-
+-	int effect_count_max;
+-
+-	int irq_flags = 0;
+-
+-	int ret = -1;
+-
+-	int rc = 0;
+-
++	int ret;
++	int rc;
+ #ifdef ENABLE_PIN_CONTROL
+-
+ 	int i;
+-
+ #endif
+-
+ 	aw_info("%s enter\n", __func__);
+-
+ 	if (!i2c_check_functionality(i2c->adapter, I2C_FUNC_I2C)) {
+ 		aw_err("check_functionality failed\n");
+-
+ 		return -EIO;
+ 	}
+-
+ 	awinic = devm_kzalloc(&i2c->dev, sizeof(struct awinic), GFP_KERNEL);
+-
+ 	if (awinic == NULL)
+-
+ 		return -ENOMEM;
+-
+ 	input_dev = devm_input_allocate_device(&i2c->dev);
+-
+ 	if (!input_dev)
+-
+ 		return -ENOMEM;
+-
+ 	input_dev->name = "awinic_haptic";
+-
+ 	awinic->dev = &i2c->dev;
+-
+ 	awinic->i2c = i2c;
+-
++	awinic->input_dev = input_dev;
+ 	device_init_wakeup(awinic->dev, true);
+-
+ 	i2c_set_clientdata(i2c, awinic);
+-
+ 	/* awinic rst & int */
+-
+ 	if (np) {
+ 		ret = awinic_parse_dt(awinic, &i2c->dev, np);
+-
+ 		if (ret) {
+ 			aw_err("%s: failed to parse device tree node\n",
+-
+ 			       __func__);
+-
+-			goto err_parse_dt;
+-		}
+-
++			goto error;
++		}
+ 	} else {
+ 		awinic->reset_gpio = -1;
+-
+ 		awinic->irq_gpio = -1;
+ 	}
+-
+ 	awinic->enable_pin_control = 0;
+-
+ #ifdef ENABLE_PIN_CONTROL
+-
+ 	awinic->awinic_pinctrl = devm_pinctrl_get(&i2c->dev);
+-
+ 	if (IS_ERR(awinic->awinic_pinctrl)) {
+ 		if (PTR_ERR(awinic->awinic_pinctrl) == -EPROBE_DEFER) {
+ 			aw_info("%s pinctrl not ready\n", __func__);
+-
+ 			rc = -EPROBE_DEFER;
+-
+-			return rc;
+-		}
+-
++			ret = rc;
++			goto error;
++		}
+ 		aw_info("%s Target does not use pinctrl\n", __func__);
+-
+ 		awinic->awinic_pinctrl = NULL;
+-
+ 		rc = -EINVAL;
+-
+-		return rc;
+-	}
+-
++		ret = rc;
++		goto error;
++	}
+ 	for (i = 0; i < ARRAY_SIZE(awinic->pinctrl_state); i++) {
+ 		const char *n = pctl_names[i];
+-
+ 		struct pinctrl_state *state =
+-
+ 			pinctrl_lookup_state(awinic->awinic_pinctrl, n);
+-
+ 		if (!IS_ERR(state)) {
+ 			aw_info("%s: found pin control %s\n", __func__, n);
+-
+ 			awinic->pinctrl_state[i] = state;
+-
+ 			awinic->enable_pin_control = 1;
+-
+ 			awinic_set_interrupt(awinic);
+-
+ 			continue;
+ 		}
+-
+ 		aw_info("%s cannot find '%s'\n", __func__, n);
+ 	}
+-
+ #endif
+-
+ 	if (!awinic->enable_pin_control) {
+ 		if (gpio_is_valid(awinic->reset_gpio)) {
+ 			ret = devm_gpio_request_one(&i2c->dev,
+-
+ 						    awinic->reset_gpio,
+-
+ 						    GPIOF_OUT_INIT_LOW,
+-
+ 						    "awinic_rst");
+-
+ 			if (ret) {
+ 				aw_err("%s: rst request failed, ret = %d\n",
+ 				       __func__, ret);
+-
+ 				if (ret == -EBUSY)
+ 					ret = -EPROBE_DEFER;
+-
+-				goto err_reset_gpio_request;
++				goto error;
+ 			}
+ 		}
+ 	}
+-
+ 	if (gpio_is_valid(awinic->irq_gpio)) {
+ 		ret = devm_gpio_request_one(&i2c->dev, awinic->irq_gpio,
+-
+-					    GPIOF_DIR_IN, "awinic_int");
+-
++					    GPIOF_IN, "awinic_int");
+ 		if (ret) {
+ 			aw_err("%s: int request failed, ret = %d\n", __func__,
+ 			       ret);
+-
+ 			if (ret == -EBUSY)
+ 				ret = -EPROBE_DEFER;
+-
+-			goto err_irq_gpio_request;
+-		}
+-	}
+-
++			goto error;
++		}
++	}
+ 	ret = awinic_parse_chipid(awinic);
+-
+ 	if (ret < 0) {
+ 		aw_err("%s: read_chipid failed ret=%d\n", __func__, ret);
+-
+-		goto err_id;
+-	}
+-
++		goto error;
++	}
++	/* Admit only one hardware owner before creating global stream interfaces. */
++	ret = create_rb();
++	if (ret)
++		goto error;
++	awinic->ring_owned = true;
+ 	xm_hap_driver_init(true);
+-
+-	/* aw8697 */
+-
+ 	if (awinic->name == AW8697) {
+-		awinic->aw8697 = devm_kzalloc(&i2c->dev,
+-
+-					      sizeof(struct aw8697),
+-					      GFP_KERNEL);
+-
+-		if (awinic->aw8697 == NULL) {
+-			if (gpio_is_valid(awinic->irq_gpio))
+-
+-				// devm_gpio_free(&i2c->dev, awinic->irq_gpio);
+-
+-				if (gpio_is_valid(awinic->reset_gpio))
+-
+-					// devm_gpio_free(&i2c->dev, awinic->reset_gpio);
+-
+-					devm_kfree(&i2c->dev, awinic);
+-
+-			awinic = NULL;
+-
+-			return -ENOMEM;
+-		}
+-
++		awinic->aw8697 = devm_kzalloc(awinic->dev, sizeof(*awinic->aw8697), GFP_KERNEL);
++		if (!awinic->aw8697) {
++			ret = -ENOMEM;
++			goto error;
++		}
+ 		awinic->aw8697->dev = awinic->dev;
+-
+-		awinic->aw8697->i2c = awinic->i2c;
+-
++		awinic->aw8697->i2c = i2c;
+ 		awinic->aw8697->reset_gpio = awinic->reset_gpio;
+-
+ 		awinic->aw8697->irq_gpio = awinic->irq_gpio;
+-
+-		/* aw8697 rst & int */
+-
+ 		if (np) {
+ 			ret = aw8697_parse_dt(&i2c->dev, awinic->aw8697, np);
+-
+-			if (ret) {
+-				aw_err("%s: failed to parse device tree node\n",
+-
+-				       __func__);
+-
+-				goto err_aw8697_parse_dt;
++			if (ret)
++				goto error;
++		}
++		awinic->aw8697->work_queue = create_singlethread_workqueue("aw8697_vibrator");
++		if (!awinic->aw8697->work_queue) {
++			ret = -ENOMEM;
++			goto error;
++		}
++		aw8697_vibrator_init(awinic->aw8697);
++		awinic->backend_initialized = true;
++		ret = aw8697_haptic_init(awinic->aw8697);
++		if (ret < 0)
++			goto error;
++		if (gpio_is_valid(awinic->irq_gpio) &&
++		    !(awinic->aw8697->flags & AW8697_FLAG_SKIP_INTERRUPTS)) {
++			awinic->irq = gpio_to_irq(awinic->irq_gpio);
++			if (awinic->irq < 0) {
++				ret = awinic->irq;
++				goto error;
+ 			}
+-		}
+-
+-		/* aw8697 irq */
+-
+-		if (gpio_is_valid(awinic->aw8697->irq_gpio) &&
+-
+-		    !(awinic->aw8697->flags & AW8697_FLAG_SKIP_INTERRUPTS)) {
+-			/* register irq handler */
+-
+ 			aw8697_interrupt_setup(awinic->aw8697);
+-
+-			irq_flags = IRQF_TRIGGER_FALLING | IRQF_ONESHOT;
+-
+-			ret = devm_request_threaded_irq(
+-				&i2c->dev,
+-
+-				gpio_to_irq(awinic->aw8697->irq_gpio),
+-
+-				NULL, aw8697_irq, irq_flags,
+-
++			ret = devm_request_threaded_irq(awinic->dev, awinic->irq,
++				NULL, aw8697_irq, IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+ 				"aw8697", awinic->aw8697);
+-
+-			if (ret != 0) {
+-				aw_err("%s: failed to request IRQ %d: %d\n",
+-
+-				       __func__,
+-
+-				       gpio_to_irq(awinic->aw8697->irq_gpio),
+-
+-				       ret);
+-
+-				goto err_aw8697_irq;
+-			}
+-
++			if (ret)
++				goto error;
++			awinic->irq_registered = true;
+ 		} else {
+-			aw_info("%s skipping IRQ registration\n", __func__);
+-
+-			/* disable feature support if gpio was invalid */
+-
+ 			awinic->aw8697->flags |= AW8697_FLAG_SKIP_INTERRUPTS;
+-
+-			aw_info("%s: aw8697_irq failed.\n", __func__);
+-		}
+-
+-		awinic->aw8697->work_queue = create_singlethread_workqueue(
+-			"aw8697_vibrator_work_queue");
+-
+-		if (!awinic->aw8697->work_queue) {
+-			aw_err("%s: Error creating aw8697_vibrator_work_queue\n",
+-
+-			       __func__);
+-
+-			goto err_aw8697_sysfs;
+-		}
+-
+-		aw8697_vibrator_init(awinic->aw8697);
+-
+-		aw8697_haptic_init(awinic->aw8697);
+-
++		}
++		CUSTOME_WAVE_ID = awinic->aw8697->info.effect_max;
++		input_set_drvdata(input_dev, awinic->aw8697);
++		awinic->aw8697->input_dev = input_dev;
++		input_set_capability(input_dev, EV_FF, FF_CONSTANT);
++		input_set_capability(input_dev, EV_FF, FF_GAIN);
++		if (awinic->aw8697->effects_count) {
++			input_set_capability(input_dev, EV_FF, FF_PERIODIC);
++			input_set_capability(input_dev, EV_FF, FF_CUSTOM);
++		}
++		ret = input_ff_create(input_dev,
++			max_t(int, FF_EFFECT_COUNT_MAX, awinic->aw8697->effects_count + 1));
++		if (ret)
++			goto error;
++		input_dev->ff->upload = aw8697_haptics_upload_effect;
++		input_dev->ff->playback = aw8697_haptics_playback;
++		input_dev->ff->erase = aw8697_haptics_erase;
++		input_dev->ff->set_gain = aw8697_haptics_set_gain;
+ 		aw8697_ram_init(awinic->aw8697);
+-
+-		CUSTOME_WAVE_ID = awinic->aw8697->info.effect_max;
+-
+-		/*aw8697 input config*/
+-
+-		input_set_drvdata(input_dev, awinic->aw8697);
+-
+-		awinic->aw8697->input_dev = input_dev;
+-
+-		input_set_capability(input_dev, EV_FF, FF_CONSTANT);
+-
+-		input_set_capability(input_dev, EV_FF, FF_GAIN);
+-
+-		if (awinic->aw8697->effects_count != 0) {
+-			input_set_capability(input_dev, EV_FF, FF_PERIODIC);
+-
+-			input_set_capability(input_dev, EV_FF, FF_CUSTOM);
+-		}
+-
+-		if (awinic->aw8697->effects_count + 1 > FF_EFFECT_COUNT_MAX)
+-
+-			effect_count_max = awinic->aw8697->effects_count + 1;
+-
+-		else
+-
+-			effect_count_max = FF_EFFECT_COUNT_MAX;
+-
+-		rc = input_ff_create(input_dev, effect_count_max);
+-
+-		if (rc < 0) {
+-			aw_err("%s create FF input device failed, rc=%d\n",
+-
+-			       __func__, rc);
+-
+-			goto err_aw8697_input_ff;
+-		}
+-
+-		INIT_WORK(&awinic->aw8697->set_gain_work,
+-
+-			  aw8697_haptics_set_gain_work_routine);
+-
+-		ff = input_dev->ff;
+-
+-		ff->upload = aw8697_haptics_upload_effect;
+-
+-		ff->playback = aw8697_haptics_playback;
+-
+-		ff->erase = aw8697_haptics_erase;
+-
+-		ff->set_gain = aw8697_haptics_set_gain;
+-
+-		rc = input_register_device(input_dev);
+-
+-		if (rc < 0) {
+-			aw_err("%s register input device failed, rc=%d\n",
+-
+-			       __func__, rc);
+-
+-			goto aw8697_destroy_ff;
+-		}
+-
+ 	} else if (awinic->name == AW86927) {
+-		awinic->aw86927 = devm_kzalloc(&i2c->dev,
+-
+-					       sizeof(struct aw86927),
+-					       GFP_KERNEL);
+-
+-		if (awinic->aw86927 == NULL) {
+-			if (gpio_is_valid(awinic->irq_gpio))
+-
+-				// devm_gpio_free(&i2c->dev, awinic->irq_gpio);
+-
+-				if (gpio_is_valid(awinic->reset_gpio))
+-
+-					// devm_gpio_free(&i2c->dev, awinic->reset_gpio);
+-
+-					devm_kfree(&i2c->dev, awinic);
+-
+-			awinic = NULL;
+-
+-			return -ENOMEM;
+-		}
+-
++		awinic->aw86927 = devm_kzalloc(awinic->dev, sizeof(*awinic->aw86927), GFP_KERNEL);
++		if (!awinic->aw86927) {
++			ret = -ENOMEM;
++			goto error;
++		}
+ 		awinic->aw86927->dev = awinic->dev;
+-
+-		awinic->aw86927->i2c = awinic->i2c;
+-
++		awinic->aw86927->i2c = i2c;
+ 		awinic->aw86927->reset_gpio = awinic->reset_gpio;
+-
+ 		awinic->aw86927->irq_gpio = awinic->irq_gpio;
+-
+-		/* chip qualify */
+ #ifdef AW_CHECK_QUAL
+ 		if (aw86927_check_qualify(awinic->aw86927)) {
+-			aw_err("%s:unqualified chip!\n", __func__);
+-
+-			goto err_aw86927_check_qualify;
++			ret = -ENODEV;
++			goto error;
+ 		}
+ #endif
+-		/* aw86927 rst & int */
+-
+ 		if (np) {
+ 			ret = aw86927_parse_dt(awinic->aw86927, &i2c->dev, np);
+-
+-			if (ret) {
+-				aw_err("%s: failed to parse device tree node\n",
+-
+-				       __func__);
+-
+-				XM_HAP_REGISTER_EXCEPTION("DT",
+-							  "haptics_parse_dt");
+-
+-				goto err_aw86927_parse_dt;
++			if (ret)
++				goto error;
++		}
++		awinic->aw86927->work_queue = create_singlethread_workqueue("aw86927_vibrator");
++		if (!awinic->aw86927->work_queue) {
++			ret = -ENOMEM;
++			goto error;
++		}
++		aw86927_vibrator_init(awinic->aw86927);
++		awinic->backend_initialized = true;
++		ret = aw86927_haptic_init(awinic->aw86927);
++		if (ret < 0)
++			goto error;
++		if (gpio_is_valid(awinic->irq_gpio) &&
++		    !(awinic->aw86927->flags & AW86927_FLAG_SKIP_INTERRUPTS)) {
++			awinic->irq = gpio_to_irq(awinic->irq_gpio);
++			if (awinic->irq < 0) {
++				ret = awinic->irq;
++				goto error;
+ 			}
+-		}
+-
+-		/* aw86927 irq */
+-
+-		if (gpio_is_valid(awinic->aw86927->irq_gpio) &&
+-
+-		    !(awinic->aw86927->flags & AW86927_FLAG_SKIP_INTERRUPTS)) {
+-			/* register irq handler */
+-
+ 			aw86927_interrupt_setup(awinic->aw86927);
+-
+-			irq_flags = IRQF_TRIGGER_FALLING | IRQF_ONESHOT;
+-
+-			ret = devm_request_threaded_irq(
+-				&i2c->dev,
+-
+-				gpio_to_irq(awinic->aw86927->irq_gpio),
+-
+-				NULL, aw86927_irq, irq_flags,
+-
++			ret = devm_request_threaded_irq(awinic->dev, awinic->irq,
++				NULL, aw86927_irq, IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+ 				"aw86927", awinic->aw86927);
+-
+-			if (ret != 0) {
+-				aw_err("%s: failed to request IRQ %d: %d\n",
+-
+-				       __func__,
+-
+-				       gpio_to_irq(awinic->aw86927->irq_gpio),
+-
+-				       ret);
+-
+-				goto err_aw86927_irq;
+-			}
+-
++			if (ret)
++				goto error;
++			awinic->irq_registered = true;
+ 		} else {
+-			aw_info("%s skipping IRQ registration\n", __func__);
+-
+-			/* disable feature support if gpio was invalid */
+-
+ 			awinic->aw86927->flags |= AW86927_FLAG_SKIP_INTERRUPTS;
+-
+-			aw_info("%s: aw86927_irq failed.\n", __func__);
+-		}
+-
+-		awinic->aw86927->work_queue = create_singlethread_workqueue(
+-			"aw86927_vibrator_work_queue");
+-
+-		if (!awinic->aw86927->work_queue) {
+-			aw_err("%s: Error creating aw86927_vibrator_work_queue\n",
+-
+-			       __func__);
+-
+-			goto err_aw86927_sysfs;
+-		}
+-
+-		aw86927_vibrator_init(awinic->aw86927);
+-
+-		aw86927_haptic_init(awinic->aw86927);
+-
++		}
++		CUSTOME_WAVE_ID = awinic->aw86927->info.effect_max;
++		input_set_drvdata(input_dev, awinic->aw86927);
++		awinic->aw86927->input_dev = input_dev;
++		input_set_capability(input_dev, EV_FF, FF_CONSTANT);
++		input_set_capability(input_dev, EV_FF, FF_GAIN);
++		if (awinic->aw86927->effects_count) {
++			input_set_capability(input_dev, EV_FF, FF_PERIODIC);
++			input_set_capability(input_dev, EV_FF, FF_CUSTOM);
++		}
++		ret = input_ff_create(input_dev,
++			max_t(int, FF_EFFECT_COUNT_MAX, awinic->aw86927->effects_count + 1));
++		if (ret)
++			goto error;
++		input_dev->ff->upload = aw86927_haptics_upload_effect;
++		input_dev->ff->playback = aw86927_haptics_playback;
++		input_dev->ff->erase = aw86927_haptics_erase;
++		input_dev->ff->set_gain = aw86927_haptics_set_gain;
+ 		aw86927_ram_init(awinic->aw86927);
+-
+-		CUSTOME_WAVE_ID = awinic->aw86927->info.effect_max;
+-
+-		/*aw86927 input config*/
+-
+-		input_set_drvdata(input_dev, awinic->aw86927);
+-
+-		awinic->aw86927->input_dev = input_dev;
+-
+-		input_set_capability(input_dev, EV_FF, FF_CONSTANT);
+-
+-		input_set_capability(input_dev, EV_FF, FF_GAIN);
+-
+-		if (awinic->aw86927->effects_count != 0) {
+-			input_set_capability(input_dev, EV_FF, FF_PERIODIC);
+-
+-			input_set_capability(input_dev, EV_FF, FF_CUSTOM);
+-		}
+-
+-		if (awinic->aw86927->effects_count + 1 > FF_EFFECT_COUNT_MAX)
+-
+-			effect_count_max = awinic->aw86927->effects_count + 1;
+-
+-		else
+-
+-			effect_count_max = FF_EFFECT_COUNT_MAX;
+-
+-		rc = input_ff_create(input_dev, effect_count_max);
+-
+-		if (rc < 0) {
+-			aw_err("%s create FF input device failed, rc=%d\n",
+-
+-			       __func__, rc);
+-
+-			goto err_aw86927_input_ff;
+-		}
+-
+-		INIT_WORK(&awinic->aw86927->set_gain_work,
+-
+-			  aw86927_haptics_set_gain_work_routine);
+-
+-		ff = input_dev->ff;
+-
+-		ff->upload = aw86927_haptics_upload_effect;
+-
+-		ff->playback = aw86927_haptics_playback;
+-
+-		ff->erase = aw86927_haptics_erase;
+-
+-		ff->set_gain = aw86927_haptics_set_gain;
+-
+-		rc = input_register_device(input_dev);
+-
+-		if (rc < 0) {
+-			aw_err("%s register input device failed, rc=%d\n",
+-
+-			       __func__, rc);
+-
+-			XM_HAP_REGISTER_EXCEPTION("Device register",
+-						  "input_register_device");
+-
+-			goto aw86927_destroy_ff;
+-		}
+-
+ 	} else {
+-		goto err_parse_dt;
+-	}
+-
+-	dev_set_drvdata(&i2c->dev, awinic);
+-
+-	ret = create_rb();
+-
+-	if (ret < 0) {
++		ret = -ENODEV;
++		goto error;
++	}
++	/* Every callback dependency is ready before the first visible interface. */
++	ret = input_register_device(input_dev);
++	if (ret)
++		goto error;
++	awinic->input_registered = true;
++	ret = sysfs_create_group(&i2c->dev.kobj,
++		awinic->name == AW8697 ? &aw8697_vibrator_attribute_group :
++					 &aw86927_vibrator_attribute_group);
++	if (ret)
++		goto error;
++	awinic->sysfs_registered = true;
++	if (awinic->name == AW8697) {
++		ret = aw8697_misc_register(awinic->aw8697);
++		if (ret)
++			goto error;
++		awinic->misc_registered = true;
++	}
++	return 0;
++error:
++	if (awinic->backend_initialized)
+ 		XM_HAP_REGISTER_EXCEPTION("Hardware", "haptics_hw_init");
+-
+-		aw_info("%s error creating ringbuffer\n", __func__);
+-
+-		goto err_rb;
+-	}
+-
+-	aw_info("%s probe completed successfully!\n", __func__);
+-
+-	return 0;
+-
+-err_rb:
+-
+-aw86927_destroy_ff:
+-
+-	if (awinic->name == AW86927)
+-
+-		input_ff_destroy(awinic->aw86927->input_dev);
+-
+-err_aw86927_input_ff:
+-
+-err_aw86927_sysfs:
+-
+-	if (awinic->name == AW86927)
+-
+-		devm_free_irq(&i2c->dev, gpio_to_irq(awinic->aw86927->irq_gpio),
+-
+-			      awinic->aw86927);
+-
+-err_aw86927_irq:
+-
+-err_aw86927_parse_dt:
+-#ifdef AW_CHECK_QUAL
+-err_aw86927_check_qualify:
+-#endif
+-	if (awinic->name == AW86927) {
+-		devm_kfree(&i2c->dev, awinic->aw86927);
+-
+-		awinic->aw86927 = NULL;
+-	}
+-
+-aw8697_destroy_ff:
+-
+-	if (awinic->name == AW8697)
+-
+-		input_ff_destroy(awinic->aw8697->input_dev);
+-
+-err_aw8697_input_ff:
+-
+-err_aw8697_sysfs:
+-
+-	if (awinic->name == AW8697)
+-
+-		devm_free_irq(&i2c->dev, gpio_to_irq(awinic->aw8697->irq_gpio),
+-
+-			      awinic->aw8697);
+-
+-err_aw8697_irq:
+-
+-err_aw8697_parse_dt:
+-
+-	if (awinic->name == AW8697) {
+-		devm_kfree(&i2c->dev, awinic->aw8697);
+-
+-		awinic->aw8697 = NULL;
+-	}
+-
+-err_id:
+-
+-	if (gpio_is_valid(awinic->irq_gpio))
+-
+-		// devm_gpio_free(&i2c->dev, awinic->irq_gpio);
+-
+-err_irq_gpio_request:
+-
+-		if (gpio_is_valid(awinic->reset_gpio))
+-
+-			// devm_gpio_free(&i2c->dev, awinic->reset_gpio);
+-
+-err_reset_gpio_request:
+-
+-err_parse_dt:
+-
+-			device_init_wakeup(awinic->dev, false);
+-
+-	devm_kfree(&i2c->dev, awinic);
+-
+-	awinic = NULL;
+-
++	awinic_cleanup(awinic);
++	i2c_set_clientdata(i2c, NULL);
+ 	return ret;
+ }
+ 
+ static void awinic_i2c_remove(struct i2c_client *i2c)
+-
+ {
+ 	struct awinic *awinic = i2c_get_clientdata(i2c);
+ 
+-	aw_info("%s enter\n", __func__);
+-
+-	if (awinic->name == AW8697) {
+-		aw_err("%s remove aw8697\n", __func__);
+-
+-		misc_deregister(&aw8697_haptic_misc);
+-
+-		sysfs_remove_group(&i2c->dev.kobj,
+-
+-				   &aw8697_vibrator_attribute_group);
+-
+-		devm_free_irq(&i2c->dev, gpio_to_irq(awinic->aw8697->irq_gpio),
+-
+-			      awinic->aw8697);
+-
+-		if (gpio_is_valid(awinic->aw8697->irq_gpio))
+-
+-			// devm_gpio_free(&i2c->dev, awinic->aw8697->irq_gpio);
+-
+-			if (gpio_is_valid(awinic->aw8697->reset_gpio))
+-
+-				// devm_gpio_free(&i2c->dev, awinic->aw8697->reset_gpio);
+-
+-				if (awinic->aw8697 != NULL) {
+-					flush_workqueue(
+-						awinic->aw8697->work_queue);
+-
+-					destroy_workqueue(
+-						awinic->aw8697->work_queue);
+-				}
+-
+-		devm_kfree(&i2c->dev, awinic->aw8697);
+-
+-		awinic->aw8697 = NULL;
+-
+-	} else if (awinic->name == AW86927) {
+-		aw_err("%s remove aw86927\n", __func__);
+-
+-		sysfs_remove_group(&i2c->dev.kobj,
+-
+-				   &aw86927_vibrator_attribute_group);
+-
+-		devm_free_irq(&i2c->dev, gpio_to_irq(awinic->aw86927->irq_gpio),
+-
+-			      awinic->aw86927);
+-
+-		if (gpio_is_valid(awinic->aw86927->irq_gpio))
+-
+-			// devm_gpio_free(&i2c->dev, awinic->aw86927->irq_gpio);
+-
+-			if (gpio_is_valid(awinic->aw86927->reset_gpio))
+-
+-				// devm_gpio_free(&i2c->dev, awinic->aw86927->reset_gpio);
+-
+-				if (awinic->aw86927 != NULL) {
+-					flush_workqueue(
+-						awinic->aw86927->work_queue);
+-
+-					destroy_workqueue(
+-						awinic->aw86927->work_queue);
+-				}
+-
+-		devm_kfree(&i2c->dev, awinic->aw86927);
+-
+-		awinic->aw86927 = NULL;
+-
+-	} else {
+-		aw_err("%s no chip\n", __func__);
+-
+-		goto exit;
+-	}
+-
+-	release_rb();
+-
+-	device_init_wakeup(awinic->dev, false);
+-
+-exit:
+-	aw_info("%s exit\n", __func__);
++	awinic_cleanup(awinic);
++	i2c_set_clientdata(i2c, NULL);
+ }
+ 
+ static const struct i2c_device_id awinic_i2c_id[] = {
+@@ -1590,6 +1218,8 @@
+ 	{},
+ 
+ };
++
++MODULE_DEVICE_TABLE(of, aw_dt_match);
+ 
+ static struct i2c_driver awinic_i2c_driver = {
+ 
+--- a/drivers/input/misc/aw86927_haptic/aw_haptic.h
++++ b/drivers/input/misc/aw86927_haptic/aw_haptic.h
+@@ -159,6 +159,14 @@
+ 	struct device *dev;
+ 	unsigned char name;
+ 	bool IsUsedIRQ;
++	bool ring_owned;
++	bool backend_initialized;
++	bool input_registered;
++	bool sysfs_registered;
++	bool misc_registered;
++	bool irq_registered;
++	int irq;
++	struct input_dev *input_dev;
+ 
+ 	int reset_gpio;
+ 	int irq_gpio;
+--- a/drivers/input/misc/aw86927_haptic/aw86927.c
++++ b/drivers/input/misc/aw86927_haptic/aw86927.c
+@@ -29,6 +29,7 @@
+ #include <linux/syscalls.h>
+ #include <linux/power_supply.h>
+ #include <linux/vmalloc.h>
++#include <linux/limits.h>
+ #include <linux/pm_qos.h>
+ #include <sound/core.h>
+ #include <sound/pcm.h>
+@@ -61,6 +62,14 @@
+  ******************************************************/
+ static struct aw86927_container *aw86927_rtp;
+ 
++static struct aw86927_container *aw86927_alloc_rtp(size_t length)
++{
++	if (!length || length > INT_MAX)
++		return NULL;
++	return vmalloc(sizeof(struct aw86927_container) + length);
++}
++
++
+ /******************************************************
+  *
+  * i2c write/read
+@@ -115,35 +124,36 @@
+ 				  unsigned char reg_data)
+ {
+ 	unsigned char reg_val = 0;
+-
+-	aw86927_i2c_read(aw86927, reg_addr, &reg_val);
++	int ret;
++
++	ret = aw86927_i2c_read(aw86927, reg_addr, &reg_val);
++	if (ret < 0)
++		return ret;
+ 	reg_val &= mask;
+ 	reg_val |= reg_data;
+-	aw86927_i2c_write(aw86927, reg_addr, reg_val);
+-
+-	return 0;
++	return aw86927_i2c_write(aw86927, reg_addr, reg_val);
+ }
+ 
+ static int aw86927_i2c_writes(struct aw86927 *aw86927, unsigned char reg_addr,
+ 			      unsigned char *buf, unsigned int len)
+ {
+-	int ret = -1;
+ 	unsigned char *data;
+-
++	int ret;
++
++	if (!buf || !len || len > U16_MAX - 1)
++		return -EINVAL;
+ 	data = kmalloc(len + 1, GFP_KERNEL);
+-
++	if (!data)
++		return -ENOMEM;
+ 	data[0] = reg_addr;
+-	memcpy(&data[1], buf, len);
+-
++	memcpy(data + 1, buf, len);
+ 	ret = i2c_master_send(aw86927->i2c, data, len + 1);
+-	if (ret < 0)
+-		aw_err("%s: i2c master send error\n", __func__);
+-
++	if (ret >= 0 && ret != len + 1)
++		ret = -EIO;
+ 	kfree(data);
+-
+ 	return ret;
+ }
+-int aw86927_i2c_reads(struct aw86927 *aw86927, unsigned char reg_addr,
++static int aw86927_i2c_reads(struct aw86927 *aw86927, unsigned char reg_addr,
+ 		      unsigned char *buf, unsigned int len)
+ {
+ 	int ret;
+@@ -1162,7 +1172,7 @@
+ 	return 0;
+ }
+ 
+-void aw86927_vibrate_params_init(struct aw86927 *aw86927)
++static void aw86927_vibrate_params_init(struct aw86927 *aw86927)
+ {
+ 	unsigned char i = 0;
+ 	unsigned char reg_val = 0;
+@@ -1186,34 +1196,33 @@
+ 	}
+ }
+ 
++static void aw86927_stop_work_routine(struct work_struct *work)
++{
++	struct aw86927 *aw86927 = container_of(work, struct aw86927, stop_work);
++
++	mutex_lock(&aw86927->lock);
++	if (!READ_ONCE(aw86927->stopping))
++		aw86927_i2c_write(aw86927, AW86927_REG_PLAYCFG4,
++			      AW86927_BIT_PLAYCFG4_STOP_ON);
++	mutex_unlock(&aw86927->lock);
++}
++
+ static enum hrtimer_restart qti_hap_stop_timer(struct hrtimer *timer)
+ {
+-	struct aw86927 *aw86927 =
+-		container_of(timer, struct aw86927, stop_timer);
+-	int rc;
+-
+-	aw_info("%s enter\n", __func__);
+-	aw86927->play.length_us = 0;
+-	rc = aw86927_i2c_write(aw86927, AW86927_REG_PLAYCFG4,
+-			       AW86927_BIT_PLAYCFG4_STOP_ON);
+-	if (rc < 0)
+-		aw_err("Stop playing failed, rc=%d\n", rc);
+-
++	struct aw86927 *aw86927 = container_of(timer, struct aw86927, stop_timer);
++
++	WRITE_ONCE(aw86927->play.length_us, 0);
++	if (!READ_ONCE(aw86927->stopping))
++		queue_work(aw86927->work_queue, &aw86927->stop_work);
+ 	return HRTIMER_NORESTART;
+ }
+ 
+ static enum hrtimer_restart qti_hap_disable_timer(struct hrtimer *timer)
+ {
+-	struct aw86927 *aw86927 =
+-		container_of(timer, struct aw86927, hap_disable_timer);
+-	int rc;
+-
+-	aw_info("%s enter\n", __func__);
+-	rc = aw86927_i2c_write(aw86927, AW86927_REG_PLAYCFG4,
+-			       AW86927_BIT_PLAYCFG4_STOP_ON);
+-	if (rc < 0)
+-		aw_err("Disable haptics module failed, rc=%d\n", rc);
+-
++	struct aw86927 *aw86927 = container_of(timer, struct aw86927, hap_disable_timer);
++
++	if (!READ_ONCE(aw86927->stopping))
++		queue_work(aw86927->work_queue, &aw86927->stop_work);
+ 	return HRTIMER_NORESTART;
+ }
+ 
+@@ -1224,11 +1233,6 @@
+ 	aw86927->f0_cali_status = true;
+ 	aw86927->rtp_routine_on = 0;
+ 	aw86927->rtp_num_max = awinic_rtp_name_len;
+-	hrtimer_init(&aw86927->stop_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-	aw86927->stop_timer.function = qti_hap_stop_timer;
+-	hrtimer_init(&aw86927->hap_disable_timer, CLOCK_MONOTONIC,
+-		     HRTIMER_MODE_REL);
+-	aw86927->hap_disable_timer.function = qti_hap_disable_timer;
+ 	/* Unlock register */
+ 	aw86927_i2c_write(aw86927, AW86927_REG_TMCFG,
+ 			  AW86927_BIT_TMCFG_TM_UNLOCK);
+@@ -1716,7 +1720,7 @@
+ 
+ 	mutex_lock(&aw86927->rtp_lock);
+ 	vfree(aw86927_rtp);
+-	aw86927_rtp = vmalloc(rtp_file->size + sizeof(int));
++	aw86927_rtp = aw86927_alloc_rtp(rtp_file->size);
+ 	if (!aw86927_rtp) {
+ 		release_firmware(rtp_file);
+ 		mutex_unlock(&aw86927->rtp_lock);
+@@ -1738,7 +1742,7 @@
+ {
+ 	int ret = -1;
+ 	unsigned char osc_int_state = 0;
+-	unsigned int buf_len = 0;
++	int buf_len = 0;
+ 
+ 	aw86927->rtp_cnt = 0;
+ 	aw86927->timeval_flags = 1;
+@@ -3671,6 +3675,9 @@
+ 	struct aw86927 *aw86927 =
+ 		container_of(timer, struct aw86927, haptic_audio.timer);
+ 
++	if (READ_ONCE(aw86927->stopping))
++		return HRTIMER_NORESTART;
++
+ 	aw_dbg("%s enter\n", __func__);
+ 	queue_work(aw86927->work_queue, &aw86927->haptic_audio.work);
+ 
+@@ -3701,6 +3708,9 @@
+ {
+ 	struct aw86927 *aw86927 =
+ 		container_of(work, struct aw86927, haptic_audio.work);
++
++	if (READ_ONCE(aw86927->stopping))
++		return;
+ 	int rtp_is_going_on = 0;
+ 
+ 	aw_info("%s enter\n", __func__);
+@@ -3774,12 +3784,6 @@
+ 
+ 	aw86927->haptic_audio.delay_val = 1;
+ 	aw86927->haptic_audio.timer_val = 21318;
+-	hrtimer_init(&aw86927->haptic_audio.timer, CLOCK_MONOTONIC,
+-		     HRTIMER_MODE_REL);
+-	aw86927->haptic_audio.timer.function = aw86927_haptic_audio_timer_func;
+-	INIT_WORK(&aw86927->haptic_audio.work,
+-		  aw86927_haptic_audio_work_routine);
+-	mutex_init(&aw86927->haptic_audio.lock);
+ }
+ 
+ static int aw86927_container_update(struct aw86927 *aw86927,
+@@ -3850,6 +3854,13 @@
+ 	int ret = 0;
+ 	unsigned short check_sum = 0;
+ 
++	/* Check header, signed container length and FIFO bounds before access. */
++	if (!cont || cont->size < 5 || cont->size > 128 * 1024 ||
++	    ((cont->data[2] << 8) | cont->data[3]) < 4 ||
++	    ((cont->data[2] << 8) | cont->data[3]) > get_rb_max_size()) {
++		release_firmware(cont);
++		return;
++	}
+ 	aw_info("%s enter\n", __func__);
+ 	if (aw86927->nv_flag == 1) {
+ 		if (!cont) {
+@@ -3916,39 +3927,36 @@
+ 
+ static int aw86927_ram_update(struct aw86927 *aw86927)
+ {
++	if (READ_ONCE(aw86927->stopping))
++		return -ESHUTDOWN;
++	mod_delayed_work(aw86927->work_queue, &aw86927->ram_work, 0);
++	return 0;
++}
++
++static void aw86927_ram_work_routine(struct work_struct *work)
++{
++	struct aw86927 *aw86927 = container_of(work, struct aw86927, ram_work.work);
++	const struct firmware *firmware;
++	int ret;
++
++	if (READ_ONCE(aw86927->stopping))
++		return;
++	ret = request_firmware(&firmware,
++		awinic_ram_name[aw86927->nv_flag == 1 ? 1 : 0], aw86927->dev);
++	if (ret)
++		return;
++	if (READ_ONCE(aw86927->stopping)) {
++		release_firmware(firmware);
++		return;
++	}
+ 	aw86927->ram_init = 0;
+ 	aw86927->rtp_init = 0;
+-	aw_info("%s enter\n", __func__);
+-	if (aw86927->nv_flag == 1) {
+-		aw_info("Use the backup ram file!\n");
+-		return request_firmware_nowait(THIS_MODULE, FW_ACTION_UEVENT,
+-					       awinic_ram_name[1], aw86927->dev,
+-					       GFP_KERNEL, aw86927,
+-					       aw86927_ram_loaded);
+-	} else {
+-		aw_info("Use the default ram file!\n");
+-		return request_firmware_nowait(THIS_MODULE, FW_ACTION_UEVENT,
+-					       awinic_ram_name[0], aw86927->dev,
+-					       GFP_KERNEL, aw86927,
+-					       aw86927_ram_loaded);
+-	}
+-}
+-
+-#ifdef AW_RAM_UPDATE_DELAY
+-static void aw86927_ram_work_routine(struct work_struct *work)
+-{
+-	struct aw86927 *aw86927 =
+-		container_of(work, struct aw86927, ram_work.work);
+-
+-	aw_info("%s enter\n", __func__);
+-
+-	aw86927_ram_update(aw86927);
+-}
+-#endif
++	aw86927_ram_loaded(firmware, aw86927);
++}
+ 
+ static int aw86927_haptic_rtp_play(struct aw86927 *aw86927)
+ {
+-	unsigned int buf_len = 0;
++	int buf_len = 0;
+ 	unsigned int period_size = aw86927->ram.base_addr >> 2;
+ 
+ 	aw_info("%s enter\n", __func__);
+@@ -3975,9 +3983,10 @@
+ 			}
+ 		} else {
+ 			buf_len = read_rb(aw86927_rtp->data, period_size);
+-			aw86927_i2c_writes(aw86927, AW86927_REG_RTPDATA,
++			if ((int)buf_len > 0)
++				aw86927_i2c_writes(aw86927, AW86927_REG_RTPDATA,
+ 					   aw86927_rtp->data, buf_len);
+-			if (buf_len < period_size) {
++			if (buf_len <= 0 || buf_len < period_size) {
+ 				aw_info("%s: custom rtp update complete\n",
+ 					__func__);
+ 				aw86927->rtp_cnt = 0;
+@@ -4006,7 +4015,14 @@
+ 
+ 	struct aw86927 *aw86927 = container_of(work, struct aw86927, rtp_work);
+ 
+-	if ((aw86927->effect_id < aw86927->info.effect_id_boundary) &&
++	if (!aw86927->ram_init || aw86927->ram.base_addr < 4 ||
++	    aw86927->ram.base_addr > get_rb_max_size() ||
++	    (aw86927->flags & AW86927_FLAG_SKIP_INTERRUPTS))
++		return;
++	if (READ_ONCE(aw86927->stopping))
++		return;
++
++	if ((aw86927->effect_id < aw86927->info.effect_id_boundary) ||
+ 	    (aw86927->effect_id > aw86927->info.effect_max))
+ 		return;
+ 
+@@ -4018,12 +4034,12 @@
+ 	aw86927_interrupt_clear(aw86927);
+ 	/* wait for irq to exit */
+ 	atomic_set(&aw86927->exit_in_rtp_loop, 1);
+-	while (atomic_read(&aw86927->is_in_rtp_loop)) {
++	while (atomic_read(&aw86927->is_in_rtp_loop) && !READ_ONCE(aw86927->stopping)) {
+ 		aw_info("%s  goint to waiting irq exit\n", __func__);
+ 		mutex_unlock(&aw86927->lock);
+ 		ret = wait_event_interruptible(
+ 			aw86927->wait_q,
+-			atomic_read(&aw86927->is_in_rtp_loop) == 0);
++			atomic_read(&aw86927->is_in_rtp_loop) == 0 || READ_ONCE(aw86927->stopping));
+ 		aw_info("%s  wakeup\n", __func__);
+ 		mutex_lock(&aw86927->lock);
+ 		if (ret == -ERESTARTSYS) {
+@@ -4035,6 +4051,10 @@
+ 		}
+ 	}
+ 
++	if (READ_ONCE(aw86927->stopping)) {
++		mutex_unlock(&aw86927->lock);
++		return;
++	}
+ 	atomic_set(&aw86927->exit_in_rtp_loop, 0);
+ 	wake_up_interruptible(&aw86927->stop_wait_q);
+ 
+@@ -4043,13 +4063,13 @@
+ 		aw_err("%s buffer size %d, availbe size %d\n", __func__,
+ 		       aw86927->ram.base_addr >> 2, get_rb_avalible_size());
+ 		while (get_rb_avalible_size() < aw86927->ram.base_addr &&
+-		       !rb_shoule_exit()) {
++		       !rb_shoule_exit() && !READ_ONCE(aw86927->stopping)) {
+ 			mutex_unlock(&aw86927->lock);
+ 			ret = wait_event_interruptible(
+ 				aw86927->stop_wait_q,
+ 				(get_rb_avalible_size() >=
+ 				 aw86927->ram.base_addr) ||
+-					rb_shoule_exit());
++					rb_shoule_exit() || READ_ONCE(aw86927->stopping));
+ 			aw_info("%s  wakeup\n", __func__);
+ 			aw_err("%s after wakeup sbuffer size %d, availbe size %d\n",
+ 			       __func__, aw86927->ram.base_addr >> 2,
+@@ -4063,6 +4083,10 @@
+ 		}
+ 	}
+ 
++	if (READ_ONCE(aw86927->stopping)) {
++		mutex_unlock(&aw86927->lock);
++		return;
++	}
+ 	aw86927_haptic_stop(aw86927);
+ 	if (aw86927->state) {
+ 		pm_stay_awake(aw86927->dev);
+@@ -4102,7 +4126,7 @@
+ 				return;
+ 			}
+ 			vfree(aw86927_rtp);
+-			aw86927_rtp = vmalloc(rtp_file->size + sizeof(int));
++			aw86927_rtp = aw86927_alloc_rtp(rtp_file->size);
+ 			if (!aw86927_rtp) {
+ 				release_firmware(rtp_file);
+ 				aw_err("%s: error allocating memory\n",
+@@ -4124,8 +4148,7 @@
+ 			aw86927_rtp = NULL;
+ 			if (aw86927->ram.base_addr != 0) {
+ 				aw86927_rtp =
+-					vmalloc((aw86927->ram.base_addr >> 2) +
+-						sizeof(int));
++					aw86927_alloc_rtp(aw86927->ram.base_addr >> 2);
+ 			} else {
+ 				pr_err("ram update not done yet, return !");
+ 			}
+@@ -4178,6 +4201,9 @@
+ {
+ 	struct aw86927 *aw86927 = container_of(timer, struct aw86927, timer);
+ 
++	if (READ_ONCE(aw86927->stopping))
++		return HRTIMER_NORESTART;
++
+ 	aw_info("%s enter\n", __func__);
+ 
+ 	aw86927->state = 0;
+@@ -4190,6 +4216,9 @@
+ {
+ 	struct aw86927 *aw86927 =
+ 		container_of(work, struct aw86927, vibrator_work);
++
++	if (READ_ONCE(aw86927->stopping))
++		return;
+ 
+ 	aw_dbg("%s enter\n", __func__);
+ 	aw_info("%s: effect_id = %d state=%d activate_mode = %d duration = %d\n",
+@@ -4231,15 +4260,17 @@
+ 	struct aw86927 *aw86927 = data;
+ 	unsigned char glb_state_val = 0;
+ 	//unsigned char reg_val = 0;
+-	unsigned int buf_len = 0;
++	int buf_len = 0;
+ 	unsigned int period_size = aw86927->ram.base_addr >> 2;
+ 	int ret = 0;
+ 
++	if (READ_ONCE(aw86927->stopping))
++		return IRQ_HANDLED;
+ 	atomic_set(&aw86927->is_in_rtp_loop, 1);
+ 	aw_info("%s enter\n", __func__);
+ 	ret = aw86927_get_irq_state(aw86927);
+ 	if (ret < 0)
+-		return IRQ_HANDLED;
++		goto out;
+ 	if (ret & AW86927_SYSINT_ERROR)
+ 		aw86927->rtp_routine_on = 0;
+ 	if ((ret & AW86927_SYSINT_FF_AEI) && aw86927->rtp_init) {
+@@ -4257,9 +4288,10 @@
+ 			if (aw86927->is_custom_wave == 1) {
+ 				buf_len =
+ 					read_rb(aw86927_rtp->data, period_size);
+-				aw86927_i2c_writes(aw86927, AW86927_REG_RTPDATA,
++				if ((int)buf_len > 0)
++					aw86927_i2c_writes(aw86927, AW86927_REG_RTPDATA,
+ 						   aw86927_rtp->data, buf_len);
+-				if (buf_len < period_size) {
++				if (buf_len <= 0 || buf_len < period_size) {
+ 					aw_info("%s: rtp update complete\n",
+ 						__func__);
+ 					aw86927_haptic_set_rtp_aei(aw86927,
+@@ -4316,6 +4348,7 @@
+ 	// aw_dbg("%s: reg SYSINT=0x%x\n", __func__, reg_val);
+ 	// aw86927_i2c_read(aw86927, AW86927_REG_SYSST, &reg_val);
+ 	// aw_dbg("%s: reg SYSST=0x%x\n", __func__, reg_val);
++out:
+ 	atomic_set(&aw86927->is_in_rtp_loop, 0);
+ 	wake_up_interruptible(&aw86927->wait_q);
+ 	aw_info("%s exit\n", __func__);
+@@ -4325,20 +4358,15 @@
+ 
+ int aw86927_vibrator_init(struct aw86927 *aw86927)
+ {
+-	int ret = 0;
+ 
+ 	aw_info("%s enter\n", __func__);
+-	ret = sysfs_create_group(&aw86927->i2c->dev.kobj,
+-				 &aw86927_vibrator_attribute_group);
+-	if (ret < 0) {
+-		aw_info("%s error creating sysfs attr files\n", __func__);
+-		return ret;
+-	}
+-
+-	hrtimer_init(&aw86927->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-	aw86927->timer.function = aw86927_vibrator_timer_func;
++	hrtimer_setup(&aw86927->timer, aw86927_vibrator_timer_func,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	INIT_WORK(&aw86927->vibrator_work, aw86927_vibrator_work_routine);
+ 	INIT_WORK(&aw86927->rtp_work, aw86927_rtp_work_routine);
++	INIT_WORK(&aw86927->set_gain_work, aw86927_haptics_set_gain_work_routine);
++	INIT_WORK(&aw86927->stop_work, aw86927_stop_work_routine);
++	INIT_DELAYED_WORK(&aw86927->ram_work, aw86927_ram_work_routine);
+ 	mutex_init(&aw86927->lock);
+ 	mutex_init(&aw86927->rtp_lock);
+ 	atomic_set(&aw86927->is_in_rtp_loop, 0);
+@@ -4346,6 +4374,14 @@
+ 	atomic_set(&aw86927->is_in_write_loop, 0);
+ 	init_waitqueue_head(&aw86927->wait_q);
+ 	init_waitqueue_head(&aw86927->stop_wait_q);
++	hrtimer_setup(&aw86927->stop_timer, qti_hap_stop_timer,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	hrtimer_setup(&aw86927->hap_disable_timer, qti_hap_disable_timer,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	hrtimer_setup(&aw86927->haptic_audio.timer, aw86927_haptic_audio_timer_func,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	INIT_WORK(&aw86927->haptic_audio.work, aw86927_haptic_audio_work_routine);
++	mutex_init(&aw86927->haptic_audio.lock);
+ 	return 0;
+ }
+ 
+@@ -4382,12 +4418,8 @@
+ int aw86927_ram_init(struct aw86927 *aw86927)
+ {
+ #ifdef AW_RAM_UPDATE_DELAY
+-	int ram_timer_val = 5000;
+-
+-	aw_info("%s enter\n", __func__);
+-	INIT_DELAYED_WORK(&aw86927->ram_work, aw86927_ram_work_routine);
+ 	queue_delayed_work(aw86927->work_queue, &aw86927->ram_work,
+-			   msecs_to_jiffies(ram_timer_val));
++			   msecs_to_jiffies(5000));
+ #else
+ 	aw86927_ram_update(aw86927);
+ #endif
+@@ -4419,19 +4451,23 @@
+ 	       __func__, effect->type, FF_CONSTANT, FF_PERIODIC);
+ 	aw86927->effect_type = effect->type;
+ 	mutex_lock(&aw86927->lock);
+-	while (atomic_read(&aw86927->exit_in_rtp_loop)) {
++	while (atomic_read(&aw86927->exit_in_rtp_loop) && !READ_ONCE(aw86927->stopping)) {
+ 		aw_info("%s  goint to waiting rtp  exit\n", __func__);
+ 		mutex_unlock(&aw86927->lock);
+ 		ret = wait_event_interruptible(
+ 			aw86927->stop_wait_q,
+-			atomic_read(&aw86927->exit_in_rtp_loop) == 0);
++			atomic_read(&aw86927->exit_in_rtp_loop) == 0 ||
++			READ_ONCE(aw86927->stopping));
+ 		aw_info("%s wakeup\n", __func__);
+ 		if (ret == -ERESTARTSYS) {
+-			mutex_unlock(&aw86927->lock);
+ 			aw_err("%s wake up by signal return erro\n", __func__);
+ 			return ret;
+ 		}
+ 		mutex_lock(&aw86927->lock);
++	}
++	if (READ_ONCE(aw86927->stopping)) {
++		mutex_unlock(&aw86927->lock);
++		return -ESHUTDOWN;
+ 	}
+ 	if (aw86927->effect_type == FF_CONSTANT) {
+ 		aw_dbg("%s: effect_type is  FF_CONSTANT!\n", __func__);
+@@ -4516,6 +4552,9 @@
+ {
+ 	struct aw86927 *aw86927 = input_get_drvdata(dev);
+ 	int rc = 0;
++
++	if (READ_ONCE(aw86927->stopping))
++		return -ESHUTDOWN;
+ 
+ 	aw_dbg("%s: effect_id=%d , activate_mode = %d val = %d\n", __func__,
+ 	       aw86927->effect_id, aw86927->activate_mode, val);
+@@ -4559,6 +4598,9 @@
+ 	struct aw86927 *aw86927 = input_get_drvdata(dev);
+ 	int rc = 0;
+ 
++	if (READ_ONCE(aw86927->stopping))
++		return -ESHUTDOWN;
++
+ 	/*for osc calibration*/
+ 	if (aw86927->osc_cali_run != 0)
+ 		return 0;
+@@ -4579,6 +4621,9 @@
+ 	int temp = 0;
+ 	struct aw86927 *aw86927 =
+ 		container_of(work, struct aw86927, set_gain_work);
++
++	if (READ_ONCE(aw86927->stopping))
++		return;
+ 
+ 	struct thermal_zone_device *tzd;
+ 	aw_dbg("%s enter!\n", __func__);
+@@ -4637,7 +4682,39 @@
+ {
+ 	struct aw86927 *aw86927 = input_get_drvdata(dev);
+ 
++	if (READ_ONCE(aw86927->stopping))
++		return;
++
+ 	aw_dbg("%s enter\n", __func__);
+ 	aw86927->new_gain = gain;
+ 	queue_work(aw86927->work_queue, &aw86927->set_gain_work);
+ }
++
++
++void aw86927_shutdown(struct aw86927 *aw86927)
++{
++	/* Publication and IRQ admission have been revoked by the caller. */
++	cancel_delayed_work_sync(&aw86927->ram_work);
++	hrtimer_cancel(&aw86927->timer);
++	hrtimer_cancel(&aw86927->stop_timer);
++	hrtimer_cancel(&aw86927->hap_disable_timer);
++	hrtimer_cancel(&aw86927->haptic_audio.timer);
++	cancel_work_sync(&aw86927->vibrator_work);
++	cancel_work_sync(&aw86927->rtp_work);
++	cancel_work_sync(&aw86927->set_gain_work);
++	cancel_work_sync(&aw86927->stop_work);
++	cancel_work_sync(&aw86927->haptic_audio.work);
++	/* A work item that was already running may have armed a final timer. */
++	hrtimer_cancel(&aw86927->timer);
++	hrtimer_cancel(&aw86927->stop_timer);
++	hrtimer_cancel(&aw86927->hap_disable_timer);
++	hrtimer_cancel(&aw86927->haptic_audio.timer);
++	destroy_workqueue(aw86927->work_queue);
++	aw86927->work_queue = NULL;
++	mutex_lock(&aw86927->lock);
++	aw86927_haptic_stop(aw86927);
++	mutex_unlock(&aw86927->lock);
++	pm_relax(aw86927->dev);
++	vfree(aw86927_rtp);
++	aw86927_rtp = NULL;
++}
+--- a/drivers/input/misc/aw86927_haptic/aw86927.h
++++ b/drivers/input/misc/aw86927_haptic/aw86927.h
+@@ -146,6 +146,8 @@
+ 	struct work_struct vibrator_work;
+ 	struct work_struct rtp_work;
+ 	struct work_struct set_gain_work;
++	struct work_struct stop_work;
++	bool stopping;
+ 	struct delayed_work ram_work;
+ 
+ 	struct fileops fileops;
+@@ -822,6 +824,7 @@
+ extern void aw86927_interrupt_setup(struct aw86927 *aw86927);
+ extern int aw86927_vibrator_init(struct aw86927 *aw86927);
+ extern int aw86927_haptic_init(struct aw86927 *aw86927);
++extern void aw86927_shutdown(struct aw86927 *aw86927);
+ extern int aw86927_ram_init(struct aw86927 *aw86927);
+ extern irqreturn_t aw86927_irq(int irq, void *data);
+ extern struct attribute_group aw86927_vibrator_attribute_group;
+--- a/drivers/input/misc/aw86927_haptic/aw8697.c
++++ b/drivers/input/misc/aw86927_haptic/aw8697.c
+@@ -25,11 +25,14 @@
+ #include <linux/interrupt.h>
+ #include <linux/debugfs.h>
+ #include <linux/miscdevice.h>
++#include <linux/kref.h>
+ #include <linux/platform_device.h>
+ #include <asm/uaccess.h>
+ #include <linux/syscalls.h>
+ #include <linux/power_supply.h>
+ #include <linux/pm_qos.h>
++#include <linux/vmalloc.h>
++#include <linux/limits.h>
+ #include "aw_haptic.h"
+ #include "ringbuffer.h"
+ #include "aw_config.h"
+@@ -42,7 +45,36 @@
+  ******************************************************/
+ 
+ static struct aw8697_container *aw8697_rtp;
+-static struct aw8697 *g_aw8697;
++
++static struct aw8697_container *aw8697_alloc_rtp(size_t length)
++{
++	if (!length || length > INT_MAX)
++		return NULL;
++	return vmalloc(sizeof(struct aw8697_container) + length);
++}
++
++struct aw8697_misc_context {
++	struct kref ref;
++	struct mutex lock;
++	struct aw8697 *aw8697;
++};
++
++struct aw8697_file_context {
++	struct aw8697_misc_context *device;
++	u8 cmd;
++	u8 reg;
++};
++
++static DEFINE_MUTEX(aw8697_misc_lock);
++static struct aw8697_misc_context *aw8697_misc_context;
++
++static void aw8697_misc_release(struct kref *ref)
++{
++	struct aw8697_misc_context *context =
++		container_of(ref, struct aw8697_misc_context, ref);
++
++	kfree(context);
++}
+ 
+ static const unsigned char aw8697_reg_access[AW8697_REG_MAX] = {
+ 	[AW8697_REG_ID] = REG_RD_ACCESS,
+@@ -213,36 +245,37 @@
+ 				 unsigned int mask, unsigned char reg_data)
+ {
+ 	unsigned char reg_val = 0;
+-
+-	aw8697_i2c_read(aw8697, reg_addr, &reg_val);
++	int ret;
++
++	ret = aw8697_i2c_read(aw8697, reg_addr, &reg_val);
++	if (ret < 0)
++		return ret;
+ 	reg_val &= mask;
+ 	reg_val |= reg_data;
+-	aw8697_i2c_write(aw8697, reg_addr, reg_val);
+-
+-	return 0;
++	return aw8697_i2c_write(aw8697, reg_addr, reg_val);
+ }
+ 
+ static int aw8697_i2c_writes(struct aw8697 *aw8697, unsigned char reg_addr,
+-			     unsigned char *buf, unsigned int len)
+-{
+-	int ret = -1;
++			      unsigned char *buf, unsigned int len)
++{
+ 	unsigned char *data;
+-
++	int ret;
++
++	if (!buf || !len || len > U16_MAX - 1)
++		return -EINVAL;
+ 	data = kmalloc(len + 1, GFP_KERNEL);
+-
++	if (!data)
++		return -ENOMEM;
+ 	data[0] = reg_addr;
+-	memcpy(&data[1], buf, len);
+-
++	memcpy(data + 1, buf, len);
+ 	ret = i2c_master_send(aw8697->i2c, data, len + 1);
+-	if (ret < 0)
+-		aw_err("%s: i2c master send error\n", __func__);
+-
++	if (ret >= 0 && ret != len + 1)
++		ret = -EIO;
+ 	kfree(data);
+-
+ 	return ret;
+ }
+ 
+-int aw8697_i2c_reads(struct aw8697 *aw8697, unsigned char reg_addr,
++static int aw8697_i2c_reads(struct aw8697 *aw8697, unsigned char reg_addr,
+ 		     unsigned char *buf, unsigned int len)
+ {
+ 	int ret;
+@@ -294,7 +327,8 @@
+ 		awinic_rtp_name[aw8697->rtp_file_num], cont ? cont->size : 0);
+ 
+ 	/* aw8697 rtp update */
+-	aw8697_rtp = vmalloc(cont->size + sizeof(int));
++	vfree(aw8697_rtp);
++	aw8697_rtp = aw8697_alloc_rtp(cont->size);
+ 	if (!aw8697_rtp) {
+ 		release_firmware(cont);
+ 		aw_err("%s: Error allocating memory\n", __func__);
+@@ -311,12 +345,23 @@
+ 
+ static int aw8697_rtp_update(struct aw8697 *aw8697)
+ {
+-	aw_info("%s enter\n", __func__);
+-
+-	return request_firmware_nowait(THIS_MODULE, FW_ACTION_UEVENT,
+-				       awinic_rtp_name[aw8697->rtp_file_num],
+-				       aw8697->dev, GFP_KERNEL, aw8697,
+-				       aw8697_rtp_loaded);
++	const struct firmware *firmware;
++	int ret;
++
++	if (READ_ONCE(aw8697->stopping))
++		return -ESHUTDOWN;
++	ret = request_firmware(&firmware, awinic_rtp_name[aw8697->rtp_file_num], aw8697->dev);
++	if (ret)
++		return ret;
++	mutex_lock(&aw8697->lock);
++	mutex_lock(&aw8697->rtp_lock);
++	if (READ_ONCE(aw8697->stopping))
++		release_firmware(firmware);
++	else
++		aw8697_rtp_loaded(firmware, aw8697);
++	mutex_unlock(&aw8697->rtp_lock);
++	mutex_unlock(&aw8697->lock);
++	return 0;
+ }
+ 
+ #ifdef AW_CHECK_RAM_DATA
+@@ -446,6 +491,13 @@
+ 	int i = 0;
+ 	unsigned short check_sum = 0;
+ 
++	/* Check header, signed container length and FIFO bounds before access. */
++	if (!cont || cont->size < 5 || cont->size > 128 * 1024 ||
++	    ((cont->data[2] << 8) | cont->data[3]) < 4 ||
++	    ((cont->data[2] << 8) | cont->data[3]) > get_rb_max_size()) {
++		release_firmware(cont);
++		return;
++	}
+ 	aw_info("%s enter\n", __func__);
+ 	if (!cont) {
+ 		aw_err("%s: failed to read %s\n", __func__, awinic_ram_name[0]);
+@@ -473,6 +525,7 @@
+ 	} else {
+ 		aw_err("%s: check sum err: check_sum=0x%04x\n", __func__,
+ 		       check_sum);
++		release_firmware(cont);
+ 		return;
+ 	}
+ 
+@@ -503,26 +556,31 @@
+ 
+ static int aw8697_ram_update(struct aw8697 *aw8697)
+ {
++	if (READ_ONCE(aw8697->stopping))
++		return -ESHUTDOWN;
++	mod_delayed_work(aw8697->work_queue, &aw8697->ram_work, 0);
++	return 0;
++}
++
++static void aw8697_ram_work_routine(struct work_struct *work)
++{
++	struct aw8697 *aw8697 = container_of(work, struct aw8697, ram_work.work);
++	const struct firmware *firmware;
++	int ret;
++
++	if (READ_ONCE(aw8697->stopping))
++		return;
++	ret = request_firmware(&firmware, awinic_ram_name[0], aw8697->dev);
++	if (ret)
++		return;
++	if (READ_ONCE(aw8697->stopping)) {
++		release_firmware(firmware);
++		return;
++	}
+ 	aw8697->ram_init = 0;
+ 	aw8697->rtp_init = 0;
+-	aw_info("%s enter\n", __func__);
+-
+-	return request_firmware_nowait(THIS_MODULE, FW_ACTION_UEVENT,
+-				       awinic_ram_name[0], aw8697->dev,
+-				       GFP_KERNEL, aw8697, aw8697_ram_loaded);
+-}
+-
+-#ifdef AW_RAM_UPDATE_DELAY
+-static void aw8697_ram_work_routine(struct work_struct *work)
+-{
+-	struct aw8697 *aw8697 =
+-		container_of(work, struct aw8697, ram_work.work);
+-
+-	aw_info("%s enter\n", __func__);
+-
+-	aw8697_ram_update(aw8697);
+-}
+-#endif
++	aw8697_ram_loaded(firmware, aw8697);
++}
+ /*****************************************************
+  *
+  * haptic control
+@@ -1254,7 +1312,7 @@
+  *****************************************************/
+ static int aw8697_haptic_rtp_init(struct aw8697 *aw8697)
+ {
+-	unsigned int buf_len = 0;
++	int buf_len = 0;
+ 	unsigned int period_size = aw8697->ram.base_addr >> 2;
+ 
+ 	aw8697->rtp_cnt = 0;
+@@ -1280,9 +1338,10 @@
+ 			}
+ 		} else {
+ 			buf_len = read_rb(aw8697_rtp->data, period_size);
+-			aw8697_i2c_writes(aw8697, AW8697_REG_RTP_DATA,
++			if ((int)buf_len > 0)
++				aw8697_i2c_writes(aw8697, AW8697_REG_RTP_DATA,
+ 					  aw8697_rtp->data, buf_len);
+-			if (buf_len < period_size) {
++			if (buf_len <= 0 || buf_len < period_size) {
+ 				aw_info("%s: custom rtp update complete\n",
+ 					__func__);
+ 				aw8697->rtp_cnt = 0;
+@@ -1492,7 +1551,7 @@
+ {
+ 	const struct firmware *rtp_file;
+ 	int ret = -1;
+-	unsigned int buf_len = 0;
++	int buf_len = 0;
+ 	unsigned char osc_int_state = 0;
+ 
+ 	aw8697->rtp_cnt = 0;
+@@ -1514,7 +1573,7 @@
+ 	aw8697->rtp_init = 0;
+ 	mutex_lock(&aw8697->rtp_lock);
+ 	vfree(aw8697_rtp);
+-	aw8697_rtp = vmalloc(rtp_file->size + sizeof(int));
++	aw8697_rtp = aw8697_alloc_rtp(rtp_file->size);
+ 	if (!aw8697_rtp) {
+ 		release_firmware(rtp_file);
+ 		mutex_unlock(&aw8697->rtp_lock);
+@@ -1598,7 +1657,14 @@
+ 	int ret = -1;
+ 	struct aw8697 *aw8697 = container_of(work, struct aw8697, rtp_work);
+ 
+-	if ((aw8697->effect_id < aw8697->info.effect_id_boundary) &&
++	if (!aw8697->ram_init || aw8697->ram.base_addr < 4 ||
++	    aw8697->ram.base_addr > get_rb_max_size() ||
++	    (aw8697->flags & AW8697_FLAG_SKIP_INTERRUPTS))
++		return;
++	if (READ_ONCE(aw8697->stopping))
++		return;
++
++	if ((aw8697->effect_id < aw8697->info.effect_id_boundary) ||
+ 	    (aw8697->effect_id > aw8697->info.effect_max))
+ 		return;
+ 
+@@ -1610,12 +1676,12 @@
+ 	aw8697_interrupt_clear(aw8697);
+ 	/* wait for irq to exit */
+ 	atomic_set(&aw8697->exit_in_rtp_loop, 1);
+-	while (atomic_read(&aw8697->is_in_rtp_loop)) {
++	while (atomic_read(&aw8697->is_in_rtp_loop) && !READ_ONCE(aw8697->stopping)) {
+ 		aw_info("%s  goint to waiting irq exit\n", __func__);
+ 		mutex_unlock(&aw8697->lock);
+ 		ret = wait_event_interruptible(
+ 			aw8697->wait_q,
+-			atomic_read(&aw8697->is_in_rtp_loop) == 0);
++			atomic_read(&aw8697->is_in_rtp_loop) == 0 || READ_ONCE(aw8697->stopping));
+ 		aw_info("%s  wakeup\n", __func__);
+ 		mutex_lock(&aw8697->lock);
+ 		if (ret == -ERESTARTSYS) {
+@@ -1627,6 +1693,10 @@
+ 		}
+ 	}
+ 
++	if (READ_ONCE(aw8697->stopping)) {
++		mutex_unlock(&aw8697->lock);
++		return;
++	}
+ 	atomic_set(&aw8697->exit_in_rtp_loop, 0);
+ 	wake_up_interruptible(&aw8697->stop_wait_q);
+ 
+@@ -1635,12 +1705,13 @@
+ 		aw_err("%s buffer size %d, availbe size %d\n", __func__,
+ 		       aw8697->ram.base_addr >> 2, get_rb_avalible_size());
+ 		while (get_rb_avalible_size() < aw8697->ram.base_addr &&
+-		       !rb_shoule_exit()) {
++		       !rb_shoule_exit() && !READ_ONCE(aw8697->stopping)) {
+ 			mutex_unlock(&aw8697->lock);
+ 			ret = wait_event_interruptible(
+ 				aw8697->stop_wait_q, (get_rb_avalible_size() >=
+ 						      aw8697->ram.base_addr) ||
+-							     rb_shoule_exit());
++						 rb_shoule_exit() ||
++						 READ_ONCE(aw8697->stopping));
+ 			aw_info("%s  wakeup\n", __func__);
+ 			aw_err("%s after wakeup sbuffer size %d, availbe size %d\n",
+ 			       __func__, aw8697->ram.base_addr >> 2,
+@@ -1654,6 +1725,10 @@
+ 		}
+ 	}
+ 
++	if (READ_ONCE(aw8697->stopping)) {
++		mutex_unlock(&aw8697->lock);
++		return;
++	}
+ 	aw8697_haptic_stop(aw8697);
+ 
+ 	if (aw8697->state) {
+@@ -1691,7 +1766,7 @@
+ 			}
+ 
+ 			vfree(aw8697_rtp);
+-			aw8697_rtp = vmalloc(rtp_file->size + sizeof(int));
++			aw8697_rtp = aw8697_alloc_rtp(rtp_file->size);
+ 			if (!aw8697_rtp) {
+ 				release_firmware(rtp_file);
+ 				aw_err("%s: error allocating memory\n",
+@@ -1709,7 +1784,7 @@
+ 			release_firmware(rtp_file);
+ 		} else {
+ 			vfree(aw8697_rtp);
+-			aw8697_rtp = vmalloc(aw8697->ram.base_addr >> 2);
++			aw8697_rtp = aw8697_alloc_rtp(aw8697->ram.base_addr >> 2);
+ 			if (!aw8697_rtp) {
+ 				aw_err("%s: error allocating memory\n",
+ 				       __func__);
+@@ -1741,6 +1816,9 @@
+ 	struct aw8697 *aw8697 =
+ 		container_of(timer, struct aw8697, haptic_audio.timer);
+ 
++	if (READ_ONCE(aw8697->stopping))
++		return HRTIMER_NORESTART;
++
+ 	aw_dbg("%s enter\n", __func__);
+ 	/* schedule_work(&aw8697->haptic_audio.work); */
+ 	queue_work(aw8697->work_queue, &aw8697->haptic_audio.work);
+@@ -1757,6 +1835,9 @@
+ {
+ 	struct aw8697 *aw8697 =
+ 		container_of(work, struct aw8697, haptic_audio.work);
++
++	if (READ_ONCE(aw8697->stopping))
++		return;
+ 
+ 	aw_info("%s enter\n", __func__);
+ 
+@@ -2176,155 +2257,130 @@
+  *****************************************************/
+ static int aw8697_file_open(struct inode *inode, struct file *file)
+ {
+-	if (!try_module_get(THIS_MODULE))
+-		return -ENODEV;
+-	aw_info("%s enter\n", __func__);
+-	file->private_data = (void *)g_aw8697;
+-
+-	return 0;
++	struct aw8697_file_context *context;
++	int ret = 0;
++
++	context = kzalloc(sizeof(*context), GFP_KERNEL);
++	if (!context)
++		return -ENOMEM;
++	mutex_lock(&aw8697_misc_lock);
++	if (!aw8697_misc_context) {
++		ret = -ENODEV;
++	} else {
++		context->device = aw8697_misc_context;
++		kref_get(&context->device->ref);
++		file->private_data = context;
++	}
++	mutex_unlock(&aw8697_misc_lock);
++	if (ret)
++		kfree(context);
++	return ret;
+ }
+ 
+ static int aw8697_file_release(struct inode *inode, struct file *file)
+ {
+-	file->private_data = (void *)NULL;
+-	aw_info("%s enter\n", __func__);
+-	module_put(THIS_MODULE);
+-
++	struct aw8697_file_context *context = file->private_data;
++
++	kref_put(&context->device->ref, aw8697_misc_release);
++	kfree(context);
+ 	return 0;
+ }
+ 
+ static long aw8697_file_unlocked_ioctl(struct file *file, unsigned int cmd,
+ 				       unsigned long arg)
+ {
+-	struct aw8697 *aw8697 = (struct aw8697 *)file->private_data;
+-	int ret = 0;
+-
+-	aw_info("%s enter\n", __func__);
+-	aw_info("%s: cmd=0x%x, arg=0x%lx\n", __func__, cmd, arg);
+-
++	struct aw8697_file_context *context = file->private_data;
++	long ret;
++
++	mutex_lock(&context->device->lock);
++	/* This driver defines no implemented ioctl commands. */
++	ret = context->device->aw8697 ? -ENOTTY : -ENODEV;
++	mutex_unlock(&context->device->lock);
++	return ret;
++}
++
++static ssize_t aw8697_file_read(struct file *file, char __user *buffer, size_t len,
++			       loff_t *offset)
++{
++	struct aw8697_file_context *context = file->private_data;
++	struct aw8697 *aw8697;
++	u8 *data;
++	size_t i;
++	ssize_t ret;
++
++	if (!len)
++		return 0;
++	if (len > 256)
++		return -EINVAL;
++	data = kmalloc(len, GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++	mutex_lock(&context->device->lock);
++	aw8697 = context->device->aw8697;
++	if (!aw8697 || READ_ONCE(aw8697->stopping)) {
++		ret = -ENODEV;
++		goto out;
++	}
++	if (context->cmd != AW8697_HAPTIC_CMD_READ_REG || len > 256 - context->reg) {
++		ret = -EINVAL;
++		goto out;
++	}
+ 	mutex_lock(&aw8697->lock);
+-
+-	if (_IOC_TYPE(cmd) != AW8697_HAPTIC_IOCTL_MAGIC) {
+-		aw_err("%s: cmd magic err\n", __func__);
++	for (i = 0; i < len; i++) {
++		ret = aw8697_i2c_read(aw8697, context->reg + i, &data[i]);
++		if (ret < 0)
++			break;
++	}
++	mutex_unlock(&aw8697->lock);
++	if (i == len)
++		ret = copy_to_user(buffer, data, len) ? -EFAULT : len;
++out:
++	mutex_unlock(&context->device->lock);
++	kfree(data);
++	return ret;
++}
++
++static ssize_t aw8697_file_write(struct file *file, const char __user *buffer,
++				size_t len, loff_t *offset)
++{
++	struct aw8697_file_context *context = file->private_data;
++	struct aw8697 *aw8697;
++	u8 *data;
++	size_t i;
++	ssize_t ret;
++
++	if (len < 2 || len > 258)
+ 		return -EINVAL;
+-	}
+-
+-	switch (cmd) {
+-	default:
+-		aw_err("%s, unknown cmd\n", __func__);
+-		break;
+-	}
+-
+-	mutex_unlock(&aw8697->lock);
+-
++	data = memdup_user(buffer, len);
++	if (IS_ERR(data))
++		return PTR_ERR(data);
++	mutex_lock(&context->device->lock);
++	aw8697 = context->device->aw8697;
++	if (!aw8697 || READ_ONCE(aw8697->stopping)) {
++		ret = -ENODEV;
++		goto out;
++	}
++	ret = -EINVAL;
++	if (data[0] == AW8697_HAPTIC_CMD_READ_REG && len == 2) {
++		context->cmd = data[0];
++		context->reg = data[1];
++		ret = len;
++	} else if (data[0] == AW8697_HAPTIC_CMD_WRITE_REG && len > 2 &&
++		   len - 2 <= 256 - data[1]) {
++		mutex_lock(&aw8697->lock);
++		for (i = 2; i < len; i++) {
++			ret = aw8697_i2c_write(aw8697, data[1] + i - 2, data[i]);
++			if (ret < 0)
++				break;
++		}
++		mutex_unlock(&aw8697->lock);
++		if (i == len)
++			ret = len;
++	}
++out:
++	mutex_unlock(&context->device->lock);
++	kfree(data);
+ 	return ret;
+-}
+-
+-static ssize_t aw8697_file_read(struct file *filp, char *buff, size_t len,
+-				loff_t *offset)
+-{
+-	struct aw8697 *aw8697 = (struct aw8697 *)filp->private_data;
+-	int ret = 0;
+-	int i = 0;
+-	unsigned char reg_val = 0;
+-	unsigned char *pbuff = NULL;
+-
+-	aw_info("%s enter\n", __func__);
+-	mutex_lock(&aw8697->lock);
+-
+-	aw_info("%s: len=%zu\n", __func__, len);
+-
+-	switch (aw8697->fileops.cmd) {
+-	case AW8697_HAPTIC_CMD_READ_REG:
+-		pbuff = (unsigned char *)kzalloc(len, GFP_KERNEL);
+-		if (pbuff != NULL) {
+-			for (i = 0; i < len; i++) {
+-				aw8697_i2c_read(aw8697, aw8697->fileops.reg + i,
+-						&reg_val);
+-				pbuff[i] = reg_val;
+-			}
+-			for (i = 0; i < len; i++) {
+-				aw_info("%s: pbuff[%d]=0x%02x\n", __func__, i,
+-					pbuff[i]);
+-			}
+-			ret = copy_to_user(buff, pbuff, len);
+-			if (ret) {
+-				aw_err("%s: copy to user fail\n", __func__);
+-			}
+-			kfree(pbuff);
+-		} else {
+-			aw_err("%s: alloc memory fail\n", __func__);
+-		}
+-		break;
+-	default:
+-		aw_err("%s, unknown cmd %d\n", __func__, aw8697->fileops.cmd);
+-		break;
+-	}
+-
+-	mutex_unlock(&aw8697->lock);
+-
+-	return len;
+-}
+-
+-static ssize_t aw8697_file_write(struct file *filp, const char *buff,
+-				 size_t len, loff_t *off)
+-{
+-	struct aw8697 *aw8697 = (struct aw8697 *)filp->private_data;
+-	int i = 0;
+-	int ret = 0;
+-	unsigned char *pbuff = NULL;
+-
+-	aw_info("%s enter\n", __func__);
+-	pbuff = (unsigned char *)kzalloc(len, GFP_KERNEL);
+-	if (pbuff == NULL) {
+-		aw_err("%s: alloc memory fail\n", __func__);
+-		return len;
+-	}
+-	ret = copy_from_user(pbuff, buff, len);
+-	if (ret) {
+-		aw_err("%s: copy from user fail\n", __func__);
+-		return len;
+-	}
+-
+-	for (i = 0; i < len; i++) {
+-		aw_info("%s: pbuff[%d]=0x%02x\n", __func__, i, pbuff[i]);
+-	}
+-
+-	mutex_lock(&aw8697->lock);
+-
+-	aw8697->fileops.cmd = pbuff[0];
+-
+-	switch (aw8697->fileops.cmd) {
+-	case AW8697_HAPTIC_CMD_READ_REG:
+-		if (len == 2) {
+-			aw8697->fileops.reg = pbuff[1];
+-		} else {
+-			aw_err("%s: read cmd len %zu err\n", __func__, len);
+-		}
+-		break;
+-	case AW8697_HAPTIC_CMD_WRITE_REG:
+-		if (len > 2) {
+-			for (i = 0; i < len - 2; i++) {
+-				aw_info("%s: write reg0x%02x=0x%02x\n",
+-					__func__, pbuff[1] + i, pbuff[i + 2]);
+-				aw8697_i2c_write(aw8697, pbuff[1] + i,
+-						 pbuff[2 + i]);
+-			}
+-		} else {
+-			aw_err("%s: write cmd len %zu err\n", __func__, len);
+-		}
+-		break;
+-	default:
+-		aw_err("%s, unknown cmd %d\n", __func__, aw8697->fileops.cmd);
+-		break;
+-	}
+-
+-	mutex_unlock(&aw8697->lock);
+-
+-	if (pbuff != NULL)
+-		kfree(pbuff);
+-
+-	return len;
+ }
+ 
+ static const struct file_operations fops = {
+@@ -2342,44 +2398,85 @@
+ 	.fops = &fops,
+ };
+ 
++int aw8697_misc_register(struct aw8697 *aw8697)
++{
++	struct aw8697_misc_context *context;
++	int ret;
++
++	context = kzalloc(sizeof(*context), GFP_KERNEL);
++	if (!context)
++		return -ENOMEM;
++	kref_init(&context->ref);
++	mutex_init(&context->lock);
++	context->aw8697 = aw8697;
++	mutex_lock(&aw8697_misc_lock);
++	aw8697_misc_context = context;
++	mutex_unlock(&aw8697_misc_lock);
++	ret = misc_register(&aw8697_haptic_misc);
++	if (ret) {
++		mutex_lock(&aw8697_misc_lock);
++		aw8697_misc_context = NULL;
++		mutex_unlock(&aw8697_misc_lock);
++		kref_put(&context->ref, aw8697_misc_release);
++	}
++	return ret;
++}
++
++void aw8697_misc_unregister(void)
++{
++	struct aw8697_misc_context *context;
++
++	misc_deregister(&aw8697_haptic_misc);
++	mutex_lock(&aw8697_misc_lock);
++	context = aw8697_misc_context;
++	aw8697_misc_context = NULL;
++	mutex_unlock(&aw8697_misc_lock);
++	mutex_lock(&context->lock);
++	context->aw8697 = NULL;
++	mutex_unlock(&context->lock);
++	kref_put(&context->ref, aw8697_misc_release);
++}
++
+ /*****************************************************
+  *
+  * vibrator
+  *
+  *****************************************************/
++static void aw8697_stop_work_routine(struct work_struct *work)
++{
++	struct aw8697 *aw8697 = container_of(work, struct aw8697, stop_work);
++
++	mutex_lock(&aw8697->lock);
++	if (!READ_ONCE(aw8697->stopping))
++		aw8697_haptic_play_go(aw8697, false);
++	mutex_unlock(&aw8697->lock);
++}
++
+ static enum hrtimer_restart qti_hap_stop_timer(struct hrtimer *timer)
+ {
+ 	struct aw8697 *aw8697 = container_of(timer, struct aw8697, stop_timer);
+-	int rc;
+-
+-	aw_info("%s enter\n", __func__);
+-	aw8697->play.length_us = 0;
+-	/* qti_haptics_play(aw8697, false); */
+-	rc = aw8697_haptic_play_go(aw8697, false);
+-	if (rc < 0)
+-		aw_err("Stop playing failed, rc=%d\n", rc);
+-
++
++	WRITE_ONCE(aw8697->play.length_us, 0);
++	if (!READ_ONCE(aw8697->stopping))
++		queue_work(aw8697->work_queue, &aw8697->stop_work);
+ 	return HRTIMER_NORESTART;
+ }
+ 
+ static enum hrtimer_restart qti_hap_disable_timer(struct hrtimer *timer)
+ {
+-	struct aw8697 *aw8697 =
+-		container_of(timer, struct aw8697, hap_disable_timer);
+-	int rc;
+-
+-	aw_info("%s enter\n", __func__);
+-	/* qti_haptics_module_en(aw8697, false); */
+-	rc = aw8697_haptic_play_go(aw8697, false);
+-	if (rc < 0)
+-		aw_err("Disable haptics module failed, rc=%d\n", rc);
+-
++	struct aw8697 *aw8697 = container_of(timer, struct aw8697, hap_disable_timer);
++
++	if (!READ_ONCE(aw8697->stopping))
++		queue_work(aw8697->work_queue, &aw8697->stop_work);
+ 	return HRTIMER_NORESTART;
+ }
+ 
+ static enum hrtimer_restart aw8697_vibrator_timer_func(struct hrtimer *timer)
+ {
+ 	struct aw8697 *aw8697 = container_of(timer, struct aw8697, timer);
++
++	if (READ_ONCE(aw8697->stopping))
++		return HRTIMER_NORESTART;
+ 
+ 	aw_info("%s enter\n", __func__);
+ 
+@@ -2394,6 +2491,9 @@
+ {
+ 	struct aw8697 *aw8697 =
+ 		container_of(work, struct aw8697, vibrator_work);
++
++	if (READ_ONCE(aw8697->stopping))
++		return;
+ 
+ 	aw_dbg("%s enter\n", __func__);
+ 	aw_info("%s: effect_id=%d state=%d activate_mode=%d duration=%d\n",
+@@ -2476,9 +2576,11 @@
+ 	struct aw8697 *aw8697 = data;
+ 	unsigned char reg_val = 0;
+ 	unsigned char dbg_val = 0;
+-	unsigned int buf_len = 0;
++	int buf_len = 0;
+ 	unsigned int period_size = aw8697->ram.base_addr >> 2;
+ 
++	if (READ_ONCE(aw8697->stopping))
++		return IRQ_HANDLED;
+ 	atomic_set(&aw8697->is_in_rtp_loop, 1);
+ 	aw8697_i2c_read(aw8697, AW8697_REG_SYSINT, &reg_val);
+ 	/* aw_info("%s: reg SYSINT=0x%x\n", __func__, reg_val); */
+@@ -2517,11 +2619,12 @@
+ 				if (aw8697->is_custom_wave == 1) {
+ 					buf_len = read_rb(aw8697_rtp->data,
+ 							  period_size);
+-					aw8697_i2c_writes(aw8697,
++					if ((int)buf_len > 0)
++						aw8697_i2c_writes(aw8697,
+ 							  AW8697_REG_RTP_DATA,
+ 							  aw8697_rtp->data,
+ 							  buf_len);
+-					if (buf_len < period_size) {
++					if (buf_len <= 0 || buf_len < period_size) {
+ 						aw_info("%s: rtp update complete\n",
+ 							__func__);
+ 						aw8697_haptic_set_rtp_aei(
+@@ -2859,19 +2962,23 @@
+ 	       __func__, effect->type, FF_CONSTANT, FF_PERIODIC);
+ 	aw8697->effect_type = effect->type;
+ 	mutex_lock(&aw8697->lock);
+-	while (atomic_read(&aw8697->exit_in_rtp_loop)) {
++	while (atomic_read(&aw8697->exit_in_rtp_loop) && !READ_ONCE(aw8697->stopping)) {
+ 		aw_info("%s  goint to waiting rtp  exit\n", __func__);
+ 		mutex_unlock(&aw8697->lock);
+ 		ret = wait_event_interruptible(
+ 			aw8697->stop_wait_q,
+-			atomic_read(&aw8697->exit_in_rtp_loop) == 0);
++			atomic_read(&aw8697->exit_in_rtp_loop) == 0 ||
++			READ_ONCE(aw8697->stopping));
+ 		aw_info("%s  wakeup\n", __func__);
+ 		if (ret == -ERESTARTSYS) {
+-			mutex_unlock(&aw8697->lock);
+ 			aw_err("%s wake up by signal return erro\n", __func__);
+ 			return ret;
+ 		}
+ 		mutex_lock(&aw8697->lock);
++	}
++	if (READ_ONCE(aw8697->stopping)) {
++		mutex_unlock(&aw8697->lock);
++		return -ESHUTDOWN;
+ 	}
+ 	if (aw8697->effect_type == FF_CONSTANT) {
+ 		aw_dbg("%s: effect_type is  FF_CONSTANT!\n", __func__);
+@@ -2957,6 +3064,9 @@
+ 	struct aw8697 *aw8697 = input_get_drvdata(dev);
+ 	int rc = 0;
+ 
++	if (READ_ONCE(aw8697->stopping))
++		return -ESHUTDOWN;
++
+ 	/* aw_info("%s effect_id=%d , val = %d\n", __func__, effect_id, val);
+ 	 * aw_info("%s aw8697->effect_id=%d , aw8697->activate_mode = %d\n",
+ 	 *   __func__, aw8697->effect_id, aw8697->activate_mode);
+@@ -3007,6 +3117,9 @@
+ 	struct aw8697 *aw8697 = input_get_drvdata(dev);
+ 	int rc = 0;
+ 
++	if (READ_ONCE(aw8697->stopping))
++		return -ESHUTDOWN;
++
+ 	/*for osc calibration*/
+ 	if (aw8697->osc_cali_run != 0)
+ 		return 0;
+@@ -3023,6 +3136,9 @@
+ 	unsigned char comp_level = 0;
+ 	struct aw8697 *aw8697 =
+ 		container_of(work, struct aw8697, set_gain_work);
++
++	if (READ_ONCE(aw8697->stopping))
++		return;
+ 
+ 	if (aw8697->new_gain >= 0x7FFF)
+ 		aw8697->level = 0x80; /*128 */
+@@ -3060,6 +3176,9 @@
+ void aw8697_haptics_set_gain(struct input_dev *dev, u16 gain)
+ {
+ 	struct aw8697 *aw8697 = input_get_drvdata(dev);
++
++	if (READ_ONCE(aw8697->stopping))
++		return;
+ 
+ 	aw_dbg("%s enter\n", __func__);
+ 	aw8697->new_gain = gain;
+@@ -4406,21 +4525,16 @@
+ 
+ int aw8697_vibrator_init(struct aw8697 *aw8697)
+ {
+-	int ret = 0;
+ 
+ 	aw_info("%s enter\n", __func__);
+ 
+-	ret = sysfs_create_group(&aw8697->i2c->dev.kobj,
+-				 &aw8697_vibrator_attribute_group);
+-	if (ret < 0) {
+-		aw_info("%s error creating sysfs attr files\n", __func__);
+-		return ret;
+-	}
+-	g_aw8697 = aw8697;
+-	hrtimer_init(&aw8697->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-	aw8697->timer.function = aw8697_vibrator_timer_func;
++	hrtimer_setup(&aw8697->timer, aw8697_vibrator_timer_func,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	INIT_WORK(&aw8697->vibrator_work, aw8697_vibrator_work_routine);
+ 	INIT_WORK(&aw8697->rtp_work, aw8697_rtp_work_routine);
++	INIT_WORK(&aw8697->set_gain_work, aw8697_haptics_set_gain_work_routine);
++	INIT_WORK(&aw8697->stop_work, aw8697_stop_work_routine);
++	INIT_DELAYED_WORK(&aw8697->ram_work, aw8697_ram_work_routine);
+ 
+ 	mutex_init(&aw8697->lock);
+ 	mutex_init(&aw8697->rtp_lock);
+@@ -4430,6 +4544,14 @@
+ 	init_waitqueue_head(&aw8697->wait_q);
+ 	init_waitqueue_head(&aw8697->stop_wait_q);
+ 
++	hrtimer_setup(&aw8697->stop_timer, qti_hap_stop_timer,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	hrtimer_setup(&aw8697->hap_disable_timer, qti_hap_disable_timer,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	hrtimer_setup(&aw8697->haptic_audio.timer, aw8697_haptic_audio_timer_func,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	INIT_WORK(&aw8697->haptic_audio.work, aw8697_haptic_audio_work_routine);
++	mutex_init(&aw8697->haptic_audio.lock);
+ 	return 0;
+ }
+ 
+@@ -4441,29 +4563,13 @@
+ 	unsigned char bemf_config = 0;
+ 
+ 	aw_info("%s enter\n", __func__);
+-	ret = misc_register(&aw8697_haptic_misc);
+-	if (ret) {
+-		aw_err("%s: misc fail: %d\n", __func__, ret);
+-		return ret;
+-	}
+-
+ 	/* haptic audio */
+ 	aw8697->haptic_audio.delay_val = 1;
+ 	aw8697->haptic_audio.timer_val = 21318;
+ 	aw8697->f0_cali_status = true;
+ 
+-	hrtimer_init(&aw8697->haptic_audio.timer, CLOCK_MONOTONIC,
+-		     HRTIMER_MODE_REL);
+-	aw8697->haptic_audio.timer.function = aw8697_haptic_audio_timer_func;
+-	INIT_WORK(&aw8697->haptic_audio.work, aw8697_haptic_audio_work_routine);
+-
+-	mutex_init(&aw8697->haptic_audio.lock);
+-
+-	hrtimer_init(&aw8697->stop_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-	aw8697->stop_timer.function = qti_hap_stop_timer;
+-	hrtimer_init(&aw8697->hap_disable_timer, CLOCK_MONOTONIC,
+-		     HRTIMER_MODE_REL);
+-	aw8697->hap_disable_timer.function = qti_hap_disable_timer;
++
++
+ 
+ 	/* haptic init */
+ 	mutex_lock(&aw8697->lock);
+@@ -4543,17 +4649,39 @@
+ int aw8697_ram_init(struct aw8697 *aw8697)
+ {
+ #ifdef AW_RAM_UPDATE_DELAY
+-	int ram_timer_val = 5000;
+-
+-	aw_info("%s enter\n", __func__);
+-	INIT_DELAYED_WORK(&aw8697->ram_work, aw8697_ram_work_routine);
+-	/*schedule_delayed_work(&aw8697->ram_work,
+-	 *			msecs_to_jiffies(ram_timer_val));
+-	 */
+ 	queue_delayed_work(aw8697->work_queue, &aw8697->ram_work,
+-			   msecs_to_jiffies(ram_timer_val));
++			   msecs_to_jiffies(5000));
+ #else
+ 	aw8697_ram_update(aw8697);
+ #endif
+ 	return 0;
+ }
++
++
++void aw8697_shutdown(struct aw8697 *aw8697)
++{
++	/* Publication and IRQ admission have been revoked by the caller. */
++	cancel_delayed_work_sync(&aw8697->ram_work);
++	hrtimer_cancel(&aw8697->timer);
++	hrtimer_cancel(&aw8697->stop_timer);
++	hrtimer_cancel(&aw8697->hap_disable_timer);
++	hrtimer_cancel(&aw8697->haptic_audio.timer);
++	cancel_work_sync(&aw8697->vibrator_work);
++	cancel_work_sync(&aw8697->rtp_work);
++	cancel_work_sync(&aw8697->set_gain_work);
++	cancel_work_sync(&aw8697->stop_work);
++	cancel_work_sync(&aw8697->haptic_audio.work);
++	/* A work item that was already running may have armed a final timer. */
++	hrtimer_cancel(&aw8697->timer);
++	hrtimer_cancel(&aw8697->stop_timer);
++	hrtimer_cancel(&aw8697->hap_disable_timer);
++	hrtimer_cancel(&aw8697->haptic_audio.timer);
++	destroy_workqueue(aw8697->work_queue);
++	aw8697->work_queue = NULL;
++	mutex_lock(&aw8697->lock);
++	aw8697_haptic_stop(aw8697);
++	mutex_unlock(&aw8697->lock);
++	pm_relax(aw8697->dev);
++	vfree(aw8697_rtp);
++	aw8697_rtp = NULL;
++}
+--- a/drivers/input/misc/aw86927_haptic/aw8697.h
++++ b/drivers/input/misc/aw86927_haptic/aw8697.h
+@@ -186,6 +186,8 @@
+ 	struct work_struct vibrator_work;
+ 	struct work_struct rtp_work;
+ 	struct work_struct set_gain_work;
++	struct work_struct stop_work;
++	bool stopping;
+ 	struct delayed_work ram_work;
+ 
+ 	struct fileops fileops;
+@@ -725,8 +727,11 @@
+ extern void aw8697_haptics_set_gain(struct input_dev *dev, u16 gain);
+ extern void aw8697_haptics_set_gain_work_routine(struct work_struct *work);
+ extern void aw8697_interrupt_setup(struct aw8697 *aw8697);
++extern int aw8697_misc_register(struct aw8697 *aw8697);
++extern void aw8697_misc_unregister(void);
+ extern int aw8697_vibrator_init(struct aw8697 *aw8697);
+ extern int aw8697_haptic_init(struct aw8697 *aw8697);
++extern void aw8697_shutdown(struct aw8697 *aw8697);
+ extern int aw8697_ram_init(struct aw8697 *aw8697);
+ extern irqreturn_t aw8697_irq(int irq, void *data);
+ extern struct attribute_group aw8697_vibrator_attribute_group;
+--- a/drivers/input/misc/aw86927_haptic/xm-haptic.h
++++ b/drivers/input/misc/aw86927_haptic/xm-haptic.h
+@@ -47,9 +47,12 @@
+ static void xm_hap_driver_exception_handler(int exception_code, ...)
+ {
+ #if IS_ENABLED(CONFIG_MIEV)
+-	struct misight_mievent *event = cdev_tevent_alloc(exception_code);
++	struct misight_mievent *event;
+ 	va_list args;
+-	if (!xm_hap_exception_enable)
++	if (!READ_ONCE(xm_hap_exception_enable))
++		return;
++	event = cdev_tevent_alloc(exception_code);
++	if (!event)
+ 		return;
+ 	va_start(args, exception_code);
+ 	switch (exception_code) {
+@@ -82,7 +85,7 @@
+ }
+ static void xm_hap_driver_init(bool enable)
+ {
+-	xm_hap_exception_enable = enable;
++	WRITE_ONCE(xm_hap_exception_enable, enable);
+ 	pr_info("%s: TODO.", __func__);
+ }
+ #endif
+--- a/drivers/input/misc/aw86927_haptic/ringbuffer.c
++++ b/drivers/input/misc/aw86927_haptic/ringbuffer.c
+@@ -1,221 +1,256 @@
+-/*
+-* reader shoule NEVER block !!!, if no data is avaliable, just return zero
+-* writer will block if there is no space, and wakend up by reader or force exit
+-* there is 1 writer and 1 reader for each buffer, so no lock is used
+-* writer shoule read rd_index to check if free size is enought, and  then fill this buffer  update wr_index
+-* reader shoule read wr_index to check if avaliable size is enought, and then read the buffer and update rd_index
+-* empty: wr_index==rd_index
+-* full: (wr_index +1) % BUFFER_SIZE == rd_index
+-* total avaliable size is BUFFER_SIZE -1
+-*/
+-#define DEBUG
++// SPDX-License-Identifier: GPL-2.0
++/* A single owned haptic stream; readers never wait for producer data. */
+ #include <linux/errno.h>
++#include <linux/srcu.h>
+ #include "ringbuffer.h"
+ 
+-#define BUFFER_SIZE (1024 * 8 + 1)
++#define BUFFER_SIZE (1024 * 8)
+ 
+ struct rb {
+-	char *gbuffer;
+-	atomic_t wr_index;
+-	atomic_t rd_index;
+-	atomic_t eof;
+-	volatile int32_t aval_size; // avalibale to write size.
+-	atomic_t buf_condition, exit;
++	/* Serializes buffer data and producer admission separately. */
++	struct mutex data_lock;
++	struct mutex writer_lock;
+ 	wait_queue_head_t wait_q;
++	char data[BUFFER_SIZE];
++	unsigned int read_pos;
++	unsigned int write_pos;
++	unsigned int used;
++	unsigned int generation;
++	bool eof;
++	bool stopping;
++	bool removing;
+ };
+ 
+-struct rb *grb;
+-
+-int32_t get_free_size(int32_t tail, int32_t head)
+-{
+-	if (head == tail)
+-		return BUFFER_SIZE - 1;
+-	else if (head < tail)
+-		return (head + BUFFER_SIZE - 1 - tail);
+-	else
+-		return (head - tail - 1);
++static DEFINE_MUTEX(rb_instance_lock);
++DEFINE_STATIC_SRCU(rb_instance_srcu);
++static struct rb __rcu *grb;
++
++static bool rb_can_write(struct rb *buffer, int size, unsigned int generation)
++{
++	bool ready;
++
++	mutex_lock(&buffer->data_lock);
++	ready = buffer->removing || buffer->stopping || buffer->eof ||
++		buffer->generation != generation ||
++		BUFFER_SIZE - buffer->used >= size;
++	mutex_unlock(&buffer->data_lock);
++	return ready;
+ }
+ 
+ int write_rb(const char *data, int32_t size)
+ {
+-	int32_t tail = atomic_read(&grb->wr_index);
+-	int32_t head = atomic_read(&grb->rd_index);
+-	int32_t part;
+-	int32_t ret;
+-	grb->aval_size = get_free_size(tail, head);
+-
+-	pr_debug("write  write index %d, read index %d, free size %d", tail,
+-		 head, grb->aval_size);
+-
+-	while ((grb->aval_size < size) && (!atomic_read(&grb->exit))) {
+-		pr_debug("no space avaliable");
+-		pr_info("%s  goint to waiting irq exit\n", __func__);
+-		ret = wait_event_interruptible(
+-			grb->wait_q, atomic_read(&grb->buf_condition) == 1);
+-		if (ret == -ERESTARTSYS) {
+-			pr_err("%s wake up by signal return erro\n", __func__);
+-			return ret;
++	struct rb *buffer;
++	unsigned int generation, part;
++	int index, ret;
++
++	if (!data || size <= 0 || size > BUFFER_SIZE)
++		return -EINVAL;
++	index = srcu_read_lock(&rb_instance_srcu);
++	buffer = srcu_dereference(grb, &rb_instance_srcu);
++	if (!buffer) {
++		ret = -ENODEV;
++		goto out;
++	}
++	mutex_lock(&buffer->data_lock);
++	generation = buffer->generation;
++	mutex_unlock(&buffer->data_lock);
++	ret = mutex_lock_interruptible(&buffer->writer_lock);
++	if (ret)
++		goto out;
++	ret = wait_event_interruptible(buffer->wait_q, rb_can_write(buffer, size, generation));
++	if (ret)
++		goto writer_out;
++	mutex_lock(&buffer->data_lock);
++	if (buffer->removing || buffer->stopping || buffer->eof) {
++		ret = -ESHUTDOWN;
++	} else if (buffer->generation != generation) {
++		ret = -ECANCELED;
++	} else {
++		part = min_t(unsigned int, size, BUFFER_SIZE - buffer->write_pos);
++		memcpy(buffer->data + buffer->write_pos, data, part);
++		memcpy(buffer->data, data + part, size - part);
++		buffer->write_pos = (buffer->write_pos + size) % BUFFER_SIZE;
++		buffer->used += size;
++		ret = size;
++	}
++	mutex_unlock(&buffer->data_lock);
++writer_out:
++	mutex_unlock(&buffer->writer_lock);
++out:
++	srcu_read_unlock(&rb_instance_srcu, index);
++	return ret;
++}
++
++int read_rb(char *data, int32_t size)
++{
++	struct rb *buffer;
++	unsigned int part, bytes;
++	int index, ret = 0;
++
++	if (!data || size <= 0 || size > BUFFER_SIZE)
++		return -EINVAL;
++	index = srcu_read_lock(&rb_instance_srcu);
++	buffer = srcu_dereference(grb, &rb_instance_srcu);
++	if (!buffer)
++		goto out;
++	mutex_lock(&buffer->data_lock);
++	if (!buffer->removing && !buffer->stopping) {
++		bytes = min_t(unsigned int, size, buffer->used);
++		part = min(bytes, BUFFER_SIZE - buffer->read_pos);
++		memcpy(data, buffer->data + buffer->read_pos, part);
++		memcpy(data + part, buffer->data, bytes - part);
++		buffer->read_pos = (buffer->read_pos + bytes) % BUFFER_SIZE;
++		buffer->used -= bytes;
++		ret = bytes;
++	}
++	mutex_unlock(&buffer->data_lock);
++	wake_up_interruptible_all(&buffer->wait_q);
++out:
++	srcu_read_unlock(&rb_instance_srcu, index);
++	return ret;
++}
++
++int get_rb_free_size(void)
++{
++	struct rb *buffer;
++	int index, bytes = 0;
++
++	index = srcu_read_lock(&rb_instance_srcu);
++	buffer = srcu_dereference(grb, &rb_instance_srcu);
++	if (buffer) {
++		mutex_lock(&buffer->data_lock);
++		bytes = BUFFER_SIZE - buffer->used;
++		mutex_unlock(&buffer->data_lock);
++	}
++	srcu_read_unlock(&rb_instance_srcu, index);
++	return bytes;
++}
++
++int get_rb_avalible_size(void)
++{
++	struct rb *buffer;
++	int index, bytes = 0;
++
++	index = srcu_read_lock(&rb_instance_srcu);
++	buffer = srcu_dereference(grb, &rb_instance_srcu);
++	if (buffer) {
++		mutex_lock(&buffer->data_lock);
++		bytes = buffer->used;
++		mutex_unlock(&buffer->data_lock);
++	}
++	srcu_read_unlock(&rb_instance_srcu, index);
++	return bytes;
++}
++
++int get_rb_max_size(void)
++{
++	return BUFFER_SIZE;
++}
++
++void rb_force_exit(void)
++{
++	struct rb *buffer;
++	int index = srcu_read_lock(&rb_instance_srcu);
++
++	buffer = srcu_dereference(grb, &rb_instance_srcu);
++	if (buffer) {
++		mutex_lock(&buffer->data_lock);
++		buffer->stopping = true;
++		mutex_unlock(&buffer->data_lock);
++		wake_up_interruptible_all(&buffer->wait_q);
++	}
++	srcu_read_unlock(&rb_instance_srcu, index);
++}
++
++void rb_end(void)
++{
++	struct rb *buffer;
++	int index = srcu_read_lock(&rb_instance_srcu);
++
++	buffer = srcu_dereference(grb, &rb_instance_srcu);
++	if (buffer) {
++		mutex_lock(&buffer->data_lock);
++		buffer->eof = true;
++		mutex_unlock(&buffer->data_lock);
++		wake_up_interruptible_all(&buffer->wait_q);
++	}
++	srcu_read_unlock(&rb_instance_srcu, index);
++}
++
++int rb_shoule_exit(void)
++{
++	struct rb *buffer;
++	int index, done = 1;
++
++	index = srcu_read_lock(&rb_instance_srcu);
++	buffer = srcu_dereference(grb, &rb_instance_srcu);
++	if (buffer) {
++		mutex_lock(&buffer->data_lock);
++		done = buffer->eof || buffer->stopping;
++		mutex_unlock(&buffer->data_lock);
++	}
++	srcu_read_unlock(&rb_instance_srcu, index);
++	return done;
++}
++
++int create_rb(void)
++{
++	struct rb *buffer;
++	int ret = 0;
++
++	mutex_lock(&rb_instance_lock);
++	if (rcu_access_pointer(grb)) {
++		ret = -EBUSY;
++		goto out;
++	}
++	buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
++	if (!buffer) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	mutex_init(&buffer->data_lock);
++	mutex_init(&buffer->writer_lock);
++	init_waitqueue_head(&buffer->wait_q);
++	rcu_assign_pointer(grb, buffer);
++out:
++	mutex_unlock(&rb_instance_lock);
++	return ret;
++}
++
++void rb_init(void)
++{
++	struct rb *buffer;
++	int index = srcu_read_lock(&rb_instance_srcu);
++
++	buffer = srcu_dereference(grb, &rb_instance_srcu);
++	if (buffer) {
++		mutex_lock(&buffer->data_lock);
++		if (!buffer->removing) {
++			buffer->generation++;
++			buffer->used = buffer->read_pos = buffer->write_pos = 0;
++			buffer->eof = buffer->stopping = false;
+ 		}
+-
+-		atomic_set(&grb->buf_condition, 0);
+-		tail = atomic_read(&grb->wr_index);
+-		head = atomic_read(&grb->rd_index);
+-		grb->aval_size = get_free_size(tail, head);
+-	}
+-	if (atomic_read(&grb->exit) == 1) {
+-		pr_debug("exit write_rb");
+-		return -EPERM;
+-	}
+-
+-	part = BUFFER_SIZE - tail;
+-	if (part < size) {
+-		memcpy(grb->gbuffer + tail, data, part);
+-		memcpy(grb->gbuffer, data + part, size - part);
+-		tail = size - part;
+-	} else {
+-		memcpy(grb->gbuffer + tail, data, size);
+-		tail += size;
+-		if (tail >= BUFFER_SIZE)
+-			tail = tail % BUFFER_SIZE;
+-	}
+-	atomic_set(&grb->wr_index, tail);
+-	grb->aval_size = get_free_size(tail, head);
+-	pr_debug("after write %d,  write index %d, read index %d, aval_size %d",
+-		 size, tail, head, grb->aval_size);
+-	return size;
+-}
+-
+-int read_rb(char *data, int32_t size)
+-{
+-	int32_t tail;
+-	int32_t head;
+-	int32_t filled_size;
+-	void *buf;
+-	int32_t read_bytes, part;
+-	buf = data;
+-
+-	pr_debug("read_rb data:%p, size %d", data, (int)size);
+-
+-	tail = atomic_read(&grb->wr_index);
+-	head = atomic_read(&grb->rd_index);
+-	grb->aval_size = get_free_size(tail, head);
+-	filled_size = BUFFER_SIZE - 1 - grb->aval_size; // aready write size.
+-
+-	pr_debug("write index %d, read index %d, filled size %d", tail, head,
+-		 filled_size);
+-	read_bytes = MIN(size, filled_size);
+-	if (size > filled_size)
+-		pr_debug("buffer underrun , req size %d, filled size %d", size,
+-			 filled_size);
+-	part = BUFFER_SIZE - head;
+-	if (part < read_bytes) {
+-		memcpy(buf, grb->gbuffer + head, part);
+-		memcpy((char *)buf + part, grb->gbuffer, read_bytes - part);
+-		head = read_bytes - part;
+-	} else {
+-		memcpy(buf, grb->gbuffer + head, read_bytes);
+-		head += read_bytes;
+-		if (head >= BUFFER_SIZE)
+-			head = head % BUFFER_SIZE;
+-	}
+-	atomic_set(&grb->rd_index, head);
+-	grb->aval_size = get_free_size(tail, head);
+-
+-	//add wakeup here
+-	atomic_set(&grb->buf_condition, 1);
+-	wake_up_interruptible(&grb->wait_q);
+-	pr_debug(
+-		"read_rb: after read %d  write index %d, read index %d, aval_size %d",
+-		read_bytes, tail, head, grb->aval_size);
+-
+-	return atomic_read(&grb->eof) ? read_bytes : size;
+-}
+-
+-int get_rb_free_size(void)
+-{
+-	int32_t tail = atomic_read(&grb->wr_index);
+-	int32_t head = atomic_read(&grb->rd_index);
+-	grb->aval_size = get_free_size(tail, head);
+-	return grb->aval_size;
+-}
+-
+-int get_rb_avalible_size(void)
+-{
+-	return BUFFER_SIZE - 1 - get_rb_free_size();
+-}
+-
+-int get_rb_max_size(void)
+-{
+-	return BUFFER_SIZE - 1;
+-}
+-
+-void rb_force_exit(void)
+-{
+-	pr_debug("rb force exit");
+-	atomic_set(&grb->exit, 1);
+-	atomic_set(&grb->buf_condition, 1);
+-	wake_up_interruptible(&grb->wait_q);
+-}
+-
+-void rb_end(void)
+-{
+-	atomic_set(&grb->eof, 1);
+-}
+-
+-int rb_shoule_exit(void)
+-{
+-	return atomic_read(&grb->eof) || atomic_read(&grb->exit);
+-}
+-
+-int create_rb(void)
+-{
+-	int32_t tail;
+-	int32_t head;
+-	grb = kzalloc(sizeof(struct rb), GFP_KERNEL);
+-	if (grb == NULL) {
+-		goto err;
+-		;
+-	}
+-	grb->gbuffer = kzalloc(BUFFER_SIZE, GFP_KERNEL);
+-	if (grb->gbuffer == NULL) {
+-		goto err;
+-	}
+-
+-	rb_init();
+-
+-	init_waitqueue_head(&grb->wait_q);
+-	tail = atomic_read(&grb->wr_index);
+-	head = atomic_read(&grb->rd_index);
+-	grb->aval_size = get_free_size(tail, head);
+-
++		mutex_unlock(&buffer->data_lock);
++		wake_up_interruptible_all(&buffer->wait_q);
++	}
++	srcu_read_unlock(&rb_instance_srcu, index);
++}
++
++int release_rb(void)
++{
++	struct rb *buffer;
++
++	mutex_lock(&rb_instance_lock);
++	buffer = rcu_dereference_protected(grb, lockdep_is_held(&rb_instance_lock));
++	if (buffer) {
++		mutex_lock(&buffer->data_lock);
++		buffer->removing = buffer->stopping = true;
++		mutex_unlock(&buffer->data_lock);
++		rcu_assign_pointer(grb, NULL);
++		wake_up_interruptible_all(&buffer->wait_q);
++		synchronize_srcu(&rb_instance_srcu);
++		kfree(buffer);
++	}
++	mutex_unlock(&rb_instance_lock);
+ 	return 0;
+-err:
+-	if (grb)
+-		kfree(grb);
+-	if (grb->gbuffer)
+-		kfree(grb->gbuffer);
+-	return -EPERM;
+-}
+-
+-void rb_init(void)
+-{
+-	pr_debug("rb init");
+-	atomic_set(&grb->wr_index, 0);
+-	atomic_set(&grb->rd_index, 0);
+-	atomic_set(&grb->buf_condition, 0);
+-	atomic_set(&grb->exit, 0);
+-	atomic_set(&grb->eof, 0);
+-}
+-
+-int release_rb(void)
+-{
+-	if (grb != NULL) {
+-		if (grb->gbuffer) {
+-			kfree(grb->gbuffer);
+-			grb->gbuffer = NULL;
+-		}
+-		kfree(grb);
+-		grb = NULL;
+-	}
+-	return 0;
+-}
++}
+--- a/drivers/input/misc/aw86927_haptic/ringbuffer.h
++++ b/drivers/input/misc/aw86927_haptic/ringbuffer.h
+@@ -1,14 +1,5 @@
+-/*
+-* reader shoule NEVER block !!!, if no data is avaliable, just return zero
+-* writer will block if there is no space, and wakend up by reader or force exit
+-* there is 1 writer and 1 reader for each buffer, so no lock is used
+-* writer shoule read rd_index to check if free size is enought, and  then fill this buffer  update wr_index
+-* reader shoule read wr_index to check if avaliable size is enought, and then read the buffer and update rd_index
+-* empty: wr_index==rd_index
+-* full: (wr_index +1) % BUFFER_SIZE == rd_index
+-* total avaliable size is BUFFER_SIZE -1
+-*/
+-
++/* SPDX-License-Identifier: GPL-2.0 */
++/* One owned stream; read_rb returns the bytes copied and never waits for data. */
+ #ifndef _RINGBUFFER_H_
+ #define _RINGBUFFER_H_
+ 

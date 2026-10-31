@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 231 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 236 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 231 platform `.ko` files, their symbol tables and DDK configurations.
+- 236 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 12,551
-imported symbol CRCs across all 231 modules.
+used. The current [validation report](validation-20261031.json) checks 12,796
+imported symbol CRCs across all 236 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1382,5 +1382,47 @@ The combined 231-module archive `artifacts/20261031T142154214564Z` passes
 and overlay checks pass with 1,084 existing vendor DTC warnings.
 ROM module build coverage is 229/466 (49.1%), leaving 237 names to assess or
 port, including alternative hardware. WLAN/Bluetooth, remaining audio,
+camera/video, device interfaces and image/installer work remain. No flashable
+6.18 ZIP or phone validation exists yet.
+
+
+## WLAN mailbox, audio packets and haptics
+
+The native WLAN utility, firmware-schema and SMEM mailbox modules preserve the
+modem descriptor/TLV layouts and generated QMI schemas. SMEM validates client
+ranges, ring pointers and complete frames, reserves space to distinguish a full
+ring, initializes padding and drains IRQs and callbacks before removal. Changed
+descriptor layouts return ESTALE and require driver rebind. Urgent signal errors
+can occur after a payload is committed. Stop must run outside urgent callbacks.
+WLAN utility callback withdrawal drains readers; MAC data publishes once. The
+utility retains its module because native getters return raw MAC storage.
+[Utility tests](wlan-utils-validation-20261031.json) cover 2,048 MAC publications,
+8,075 parser/copy boundaries, 3,104 ring/wire cases, probe faults and callback
+withdrawal. Three mutation controls reject unchecked descriptors, missing ring
+reservation and omitted callback drain. Live modem protocol and MMIO remain
+untested; the main WLAN driver still needs completion.
+
+Audio packets validate native GPR headers and message lengths, retain per-open
+regions and queues, and serialize send/read/withdrawal. Open files retain removed
+instances and old sessions stay disconnected after rebind. [Full-source tests](audio-pkt-validation-20261031.json)
+pass twenty-five ASan/UBSan groups; sixteen original-source controls and one
+cleanup-lock mutation reject their targeted faults. Tests use the integrated GPR
+headers and mock VFS, ION and DSP services. Live DMA and DSP behavior remain untested.
+
+The Awinic composite retains both AW8697 and AW86927 backends and native miev
+integration. Owned delayed work loads RAM firmware; atomic timer callbacks queue
+sleeping I2C operations. Stop drains work and disconnects retained misc files.
+Firmware/I2C bounds and actual transfers are checked; the ring reports bytes
+copied and cancels blocked writers on reset/removal. [Haptic tests](haptic-validation-20261031.json)
+cover thirty-four probe faults, firmware waits, 492 malformed RAM cases and 4,410
+I2C cases. [Ring tests](haptic-ring-validation-20261031.json) cover 300 wraps and
+65,536 concurrent bytes. Six compiled negative controls reject their faults.
+Physical timing, firmware compatibility and kernel IRQ behavior remain untested.
+
+The combined 236-module archive `artifacts/20261031T144453214130Z` passes
+12,796 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
+and overlay checks pass with 1,084 existing vendor DTC warnings.
+ROM module build coverage is 234/466 (50.2%), leaving 232 names to assess or
+port, including alternative hardware. Main WLAN/Bluetooth, remaining audio,
 camera/video, device interfaces and image/installer work remain. No flashable
 6.18 ZIP or phone validation exists yet.
