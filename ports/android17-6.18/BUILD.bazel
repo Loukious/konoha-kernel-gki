@@ -1277,6 +1277,16 @@ ddk_module(
     deps = [":thermal_headers", ":platform_headers", ":qcom_ipc_logging"],
 )
 
+ddk_module(
+    name = "bcl_pmic5",
+    srcs = ["drivers/thermal/qcom/qti_bcl_pmic5.c", "drivers/thermal/qcom/qti_bcl_stats.c"],
+    out = "bcl_pmic5.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":thermal_headers", ":platform_headers", ":qcom_ipc_logging"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1360,6 +1370,7 @@ kernel_module_group(
         ":qcom_cpu_vendor_hooks",
         ":qti_thermal_vendor_hooks",
         ":qcom_tsens",
+        ":bcl_pmic5",
         ":nvmem_qfprom",
         ":qcom_cpufreq_thermal",
         ":qcom_cpufreq_hw",

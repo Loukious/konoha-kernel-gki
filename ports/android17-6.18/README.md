@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 96 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 97 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 96 platform `.ko` files, their symbol tables and DDK configurations.
+- 97 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 4206
-imported symbol CRCs across all 96 modules.
+used. The current [validation report](validation-20261031.json) checks 4262
+imported symbol CRCs across all 97 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -230,7 +230,7 @@ wake, receive threads stop, and queued memory work drains before descriptors
 are freed. The deferred-free worker also supports stop and drain. Unknown queue
 names fail cleanly, and receiver allocation/thread failures unwind registration.
 These adaptations pass checkpatch with no errors, warnings or style checks;
-the full build passes 4206 imported-symbol CRC checks without compiler/modpost
+the full build passes 4262 imported-symbol CRC checks without compiler/modpost
 warnings. Cross-VM sharing, secure-display allocation and memory pressure still
 require device testing. `ZONE_DEVICE` and reserved-IPA support remain disabled,
 matching the Onyx HLOS baseline; guest-only mapping paths are not validated.
@@ -419,3 +419,28 @@ result is in [tsens-validation-20261031.json](tsens-validation-20261031.json).
 This adaptation passes checkpatch without errors, warnings or style checks.
 Register access, IRQ wakeup, thermal policy and temperature accuracy still
 require testing on the phone.
+
+
+The PMIC battery-monitor group adds `bcl_pmic5`, retaining Onyx's current,
+voltage, low-battery IRQ levels and PMIC-specific register/scale tables. The
+voltage trip callback uses the 6.18 trip descriptor and bounds-checks register
+indices. ADC multiplication widens before arithmetic; CCM thresholds saturate
+before narrowing. BPM snapshots decode little-endian bytes into aligned local
+storage, release the hardware hold after read failures, and leave caller output
+unchanged on error.
+
+Controllers have managed IDs, logs, notifiers and debugfs directories. All
+thermal zones precede every IRQ registration; disabled IRQs remember the
+threshold selected during zone setup and arm only after their handlers exist.
+Zone disable and device teardown balance IRQ/wake state, and late callbacks
+cannot rearm released interrupts. NVMEM and IRQ probe deferrals propagate.
+Notifier callbacks are initialized before registration and drained before
+storage is freed. Statistics snapshots serialize with IRQ updates.
+
+`verify_bcl.py WORKSPACE/onyx` checks 196,608 signed ADC conversions, integer
+boundaries, CCM saturation, injected snapshot failures and IRQ/wake lifetimes
+with AddressSanitizer and UndefinedBehaviorSanitizer. The harness also rejects
+the former 32-bit multiplication overflow. The [recorded result](bcl-validation-20261031.json)
+covers host helpers; it does not exercise real IRQ concurrency or the PMIC.
+The adapter passes checkpatch and the full platform build without warnings.
+Battery accuracy, voltage-threshold propagation and mitigation need phone tests.
