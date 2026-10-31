@@ -37,19 +37,24 @@
  	if (!ret)
 --- a/drivers/virt/gunyah/gh_rm_core.c
 +++ b/drivers/virt/gunyah/gh_rm_core.c
-@@ -14,6 +14,7 @@
+@@ -14,6 +14,8 @@
  #include <linux/notifier.h>
  #include <linux/irqdomain.h>
  #include <linux/workqueue.h>
 +#include <linux/vmalloc.h>
++#include <linux/rwsem.h>
  #include <linux/delay.h>
  #include <linux/completion.h>
  #include <linux/auxiliary_bus.h>
-@@ -90,11 +91,11 @@
+@@ -89,12 +91,14 @@
+ static gh_vpm_grp_set_cb_t gh_vpm_grp_set_fn;
  static gh_vpm_grp_reset_cb_t gh_vpm_grp_reset_fn;
  static gh_all_res_populated_cb_t gh_all_res_populated_fn;
- 
+-
 -static DEFINE_MUTEX(gh_rm_call_idr_lock);
++static DECLARE_RWSEM(gh_proxy_cb_sem);
++static const struct gh_rm_proxy_callbacks *gh_proxy_cb_owner;
++
  static DEFINE_MUTEX(gh_virtio_mmio_fn_lock);
 -static DEFINE_IDR(gh_rm_call_idr);
 -static DEFINE_MUTEX(gh_rm_send_lock);
@@ -61,7 +66,7 @@
  static struct device_node *gh_rm_intc;
  static struct irq_domain *gh_rm_irq_domain;
  static u32 gh_rm_base_virq;
-@@ -245,7 +246,7 @@
+@@ -245,7 +249,7 @@
  	memcpy(notif->msg, msg, msg_size);
  	INIT_WORK(&notif->work, gh_rm_notif_work);
  
@@ -70,7 +75,135 @@
  	return NOTIFY_DONE;
  }
  
-@@ -975,7 +976,7 @@
+@@ -416,6 +420,8 @@
+ 	u32 n_res, i;
+ 	u64 base = 0, size = 0;
+ 
++	guard(rwsem_read)(&gh_proxy_cb_sem);
++
+ 	res_entries = gh_rm_vm_get_hyp_res(vmid, &n_res);
+ 	if (IS_ERR_OR_NULL(res_entries))
+ 		return PTR_ERR(res_entries);
+@@ -555,6 +561,8 @@
+ 	u32 n_res, i;
+ 	int ret = 0, irq = -1;
+ 	gh_capid_t cap_id;
++
++	guard(rwsem_read)(&gh_proxy_cb_sem);
+ 
+ 	res_entries = gh_rm_vm_get_hyp_res(vmid, &n_res);
+ 	if (IS_ERR_OR_NULL(res_entries))
+@@ -664,6 +672,55 @@
+ }
+ EXPORT_SYMBOL_GPL(gh_rm_unset_virtio_mmio_cb);
+ 
++int gh_rm_register_proxy_callbacks(const struct gh_rm_proxy_callbacks *callbacks)
++{
++	guard(rwsem_write)(&gh_proxy_cb_sem);
++
++	if (!callbacks ||
++	    !callbacks->wdog ||
++	    !callbacks->vcpu_set ||
++	    !callbacks->vcpu_reset ||
++	    !callbacks->vpm_set ||
++	    !callbacks->vpm_reset ||
++	    !callbacks->all_res)
++		return -EINVAL;
++
++	if (gh_wdog_manage_fn ||
++	    gh_vcpu_affinity_set_fn ||
++	    gh_vcpu_affinity_reset_fn ||
++	    gh_vpm_grp_set_fn ||
++	    gh_vpm_grp_reset_fn ||
++	    gh_all_res_populated_fn)
++		return -EBUSY;
++
++	gh_wdog_manage_fn = callbacks->wdog;
++	gh_vcpu_affinity_set_fn = callbacks->vcpu_set;
++	gh_vcpu_affinity_reset_fn = callbacks->vcpu_reset;
++	gh_vpm_grp_set_fn = callbacks->vpm_set;
++	gh_vpm_grp_reset_fn = callbacks->vpm_reset;
++	gh_all_res_populated_fn = callbacks->all_res;
++	gh_proxy_cb_owner = callbacks;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(gh_rm_register_proxy_callbacks);
++
++void gh_rm_unregister_proxy_callbacks(const struct gh_rm_proxy_callbacks *callbacks)
++{
++	guard(rwsem_write)(&gh_proxy_cb_sem);
++
++	if (gh_proxy_cb_owner != callbacks)
++		return;
++
++	gh_wdog_manage_fn = NULL;
++	gh_vcpu_affinity_set_fn = NULL;
++	gh_vcpu_affinity_reset_fn = NULL;
++	gh_vpm_grp_set_fn = NULL;
++	gh_vpm_grp_reset_fn = NULL;
++	gh_all_res_populated_fn = NULL;
++	gh_proxy_cb_owner = NULL;
++}
++EXPORT_SYMBOL_GPL(gh_rm_unregister_proxy_callbacks);
++
+ /**
+  * gh_rm_set_wdog_manage_cb: Set callback that handles wdog resource
+  * @fnptr: Pointer to callback function
+@@ -677,6 +734,8 @@
+  */
+ int gh_rm_set_wdog_manage_cb(gh_wdog_manage_cb_t fnptr)
+ {
++	guard(rwsem_write)(&gh_proxy_cb_sem);
++
+ 	if (!fnptr)
+ 		return -EINVAL;
+ 
+@@ -702,6 +761,8 @@
+  */
+ int gh_rm_set_vcpu_affinity_cb(gh_vcpu_affinity_set_cb_t fnptr)
+ {
++	guard(rwsem_write)(&gh_proxy_cb_sem);
++
+ 	if (!fnptr)
+ 		return -EINVAL;
+ 
+@@ -727,6 +788,8 @@
+  */
+ int gh_rm_reset_vcpu_affinity_cb(gh_vcpu_affinity_reset_cb_t fnptr)
+ {
++	guard(rwsem_write)(&gh_proxy_cb_sem);
++
+ 	if (!fnptr)
+ 		return -EINVAL;
+ 
+@@ -752,6 +815,8 @@
+  */
+ int gh_rm_set_vpm_grp_cb(gh_vpm_grp_set_cb_t fnptr)
+ {
++	guard(rwsem_write)(&gh_proxy_cb_sem);
++
+ 	if (!fnptr)
+ 		return -EINVAL;
+ 
+@@ -777,6 +842,8 @@
+  */
+ int gh_rm_reset_vpm_grp_cb(gh_vpm_grp_reset_cb_t fnptr)
+ {
++	guard(rwsem_write)(&gh_proxy_cb_sem);
++
+ 	if (!fnptr)
+ 		return -EINVAL;
+ 
+@@ -802,6 +869,8 @@
+  */
+ int gh_rm_all_res_populated_cb(gh_all_res_populated_cb_t fnptr)
+ {
++	guard(rwsem_write)(&gh_proxy_cb_sem);
++
+ 	if (!fnptr)
+ 		return -EINVAL;
+ 
+@@ -975,7 +1044,7 @@
  
  static int gh_vm_probe(struct device *dev, struct device_node *hyp_root)
  {
@@ -79,7 +212,7 @@
  	struct gh_vm_property temp_property = {0};
  	int vmid, owner_vmid, ret;
  	const char *vm_name;
-@@ -984,9 +985,9 @@
+@@ -984,9 +1053,9 @@
  
  	gh_init_vm_prop_table();
  
@@ -91,7 +224,7 @@
  		if (IS_ERR_OR_NULL(node)) {
  			dev_err(dev, "Could not find vm-id node\n");
  			return -ENODEV;
-@@ -1033,7 +1034,10 @@
+@@ -1033,7 +1102,10 @@
  
  		/* check peer to see if any VM has been bootup */
  		gh_vm_check_peer(dev, node);
@@ -103,7 +236,7 @@
  		gh_rm_core_initialized = true;
  		/* Query RM for available resources */
  		schedule_work(&gh_rm_get_svm_res_work);
-@@ -1052,17 +1056,47 @@
+@@ -1052,17 +1124,47 @@
  	{ }
  };
  
@@ -155,7 +288,7 @@
  
  	if (of_property_read_u32(node, "qcom,free-irq-start",
  				 &gh_rm_base_virq)) {
-@@ -1077,37 +1111,53 @@
+@@ -1077,37 +1179,53 @@
  	}
  	gh_rm_irq_domain = irq_find_host(gh_rm_intc);
  	if (!gh_rm_irq_domain) {
@@ -242,7 +375,26 @@
  void gunyah_vm_put(struct gunyah_vm *ghvm);
 --- a/include/linux/gunyah/gh_rm_drv.h
 +++ b/include/linux/gunyah/gh_rm_drv.h
-@@ -403,6 +403,8 @@
+@@ -362,6 +362,18 @@
+ int gh_rm_set_vpm_grp_cb(gh_vpm_grp_set_cb_t fnptr);
+ int gh_rm_reset_vpm_grp_cb(gh_vpm_grp_reset_cb_t fnptr);
+ int gh_rm_all_res_populated_cb(gh_all_res_populated_cb_t fnptr);
++
++struct gh_rm_proxy_callbacks {
++	gh_wdog_manage_cb_t wdog;
++	gh_vcpu_affinity_set_cb_t vcpu_set;
++	gh_vcpu_affinity_reset_cb_t vcpu_reset;
++	gh_vpm_grp_set_cb_t vpm_set;
++	gh_vpm_grp_reset_cb_t vpm_reset;
++	gh_all_res_populated_cb_t all_res;
++};
++
++int gh_rm_register_proxy_callbacks(const struct gh_rm_proxy_callbacks *callbacks);
++void gh_rm_unregister_proxy_callbacks(const struct gh_rm_proxy_callbacks *callbacks);
+ 
+ /* Client APIs for VM management */
+ int gh_rm_vm_alloc_vmid(enum gh_vm_names vm_name, int *vmid);
+@@ -403,6 +415,8 @@
  			      struct gh_mem_attr_desc *mem_attr_desc,
  			      gh_memparcel_handle_t *handle);
  int gh_rm_mem_release(gh_memparcel_handle_t handle, u8 flags);
@@ -251,6 +403,25 @@
  int ghd_rm_mem_reclaim(gh_memparcel_handle_t handle, u8 flags);
  struct gh_sgl_desc *gh_rm_mem_accept(gh_memparcel_handle_t handle, u8 mem_type,
  				     u8 trans_type, u32 flags, gh_label_t label,
+@@ -510,6 +524,18 @@
+ 	return -EINVAL;
+ }
+ 
++struct gh_rm_proxy_callbacks {
++	gh_wdog_manage_cb_t wdog;
++	gh_vcpu_affinity_set_cb_t vcpu_set;
++	gh_vcpu_affinity_reset_cb_t vcpu_reset;
++	gh_vpm_grp_set_cb_t vpm_set;
++	gh_vpm_grp_reset_cb_t vpm_reset;
++	gh_all_res_populated_cb_t all_res;
++};
++
++int gh_rm_register_proxy_callbacks(const struct gh_rm_proxy_callbacks *callbacks);
++void gh_rm_unregister_proxy_callbacks(const struct gh_rm_proxy_callbacks *callbacks);
++
+ /* Client APIs for VM management */
+ static inline int gh_rm_vm_alloc_vmid(enum gh_vm_names vm_name, int *vmid)
+ {
 --- a/include/trace/events/qrtr.h
 +++ b/include/trace/events/qrtr.h
 @@ -102,7 +102,7 @@

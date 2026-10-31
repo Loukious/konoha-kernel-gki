@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 57 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 60 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 57 platform `.ko` files, their symbol tables and DDK configurations.
+- 60 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 2178
-imported symbol CRCs across all 57 modules.
+used. The current [validation report](validation-20261031.json) checks 2429
+imported symbol CRCs across all 60 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -142,13 +142,21 @@ The QRTR group builds the pinned Onyx core, name service and Gunyah transport,
 including the vendor routing, wakeup and process-deletion interfaces. The node
 ID and wakeup defaults remain 1 and 0 ms, with the baseline DT override. Trace
 strings use the 6.18 API, and the node-ID walk releases each node exactly once.
-The secure-VM loader and guest-power drivers are not ported. A QRTR node with
-`qcom,master` therefore reports `-EOPNOTSUPP` before allocating transport
-resources; it cannot silently probe without its VM lifecycle notifier.
-Guest-mode transport compiles but is not runtime-tested. The Tuna VM IRQ-chip
-provider is still missing. Checkpatch finds no code-style warnings or errors
-in this adaptation patch (commit-message and sign-off checks do not apply to
-the stored source diff).
+The secure-VM group builds `mdt_loader`, `secure_buffer` and `gunyah_loader`,
+including the Onyx proxy scheduler and virtio backend. The vendor firmware
+loader, wrapped memory assignments and `/dev/qgunyah` UAPI remain intact.
+QRTR host transport and IRQ lending now link to the real VM lifecycle notifier.
+The IRQ eventfd registration holds its file descriptor only during setup and
+retains an eventfd context for asynchronous notifications, using the 6.18 fd
+and eventfd APIs. Loader initialization propagates errors and unwinds earlier
+registrations. Proxy callbacks are installed atomically after initialization;
+removal waits for in-flight resource callbacks before releasing the proxy data.
+
+Guest-power operations stay disabled, matching the recorded Onyx HLOS config.
+The Tuna VM IRQ-chip provider is still missing. VM firmware loading, proxy
+scheduling, memory assignment and virtio operation have not been tested on the
+phone. Checkpatch finds no code-style errors or warnings in these adaptation
+patches (commit-message and sign-off checks do not apply to source diffs).
 
 ## Baseline inventory
 
@@ -171,7 +179,7 @@ changes are captured for later porting; they are not in this initial group.
 
 ## Next implementation gates
 
-1. Complete the Gunyah secure-VM loader, VM IRQ-chip and IOMMU dependencies
+1. Complete the VM IRQ-chip and IOMMU dependencies
    needed for Onyx early boot.
    Test UFS/encryption, probe ordering, GPIO wakeups, SCM wait queues and
    shared-memory operations.

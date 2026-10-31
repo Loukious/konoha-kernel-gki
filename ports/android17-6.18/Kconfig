@@ -175,3 +175,17 @@ config QRTR_WAKEUP_MS
 	int "Onyx QRTR wakeup timeout"
 	depends on QRTR
 	default 0
+
+config QCOM_SECURE_BUFFER
+	tristate "Onyx secure memory assignment"
+	depends on QCOM_SCM
+
+config GH_SECURE_VM_LOADER
+	tristate "Onyx secure VM loader"
+	depends on GUNYAH && GH_RM_DRV
+	select QCOM_MDT_LOADER
+	select QCOM_SECURE_BUFFER
+
+config GH_PROXY_SCHED
+	tristate "Onyx proxy scheduling for secondary VMs"
+	depends on GH_SECURE_VM_LOADER

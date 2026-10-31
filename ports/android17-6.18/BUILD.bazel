@@ -683,7 +683,7 @@ ddk_module(
     kconfig = "Kconfig",
     defconfig = "platform_defconfig",
     kernel_build = "//common:kernel_aarch64",
-    deps = [":gunyah_headers", ":scm_headers", ":gh_rm_drv"],
+    deps = [":gunyah_headers", ":scm_headers", ":gh_rm_drv", ":gunyah_loader"],
 )
 
 ddk_module(
@@ -732,7 +732,52 @@ ddk_module(
     kconfig = "Kconfig",
     defconfig = "platform_defconfig",
     kernel_build = "//common:kernel_aarch64",
-    deps = [":gunyah_headers", ":scm_headers", ":gh_rm_drv", ":gh_msgq", ":qrtr", ":gh_dbl", ":qcom_scm"],
+    deps = [":gunyah_headers", ":scm_headers", ":gh_rm_drv", ":gh_msgq", ":qrtr", ":gh_dbl", ":qcom_scm", ":gunyah_loader"],
+)
+
+ddk_headers(
+    name = "loader_headers",
+    hdrs = glob(["drivers/virt/gunyah/*.h"]) + [
+        "drivers/soc/qcom/trace_secure_buffer.h",
+        "include/linux/soc/qcom/mdt_loader.h",
+        "include/uapi/linux/gunyah_deprecated.h",
+        "include/uapi/linux/gh_virtio_backend.h",
+        "include/trace/events/gh_virtio_backend.h",
+    ],
+    linux_includes = ["include", "include/uapi"],
+)
+
+ddk_module(
+    name = "mdt_loader",
+    srcs = ["drivers/soc/qcom/mdt_loader.c"],
+    out = "mdt_loader.ko",
+    includes = ["drivers/virt/gunyah", "drivers/soc/qcom"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":loader_headers", ":scm_headers", ":qcom_scm"],
+)
+
+ddk_module(
+    name = "secure_buffer",
+    srcs = ["drivers/soc/qcom/secure_buffer.c"],
+    out = "secure_buffer.ko",
+    includes = ["drivers/virt/gunyah", "drivers/soc/qcom"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":loader_headers", ":scm_headers", ":qcom_scm", ":gh_rm_drv"],
+)
+
+ddk_module(
+    name = "gunyah_loader",
+    srcs = ["drivers/virt/gunyah/gh_main.c", "drivers/virt/gunyah/gh_secure_vm_loader.c", "drivers/virt/gunyah/gh_secure_vm_virtio_backend.c", "drivers/virt/gunyah/gh_proxy_sched.c"],
+    out = "gunyah_loader.ko",
+    includes = ["drivers/virt/gunyah", "drivers/soc/qcom"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":loader_headers", ":gunyah_headers", ":scm_headers", ":gh_rm_drv", ":qcom_scm", ":secure_buffer", ":mdt_loader"],
 )
 
 kernel_module_group(
@@ -782,6 +827,9 @@ kernel_module_group(
         ":gh_ctrl",
         ":qrtr_gunyah",
         ":qrtr",
+        ":mdt_loader",
+        ":secure_buffer",
+        ":gunyah_loader",
     ],
 )
 

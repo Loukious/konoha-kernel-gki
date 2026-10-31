@@ -1,0 +1,333 @@
+--- a/drivers/virt/gunyah/gh_main.c
++++ b/drivers/virt/gunyah/gh_main.c
+@@ -234,7 +234,7 @@
+ 	return ret;
+ }
+ 
+-void gh_destroy_vcpu(struct gh_vcpu *vcpu)
++static void gh_destroy_vcpu(struct gh_vcpu *vcpu)
+ {
+ 	struct gh_vm *vm = vcpu->vm;
+ 	u32 id = vcpu->vcpu_id;
+@@ -244,7 +244,7 @@
+ 	vm->created_vcpus--;
+ }
+ 
+-int gh_destroy_vm(struct gh_vm *vm)
++static int gh_destroy_vm(struct gh_vm *vm)
+ {
+ 	int vcpu_id, ret;
+ 
+@@ -1006,28 +1006,29 @@
+ 
+ 	ret = gh_secure_vm_loader_init();
+ 	if (ret)
+-		pr_err("gunyah: secure loader init failed %d\n", ret);
++		return ret;
+ 
+ 	ret = gh_proxy_sched_init();
+ 	if (ret)
+-		pr_err("gunyah: proxy scheduler init failed %d\n", ret);
++		goto exit_loader;
+ 
+ 	ret = misc_register(&gh_dev);
+-	if (ret) {
+-		pr_err("gunyah: misc device register failed %d\n", ret);
+-		goto err_gh_init;
+-	}
++	if (ret)
++		goto exit_proxy;
+ 
+ 	ret = gh_virtio_backend_init();
+ 	if (ret)
+-		pr_err("gunyah: virtio backend init failed %d\n", ret);
+-
+-	return ret;
+-
+-err_gh_init:
++		goto deregister_misc;
++
++	return 0;
++
++deregister_misc:
++	misc_deregister(&gh_dev);
++exit_proxy:
+ 	gh_proxy_sched_exit();
++exit_loader:
+ 	gh_secure_vm_loader_exit();
+-	return 0;
++	return ret;
+ }
+ module_init(gh_init);
+ 
+@@ -1041,3 +1042,4 @@
+ module_exit(gh_exit);
+ 
+ MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Qualcomm Gunyah secure VM loader and proxy scheduler");
+--- a/drivers/virt/gunyah/gh_secure_vm_loader.c
++++ b/drivers/virt/gunyah/gh_secure_vm_loader.c
+@@ -28,6 +28,7 @@
+ #include <soc/qcom/secure_buffer.h>
+ 
+ #include "gh_private.h"
++#include "gh_secure_vm_loader.h"
+ #include "gh_secure_vm_virtio_backend.h"
+ 
+ #define PAGE_ROUND_UP(x) ((((u64)(x) + (PAGE_SIZE - 1)) / PAGE_SIZE)  * PAGE_SIZE)
+@@ -888,7 +889,7 @@
+ 	return ret;
+ }
+ 
+-static int gh_secure_vm_loader_remove(struct platform_device *pdev)
++static void gh_secure_vm_loader_remove(struct platform_device *pdev)
+ {
+ 	struct gh_sec_vm_dev *sec_vm_dev;
+ 
+@@ -903,7 +904,8 @@
+ 	else
+ 		of_reserved_mem_device_release(&pdev->dev);
+ 
+-	return gh_virtio_backend_remove(sec_vm_dev->vm_name);
++	if (gh_virtio_backend_remove(sec_vm_dev->vm_name))
++		dev_err(&pdev->dev, "Failed to remove virtio backend\n");
+ }
+ 
+ static const struct of_device_id gh_secure_vm_loader_match_table[] = {
+--- a/drivers/virt/gunyah/gh_secure_vm_virtio_backend.c
++++ b/drivers/virt/gunyah/gh_secure_vm_virtio_backend.c
+@@ -96,7 +96,6 @@
+ 	struct eventfd_ctx *ctx;
+ 	wait_queue_entry_t wait;
+ 	poll_table pt;
+-	struct fd fd;
+ 	struct work_struct shutdown_work;
+ };
+ 
+@@ -192,9 +191,7 @@
+ 	if (irq->ctx) {
+ 		eventfd_ctx_remove_wait_queue(irq->ctx, &irq->wait, &isr);
+ 		eventfd_ctx_put(irq->ctx);
+-		fdput(irq->fd);
+ 		irq->ctx = NULL;
+-		irq->fd.file = NULL;
+ 	}
+ 	spin_unlock_irqrestore(&vb_dev->lock, iflags);
+ }
+@@ -231,53 +228,44 @@
+ static int vb_dev_irqfd(struct virtio_backend_device *vb_dev,
+ 		struct virtio_irqfd *ifd)
+ {
+-	struct fd f;
+-	int ret = -EBUSY;
+-	struct eventfd_ctx *eventfd = NULL;
++	struct fd f = fdget(ifd->fd);
++	struct eventfd_ctx *eventfd;
+ 	__poll_t events;
+ 	unsigned long flags;
+-
+-	f.file = NULL;
+-
+-	spin_lock_irqsave(&vb_dev->lock, flags);
+-
+-	if (vb_dev->irq.fd.file)
+-		goto fail;
+-
+-	f = fdget(ifd->fd);
+-	if (!f.file)
+-		goto fail;
+-
+-	eventfd = eventfd_ctx_fileget(f.file);
++	int ret = 0;
++
++	if (fd_empty(f))
++		return -EBADF;
++
++	eventfd = eventfd_ctx_fileget(fd_file(f));
+ 	if (IS_ERR(eventfd)) {
+ 		ret = PTR_ERR(eventfd);
+-		goto fail;
+-	}
++		goto put_fd;
++	}
++
++	spin_lock_irqsave(&vb_dev->lock, flags);
++	if (vb_dev->irq.ctx) {
++		spin_unlock_irqrestore(&vb_dev->lock, flags);
++		eventfd_ctx_put(eventfd);
++		ret = -EBUSY;
++		goto put_fd;
++	}
++
++	init_waitqueue_func_entry(&vb_dev->irq.wait, vb_dev_irqfd_wakeup);
++	init_poll_funcptr(&vb_dev->irq.pt, vb_dev_irqfd_ptable_queue_proc);
+ 	vb_dev->irq.ctx = eventfd;
+-	vb_dev->irq.fd = f;
+-
+ 	spin_unlock_irqrestore(&vb_dev->lock, flags);
+ 
+-	init_waitqueue_func_entry(&vb_dev->irq.wait, vb_dev_irqfd_wakeup);
+-	INIT_WORK(&vb_dev->irq.shutdown_work, irqfd_shutdown);
+-	init_poll_funcptr(&vb_dev->irq.pt, vb_dev_irqfd_ptable_queue_proc);
+-	events = vfs_poll(f.file, &vb_dev->irq.pt);
++	events = vfs_poll(fd_file(f), &vb_dev->irq.pt);
+ 	if (events & EPOLLIN) {
+ 		dev_dbg(vb_dev->vm->dev,
+ 			"%s: Premature injection of interrupt\n",
+ 			VIRTIO_PRINT_MARKER);
+ 	}
+ 
+-	return 0;
+-
+-fail:
+-	if (eventfd && !IS_ERR(eventfd))
+-		eventfd_ctx_put(eventfd);
+-	if (f.file)
+-		fdput(f);
+-
+-	spin_unlock_irqrestore(&vb_dev->lock, flags);
+-
++	/* The eventfd context owns the asynchronous wait, not a borrowed fd. */
++put_fd:
++	fdput(f);
+ 	return ret;
+ }
+ 
+@@ -321,7 +309,7 @@
+ 	for (i = 0; i < MAX_IO_CONTEXTS; ++i) {
+ 		flags = 1 << i;
+ 		if ((vb_dev->vdev_event_data & flags) && vb_dev->ioctx[i].ctx) {
+-			eventfd_signal(vb_dev->ioctx[i].ctx, 1);
++			eventfd_signal(vb_dev->ioctx[i].ctx);
+ 			vb_dev->vdev_event_data &= ~flags;
+ 			trace_gh_virtio_backend_queue_notify(vb_dev->label, i);
+ 		}
+@@ -1115,6 +1103,7 @@
+ 	vb_dev->label = label;
+ 	vb_dev->vm = vm;
+ 	spin_lock_init(&vb_dev->lock);
++	INIT_WORK(&vb_dev->irq.shutdown_work, irqfd_shutdown);
+ 	init_waitqueue_head(&vb_dev->evt_queue);
+ 	init_waitqueue_head(&vb_dev->notify_queue);
+ 	mutex_init(&vb_dev->mutex);
+--- a/drivers/virt/gunyah/gh_proxy_sched.c
++++ b/drivers/virt/gunyah/gh_proxy_sched.c
+@@ -646,7 +646,7 @@
+ }
+ EXPORT_SYMBOL_GPL(gh_poll_vcpu_run);
+ 
+-void gh_vcpu_work_function(struct work_struct *work)
++static void gh_vcpu_work_function(struct work_struct *work)
+ {
+ 	struct gh_proxy_vcpu *vcpu =
+ 		container_of(work, struct gh_proxy_vcpu, work);
+@@ -706,8 +706,8 @@
+ 	}
+ }
+ 
+-int gh_vcpu_pm_notifier_call(struct notifier_block *nb, unsigned long action,
+-			     void *data)
++static int gh_vcpu_pm_notifier_call(struct notifier_block *nb, unsigned long action,
++				    void *data)
+ {
+ 	struct gh_proxy_vcpu *vcpu =
+ 		container_of(nb, struct gh_proxy_vcpu, suspend_nb);
+@@ -870,48 +870,14 @@
+ 	return ret;
+ }
+ 
+-static int gh_proxy_sched_reg_rm_cbs(void)
+-{
+-	int ret = -EINVAL;
+-
+-	ret = gh_rm_set_wdog_manage_cb(&gh_wdog_manage);
+-	if (ret) {
+-		pr_err("fail to set the WDOG resource callback\n");
+-		return ret;
+-	}
+-
+-	ret = gh_rm_set_vcpu_affinity_cb(&gh_populate_vm_vcpu_info);
+-	if (ret) {
+-		pr_err("fail to set the VM VCPU populate callback\n");
+-		return ret;
+-	}
+-
+-	ret = gh_rm_reset_vcpu_affinity_cb(&gh_unpopulate_vm_vcpu_info);
+-	if (ret) {
+-		pr_err("fail to set the VM VCPU unpopulate callback\n");
+-		return ret;
+-	}
+-
+-	ret = gh_rm_set_vpm_grp_cb(&gh_populate_vm_vpm_grp_info);
+-	if (ret) {
+-		pr_err("fail to set the VM VPM GRP populate callback\n");
+-		return ret;
+-	}
+-
+-	ret = gh_rm_reset_vpm_grp_cb(&gh_unpopulate_vm_vpm_grp_info);
+-	if (ret) {
+-		pr_err("fail to set the VM VPM GRP unpopulate callback\n");
+-		return ret;
+-	}
+-
+-	ret = gh_rm_all_res_populated_cb(&gh_populate_all_res_info);
+-	if (ret) {
+-		pr_err("fail to set the all res populate callback\n");
+-		return ret;
+-	}
+-
+-	return 0;
+-}
++static const struct gh_rm_proxy_callbacks gh_proxy_callbacks = {
++	.wdog = gh_wdog_manage,
++	.vcpu_set = gh_populate_vm_vcpu_info,
++	.vcpu_reset = gh_unpopulate_vm_vcpu_info,
++	.vpm_set = gh_populate_vm_vpm_grp_info,
++	.vpm_reset = gh_unpopulate_vm_vpm_grp_info,
++	.all_res = gh_populate_all_res_info,
++};
+ 
+ int gh_proxy_sched_init(void)
+ {
+@@ -923,16 +889,15 @@
+ 		goto err;
+ 	}
+ 
+-	ret = gh_proxy_sched_reg_rm_cbs();
++	gh_init_vms();
++	init_done = true;
++	ret = gh_rm_register_proxy_callbacks(&gh_proxy_callbacks);
+ 	if (ret)
+ 		goto free_gh_vms;
+-
+-	gh_init_vms();
+-
+-	init_done = true;
+ 	return 0;
+ 
+ free_gh_vms:
++	init_done = false;
+ 	kfree(gh_vms);
+ err:
+ 	return ret;
+@@ -940,5 +905,8 @@
+ 
+ void gh_proxy_sched_exit(void)
+ {
++	gh_rm_unregister_proxy_callbacks(&gh_proxy_callbacks);
++	init_done = false;
+ 	kfree(gh_vms);
+-}
++	gh_vms = NULL;
++}
+--- a/drivers/soc/qcom/secure_buffer.c
++++ b/drivers/soc/qcom/secure_buffer.c
+@@ -464,7 +464,7 @@
+ 		if (sg->length % PAGE_SIZE)
+ 			npages++;
+ 		while (npages--)
+-			set_page_private(nth_page(sg_page(sg), npages), flag);
++			set_page_private(pfn_to_page(page_to_pfn(sg_page(sg)) + npages), flag);
+ 	}
+ }
+ 
