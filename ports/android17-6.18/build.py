@@ -92,7 +92,7 @@ def main():
         "limits": [
             "Build and imported-symbol CRC checks only; no device boot or hardware validation.",
             "Not flashable: the rest of the Onyx driver stack and boot images are not ported.",
-            "Vendor Gunyah RM is not enabled: SCM uses the pinned vendor header's existing HLOS fallback. Secondary-VM support remains to be ported.",
+            "Gunyah services are built, but the secure VM loader and guest power drivers are not ported. QRTR host transport rejects probe without the loader; secondary-VM operation remains untested.",
             "The default Kleaf build uses the maybe-dirty suffix without stamping; input revisions are recorded separately.",
         ],
     }

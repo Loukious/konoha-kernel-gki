@@ -128,3 +128,50 @@ config REGULATOR_STUB
 config SCSI_UFS_CRYPTO_QTI
 	tristate "Onyx UFS hardware wrapped keys"
 	depends on SCSI_UFS_CRYPTO && SCSI_UFS_QCOM && QCOM_INLINE_CRYPTO_ENGINE
+
+config GH_ARM64_DRV
+	tristate "Onyx Gunyah ARM64 services"
+	depends on GUNYAH
+
+config GH_DBL
+	tristate "Onyx Gunyah doorbells"
+	depends on GUNYAH
+
+config GH_MSGQ
+	tristate "Onyx Gunyah message queues"
+	depends on GUNYAH
+
+config GH_RM_DRV
+	tristate "Onyx Gunyah vendor resource manager"
+	depends on GUNYAH
+
+config GH_IRQ_LEND
+	tristate "Onyx Gunyah IRQ lending"
+	depends on GUNYAH
+	depends on GH_RM_DRV
+
+config GH_MEM_NOTIFIER
+	tristate "Onyx Gunyah memory notification"
+	depends on GUNYAH
+	depends on GH_RM_DRV
+
+config GH_CTRL
+	tristate "Onyx Gunyah hypervisor control"
+	depends on GUNYAH
+	depends on SYSFS
+	select SYS_HYPERVISOR
+
+config QRTR_GUNYAH
+	tristate "Onyx QRTR Gunyah transport"
+	depends on GUNYAH
+	depends on QRTR && GH_MSGQ && GH_RM_DRV
+
+config QRTR_NODE_ID
+	int "Onyx QRTR local node ID"
+	depends on QRTR
+	default 1
+
+config QRTR_WAKEUP_MS
+	int "Onyx QRTR wakeup timeout"
+	depends on QRTR
+	default 0

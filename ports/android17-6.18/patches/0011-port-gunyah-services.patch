@@ -1,0 +1,339 @@
+--- a/drivers/virt/gunyah/gh_msgq.c
++++ b/drivers/virt/gunyah/gh_msgq.c
+@@ -53,7 +53,7 @@
+ static LIST_HEAD(gh_msgq_cap_list);
+ static DEFINE_SPINLOCK(gh_msgq_cap_list_lock);
+ 
+-struct gh_msgq_cap_table *gh_msgq_alloc_entry(int label)
++static struct gh_msgq_cap_table *gh_msgq_alloc_entry(int label)
+ {
+ 	int ret;
+ 	struct gh_msgq_cap_table *cap_table_entry = NULL;
+@@ -124,15 +124,12 @@
+ 
+ static int __gh_msgq_recv(struct gh_msgq_cap_table *cap_table_entry,
+ 				void *buff, size_t buff_size,
+-				size_t *recv_size, u64 rx_flags)
++				size_t *recv_size)
+ {
+ 	struct gh_hcall_msgq_recv_resp resp = {};
+ 	unsigned long flags;
+ 	int gh_ret;
+ 	int ret = 0;
+-
+-	/* Discard the driver specific flags, and keep only HVC specifics */
+-	rx_flags &= GH_MSGQ_HVC_FLAGS_MASK;
+ 
+ 	spin_lock_irqsave(&cap_table_entry->rx_lock, flags);
+ 	gh_ret = gh_hcall_msgq_recv(cap_table_entry->rx_cap_id, buff,
+@@ -226,7 +223,7 @@
+ 			return ret;
+ 
+ 		ret = __gh_msgq_recv(cap_table_entry, buff, buff_size,
+-					recv_size, flags);
++					recv_size);
+ 	} while (ret == -EAGAIN);
+ 
+ 	if (!ret)
+--- a/drivers/virt/gunyah/gh_rm_core.c
++++ b/drivers/virt/gunyah/gh_rm_core.c
+@@ -14,6 +14,7 @@
+ #include <linux/notifier.h>
+ #include <linux/irqdomain.h>
+ #include <linux/workqueue.h>
++#include <linux/vmalloc.h>
+ #include <linux/delay.h>
+ #include <linux/completion.h>
+ #include <linux/auxiliary_bus.h>
+@@ -90,11 +91,11 @@
+ static gh_vpm_grp_reset_cb_t gh_vpm_grp_reset_fn;
+ static gh_all_res_populated_cb_t gh_all_res_populated_fn;
+ 
+-static DEFINE_MUTEX(gh_rm_call_idr_lock);
+ static DEFINE_MUTEX(gh_virtio_mmio_fn_lock);
+-static DEFINE_IDR(gh_rm_call_idr);
+-static DEFINE_MUTEX(gh_rm_send_lock);
+-
++
++static struct workqueue_struct *gh_rm_notif_wq;
++static bool gh_vm_status_registered;
++static bool gh_guest_pops_initialized;
+ static struct device_node *gh_rm_intc;
+ static struct irq_domain *gh_rm_irq_domain;
+ static u32 gh_rm_base_virq;
+@@ -245,7 +246,7 @@
+ 	memcpy(notif->msg, msg, msg_size);
+ 	INIT_WORK(&notif->work, gh_rm_notif_work);
+ 
+-	schedule_work(&notif->work);
++	queue_work(gh_rm_notif_wq, &notif->work);
+ 	return NOTIFY_DONE;
+ }
+ 
+@@ -975,7 +976,7 @@
+ 
+ static int gh_vm_probe(struct device *dev, struct device_node *hyp_root)
+ {
+-	struct device_node *node;
++	struct device_node *node __free(device_node) = NULL;
+ 	struct gh_vm_property temp_property = {0};
+ 	int vmid, owner_vmid, ret;
+ 	const char *vm_name;
+@@ -984,9 +985,9 @@
+ 
+ 	gh_init_vm_prop_table();
+ 
+-	node = of_find_compatible_node(hyp_root, NULL, "qcom,gunyah-vm-id-1.0");
++	node = of_get_compatible_child(hyp_root, "qcom,gunyah-vm-id-1.0");
+ 	if (IS_ERR_OR_NULL(node)) {
+-		node = of_find_compatible_node(hyp_root, NULL, "qcom,haven-vm-id-1.0");
++		node = of_get_compatible_child(hyp_root, "qcom,haven-vm-id-1.0");
+ 		if (IS_ERR_OR_NULL(node)) {
+ 			dev_err(dev, "Could not find vm-id node\n");
+ 			return -ENODEV;
+@@ -1033,7 +1034,10 @@
+ 
+ 		/* check peer to see if any VM has been bootup */
+ 		gh_vm_check_peer(dev, node);
+-		gh_rm_register_notifier(&gh_vm_status_nb);
++		ret = gh_rm_register_notifier(&gh_vm_status_nb);
++		if (ret)
++			return ret;
++		gh_vm_status_registered = true;
+ 		gh_rm_core_initialized = true;
+ 		/* Query RM for available resources */
+ 		schedule_work(&gh_rm_get_svm_res_work);
+@@ -1052,17 +1056,47 @@
+ 	{ }
+ };
+ 
++MODULE_DEVICE_TABLE(auxiliary, gh_rm_drv_id_table);
++
++static void gh_rm_cleanup(void)
++{
++	gunyah_rm_notifier_unregister(rm, &gh_rm_core_notifier_blk);
++	destroy_workqueue(gh_rm_notif_wq);
++	if (gh_vm_status_registered) {
++		gh_rm_unregister_notifier(&gh_vm_status_nb);
++		gh_vm_status_registered = false;
++	}
++	cancel_work_sync(&gh_rm_get_svm_res_work);
++	if (gh_guest_pops_initialized) {
++		gh_guest_pops_remove();
++		gh_guest_pops_initialized = false;
++	}
++	gh_rm_core_initialized = false;
++	of_node_put(gh_rm_intc);
++	gh_rm_intc = NULL;
++	gh_rm_irq_domain = NULL;
++	rm = NULL;
++}
++
+ static int gh_rm_drv_probe(struct auxiliary_device *adev,
+ 				const struct auxiliary_device_id *adev_id)
+ {
+ 	struct device *dev = &adev->dev;
+-	struct device *rm_dev = adev->dev.parent;
+-	struct device_node *node = rm_dev->of_node;
++	struct device_node *hyp_node __free(device_node) = NULL;
++	struct device_node *node __free(device_node) = NULL;
+ 	int ret;
+ 
+-	rm = rm_dev->driver_data;
++	rm = dev_get_platdata(dev);
+ 	if (!rm)
+-		dev_err(dev, "Failed to get the rm pointer\n");
++		return dev_err_probe(dev, -ENODEV, "Failed to get the rm pointer\n");
++
++	/* The 6.18 core's parent is a misc device without an OF node. */
++	hyp_node = of_find_node_by_path("/hypervisor");
++	if (!hyp_node)
++		return -ENODEV;
++	node = of_get_compatible_child(hyp_node, "gunyah-resource-manager");
++	if (!node)
++		return -ENODEV;
+ 
+ 	if (of_property_read_u32(node, "qcom,free-irq-start",
+ 				 &gh_rm_base_virq)) {
+@@ -1077,37 +1111,53 @@
+ 	}
+ 	gh_rm_irq_domain = irq_find_host(gh_rm_intc);
+ 	if (!gh_rm_irq_domain) {
+-		dev_err(dev, "Failed to get IRQ domain associated with RM\n");
+-		return -ENXIO;
++		ret = -EPROBE_DEFER;
++		goto put_intc;
++	}
++
++	gh_rm_notif_wq = alloc_workqueue("gh_rm_notif", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
++	if (!gh_rm_notif_wq) {
++		ret = -ENOMEM;
++		goto put_intc;
+ 	}
+ 
+ 	ret = gunyah_rm_notifier_register(rm, &gh_rm_core_notifier_blk);
+ 	if (ret) {
+ 		dev_err(dev, "Failed to register to RM notifier %d\n", ret);
+-		return ret;
++		destroy_workqueue(gh_rm_notif_wq);
++		goto put_intc;
+ 	}
+ 
+ 	/* Probe the vmid */
+-	ret = gh_vm_probe(dev, node->parent);
++	ret = gh_vm_probe(dev, hyp_node);
+ 	if (ret < 0 && ret != -ENODEV)
+-		return ret;
++		goto cleanup;
+ 
+ 	ret = gh_guest_pops_init();
+ 	if (ret < 0 && ret != -ENODEV)
+-		return ret;
++		goto cleanup;
++	gh_guest_pops_initialized = !ret;
+ 
+ 	ret = gh_rm_setup_feature_scm_assign();
+ 	if (ret)
+-		return ret;
++		goto cleanup;
+ 
+ 	return 0;
++
++cleanup:
++	gh_rm_cleanup();
++	return ret;
++put_intc:
++	of_node_put(gh_rm_intc);
++	gh_rm_intc = NULL;
++	gh_rm_irq_domain = NULL;
++	rm = NULL;
++	return ret;
+ }
+ 
+ static void gh_rm_drv_remove(struct auxiliary_device *adev)
+ {
+-	gh_guest_pops_remove();
+-	gunyah_rm_notifier_unregister(rm, &gh_rm_core_notifier_blk);
+-	idr_destroy(&gh_rm_call_idr);
++	gh_rm_cleanup();
+ }
+ 
+ static struct auxiliary_driver gh_rm_driver = {
+--- a/drivers/virt/gunyah/gh_rm_iface.c
++++ b/drivers/virt/gunyah/gh_rm_iface.c
+@@ -109,7 +109,7 @@
+ 	return 0;
+ }
+ 
+-void gh_reset_vm_prop_table_entry(gh_vmid_t vmid)
++static void gh_reset_vm_prop_table_entry(gh_vmid_t vmid)
+ {
+ 	size_t vm_name;
+ 
+--- a/include/linux/gunyah.h
++++ b/include/linux/gunyah.h
+@@ -18,6 +18,7 @@
+ #include <uapi/linux/gunyah.h>
+ 
+ struct gunyah_vm;
++struct gunyah_auth_desc;
+ 
+ int __must_check gunyah_vm_get(struct gunyah_vm *ghvm);
+ void gunyah_vm_put(struct gunyah_vm *ghvm);
+--- a/include/linux/gunyah/gh_rm_drv.h
++++ b/include/linux/gunyah/gh_rm_drv.h
+@@ -403,6 +403,8 @@
+ 			      struct gh_mem_attr_desc *mem_attr_desc,
+ 			      gh_memparcel_handle_t *handle);
+ int gh_rm_mem_release(gh_memparcel_handle_t handle, u8 flags);
++int gh_rm_mem_append(gh_memparcel_handle_t handle, u8 flags,
++		     struct gh_sgl_entry *sgl_entries, u32 n_sgl_entries);
+ int ghd_rm_mem_reclaim(gh_memparcel_handle_t handle, u8 flags);
+ struct gh_sgl_desc *gh_rm_mem_accept(gh_memparcel_handle_t handle, u8 mem_type,
+ 				     u8 trans_type, u32 flags, gh_label_t label,
+--- a/include/trace/events/qrtr.h
++++ b/include/trace/events/qrtr.h
+@@ -102,7 +102,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(ctrl_pkt_str, ctrl_pkt_str);
++		__assign_str(ctrl_pkt_str);
+ 		__entry->sq_node = sq_node;
+ 		__entry->sq_port = sq_port;
+ 	),
+--- a/net/qrtr/af_qrtr.c
++++ b/net/qrtr/af_qrtr.c
+@@ -13,6 +13,7 @@
+ #include <linux/wait.h>
+ #include <linux/rwsem.h>
+ #include <linux/uidgid.h>
++#include <linux/of.h>
+ #include <linux/of_device.h>
+ #include <linux/pm_wakeup.h>
+ #include <linux/completion.h>
+@@ -2409,11 +2410,11 @@
+ 
+ 	while ((np = of_find_compatible_node(np, NULL, compat))) {
+ 		ret = of_property_read_u32(np, "qcom,node-id", &node_id);
+-		of_node_put(np);
+ 		if (ret)
+ 			continue;
+ 
+ 		qrtr_local_nid = node_id;
++		of_node_put(np);
+ 		break;
+ 	}
+ }
+--- a/net/qrtr/gunyah.c
++++ b/net/qrtr/gunyah.c
+@@ -757,6 +757,9 @@
+ 		return ret;
+ 	}
+ 	qdev->master = of_property_read_bool(node, "qcom,master");
++	if (qdev->master && !IS_REACHABLE(CONFIG_GH_SECURE_VM_LOADER))
++		return dev_err_probe(qdev->dev, -EOPNOTSUPP,
++				     "Host transport requires the secure VM loader\n");
+ 
+ 	ret = qrtr_gunyah_map_memory(qdev);
+ 	if (ret)
+@@ -814,7 +817,7 @@
+ 	return ret;
+ }
+ 
+-static int qrtr_gunyah_remove(struct platform_device *pdev)
++static void qrtr_gunyah_remove(struct platform_device *pdev)
+ {
+ 	struct qrtr_gunyah_dev *qdev = dev_get_drvdata(&pdev->dev);
+ 	struct device_node *np;
+@@ -826,25 +829,25 @@
+ 	gh_dbl_rx_unregister(qdev->rx_dbl);
+ 
+ 	if (!qdev->master)
+-		return 0;
++		return;
+ 	gh_unregister_vm_notifier(&qdev->vm_nb);
+ 
+ 	if (ghd_rm_get_vmid(qdev->peer_name, &peer_vmid))
+-		return 0;
++		return;
+ 	if (ghd_rm_get_vmid(GH_PRIMARY_VM, &self_vmid))
+-		return 0;
++		return;
+ 	qrtr_gunyah_unshare_mem(qdev, self_vmid, peer_vmid);
+ 
+ 	np = of_parse_phandle(qdev->dev->of_node, "shared-buffer", 0);
+ 	if (np) {
+ 		of_node_put(np);
+-		return 0;
++		return;
+ 	}
+ 
+ 	dma_free_attrs(qdev->dev, qdev->size, qdev->base, qdev->res.start,
+ 		       DMA_ATTR_FORCE_CONTIGUOUS);
+ 
+-	return 0;
++	return;
+ }
+ 
+ static const struct of_device_id qrtr_gunyah_match_table[] = {

@@ -29,7 +29,7 @@ ddk_module(
     kconfig = "Kconfig",
     defconfig = "scm_defconfig",
     kernel_build = "//common:kernel_aarch64",
-    deps = [":scm_headers"],
+    deps = [":scm_headers", ":gh_rm_drv"],
 )
 
 ddk_headers(
@@ -621,6 +621,120 @@ ddk_module(
     deps = [":ufs_headers", ":storage_pmic_headers", ":platform_headers", ":scm_headers", ":clock_headers", ":phy_qcom_ufs", ":clk_qcom", ":qcom_ipc_logging", ":qcom_ice", ":ufshcd_crypto_qti"],
 )
 
+ddk_headers(
+    name = "gunyah_headers",
+    hdrs = glob(["drivers/virt/gunyah/*.h", "arch/arm64/gunyah/*.h", "arch/arm64/include/asm/gunyah/*.h"]) + [
+        "include/trace/events/gunyah.h",
+        "include/trace/events/qrtr.h",
+        "net/qrtr/qrtr.h",
+    ],
+    linux_includes = ["include", "arch/arm64/include"],
+)
+
+ddk_module(
+    name = "gh_arm_drv",
+    srcs = ["arch/arm64/gunyah/gh_arm.c", "arch/arm64/gunyah/irq.c", "arch/arm64/gunyah/reset.c"],
+    includes = ["drivers/virt/gunyah"],
+    out = "gh_arm_drv.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":gunyah_headers", ":scm_headers"],
+)
+
+ddk_module(
+    name = "gh_dbl",
+    srcs = ["drivers/virt/gunyah/gh_dbl.c"],
+    includes = ["drivers/virt/gunyah"],
+    out = "gh_dbl.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":gunyah_headers", ":scm_headers"],
+)
+
+ddk_module(
+    name = "gh_msgq",
+    srcs = ["drivers/virt/gunyah/gh_msgq.c"],
+    includes = ["drivers/virt/gunyah"],
+    out = "gh_msgq.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":gunyah_headers", ":scm_headers"],
+)
+
+ddk_module(
+    name = "gh_rm_drv",
+    srcs = ["drivers/virt/gunyah/gh_rm_core.c", "drivers/virt/gunyah/gh_rm_iface.c"],
+    includes = ["drivers/virt/gunyah"],
+    out = "gh_rm_drv.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":gunyah_headers", ":scm_headers", ":gh_arm_drv", ":gh_dbl", ":gh_msgq"],
+)
+
+ddk_module(
+    name = "gh_irq_lend",
+    srcs = ["drivers/virt/gunyah/gh_irq_lend.c"],
+    includes = ["drivers/virt/gunyah"],
+    out = "gh_irq_lend.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":gunyah_headers", ":scm_headers", ":gh_rm_drv"],
+)
+
+ddk_module(
+    name = "gh_mem_notifier",
+    srcs = ["drivers/virt/gunyah/gh_mem_notifier.c"],
+    includes = ["drivers/virt/gunyah"],
+    out = "gh_mem_notifier.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":gunyah_headers", ":scm_headers", ":gh_rm_drv"],
+)
+
+ddk_module(
+    name = "gh_ctrl",
+    srcs = ["drivers/virt/gunyah/gh_ctrl.c"],
+    includes = ["drivers/virt/gunyah"],
+    out = "gh_ctrl.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":gunyah_headers", ":scm_headers"],
+)
+
+ddk_headers(
+    name = "qrtr_headers",
+    hdrs = ["net/qrtr/qrtr.h", "include/trace/events/qrtr.h", "include/uapi/linux/qrtr.h"],
+    linux_includes = ["include", "include/uapi"],
+)
+
+ddk_module(
+    name = "qrtr",
+    srcs = ["net/qrtr/af_qrtr.c", "net/qrtr/ns.c", "net/qrtr/qrtr.h"],
+    out = "qrtr.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":qrtr_headers", ":platform_headers", ":qcom_ipc_logging"],
+)
+
+ddk_module(
+    name = "qrtr_gunyah",
+    srcs = ["net/qrtr/gunyah.c"],
+    includes = ["drivers/virt/gunyah"],
+    out = "qrtr-gunyah.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":gunyah_headers", ":scm_headers", ":gh_rm_drv", ":gh_msgq", ":qrtr", ":gh_dbl", ":qcom_scm"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -659,6 +773,15 @@ kernel_module_group(
         ":qcom_ice",
         ":ufshcd_crypto_qti",
         ":ufs_qcom",
+        ":gh_arm_drv",
+        ":gh_dbl",
+        ":gh_msgq",
+        ":gh_rm_drv",
+        ":gh_irq_lend",
+        ":gh_mem_notifier",
+        ":gh_ctrl",
+        ":qrtr_gunyah",
+        ":qrtr",
     ],
 )
 

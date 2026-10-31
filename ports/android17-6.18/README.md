@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 48 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 57 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 48 platform `.ko` files, their symbol tables and DDK configurations.
+- 57 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 1799
-imported symbol CRCs across all 48 modules.
+used. The current [validation report](validation-20261031.json) checks 2178
+imported symbol CRCs across all 57 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -125,11 +125,30 @@ configuration. Common Kconfig also selects `QCOM_TZMEM`; the vendor composite
 module uses its own included QTEE allocator and does not link the upstream
 TZMEM implementation. These module options do not change the stock GKI config.
 
-Vendor Gunyah RM is not yet ported/enabled. SCM therefore uses the pinned
-vendor header's existing HLOS fallback, which retains SCM memory assignment
-and does not perform secondary-VM identity substitution. This does not
-establish support for secondary VMs. The Tuna VM match and soft dependency
-are preserved, but its VM IRQ provider is not built yet.
+The Gunyah group builds `gh_arm_drv`, `gh_dbl`, `gh_msgq`, `gh_rm_drv`,
+`gh_irq_lend`, `gh_mem_notifier` and `gh_ctrl`. It retains the Onyx hypercall
+wrappers and RPC payloads while using the pinned 6.18 resource-manager API.
+The vendor RM obtains its context from the auxiliary device's platform data
+and looks up the Onyx `/hypervisor` device-tree children explicitly. Probe
+failure and removal unregister the RM notifier and drain a dedicated workqueue
+before releasing context; VM-status and guest-power cleanup track successful
+registration. The auxiliary aliases are included in module metadata.
+
+SCM now declares its dependency on `gh_rm_drv` and enables the real VM identity
+and memory-assignment helpers instead of the optional header fallbacks.
+Firmware negotiation and secondary-VM operation remain untested.
+
+The QRTR group builds the pinned Onyx core, name service and Gunyah transport,
+including the vendor routing, wakeup and process-deletion interfaces. The node
+ID and wakeup defaults remain 1 and 0 ms, with the baseline DT override. Trace
+strings use the 6.18 API, and the node-ID walk releases each node exactly once.
+The secure-VM loader and guest-power drivers are not ported. A QRTR node with
+`qcom,master` therefore reports `-EOPNOTSUPP` before allocating transport
+resources; it cannot silently probe without its VM lifecycle notifier.
+Guest-mode transport compiles but is not runtime-tested. The Tuna VM IRQ-chip
+provider is still missing. Checkpatch finds no code-style warnings or errors
+in this adaptation patch (commit-message and sign-off checks do not apply to
+the stored source diff).
 
 ## Baseline inventory
 
@@ -152,7 +171,8 @@ changes are captured for later porting; they are not in this initial group.
 
 ## Next implementation gates
 
-1. Complete the Gunyah host/VM and IOMMU dependencies needed for Onyx early boot.
+1. Complete the Gunyah secure-VM loader, VM IRQ-chip and IOMMU dependencies
+   needed for Onyx early boot.
    Test UFS/encryption, probe ordering, GPIO wakeups, SCM wait queues and
    shared-memory operations.
 2. Port the device trees and remaining first-stage list; produce matching
