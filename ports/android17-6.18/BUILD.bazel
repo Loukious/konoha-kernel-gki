@@ -2201,9 +2201,22 @@ ddk_module(
     visibility = ["//visibility:public"],
 )
 
+ddk_module(
+    name = "dwc3_msm",
+    srcs = ["drivers/usb/dwc3/dwc3-msm-core.c", "drivers/usb/dwc3/dwc3-msm-ops.c", "drivers/usb/dwc3/debug_ipc.c", "drivers/usb/dwc3/debug-ipc.h", "include/linux/usb/redriver.h", "include/linux/soc/qcom/wcd939x-i2c.h", "drivers/usb/dwc3/core.h", "drivers/usb/dwc3/gadget.h", "drivers/usb/dwc3/debug.h", "drivers/usb/dwc3/io.h", "drivers/usb/dwc3/trace.h", "drivers/usb/host/xhci.h", "drivers/usb/host/xhci-ext-caps.h", "drivers/usb/host/pci-quirks.h", "drivers/usb/host/xhci-port.h", "drivers/usb/host/xhci-caps.h"],
+    out = "dwc3-msm.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    includes = ["drivers/usb/dwc3", "drivers/usb/host"],
+    linux_includes = ["include"],
+    deps = [":usb_phy_headers", ":platform_headers", ":qcom_ipc_logging", ":clock_headers", ":clk_qcom", ":usb_repeater", ":mca_headers", ":mca_sysfs", ":wcd_headers", ":wcd_usbss_i2c", ":redriver_headers", ":redriver"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
+        ":dwc3_msm",
         ":panel_event_notifier",
         ":pm8941_pwrkey",
         ":mi_fp",

@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 172 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 173 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 172 platform `.ko` files, their symbol tables and DDK configurations.
+- 173 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 7740
-imported symbol CRCs across all 172 modules.
+used. The current [validation report](validation-20261031.json) checks 7949
+imported symbol CRCs across all 173 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -874,3 +874,29 @@ names (36.7%); 295 remain to assess or port, including alternative hardware.
 Host tests do not establish live kernel/VFS/IRQ/SRCU, hardware or boot behavior.
 Matching images, remaining drivers and installer verification are still needed
 before a flashable ZIP exists.
+
+
+DWC3-MSM adds the Onyx USB controller with real redriver, clock, repeater, WCD
+and MCA providers. Register/hook APIs match pinned common; all sixteen hook
+symbols and signatures are verified against source and the built System.map.
+Probe/remove and host-role failures unwind resources; GSI DMA allocation is
+transactional and bounded. A core-remove wrapper frees GSI buffers after core
+quiescence and before platform-bus IOMMU detachment. Role-switch handles detach
+from their owner; extcon callbacks clear/drain owner access before removal.
+
+Published PM/remove/audio callback storage and module text remain resident
+because their call sites have no replacement grace period. Extcon raw-notifier
+storage remains as detached tombstones for the same reason. These are deliberate
+lifetime limits; the module cannot unload after permanent publication. Onyx
+continues to use high-speed eUSB2/NOP PHY with QMP/DP disabled. Gadget transports
+and their userspace configuration remain separate work. Checkpatch has three
+CONST_STRUCT advisories for runtime-initialized PM tables/pointers.
+
+`verify_dwc.py` passes extracted ASan/UBSan allocation/IRQ/clock/power cases,
+callback withdrawal, PM/hook scoping, core-removal ordering and bounded debug
+indices. It does not test actual kprobe registration, DMA/electrical behavior,
+live kernel timing or boot. The 173-module combined build passes 7,949 imported
+symbol CRCs with no compiler/modpost warnings; device-tree verification passes
+with the existing 1,084 DTC warnings. Coverage is 172/466 vendor names (36.9%),
+with 294 remaining to assess or port. Image assembly and the remaining driver
+stack are still required for a flashable ZIP.
