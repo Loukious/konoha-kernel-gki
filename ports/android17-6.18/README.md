@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 213 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 217 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 213 platform `.ko` files, their symbol tables and DDK configurations.
+- 217 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 11,459
-imported symbol CRCs across all 213 modules.
+used. The current [validation report](validation-20261031.json) checks 11,592
+imported symbol CRCs across all 217 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1221,3 +1221,42 @@ all seventeen imported WLAN support C/header files and ten core monitor/direct
 injection source files are identical. Other differences include configuration,
 regulatory source, build files and userspace Sigma tools. The main Wi-Fi driver
 and its monitor/injection operation on 6.18 remain separate pending work.
+
+
+## WLAN base and charger protection
+
+Native WLAN generic-netlink and preallocation providers preserve the ROM family,
+groups, exports and pool sizing tables. Command IDs and duplicate registrations
+are validated; immutable callback/context pairs are withdrawn through SRCU before
+release. Pool creation unwinds partial failures. Failed tracker growth preserves
+old allocations, borrowed buffers retain module/pool storage, and a different
+device cannot replace storage with outstanding borrowers. Deinit stops new
+allocations while allowing existing buffers to return. A later deinit releases
+retained pools once all borrowers return. Buffers are explicitly zeroed, including
+reserve allocations. [Integrated tests](wlan-base-validation-20261031.json) cover
+15 setup failures, failed tracker growth, 4,000 concurrent borrow attempts,
+100 lifecycle cycles, all 256 command IDs and 200 callback-withdrawal drains.
+They use mock allocators/netlink and pthread SRCU and do not establish live
+reserve allocator, IRQ, module teardown, monitor/injection or WLAN operation.
+Status callbacks unregister outside their own callback.
+
+The connector-temperature and liquid-detection modules retain their Onyx
+properties and aliases. Getter withdrawal drains active users and reports
+-ENODEV for absent providers. Connector protection owns its MOS GPIO and queue,
+keeps rate history per device, validates temperature readings and packed boost
+dimensions, and inhibits software charging on sensor errors. Removal/shutdown
+withdraw callbacks and drain policy work. Failed recovery leaves protection
+latched. The [connector tests](antiburn-validation-20261031.json) and
+[liquid-detection tests](lpd-validation-20261031.json) cover probe failures,
+callback/worker drains, sensor/property errors, single-sensor operation,
+hysteresis, failed GPIO recovery, long uptime and the actual 18-property Onyx
+profile. Native cached thermal-zone lifetimes and the adapter VBUS helper remain
+unverified; mocked tests do not establish electrical protection or phone safety.
+
+The combined 217-module archive `artifacts/20261031T132957264826Z` passes
+11,592 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
+and overlay checks pass with 1,084 existing vendor DTC warnings. Built ROM module
+coverage is 215/466 (46.1%), leaving 251 names to assess or port, including
+alternative hardware. The main WLAN and remaining transport review, PCIe/MHI,
+audio, camera/video, other device interfaces and image/installer packaging are
+still in progress. There is no flashable 6.18 ZIP or phone validation yet.

@@ -1,0 +1,36 @@
+{
+  "tests": {
+    "wlan_prealloc": {
+      "initialization_faults": 15,
+      "tracker_failure_preserves_borrowers": true,
+      "returned_buffers_zeroed": true,
+      "borrowers_prevent_destroy_and_wrong_device_replacement": true,
+      "double_and_foreign_returns": true,
+      "concurrent_borrow_attempts": 4000,
+      "concurrent_lifecycle_cycles": 100
+    },
+    "wlan_netlink": {
+      "command_bounds": 256,
+      "duplicate_and_allocation_errors": true,
+      "callback_context_pair": true,
+      "threaded_unregister_drain": 200,
+      "registration_reentry": true
+    }
+  },
+  "source_sha256": {
+    "platform/cnss_genl/cnss_nl.c": "0b6fcf83cefda902d52934a6cdca29882fe4b40fd01ee24dac3bcb94b63b7c3a",
+    "platform/cnss_prealloc/cnss_prealloc.c": "25c787137991dc6045b10090f7ac25747e2dfde606e66acd063eec26d2f8f06b",
+    "platform/cnss_utils/cnss_common.h": "1e3ab5f2e6f9ed6124c305d6d07415129b6cc787e78ef35529dcf72c1bacddc1",
+    "platform/inc/cnss_nl.h": "710f9d3b94a1ee793e8b7c36418768e5bcdcdb59c793092afb2f346fc7b13a51",
+    "platform/inc/cnss_prealloc.h": "94b12dd58a45e132bae9d9cdf265a77255a23442fbef5d0aff7ca120f7e3ba34"
+  },
+  "harness_sha256": {
+    "wlan_prealloc.c": "b95f7ce3d8979d4870d671521e6041afb0b266d9ff734a21e2ce93035bcb298e",
+    "wlan_netlink.c": "be6de972f98fbe2f55a1a4d3a2a0adc6baa7eb14ef7c6bdbfedb8e2fedf2f871"
+  },
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Production callback/pool functions and native sizing tables with mocked slab/mempool/netlink APIs and pthread SRCU. No live reserve allocator, IRQ semantics, kernel module teardown, firmware, WLAN capture/injection or phone validation."
+}

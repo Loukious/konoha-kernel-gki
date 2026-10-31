@@ -2728,6 +2728,58 @@ ddk_module(
     visibility = ["//visibility:public"],
 )
 
+ddk_headers(
+    name = "wlan_base_headers",
+    hdrs = ["platform/cnss_utils/cnss_common.h", "platform/inc/cnss_nl.h", "platform/inc/cnss_prealloc.h"],
+    includes = ["platform/inc", "platform/cnss_utils"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "cnss_prealloc",
+    srcs = ["platform/cnss_prealloc/cnss_prealloc.c"],
+    out = "cnss_prealloc.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":wlan_base_headers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "cnss_nl",
+    srcs = ["platform/cnss_genl/cnss_nl.c"],
+    out = "cnss_nl.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":wlan_base_headers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_connector_antiburn",
+    srcs = ["drivers/power/supply/mca/mca_hardware_monitor/mca_connector_antiburn.c", "drivers/power/supply/mca/mca_hardware_monitor/inc/mca_connector_antiburn.h"],
+    out = "mca_connector_antiburn.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mca_headers", ":chargehw_headers", ":chargepolicy_headers", ":mca_common", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_sysfs", ":mca_hwid", ":mca_workqueue", ":mca_charge_mievent", ":mca_platform_buckchg_class", ":mca_strategy_class", ":mca_protocol_class", ":mca_protocol_pd_class"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_lpd_detect",
+    srcs = ["drivers/power/supply/mca/mca_hardware_monitor/mca_lpd_detect.c", "drivers/power/supply/mca/mca_hardware_monitor/inc/mca_lpd_detect.h"],
+    out = "mca_lpd_detect.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":mca_headers", ":chargehw_headers", ":chargepolicy_headers", ":mca_common", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_sysfs", ":mca_hwid", ":mca_workqueue", ":mca_charge_mievent", ":mca_platform_buckchg_class", ":mca_strategy_class", ":mca_protocol_class", ":mca_protocol_pd_class"],
+    visibility = ["//visibility:public"],
+)
+
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -2931,6 +2983,10 @@ kernel_module_group(
         ":nt36532_touch",
         ":gpr_dlkm",
         ":mca_strategy_buckchg",
+        ":cnss_prealloc",
+        ":cnss_nl",
+        ":mca_connector_antiburn",
+        ":mca_lpd_detect",
     ],
 )
 
