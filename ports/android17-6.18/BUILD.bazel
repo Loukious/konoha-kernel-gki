@@ -1120,6 +1120,50 @@ ddk_module(
     deps = [":pmu_headers", ":cache_irq_headers", ":scmi_vendor_headers", ":cpu_phys_log_map", ":qcom_llcc_pmu", ":qcom_scmi_client"],
 )
 
+ddk_headers(
+    name = "cpufreq_headers",
+    hdrs = ["include/linux/qcom-cpufreq-hw.h", "include/trace/events/dcvsh.h"],
+    linux_includes = ["include"],
+)
+
+ddk_module(
+    name = "qcom_cpufreq_hw",
+    srcs = ["drivers/cpufreq/qcom-cpufreq-hw.c"],
+    out = "qcom-cpufreq-hw.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":cpufreq_headers"],
+)
+
+ddk_module(
+    name = "qcom_cpufreq_thermal",
+    srcs = ["drivers/cpufreq/qcom-cpufreq-thermal.c"],
+    out = "qcom-cpufreq-thermal.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":cpufreq_headers"],
+)
+
+ddk_module(
+    name = "nvmem_qfprom",
+    srcs = ["drivers/nvmem/qfprom.c"],
+    out = "nvmem_qfprom.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+)
+
+ddk_module(
+    name = "qfprom_sys",
+    srcs = ["drivers/soc/qcom/qfprom-sys.c"],
+    out = "qfprom-sys.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -1193,6 +1237,10 @@ kernel_module_group(
         ":dcvs_fp",
         ":qcom_dcvs",
         ":qcom_pmu_lib",
+        ":qfprom_sys",
+        ":nvmem_qfprom",
+        ":qcom_cpufreq_thermal",
+        ":qcom_cpufreq_hw",
     ],
 )
 

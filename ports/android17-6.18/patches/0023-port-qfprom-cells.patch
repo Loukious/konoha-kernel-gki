@@ -1,0 +1,101 @@
+--- a/drivers/soc/qcom/qfprom-sys.c
++++ b/drivers/soc/qcom/qfprom-sys.c
+@@ -20,7 +20,7 @@
+ };
+ 
+ static ssize_t qfprom_sys_cell_read(struct file *filp, struct kobject *kobj,
+-				struct bin_attribute *attr,
++				const struct bin_attribute *attr,
+ 				char *buf, loff_t pos, size_t count)
+ {
+ 	struct nvmem_cell *cell;
+@@ -31,12 +31,18 @@
+ 	if (!cell)
+ 		return -EINVAL;
+ 
++	if (pos < 0)
++		return -EINVAL;
+ 	data = nvmem_cell_read(cell, &len);
+ 	if (IS_ERR(data))
+-		return -EINVAL;
++		return PTR_ERR(data);
+ 
+-	len = min(len, count);
+-	memcpy(buf, data, len);
++	if (pos >= len) {
++		kfree(data);
++		return 0;
++	}
++	len = min_t(size_t, len - pos, count);
++	memcpy(buf, data + pos, len);
+ 	kfree(data);
+ 	return len;
+ }
+@@ -58,28 +64,28 @@
+ 	if (!priv)
+ 		return -ENOMEM;
+ 
+-	priv->cells = devm_kzalloc(dev,
+-				cell_count * sizeof(struct nvmem_cell *),
+-				GFP_KERNEL);
++	priv->cells = devm_kcalloc(dev, cell_count, sizeof(*priv->cells), GFP_KERNEL);
+ 	if (!priv->cells)
+ 		return -ENOMEM;
+ 
+-	cells = devm_kzalloc(dev, cell_count * sizeof(char *), GFP_KERNEL);
++	cells = devm_kcalloc(dev, cell_count, sizeof(*cells), GFP_KERNEL);
+ 	if (!cells)
+ 		return -ENOMEM;
+ 
+-	priv->attrs = devm_kzalloc(dev,
+-			cell_count * sizeof(struct bin_attribute *),
+-			GFP_KERNEL);
++	priv->attrs = devm_kcalloc(dev, cell_count, sizeof(*priv->attrs), GFP_KERNEL);
+ 	if (!priv->attrs)
+ 		return -ENOMEM;
+ 
+ 	ret = of_property_read_string_array(dev->of_node, "nvmem-cell-names",
+ 						cells, cell_count);
++	if (ret < 0)
++		return ret;
++	if (ret != cell_count)
++		return -EINVAL;
+ 
+ 	for (i = 0; i < cell_count; i++) {
+ 		cell = nvmem_cell_get(dev, cells[i]);
+-		if (IS_ERR_OR_NULL(cell)) {
++		if (IS_ERR(cell)) {
+ 			ret = PTR_ERR(cell);
+ 			dev_err(dev, "cell corresponding to %s not found\n",
+ 					cells[i]);
+@@ -110,7 +116,7 @@
+ 	}
+ 
+ 	priv->cell_count = cell_count;
+-	dev->platform_data = priv;
++	platform_set_drvdata(pdev, priv);
+ 	return 0;
+ 
+ remove_cells:
+@@ -122,18 +128,16 @@
+ 	return ret;
+ }
+ 
+-static int qfprom_sys_remove(struct platform_device *pdev)
++static void qfprom_sys_remove(struct platform_device *pdev)
+ {
+ 	struct qfprom_sys *priv;
+ 	int i;
+ 
+-	priv = dev_get_platdata(&pdev->dev);
++	priv = platform_get_drvdata(pdev);
+ 	for (i = 0; i < priv->cell_count; i++) {
++		sysfs_remove_bin_file(&pdev->dev.kobj, priv->attrs[i]);
+ 		nvmem_cell_put(priv->cells[i]);
+-		sysfs_remove_bin_file(&pdev->dev.kobj, priv->attrs[i]);
+ 	}
+-
+-	return 0;
+ }
+ 
+ static const struct of_device_id qfprom_sys_of_match[] = {
