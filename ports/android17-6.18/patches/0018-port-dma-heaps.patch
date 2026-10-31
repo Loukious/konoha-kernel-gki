@@ -1,0 +1,619 @@
+--- a/drivers/dma-buf/heaps/qcom_dma_heap_priv.h
++++ b/drivers/dma-buf/heaps/qcom_dma_heap_priv.h
+@@ -14,6 +14,9 @@
+ #include <linux/fs.h>
+ 
+ #include <linux/mem-buf-exporter.h>
++
++struct dma_heap *qcom_dma_heap_add(const struct dma_heap_export_info *exp_info,
++				   long (*get_pool_size)(struct dma_heap *heap));
+ 
+ void qcom_store_dma_buf_fops(struct file *file);
+ 
+--- a/drivers/dma-buf/heaps/qcom_dma_heap.c
++++ b/drivers/dma-buf/heaps/qcom_dma_heap.c
+@@ -8,6 +8,8 @@
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/err.h>
++#include <linux/kobject.h>
++#include <linux/slab.h>
+ 
+ #include <linux/qcom_dma_heap.h>
+ #include <linux/qcom_tvm_heap.h>
+@@ -19,19 +21,92 @@
+ #include "qcom_dma_heap_priv.h"
+ #include "qcom_system_movable_heap.h"
+ 
+-/*
+- * We cache the file ops used by DMA-BUFs so that a user with a struct file
+- * pointer can determine if that file is for a DMA-BUF. We can't initialize
+- * the pointer here at compile time as ERR_PTR() evaluates to a function.
+- */
+-#define FOPS_INIT_VAL ERR_PTR(-EINVAL)
++/* The registered heaps and their callbacks remain for the kernel lifetime. */
++struct qcom_heap_stats {
++	struct list_head list;
++	struct dma_heap *heap;
++	long (*get_pool_size)(struct dma_heap *heap);
++};
++
++static LIST_HEAD(heap_stats_list);
++static DEFINE_MUTEX(heap_stats_lock);
++static struct kobject *dma_heap_kobject;
+ static const struct file_operations *dma_buf_cached_fops;
++
++struct dma_heap *qcom_dma_heap_add(const struct dma_heap_export_info *exp_info,
++				   long (*get_pool_size)(struct dma_heap *heap))
++{
++	struct qcom_heap_stats *stats;
++	struct dma_heap *heap;
++
++	stats = kzalloc(sizeof(*stats), GFP_KERNEL);
++	if (!stats)
++		return ERR_PTR(-ENOMEM);
++
++	heap = dma_heap_add(exp_info);
++	if (IS_ERR(heap)) {
++		kfree(stats);
++		return heap;
++	}
++
++	stats->heap = heap;
++	stats->get_pool_size = get_pool_size;
++	mutex_lock(&heap_stats_lock);
++	list_add_tail(&stats->list, &heap_stats_list);
++	mutex_unlock(&heap_stats_lock);
++	return heap;
++}
++
++static u64 qcom_heap_pool_size_kb(void)
++{
++	struct qcom_heap_stats *stats;
++	u64 total = 0;
++
++	lockdep_assert_held(&heap_stats_lock);
++	list_for_each_entry(stats, &heap_stats_list, list)
++		total += stats->get_pool_size(stats->heap);
++
++	return total / 1024;
++}
++
++long dma_heap_try_get_pool_size_kb(void)
++{
++	long total;
++
++	if (!mutex_trylock(&heap_stats_lock))
++		return -1;
++
++	total = qcom_heap_pool_size_kb();
++	mutex_unlock(&heap_stats_lock);
++	return total;
++}
++EXPORT_SYMBOL_GPL(dma_heap_try_get_pool_size_kb);
++
++static ssize_t total_pools_kb_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	u64 total;
++
++	mutex_lock(&heap_stats_lock);
++	total = qcom_heap_pool_size_kb();
++	mutex_unlock(&heap_stats_lock);
++	return sysfs_emit(buf, "%llu\n", total);
++}
++
++static struct kobj_attribute total_pools_kb_attr = __ATTR_RO(total_pools_kb);
+ 
+ static int qcom_dma_heap_probe(struct platform_device *pdev)
+ {
+ 	int ret = 0;
+ 	int i;
+ 	struct platform_data *heaps;
++
++	if (!mem_buf_is_ready())
++		return -EPROBE_DEFER;
++
++	heaps = parse_heap_dt(pdev);
++	if (IS_ERR(heaps))
++		return PTR_ERR(heaps);
+ 
+ 	qcom_system_heap_create("qcom,system", "system", false);
+ #ifdef CONFIG_QCOM_DMABUF_HEAPS_SYSTEM_UNCACHED
+@@ -43,10 +118,6 @@
+ 				       QCOM_DMA_HEAP_FLAG_CP_NON_PIXEL);
+ 	qcom_sys_movable_heap_create();
+ 
+-	heaps = parse_heap_dt(pdev);
+-	if (IS_ERR_OR_NULL(heaps))
+-		return PTR_ERR(heaps);
+-
+ 	for (i = 0; i < heaps->nr; i++) {
+ 		struct platform_heap *heap_data = &heaps->heaps[i];
+ 
+@@ -78,21 +149,18 @@
+ 
+ 	free_pdata(heaps);
+ 
+-	dma_buf_cached_fops = FOPS_INIT_VAL;
+-
+ 	return ret;
+ }
+ 
+ void qcom_store_dma_buf_fops(struct file *file)
+ {
+-	if (dma_buf_cached_fops == FOPS_INIT_VAL)
+-		dma_buf_cached_fops = file->f_op;
++	cmpxchg(&dma_buf_cached_fops, NULL, file->f_op);
+ }
+ EXPORT_SYMBOL(qcom_store_dma_buf_fops);
+ 
+ bool qcom_is_dma_buf_file(struct file *file)
+ {
+-	return file->f_op == dma_buf_cached_fops;
++	return file->f_op == READ_ONCE(dma_buf_cached_fops);
+ }
+ EXPORT_SYMBOL(qcom_is_dma_buf_file);
+ 
+@@ -105,14 +173,35 @@
+ 	.probe = qcom_dma_heap_probe,
+ 	.driver = {
+ 		.name = "qcom-dma-heap",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = qcom_dma_heap_match_table,
+ 	},
+ };
+ 
+ static int __init init_heap_driver(void)
+ {
+-	return platform_driver_register(&qcom_dma_heap_driver);
++	int ret;
++
++	dma_heap_kobject = kobject_create_and_add("dma_heap", kernel_kobj);
++	if (!dma_heap_kobject)
++		return -ENOMEM;
++
++	ret = sysfs_create_file(dma_heap_kobject, &total_pools_kb_attr.attr);
++	if (ret)
++		goto put_kobject;
++
++	ret = platform_driver_register(&qcom_dma_heap_driver);
++	if (!ret)
++		return 0;
++
++	sysfs_remove_file(dma_heap_kobject, &total_pools_kb_attr.attr);
++put_kobject:
++	kobject_put(dma_heap_kobject);
++	return ret;
+ }
+ module_init(init_heap_driver);
+ 
++MODULE_DESCRIPTION("Qualcomm DMA-BUF heaps");
+ MODULE_LICENSE("GPL");
++MODULE_IMPORT_NS("DMA_BUF");
++MODULE_IMPORT_NS("DMA_BUF_HEAP");
+--- a/drivers/dma-buf/heaps/qcom_dt_parser.c
++++ b/drivers/dma-buf/heaps/qcom_dt_parser.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/of.h>
++#include <linux/of_device.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+ #include <linux/of_platform.h>
+@@ -102,21 +103,13 @@
+ 	return ret;
+ }
+ 
+-static void release_reserved_memory_regions(struct platform_heap *heaps,
+-					    int idx)
++static void release_heap_devices(struct platform_heap *heaps, int count)
+ {
+-	struct device *dev;
+-	struct device_node *node, *mem_node;
++	while (count--) {
++		struct device *dev = heaps[count].dev;
+ 
+-	for (idx = idx - 1; idx >= 0; idx--) {
+-		dev = heaps[idx].dev;
+-		node = dev->of_node;
+-		mem_node = of_parse_phandle(node, "memory-region", 0);
+-
+-		if (mem_node)
+-			of_reserved_mem_device_release(dev);
+-
+-		of_node_put(mem_node);
++		of_reserved_mem_device_release(dev);
++		of_platform_device_destroy(dev, NULL);
+ 	}
+ }
+ 
+@@ -152,30 +145,32 @@
+ 	}
+ 
+ 	for_each_available_child_of_node(dt_node, node) {
++		struct platform_heap *heap = &pdata->heaps[idx];
++
+ 		new_dev = of_platform_device_create(node, NULL, &pdev->dev);
+ 		if (!new_dev) {
+ 			pr_err("Failed to create device %s\n", node->name);
+ 			ret = -EINVAL;
+ 			goto free_heaps;
+ 		}
+-		of_dma_configure(&new_dev->dev, node, true);
++		heap->dev = &new_dev->dev;
++		idx++;
++		ret = of_dma_configure(heap->dev, node, true);
++		if (ret)
++			goto free_heaps;
+ 
+-		pdata->heaps[idx].dev = &new_dev->dev;
+-
+-		ret = populate_heap(node, &pdata->heaps[idx]);
++		ret = populate_heap(node, heap);
+ 		if (ret)
+ 			goto free_heaps;
+ 
+ 		mem_node = of_parse_phandle(node, "memory-region", 0);
+ 		if (mem_node) {
+-			ret = heap_dt_init(mem_node, &pdata->heaps[idx]);
++			ret = heap_dt_init(mem_node, heap);
++			of_node_put(mem_node);
+ 			if (ret)
+ 				goto free_heaps;
+-
+-			of_node_put(mem_node);
+ 		}
+ 
+-		++idx;
+ 	}
+ 
+ out:
+@@ -183,7 +178,7 @@
+ 
+ free_heaps:
+ 	of_node_put(node);
+-	release_reserved_memory_regions(pdata->heaps, idx);
++	release_heap_devices(pdata->heaps, idx);
+ 	free_pdata(pdata);
+ 	return ERR_PTR(ret);
+ }
+--- a/drivers/dma-buf/heaps/qcom_sg_ops.c
++++ b/drivers/dma-buf/heaps/qcom_sg_ops.c
+@@ -35,15 +35,15 @@
+ 
+ #include "qcom_sg_ops.h"
+ 
+-int proxy_invalid_map(struct device *dev, struct sg_table *table,
+-		      struct dma_buf *dmabuf)
++static int proxy_invalid_map(struct device *dev, struct sg_table *table,
++			     struct dma_buf *dmabuf)
+ {
+ 	WARN(1, "Trying to map with SMMU proxy driver when it has not fully probed!\n");
+ 	return -EINVAL;
+ }
+ 
+-void proxy_invalid_unmap(struct device *dev, struct sg_table *table,
+-			 struct dma_buf *dmabuf)
++static void proxy_invalid_unmap(struct device *dev, struct sg_table *table,
++				struct dma_buf *dmabuf)
+ {
+ 	WARN(1, "Trying to unmap with SMMU proxy driver when it has not fully probed!\n");
+ }
+--- a/drivers/dma-buf/heaps/qcom_system_heap.c
++++ b/drivers/dma-buf/heaps/qcom_system_heap.c
+@@ -59,7 +59,6 @@
+ #include "qcom_sg_ops.h"
+ #include "qcom_system_heap.h"
+ #include "qcom_system_movable_heap.h"
+-#include "../../../mm/internal.h"
+ 
+ #if IS_ENABLED(CONFIG_QCOM_DMABUF_HEAPS_PAGE_POOL_REFILL)
+ #define DYNAMIC_POOL_FILL_MARK (100 * SZ_1M)
+@@ -148,7 +147,7 @@
+ 		return true;
+ 
+ 	/* For a high-order request, check at least one suitable page is free */
+-	for (o = order; o < MAX_ORDER; o++) {
++	for (o = order; o < NR_PAGE_ORDERS; o++) {
+ 		struct free_area *area = &z->free_area[o];
+ 		int mt;
+ 
+@@ -164,7 +163,7 @@
+ 			if (mt == MIGRATE_CMA)
+ 				continue;
+ #endif
+-			if (!free_area_empty(area, mt))
++			if (!list_empty(&area->free_list[mt]))
+ 				return true;
+ 		}
+ 	}
+@@ -576,7 +575,6 @@
+ 
+ static const struct dma_heap_ops system_heap_ops = {
+ 	.allocate = system_heap_allocate,
+-	.get_pool_size = get_pool_size_bytes,
+ };
+ 
+ void qcom_system_heap_create(const char *name, const char *system_alias, bool uncached)
+@@ -612,7 +610,7 @@
+ 	if (ret)
+ 		goto free_pools;
+ 
+-	heap = dma_heap_add(&exp_info);
++	heap = qcom_dma_heap_add(&exp_info, get_pool_size_bytes);
+ 	if (IS_ERR(heap)) {
+ 		ret = PTR_ERR(heap);
+ 		goto stop_worker;
+@@ -627,7 +625,7 @@
+ 	if (system_alias != NULL) {
+ 		exp_info.name = system_alias;
+ 
+-		heap = dma_heap_add(&exp_info);
++		heap = qcom_dma_heap_add(&exp_info, get_pool_size_bytes);
+ 		if (IS_ERR(heap)) {
+ 			pr_err("%s: Failed to create '%s', error is %ld\n", __func__,
+ 			       system_alias, PTR_ERR(heap));
+--- a/drivers/dma-buf/heaps/qcom_dynamic_page_pool.c
++++ b/drivers/dma-buf/heaps/qcom_dynamic_page_pool.c
+@@ -76,20 +76,26 @@
+ 
+ int dynamic_page_pool_total(struct dynamic_page_pool *pool, bool high)
+ {
+-	int count = pool->low_count;
++	int count = READ_ONCE(pool->low_count);
+ 
+ 	if (high)
+-		count += pool->high_count;
++		count += READ_ONCE(pool->high_count);
+ 
+ 	return count << pool->order;
+ }
+ 
+-struct dynamic_page_pool *dynamic_page_pool_create(gfp_t gfp_mask, unsigned int order)
++static struct dynamic_page_pool *dynamic_page_pool_create(gfp_t gfp_mask, unsigned int order,
++							  int vmid, prerelease_callback callback)
+ {
+ 	struct dynamic_page_pool *pool = kmalloc(sizeof(*pool), GFP_KERNEL);
+ 
+ 	if (!pool)
+ 		return NULL;
++	pool->vmid = vmid;
++	pool->prerelease_callback = callback;
++	atomic_set(&pool->count, 0);
++	pool->last_low_watermark_ktime = 0;
++	pool->refill_worker = NULL;
+ 	pool->high_count = 0;
+ 	pool->low_count = 0;
+ 	INIT_LIST_HEAD(&pool->low_items);
+@@ -105,7 +111,7 @@
+ 	return pool;
+ }
+ 
+-void dynamic_page_pool_destroy(struct dynamic_page_pool *pool)
++static void dynamic_page_pool_destroy(struct dynamic_page_pool *pool)
+ {
+ 	struct page *page, *tmp;
+ 	LIST_HEAD(pages);
+@@ -278,12 +284,7 @@
+ 
+ 	for (i = 0; i < NUM_ORDERS; i++) {
+ 		pool_list[i] = dynamic_page_pool_create(order_flags[i],
+-							orders[i]);
+-		pool_list[i]->vmid = vmid;
+-		pool_list[i]->prerelease_callback = callback;
+-		atomic_set(&pool_list[i]->count, 0);
+-		pool_list[i]->last_low_watermark_ktime = 0;
+-
++							orders[i], vmid, callback);
+ 		if (IS_ERR_OR_NULL(pool_list[i])) {
+ 			int j;
+ 
+@@ -315,25 +316,28 @@
+ 	kfree(pool_list);
+ }
+ 
+-static struct shrinker pool_shrinker = {
+-	.count_objects = dynamic_page_pool_shrink_count,
+-	.scan_objects = dynamic_page_pool_shrink_scan,
+-	.seeks = DEFAULT_SEEKS,
+-	.batch = 0,
+-};
++static DEFINE_MUTEX(pool_shrinker_lock);
++static struct shrinker *pool_shrinker;
+ 
+ int dynamic_page_pool_init_shrinker(void)
+ {
+-	int ret;
+-	static bool registered;
+-
+-	if (registered)
+-		return 0;
+-
+-	ret = register_shrinker(&pool_shrinker, "dynamic_page_pool");
+-	if (ret)
+-		return ret;
+-
+-	registered = true;
+-	return 0;
+-}
++	int ret = 0;
++
++	mutex_lock(&pool_shrinker_lock);
++	if (pool_shrinker)
++		goto out;
++
++	pool_shrinker = shrinker_alloc(0, "dynamic_page_pool");
++	if (!pool_shrinker) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	pool_shrinker->count_objects = dynamic_page_pool_shrink_count;
++	pool_shrinker->scan_objects = dynamic_page_pool_shrink_scan;
++	pool_shrinker->seeks = DEFAULT_SEEKS;
++	shrinker_register(pool_shrinker);
++out:
++	mutex_unlock(&pool_shrinker_lock);
++	return ret;
++}
+--- a/drivers/dma-buf/heaps/qcom_secure_system_heap.c
++++ b/drivers/dma-buf/heaps/qcom_secure_system_heap.c
+@@ -636,7 +636,6 @@
+ 
+ static const struct dma_heap_ops system_heap_ops = {
+ 	.allocate = system_heap_allocate,
+-	.get_pool_size = get_pool_size_bytes,
+ };
+ 
+ static int create_prefetch_workqueue(void)
+@@ -698,7 +697,7 @@
+ 	exp_info.ops = &system_heap_ops;
+ 	exp_info.priv = sys_heap;
+ 
+-	heap = dma_heap_add(&exp_info);
++	heap = qcom_dma_heap_add(&exp_info, get_pool_size_bytes);
+ 	if (IS_ERR(heap)) {
+ 		ret = PTR_ERR(heap);
+ 		goto free_pools;
+@@ -713,7 +712,7 @@
+ 	if (secure_system_alias != NULL) {
+ 		exp_info.name = secure_system_alias;
+ 
+-		heap = dma_heap_add(&exp_info);
++		heap = qcom_dma_heap_add(&exp_info, get_pool_size_bytes);
+ 		if (IS_ERR(heap)) {
+ 			pr_err("%s: Failed to create '%s', error is %ld\n", __func__,
+ 			       secure_system_alias, PTR_ERR(heap));
+--- a/drivers/dma-buf/heaps/qcom_dma_heap_secure_utils.c
++++ b/drivers/dma-buf/heaps/qcom_dma_heap_secure_utils.c
+@@ -8,6 +8,7 @@
+ #include <soc/qcom/secure_buffer.h>
+ #include <linux/qcom_dma_heap.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
++#include "qcom_dma_heap_secure_utils.h"
+ 
+ int get_secure_vmid(unsigned long flags)
+ {
+--- a/drivers/dma-buf/heaps/qcom_cma_heap.c
++++ b/drivers/dma-buf/heaps/qcom_cma_heap.c
+@@ -50,10 +50,10 @@
+ }
+ 
+ /* dmabuf heap CMA operations functions */
+-struct dma_buf *cma_heap_allocate(struct dma_heap *heap,
+-				  unsigned long len,
+-				  u32 fd_flags,
+-				  u64 heap_flags)
++static struct dma_buf *cma_heap_allocate(struct dma_heap *heap,
++					 unsigned long len,
++					 u32 fd_flags,
++					 u64 heap_flags)
+ {
+ 	struct cma_heap *cma_heap;
+ 	struct qcom_sg_buffer *helper_buffer;
+--- a/drivers/dma-buf/heaps/qcom_carveout_heap.c
++++ b/drivers/dma-buf/heaps/qcom_carveout_heap.c
+@@ -59,8 +59,8 @@
+ 
+ static void sc_heap_free(struct qcom_sg_buffer *buffer);
+ 
+-void __maybe_unused pages_sync_for_device(struct device *dev, struct page *page,
+-			       size_t size, enum dma_data_direction dir)
++static void __maybe_unused pages_sync_for_device(struct device *dev, struct page *page,
++						 size_t size, enum dma_data_direction dir)
+ {
+ 	struct scatterlist sg;
+ 
+@@ -106,7 +106,7 @@
+ 	up_read(&carveout_heap->mem_sem);
+ }
+ 
+-struct mem_buf_vmperm *
++static struct mem_buf_vmperm *
+ carveout_setup_vmperm(struct carveout_heap *carveout_heap,
+ 			struct sg_table *sgt)
+ {
+--- a/drivers/dma-buf/heaps/deferred-free-helper.c
++++ b/drivers/dma-buf/heaps/deferred-free-helper.c
+@@ -11,6 +11,7 @@
+ #include <linux/freezer.h>
+ #include <linux/list.h>
+ #include <linux/slab.h>
++#include <linux/shrinker.h>
+ #include <linux/swap.h>
+ #include <linux/sched/signal.h>
+ 
+@@ -101,18 +102,16 @@
+ 	return total_freed;
+ }
+ 
+-static struct shrinker freelist_shrinker = {
+-	.count_objects = freelist_shrink_count,
+-	.scan_objects = freelist_shrink_scan,
+-	.seeks = DEFAULT_SEEKS,
+-	.batch = 0,
+-};
++static struct shrinker *freelist_shrinker;
+ 
+ static int deferred_free_thread(void *data)
+ {
+-	while (true) {
++	while (!kthread_should_stop()) {
+ 		wait_event_freezable(freelist_waitqueue,
+-				     get_freelist_nr_pages() > 0);
++				     get_freelist_nr_pages() > 0 || kthread_should_stop());
++
++		if (kthread_should_stop())
++			break;
+ 
+ 		free_one_item(DF_NORMAL);
+ 	}
+@@ -120,8 +119,16 @@
+ 	return 0;
+ }
+ 
+-static int deferred_freelist_init(void)
++static int __init deferred_freelist_init(void)
+ {
++	freelist_shrinker = shrinker_alloc(0, "dmabuf-deferred-free-shrinker");
++	if (!freelist_shrinker)
++		return -ENOMEM;
++
++	freelist_shrinker->count_objects = freelist_shrink_count;
++	freelist_shrinker->scan_objects = freelist_shrink_scan;
++	freelist_shrinker->seeks = DEFAULT_SEEKS;
++
+ 	list_nr_pages = 0;
+ 
+ 	init_waitqueue_head(&freelist_waitqueue);
+@@ -129,12 +136,25 @@
+ 				    "%s", "dmabuf-deferred-free-worker");
+ 	if (IS_ERR(freelist_task)) {
+ 		pr_err("Creating thread for deferred free failed\n");
+-		return -1;
++		shrinker_free(freelist_shrinker);
++		return PTR_ERR(freelist_task);
+ 	}
+ 	sched_set_normal(freelist_task, 19);
+ 
+-	return register_shrinker(&freelist_shrinker, "dmabuf-deferred-free-shrinker");
++	shrinker_register(freelist_shrinker);
++	return 0;
+ }
+ module_init(deferred_freelist_init);
+-MODULE_LICENSE("GPL v2");
+ 
++static void __exit deferred_freelist_exit(void)
++{
++	shrinker_free(freelist_shrinker);
++	kthread_stop(freelist_task);
++	while (free_one_item(DF_NORMAL))
++		cond_resched();
++}
++module_exit(deferred_freelist_exit);
++
++MODULE_DESCRIPTION("DMA-BUF heaps deferred-free library");
++MODULE_LICENSE("GPL");
++

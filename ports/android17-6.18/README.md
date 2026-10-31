@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 72 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 77 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 72 platform `.ko` files, their symbol tables and DDK configurations.
+- 77 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 3074
-imported symbol CRCs across all 72 modules.
+used. The current [validation report](validation-20261031.json) checks 3464
+imported symbol CRCs across all 77 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -208,6 +208,33 @@ formatting, and logs show the formatted message. The adaptation passes
 checkpatch without errors, warnings or style checks. Firmware acknowledgments
 and power-state transitions require hardware validation.
 
+The memory-sharing group adds `mem_buf_dev`, `mem_buf_msgq`, `mem_buf`,
+`qcom_dma_heaps` and `deferred-free-helper`. The system heap, automatic page-pool
+refill, secure system heaps, CMA and carveout heaps use the recorded Onyx
+configuration. Heap registration waits for the memory-permissions driver's
+VM identity initialization. DMA-BUF and DMA-heap namespace imports, page-order
+bounds and shrinker allocation use 6.18 interfaces. Pool objects are fully
+initialized before reclaim can see them, and failed allocations unwind their
+worker and device resources.
+
+The vendor `/sys/kernel/dma_heap/total_pools_kb` statistic and
+`dma_heap_try_get_pool_size_kb` export remain available through a module-side
+registry, preserving the baseline's per-heap accounting, including aliases.
+The memory-buffer ioctl and VM-device UAPI are unchanged. VM registration avoids
+double frees and releases device references on failure/removal. Memory grants
+can outlive local file descriptors, so the memory-sharing service remains
+resident, as do the registered heaps.
+
+Gunyah message queues now support explicit shutdown: blocked sends/receives
+wake, receive threads stop, and queued memory work drains before descriptors
+are freed. The deferred-free worker also supports stop and drain. Unknown queue
+names fail cleanly, and receiver allocation/thread failures unwind registration.
+These adaptations pass checkpatch with no errors, warnings or style checks;
+the full build passes 3464 imported-symbol CRC checks without compiler/modpost
+warnings. Cross-VM sharing, secure-display allocation and memory pressure still
+require device testing. `ZONE_DEVICE` and reserved-IPA support remain disabled,
+matching the Onyx HLOS baseline; guest-only mapping paths are not validated.
+
 ## Baseline inventory
 
 The sources in `sources.json` match the local crDroid 17.0 ROM lineage. Capture
@@ -229,7 +256,7 @@ changes are captured for later porting; they are not in this initial group.
 
 ## Next implementation gates
 
-1. Complete the VM IRQ-chip, memory heaps and remaining dependencies
+1. Complete the VM IRQ-chip, CPU power-control and remaining dependencies
    needed for Onyx early boot.
    Test UFS/encryption, probe ordering, GPIO wakeups, SCM wait queues and
    shared-memory operations.

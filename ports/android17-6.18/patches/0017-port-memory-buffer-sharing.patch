@@ -1,0 +1,498 @@
+--- a/drivers/soc/qcom/mem_buf/mem-buf-dev.c
++++ b/drivers/soc/qcom/mem_buf/mem-buf-dev.c
+@@ -25,6 +25,13 @@
+ struct device *mem_buf_dev;
+ EXPORT_SYMBOL_GPL(mem_buf_dev);
+ 
++bool mem_buf_is_ready(void)
++{
++	/* Pair with publication after VM identity and permissions setup. */
++	return smp_load_acquire(&mem_buf_dev);
++}
++EXPORT_SYMBOL_GPL(mem_buf_is_ready);
++
+ unsigned char mem_buf_capability;
+ EXPORT_SYMBOL_GPL(mem_buf_capability);
+ 
+@@ -233,17 +240,20 @@
+ 	ret = mem_buf_vm_init(dev);
+ 	if (ret) {
+ 		dev_err(dev, "mem_buf_vm_init failed %d\n", ret);
+-		return ret;
+-	}
+-
+-	mem_buf_dev = dev;
++		of_reserved_mem_device_release(dev);
++		return ret;
++	}
++
++	/* Heap registration must observe all completed VM initialization. */
++	smp_store_release(&mem_buf_dev, dev);
+ 	return 0;
+ }
+ 
+-static int mem_buf_remove(struct platform_device *pdev)
+-{
+-	mem_buf_dev = NULL;
+-	return 0;
++static void mem_buf_remove(struct platform_device *pdev)
++{
++	WRITE_ONCE(mem_buf_dev, NULL);
++	mem_buf_vm_exit();
++	of_reserved_mem_device_release(&pdev->dev);
+ }
+ 
+ static const struct of_device_id mem_buf_match_tbl[] = {
+@@ -256,6 +266,7 @@
+ 	.remove = mem_buf_remove,
+ 	.driver = {
+ 		.name = "mem-buf",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = of_match_ptr(mem_buf_match_tbl),
+ 	},
+ };
+@@ -268,11 +279,10 @@
+ 
+ static void __exit mem_buf_dev_exit(void)
+ {
+-	mem_buf_vm_exit();
+ 	platform_driver_unregister(&mem_buf_driver);
+ }
+ module_exit(mem_buf_dev_exit);
+ 
+ MODULE_DESCRIPTION("Qualcomm Technologies, Inc. Memory Buffer Sharing driver");
+ MODULE_LICENSE("GPL");
+-MODULE_IMPORT_NS(DMA_BUF);
++MODULE_IMPORT_NS("DMA_BUF");
+--- a/drivers/soc/qcom/mem_buf/mem-buf-gh.c
++++ b/drivers/soc/qcom/mem_buf/mem-buf-gh.c
+@@ -184,6 +184,7 @@
+ 	}
+ 
+ 	dmabuf = dma_heap_buffer_alloc(heap, xfer_mem->size, flags, 0);
++	dma_heap_put(heap);
+ 	if (IS_ERR(dmabuf)) {
+ 		pr_err("%s dmaheap_alloc failure sz: 0x%zx heap: %s flags: 0x%x rc: %ld\n",
+ 		       __func__, xfer_mem->size, name, flags,
+@@ -227,7 +228,7 @@
+ 	int ret, i = 0;
+ 	struct page **pages;
+ 	size_t size = count << PAGE_SHIFT;
+-	unsigned long order_mask = (1U << MAX_ORDER) - 1;
++	unsigned long order_mask = (1U << NR_PAGE_ORDERS) - 1;
+ 
+ 	pages = kvcalloc(count, sizeof(*pages), GFP_KERNEL);
+ 	if (!pages)
+@@ -1635,6 +1636,10 @@
+ err_msgq_register:
+ 	for (i = 0; i < num_msgqs; i++)
+ 		if (!IS_ERR_OR_NULL(msgqs[i]))
++			mem_buf_msgq_stop(msgqs[i]);
++	flush_workqueue(mem_buf_wq);
++	for (i = 0; i < num_msgqs; i++)
++		if (!IS_ERR_OR_NULL(msgqs[i]))
+ 			mem_buf_msgq_unregister(msgqs[i]);
+ 	kfree(msgqs);
+ 	num_msgqs = 0;
+@@ -1663,6 +1668,9 @@
+ 			"Removing mem-buf driver while memory is still lent\n");
+ 	mutex_unlock(&mem_buf_xfer_mem_list_lock);
+ 	for (i = 0; i < num_msgqs; i++)
++		mem_buf_msgq_stop(msgqs[i]);
++	flush_workqueue(mem_buf_wq);
++	for (i = 0; i < num_msgqs; i++)
+ 		mem_buf_msgq_unregister(msgqs[i]);
+ 	kfree(msgqs);
+ 	num_msgqs = 0;
+--- a/drivers/soc/qcom/mem_buf/mem-buf-ids.c
++++ b/drivers/soc/qcom/mem_buf/mem-buf-ids.c
+@@ -103,6 +103,7 @@
+ }
+ 
+ static const struct file_operations mem_buf_vm_fops = {
++	.owner = THIS_MODULE,
+ 	.open = mem_buf_vm_open,
+ };
+ 
+@@ -134,7 +135,7 @@
+ 	vm = xa_load(&mem_buf_vms, current_vmid);
+ 	if (!vm) {
+ 		pr_err_ratelimited("No vm with vmid=0x%x\n", current_vmid);
+-		return PTR_ERR(vm);
++		return -ENODEV;
+ 	}
+ 
+ 	if (vm->allowed_api & MEM_BUF_API_GUNYAH)
+@@ -184,6 +185,11 @@
+ 	struct device *dev;
+ 	int minor, ret;
+ 	unsigned long idx;
++	struct mem_buf_vm *old_vm;
++
++	dev = &new_vm->dev;
++	device_initialize(dev);
++	dev->release = mem_buf_vm_device_release;
+ 
+ 	xa_for_each(&mem_buf_vm_minors, idx, vm) {
+ 		if (!strcmp(vm->name, new_vm->name)) {
+@@ -201,16 +207,17 @@
+ 	}
+ 
+ 	cdev_init(&new_vm->cdev, &mem_buf_vm_fops);
+-	dev = &new_vm->dev;
+-	device_initialize(dev);
++	new_vm->cdev.owner = THIS_MODULE;
+ 	dev->devt = MKDEV(MAJOR(mem_buf_vm_devt), minor);
+ 	dev->class = mem_buf_vm_class;
+ 	dev->parent = NULL;
+-	dev->release = mem_buf_vm_device_release;
+ 	dev_set_drvdata(dev, new_vm);
+-	dev_set_name(dev, "%s", new_vm->name);
+-
+-	ret = xa_err(xa_store(&mem_buf_vms, new_vm->vmid, new_vm, GFP_KERNEL));
++	ret = dev_set_name(dev, "%s", new_vm->name);
++	if (ret)
++		goto err_xa_store;
++
++	old_vm = xa_store(&mem_buf_vms, new_vm->vmid, new_vm, GFP_KERNEL);
++	ret = xa_err(old_vm);
+ 	if (ret)
+ 		goto err_xa_store;
+ 
+@@ -222,12 +229,12 @@
+ 	return 0;
+ 
+ err_cdev_add:
+-	xa_erase(&mem_buf_vms, new_vm->vmid);
++	xa_store(&mem_buf_vms, new_vm->vmid, old_vm, GFP_KERNEL);
+ err_xa_store:
+ 	xa_erase(&mem_buf_vm_minors, minor);
+-	put_device(dev);
+ err_devt:
+ err_duplicate:
++	put_device(dev);
+ 	return ret;
+ }
+ 
+@@ -241,11 +248,7 @@
+ 		return -ENOMEM;
+ 
+ 	ret = mem_buf_vm_add(vm);
+-	if (ret) {
+-		kfree(vm);
+-		return ret;
+-	}
+-	return 0;
++	return ret;
+ }
+ 
+ static int mem_buf_vm_add_self(void)
+@@ -255,7 +258,7 @@
+ 
+ 	vm = xa_load(&mem_buf_vms, current_vmid);
+ 	if (!vm)
+-		return PTR_ERR(vm);
++		return -ENODEV;
+ 
+ 	self = kzalloc(sizeof(*self), GFP_KERNEL);
+ 	if (!self)
+@@ -267,11 +270,7 @@
+ 	self->allowed_api = vm->allowed_api;
+ 
+ 	ret = mem_buf_vm_add(self);
+-	if (ret) {
+-		kfree(self);
+-		return ret;
+-	}
+-	return 0;
++	return ret;
+ }
+ 
+ static char *mem_buf_vm_devnode(const struct device *dev, umode_t *mode)
+@@ -284,6 +283,7 @@
+ 	struct mem_buf_vm *vm = container_of(dev, struct mem_buf_vm, dev);
+ 
+ 	cdev_device_del(&vm->cdev, dev);
++	put_device(dev);
+ 	return 0;
+ }
+ 
+--- a/drivers/soc/qcom/mem_buf/mem-buf-msgq.c
++++ b/drivers/soc/qcom/mem_buf/mem-buf-msgq.c
+@@ -67,6 +67,7 @@
+ 	struct idr txn_idr;
+ 	void *msgq_hdl;
+ 	struct task_struct *recv_thr;
++	void *recv_buf;
+ 	struct list_head list;
+ };
+ 
+@@ -427,7 +428,7 @@
+ {
+ 	int i;
+ 
+-	for (i = 0; i < ARRAY_SIZE(mem_buf_msgqs); i++)
++	for (i = 0; mem_buf_msgqs[i].name; i++)
+ 		if (!strcmp(name, mem_buf_msgqs[i].name))
+ 			return mem_buf_msgqs[i].label;
+ 
+@@ -437,41 +438,44 @@
+ static int mem_buf_msgq_recv_fn(void *data)
+ {
+ 	struct mem_buf_msgq_desc *desc = data;
+-	void *buf;
++	void *buf = desc->recv_buf;
+ 	size_t size;
+ 	int ret;
+ 
+-	buf = kzalloc(GH_MSGQ_MAX_MSG_SIZE_BYTES, GFP_KERNEL);
+-	if (!buf)
+-		return -ENOMEM;
+-
+ 	while (!kthread_should_stop()) {
+ 		ret = gh_msgq_recv(desc->msgq_hdl, buf, GH_MSGQ_MAX_MSG_SIZE_BYTES, &size, 0);
+-		if (ret < 0)
++		if (ret < 0 && ret != -ESHUTDOWN)
+ 			pr_err_ratelimited("%s failed to receive message rc: %d\n", __func__, ret);
+-		else
++		else if (!ret)
+ 			mem_buf_process_msg(desc, buf, size);
+ 	}
+ 
+-	kfree(buf);
+ 	return 0;
+ }
+ 
+ void *mem_buf_msgq_register(const char *msgq_name, struct mem_buf_msgq_hdlr_info *info)
+ {
+-	struct mem_buf_msgq_desc *desc = kzalloc(sizeof(*desc), GFP_KERNEL);
++	struct mem_buf_msgq_desc *desc;
+ 	int label;
+ 	void *ret;
+ 
+-	if (!desc)
+-		return ERR_PTR(-ENOMEM);
+-	else if (!info || !info->msgq_ops || !info->msgq_ops->alloc_req_hdlr ||
+-		 !info->msgq_ops->alloc_resp_hdlr || !info->msgq_ops->relinquish_hdlr)
++	if (!msgq_name || !info || !info->msgq_ops || !info->msgq_ops->alloc_req_hdlr ||
++	    !info->msgq_ops->alloc_resp_hdlr || !info->msgq_ops->relinquish_hdlr)
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	label = mem_buf_msgq_name_to_msgq_label(msgq_name);
+ 	if (label < 0)
+ 		return ERR_PTR(label);
++
++	desc = kzalloc(sizeof(*desc), GFP_KERNEL);
++	if (!desc)
++		return ERR_PTR(-ENOMEM);
++
++	desc->recv_buf = kzalloc(GH_MSGQ_MAX_MSG_SIZE_BYTES, GFP_KERNEL);
++	if (!desc->recv_buf) {
++		kfree(desc);
++		return ERR_PTR(-ENOMEM);
++	}
+ 
+ 	INIT_LIST_HEAD(&desc->list);
+ 	desc->msgq_ops = info->msgq_ops;
+@@ -500,28 +504,47 @@
+ 	return desc;
+ 
+ err_thr_create:
++	mutex_lock(&mem_buf_msgq_list_lock);
++	list_del(&desc->list);
++	mutex_unlock(&mem_buf_msgq_list_lock);
+ 	gh_msgq_unregister(desc->msgq_hdl);
+ err_msgq_register:
+ 	idr_destroy(&desc->txn_idr);
+ 	mutex_destroy(&desc->idr_mutex);
++	kfree(desc->recv_buf);
+ 	kfree(desc);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(mem_buf_msgq_register);
+ 
++void mem_buf_msgq_stop(void *mem_buf_msgq_hdl)
++{
++	struct mem_buf_msgq_desc *desc = mem_buf_msgq_hdl;
++
++	if (!desc->recv_thr)
++		return;
++
++	gh_msgq_shutdown(desc->msgq_hdl);
++	kthread_stop(desc->recv_thr);
++	desc->recv_thr = NULL;
++}
++EXPORT_SYMBOL_GPL(mem_buf_msgq_stop);
++
+ void mem_buf_msgq_unregister(void *mem_buf_msgq_hdl)
+ {
+ 	struct mem_buf_msgq_desc *desc = mem_buf_msgq_hdl;
+ 
+-	kthread_stop(desc->recv_thr);
++	mem_buf_msgq_stop(desc);
+ 	mutex_lock(&mem_buf_msgq_list_lock);
+ 	list_del(&desc->list);
+ 	mutex_unlock(&mem_buf_msgq_list_lock);
+ 	gh_msgq_unregister(desc->msgq_hdl);
+ 	idr_destroy(&desc->txn_idr);
+ 	mutex_destroy(&desc->idr_mutex);
++	kfree(desc->recv_buf);
+ 	kfree(desc);
+ }
+ EXPORT_SYMBOL_GPL(mem_buf_msgq_unregister);
+ 
++MODULE_DESCRIPTION("Qualcomm memory buffer message queues");
+ MODULE_LICENSE("GPL");
+--- a/drivers/soc/qcom/mem_buf/mem-buf-msgq.h
++++ b/drivers/soc/qcom/mem_buf/mem-buf-msgq.h
+@@ -194,6 +194,7 @@
+ 
+ #if IS_ENABLED(CONFIG_QCOM_MEM_BUF_MSGQ)
+ void *mem_buf_msgq_register(const char *msgq_name, struct mem_buf_msgq_hdlr_info *info);
++void mem_buf_msgq_stop(void *mem_buf_msgq_hdl);
+ void mem_buf_msgq_unregister(void *mem_buf_msgq_hdl);
+ void *mem_buf_init_txn(void *mem_buf_msgq_hdl, void *resp_buf);
+ int mem_buf_msgq_send(void *mem_buf_msgq_hdl, void *msg);
+@@ -221,7 +222,8 @@
+ 	return ERR_PTR(-EOPNOTSUPP);
+ }
+ 
+-static inline void mem_buf_msgq_unregister(void *mem_buf_msgq_hdl)
++static inline void mem_buf_msgq_stop(void *mem_buf_msgq_hdl);
++void mem_buf_msgq_unregister(void *mem_buf_msgq_hdl)
+ {
+ }
+ 
+--- a/drivers/soc/qcom/mem_buf/mem-buf.c
++++ b/drivers/soc/qcom/mem_buf/mem-buf.c
+@@ -327,6 +327,7 @@
+ }
+ 
+ static const struct file_operations mem_buf_dev_fops = {
++	.owner = THIS_MODULE,
+ 	.unlocked_ioctl = mem_buf_dev_ioctl,
+ 	.compat_ioctl = compat_ptr_ioctl,
+ };
+@@ -345,6 +346,7 @@
+ 		return ret;
+ 
+ 	cdev_init(&mem_buf_char_dev, &mem_buf_dev_fops);
++	mem_buf_char_dev.owner = THIS_MODULE;
+ 	ret = cdev_add(&mem_buf_char_dev, mem_buf_dev_no, MEM_BUF_MAX_DEVS);
+ 	if (ret < 0)
+ 		goto err_cdev_add;
+@@ -365,12 +367,11 @@
+ 	return ret;
+ }
+ 
+-static int mem_buf_msgq_remove(struct platform_device *pdev)
++static void mem_buf_msgq_remove(struct platform_device *pdev)
+ {
+ 	device_destroy(mem_buf_class, mem_buf_dev_no);
+ 	cdev_del(&mem_buf_char_dev);
+ 	mem_buf_msgq_free(&pdev->dev);
+-	return 0;
+ }
+ 
+ static const struct of_device_id mem_buf_msgq_match_tbl[] = {
+@@ -383,6 +384,7 @@
+ 	.remove = mem_buf_msgq_remove,
+ 	.driver = {
+ 		.name = "mem-buf-msgq",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = of_match_ptr(mem_buf_msgq_match_tbl),
+ 	},
+ };
+@@ -417,14 +419,9 @@
+ }
+ module_init(mem_buf_init);
+ 
+-static void __exit mem_buf_exit(void)
+-{
+-	platform_driver_unregister(&mem_buf_msgq_driver);
+-	class_destroy(mem_buf_class);
+-	unregister_chrdev_region(mem_buf_dev_no, MEM_BUF_MAX_DEVS);
+-}
+-module_exit(mem_buf_exit);
++/* Remote memory grants can outlive local file descriptors. Keep the service resident. */
+ 
+ MODULE_DESCRIPTION("Qualcomm Technologies, Inc. Memory Buffer Sharing driver");
+ MODULE_LICENSE("GPL");
+-MODULE_IMPORT_NS(DMA_BUF);
++MODULE_IMPORT_NS("DMA_BUF");
++MODULE_IMPORT_NS("DMA_BUF_HEAP");
+--- a/drivers/soc/qcom/mem_buf/trace-mem-buf.h
++++ b/drivers/soc/qcom/mem_buf/trace-mem-buf.h
+@@ -81,8 +81,8 @@
+ 
+ 	TP_fast_assign(
+ 		__entry->size = size;
+-		__assign_str(src_type, mem_type_to_str(src_mem_type));
+-		__assign_str(dst_type, mem_type_to_str(dst_mem_type));
++		__assign_str(src_type);
++		__assign_str(dst_type);
+ 		__entry->nr_acl_entries = acl_desc->n_acl_entries;
+ 		gh_acl_to_vmid_perms(acl_desc, __get_dynamic_array(vmids),
+ 				     __get_dynamic_array(perms));
+@@ -116,9 +116,9 @@
+ 
+ 	TP_fast_assign(
+ 		__entry->txn_id = req->hdr.txn_id;
+-		__assign_str(msg_type, msg_type_to_str(req->hdr.msg_type));
++		__assign_str(msg_type);
+ 		__entry->size = req->size;
+-		__assign_str(src_type, mem_type_to_str(req->src_mem_type));
++		__assign_str(src_type);
+ 		__entry->nr_acl_entries = req->acl_desc.n_acl_entries;
+ 		gh_acl_to_vmid_perms(&req->acl_desc, __get_dynamic_array(vmids),
+ 				     __get_dynamic_array(perms));
+@@ -161,7 +161,7 @@
+ 	),
+ 
+ 	TP_fast_assign(
+-		__assign_str(msg_type, msg_type_to_str(rel_req->hdr.msg_type));
++		__assign_str(msg_type);
+ 		__entry->hdl = rel_req->hdl;
+ 		__entry->txn_id = rel_req->hdr.txn_id;
+ 	),
+@@ -200,7 +200,7 @@
+ 
+ 	TP_fast_assign(
+ 		__entry->txn_id = resp->hdr.txn_id;
+-		__assign_str(msg_type, msg_type_to_str(resp->hdr.msg_type));
++		__assign_str(msg_type);
+ 		__entry->ret = resp->ret;
+ 		__entry->hdl = resp->hdl;
+ 	),
+@@ -238,7 +238,7 @@
+ 
+ 	TP_fast_assign(
+ 		__entry->txn_id = resp->hdr.txn_id;
+-		__assign_str(msg_type, msg_type_to_str(resp->hdr.msg_type));
++		__assign_str(msg_type);
+ 	),
+ 
+ 	TP_printk("txn_id: %d msg_type: %s",
+--- a/include/linux/mem-buf.h
++++ b/include/linux/mem-buf.h
+@@ -16,6 +16,9 @@
+ 
+ /* For in-kernel use only, not allowed for userspace ioctl */
+ #define MEM_BUF_BUDDY_MEM_TYPE (MEM_BUF_ION_MEM_TYPE + 2)
++
++/* True after the local VM identity and permissions have been initialized. */
++bool mem_buf_is_ready(void);
+ 
+ /* Used to obtain the underlying vmperm struct of a DMA-BUF */
+ struct mem_buf_vmperm *to_mem_buf_vmperm(struct dma_buf *dmabuf);
+--- a/include/linux/qcom_dma_heap.h
++++ b/include/linux/qcom_dma_heap.h
+@@ -36,6 +36,8 @@
+ #define QCOM_DMA_HEAP_FLAGS_CP_MASK	GENMASK(30, 15)
+ 
+ #define QCOM_DMA_HEAP_FLAG_SECURE	BIT(31)
++
++long dma_heap_try_get_pool_size_kb(void);
+ 
+ bool qcom_is_dma_buf_file(struct file *file);
+ 

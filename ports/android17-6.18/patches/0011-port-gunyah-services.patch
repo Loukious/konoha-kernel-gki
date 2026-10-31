@@ -1,6 +1,14 @@
 --- a/drivers/virt/gunyah/gh_msgq.c
 +++ b/drivers/virt/gunyah/gh_msgq.c
-@@ -53,7 +53,7 @@
+@@ -25,6 +25,7 @@
+ 
+ struct gh_msgq_desc {
+ 	int label;
++	bool stopping;
+ 	struct gh_msgq_cap_table *cap_table;
+ };
+ 
+@@ -53,7 +54,7 @@
  static LIST_HEAD(gh_msgq_cap_list);
  static DEFINE_SPINLOCK(gh_msgq_cap_list_lock);
  
@@ -9,7 +17,7 @@
  {
  	int ret;
  	struct gh_msgq_cap_table *cap_table_entry = NULL;
-@@ -124,15 +124,12 @@
+@@ -124,15 +125,12 @@
  
  static int __gh_msgq_recv(struct gh_msgq_cap_table *cap_table_entry,
  				void *buff, size_t buff_size,
@@ -26,15 +34,107 @@
  
  	spin_lock_irqsave(&cap_table_entry->rx_lock, flags);
  	gh_ret = gh_hcall_msgq_recv(cap_table_entry->rx_cap_id, buff,
-@@ -226,7 +223,7 @@
+@@ -176,6 +174,9 @@
+ 	if (buff_size > GH_MSGQ_MAX_MSG_SIZE_BYTES)
+ 		return -E2BIG;
+ 
++	if (READ_ONCE(client_desc->stopping))
++		return -ESHUTDOWN;
++
+ 	if (client_desc->cap_table == NULL)
+ 		return -EAGAIN;
+ 
+@@ -201,9 +202,12 @@
+ 	spin_unlock(&cap_table_entry->cap_entry_lock);
+ 
+ 	ret = wait_event_state(cap_table_entry->rx_wq,
+-				cap_table_entry->rx_cap_id != GH_CAPID_INVAL, state);
++				cap_table_entry->rx_cap_id != GH_CAPID_INVAL ||
++				READ_ONCE(client_desc->stopping), state);
+ 	if (ret)
+ 		return ret;
++	if (READ_ONCE(client_desc->stopping))
++		return -ESHUTDOWN;
+ 
+ 	spin_lock(&cap_table_entry->cap_entry_lock);
+ 
+@@ -221,12 +225,16 @@
+ 			return -EAGAIN;
+ 
+ 		ret = wait_event_state(cap_table_entry->rx_wq,
+-					!cap_table_entry->rx_empty, state);
++					!cap_table_entry->rx_empty ||
++					READ_ONCE(client_desc->stopping), state);
+ 		if (ret)
  			return ret;
  
++		if (READ_ONCE(client_desc->stopping))
++			return -ESHUTDOWN;
++
  		ret = __gh_msgq_recv(cap_table_entry, buff, buff_size,
 -					recv_size, flags);
 +					recv_size);
  	} while (ret == -EAGAIN);
  
  	if (!ret)
+@@ -350,6 +358,9 @@
+ 	if (size > GH_MSGQ_MAX_MSG_SIZE_BYTES)
+ 		return -E2BIG;
+ 
++	if (READ_ONCE(client_desc->stopping))
++		return -ESHUTDOWN;
++
+ 	if (client_desc->cap_table == NULL)
+ 		return -EAGAIN;
+ 
+@@ -375,8 +386,11 @@
+ 	spin_unlock(&cap_table_entry->cap_entry_lock);
+ 
+ 	if (wait_event_interruptible(cap_table_entry->tx_wq,
+-				cap_table_entry->tx_cap_id != GH_CAPID_INVAL))
++				cap_table_entry->tx_cap_id != GH_CAPID_INVAL ||
++				READ_ONCE(client_desc->stopping)))
+ 		return -ERESTARTSYS;
++	if (READ_ONCE(client_desc->stopping))
++		return -ESHUTDOWN;
+ 
+ 	spin_lock(&cap_table_entry->cap_entry_lock);
+ 
+@@ -394,8 +408,12 @@
+ 			return -EAGAIN;
+ 
+ 		if (wait_event_interruptible(cap_table_entry->tx_wq,
+-					!cap_table_entry->tx_full))
++					!cap_table_entry->tx_full ||
++					READ_ONCE(client_desc->stopping)))
+ 			return -ERESTARTSYS;
++
++		if (READ_ONCE(client_desc->stopping))
++			return -ESHUTDOWN;
+ 
+ 		ret = __gh_msgq_send(cap_table_entry, buff, size, flags);
+ 	} while (ret == -EAGAIN);
+@@ -470,6 +488,20 @@
+ 	return client_desc;
+ }
+ EXPORT_SYMBOL_GPL(gh_msgq_register);
++
++/* Wake blocked users; the owner must join them before unregistering. */
++void gh_msgq_shutdown(void *msgq_client_desc)
++{
++	struct gh_msgq_desc *client_desc = msgq_client_desc;
++	struct gh_msgq_cap_table *entry = client_desc->cap_table;
++
++	WRITE_ONCE(client_desc->stopping, true);
++	if (entry) {
++		wake_up_all(&entry->rx_wq);
++		wake_up_all(&entry->tx_wq);
++	}
++}
++EXPORT_SYMBOL_GPL(gh_msgq_shutdown);
+ 
+ /**
+  * gh_msgq_unregister: Unregister as a client to the use the message queue
 --- a/drivers/virt/gunyah/gh_rm_core.c
 +++ b/drivers/virt/gunyah/gh_rm_core.c
 @@ -14,6 +14,8 @@
@@ -508,3 +608,13 @@
  }
  
  static const struct of_device_id qrtr_gunyah_match_table[] = {
+--- a/include/linux/gunyah/gh_msgq.h
++++ b/include/linux/gunyah/gh_msgq.h
+@@ -44,6 +44,7 @@
+ #if IS_ENABLED(CONFIG_GH_MSGQ)
+ void *gh_msgq_register(int label);
+ int gh_msgq_unregister(void *msgq_client_desc);
++void gh_msgq_shutdown(void *msgq_client_desc);
+ int gh_msgq_send(void *msgq_client_desc,
+ 			void *buff, size_t size, unsigned long flags);
+ int gh_msgq_recv(void *msgq_client_desc,

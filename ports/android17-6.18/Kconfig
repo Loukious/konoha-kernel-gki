@@ -225,3 +225,51 @@ config GIC_INTERRUPT_ROUTING
 config MSM_QMP
 	tristate "Onyx QMP mailbox transport"
 	depends on MAILBOX && QCOM_AOSS_QMP
+
+config QCOM_MEM_BUF_DEV
+	tristate "Onyx shared memory permissions"
+	depends on DMA_SHARED_BUFFER
+
+config QCOM_MEM_BUF_DEV_GH
+	bool "Onyx Gunyah shared memory permissions"
+	depends on QCOM_MEM_BUF_DEV && GH_RM_DRV
+
+config QCOM_MEM_BUF_MSGQ
+	tristate "Onyx shared memory message queue"
+	depends on GH_MSGQ && QCOM_MEM_BUF_DEV_GH
+
+config QCOM_MEM_BUF
+	tristate "Onyx memory buffer sharing"
+	depends on QCOM_MEM_BUF_DEV
+
+config QCOM_MEM_BUF_GH
+	bool "Onyx Gunyah memory buffer sharing"
+	depends on QCOM_MEM_BUF && QCOM_MEM_BUF_DEV_GH
+
+config QCOM_DMABUF_HEAPS
+	tristate "Onyx DMA-BUF heaps"
+	depends on DMABUF_HEAPS && QCOM_MEM_BUF_DEV
+
+config QCOM_DMABUF_HEAPS_SYSTEM
+	bool "Onyx system heap"
+	depends on QCOM_DMABUF_HEAPS
+
+config QCOM_DMABUF_HEAPS_PAGE_POOL_REFILL
+	bool "Onyx system heap page pool refill"
+	depends on QCOM_DMABUF_HEAPS_SYSTEM
+
+config QCOM_DMABUF_HEAPS_SYSTEM_SECURE
+	bool "Onyx secure system heap"
+	depends on QCOM_DMABUF_HEAPS_SYSTEM && QCOM_SECURE_BUFFER
+
+config QCOM_DMABUF_HEAPS_CMA
+	bool "Onyx CMA heap"
+	depends on QCOM_DMABUF_HEAPS && DMA_CMA
+
+config QCOM_DMABUF_HEAPS_CARVEOUT
+	bool "Onyx carveout heaps"
+	depends on QCOM_DMABUF_HEAPS
+
+config DMABUF_HEAPS_DEFERRED_FREE
+	tristate "Onyx DMA-BUF deferred free helper"
+	depends on DMA_SHARED_BUFFER
