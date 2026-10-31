@@ -1,0 +1,2398 @@
+--- a/qcom/opensource/securemsm-kernel/hdcp/hdcp_main.c
++++ b/qcom/opensource/securemsm-kernel/hdcp/hdcp_main.c
+@@ -7,12 +7,14 @@
+ #include "hdcp_qseecom.h"
+ #include "hdcp_smcinvoke.h"
+ 
+-struct hdcp_ta_interface ta_interface;
++static struct hdcp_ta_interface ta_interface;
++static bool hdcp_uses_smcinvoke;
+ static DEFINE_MUTEX(hdcp1_mutex_g);
+ static DEFINE_MUTEX(hdcp2_mutex_g);
+ 
+-void select_interface(bool use_smcinvoke)
+-{
++static void select_interface(bool use_smcinvoke)
++{
++	hdcp_uses_smcinvoke = use_smcinvoke;
+ 	if (use_smcinvoke) {
+ 		ta_interface.trusted_app_hdcp1_init = &hdcp1_init_smcinvoke;
+ 		ta_interface.trusted_app_hdcp1_feature_supported = &hdcp1_feature_supported_smcinvoke;
+@@ -58,7 +60,7 @@
+ 	}
+ }
+ 
+-int hdcp1_count_ones(u8 *array, u8 len)
++static int hdcp1_count_ones(u8 *array, u8 len)
+ {
+ 	int i, j, count = 0;
+ 
+@@ -212,6 +214,11 @@
+ {
+ 	struct hdcp2_qsee_handle *handle = ctx;
+ 
++	guard(mutex)(&hdcp2_mutex_g);
++	/* Retry policy belongs to the legacy QSEECom implementation. */
++	if (!ctx || hdcp_uses_smcinvoke)
++		return;
++
+ 	handle->max_hdcp_key_verify_retries = max_hdcp_key_verify_retries;
+ 
+ 	pr_debug("hdcp2 max_hdcp_key_verify_retries %d\n", handle->max_hdcp_key_verify_retries);
+@@ -220,6 +227,7 @@
+ 
+ void hdcp2_deinit(void *ctx)
+ {
++	guard(mutex)(&hdcp2_mutex_g);
+ 	ta_interface.trusted_app_hdcp2_deinit(ctx);
+ }
+ EXPORT_SYMBOL_GPL(hdcp2_deinit);
+@@ -240,6 +248,11 @@
+ {
+ 	struct hdcp1_qsee_handle *handle = ctx;
+ 
++	guard(mutex)(&hdcp1_mutex_g);
++	/* Retry policy belongs to the legacy QSEECom implementation. */
++	if (!ctx || hdcp_uses_smcinvoke)
++		return;
++
+ 	handle->max_hdcp_key_verify_retries = max_hdcp_key_verify_retries;
+ 
+ 	pr_debug("hdcp1 max_hdcp_key_verify_retries %d\n", handle->max_hdcp_key_verify_retries);
+@@ -248,6 +261,7 @@
+ 
+ void hdcp1_deinit(void *data)
+ {
++	guard(mutex)(&hdcp1_mutex_g);
+ 	kfree(data);
+ }
+ EXPORT_SYMBOL_GPL(hdcp1_deinit);
+@@ -280,6 +294,7 @@
+ {
+ 	int ret = 0;
+ 
++	guard(mutex)(&hdcp1_mutex_g);
+ 	ret = ta_interface.trusted_app_hdcp1_ops_notify(data, topo, is_authenticated);
+ 
+ 	return ret;
+@@ -321,6 +336,7 @@
+ 		}
+ 
+ 	use_smcinvoke = of_property_read_bool(np, "qcom,use-smcinvoke");
++	of_node_put(np);
+ 
+ 	select_interface(use_smcinvoke);
+ 
+--- a/qcom/opensource/securemsm-kernel/hdcp/hdcp_smcinvoke.c
++++ b/qcom/opensource/securemsm-kernel/hdcp/hdcp_smcinvoke.c
+@@ -82,7 +82,7 @@
+ 	return ret;
+ }
+ 
+-int load_app(char *app_name, struct Object *app_obj,
++static int load_app(char *app_name, struct Object *app_obj,
+ 			 struct Object *app_controller_obj)
+ {
+ 	int ret = 0;
+@@ -383,7 +383,7 @@
+ 	kfree_sensitive(ctx);
+ }
+ 
+-int hdcp_get_version(struct hdcp2_smcinvoke_handle *handle)
++static int hdcp_get_version(struct hdcp2_smcinvoke_handle *handle)
+ {
+ 	int ret = 0;
+ 	uint32_t app_major_version = 0;
+@@ -407,7 +407,7 @@
+ 	return ret;
+ }
+ 
+-int hdcp2_app_init(struct hdcp2_smcinvoke_handle *handle)
++static int hdcp2_app_init(struct hdcp2_smcinvoke_handle *handle)
+ {
+ 	int ret = 0;
+ 	uint32_t app_minor_version = 0;
+@@ -449,7 +449,7 @@
+ 	return ret;
+ }
+ 
+-int hdcp2_app_tx_init(struct hdcp2_smcinvoke_handle *handle)
++static int hdcp2_app_tx_init(struct hdcp2_smcinvoke_handle *handle)
+ {
+ 	int ret = 0;
+ 	uint32_t ctxhandle = 0;
+@@ -478,7 +478,7 @@
+ 	return ret;
+ }
+ 
+-int hdcp2_app_tx_deinit(struct hdcp2_smcinvoke_handle *handle)
++static int hdcp2_app_tx_deinit(struct hdcp2_smcinvoke_handle *handle)
+ {
+ 	int ret = 0;
+ 
+@@ -728,6 +728,9 @@
+ 		goto error;
+ 	}
+ 
++	if (req_len > MAX_RX_MESSAGE_SIZE || !handle->app_data.request.data ||
++	    !handle->app_data.response.data)
++		return -EINVAL;
+ 	handle->app_data.request.length = req_len;
+ 
+ 	if (!(handle->hdcp_state & HDCP_STATE_SESSION_INIT)) {
+@@ -750,6 +753,8 @@
+ 		goto error;
+ 	}
+ 
++	if (resMsgOut > sizeof(resMsg))
++		return -EINVAL;
+ 	memcpy(handle->app_data.response.data, resMsg, resMsgOut);
+ 
+ 	handle->app_data.response.length = resMsgOut;
+@@ -781,6 +786,9 @@
+ 		goto error;
+ 	}
+ 
++	if (req_len > MAX_RX_MESSAGE_SIZE || !handle->app_data.request.data ||
++	    !handle->app_data.response.data)
++		return -EINVAL;
+ 	handle->app_data.request.length = req_len;
+ 
+ 	if (!handle->app_data.request.data) {
+@@ -798,6 +806,8 @@
+ 		goto error;
+ 	}
+ 
++	if (resMsgLen > sizeof(resMsg))
++		return -EINVAL;
+ 	memcpy(handle->app_data.response.data, resMsg, resMsgLen);
+ 
+ 	/* check if it's a repeater */
+@@ -828,6 +838,9 @@
+ 		goto error;
+ 	}
+ 
++	if (req_len > MAX_RX_MESSAGE_SIZE || !handle->app_data.request.data ||
++	    !handle->app_data.response.data)
++		return -EINVAL;
+ 	handle->app_data.request.length = req_len;
+ 
+ 	ret = hdcp2p2_send_timeout(handle->hdcp2_app_obj, handle->tz_ctxhandle,
+@@ -838,6 +851,8 @@
+ 		goto error;
+ 	}
+ 
++	if (resMsgLenOut > sizeof(resMsg))
++		return -EINVAL;
+ 	memcpy(handle->app_data.response.data, resMsg, resMsgLenOut);
+ 
+ 	handle->app_data.response.length = resMsgLenOut;
+@@ -860,6 +875,9 @@
+ 		goto error;
+ 	}
+ 
++	if (req_len > MAX_RX_MESSAGE_SIZE || !handle->app_data.request.data ||
++	    !handle->app_data.response.data)
++		return -EINVAL;
+ 	handle->app_data.request.length = req_len;
+ 
+ 	/*
+@@ -897,6 +915,9 @@
+ 		goto error;
+ 	}
+ 
++	if (req_len > MAX_RX_MESSAGE_SIZE || !handle->app_data.request.data ||
++	    !handle->app_data.response.data)
++		return -EINVAL;
+ 	handle->app_data.request.length = req_len;
+ 
+ 	ret = hdcp2p2_query_stream_type(
+@@ -907,6 +928,8 @@
+ 		goto error;
+ 	}
+ 
++	if (resMsgLenOut > sizeof(resMsg))
++		return -EINVAL;
+ 	memcpy(handle->app_data.response.data, resMsg, resMsgLenOut);
+ 
+ 	handle->app_data.response.length = resMsgLenOut;
+--- a/qcom/opensource/securemsm-kernel/smmu-proxy/qti-smmu-proxy-common.c
++++ b/qcom/opensource/securemsm-kernel/smmu-proxy/qti-smmu-proxy-common.c
+@@ -18,50 +18,35 @@
+ 
+ static struct csf_version cached_csf_version;
+ 
++static DEFINE_MUTEX(csf_version_lock);
++
+ int smmu_proxy_get_csf_version(struct csf_version *csf_version)
+ {
++	struct Object client_env = Object_NULL, sc_object = Object_NULL;
++	struct csf_version version = { 0 };
+ 	int ret;
+-	struct Object client_env = {0};
+-	struct Object sc_object;
+ 
+-	/* Assumption is that cached_csf_version.arch_ver !=0 ==> other vals are set */
+-	if (cached_csf_version.arch_ver != 0) {
+-		csf_version->arch_ver = cached_csf_version.arch_ver;
+-		csf_version->max_ver = cached_csf_version.max_ver;
+-		csf_version->min_ver = cached_csf_version.min_ver;
+-
++	if (!csf_version)
++		return -EINVAL;
++	guard(mutex)(&csf_version_lock);
++	if (cached_csf_version.arch_ver) {
++		*csf_version = cached_csf_version;
+ 		return 0;
+ 	}
+-
+ 	ret = get_client_env_object(&client_env);
+-	if (ret) {
+-		pr_err("%s: Failed to get env object rc: %d\n", __func__,
+-		       ret);
++	if (ret)
+ 		return ret;
++	ret = IClientEnv_open(client_env, CTrustedCameraDriver_UID, &sc_object);
++	if (!ret) {
++		ret = ITrustedCameraDriver_getVersion(sc_object, &version.arch_ver,
++						    &version.max_ver, &version.min_ver);
++		Object_release(sc_object);
+ 	}
+-
+-	ret = IClientEnv_open(client_env, CTrustedCameraDriver_UID, &sc_object);
+-	if (ret) {
+-		pr_err("%s: Failed to get seccam object rc: %d\n", __func__,
+-		       ret);
+-		return ret;
++	Object_release(client_env);
++	if (!ret) {
++		cached_csf_version = version;
++		*csf_version = version;
+ 	}
+-
+-	ret = ITrustedCameraDriver_getVersion(sc_object, &csf_version->arch_ver,
+-					      &csf_version->max_ver,
+-					      &csf_version->min_ver);
+-
+-	Object_release(sc_object);
+-	Object_release(client_env);
+-
+-	/*
+-	 * Once we set cached_csf_version.arch_ver, concurrent callers will get
+-	 * the cached value.
+-	 */
+-	cached_csf_version.min_ver = csf_version->min_ver;
+-	cached_csf_version.max_ver = csf_version->max_ver;
+-	cached_csf_version.arch_ver = csf_version->arch_ver;
+-
+ 	return ret;
+ }
+ EXPORT_SYMBOL(smmu_proxy_get_csf_version);
+@@ -87,6 +72,7 @@
+ 	}
+ 
+ 	cdev_init(&smmu_proxy_char_dev, fops);
++	smmu_proxy_char_dev.owner = THIS_MODULE;
+ 	ret = cdev_add(&smmu_proxy_char_dev, smmu_proxy_dev_no,
+ 		       SMMU_PROXY_MAX_DEVS);
+ 	if (ret < 0)
+@@ -111,3 +97,11 @@
+ 	return ret;
+ }
+ 
++
++void smmu_proxy_destroy_dev(void)
++{
++	device_destroy(smmu_proxy_class, smmu_proxy_dev_no);
++	cdev_del(&smmu_proxy_char_dev);
++	class_destroy(smmu_proxy_class);
++	unregister_chrdev_region(smmu_proxy_dev_no, SMMU_PROXY_MAX_DEVS);
++}
+--- a/qcom/opensource/securemsm-kernel/smmu-proxy/qti-smmu-proxy-common.h
++++ b/qcom/opensource/securemsm-kernel/smmu-proxy/qti-smmu-proxy-common.h
+@@ -26,5 +26,6 @@
+ };
+ 
+ int smmu_proxy_create_dev(const struct file_operations *fops);
++void smmu_proxy_destroy_dev(void);
+ 
+ #endif /* __QTI_SMMU_PROXY_COMMON_H_ */
+--- a/qcom/opensource/securemsm-kernel/smmu-proxy/qti-smmu-proxy-pvm.c
++++ b/qcom/opensource/securemsm-kernel/smmu-proxy/qti-smmu-proxy-pvm.c
+@@ -15,11 +15,18 @@
+ 
+ static void *msgq_hdl;
+ 
+-DEFINE_MUTEX(sender_mutex);
++static DEFINE_MUTEX(sender_mutex);
+ 
+ static const struct file_operations smmu_proxy_dev_fops;
+ 
+-int smmu_proxy_unmap(void *data)
++static bool smmu_proxy_response_valid(const struct smmu_proxy_resp_hdr *hdr,
++				      size_t size, size_t expected, u32 type)
++{
++	return size == expected && size >= sizeof(*hdr) &&
++	       hdr->msg_size == expected && hdr->msg_type == type;
++}
++
++static int smmu_proxy_unmap(void *data)
+ {
+ 	struct dma_buf *dmabuf;
+ 	void *buf;
+@@ -30,6 +37,10 @@
+ 	int retry_cnt;
+ 
+ 	mutex_lock(&sender_mutex);
++	if (IS_ERR_OR_NULL(msgq_hdl)) {
++		ret = -ENODEV;
++		goto out;
++	}
+ 	buf = kzalloc(GH_MSGQ_MAX_MSG_SIZE_BYTES, GFP_KERNEL);
+ 	if (!buf) {
+ 		ret = -ENOMEM;
+@@ -56,10 +67,7 @@
+ 		goto free_buf;
+ 	}
+ 
+-	/*
+-	 * No need to validate size -  gh_msgq_recv() ensures that sizeof(*resp) <
+-	 * GH_MSGQ_MAX_MSG_SIZE_BYTES
+-	 */
++
+ 	retry_cnt = GH_MSGQ_RECV_RETRY_CNT;
+ 	do {
+ 		ret = gh_msgq_recv(msgq_hdl, buf, sizeof(*resp), &size, 0);
+@@ -77,6 +85,12 @@
+ 	} while (--retry_cnt);
+ 
+ 	resp = buf;
++	if (!smmu_proxy_response_valid(&resp->hdr, size, sizeof(*resp),
++				       SMMU_PROXY_UNMAP_RESP)) {
++		ret = -EPROTO;
++		goto free_buf;
++	}
++	ret = 0;
+ 	if (resp->hdr.ret) {
+ 		ret = resp->hdr.ret;
+ 		pr_err("%s: Unmap call failed on remote VM, rc: %d\n", __func__,
+@@ -106,6 +120,10 @@
+ 	int retry_cnt;
+ 
+ 	mutex_lock(&sender_mutex);
++	if (IS_ERR_OR_NULL(msgq_hdl)) {
++		ret = -ENODEV;
++		goto out;
++	}
+ 	buf = kzalloc(GH_MSGQ_MAX_MSG_SIZE_BYTES, GFP_KERNEL);
+ 	if (!buf) {
+ 		ret = -ENOMEM;
+@@ -145,10 +163,7 @@
+ 		goto free_buf;
+ 	}
+ 
+-	/*
+-	 * No need to validate size -  gh_msgq_recv() ensures that sizeof(*resp) <
+-	 * GH_MSGQ_MAX_MSG_SIZE_BYTES
+-	 */
++
+ 	retry_cnt = GH_MSGQ_RECV_RETRY_CNT;
+ 	do {
+ 		ret = gh_msgq_recv(msgq_hdl, buf, sizeof(*resp), &size, 0);
+@@ -166,6 +181,12 @@
+ 	} while (--retry_cnt);
+ 
+ 	resp = buf;
++	if (!smmu_proxy_response_valid(&resp->hdr, size, sizeof(*resp),
++				       SMMU_PROXY_SWITCH_SID_RESP)) {
++		ret = -EPROTO;
++		goto free_buf;
++	}
++	ret = 0;
+ 	if (resp->hdr.ret) {
+ 		ret = resp->hdr.ret;
+ 		pr_err("%s: Switch call failed on remote VM, rc: %d\n", __func__,
+@@ -186,7 +207,7 @@
+ }
+ EXPORT_SYMBOL_GPL(smmu_proxy_switch_sid);
+ 
+-int smmu_proxy_map(struct device *client_dev, struct sg_table *proxy_iova,
++static int smmu_proxy_map(struct device *client_dev, struct sg_table *proxy_iova,
+ 		   struct dma_buf *dmabuf)
+ {
+ 	void *buf;
+@@ -216,6 +237,10 @@
+ 	n_acl_entries = csf_version.min_ver == 1 ? 2 : 1;
+ 
+ 	mutex_lock(&sender_mutex);
++	if (IS_ERR_OR_NULL(msgq_hdl)) {
++		ret = -ENODEV;
++		goto out;
++	}
+ 	buf = kzalloc(GH_MSGQ_MAX_MSG_SIZE_BYTES, GFP_KERNEL);
+ 	if (!buf) {
+ 		ret = -ENOMEM;
+@@ -268,16 +293,18 @@
+ 		goto free_buf;
+ 	}
+ 
+-	/*
+-	 * No need to validate size -  gh_msgq_recv() ensures that sizeof(*resp) <
+-	 * GH_MSGQ_MAX_MSG_SIZE_BYTES
+-	 */
++
+ 	retry_cnt = GH_MSGQ_RECV_RETRY_CNT;
+ 	resp = buf;
+ 	flags = 0;
+ 	do {
+ 		ret = gh_msgq_recv(msgq_hdl, buf, sizeof(*resp), &size, flags);
+ 		if (ret >= 0) {
++			if (!smmu_proxy_response_valid(&resp->hdr, size, sizeof(*resp),
++						       SMMU_PROXY_MAP_RESP)) {
++				ret = -EPROTO;
++				goto free_buf;
++			}
+ 			if (resp->hdr.ret) {
+ 				ret = resp->hdr.ret;
+ 				pr_err_ratelimited("%s: Map call failed on remote VM, rc: %d\n",
+@@ -303,6 +330,12 @@
+ 		mdelay(DELAY_MS);
+ 	} while (--retry_cnt);
+ 
++	if (!resp->mapping_len || resp->mapping_len > U32_MAX ||
++	    resp->mapping_len > dmabuf->size ||
++	    resp->iova > U64_MAX - resp->mapping_len) {
++		ret = -EPROTO;
++		goto free_buf;
++	}
+ 	ret = mem_buf_dma_buf_set_destructor(dmabuf, smmu_proxy_unmap, dmabuf);
+ 	if (ret) {
+ 		pr_err_ratelimited("%s: Failed to set vmperm destructor, rc: %d\n",
+@@ -327,7 +360,7 @@
+ 	return ret;
+ }
+ 
+-void smmu_proxy_unmap_nop(struct device *client_dev, struct sg_table *table,
++static void smmu_proxy_unmap_nop(struct device *client_dev, struct sg_table *table,
+ 			  struct dma_buf *dmabuf)
+ {
+ 
+@@ -377,56 +410,49 @@
+ }
+ 
+ static const struct file_operations smmu_proxy_dev_fops = {
++	.owner = THIS_MODULE,
+ 	.unlocked_ioctl = smmu_proxy_dev_ioctl,
+ 	.compat_ioctl = compat_ptr_ioctl,
+ };
+ 
+ static int sender_probe_handler(struct platform_device *pdev)
+ {
++	struct csf_version csf_version;
+ 	int ret;
+-	struct csf_version csf_version;
+-
++
++	guard(mutex)(&sender_mutex);
++	if (msgq_hdl)
++		return -EBUSY;
+ 	msgq_hdl = gh_msgq_register(GH_MSGQ_LABEL_SMMU_PROXY);
+ 	if (IS_ERR(msgq_hdl)) {
+ 		ret = PTR_ERR(msgq_hdl);
+-		pr_err("%s: Queue registration failed rc: %ld!\n", __func__, PTR_ERR(msgq_hdl));
++		msgq_hdl = NULL;
+ 		return ret;
+ 	}
+-
+ 	ret = smmu_proxy_get_csf_version(&csf_version);
+-	if (ret) {
+-		pr_err("%s: Failed to get CSF version rc: %d\n", __func__, ret);
++	if (ret)
+ 		goto free_msgq;
+-	}
+-
+-	if (csf_version.arch_ver == 2 && csf_version.max_ver == 0) {
+-		ret = qti_smmu_proxy_register_callbacks(NULL, NULL);
+-	} else if (csf_version.arch_ver == 2 && csf_version.max_ver == 5) {
+-		ret = qti_smmu_proxy_register_callbacks(smmu_proxy_map, smmu_proxy_unmap_nop);
+-	} else {
+-		pr_err("%s: Invalid CSF version: %d.%d\n", __func__, csf_version.arch_ver,
+-			csf_version.max_ver);
++	if (csf_version.arch_ver != 2 ||
++	    (csf_version.max_ver != 0 && csf_version.max_ver != 5)) {
++		ret = -EINVAL;
+ 		goto free_msgq;
+ 	}
+-
+-	if (ret) {
+-		pr_err("%s: Failed to set SMMU proxy callbacks rc: %d\n", __func__, ret);
++	ret = smmu_proxy_create_dev(&smmu_proxy_dev_fops);
++	if (ret)
+ 		goto free_msgq;
+-	}
+-
+-	ret = smmu_proxy_create_dev(&smmu_proxy_dev_fops);
+-	if (ret) {
+-		pr_err("%s: Failed to create character device rc: %d\n", __func__,
+-		       ret);
+-		goto set_callbacks_null;
+-	}
+-
++	ret = qti_smmu_proxy_register_callbacks(
++		csf_version.max_ver == 5 ? smmu_proxy_map : NULL,
++		csf_version.max_ver == 5 ? smmu_proxy_unmap_nop : NULL);
++	if (ret) {
++		smmu_proxy_destroy_dev();
++		goto free_msgq;
++	}
++	/* Heap destructors and firmware mappings retain this callback provider. */
++	__module_get(THIS_MODULE);
+ 	return 0;
+-
+-set_callbacks_null:
+-	qti_smmu_proxy_register_callbacks(NULL, NULL);
+ free_msgq:
+ 	gh_msgq_unregister(msgq_hdl);
++	msgq_hdl = NULL;
+ 	return ret;
+ }
+ 
+@@ -435,19 +461,23 @@
+ 	{},
+ };
+ 
++MODULE_DEVICE_TABLE(of, smmu_proxy_match_table);
++
+ static struct platform_driver smmu_proxy_driver = {
+ 	.probe = sender_probe_handler,
+ 	.driver = {
+ 		.name = "qti-smmu-proxy",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = smmu_proxy_match_table,
+ 	},
+ };
+ 
+-int __init init_smmu_proxy_driver(void)
++static int __init init_smmu_proxy_driver(void)
+ {
+ 	return platform_driver_register(&smmu_proxy_driver);
+ }
+ module_init(init_smmu_proxy_driver);
+ 
+-MODULE_IMPORT_NS(DMA_BUF);
++MODULE_IMPORT_NS("DMA_BUF");
+ MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("QTI SMMU proxy sender");
+--- a/qcom/opensource/securemsm-kernel/smmu-proxy/qti-smmu-proxy-tvm.c
++++ b/qcom/opensource/securemsm-kernel/smmu-proxy/qti-smmu-proxy-tvm.c
+@@ -837,5 +837,5 @@
+ }
+ module_init(init_smmu_proxy_driver);
+ 
+-MODULE_IMPORT_NS(DMA_BUF);
++MODULE_IMPORT_NS("DMA_BUF");
+ MODULE_LICENSE("GPL v2");
+--- a/qcom/opensource/securemsm-kernel/qseecom/qseecom.c
++++ b/qcom/opensource/securemsm-kernel/qseecom/qseecom.c
+@@ -22,7 +22,6 @@
+ #include <linux/mutex.h>
+ #include <linux/io.h>
+ #include <linux/dma-buf.h>
+-#include <linux/msm_ion.h>
+ #include <linux/types.h>
+ #include <linux/clk.h>
+ #include <linux/elf.h>
+@@ -2074,7 +2073,7 @@
+ 			pr_err("Failed to decrease clk ref count.\n");
+ 			goto err_scale_timer;
+ 		}
+-		del_timer_sync(&(qseecom.bw_scale_down_timer));
++		timer_delete_sync(&(qseecom.bw_scale_down_timer));
+ 		qseecom.timer_running = false;
+ 	}
+ err_scale_timer:
+@@ -5552,7 +5551,8 @@
+ 
+ #if IS_ENABLED(CONFIG_QSEECOM)
+ #if IS_ENABLED(CONFIG_QSEECOM_PROXY)
+-const static struct qseecom_drv_ops qseecom_driver_ops = {
++static const struct qseecom_drv_ops qseecom_driver_ops = {
++	.owner = THIS_MODULE,
+ 	.qseecom_send_command = __qseecom_send_command,
+ 	.qseecom_start_app = __qseecom_start_app,
+ 	.qseecom_shutdown_app = __qseecom_shutdown_app,
+@@ -8509,6 +8509,9 @@
+ {
+ 	int ret = 0;
+ 	struct qseecom_dev_handle *data;
++
++	if (atomic_read(&qseecom.qseecom_state) != QSEECOM_STATE_READY)
++		return -ENODEV;
+ 	data = kzalloc(sizeof(*data), GFP_KERNEL);
+ 	if (!data)
+ 	{
+@@ -8528,6 +8531,8 @@
+ 				&data->sglistinfo_shm);
+ 	if (!data->sglistinfo_ptr)
+ 	{
++		file->private_data = NULL;
++		kfree(data);
+ 		return -ENOMEM;
+ 	}
+ 	return ret;
+@@ -9436,10 +9441,10 @@
+ {
+ 	if (!qseecom.support_bus_scaling || qseecom.no_clock_support)
+ 		return;
++	timer_shutdown_sync(&qseecom.bw_scale_down_timer);
++	cancel_work_sync(&qseecom.bw_inactive_req_ws);
+ 	qseecom_bus_scale_update_request(qseecom.qsee_perf_client, 0);
+ 	icc_put(qseecom.icc_path);
+-	cancel_work_sync(&qseecom.bw_inactive_req_ws);
+-	del_timer_sync(&qseecom.bw_scale_down_timer);
+ }
+ 
+ static int qseecom_send_app_region(struct platform_device *pdev)
+@@ -9885,7 +9890,7 @@
+ 		goto exit_deinit_bus;
+ 	rc = qseecom_create_device(pdev);
+ 	if (rc)
+-		goto exit_deinit_bus;
++		goto exit_stop_threads;
+ 
+ #if IS_ENABLED(CONFIG_QSEECOM) && IS_ENABLED(CONFIG_QSEECOM_PROXY)
+ 	/*If the api fails to get the func ops, print the error and continue
+@@ -9895,8 +9900,13 @@
+ 		pr_err("failed to provide qseecom ops %d", rc);
+ #endif
+ 	atomic_set(&qseecom.qseecom_state, QSEECOM_STATE_READY);
++	/* Listener and application references have no live device withdrawal. */
++	__module_get(THIS_MODULE);
+ 	return 0;
+ 
++exit_stop_threads:
++	kthread_stop(qseecom.unload_app_kthread_task);
++	kthread_stop(qseecom.unregister_lsnr_kthread_task);
+ exit_deinit_bus:
+ 	qseecom_deinit_bus();
+ exit_deinit_clock:
+@@ -9996,7 +10006,7 @@
+ 				qseecom.current_mode = INACTIVE;
+ 		}
+ 
+-		del_timer_sync(&(qseecom.bw_scale_down_timer));
++		timer_delete_sync(&(qseecom.bw_scale_down_timer));
+ 		qseecom.timer_running = false;
+ 
+ 		mutex_unlock(&qsee_bw_mutex);
+@@ -10101,6 +10111,7 @@
+ 	.resume = qseecom_resume,
+ 	.driver = {
+ 		.name = "qseecom",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = qseecom_match,
+ 	},
+ };
+@@ -10117,7 +10128,7 @@
+ 
+ MODULE_LICENSE("GPL v2");
+ MODULE_DESCRIPTION("QTI Secure Execution Environment Communicator");
+-MODULE_IMPORT_NS(DMA_BUF);
++MODULE_IMPORT_NS("DMA_BUF");
+ 
+ module_init(qseecom_init);
+ module_exit(qseecom_exit);
+--- a/qcom/opensource/securemsm-kernel/smcinvoke/si_core_xts/qseecom.c
++++ b/qcom/opensource/securemsm-kernel/smcinvoke/si_core_xts/qseecom.c
+@@ -13,6 +13,8 @@
+ #include <linux/slab.h>
+ #include <linux/firmware.h>
+ #include <linux/elf.h>
++#include <linux/module.h>
++#include <linux/overflow.h>
+ 
+ #include "smcinvoke.h"
+ #include "smcinvoke_object.h"
+@@ -64,8 +66,7 @@
+ 	uint32_t arch_type = 0;
+ 
+ 	if (strnlen(app_name, MAX_FW_APP_SIZE) == MAX_FW_APP_SIZE) {
+-		pr_err("The app_name (%s) with length %zu is not valid\n",
+-			app_name, strnlen(app_name, MAX_FW_APP_SIZE));
++		pr_err("The app_name is not terminated\n");
+ 		return -EINVAL;
+ 	}
+ 
+@@ -85,7 +86,7 @@
+ 	ret = IQSEEComCompatAppLoader_loadFromBuffer(
+ 			cxt->app_loader, imgbuf_va, fw_size,
+ 			app_name, strlen(app_name),
+-			dist_name, MAX_FW_APP_SIZE, &dist_name_len,
++			dist_name, MAX_FW_APP_SIZE - 1, &dist_name_len,
+ 			&cxt->app_controller);
+ 	if (ret) {
+ 		pr_err("loadFromBuffer failed for app %s, ret = %d\n",
+@@ -110,7 +111,7 @@
+ 
+ 	pr_warn("%s, start app %s, size %u\n",
+ 		__func__, app_name, size);
+-	if (app_name == NULL || handle == NULL) {
++	if (!app_name || !handle || !size) {
+ 		pr_err("app_name is null or invalid handle\n");
+ 		return -EINVAL;
+ 	}
+@@ -228,6 +229,7 @@
+ 
+ #if IS_ENABLED(CONFIG_QSEECOM_PROXY)
+ static const struct qseecom_drv_ops qseecom_driver_ops = {
++	.owner = THIS_MODULE,
+ 	.qseecom_send_command = __qseecom_send_command,
+ 	.qseecom_start_app = __qseecom_start_app,
+ 	.qseecom_shutdown_app = __qseecom_shutdown_app,
+@@ -270,109 +272,111 @@
+ #endif /* CONFIG_QSEECOM_PROXY */
+ #endif /* CONFIG_QSEECOM_COMPAT */
+ 
++static int split_firmware_layout(const struct firmware *header, size_t **offsets,
++				unsigned int *count)
++{
++	struct elf32_hdr eh32;
++	struct elf64_hdr eh64;
++	size_t table, entry_size, *offset;
++	unsigned int i, nr;
++	bool is_64;
++
++	if (header->size < EI_NIDENT || memcmp(header->data, ELFMAG, SELFMAG) ||
++	    header->data[EI_DATA] != ELFDATA2LSB || header->data[EI_VERSION] != EV_CURRENT)
++		return -EINVAL;
++	is_64 = header->data[EI_CLASS] == ELFCLASS64;
++	if (is_64) {
++		if (header->size < sizeof(eh64))
++			return -EINVAL;
++		memcpy(&eh64, header->data, sizeof(eh64));
++		table = eh64.e_phoff;
++		nr = eh64.e_phnum;
++		entry_size = sizeof(Elf64_Phdr);
++		if (eh64.e_phentsize != entry_size)
++			return -EINVAL;
++	} else {
++		if (header->data[EI_CLASS] != ELFCLASS32 || header->size < sizeof(eh32))
++			return -EINVAL;
++		memcpy(&eh32, header->data, sizeof(eh32));
++		table = eh32.e_phoff;
++		nr = eh32.e_phnum;
++		entry_size = sizeof(Elf32_Phdr);
++		if (eh32.e_phentsize != entry_size)
++			return -EINVAL;
++	}
++	if (nr < 2 || table > header->size || nr > (header->size - table) / entry_size)
++		return -EINVAL;
++	offset = kcalloc(nr, sizeof(*offset), GFP_KERNEL);
++	if (!offset)
++		return -ENOMEM;
++	for (i = 1; i < nr; i++) {
++		if (is_64) {
++			Elf64_Phdr ph;
++
++			memcpy(&ph, header->data + table + i * entry_size, sizeof(ph));
++			offset[i] = ph.p_offset;
++		} else {
++			Elf32_Phdr ph;
++
++			memcpy(&ph, header->data + table + i * entry_size, sizeof(ph));
++			offset[i] = ph.p_offset;
++		}
++	}
++	*offsets = offset;
++	*count = nr;
++	return 0;
++}
++
+ char *firmware_request_from_smcinvoke(const char *appname, size_t *fw_size, struct qtee_shm *shm)
+ {
+-	int rc = 0;
+-	const struct firmware *fw_entry = NULL, *fw_entry00 = NULL, *fw_entrylast = NULL;
+-	char fw_name[MAX_FW_APP_SIZE + FILE_EXT_SIZE] = "\0";
+-	int num_images = 0, phi = 0;
+-	unsigned char app_arch = 0;
+-	u8 *img_data_ptr = NULL;
+-	size_t bufferOffset = 0, phdr_table_offset = 0;
+-	size_t *offset = NULL;
+-	Elf32_Phdr phdr32;
+-	Elf64_Phdr phdr64;
+-	struct elf32_hdr *ehdr = NULL;
+-	struct elf64_hdr *ehdr64 = NULL;
+-
+-
+-	/* load b00*/
++	const struct firmware *header = NULL, **parts = NULL;
++	char fw_name[MAX_FW_APP_SIZE + FILE_EXT_SIZE];
++	size_t *offset = NULL, total = 0, end;
++	unsigned int count = 0, i;
++	int ret;
++	char *image = NULL;
++
++	if (!appname || !fw_size || !shm || IS_ERR_OR_NULL(smci_dev) ||
++	    strnlen(appname, MAX_FW_APP_SIZE) == MAX_FW_APP_SIZE)
++		return NULL;
++	*fw_size = 0;
++	memset(shm, 0, sizeof(*shm));
+ 	snprintf(fw_name, sizeof(fw_name), "%s.b00", appname);
+-	rc = firmware_request_nowarn(&fw_entry00, fw_name, smci_dev);
+-	if (rc) {
+-		pr_err("Load %s failed, ret:%d\n", fw_name, rc);
++	ret = firmware_request_nowarn(&header, fw_name, smci_dev);
++	if (ret)
+ 		return NULL;
+-	}
+-
+-	app_arch = *(unsigned char *)(fw_entry00->data + EI_CLASS);
+-
+-	/*Get the offsets for split images header*/
+-	if (app_arch == ELFCLASS32) {
+-
+-		ehdr = (struct elf32_hdr *)fw_entry00->data;
+-		num_images = ehdr->e_phnum;
+-		offset = kcalloc(num_images, sizeof(size_t), GFP_KERNEL);
+-		if (offset == NULL)
+-			goto release_fw_entry00;
+-		phdr_table_offset = (size_t) ehdr->e_phoff;
+-		for (phi = 1; phi < num_images; ++phi) {
+-			bufferOffset = phdr_table_offset + phi * sizeof(Elf32_Phdr);
+-			phdr32 = *(Elf32_Phdr *)(fw_entry00->data + bufferOffset);
+-			offset[phi] = (size_t)phdr32.p_offset;
+-		}
+-
+-	} else if (app_arch == ELFCLASS64) {
+-
+-		ehdr64 = (struct elf64_hdr *)fw_entry00->data;
+-		num_images = ehdr64->e_phnum;
+-		offset = kcalloc(num_images, sizeof(size_t), GFP_KERNEL);
+-		if (offset == NULL)
+-			goto release_fw_entry00;
+-		phdr_table_offset = (size_t) ehdr64->e_phoff;
+-		for (phi = 1; phi < num_images; ++phi) {
+-			bufferOffset = phdr_table_offset + phi * sizeof(Elf64_Phdr);
+-			phdr64 = *(Elf64_Phdr *)(fw_entry00->data + bufferOffset);
+-			offset[phi] = (size_t)phdr64.p_offset;
+-		}
+-
+-	} else {
+-
+-		pr_err("QSEE %s app, arch %u is not supported\n", appname, app_arch);
+-		goto release_fw_entry00;
+-	}
+-
+-	/*Find the size of last split bin image*/
+-	snprintf(fw_name, ARRAY_SIZE(fw_name), "%s.b%02d", appname, num_images-1);
+-	rc = firmware_request_nowarn(&fw_entrylast, fw_name, smci_dev);
+-	if (rc) {
+-		pr_err("Failed to locate blob %s\n", fw_name);
+-		goto release_fw_entry00;
+-	}
+-
+-	/*Total size of image will be the offset of last image + the size of last split image*/
+-	*fw_size = fw_entrylast->size + offset[num_images-1];
+-
+-	/*Allocate memory for the buffer that will hold the split image*/
+-	rc = qtee_shmbridge_allocate_shm((*fw_size), shm);
+-	if (rc) {
+-		pr_err("smbridge alloc failed for size: %zu\n", *fw_size);
+-		goto release_fw_entrylast;
+-	}
+-	img_data_ptr = shm->vaddr;
+-	/*
+-	 * Copy contents of split bins to the buffer
+-	 */
+-	memcpy(img_data_ptr, fw_entry00->data, fw_entry00->size);
+-	for (phi = 1; phi < num_images-1; phi++) {
+-		snprintf(fw_name, ARRAY_SIZE(fw_name), "%s.b%02d", appname, phi);
+-		rc = firmware_request_nowarn(&fw_entry, fw_name, smci_dev);
+-		if (rc) {
+-			pr_err("Failed to locate blob %s\n", fw_name);
+-			qtee_shmbridge_free_shm(shm);
+-			img_data_ptr = NULL;
+-			goto release_fw_entrylast;
+-		}
+-		memcpy(img_data_ptr + offset[phi], fw_entry->data, fw_entry->size);
+-		release_firmware(fw_entry);
+-		fw_entry = NULL;
+-	}
+-	memcpy(img_data_ptr + offset[phi], fw_entrylast->data, fw_entrylast->size);
+-
+-release_fw_entrylast:
+-	release_firmware(fw_entrylast);
+-release_fw_entry00:
+-	release_firmware(fw_entry00);
++	ret = split_firmware_layout(header, &offset, &count);
++	if (ret)
++		goto out;
++	parts = kcalloc(count, sizeof(*parts), GFP_KERNEL);
++	if (!parts)
++		goto out;
++	total = header->size;
++	for (i = 1; i < count; i++) {
++		ret = snprintf(fw_name, sizeof(fw_name), "%s.b%02u", appname, i);
++		if (ret >= sizeof(fw_name))
++			goto out;
++		ret = firmware_request_nowarn(&parts[i], fw_name, smci_dev);
++		if (ret || check_add_overflow(offset[i], parts[i]->size, &end))
++			goto out;
++		total = max(total, end);
++	}
++	/* The shared allocator rounds the size up to a page. */
++	if (total > SIZE_MAX - (PAGE_SIZE - 1) || qtee_shmbridge_allocate_shm(total, shm))
++		goto out;
++	image = shm->vaddr;
++	memset(image, 0, total);
++	memcpy(image, header->data, header->size);
++	for (i = 1; i < count; i++)
++		memcpy(image + offset[i], parts[i]->data, parts[i]->size);
++	*fw_size = total;
++out:
++	if (parts)
++		for (i = 1; i < count; i++)
++			release_firmware(parts[i]);
++	release_firmware(header);
++	kfree(parts);
+ 	kfree(offset);
+-	return img_data_ptr;
++	return image;
+ }
+ EXPORT_SYMBOL_GPL(firmware_request_from_smcinvoke);
+--- a/qcom/opensource/securemsm-kernel/smcinvoke/si_core_xts/smci.c
++++ b/qcom/opensource/securemsm-kernel/smcinvoke/si_core_xts/smci.c
+@@ -39,6 +39,7 @@
+ static const struct file_operations server_fops;
+ 
+ static struct si_object_operations cbo_sio_ops;
++static void ____destroy_server_info(struct kref *kref);
+ 
+ /* 'struct cb_object' is a userspace callback object. */
+ 
+@@ -75,14 +76,57 @@
+ 
+ /* U_HANDLE allocation and mapping to instance of 'file'. */
+ 
++/* Each object count occupies one four-bit field in the wire ABI. */
++#define SMCI_MAX_EXPORTED_FDS 15
++
++struct smci_fd_batch {
++	unsigned int count;
++	struct {
++		int fd;
++		struct file *file;
++	} entries[SMCI_MAX_EXPORTED_FDS];
++};
++
++static int smci_fd_reserve(struct smci_fd_batch *batch, unsigned int flags)
++{
++	if (batch && batch->count == ARRAY_SIZE(batch->entries))
++		return -E2BIG;
++	return get_unused_fd_flags(flags);
++}
++
++static void smci_fd_publish(struct smci_fd_batch *batch, int fd, struct file *file)
++{
++	if (batch) {
++		batch->entries[batch->count].fd = fd;
++		batch->entries[batch->count++].file = file;
++	} else {
++		fd_install(fd, file);
++	}
++}
++
++static void smci_fd_batch_finish(struct smci_fd_batch *batch, bool commit)
++{
++	unsigned int i;
++
++	for (i = 0; i < batch->count; i++) {
++		if (commit) {
++			fd_install(batch->entries[i].fd, batch->entries[i].file);
++		} else {
++			put_unused_fd(batch->entries[i].fd);
++			fput(batch->entries[i].file);
++		}
++	}
++	batch->count = 0;
++}
++
+ static int u_handle_alloc(const char *name, const struct file_operations *fops,
+-	void *private, s64 *u_handle)
++	void *private, s64 *u_handle, struct smci_fd_batch *batch)
+ {
+ 	int fd;
+ 
+ 	struct file *file;
+ 
+-	fd = get_unused_fd_flags(O_RDWR);
++	fd = smci_fd_reserve(batch, O_RDWR);
+ 	if (fd < 0)
+ 		return fd;
+ 
+@@ -93,7 +137,7 @@
+ 		return PTR_ERR(file);
+ 	}
+ 
+-	fd_install(fd, file);
++	smci_fd_publish(batch, fd, file);
+ 	*u_handle = fd;
+ 
+ 	pr_debug("fd %d assigned for %s.\n", fd, name);
+@@ -138,6 +182,8 @@
+ 	struct file *filp;
+ 	struct cb_object *cb_object;
+ 
++	if (server_id < 0 || server_id > INT_MAX)
++		return ERR_PTR(-EBADF);
+ 	filp = get_cb_server_file(server_id);
+ 	if (!filp)
+ 		return ERR_PTR(-EBADF);
+@@ -174,6 +220,10 @@
+ 	/* The 'U_HANDLE' instance mapped to 'si_object'. */
+ 	s64 u_handle = o->fd;
+ 
++	if (u_handle > INT_MAX) {
++		ret = -EBADF;
++		goto out;
++	}
+ 	if (U_HANDLE_IS_NULL(u_handle)) {
+ 		object = NULL_SI_OBJECT;
+ 
+@@ -191,8 +241,13 @@
+ 			/* 'cb_object' represent an object in 'si'. */
+ 
+ 			cb_object->u_handle = u_handle;
+-			init_si_object_user(&cb_object->object, SI_OT_CB_OBJECT, &cbo_sio_ops,
++			ret = init_si_object_user(&cb_object->object, SI_OT_CB_OBJECT, &cbo_sio_ops,
+ 				"cbo-%s%d", cb_object->si->comm, u_handle);
++			if (ret) {
++				kref_put(&cb_object->si->refcount, ____destroy_server_info);
++				kfree(cb_object);
++				goto out;
++			}
+ 
+ 			object = &cb_object->object;
+ 
+@@ -226,8 +281,13 @@
+ 			object = init_si_mem_object_user(dma_buf, mem_object_release,
+ 				IS_ERR(x_cb) ? NULL : x_cb);
+ 
+-			if (!object)
++			if (!object) {
+ 				ret = -EINVAL;
++				if (!IS_ERR(x_cb)) {
++					kref_put(&x_cb->si->refcount, ____destroy_server_info);
++					kfree(x_cb);
++				}
++			}
+ 
+ 			get_si_object(object);
+ 
+@@ -249,6 +309,7 @@
+ 		}
+ 	}
+ 
++out:
+ 	if (ret) {
+ 
+ 		/* Return 'NULL' as default. */
+@@ -267,7 +328,7 @@
+  */
+ 
+ static int get_u_handle_from_si_object(struct si_object *object,
+-	s64 *u_handle, struct server_info **si)
++	s64 *u_handle, struct server_info **si, struct smci_fd_batch *batch)
+ {
+ 	int ret = 0;
+ 
+@@ -286,17 +347,27 @@
+ 		if (is_mem_object(object)) {
+ 			struct dma_buf *dma_buf = mem_object_to_dma_buf(object);
+ 
+-			get_dma_buf(dma_buf);
+-			*u_handle = dma_buf_fd(dma_buf, O_CLOEXEC);
++			if (IS_ERR_OR_NULL(dma_buf)) {
++				ret = -EINVAL;
++				break;
++			}
++			*u_handle = smci_fd_reserve(batch, O_CLOEXEC);
+ 			if (*u_handle < 0) {
+-				dma_buf_put(dma_buf);
+-
+-				ret = -EBADF;
+-			} else
++				ret = *u_handle;
++			} else {
++				/* The pending file owns the DMA reference until commit or abort. */
++				smci_fd_publish(batch, *u_handle, get_file(dma_buf->file));
+ 				put_si_object(object);
++			}
+ 
+ 		} else {
+-			struct cb_object *cb_object = to_cb_object(object);
++			struct cb_object *cb_object;
++
++			if (!is_cb_object(object)) {
++				ret = -EINVAL;
++				break;
++			}
++			cb_object = to_cb_object(object);
+ 
+ 			*u_handle = cb_object->u_handle;
+ 
+@@ -319,7 +390,7 @@
+ 		 * type. Because, it is used by file's 'private_data'.
+ 		 */
+ 
+-		if (u_handle_alloc(si_object_name(object), &qtee_fops, object, u_handle))
++		if (u_handle_alloc(si_object_name(object), &qtee_fops, object, u_handle, batch))
+ 			ret = -EBADF;
+ 
+ 		break;
+@@ -438,7 +509,8 @@
+ 
+ /* 'marshal_out_req' consumes 'u' as initialized by 'marshal_in_req' to fill 'args'. */
+ 
+-static int marshal_out_req(union smcinvoke_arg args[], struct si_arg u[])
++static int marshal_out_req(union smcinvoke_arg args[], struct si_arg u[],
++	struct smci_fd_batch *batch)
+ {
+ 	int i = 0, err = 0;
+ 
+@@ -476,7 +548,7 @@
+ 			args[i].o.fd = SMCINVOKE_USERSPACE_OBJ_NULL;
+ 
+ 			put_si_object(u[i].o);
+-		} else if (get_u_handle_from_si_object(u[i].o, &args[i].o.fd, NULL)) {
++		} else if (get_u_handle_from_si_object(u[i].o, &args[i].o.fd, NULL, batch)) {
+ 			put_si_object(u[i].o);
+ 
+ 			err = -1;
+@@ -488,19 +560,7 @@
+ 	if (!err)
+ 		return 0;
+ 
+-	/* Release whatever resources we got in 'args'! */
+-	/* Return with clean slate. */
+-
+-	for (i = 0; u[i].type; i++) {
+-		if (u[i].type == SI_AT_OO) {
+-			if (U_HANDLE_IS_OBJECT(args[i].o.fd)) {
+-
+-				/* This is a file descriptor. Need cleanup. */
+-				/* TODO. Cleanup exported object. */
+-
+-			}
+-		}
+-	}
++	/* The caller aborts all unpublished descriptors on failure. */
+ 
+ 	return -1;
+ }
+@@ -508,7 +568,8 @@
+ /* We assume 'u' is sorted so 'SI_AT_IB', 'SI_AT_OB', following by 'SI_AT_IO', and 'SI_AT_OO'. */
+ 
+ static int marshal_in_cb_req(union smcinvoke_arg args[], void __user *u_args,
+-	u32 *counts, struct si_arg u[], struct server_info *target_si)
++	u32 *counts, struct si_arg u[], struct server_info *target_si,
++	struct smci_fd_batch *batch)
+ {
+ 	int i = 0, err = 0;
+ 	int ib = 0, ob = 0, io = 0, oo = 0;
+@@ -545,10 +606,10 @@
+ 	ob = i;
+ 
+ 	for (; u[i].type == SI_AT_IO; i++) {
+-		struct server_info *si;
++		struct server_info *si = NULL;
+ 
+ 		if (!err) {
+-			if (get_u_handle_from_si_object(u[i].o, &args[i].o.fd, &si)) {
++			if (get_u_handle_from_si_object(u[i].o, &args[i].o.fd, &si, batch)) {
+ 				put_si_object(u[i].o);
+ 
+ 				err = -1;
+@@ -583,19 +644,7 @@
+ 		return 0;
+ 	}
+ 
+-	/* Release whatever resources we got in 'args'! */
+-	/* Return with clean slate. */
+-
+-	for (i = 0; u[i].type; i++) {
+-		if (u[i].type == SI_AT_IO) {
+-			if (U_HANDLE_IS_OBJECT(args[i].o.fd)) {
+-
+-				/* This is a file descriptor. Need cleanup. */
+-				/* TODO. Cleanup exported object. */
+-
+-			}
+-		}
+-	}
++	/* The caller aborts all unpublished descriptors on failure. */
+ 
+ 	return -1;
+ }
+@@ -1174,11 +1223,16 @@
+ 
+ /* User Callback server */
+ 
+-static long process_accept_req(struct server_info *si, struct smcinvoke_accept *accept)
+-{
++static long process_accept_req(struct server_info *si, struct smcinvoke_accept *accept,
++	void __user *accept_user)
++{
++	struct smci_fd_batch exports = {};
+ 	struct cb_txn *cb_txn;
+-
+-	if (accept->argsize != sizeof(union smcinvoke_arg))
++	int ret = 0;
++
++	if (accept->argsize != sizeof(union smcinvoke_arg) ||
++	    accept->buf_len > SIZE_MAX || accept->buf_addr > U64_MAX - accept->buf_len ||
++	    accept->txn_id > UINT_MAX)
+ 		return -EINVAL;
+ 
+ 	/* Processing response ... */
+@@ -1203,6 +1257,8 @@
+ 		}
+ 
+ 		errno = accept->result;
++		if (accept->buf_len < cb_txn->u_args_sz)
++			errno = -EINVAL;
+ 		if (!errno) {
+ 			/* Only parse arguments on SUCCESS. */
+ 
+@@ -1273,10 +1329,28 @@
+ 		accept->cbobj_id = cb_txn->u_handle;
+ 		accept->op = cb_txn->op;
+ 		accept->txn_id = cb_txn->context_id;
+-
++		{
++			size_t needed = ALIGN(cb_txn->u_args_sz, 8);
++			int i;
++
++			for (i = 0; cb_txn->args[i].type; i++) {
++				if (cb_txn->args[i].type != SI_AT_IB &&
++				    cb_txn->args[i].type != SI_AT_OB)
++					continue;
++				if (cb_txn->args[i].b.size > SIZE_MAX - needed - 7)
++					break;
++				needed = ALIGN(needed + cb_txn->args[i].b.size, 8);
++			}
++			if (cb_txn->args[i].type || needed > accept->buf_len) {
++				cb_txn->errno = -EINVAL;
++				goto out_failed;
++			}
++		}
++
++		cb_txn->errno = -EINVAL;
+ 		if (marshal_in_cb_req(cb_txn->u_args,
+ 			(void __user *)ALIGN(accept->buf_addr + cb_txn->u_args_sz, 8),
+-				&accept->counts, cb_txn->args, si)) {
++				&accept->counts, cb_txn->args, si, &exports)) {
+ 
+ 			goto out_failed;
+ 		}
+@@ -1287,23 +1361,37 @@
+ 		if (copy_to_user((void __user *)accept->buf_addr,
+ 			cb_txn->u_args, cb_txn->u_args_sz)) {
+ 
+-			/* TODO. We need to do some cleanup for 'marshal_in_cb_req'. */
+-
++			ret = -EFAULT;
++			cb_txn->errno = ret;
+ 			goto out_failed;
+ 		}
++
++		accept->has_resp = 0;
++		if (copy_to_user(accept_user, accept, sizeof(*accept))) {
++			ret = -EFAULT;
++			cb_txn->errno = ret;
++			goto out_failed;
++		}
++		/* Install only after both the argument and request copies succeed. */
++		smci_fd_batch_finish(&exports, true);
+ 
+ 		/* SUCCESS picking a request; return. */
+ 		break;
+ 
+ out_failed:
+ 
++		smci_fd_batch_finish(&exports, false);
+ 		/* FAILED parsing a request; notify QTEE (if necessary) and try another one. */
+-		if (!accept->txn_id)
++		if (!accept->txn_id) {
+ 			dequeue_and_put_txn(cb_txn);
+-		else
++		} else {
++			set_txn_state(cb_txn, XST_PROCESSED);
+ 			complete(&cb_txn->completion);
++		}
+ 
+ 		put_txn(cb_txn);
++		if (ret)
++			return ret;
+ 
+ 	} while (1);
+ 
+@@ -1330,7 +1418,7 @@
+ 		if (copy_from_user(&accept, (void __user *)arg, sizeof(accept)))
+ 			return -EFAULT;
+ 
+-		ret = process_accept_req(si, &accept);
++		ret = process_accept_req(si, &accept, (void __user *)arg);
+ 		if (ret == -ERESTARTSYS) {
+ 			struct smcinvoke_accept __user *a = (struct smcinvoke_accept __user *)arg;
+ 
+@@ -1349,17 +1437,6 @@
+ 			if (put_user(0, &a->has_resp))
+ 				return -EFAULT;
+ 
+-		} else if (!ret) {
+-
+-			/* We picked a request; and submitted any pending response.*/
+-			accept.has_resp = 0;
+-
+-			if (copy_to_user((void __user *)arg, &accept, sizeof(accept))) {
+-
+-				/* TODO. We need to do some cleanup for 'process_accept_req'. */
+-
+-				return -EFAULT;
+-			}
+ 		}
+ 
+ 		break;
+@@ -1427,6 +1504,7 @@
+ 
+ static long process_invoke_req(struct file *filp, unsigned int cmd, unsigned long arg)
+ {
++	struct smci_fd_batch exports = {};
+ 	int i, ret;
+ 
+ 	struct si_object *object = filp->private_data;
+@@ -1467,6 +1545,8 @@
+ 
+ 	if (u_req.argsize != sizeof(union smcinvoke_arg))
+ 		return -EINVAL;
++	if (u_req.counts & ~0xffffU)
++		return -EINVAL;
+ 
+ 	/* Allocate and initialize resources. */
+ 
+@@ -1528,7 +1608,8 @@
+ 		pr_err("si_object_do_invoke failed %d, %d.\n", ret, u_req.result);
+ 
+ 		if (u_req.result) {
+-			if (ret == -EINVAL || ret == -ENOMEM ||	ret == -ENOSPC) {
++			if (ret == -EINVAL || ret == -ENOMEM || ret == -ENOSPC ||
++			    ret == -E2BIG) {
+ 
+ 				/* SI-CORE did not even starts the invocation. */
+ 
+@@ -1555,7 +1636,7 @@
+ 	}
+ 
+ 	if (!u_req.result) {
+-		if (marshal_out_req(u_args, u)) {
++		if (marshal_out_req(u_args, u, &exports)) {
+ 			pr_err("marshal_out_req failed.\n");
+ 			ret = -EINVAL;
+ 
+@@ -1584,6 +1665,8 @@
+ 		goto out_failed;
+ 	}
+ 
++	/* A failed copy must never leave hidden descriptors in the caller's table. */
++	smci_fd_batch_finish(&exports, true);
+ 	pr_debug("%s object invocation returned with %d.\n",
+ 		si_object_name(object), u_req.result);
+ 
+@@ -1591,6 +1674,7 @@
+ 
+ out_failed:
+ 
++	smci_fd_batch_finish(&exports, false);
+ 	kfree(u);
+ 	kfree(u_args);
+ 	kfree(oic);
+@@ -1667,7 +1751,7 @@
+ 	get_task_comm(si->comm, current);
+ 
+ 	/* Assign a u_handle for the server. */
+-	if (!u_handle_alloc(si->comm, &server_fops, si, &u_handle))
++	if (!u_handle_alloc(si->comm, &server_fops, si, &u_handle, NULL))
+ 		return u_handle;
+ 
+ 	kfree(si);
+@@ -1694,8 +1778,15 @@
+ 	return ret;
+ }
+ 
++static bool smcinvoke_ready;
++static struct cdev *smcinvoke_cdev;
++
+ static int root_open(struct inode *nodp, struct file *filp)
+ {
++	/* Pair with the final publication after device/provider setup. */
++	if (!smp_load_acquire(&smcinvoke_ready) ||
++	    nodp->i_cdev != READ_ONCE(smcinvoke_cdev))
++		return -ENODEV;
+ 	/* Always return the same instance of root si_object. */
+ 
+ 	filp->private_data = ROOT_SI_OBJECT;
+@@ -1713,11 +1804,13 @@
+ static dev_t smcinvoke_device_no;
+ static struct class *driver_class;
+ struct device *smci_dev;
+-static struct cdev smcinvoke_cdev;
+ 
+ static int smcinvoke_probe(struct platform_device *pdev)
+ {
+ 	int ret;
++
++	if (smcinvoke_ready)
++		return -EBUSY;
+ 
+ 	ret = alloc_chrdev_region(&smcinvoke_device_no, 0, 1, SMCI_DEVICE_NAME);
+ 	if (ret < 0) {
+@@ -1738,13 +1831,19 @@
+ 		goto exit_unreg_chrdev_region;
+ 	}
+ 
+-	cdev_init(&smcinvoke_cdev, &root_fops);
+-	smcinvoke_cdev.owner = THIS_MODULE;
+-
+-	ret = cdev_add(&smcinvoke_cdev, MKDEV(MAJOR(smcinvoke_device_no), 0), 1);
++	smcinvoke_cdev = cdev_alloc();
++	if (!smcinvoke_cdev) {
++		ret = -ENOMEM;
++		goto exit_destroy_class;
++	}
++	smcinvoke_cdev->ops = &root_fops;
++	smcinvoke_cdev->owner = THIS_MODULE;
++
++	ret = cdev_add(smcinvoke_cdev, smcinvoke_device_no, 1);
+ 	if (ret < 0) {
+ 		pr_err("cdev_add failed %d.\n", ret);
+ 
++		kobject_put(&smcinvoke_cdev->kobj);
+ 		goto exit_destroy_class;
+ 	}
+ 
+@@ -1759,14 +1858,21 @@
+ 
+ #if IS_ENABLED(CONFIG_QSEECOM_COMPAT) && IS_ENABLED(CONFIG_QSEECOM_PROXY)
+ 	ret = get_qseecom_kernel_fun_ops();
+-	if (ret)
+-		pr_err("failed to get qseecom kernel func ops %d\n", ret);
++	if (ret) {
++		device_destroy(driver_class, smcinvoke_device_no);
++		smci_dev = NULL;
++		goto exit_destroy_cdev;
++	}
+ #endif
+ 
++	/* Userspace and firmware callback objects retain these singleton services. */
++	__module_get(THIS_MODULE);
++	/* Publish device and callback initialization to new file opens. */
++	smp_store_release(&smcinvoke_ready, true);
+ 	return 0;
+ 
+ exit_destroy_cdev:
+-	cdev_del(&smcinvoke_cdev);
++	cdev_del(smcinvoke_cdev);
+ exit_destroy_class:
+ 	class_destroy(driver_class);
+ exit_unreg_chrdev_region:
+@@ -1778,11 +1884,13 @@
+ static const struct of_device_id smcinvoke_match[] = {
+ 	{ .compatible = "qcom,smcinvoke", }, {},
+ };
++MODULE_DEVICE_TABLE(of, smcinvoke_match);
+ 
+ static struct platform_driver smcinvoke_plat_driver = {
+ 	.probe = smcinvoke_probe,
+ 	.driver = {
+ 		.name = "smcinvoke",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = smcinvoke_match,
+ 	},
+ };
+@@ -1791,5 +1899,5 @@
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("smcinvoke driver");
+-MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+-MODULE_IMPORT_NS(DMA_BUF);
++MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
++MODULE_IMPORT_NS("DMA_BUF");
+--- a/qcom/opensource/securemsm-kernel/smcinvoke/si_core_xts/smci_impl.h
++++ b/qcom/opensource/securemsm-kernel/smcinvoke/si_core_xts/smci_impl.h
+@@ -57,4 +57,8 @@
+ 
+ #define U_ARGS_SIZE(t) (size_of_arg((t)->args) * sizeof((t)->u_args[0]))
+ 
++struct Object;
++int get_qseecom_kernel_fun_ops(void);
++int get_root_obj(struct Object *root_obj);
++
+ #endif /* __SMCI_IMPL_H__ */
+--- a/drivers/firmware/qcom/si_core/si_core.c
++++ b/drivers/firmware/qcom/si_core/si_core.c
+@@ -281,12 +281,16 @@
+ 	case SI_OT_CB_OBJECT:
+ 	case SI_OT_ROOT:
+ 		object->ops = ops;
+-		if (!object->ops->dispatch)
+-			return -EINVAL;
++		if (!ops || !ops->dispatch) {
++			ret = -EINVAL;
++			break;
++		}
+ 
+ 		object->name = kvasprintf_const(GFP_KERNEL, fmt, ap);
+-		if (!object->name)
+-			return -ENOMEM;
++		if (!object->name) {
++			ret = -ENOMEM;
++			break;
++		}
+ 
+ 		SET_SI_OBJECT(object, SI_OT_CB_OBJECT);
+ 
+@@ -439,19 +443,80 @@
+ 
+ static DEFINE_IDA(si_object_invoke_ctxs_ida);
+ 
++static int si_message_size(const struct si_arg u[], size_t *length, u32 *counts)
++{
++	unsigned int i, n, nr[4] = { 0 };
++	size_t size;
++
++	if (!u || !length)
++		return -EINVAL;
++	for (n = 0; n <= MAX_ARGS; n++) {
++		if (u[n].type == SI_AT_END)
++			break;
++		if (n == MAX_ARGS || u[n].type < SI_AT_IB || u[n].type > SI_AT_OO)
++			return -EINVAL;
++		if (++nr[u[n].type - SI_AT_IB] > 15)
++			return -EINVAL;
++	}
++	size = ALIGN(offsetof(struct qtee_object_invoke, args) +
++		     n * sizeof(union qtee_smcinvoke_msg_arg), INVOKE_MESSAGE_ALIGN_BYTES);
++	for (i = 0; i < n; i++) {
++		if (u[i].type != SI_AT_IB && u[i].type != SI_AT_OB)
++			continue;
++		if (u[i].flags & ~SI_ARG_FLAGS_UADDR || (!u[i].b.addr && u[i].b.size))
++			return -EINVAL;
++		if (u[i].b.size > U32_MAX - size)
++			return -E2BIG;
++		size += u[i].b.size;
++		if (size > U32_MAX - (INVOKE_MESSAGE_ALIGN_BYTES - 1))
++			return -E2BIG;
++		size = ALIGN(size, INVOKE_MESSAGE_ALIGN_BYTES);
++	}
++	if (size > U32_MAX - (PAGE_SIZE - 1))
++		return -E2BIG;
++	*length = PAGE_ALIGN(size);
++	if (counts)
++		*counts = nr[0] | (nr[1] << 4) | (nr[2] << 8) | (nr[3] << 12);
++	return 0;
++}
++
++static bool si_buffer_in_bounds(const union qtee_smcinvoke_msg_arg *arg,
++			       size_t length, size_t payload)
++{
++	return arg->b.offset >= payload && arg->b.offset <= length &&
++	       arg->b.size <= length - arg->b.offset;
++}
++
++bool si_callback_valid(const struct si_object_invoke_ctx *oic,
++			      const struct qtee_callback *msg)
++{
++	size_t payload, length = oic->out.msg.size;
++	unsigned int i;
++
++	if (length < sizeof(*msg) || msg->counts & ~0xffffU)
++		return false;
++	payload = OFFSET_TO_BUFFER_ARGS(msg, counts_total(msg->counts));
++	if (payload > length || counts_total(msg->counts) > MAX_ARGS)
++		return false;
++	for_each_input_buffer(i, msg->counts)
++		if (!si_buffer_in_bounds(&msg->args[i], length, payload))
++			return false;
++	for_each_output_buffer(i, msg->counts)
++		if (!si_buffer_in_bounds(&msg->args[i], length, payload))
++			return false;
++	return true;
++}
++
+ static int shmem_alloc(struct si_object_invoke_ctx *oic, struct si_arg u[])
+ {
+-	int i;
++	int ret;
++	size_t size;
+ 
+ 	/* See 'prepare_msg'. Calculate size of inbound message. */
+ 
+-	size_t size = OFFSET_TO_BUFFER_ARGS((struct qtee_object_invoke *)(0), size_of_arg(u));
+-
+-	arg_for_each_input_buffer(i, u)
+-		size = align_offset(u[i].b.size + size);
+-
+-	arg_for_each_output_buffer(i, u)
+-		size = align_offset(u[i].b.size + size);
++	ret = si_message_size(u, &size, NULL);
++	if (ret)
++		return ret;
+ 
+ 	/* QTEE requires both input and output buffer
+ 	 *   (1) to be PAGE_SIZE aligned and
+@@ -490,22 +555,26 @@
+ 
+ static int si_object_invoke_ctx_init(struct si_object_invoke_ctx *oic, struct si_arg u[])
+ {
++	int ret;
++
+ 	memset(oic, 0, sizeof(*oic));
+ 
+ 	/* First check if we can allocate an ID, then initialize it. */
+ 	/* Context IDa [0 .. 10) are never used. */
+ 
+-	oic->context_id = ida_alloc_min(&si_object_invoke_ctxs_ida, 10, GFP_KERNEL);
+-	if (oic->context_id < 0) {
+-		pr_err("unable to allocate context ID (%d)\n", oic->context_id);
+-
+-		return oic->context_id;
+-	}
+-
+-	if (shmem_alloc(oic, u)) {
++	ret = ida_alloc_min(&si_object_invoke_ctxs_ida, 10, GFP_KERNEL);
++	if (ret < 0) {
++		pr_err("unable to allocate context ID (%d)\n", ret);
++
++		return ret;
++	}
++	oic->context_id = ret;
++
++	ret = shmem_alloc(oic, u);
++	if (ret) {
+ 		ida_free(&si_object_invoke_ctxs_ida, oic->context_id);
+ 
+-		return -ENOMEM;
++		return ret;
+ 	}
+ 
+ 	INIT_LIST_HEAD(&oic->objects_head);
+@@ -606,12 +675,34 @@
+ static int update_args(struct si_arg u[], struct si_object_invoke_ctx *oic)
+ {
+ 	int ret = 0;
++	u32 counts;
++	size_t length, payload;
+ 
+ 	int i, ib = 0, ob = 0, io = 0, oo = 0;
+ 
+ 	/* Use input message buffer in 'oic'. */
+ 
+ 	struct qtee_object_invoke *msg = (struct qtee_object_invoke *)oic->in.msg.addr;
++
++	ret = si_message_size(u, &length, &counts);
++	if (ret)
++		return ret;
++	arg_for_each_output_object(i, u)
++		u[i].o = NULL_SI_OBJECT;
++	if (oic->in.msg.size < sizeof(*msg) || msg->counts != counts)
++		return -EINVAL;
++	payload = OFFSET_TO_BUFFER_ARGS(msg, counts_total(counts));
++	if (payload > oic->in.msg.size)
++		return -EINVAL;
++	ob = counts_num__bi_(counts);
++	arg_for_each_output_buffer(i, u) {
++		if (!si_buffer_in_bounds(&msg->args[ob], oic->in.msg.size, payload) ||
++		    msg->args[ob].b.size > u[i].b.size)
++			return -EINVAL;
++		ob++;
++	}
++	ob = 0;
++	ret = 0;
+ 
+ 	arg_for_each_input_buffer(i, u)
+ 		ib++;
+@@ -674,7 +765,9 @@
+ 
+ 	struct qtee_callback *msg = (struct qtee_callback *)oic->out.msg.addr;
+ 
+-	/* We assume QTEE already checked the buffer boundaries! */
++	if (!si_callback_valid(oic, msg))
++		return -EINVAL;
++	memset(oic->u, 0, sizeof(oic->u));
+ 
+ 	for_each_input_buffer(i, msg->counts) {
+ 		oic->u[i].b.addr = OFFSET_TO_PTR(msg, msg->args[i].b.offset);
+@@ -762,8 +855,14 @@
+ 	int i, errno;
+ 
+ 	/* Get object being invoked!!! */
+-	unsigned int object_id = msg->cxt;
++	unsigned int object_id;
+ 	struct si_object *object;
++
++	if (!si_callback_valid(oic, msg)) {
++		errno = -EINVAL;
++		goto out;
++	}
++	object_id = msg->cxt;
+ 
+ 	/* QTEE can not invoke NULL object or objects it hosts. */
+ 	if (si_object_type(object_id) == SI_OT_NULL ||
+@@ -790,8 +889,8 @@
+ 		 * to schedule the actual release if there is no user.
+ 		 */
+ 
+-		erase_si_object(object_id);
+-		put_si_object(object);
++		if (erase_si_object(object_id))
++			put_si_object(object);
+ 		errno = 0;
+ 
+ 		break;
+@@ -815,7 +914,7 @@
+ 		if (errno) {
+ 
+ 			/* Unable to parse the message. Release any object arrived as input. */
+-			arg_for_each_input_buffer(i, oic->u)
++			arg_for_each_input_object(i, oic->u)
+ 				put_si_object(oic->u[i].o);
+ 
+ 			break;
+@@ -1013,6 +1112,8 @@
+ 					&response_type, &data);
+ 				if (ret)
+ 					pr_err("qseecom bridge failed with= %d\n", ret);
++				if (ret)
++					goto out;
+ 			}
+ #endif
+ 
+@@ -1219,9 +1320,18 @@
+ 	if (ret) {
+ 		kobject_put(si_core_kobj);
+ 		destroy_si_core_wq();
+-	}
+-
+-	adci_start();
++		return ret;
++	}
++
++	ret = adci_start();
++	if (ret) {
++		sysfs_remove_group(si_core_kobj, &attr_group);
++		kobject_put(si_core_kobj);
++		destroy_si_core_wq();
++		return ret;
++	}
++	/* QTEE callbacks and an active ADCI invocation have no live revocation API. */
++	__module_get(THIS_MODULE);
+ 
+ 	return ret;
+ }
+@@ -1231,6 +1341,7 @@
+ 	/* TODO. Prevent unloading if 'xa_si_objects' is not empty. */
+ 
+ 	adci_shutdown();
++	destroy_si_core_wq();
+ 	sysfs_remove_group(si_core_kobj, &attr_group);
+ 
+ 	kobject_put(si_core_kobj);
+--- a/drivers/firmware/qcom/si_core/si_core.h
++++ b/drivers/firmware/qcom/si_core/si_core.h
+@@ -23,6 +23,13 @@
+ int get_object_id(struct si_object *object, unsigned int *object_id);
+ void __put_object_id(unsigned int object_id);
+ struct si_object *qtee_get_si_object(unsigned int object_id);
++struct si_object *erase_si_object(u32 idx);
++struct kobject;
++struct kobj_attribute;
++ssize_t release_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf);
++struct qtee_callback;
++bool si_callback_valid(const struct si_object_invoke_ctx *oic,
++		       const struct qtee_callback *msg);
+ 
+ int si_object_invoke_ctx_invoke(struct si_object_invoke_ctx *oic, int *result,
+ 	u64 *response_type, unsigned int *data);
+@@ -70,7 +77,7 @@
+ 
+ /* Check if a buffer argument 'arg' can fit in a message of size 'sz'. */
+ #define arg_in_bounds(arg, sz) \
+-	(((arg)->b.offset < (sz)) && ((arg)->b.size < ((sz) - (arg)->b.offset)))
++	(((arg)->b.offset <= (sz)) && ((arg)->b.size <= ((sz) - (arg)->b.offset)))
+ 
+ struct qtee_object_invoke {
+ 	u32 cxt;
+--- a/drivers/firmware/qcom/si_core/si_core_adci.c
++++ b/drivers/firmware/qcom/si_core/si_core_adci.c
+@@ -6,6 +6,7 @@
+ #include <linux/kthread.h>
+ 
+ #include "si_core.h"
++#include "si_core_adci.h"
+ 
+ static struct task_struct *adci_task;
+ static struct si_object_invoke_ctx oic;
+@@ -45,28 +46,38 @@
+ 	return result;
+ }
+ 
+-void adci_start(void)
++int adci_start(void)
+ {
++	int ret;
++
+ 	adci_task = kthread_run(adci_fn, NULL, "adci_thread");
+ 
+-	/* Who cares if it fails?! */
+-	if (IS_ERR(adci_task))
+-		pr_err("failed (%ld).\n", PTR_ERR(adci_task));
++	if (IS_ERR(adci_task)) {
++		ret = PTR_ERR(adci_task);
++		adci_task = NULL;
++		return ret;
++	}
++	return 0;
+ }
+ 
+ int adci_shutdown(void)
+ {
+ 	int ret, result = 0;
+ 	struct si_arg args[1] = { 0 };
++	static struct si_object_invoke_ctx shutdown_oic;
++
++	if (!adci_task)
++		return 0;
+ 
+ 	/* IClientEnv_OP_adciShutdown is 9. */
+-	ret = si_object_do_invoke(&oic, ROOT_SI_OBJECT, 9, args, &result);
++	ret = si_object_do_invoke(&shutdown_oic, ROOT_SI_OBJECT, 9, args, &result);
+ 
+ 	if (ret || result)
+ 		pr_err("failed (ret = %d, %d).\n", ret, result);
+ 
+ 	/* If IClientEnv_OP_adciShutdown fails, we may stuck here. */
+ 	kthread_stop(adci_task);
++	adci_task = NULL;
+ 
+ 	return ret;
+ }
+--- a/drivers/firmware/qcom/si_core/si_core_adci.h
++++ b/drivers/firmware/qcom/si_core/si_core_adci.h
+@@ -6,7 +6,7 @@
+ #ifndef __SI_CORE_ADCI_H__
+ #define __SI_CORE_ADCI_H__
+ 
+-void adci_start(void);
++int adci_start(void);
+ int adci_shutdown(void);
+ 
+ #endif /* __SI_CORE_ADCI_H__ */
+--- a/drivers/firmware/qcom/si_core/si_core_async.c
++++ b/drivers/firmware/qcom/si_core/si_core_async.c
+@@ -11,7 +11,6 @@
+ 
+ /* Processing of the async messges happens without any ordering. */
+ 
+-struct si_object *erase_si_object(u32 idx);
+ u32 global_version;
+ 
+ struct async_msg_info {
+@@ -63,7 +62,7 @@
+ 
+ int get_async_proto_version(void)
+ {
+-	return global_version;
++	return READ_ONCE(global_version);
+ }
+ EXPORT_SYMBOL_GPL(get_async_proto_version);
+ 
+@@ -78,16 +77,20 @@
+ 
+ 	if (!(oic->flags & OIC_FLAG_BUSY))
+ 		return oic->out.msg;
++	if (!si_callback_valid(oic, msg))
++		return (struct si_buffer) { { 0 }, 0 };
+ 
+ 	/* Async requests are appended to the output buffer after the CB message. */
+ 
+ 	offset = OFFSET_TO_BUFFER_ARGS(msg, counts_total(msg->counts));
+ 
+ 	for_each_input_buffer(i, msg->counts)
+-		offset += align_offset(msg->args[i].b.size);
++		offset = max(offset, ALIGN((size_t)msg->args[i].b.offset +
++					 msg->args[i].b.size, INVOKE_MESSAGE_ALIGN_BYTES));
+ 
+ 	for_each_output_buffer(i, msg->counts)
+-		offset += align_offset(msg->args[i].b.size);
++		offset = max(offset, ALIGN((size_t)msg->args[i].b.offset +
++					 msg->args[i].b.size, INVOKE_MESSAGE_ALIGN_BYTES));
+ 
+ 	if (oic->out.msg.size > offset) {
+ 		return (struct si_buffer)
+@@ -153,7 +156,8 @@
+ 
+ 		list_move(&object->node, &oic->objects_head);
+ 
+-		if (size - ASYNC_OP_RELEASE_SIZE < ASYNC_OP_RELEASE_MSG_SIZE(++i))
++		if (size < ALIGN(ASYNC_OP_RELEASE_MSG_SIZE(++i + 1),
++				INVOKE_MESSAGE_ALIGN_BYTES))
+ 			break;
+ 	}
+ 
+@@ -269,6 +273,13 @@
+ 
+ 			if (op != SI_OBJECT_OP_NO_OP) {
+ 				t_object = args[1].o;
++				if (args[0].b.size > async_buffer->size - ASYNC_OP_USER_HDR_SIZE ||
++				    ALIGN(args[0].b.size + ASYNC_OP_USER_HDR_SIZE,
++					  INVOKE_MESSAGE_ALIGN_BYTES) > async_buffer->size) {
++					put_si_object(t_object);
++					put_si_object(object);
++					return;
++				}
+ 
+ 				/* Object's provider has done some preparation on the object. */
+ 
+@@ -278,8 +289,9 @@
+ 					if (get_object_id(t_object,
+ 						&async_msg->info.async_info.out)) {
+ 						put_si_object(t_object);
+-
+-						break;
++						put_si_object(object);
++
++						return;
+ 					}
+ 
+ 					/* We temporarily keep si_object for ourselves; get one. */
+@@ -313,7 +325,7 @@
+ 	}
+ }
+ 
+-void prepare_objects(struct si_object_invoke_ctx *oic, struct si_buffer async_buffer)
++static void prepare_objects(struct si_object_invoke_ctx *oic, struct si_buffer async_buffer)
+ {
+ 	int i;
+ 
+@@ -363,8 +375,12 @@
+ 
+ 	/* Let's use whatever buffer left for remaining of async messages. */
+ 
+-	async_buffer.addr += align_offset(size);
+-	async_buffer.size -= align_offset(size);
++	if (align_offset(size) > async_buffer.size)
++		return;
++	if (size) {
++		async_buffer.addr += align_offset(size);
++		async_buffer.size -= align_offset(size);
++	}
+ 
+ 	prepare_objects(oic, async_buffer);
+ }
+@@ -405,7 +421,9 @@
+ 	int i;
+ 
+ 	/* We need space for at least a single entry. */
+-	if (size < ASYNC_OP_RELEASE_MSG_SIZE(1))
++	if (size < ASYNC_OP_RELEASE_HDR_SIZE ||
++	    async_msg->op_release.count >
++		(size - ASYNC_OP_RELEASE_HDR_SIZE) / ASYNC_OP_RELEASE_SIZE)
+ 		return 0;
+ 
+ 	for (i = 0; i < async_msg->op_release.count; i++) {
+@@ -416,7 +434,11 @@
+ 		 * to schedule the actual release if there is no user.
+ 		 */
+ 
++		if (si_object_type(async_msg->op_release.obj[i]) != SI_OT_CB_OBJECT)
++			continue;
+ 		object = erase_si_object(async_msg->op_release.obj[i]);
++		if (!object)
++			continue;
+ 
+ 		pr_debug("%s (refs: %u).\n", si_object_name(object), kref_read(&object->refcount));
+ 
+@@ -442,18 +464,23 @@
+ 		/* QTEE assumes unused buffer is set to zero. */
+ 		if (!async_msg->header.version)
+ 			goto out;
++		if (async_msg->header.version >> 16 != 1)
++			goto out;
+ 
+ 		switch (async_msg->header.op) {
+ 		case ASYNC_OP_RELEASE:
+-			global_version = async_msg->header.version;
+ 			consumed = async_release_handler(oic,
+ 				async_msg, async_buffer.size - used);
++			if (consumed)
++				WRITE_ONCE(global_version, async_msg->header.version);
+ 
+ 			break;
+ 		default: /* Unsupported operations. */
+ 			consumed = 0;
+ 		}
+ 
++		if (align_offset(consumed) > async_buffer.size - used)
++			goto out;
+ 		used += align_offset(consumed);
+ 
+ 		if (!consumed) {
+@@ -477,5 +504,6 @@
+  out:
+ 
+ 	/* Reset the async buffer for next use in '__append__async_reqs'. */
+-	memset(async_buffer.addr, 0, async_buffer.size);
+-}
++	if (async_buffer.size)
++		memset(async_buffer.addr, 0, async_buffer.size);
++}
+--- a/drivers/firmware/qcom/si_core/xts/mem-object.c
++++ b/drivers/firmware/qcom/si_core/xts/mem-object.c
+@@ -117,13 +117,13 @@
+ 	.dispatch = mo_dispatch
+ };
+ 
+-int op_supported(unsigned long op)
++static int op_supported(unsigned long op)
+ {
+ 	switch (op) {
+ 	case OBJECT_OP_MAP_REGION:
+-		return 1;
++		return 0;
+ 	default:
+-		return 0;
++		return -EINVAL;
+ 	}
+ }
+ 
+@@ -149,6 +149,11 @@
+ 
+ 	if (ret)
+ 		return ret;
++	if (!nelems || !vmid_list || !perms_list) {
++		kfree(perms_list);
++		kfree(vmid_list);
++		return -EINVAL;
++	}
+ 
+ 	if (mem_buf_dma_buf_exclusive_owner(mo->dma_buf))
+ 		perms_list[0] = QCOM_SCM_PERM_RW;
+@@ -199,11 +204,17 @@
+ 	return ret;
+ }
+ 
+-static void rm_shm_bridge(struct mem_object *mo)
+-{
+-	if (mo->shm_bridge_handle)
+-		qtee_shmbridge_deregister(mo->shm_bridge_handle);
++static int rm_shm_bridge(struct mem_object *mo)
++{
++	int ret = 0;
++
++	if (mo->shm_bridge_handle) {
++		ret = qtee_shmbridge_deregister(mo->shm_bridge_handle);
++		if (ret)
++			return ret;
++	}
+ 	mo->shm_bridge_handle = 0;
++	return 0;
+ }
+ 
+ static void detach_dma_buf(struct mem_object *mo)
+@@ -289,11 +300,15 @@
+ 	return ret;
+ }
+ 
+-static void release_memory_obj(struct mem_object *mo)
+-{
+-	rm_shm_bridge(mo);
++static int release_memory_obj(struct mem_object *mo)
++{
++	int ret = rm_shm_bridge(mo);
++
++	if (ret)
++		return ret;
+ 
+ 	detach_dma_buf(mo);
++	return 0;
+ }
+ 
+ static unsigned long mo_shm_bridge_prepare(struct si_object *object, struct si_arg args[])
+@@ -337,7 +352,14 @@
+ {
+ 	struct mem_object *mo = to_mem_object(object);
+ 
+-	release_memory_obj(mo);
++	if (release_memory_obj(mo)) {
++		/* QTEE may still access this mapping. Retain the DMA/private references. */
++		mutex_lock(&mo_list_mutex);
++		object->name = NULL;
++		mutex_unlock(&mo_list_mutex);
++		pr_err("memory-object bridge withdrawal failed; mapping retained\n");
++		return;
++	}
+ 
+ 	if (mo->release)
+ 		mo->release(mo->private);
+@@ -361,7 +383,7 @@
+ static int shm_bridge__po_dispatch(unsigned int context_id,
+ 	struct si_object *unused, unsigned long op, struct si_arg args[])
+ {
+-	int ret;
++	int ret, i;
+ 
+ 	struct si_object *object;
+ 	struct mem_object *mo;
+@@ -380,10 +402,13 @@
+ 		if (size_of_arg(args) != 3 ||
+ 			args[0].type != SI_AT_OB  ||
+ 			args[1].type != SI_AT_IO  ||
+-			args[2].type != SI_AT_OO) {
++			args[2].type != SI_AT_OO || args[0].b.size < sizeof(*mi)) {
+ 
+ 			pr_err("mapping of a memory object with invalid message format.\n");
+ 
++			for (i = 0; args[i].type != SI_AT_END; i++)
++				if (args[i].type == SI_AT_IO)
++					put_si_object(args[i].o);
+ 			return -EINVAL;
+ 		}
+ 
+@@ -444,8 +469,10 @@
+ 	void (*release)(void *), void *private)
+ {
+ 	struct mem_object *mo;
+-
+-	if (!mem_ops.release) {
++	int ret;
++
++	/* Pair with publication after the primordial object is initialized. */
++	if (!smp_load_acquire(&mem_object_pdev) || IS_ERR_OR_NULL(dma_buf)) {
+ 		pr_err("memory object type is unknown.\n");
+ 
+ 		return NULL_SI_OBJECT;
+@@ -464,7 +491,13 @@
+ 	mo->private = private;
+ 	mo->release = release;
+ 
+-	init_si_object_user(&mo->object, SI_OT_CB_OBJECT, &mem_ops, "mem-object-%p", dma_buf);
++	ret = init_si_object_user(&mo->object, SI_OT_CB_OBJECT, &mem_ops,
++				 "mem-object-%p", dma_buf);
++	if (ret) {
++		dma_buf_put(dma_buf);
++		kfree(mo);
++		return NULL_SI_OBJECT;
++	}
+ 
+ 	mutex_lock(&mo_list_mutex);
+ 	list_add_tail(&mo->node, &mo_list);
+@@ -478,13 +511,16 @@
+ 	void (*release)(void *), void *private)
+ {
+ 	struct mem_object *mo;
+-
+-	if (size != ALIGN(size, PAGE_SIZE)) {
++	int ret;
++
++	if (!paddr || !IS_ALIGNED(paddr, PAGE_SIZE) || !size ||
++	    !IS_ALIGNED(size, PAGE_SIZE) || size > (phys_addr_t)-1 - paddr) {
+ 		pr_err("size = %zu is not page aligned\n", size);
+ 		return NULL_SI_OBJECT;
+ 	}
+ 
+-	if (!mem_ops.release) {
++	/* Pair with publication after the primordial object is initialized. */
++	if (!smp_load_acquire(&mem_object_pdev)) {
+ 		pr_err("memory object type is unknown.\n");
+ 		return NULL_SI_OBJECT;
+ 	}
+@@ -501,8 +537,12 @@
+ 	mo->mapping_info.p_addr = paddr;
+ 	mo->mapping_info.p_addr_len = size;
+ 
+-	init_si_object_user(&mo->object, SI_OT_CB_OBJECT, &mem_ops,
++	ret = init_si_object_user(&mo->object, SI_OT_CB_OBJECT, &mem_ops,
+ 		"kernel-mem-object-%pa", &paddr);
++	if (ret) {
++		kfree(mo);
++		return NULL_SI_OBJECT;
++	}
+ 
+ 	mutex_lock(&mo_list_mutex);
+ 	list_add_tail(&mo->node, &mo_list);
+@@ -574,6 +614,10 @@
+ {
+ 	int ret;
+ 
++	guard(mutex)(&mo_list_mutex);
++	if (mem_object_pdev)
++		return -EBUSY;
++
+ 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+ 	if (ret)
+ 		return ret;
+@@ -582,10 +626,16 @@
+ 	mem_ops.release = mo_shm_bridge_release;
+ 	mem_ops.prepare = mo_shm_bridge_prepare;
+ 
+-	init_si_object_user(&primordial_object,
++	ret = init_si_object_user(&primordial_object,
+ 		SI_OT_ROOT, &shm_bridge__po_ops, "po_in_mem_object");
+-
+-	mem_object_pdev = pdev;
++	if (ret)
++		return ret;
++
++	/* QTEE holds memory-object callbacks until a firmware release. */
++	__module_get(THIS_MODULE);
++	get_device(&pdev->dev);
++	/* Publish the DMA device and initialized memory-object callbacks together. */
++	smp_store_release(&mem_object_pdev, pdev);
+ 
+ 	return 0;
+ }
+@@ -593,11 +643,13 @@
+ static const struct of_device_id mem_object_match[] = {
+ 	{ .compatible = "qcom,mem-object", }, {}
+ };
++MODULE_DEVICE_TABLE(of, mem_object_match);
+ 
+ static struct platform_driver mem_object_plat_driver = {
+ 	.probe = mem_object_probe,
+ 	.driver = {
+ 		.name = "mem-object",
++		.suppress_bind_attrs = true,
+ 		.dev_groups = attr_groups,
+ 		.of_match_table = mem_object_match,
+ 	},
+@@ -607,4 +659,4 @@
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("Memory object driver");
+-MODULE_IMPORT_NS(DMA_BUF);
++MODULE_IMPORT_NS("DMA_BUF");
+--- a/drivers/misc/qseecom_proxy.c
++++ b/drivers/misc/qseecom_proxy.c
+@@ -10,16 +10,27 @@
+ #include <linux/qseecom_kernel.h>
+ #include <linux/of_platform.h>
+ #include <linux/mod_devicetable.h>
++#include <linux/mutex.h>
+ 
+ static struct qseecom_drv_ops qseecom_fun_ops = {0};
++static DEFINE_MUTEX(qseecom_ops_lock);
++static bool qseecom_ops_ready;
+ 
+ int provide_qseecom_kernel_fun_ops(const struct qseecom_drv_ops *ops)
+ {
+-	if (!ops) {
+-		pr_err("ops is NULL\n");
+-		return -1;
+-	}
++	if (!ops || !ops->owner || !ops->qseecom_start_app ||
++	    !ops->qseecom_shutdown_app || !ops->qseecom_send_command ||
++	    !ops->qseecom_process_listener_from_smcinvoke)
++		return -EINVAL;
++	guard(mutex)(&qseecom_ops_lock);
++	if (qseecom_ops_ready)
++		return -EBUSY;
++	/* Open application handles and firmware callbacks outlive each call. */
++	if (!try_module_get(ops->owner))
++		return -ENODEV;
+ 	qseecom_fun_ops = *ops;
++	/* Publish the complete immutable table to callback readers. */
++	smp_store_release(&qseecom_ops_ready, true);
+ 	pr_debug("QSEECOM proxy Ready to be served\n");
+ 	return 0;
+ }
+@@ -31,7 +42,8 @@
+ 	int32_t ret = -1;
+ 
+ 	/* start the application */
+-	if (qseecom_fun_ops.qseecom_start_app) {
++	/* Pair with publication of the complete provider table. */
++	if (smp_load_acquire(&qseecom_ops_ready)) {
+ 		ret = qseecom_fun_ops.qseecom_start_app(handle, app_name, size);
+ 		if (ret != 0)
+ 			pr_err("%s: Start app -%s failed\n", __func__, app_name);
+@@ -49,7 +61,8 @@
+ 	int32_t ret = -1;
+ 
+ 	/* shutdown the application */
+-	if (qseecom_fun_ops.qseecom_shutdown_app) {
++	/* Pair with publication of the complete provider table. */
++	if (smp_load_acquire(&qseecom_ops_ready)) {
+ 		ret = qseecom_fun_ops.qseecom_shutdown_app(handle);
+ 		if (ret != 0)
+ 			pr_err("%s: qseecom shutdown app failed with ret = %d\n", __func__, ret);
+@@ -68,7 +81,8 @@
+ 	int32_t ret = -1;
+ 
+ 	/* send command to application*/
+-	if (qseecom_fun_ops.qseecom_send_command) {
++	/* Pair with publication of the complete provider table. */
++	if (smp_load_acquire(&qseecom_ops_ready)) {
+ 		ret = qseecom_fun_ops.qseecom_send_command(handle, send_buf, sbuf_len,
+ 					resp_buf, rbuf_len);
+ 		if (ret != 0)
+@@ -87,7 +101,8 @@
+ 	int32_t ret = -1;
+ 
+ 	/* process listener from smcinvoke*/
+-	if (qseecom_fun_ops.qseecom_process_listener_from_smcinvoke) {
++	/* Pair with publication of the complete provider table. */
++	if (smp_load_acquire(&qseecom_ops_ready)) {
+ 		ret = qseecom_fun_ops.qseecom_process_listener_from_smcinvoke(result,
+ 				response_type, data);
+ 		if (ret != 0)
+@@ -107,7 +122,9 @@
+ {
+ 	int32_t ret = -1;
+ 
+-	if (qseecom_fun_ops.qseecom_create_key_in_slot) {
++	/* Pair with publication of the complete provider table. */
++	if (smp_load_acquire(&qseecom_ops_ready) &&
++	    qseecom_fun_ops.qseecom_create_key_in_slot) {
+ 		ret = qseecom_fun_ops.qseecom_create_key_in_slot(usage_code,
+ 								 key_slot,
+ 								 key_id,
+--- a/include/linux/qseecom_kernel.h
++++ b/include/linux/qseecom_kernel.h
+@@ -51,7 +51,9 @@
+ #endif /* CONFIG_QTI_CRYPTO_FDE */
+ 
+ #if IS_ENABLED(CONFIG_QSEECOM_PROXY)
++struct module;
+ struct qseecom_drv_ops {
++	struct module *owner;
+ 	int (*qseecom_send_command)(struct qseecom_handle *handle, void *send_buf,
+ 				uint32_t sbuf_len, void *resp_buf, uint32_t rbuf_len);
+ 	int (*qseecom_start_app)(struct qseecom_handle **handle,
+@@ -66,5 +68,6 @@
+ };
+ 
+ int provide_qseecom_kernel_fun_ops(const struct qseecom_drv_ops *ops);
++int get_qseecom_kernel_fun_ops(void);
+ #endif /* CONFIG_QSEECOM_PROXY */
+ #endif /* __QSEECOM_KERNEL_H_ */
+--- a/include/linux/hdcp_qseecom.h
++++ b/include/linux/hdcp_qseecom.h
+@@ -150,4 +150,7 @@
+ }
+ #endif /* CONFIG_HDCP_QSEECOM */
+ 
++void hdcp1_set_hdcp_key_verify_retries(void *ctx, u32 max_retries);
++void hdcp2_set_hdcp_key_verify_retries(void *ctx, u32 max_retries);
++
+ #endif /* __HDCP_QSEECOM_H */

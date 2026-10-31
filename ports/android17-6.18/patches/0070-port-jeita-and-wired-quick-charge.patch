@@ -1,0 +1,3413 @@
+--- a/drivers/power/supply/mca/mca_strategy/strategy_charger/mca_buckchg_jeita.c
++++ b/drivers/power/supply/mca/mca_strategy/strategy_charger/mca_buckchg_jeita.c
+@@ -18,6 +18,7 @@
+  */
+ #include <linux/module.h>
+ #include <linux/stat.h>
++#include <linux/delay.h>
+ #include <linux/init.h>
+ #include <linux/ctype.h>
+ #include <linux/err.h>
+@@ -60,10 +61,12 @@
+ 	int vbat = 0;
+ 	int min_cur = jeita_data->max_current;
+ 
++	*vbat_index = -1;
++
+ 	ret = strategy_class_fg_ops_get_voltage(&vbat);
+ 	if (ret) {
+ 		mca_log_err("get vbat failed\n");
+-		return min_cur;
++		return 0;
+ 	}
+ 
+ 	if (!jeita_data->volt_para.size)
+@@ -94,10 +97,6 @@
+ 	int now_curr = 0, chg_curr = 0, effective_curr;
+ 	int hys_affect = 0;
+ 	int data_change = 0;
+-	static int last_fastcharge_mode;
+-	static int last_chg_curr;
+-	static bool runswocp;
+-	static int base_over_curr_count;
+ 	int vbat_index = -1;
+ 	int vbat = 0;
+ 
+@@ -105,7 +104,7 @@
+ 		mca_log_err("jeita data not ready\n");
+ 		return;
+ 	}
+-	effective_curr = mca_get_effective_result(info->fcc_voter);
++	effective_curr = mca_get_named_effective_result("buck_charge_curr");
+ 
+ 	ret = platform_fg_ops_get_temp(FG_IC_MASTER, &temp);
+ 	ret |= platform_fg_ops_get_curr(FG_IC_MASTER, &now_curr);
+@@ -116,6 +115,10 @@
+ 
+ 	temp /= 10;
+ 	fastcharge_mode = strategy_class_fg_get_fastcharge();
++	if (fastcharge_mode < 0) {
++		mca_vote_named("chg_enable", "jeita", true, 0);
++		return;
++	}
+ 	mca_log_err("fastcharge_mode is %d\n", fastcharge_mode);
+ 	platform_fg_ops_get_volt(FG_IC_MASTER, &vbat);
+ 	mca_log_info("vbat is %d\n", vbat);
+@@ -148,11 +151,11 @@
+ 	/* select cur jeita_data (temperature hysteresis) */
+ 	if (info->base_proc_data.cur_jeita_index == -1) {
+ 		jeita_data = cur_jeita_data;
+-		last_chg_curr =
++		info->last_chg_curr[1] =
+ 			mca_buckchg_jeita_get_curr(cur_jeita_data, &vbat_index);
+ 	} else {
+ 		if (info->base_proc_data.cur_jeita_index == i ||
+-		    fastcharge_mode != last_fastcharge_mode)
++		    fastcharge_mode != info->last_fastcharge_mode[1])
+ 			jeita_data = cur_jeita_data;
+ 		else {
+ 			if (!fastcharge_mode ||
+@@ -188,7 +191,7 @@
+ 			}
+ 		}
+ 	}
+-	last_fastcharge_mode = fastcharge_mode;
++	info->last_fastcharge_mode[1] = fastcharge_mode;
+ 
+ 	info->base_proc_data.max_chg_curr =
+ 		mca_buckchg_jeita_get_curr(jeita_data, &vbat_index);
+@@ -197,28 +200,28 @@
+ 		mca_log_info(
+ 			"jeita_index: cur_jeita_index:%d, i:%d, hys_affect:%d\n",
+ 			info->base_proc_data.cur_jeita_index, i, hys_affect);
+-		last_chg_curr = info->base_proc_data.max_chg_curr;
+-	} else if (info->base_proc_data.max_chg_curr > last_chg_curr) {
++		info->last_chg_curr[1] = info->base_proc_data.max_chg_curr;
++	} else if (info->base_proc_data.max_chg_curr > info->last_chg_curr[1]) {
+ 		if (vbat_index != -1 &&
+ 		    vbat < jeita_data->volt_para.volt_data[vbat_index].voltage -
+ 				   info->base_vbat_low_hyst) {
+ 			data_change = 1;
+ 			mca_log_info(
+-				"vbat_thre[l->s]: max_chg_curr:%d, last_chg_curr:%d, vbat_index:%d, vbat:%d\n",
+-				info->base_proc_data.max_chg_curr, last_chg_curr,
++				"vbat_thre[l->s]: max_chg_curr:%d, info->last_chg_curr[1]:%d, vbat_index:%d, vbat:%d\n",
++				info->base_proc_data.max_chg_curr, info->last_chg_curr[1],
+ 				vbat_index, vbat);
+-			last_chg_curr = info->base_proc_data.max_chg_curr;
+-		}
+-	} else if (info->base_proc_data.max_chg_curr < last_chg_curr) {
+-		if (vbat_index != -1 &&
++			info->last_chg_curr[1] = info->base_proc_data.max_chg_curr;
++		}
++	} else if (info->base_proc_data.max_chg_curr < info->last_chg_curr[1]) {
++		if (vbat_index > 0 &&
+ 		    vbat > jeita_data->volt_para.volt_data[vbat_index - 1]
+ 				   .voltage) {
+ 			data_change = 1;
+ 			mca_log_info(
+-				"vbat_thre[s->l]: max_chg_curr:%d, last_chg_curr:%d, vbat_index:%d\n",
+-				info->base_proc_data.max_chg_curr, last_chg_curr,
++				"vbat_thre[s->l]: max_chg_curr:%d, info->last_chg_curr[1]:%d, vbat_index:%d\n",
++				info->base_proc_data.max_chg_curr, info->last_chg_curr[1],
+ 				vbat_index);
+-			last_chg_curr = info->base_proc_data.max_chg_curr;
++			info->last_chg_curr[1] = info->base_proc_data.max_chg_curr;
+ 		}
+ 	}
+ 
+@@ -232,21 +235,21 @@
+ 		info->base_proc_data.cur_jeita_index = i;
+ 
+ 	if (effective_curr != 0 && now_curr / 1000 < -chg_curr)
+-		base_over_curr_count++;
++		info->base_over_curr_count[1]++;
+ 	else
+-		base_over_curr_count = 0;
+-
+-	if (base_over_curr_count >= MCA_BASE_OVER_CURR_COUNT_MAX &&
++		info->base_over_curr_count[1] = 0;
++
++	if (info->base_over_curr_count[1] >= MCA_BASE_OVER_CURR_COUNT_MAX &&
+ 	    effective_curr != 0) {
+ 		effective_curr -= 100;
+-		base_over_curr_count = 0;
+-		mca_vote(info->fcc_voter, "swocp", true, effective_curr);
+-		runswocp = true;
++		info->base_over_curr_count[1] = 0;
++		mca_vote_named("buck_charge_curr", "swocp", true, effective_curr);
++		info->runswocp[1] = true;
+ 		mca_log_err("reduce fcc %d by swocp\n", effective_curr);
+ 	}
+-	if (now_curr / 1000 > -chg_curr + 500 && runswocp) {
+-		runswocp = false;
+-		mca_vote(info->fcc_voter, "swocp", false, 0);
++	if (now_curr / 1000 > -chg_curr + 500 && info->runswocp[1]) {
++		info->runswocp[1] = false;
++		mca_vote_named("buck_charge_curr", "swocp", false, 0);
+ 		mca_log_err("disable swocp\n");
+ 	}
+ }
+@@ -260,8 +263,6 @@
+ 	int chg_curr = 0;
+ 	int hys_affect = 0;
+ 	int data_change = 0;
+-	static int last_fastcharge_mode;
+-	static int last_chg_curr;
+ 	int vbat_index = -1;
+ 	int vbat = 0;
+ 
+@@ -278,6 +279,10 @@
+ 
+ 	temp /= 10;
+ 	fastcharge_mode = strategy_class_fg_get_fastcharge();
++	if (fastcharge_mode < 0) {
++		mca_vote_named("chg_enable", "jeita", true, 0);
++		return;
++	}
+ 	mca_log_err("fastcharge_mode is %d\n", fastcharge_mode);
+ 	platform_fg_ops_get_volt(FG_IC_SLAVE, &vbat);
+ 	mca_log_info("vbat is %d\n", vbat);
+@@ -310,11 +315,11 @@
+ 	/* select cur jeita_data (temperature hysteresis) */
+ 	if (info->flip_proc_data.cur_jeita_index == -1) {
+ 		jeita_data = cur_jeita_data;
+-		last_chg_curr =
++		info->last_chg_curr[2] =
+ 			mca_buckchg_jeita_get_curr(cur_jeita_data, &vbat_index);
+ 	} else {
+ 		if (info->flip_proc_data.cur_jeita_index == i ||
+-		    fastcharge_mode != last_fastcharge_mode)
++		    fastcharge_mode != info->last_fastcharge_mode[2])
+ 			jeita_data = cur_jeita_data;
+ 		else {
+ 			if (!fastcharge_mode ||
+@@ -350,7 +355,7 @@
+ 			}
+ 		}
+ 	}
+-	last_fastcharge_mode = fastcharge_mode;
++	info->last_fastcharge_mode[2] = fastcharge_mode;
+ 
+ 	info->flip_proc_data.max_chg_curr =
+ 		mca_buckchg_jeita_get_curr(jeita_data, &vbat_index);
+@@ -359,28 +364,28 @@
+ 		mca_log_info(
+ 			"jeita_index: cur_jeita_index:%d, i:%d, hys_affect:%d\n",
+ 			info->flip_proc_data.cur_jeita_index, i, hys_affect);
+-		last_chg_curr = info->flip_proc_data.max_chg_curr;
+-	} else if (info->flip_proc_data.max_chg_curr > last_chg_curr) {
++		info->last_chg_curr[2] = info->flip_proc_data.max_chg_curr;
++	} else if (info->flip_proc_data.max_chg_curr > info->last_chg_curr[2]) {
+ 		if (vbat_index != -1 &&
+ 		    vbat < jeita_data->volt_para.volt_data[vbat_index].voltage -
+ 				   info->flip_vbat_low_hyst) {
+ 			data_change = 1;
+ 			mca_log_info(
+-				"vbat_thre[l->s]: max_chg_curr:%d, last_chg_curr:%d, vbat_index:%d, vbat:%d\n",
+-				info->flip_proc_data.max_chg_curr, last_chg_curr,
++				"vbat_thre[l->s]: max_chg_curr:%d, info->last_chg_curr[2]:%d, vbat_index:%d, vbat:%d\n",
++				info->flip_proc_data.max_chg_curr, info->last_chg_curr[2],
+ 				vbat_index, vbat);
+-			last_chg_curr = info->flip_proc_data.max_chg_curr;
+-		}
+-	} else if (info->flip_proc_data.max_chg_curr < last_chg_curr) {
+-		if (vbat_index != -1 &&
++			info->last_chg_curr[2] = info->flip_proc_data.max_chg_curr;
++		}
++	} else if (info->flip_proc_data.max_chg_curr < info->last_chg_curr[2]) {
++		if (vbat_index > 0 &&
+ 		    vbat > jeita_data->volt_para.volt_data[vbat_index - 1]
+ 				   .voltage) {
+ 			data_change = 1;
+ 			mca_log_info(
+-				"vbat_thre[s->l]: max_chg_curr:%d, last_chg_curr:%d, vbat_index:%d\n",
+-				info->flip_proc_data.max_chg_curr, last_chg_curr,
++				"vbat_thre[s->l]: max_chg_curr:%d, info->last_chg_curr[2]:%d, vbat_index:%d\n",
++				info->flip_proc_data.max_chg_curr, info->last_chg_curr[2],
+ 				vbat_index);
+-			last_chg_curr = info->flip_proc_data.max_chg_curr;
++			info->last_chg_curr[2] = info->flip_proc_data.max_chg_curr;
+ 		}
+ 	}
+ 
+@@ -404,8 +409,6 @@
+ 	int hys_affect = 0;
+ 	int data_change = 0;
+ 	int vbat = 0;
+-	static int last_fastcharge_mode;
+-	static int last_chg_curr;
+ 	int vbat_index = -1;
+ 
+ 	if (!info->jeita_para.jeita_data || !info->voter_ok) {
+@@ -416,15 +419,21 @@
+ 	ret = strategy_class_fg_ops_get_temperature(&temp);
+ 	if (ret) {
+ 		mca_log_err("get battery temp failed\n");
++		mca_vote_named("chg_enable", "jeita", true, 0);
+ 		return;
+ 	}
+ 
+ 	temp /= 10;
+ 	fastcharge_mode = strategy_class_fg_get_fastcharge();
++	if (fastcharge_mode < 0) {
++		mca_vote_named("chg_enable", "jeita", true, 0);
++		return;
++	}
+ 
+ 	ret = strategy_class_fg_ops_get_voltage(&vbat);
+ 	if (ret) {
+ 		mca_log_err("get battery volt failed\n");
++		mca_vote_named("chg_enable", "jeita", true, 0);
+ 		return;
+ 	}
+ 
+@@ -455,11 +464,11 @@
+ 	/* select cur jeita_data */
+ 	if (info->proc_data.cur_jeita_index == -1 || info->baacfg_update) {
+ 		jeita_data = cur_jeita_data;
+-		last_chg_curr =
++		info->last_chg_curr[0] =
+ 			mca_buckchg_jeita_get_curr(cur_jeita_data, &vbat_index);
+ 	} else {
+ 		if (info->proc_data.cur_jeita_index == i ||
+-		    fastcharge_mode != last_fastcharge_mode)
++		    fastcharge_mode != info->last_fastcharge_mode[0])
+ 			jeita_data = cur_jeita_data;
+ 		else {
+ 			if (!fastcharge_mode || info->jeita_para.fcc_size == 0)
+@@ -508,9 +517,9 @@
+ 		mca_log_info(
+ 			"jeita_index: cur_jeita_index:%d, i:%d, hys_affect:%d\n",
+ 			info->proc_data.cur_jeita_index, i, hys_affect);
+-		last_chg_curr = info->proc_data.max_chg_curr;
++		info->last_chg_curr[0] = info->proc_data.max_chg_curr;
+ 	} else { //jeita_index not change, check vbat_thre
+-		if (info->proc_data.max_chg_curr > last_chg_curr) {
++		if (info->proc_data.max_chg_curr > info->last_chg_curr[0]) {
+ 			bool in_cold_zone = (i == 1 || i == 2 ||
+ 					     (i == 3 && hys_affect));
+ 			int low_hyst = in_cold_zone ? info->vbat_low_cold_hyst :
+@@ -522,22 +531,22 @@
+ 					    low_hyst) {
+ 				data_change = 1;
+ 				mca_log_info(
+-					"vbat_thre[l->s]: max_chg_curr:%d, last_chg_curr:%d, vbat_index:%d\n",
++					"vbat_thre[l->s]: max_chg_curr:%d, info->last_chg_curr[0]:%d, vbat_index:%d\n",
+ 					info->proc_data.max_chg_curr,
+-					last_chg_curr, vbat_index);
+-				last_chg_curr = info->proc_data.max_chg_curr;
++					info->last_chg_curr[0], vbat_index);
++				info->last_chg_curr[0] = info->proc_data.max_chg_curr;
+ 			}
+-		} else if (info->proc_data.max_chg_curr < last_chg_curr) {
+-			if (vbat_index != -1 &&
++		} else if (info->proc_data.max_chg_curr < info->last_chg_curr[0]) {
++			if (vbat_index > 0 &&
+ 			    vbat > jeita_data->volt_para
+ 					    .volt_data[vbat_index - 1]
+ 					    .voltage) {
+ 				data_change = 1;
+ 				mca_log_info(
+-					"vbat_thre[s->l]: max_chg_curr:%d, last_chg_curr:%d, vbat_index:%d\n",
++					"vbat_thre[s->l]: max_chg_curr:%d, info->last_chg_curr[0]:%d, vbat_index:%d\n",
+ 					info->proc_data.max_chg_curr,
+-					last_chg_curr, vbat_index);
+-				last_chg_curr = info->proc_data.max_chg_curr;
++					info->last_chg_curr[0], vbat_index);
++				info->last_chg_curr[0] = info->proc_data.max_chg_curr;
+ 			}
+ 		}
+ 	}
+@@ -546,16 +555,16 @@
+ 
+ 	if (vterm > ABNORMAL_BATT_FV_MAX) {
+ 		vterm -= info->smartchg_data.delta_fv;
+-		mca_vote(info->en_voter, "jeita-hot", true, 1);
++		mca_vote_named("chg_enable", "jeita-hot", true, 1);
+ 		if (vterm != info->vterm) {
+-			mca_vote(info->vterm_voter, "jeita", true, vterm);
++			mca_vote_named("term_volt", "jeita", true, vterm);
+ 			info->vterm = vterm;
+ 		}
+ 	} else {
+ 		if (vbat >= vterm - info->jeita_hot_termination_hyst)
+-			mca_vote(info->en_voter, "jeita-hot", true, 0);
++			mca_vote_named("chg_enable", "jeita-hot", true, 0);
+ 		else if (vbat < vterm - JEITA_HOT_RECHARGE_VBAT_HYS)
+-			mca_vote(info->en_voter, "jeita-hot", true, 1);
++			mca_vote_named("chg_enable", "jeita-hot", true, 1);
+ 	}
+ 
+ 	if (info->dtpt_status)
+@@ -565,25 +574,25 @@
+ 		chg_curr = info->proc_data.max_chg_curr;
+ 
+ 	mca_log_info(
+-		"cur index %d/%d last_chg_curr %d chg_curr %d/%d fastcharge %d jeita_vterm %d jeita_iterm %d vterm %d delta_fv %d hys_affect %d\n",
+-		i, info->proc_data.cur_jeita_index, last_chg_curr,
++		"cur index %d/%d info->last_chg_curr[0] %d chg_curr %d/%d fastcharge %d jeita_vterm %d jeita_iterm %d vterm %d delta_fv %d hys_affect %d\n",
++		i, info->proc_data.cur_jeita_index, info->last_chg_curr[0],
+ 		info->proc_data.max_chg_curr, chg_curr, fastcharge_mode,
+ 		jeita_data->vterm, jeita_data->iterm, vterm,
+ 		info->smartchg_data.delta_fv, hys_affect);
+ 
+-	last_fastcharge_mode = fastcharge_mode;
++	info->last_fastcharge_mode[0] = fastcharge_mode;
+ 	if (chg_curr)
+-		mca_vote(info->en_voter, "jeita", true, 1);
++		mca_vote_named("chg_enable", "jeita", true, 1);
+ 	else
+-		mca_vote(info->en_voter, "jeita", true, 0);
++		mca_vote_named("chg_enable", "jeita", true, 0);
+ 
+ 	if (data_change) {
+ 		if (!hys_affect)
+ 			info->proc_data.cur_jeita_index = i;
+-		mca_vote(info->fcc_voter, "jeita", true, chg_curr);
+-		mca_vote(info->vterm_voter, "jeita", true, vterm);
++		mca_vote_named("buck_charge_curr", "jeita", true, chg_curr);
++		mca_vote_named("term_volt", "jeita", true, vterm);
+ 		if (!info->support_base_flip && !info->base_flip_same)
+-			mca_vote(info->iterm_voter, "jeita", true,
++			mca_vote_named("term_curr", "jeita", true,
+ 				 jeita_data->iterm);
+ 	}
+ 
+@@ -591,8 +600,8 @@
+ 		info->cold_zone =
+ 			(info->proc_data.cur_jeita_index == JEITA_COLD_ZONE_INDEX);
+ 		mca_log_info(
+-			"cur index %d/%d last_chg_curr %d cold_zone %d\n", i,
+-			info->proc_data.cur_jeita_index, last_chg_curr,
++			"cur index %d/%d info->last_chg_curr[0] %d cold_zone %d\n", i,
++			info->proc_data.cur_jeita_index, info->last_chg_curr[0],
+ 			info->cold_zone);
+ 	}
+ }
+@@ -609,62 +618,40 @@
+ 	return platform_class_loadsw_set_ibat_limit(LOADSW_ROLE_MASTER,
+ 						    effective_result);
+ }
+-
+-static void mca_buckchg_jeita_init_voter(struct mca_buckchg_jeita_dev *info)
+-{
+-	info->flip_fcc_voter = mca_create_votable(
+-		"flip_charge_curr", MCA_VOTE_MIN,
++static int mca_buckchg_jeita_init_voter(struct mca_buckchg_jeita_dev *info)
++{
++	if (!mca_named_votable_exists("chg_enable") ||
++	    !mca_named_votable_exists("buck_charge_curr") ||
++	    !mca_named_votable_exists("term_volt") ||
++	    !mca_named_votable_exists("term_curr"))
++		return -EPROBE_DEFER;
++	info->flip_fcc_voter = mca_create_votable("flip_charge_curr", MCA_VOTE_MIN,
+ 		mca_buckchg_jeita_flip_charge_limit,
+ 		MCA_BUCKCHG_JEITA_FLIP_CURRENT_DEFAULT_VALUE, info);
+ 	if (IS_ERR(info->flip_fcc_voter))
+-		return;
+-
+-	info->en_voter = mca_find_votable("chg_enable");
+-	if (!info->en_voter)
+-		return;
+-	info->fcc_voter = mca_find_votable("buck_charge_curr");
+-	if (!info->fcc_voter)
+-		return;
+-	info->vterm_voter = mca_find_votable("term_volt");
+-	if (!info->vterm_voter)
+-		return;
+-	info->iterm_voter = mca_find_votable("term_curr");
+-	if (!info->iterm_voter)
+-		return;
+-
++		return PTR_ERR(info->flip_fcc_voter);
+ 	info->voter_ok = 1;
+-}
+-
++	return 0;
++}
+ static void mca_buckchg_jeita_monitor_work(struct work_struct *work)
+ {
+-	int interval = MCA_BUCKCHG_JEITA_UPDATE_NORMAL_INTERVAL;
+ 	struct mca_buckchg_jeita_dev *info = container_of(
+ 		work, struct mca_buckchg_jeita_dev, monitor_work.work);
+ 
+-	if (!info->voter_ok)
+-		mca_buckchg_jeita_init_voter(info);
+-
+-	if (!info->voter_ok) {
+-		interval = MCA_BUCKCHG_JEITA_INIT_VOTER_INTERVAL;
+-		mca_log_info("voter not ok\n");
+-		goto out;
+-	}
+-
+-	if (!info->online) {
+-		mca_log_info("adapter is plugout\n");
++	guard(mutex)(&info->state_lock);
++	if (!info->ready || info->stopping || !info->online)
+ 		return;
+-	}
+ 	mca_buckchg_jeita_update(info);
+ 	if (info->support_base_flip) {
+ 		mca_buckchg_base_jeita_update(info);
+ 		mca_buckchg_flip_jeita_update(info);
+ 	}
+-out:
+-	schedule_delayed_work(&info->monitor_work, msecs_to_jiffies(interval));
++	mod_delayed_work(system_wq, &info->monitor_work,
++			 msecs_to_jiffies(MCA_BUCKCHG_JEITA_UPDATE_NORMAL_INTERVAL));
+ }
+ 
+ static int
+-mca_buckchg_parse_volt_para(struct device_node *node, const char *name,
++mca_buckchg_parse_volt_para(struct device *dev, struct device_node *node, const char *name,
+ 			    struct mca_buckchg_jeita_volt_para *volt_para)
+ {
+ 	struct mca_buckchg_jeita_volt_data *volt_data;
+@@ -678,14 +665,14 @@
+ 	array_len = mca_parse_dts_count_strings(node, name,
+ 						JEITA_VOLT_DATA_MAX_GROUP,
+ 						BUCKCHG_VOLTAGE_PARA_MAX);
+-	if (array_len < 0) {
++	if (array_len <= 0) {
+ 		mca_log_err("parse %s failed\n", name);
+-		return -1;
++		return -EINVAL;
+ 	}
+ 
+ 	volt_para->size = array_len / BUCKCHG_VOLTAGE_PARA_MAX;
+ 	volt_para->volt_data =
+-		kcalloc(volt_para->size, sizeof(*volt_data), GFP_KERNEL);
++		devm_kcalloc(dev, volt_para->size, sizeof(*volt_data), GFP_KERNEL);
+ 	if (!volt_para->volt_data) {
+ 		mca_log_err("volt para no mem\n");
+ 		return -ENOMEM;
+@@ -693,7 +680,7 @@
+ 	volt_data = volt_para->volt_data;
+ 	for (i = 0; i < array_len; i++) {
+ 		if (mca_parse_dts_string_index(node, name, i, &tmp_string))
+-			return -1;
++			return -EINVAL;
+ 
+ 		row = i / BUCKCHG_VOLTAGE_PARA_MAX;
+ 		col = i % BUCKCHG_VOLTAGE_PARA_MAX;
+@@ -719,13 +706,12 @@
+ 
+ 	return 0;
+ error:
+-	kfree(volt_data);
+ 	volt_data = NULL;
+-	return -1;
++	return -EINVAL;
+ }
+ 
+ static int
+-mca_buckchg_jeita_parse_para(struct device_node *node, const char *name,
++mca_buckchg_jeita_parse_para(struct device *dev, struct device_node *node, const char *name,
+ 			     struct mca_buckchg_jeita_para *jeita_info)
+ {
+ 	int array_len, row, col, i;
+@@ -735,18 +721,18 @@
+ 
+ 	if (!node) {
+ 		mca_log_err("node in null\n");
+-		return -1;
++		return -EINVAL;
+ 	}
+ 
+ 	array_len = mca_parse_dts_count_strings(
+ 		node, name, JEITA_DATA_MAX_GROUP, JEITA_TEMP_PARA_MAX);
+-	if (array_len < 0) {
++	if (array_len <= 0) {
+ 		mca_log_err("parse jeita failed\n");
+-		return -1;
++		return -EINVAL;
+ 	}
+ 
+ 	jeita_info->size = array_len / JEITA_TEMP_PARA_MAX;
+-	jeita_info->jeita_data = kcalloc(
++	jeita_info->jeita_data = devm_kcalloc(dev,
+ 		jeita_info->size, sizeof(*jeita_info->jeita_data), GFP_KERNEL);
+ 	if (!jeita_info->jeita_data) {
+ 		mca_log_err("temp para no mem\n");
+@@ -755,7 +741,7 @@
+ 	jeita_data = jeita_info->jeita_data;
+ 	for (i = 0; i < array_len; i++) {
+ 		if (mca_parse_dts_string_index(node, name, i, &tmp_string))
+-			return -1;
++			return -EINVAL;
+ 
+ 		row = i / JEITA_TEMP_PARA_MAX;
+ 		col = i % JEITA_TEMP_PARA_MAX;
+@@ -795,7 +781,7 @@
+ 			break;
+ 		case JEITA_TEMP_PARA_VOLT_PARA_NAME:
+ 			if (mca_buckchg_parse_volt_para(
+-				    node, tmp_string,
++				    dev, node, tmp_string,
+ 				    &jeita_data[row].volt_para))
+ 				goto error;
+ 			break;
+@@ -818,15 +804,15 @@
+ 	mca_log_err("new name:%s\n", ffc_name);
+ 	array_len = mca_parse_dts_count_strings(
+ 		node, ffc_name, JEITA_DATA_MAX_GROUP, JEITA_TEMP_PARA_MAX);
+-	if (array_len < 0) {
++	if (array_len <= 0) {
+ 		mca_log_err("parse jeita para ffc failed\n");
+-		return 0;
++		return -EINVAL;
+ 	}
+ 
+ 	jeita_info->fcc_size = array_len / JEITA_TEMP_PARA_MAX;
+ 
+ 	jeita_info->jeita_ffc_data =
+-		kcalloc(jeita_info->fcc_size,
++		devm_kcalloc(dev, jeita_info->fcc_size,
+ 			sizeof(*jeita_info->jeita_ffc_data), GFP_KERNEL);
+ 	if (!jeita_info->jeita_ffc_data) {
+ 		mca_log_err("temp para no mem\n");
+@@ -835,7 +821,7 @@
+ 	jeita_ffc_data = jeita_info->jeita_ffc_data;
+ 	for (i = 0; i < array_len; i++) {
+ 		if (mca_parse_dts_string_index(node, ffc_name, i, &tmp_string))
+-			return -1;
++			return -EINVAL;
+ 
+ 		row = i / JEITA_TEMP_PARA_MAX;
+ 		col = i % JEITA_TEMP_PARA_MAX;
+@@ -877,7 +863,7 @@
+ 			break;
+ 		case JEITA_TEMP_PARA_VOLT_PARA_NAME:
+ 			if (mca_buckchg_parse_volt_para(
+-				    node, tmp_string,
++				    dev, node, tmp_string,
+ 				    &jeita_ffc_data[row].volt_para))
+ 				goto error1;
+ 			break;
+@@ -896,119 +882,172 @@
+ 			    jeita_ffc_data[i].volt_para.size);
+ 	return 0;
+ error1:
+-	kfree(jeita_ffc_data);
+ 	jeita_ffc_data = NULL;
+ error:
+-	kfree(jeita_data);
+ 	jeita_data = NULL;
+-	return -1;
++	return -EINVAL;
++}
++static int mca_jeita_validate_table(struct mca_buckchg_jeita_data *table, int count)
++{
++	int i, j;
++
++	if (!table || count <= 0 || count > JEITA_DATA_MAX_GROUP)
++		return -EINVAL;
++	for (i = 0; i < count; i++) {
++		struct mca_buckchg_jeita_data *entry = &table[i];
++
++		if (entry->temp_low < -65535 || entry->temp_high > 65535 ||
++		    entry->temp_low >= entry->temp_high || entry->low_temp_hys < 0 ||
++		    entry->low_temp_hys > 100 || entry->high_temp_hys < 0 ||
++		    entry->high_temp_hys > 100 || entry->max_current < 0 ||
++		    entry->max_current > 30000 || entry->vterm <= 0 || entry->vterm > 5000 ||
++		    entry->iterm <= 0 || entry->iterm > 30000 ||
++		    (i && table[i - 1].temp_high != entry->temp_low) ||
++		    entry->volt_para.size < 0 ||
++		    entry->volt_para.size > JEITA_VOLT_DATA_MAX_GROUP ||
++		    (entry->volt_para.size && !entry->volt_para.volt_data))
++			return -EINVAL;
++		for (j = 0; j < entry->volt_para.size; j++) {
++			struct mca_buckchg_jeita_volt_data *volt = &entry->volt_para.volt_data[j];
++
++			if (volt->voltage <= 0 || volt->voltage > entry->vterm ||
++			    volt->max_current < 0 || volt->max_current > entry->max_current ||
++			    (j && entry->volt_para.volt_data[j - 1].voltage >= volt->voltage))
++				return -EINVAL;
++		}
++		entry->design_vterm = entry->vterm;
++	}
++	return 0;
++}
++
++static int mca_jeita_validate_para(struct mca_buckchg_jeita_para *para)
++{
++	int ret = mca_jeita_validate_table(para->jeita_data, para->size);
++
++	if (ret)
++		return ret;
++	return mca_jeita_validate_table(para->jeita_ffc_data, para->fcc_size);
+ }
+ 
+ static int mca_buckchg_jeita_parse_dt(struct mca_buckchg_jeita_dev *info)
+ {
+-	struct mca_buckchg_jeita_para *jeita_info = &info->jeita_para;
+-	struct mca_buckchg_jeita_para *base_jeita_info = &info->base_jeita_para;
+-	struct mca_buckchg_jeita_para *flip_jeita_info = &info->flip_jeita_para;
+-	struct device_node *node = info->dev->of_node;
++	struct device_node *original = info->dev->of_node;
++	struct device_node *node = of_node_get(original);
+ 	const struct mca_hwid *hwid = mca_get_hwid_info();
+ 	const char *dev_name = NULL;
+ 	int ret;
+ 
+-	mca_parse_dts_u32(node, "vbat_high_hyst", &(info->vbat_high_hyst),
++	if (!hwid) {
++		ret = -EPROBE_DEFER;
++		goto out;
++	}
++	mca_parse_dts_u32(original, "vbat_high_hyst", &info->vbat_high_hyst,
+ 			  MCA_BUCKCHG_JEITA_VBAT_HIGH_HYST);
+-	mca_parse_dts_u32(node, "vbat_low_hyst", &(info->vbat_low_hyst),
++	mca_parse_dts_u32(original, "vbat_low_hyst", &info->vbat_low_hyst,
+ 			  MCA_BUCKCHG_JEITA_VBAT_LOW_HYST);
+-	mca_parse_dts_u32(node, "vbat_low_cold_hyst",
+-			  &(info->vbat_low_cold_hyst),
++	mca_parse_dts_u32(original, "vbat_low_cold_hyst", &info->vbat_low_cold_hyst,
+ 			  MCA_BUCKCHG_JEITA_VBAT_LOW_HYST);
+-	mca_parse_dts_u32(node, "base_vbat_low_hyst",
+-			  &(info->base_vbat_low_hyst),
++	mca_parse_dts_u32(original, "base_vbat_low_hyst", &info->base_vbat_low_hyst,
+ 			  MCA_BUCKCHG_JEITA_VBAT_LOW_HYST);
+-	mca_parse_dts_u32(node, "flip_vbat_low_hyst",
+-			  &(info->flip_vbat_low_hyst),
++	mca_parse_dts_u32(original, "flip_vbat_low_hyst", &info->flip_vbat_low_hyst,
+ 			  MCA_BUCKCHG_JEITA_VBAT_LOW_HYST);
+-	mca_parse_dts_u32(node, "jeita_hot_termination_hyst",
+-			  &(info->jeita_hot_termination_hyst), 0);
+-	info->has_gbl_batt_para =
+-		of_property_read_bool(node, "has-global-batt-para");
+-	if (hwid && info->has_gbl_batt_para &&
+-	    hwid->country_version != CountryCN)
++	mca_parse_dts_u32(original, "jeita_hot_termination_hyst",
++			  &info->jeita_hot_termination_hyst, 0);
++	if (info->vbat_high_hyst < 0 || info->vbat_high_hyst > 1000 ||
++	    info->vbat_low_hyst < 0 || info->vbat_low_hyst > 1000 ||
++	    info->vbat_low_cold_hyst < 0 || info->vbat_low_cold_hyst > 1000 ||
++	    info->base_vbat_low_hyst < 0 || info->base_vbat_low_hyst > 1000 ||
++	    info->flip_vbat_low_hyst < 0 || info->flip_vbat_low_hyst > 1000 ||
++	    info->jeita_hot_termination_hyst < 0 || info->jeita_hot_termination_hyst > 100) {
++		ret = -EINVAL;
++		goto out;
++	}
++	info->has_gbl_batt_para = of_property_read_bool(original, "has-global-batt-para");
++	info->has_tmp_batt_para = of_property_read_bool(original, "has-tmp-batt-para");
++	info->support_base_flip = of_property_read_bool(original, "support-base-flip");
++	info->base_flip_same = of_property_read_bool(original, "base-flip-same");
++	if (info->has_gbl_batt_para && hwid->country_version != CountryCN) {
++		of_node_put(node);
+ 		node = of_find_node_by_name(NULL, "mca_buckchg_jeita_gbl_para");
+-
++	}
++	if (info->has_tmp_batt_para) {
++		ret = platform_fg_ops_get_device_name(FG_IC_MASTER, &dev_name);
++		if (ret || !dev_name) {
++			ret = -EPROBE_DEFER;
++			goto out;
++		}
++		if (!strcmp(dev_name, "2@BP")) {
++			of_node_put(node);
++			node = of_find_node_by_name(NULL, "mca_buckchg_jeita_tmp_para");
++		}
++	}
+ 	if (!node) {
+-		mca_log_err("node in null\n");
+-		return -1;
+-	}
+-
+-	info->has_tmp_batt_para =
+-		of_property_read_bool(node, "has-tmp-batt-para");
+-	if (info->has_tmp_batt_para) {
+-		platform_fg_ops_get_device_name(FG_IC_MASTER, &dev_name);
+-		if (!dev_name) {
+-			mca_log_err("get device name fail, wait for it\n");
+-			return -EINVAL;
+-		}
+-		mca_log_err("project O9 tmp test: device name: %s\n", dev_name);
+-		if (!strcmp(dev_name, "2@BP")) {
+-			node = of_find_node_by_name(
+-				NULL, "mca_buckchg_jeita_tmp_para");
+-			if (!node) {
+-				mca_log_err("has-tmp-batt-para node in null\n");
+-				return -1;
+-			}
+-		}
+-	}
+-
+-	ret = mca_buckchg_jeita_parse_para(node, "jeita_para", jeita_info);
+-	info->support_base_flip =
+-		of_property_read_bool(node, "support-base-flip");
+-	info->base_flip_same = of_property_read_bool(node, "base-flip-same");
+-	if (info->support_base_flip) {
+-		mca_log_err("support base flip, start config buckchg jeita\n");
+-		ret = mca_buckchg_jeita_parse_para(node, "base_jeita_para",
+-						   base_jeita_info);
+-		ret = mca_buckchg_jeita_parse_para(node, "flip_jeita_para",
+-						   flip_jeita_info);
+-	}
+-
++		ret = -EINVAL;
++		goto out;
++	}
++	ret = mca_buckchg_jeita_parse_para(info->dev, node, "jeita_para", &info->jeita_para);
++	if (ret)
++		goto out;
++	ret = mca_jeita_validate_para(&info->jeita_para);
++	if (ret || !info->support_base_flip)
++		goto out;
++	ret = mca_buckchg_jeita_parse_para(info->dev, node, "base_jeita_para",
++					 &info->base_jeita_para);
++	if (ret)
++		goto out;
++	ret = mca_jeita_validate_para(&info->base_jeita_para);
++	if (ret)
++		goto out;
++	ret = mca_buckchg_jeita_parse_para(info->dev, node, "flip_jeita_para",
++					 &info->flip_jeita_para);
++	if (!ret)
++		ret = mca_jeita_validate_para(&info->flip_jeita_para);
++out:
++	of_node_put(node);
+ 	return ret;
+ }
+-
+ static int mca_buckchg_jeita_process_event(int event, int value, void *data)
+ {
+ 	struct mca_buckchg_jeita_dev *info = data;
+ 
+ 	if (!info)
+-		return -1;
+-
+-	mca_log_info("receive event %d, value %d\n", event, value);
++		return -EINVAL;
++	guard(mutex)(&info->state_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
+ 	switch (event) {
+ 	case MCA_EVENT_USB_CONNECT:
++		info->wired_online = true;
++		break;
+ 	case MCA_EVENT_WIRELESS_CONNECT:
+-		info->online = 1;
++		info->wireless_online = true;
++		break;
++	case MCA_EVENT_USB_DISCONNECT:
++		info->wired_online = false;
++		break;
++	case MCA_EVENT_WIRELESS_DISCONNECT:
++		info->wireless_online = false;
++		break;
++	case MCA_EVENT_BATTERY_DTPT:
++		info->dtpt_status = value;
++		return 0;
++	default:
++		return 0;
++	}
++	info->online = info->wired_online || info->wireless_online;
++	if (info->online) {
+ 		info->proc_data.cur_jeita_index = -1;
+ 		info->proc_data.max_chg_curr = 0;
+-		cancel_delayed_work_sync(&info->monitor_work);
+-		schedule_delayed_work(&info->monitor_work, 0);
+-		break;
+-	case MCA_EVENT_USB_DISCONNECT:
+-	case MCA_EVENT_WIRELESS_DISCONNECT:
+-		info->online = 0;
+-		cancel_delayed_work_sync(&info->monitor_work);
++		mod_delayed_work(system_wq, &info->monitor_work, 0);
++	} else {
++		cancel_delayed_work(&info->monitor_work);
+ 		info->flip_proc_data.cur_jeita_index = 0;
+ 		info->flip_proc_data.temp_hys_en = 0;
+ 		info->flip_proc_data.max_chg_curr = -1;
+ 		info->base_proc_data.cur_jeita_index = 0;
+ 		info->base_proc_data.temp_hys_en = 0;
+ 		info->base_proc_data.max_chg_curr = -1;
+-		break;
+-	case MCA_EVENT_BATTERY_DTPT:
+-		info->dtpt_status = value;
+-		break;
+-	default:
+-		break;
+-	}
+-
++	}
+ 	return 0;
+ }
+ 
+@@ -1022,7 +1061,7 @@
+ 	ret = strategy_class_fg_ops_get_temperature(&temp);
+ 	if (ret) {
+ 		mca_log_err("get battery temp failed\n");
+-		return 0;
++		return ret;
+ 	}
+ 	temp /= 10;
+ 
+@@ -1034,7 +1073,7 @@
+ 	}
+ 	if (i == info->jeita_para.size) {
+ 		mca_log_err("can not find jeita para\n");
+-		return 0;
++		return -ENODATA;
+ 	}
+ 
+ 	cur_normal_vterm = cur_jeita_data->vterm;
+@@ -1052,7 +1091,7 @@
+ 	ret = strategy_class_fg_ops_get_temperature(&temp);
+ 	if (ret) {
+ 		mca_log_err("get battery temp failed\n");
+-		return 0;
++		return ret;
+ 	}
+ 	temp /= 10;
+ 
+@@ -1064,7 +1103,7 @@
+ 	}
+ 	if (i == info->jeita_para.fcc_size) {
+ 		mca_log_err("can not find jeita fcc para\n");
+-		return 0;
++		return -ENODATA;
+ 	}
+ 
+ 	cur_ffc_itrem = cur_jeita_data->iterm;
+@@ -1082,7 +1121,7 @@
+ 	ret = strategy_class_fg_ops_get_temperature(&temp);
+ 	if (ret) {
+ 		mca_log_err("get battery temp failed\n");
+-		return 0;
++		return ret;
+ 	}
+ 	temp /= 10;
+ 
+@@ -1094,134 +1133,154 @@
+ 	}
+ 	if (i == info->jeita_para.fcc_size) {
+ 		mca_log_err("can not find jeita fcc para\n");
+-		return 0;
++		return -ENODATA;
+ 	}
+ 
+ 	cur_ffc_vterm = cur_jeita_data->vterm;
+ 
+ 	return cur_ffc_vterm;
+ }
+-
+-static int mca_strategy_buckchg_jeita_get_status(int status, void *value,
+-						 void *data)
++static int mca_strategy_buckchg_jeita_get_status(int status, void *value, void *data)
++{
++	struct mca_buckchg_jeita_dev *info = data;
++	int result;
++
++	if (!info || !value)
++		return -EINVAL;
++	guard(mutex)(&info->state_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
++	switch (status) {
++	case STRATEGY_STATUS_TYPE_JEITA_FFC_ITERM:
++		result = mca_strategy_buckchg_jeita_get_ffc_iterm(info);
++		break;
++	case STRATEGY_STATUS_TYPE_JEITA_NORMAL_VTERM:
++		result = mca_strategy_buckchg_jeita_get_normal_vterm(info);
++		break;
++	case STRATEGY_STATUS_TYPE_JEITA_FFC_VTERM:
++		result = mca_strategy_buckchg_jeita_get_ffc_vterm(info);
++		break;
++	case STRATEGY_STATUS_TYPE_JEITA_COLD_ZONE:
++		result = info->cold_zone;
++		break;
++	default:
++		return -EINVAL;
++	}
++	if (result < 0)
++		return result;
++	*(int *)value = result;
++	return 0;
++}
++
++static int mca_jeita_smartchg_delta_fv_callback(void *data,
++						int effective_result)
+ {
+ 	struct mca_buckchg_jeita_dev *info =
+ 		(struct mca_buckchg_jeita_dev *)data;
+-	int *cur_val = (int *)value;
+-
+-	if (!info || !value)
+-		return -1;
+-
+-	switch (status) {
+-	case STRATEGY_STATUS_TYPE_JEITA_FFC_ITERM:
+-		*cur_val = mca_strategy_buckchg_jeita_get_ffc_iterm(info);
+-		break;
+-	case STRATEGY_STATUS_TYPE_JEITA_NORMAL_VTERM:
+-		*cur_val = mca_strategy_buckchg_jeita_get_normal_vterm(info);
+-		break;
+-	case STRATEGY_STATUS_TYPE_JEITA_FFC_VTERM:
+-		*cur_val = mca_strategy_buckchg_jeita_get_ffc_vterm(info);
+-		break;
+-	case STRATEGY_STATUS_TYPE_JEITA_COLD_ZONE:
+-		*cur_val = info->cold_zone;
+-		break;
+-	default:
+-		return -1;
+-	}
+-
+-	return 0;
+-}
+-
+-static int mca_jeita_smartchg_delta_fv_callback(void *data,
+-						int effective_result)
+-{
+-	struct mca_buckchg_jeita_dev *info =
+-		(struct mca_buckchg_jeita_dev *)data;
+-
+-	if (!data)
+-		return -1;
+-
++
++	if (!data || effective_result < 0 || effective_result > 1000)
++		return -EINVAL;
++
++	guard(mutex)(&info->state_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
+ 	info->smartchg_data.delta_fv = effective_result;
+ 	mca_log_err("effective_result: %d\n", effective_result);
+ 
+ 	return 0;
+ }
+-
+-static int mca_buckchg_jeita_smartchg_baa_update_jeita_data(
+-	struct mca_buckchg_jeita_data *jeita_data,
+-	struct smart_batt_jeita_term_para *para)
+-{
+-	int max_volt_idx = jeita_data->volt_para.size - 1;
+-
+-	mca_log_info(
+-		"jeita_term_para idx: %d, temp: %d:%d => %d:%d, vterm: %d => %d, iterm: %d => %d\n",
+-		para->t_range.idx, para->t_range.min, para->t_range.max,
+-		jeita_data->temp_low, jeita_data->temp_high, jeita_data->vterm,
+-		para->vterm, jeita_data->iterm, para->iterm);
+-
+-	jeita_data->vterm = para->vterm;
+-	jeita_data->iterm = para->iterm;
+-	if (jeita_data->volt_para.size > 0) {
+-		mca_log_info(
+-			"volt_data[%d].voltage: %d => %d\n", max_volt_idx,
+-			jeita_data->volt_para.volt_data[max_volt_idx].voltage,
+-			jeita_data->vterm);
+-		jeita_data->volt_para.volt_data[max_volt_idx].voltage =
+-			jeita_data->vterm;
+-	}
+-
++static int mca_jeita_basp_prepare(void *data, const struct mca_basp_update *update)
++{
++	struct mca_buckchg_jeita_dev *info = data;
++	u32 total, i;
++	int ret = -EINVAL;
++
++	if (!info || !update || !update->jeita ||
++	    update->ffc_size > info->jeita_para.fcc_size ||
++	    update->normal_size > info->jeita_para.size)
++		return -EINVAL;
++	mutex_lock(&info->state_lock);
++	if (!info->ready || info->stopping) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	if (info->pending_basp) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	total = update->ffc_size + update->normal_size;
++	for (i = 0; i < total; i++) {
++		const struct smart_batt_jeita_term_para *para = &update->jeita[i];
++		struct mca_buckchg_jeita_data *table;
++		int count, j;
++
++		if (i < update->ffc_size) {
++			table = info->jeita_para.jeita_ffc_data;
++			count = info->jeita_para.fcc_size;
++		} else {
++			table = info->jeita_para.jeita_data;
++			count = info->jeita_para.size;
++		}
++		if (para->t_range.idx < 0 || para->t_range.idx >= count)
++			goto unlock;
++		table += para->t_range.idx;
++		if (para->t_range.min != table->temp_low ||
++		    para->t_range.max != table->temp_high ||
++		    para->vterm <= 0 || para->vterm > table->design_vterm ||
++		    para->iterm <= 0 || para->iterm > 30000)
++			goto unlock;
++		if (table->volt_para.size > 1 &&
++		    para->vterm <= table->volt_para.volt_data[table->volt_para.size - 2].voltage)
++			goto unlock;
++		for (j = i < update->ffc_size ? 0 : update->ffc_size; j < i; j++)
++			if (update->jeita[j].t_range.idx == para->t_range.idx)
++				goto unlock;
++	}
++	info->pending_basp = kmemdup(update->jeita,
++				     total * sizeof(*info->pending_basp), GFP_KERNEL);
++	if (!info->pending_basp) {
++		ret = -ENOMEM;
++		goto unlock;
++	}
++	info->pending_ffc_size = update->ffc_size;
++	info->pending_normal_size = update->normal_size;
++	/* Keep state_lock held until the transaction commits or aborts. */
+ 	return 0;
+-}
+-
+-static int mca_buckchg_jeita_smartchg_update_baa_para(void *data,
+-						      char *baa_para,
+-						      int ffc_size,
+-						      int normal_size)
+-{
+-	struct mca_buckchg_jeita_dev *info =
+-		(struct mca_buckchg_jeita_dev *)data;
+-	struct smart_batt_jeita_term_para *jeita_term_para = NULL;
+-	int offset = 0;
+-	int index = 0;
+-
+-	if (!data || !baa_para) {
+-		mca_log_err("data or baa_para is NULL\n");
+-		return -1;
+-	}
+-
+-	// update ffc jeita para
+-	jeita_term_para = (struct smart_batt_jeita_term_para *)baa_para;
+-	for (int i = 0; i < ffc_size; i++) {
+-		index = jeita_term_para[i].t_range.idx;
+-		if (index < 0 || index >= info->jeita_para.fcc_size) {
+-			mca_log_err(
+-				"jeita_para.fcc_size: %d, invalid idx: %d\n",
+-				info->jeita_para.fcc_size, index);
+-		} else {
+-			mca_buckchg_jeita_smartchg_baa_update_jeita_data(
+-				&(info->jeita_para.jeita_ffc_data[index]),
+-				&(jeita_term_para[i]));
+-		}
+-	}
+-
+-	// update normal jeita para
+-	offset = ffc_size * sizeof(struct smart_batt_jeita_term_para);
+-	jeita_term_para =
+-		(struct smart_batt_jeita_term_para *)(baa_para + offset);
+-	for (int i = 0; i < normal_size; i++) {
+-		index = jeita_term_para[i].t_range.idx;
+-		if (index < 0 || index >= info->jeita_para.size) {
+-			mca_log_err("jeita_para.size: %d, invalid idx: %d\n",
+-				    info->jeita_para.size, index);
+-		} else {
+-			mca_buckchg_jeita_smartchg_baa_update_jeita_data(
+-				&(info->jeita_para.jeita_data[index]),
+-				&(jeita_term_para[i]));
+-		}
+-	}
+-
++unlock:
++	mutex_unlock(&info->state_lock);
++	return ret;
++}
++
++static void mca_jeita_basp_abort(void *data)
++{
++	struct mca_buckchg_jeita_dev *info = data;
++
++	kfree(info->pending_basp);
++	info->pending_basp = NULL;
++	mutex_unlock(&info->state_lock);
++}
++
++static void mca_jeita_basp_commit(void *data)
++{
++	struct mca_buckchg_jeita_dev *info = data;
++	u32 total = info->pending_ffc_size + info->pending_normal_size, i;
++
++	for (i = 0; i < total; i++) {
++		const struct smart_batt_jeita_term_para *para = &info->pending_basp[i];
++		struct mca_buckchg_jeita_data *table = i < info->pending_ffc_size ?
++			info->jeita_para.jeita_ffc_data : info->jeita_para.jeita_data;
++
++		table += para->t_range.idx;
++		table->vterm = para->vterm;
++		table->iterm = para->iterm;
++		if (table->volt_para.size)
++			table->volt_para.volt_data[table->volt_para.size - 1].voltage = para->vterm;
++	}
+ 	info->baacfg_update = true;
+-	return 0;
++	info->proc_data.cur_jeita_index = -1;
++	if (info->online)
++		mod_delayed_work(system_wq, &info->monitor_work, 0);
++	mca_jeita_basp_abort(data);
+ }
+ 
+ static struct mca_smartchg_if_ops g_jeita_smartchg_if_ops = {
+@@ -1229,77 +1288,97 @@
+ 	.data = NULL,
+ 	.set_delta_fv = mca_jeita_smartchg_delta_fv_callback,
+ 	.set_delta_ichg = NULL,
+-	.update_baa_para = mca_buckchg_jeita_smartchg_update_baa_para,
++	.prepare_baa_para = mca_jeita_basp_prepare,
++	.commit_baa_para = mca_jeita_basp_commit,
++	.abort_baa_para = mca_jeita_basp_abort,
+ };
+-
+ static int mca_buckchg_jeita_probe(struct platform_device *pdev)
+ {
+ 	struct mca_buckchg_jeita_dev *info;
+-	int ret;
+-	int online = 0, wireless_online;
+-
++	struct mca_smartchg_if_ops ops = g_jeita_smartchg_if_ops;
++	int ret, online = 0, wireless_online = 0;
++
++	if (strategy_class_fg_ops_is_init_ok() <= 0)
++		return -EPROBE_DEFER;
+ 	info = devm_kzalloc(&pdev->dev, sizeof(*info), GFP_KERNEL);
+ 	if (!info)
+ 		return -ENOMEM;
+-
+ 	info->dev = &pdev->dev;
++	mutex_init(&info->state_lock);
++	INIT_DELAYED_WORK(&info->monitor_work, mca_buckchg_jeita_monitor_work);
++	platform_set_drvdata(pdev, info);
+ 	ret = mca_buckchg_jeita_parse_dt(info);
+-	if (ret) {
+-		mca_log_err("parse dts failed, ret: %d\n", ret);
+-		if (ret != -1) {
+-			static int parse_dt_cnt;
+-
+-			dev_err(&pdev->dev,
+-				"%s buckchg_jeita parse_dt_cnt = %d\n",
+-				__func__, ++parse_dt_cnt);
+-			msleep(100);
+-			return parse_dt_cnt <= 49 ? -EPROBE_DEFER : -1;
+-		}
+-	}
+-	INIT_DELAYED_WORK(&info->monitor_work, mca_buckchg_jeita_monitor_work);
+-	mca_buckchg_jeita_init_voter(info);
+-	(void)mca_strategy_ops_register(STRATEGY_FUNC_TYPE_JEITA,
+-					mca_buckchg_jeita_process_event,
+-					mca_strategy_buckchg_jeita_get_status,
+-					NULL, info);
+-	g_jeita_smartchg_if_ops.data = info;
+-	(void)mca_smartchg_if_ops_register(&g_jeita_smartchg_if_ops);
+-
+-	(void)mca_strategy_func_get_status(STRATEGY_FUNC_TYPE_BUCK_CHARGE,
+-					   STRATEGY_STATUS_TYPE_ONLINE,
+-					   &online);
+-	(void)mca_strategy_func_get_status(STRATEGY_FUNC_TYPE_BASIC_WIRELESS,
+-					   STRATEGY_STATUS_TYPE_ONLINE,
+-					   &wireless_online);
+-
+-	if (online || wireless_online) {
+-		info->online = 1;
+-		schedule_delayed_work(&info->monitor_work, 0);
+-		return 0;
+-	}
+-
+-	if (!info->voter_ok)
+-		schedule_delayed_work(
+-			&info->monitor_work,
+-			msecs_to_jiffies(
+-				MCA_BUCKCHG_JEITA_INIT_VOTER_INTERVAL));
+-	mca_log_err("probe ok\n");
++	if (ret)
++		return ret;
++	ret = mca_buckchg_jeita_init_voter(info);
++	if (ret)
++		return ret;
++	if (!mca_strategy_func_get_status(STRATEGY_FUNC_TYPE_BUCK_CHARGE,
++					 STRATEGY_STATUS_TYPE_ONLINE, &online))
++		info->wired_online = !!online;
++	if (!mca_strategy_func_get_status(STRATEGY_FUNC_TYPE_BASIC_WIRELESS,
++					 STRATEGY_STATUS_TYPE_ONLINE, &wireless_online))
++		info->wireless_online = !!wireless_online;
++	info->online = info->wired_online || info->wireless_online;
++	info->proc_data.cur_jeita_index = -1;
++	info->base_proc_data.cur_jeita_index = -1;
++	info->flip_proc_data.cur_jeita_index = -1;
++	ret = mca_strategy_ops_register(STRATEGY_FUNC_TYPE_JEITA,
++		mca_buckchg_jeita_process_event, mca_strategy_buckchg_jeita_get_status, NULL, info);
++	if (ret)
++		goto voter;
++	ops.data = info;
++	ret = mca_smartchg_if_ops_register(&ops);
++	if (ret)
++		goto strategy;
++	WRITE_ONCE(info->ready, true);
++	if (info->online)
++		mod_delayed_work(system_wq, &info->monitor_work, 0);
+ 	return 0;
+-}
+-
+-static int mca_buckchg_jeita_remove(struct platform_device *pdev)
+-{
+-	return 0;
+-}
+-
++strategy:
++	mca_strategy_ops_unregister(STRATEGY_FUNC_TYPE_JEITA, info);
++voter:
++	disable_delayed_work_sync(&info->monitor_work);
++	mca_destroy_votable(info->flip_fcc_voter);
++	return ret;
++}
++
++static void mca_buckchg_jeita_stop(struct mca_buckchg_jeita_dev *info)
++{
++	if (READ_ONCE(info->stopping))
++		return;
++	WRITE_ONCE(info->ready, false);
++	mca_smartchg_if_ops_unregister(MCA_SMARTCHG_IF_CHG_TYPE_JEITA, info);
++	mca_strategy_ops_unregister(STRATEGY_FUNC_TYPE_JEITA, info);
++	mutex_lock(&info->state_lock);
++	info->stopping = true;
++	mutex_unlock(&info->state_lock);
++	disable_delayed_work_sync(&info->monitor_work);
++	mca_vote_named("chg_enable", "jeita-hot", false, 0);
++	mca_vote_named("buck_charge_curr", "swocp", false, 0);
++	mca_vote_named("chg_enable", "jeita", false, 0);
++	mca_vote_named("buck_charge_curr", "jeita", false, 0);
++	mca_vote_named("term_volt", "jeita", false, 0);
++	mca_vote_named("term_curr", "jeita", false, 0);
++	mca_destroy_votable(info->flip_fcc_voter);
++	info->flip_fcc_voter = NULL;
++}
++
++static void mca_buckchg_jeita_remove(struct platform_device *pdev)
++{
++	mca_buckchg_jeita_stop(platform_get_drvdata(pdev));
++}
+ static void mca_buckchg_jeita_shutdown(struct platform_device *pdev)
+ {
++	mca_buckchg_jeita_stop(platform_get_drvdata(pdev));
+ }
+ 
+ static const struct of_device_id match_table[] = {
+ 	{ .compatible = "mca,buckchg_jeita" },
+ 	{},
+ };
++
++MODULE_DEVICE_TABLE(of, match_table);
+ 
+ static struct platform_driver mca_buckchg_jeita_driver = {
+ 	.driver	= {
+--- a/drivers/power/supply/mca/mca_strategy/strategy_charger/mca_strategy_quickchg.c
++++ b/drivers/power/supply/mca/mca_strategy/strategy_charger/mca_strategy_quickchg.c
+@@ -17,6 +17,7 @@
+  *
+  */
+ #include <linux/kernel.h>
++#include <linux/ctype.h>
+ #include <linux/string.h>
+ #include <linux/reboot.h>
+ #include <linux/ktime.h>
+@@ -82,7 +83,7 @@
+ 		(void)mca_strategy_func_get_status(
+ 			STRATEGY_FUNC_TYPE_BUCK_CHARGE,
+ 			STRATEGY_STATUS_TYPE_ONLINE, &buck_online);
+-		if (!info->online || info->force_stop ||
++		if (READ_ONCE(info->stopping) || !info->online || READ_ONCE(info->force_stop) ||
+ 		    info->proc_data.type_chg || !buck_online) {
+ 			mca_log_err(
+ 				"sleep fast return, online: %d, force_stop: %d, type_chg: %d, buck_online: %d\n",
+@@ -519,14 +520,14 @@
+ 		strategy_quickchg_enable_buck_charging(info, 0, 0, false);
+ 	}
+ 	if (info->pmic_single_cp_chg) {
+-		mca_vote_override(info->term_volt_voter, "single_cp_pmic",
++		mca_vote_named_override("term_volt", "single_cp_pmic",
+ 				  false, 0);
+-		mca_rerun_election(info->term_volt_voter);
++		mca_rerun_named_election("term_volt");
+ 		info->ffc_final_vterm = 0;
+ 		info->last_override_vterm = 0;
+ 	}
+-	(void)mca_vote(info->input_suspend_voter, "wire_qc", false, 0);
+-	(void)mca_vote(info->buck_charge_curr_voter, "wire_qc", false, 0);
++	(void)mca_vote_named("input_suspend", "wire_qc", false, 0);
++	(void)mca_vote_named("buck_charge_curr", "wire_qc", false, 0);
+ 	if (info->proc_data.cp_iic_ok) {
+ 		(void)platform_class_cp_enable_adc(CP_ROLE_MASTER, false);
+ 		(void)platform_class_cp_enable_adc(CP_ROLE_SLAVE, false);
+@@ -535,17 +536,17 @@
+ 	memset(&(info->proc_data.secure_info), 0,
+ 	       sizeof(info->proc_data.secure_info));
+ 	if (info->master_batt_close) {
+-		int term_volt = mca_get_client_vote(info->term_volt_voter,
++		int term_volt = mca_get_named_client_vote("term_volt",
+ 						    "jeita");
+ 
+ 		(void)platform_class_buckchg_ops_set_term_volt(
+ 			MAIN_BUCK_CHARGER,
+ 			term_volt + MCA_QUICK_CHG_BASE_CLOSE_VTERM_OFFSET);
+-		(void)mca_vote(info->flip_charge_curr_voter, "base_close_curr",
++		(void)mca_vote_named("flip_charge_curr", "base_close_curr",
+ 			       true, info->base_close_curr);
+ 		info->master_batt_close = false;
+ 	}
+-	(void)mca_rerun_election(info->flip_charge_curr_voter);
++	(void)mca_rerun_named_election("flip_charge_curr");
+ 	if (info->proc_data.charge_flag != MCA_QUICK_CHG_STS_CHARGE_DONE)
+ 		info->proc_data.charge_flag = MCA_QUICK_CHG_STS_NO_CHARGING;
+ }
+@@ -1144,8 +1145,6 @@
+ 	int vbat = info->proc_data.parall_vbat[FG_IC_BASE];
+ 	int base_cur_max;
+ 	int final_curr = cur_max;
+-	static int over_curr_count;
+-	static bool runSwOcp;
+ 
+ 	if (!proc_data->cur_volt_paraller[FG_IC_BASE]->volt_para)
+ 		return 0;
+@@ -1153,20 +1152,21 @@
+ 			       ->volt_para[cur_stage / 2]
+ 			       .current_max;
+ 	if (ibat >= base_cur_max)
+-		over_curr_count++;
+-
+-	if (over_curr_count > OVER_CURRENT_COUNT && final_curr) {
++		info->base_over_curr_count++;
++
++	if (info->base_over_curr_count > OVER_CURRENT_COUNT && final_curr) {
+ 		final_curr -= BASE_FCC_MA_HYS;
+-		over_curr_count = 0;
+-		runSwOcp = true;
+-	} else if (ibat < base_cur_max - 500 && runSwOcp) {
++		info->base_over_curr_count = 0;
++		info->base_runswocp = true;
++	} else if (ibat < base_cur_max - 500 && info->base_runswocp) {
+ 		final_curr = 0;
+-		runSwOcp = false;
++		info->base_runswocp = false;
+ 	}
+ 
+ 	mca_log_err(
+-		"runSwOcp:%d cur_base_stage:%d base_ibat:%d base_vbat:%d base_cur_max:%d over_curr_count:%d cur_max:%d final_cur:%d\n",
+-		runSwOcp, cur_stage, ibat, vbat, base_cur_max, over_curr_count,
++		"base_runswocp:%d cur_base_stage:%d base_ibat:%d base_vbat:%d base_cur_max:%d base_over_curr_count:%d cur_max:%d final_cur:%d\n",
++		info->base_runswocp, cur_stage, ibat, vbat, base_cur_max,
++		info->base_over_curr_count,
+ 		cur_max, final_curr);
+ 	return final_curr;
+ }
+@@ -1503,8 +1503,8 @@
+ 		return ret;
+ 	}
+ 
+-	(void)mca_vote(info->input_suspend_voter, "wire_qc", true, 1);
+-	(void)mca_vote(info->buck_charge_curr_voter, "wire_qc", true, 0);
++	(void)mca_vote_named("input_suspend", "wire_qc", true, 1);
++	(void)mca_vote_named("buck_charge_curr", "wire_qc", true, 0);
+ 
+ 	info->proc_data.cur_adp_volt =
+ 		vbat * info->proc_data.ratio + info->proc_data.delta_volt;
+@@ -1598,20 +1598,18 @@
+ {
+ 	int ret = 0;
+ 	int vbus_cp_mv = 0;
+-	static int vbus_cp_mv_before;
+-	static int vbus_counts;
+ 	int cp_vbus_hl = 0;
+ 
+ 	*stat = XM_VBUS_TUNE_INIT;
+ 	ret = platform_class_cp_get_bus_voltage(CP_ROLE_MASTER, &vbus_cp_mv);
+ 
+-	if (vbus_cp_mv == vbus_cp_mv_before && vbus_counts++ < 5) {
++	if (vbus_cp_mv == info->tune_vbus_cp_mv_before && info->tune_vbus_counts++ < 5) {
+ 		*stat = XM_VBUS_TUNE_WAIT;
+ 		return ret;
+ 	}
+ 
+-	vbus_cp_mv_before = vbus_cp_mv;
+-	vbus_counts = 0;
++	info->tune_vbus_cp_mv_before = vbus_cp_mv;
++	info->tune_vbus_counts = 0;
+ 
+ 	if (vbus_cp_mv < BUS_VOLTAGE_MIN) {
+ 		*stat = XM_VBUS_TUNE_VBUS_LOW;
+@@ -1699,7 +1697,7 @@
+ 	info->proc_data.cur_adp_volt = vbat * 2 + info->proc_data.delta_volt;
+ 	info->proc_data.cur_adp_cur = MCA_QUICK_CHG_OPEN_PATH_CURR;
+ 
+-	(void)mca_vote(info->input_suspend_voter, "wire_qc", true, 1);
++	(void)mca_vote_named("input_suspend", "wire_qc", true, 1);
+ 	mca_log_info("set adp volt %d cur %d\n", info->proc_data.cur_adp_volt,
+ 		     info->proc_data.cur_adp_cur);
+ 	protocol_class_set_adapter_volt_and_curr(info->proc_data.cur_protocol,
+@@ -1802,6 +1800,9 @@
+ mca_quick_charge_jump_stage(int stage,
+ 			    struct mca_quick_charge_volt_para_info *volt_info)
+ {
++	if (!volt_info || volt_info->volt_para_size <= 0)
++		return 0;
++	stage = clamp(stage, 0, volt_info->volt_para_size * 2 - 1);
+ 	if (!volt_info->stage_para)
+ 		return stage;
+ 
+@@ -1809,7 +1810,8 @@
+ 		return stage - 1;
+ 
+ 	if (volt_info->stage_para[stage])
+-		return mca_quick_charge_jump_stage(stage + 1, volt_info);
++		return stage + 1 < volt_info->volt_para_size * 2 ?
++			mca_quick_charge_jump_stage(stage + 1, volt_info) : stage;
+ 
+ 	return stage;
+ }
+@@ -2012,8 +2014,8 @@
+ 	platform_class_cp_enable_busucp(info->proc_data.cur_work_cp, true);
+ 	if (ret) {
+ 		info->proc_data.total_err++;
+-		mca_vote(info->input_suspend_voter, "wire_qc", false, 0);
+-		mca_vote(info->buck_charge_curr_voter, "wire_qc", false, 0);
++		mca_vote_named("input_suspend", "wire_qc", false, 0);
++		mca_vote_named("buck_charge_curr", "wire_qc", false, 0);
+ 		platform_class_cp_set_charging_enable(
+ 			info->proc_data.cur_work_cp, false);
+ 		info->pd_switch_to_pmic = true;
+@@ -2198,7 +2200,6 @@
+ 	int last_volt_stage;
+ 	int vbat_th, vterm, iterm, ratio;
+ 	int first_term = 0;
+-	static int count;
+ 
+ 	if (info->hardware_cv)
+ 		return;
+@@ -2223,24 +2224,24 @@
+ 	/* judge chg termination by vbat */
+ 	if (info->proc_data.vbat[FG_IC_MASTER] >= vterm &&
+ 	    info->proc_data.ibat[FG_IC_MASTER] <= (iterm * ratio) / 100) {
+-		count++;
++		info->done_count++;
+ 	} else if (!first_term ||
+ 		   iterm < info->proc_data.ibat[FG_IC_MASTER]) {
+-		count = 0;
++		info->done_count = 0;
+ 	} else {
+-		count += 2;
++		info->done_count += 2;
+ 		mca_log_err("triggle ibat < iterm after force_full\n");
+ 	}
+ 
+ 	mca_log_info("termination iterm: %d, vterm: %d\n", iterm, vterm);
+ 
+-	if (count > QUICK_CHARGE_TERMATIN_TIMEOUT) {
++	if (info->done_count > QUICK_CHARGE_TERMATIN_TIMEOUT) {
+ 		info->proc_data.charge_flag = MCA_QUICK_CHG_STS_CHARGE_DONE;
+ 		if (info->proc_data.ffc_flag)
+ 			strategy_class_fg_ops_set_charging_done(true);
+ 
+ 		mca_log_err("quick charge done exit");
+-		count = 0;
++		info->done_count = 0;
+ 	}
+ }
+ 
+@@ -2294,7 +2295,6 @@
+ 				->volt_para[volt_para_size - 1]
+ 				.current_min;
+ 	int delta_fv = info->smartchg_data.delta_fv;
+-	static int over_volt_count;
+ 	int secure_cur = 0;
+ 
+ 	info->proc_data.secure_info.max_vbatt =
+@@ -2303,17 +2303,17 @@
+ 			vbat_th;
+ 
+ 	if (vbat >= info->proc_data.secure_info.max_vbatt)
+-		over_volt_count++;
++		info->secure_over_volt_count++;
+ 	else
+-		over_volt_count = 0;
+-
+-	if (over_volt_count > OVER_VOLATGE_COUNT && !info->check_vbat_ov) {
++		info->secure_over_volt_count = 0;
++
++	if (info->secure_over_volt_count > OVER_VOLATGE_COUNT && !info->check_vbat_ov) {
+ 		if (!info->proc_data.secure_info.secure_cur)
+ 			info->proc_data.secure_info.secure_cur = ibatt;
+ 		info->proc_data.secure_info.secure_cur -= DEC_FCC_MA_HYS;
+ 		info->proc_data.secure_info.secure_cur =
+ 			max(info->proc_data.secure_info.secure_cur, ibatt_min);
+-		over_volt_count = 0;
++		info->secure_over_volt_count = 0;
+ 		info->check_vbat_ov = true;
+ 		if (info->proc_data.secure_info.secure_cur <=
+ 		    info->pps_taper_fcc_ma)
+@@ -2334,19 +2334,15 @@
+ static void
+ mca_eu_pps_anti_disconnection_strategy(struct mca_quick_charge_info *info)
+ {
+-	static int timer_start;
+-	static bool start_flag;
+-	static bool trigger;
+-	static int count;
+ 	s64 now;
+ 
+ 	if (!info->is_eu_model)
+ 		return;
+ 
+ 	if (!info->online) {
+-		start_flag = false;
+-		trigger = false;
+-		count = 0;
++		info->eu_pps_start_flag = false;
++		info->eu_pps_trigger = false;
++		info->eu_pps_count = 0;
+ 		info->proc_data.max_adap_ibat = 0;
+ 		mca_log_info("reset param\n");
+ 		return;
+@@ -2356,40 +2352,41 @@
+ 		return;
+ 
+ 	if (info->proc_data.ibus >= info->proc_data.max_adp_curr - 200) {
+-		count = 0;
+-		if (trigger) {
++		info->eu_pps_count = 0;
++		if (info->eu_pps_trigger) {
+ 			mca_log_info("eu_pps has trigged\n");
+ 			return;
+ 		}
+ 		now = ktime_get_boottime_seconds();
+-		if (start_flag) {
+-			if (now - timer_start < 120)
++		if (info->eu_pps_start_flag) {
++			if (now - info->eu_pps_timer_start < 120)
+ 				return;
+ 			info->proc_data.max_adap_ibat =
+ 				info->proc_data.max_ibat_final * 2 / 3;
+-			trigger = true;
++			info->eu_pps_trigger = true;
+ 			mca_log_info(
+-				"trigger:%d max_adap_ibat:[%d] max_ibat_final[%d]\n",
+-				trigger, info->proc_data.max_adap_ibat,
++				"eu_pps_trigger:%d max_adap_ibat:[%d] max_ibat_final[%d]\n",
++				info->eu_pps_trigger, info->proc_data.max_adap_ibat,
+ 				info->proc_data.max_ibat_final);
+ 		} else {
+-			timer_start = now;
+-			mca_log_info("timer_start: %lld\n", now);
+-			start_flag = true;
++			info->eu_pps_timer_start = now;
++			mca_log_info("eu_pps_timer_start: %lld\n", now);
++			info->eu_pps_start_flag = true;
+ 		}
+ 		return;
+ 	}
+ 
+-	if (start_flag && count >= 3) {
+-		start_flag = false;
+-		count = 0;
+-		mca_log_info(" count %d reset timer for eu_pps max ibus\n", count);
++	if (info->eu_pps_start_flag && info->eu_pps_count >= 3) {
++		info->eu_pps_start_flag = false;
++		info->eu_pps_count = 0;
++		mca_log_info("eu_pps_count %d reset timer for eu_pps max ibus\n",
++			     info->eu_pps_count);
+ 		return;
+ 	}
+-	if (!start_flag)
++	if (!info->eu_pps_start_flag)
+ 		return;
+-	count++;
+-	mca_log_info(" count %d \n", count);
++	info->eu_pps_count++;
++	mca_log_info("eu_pps_count %d\n", info->eu_pps_count);
+ }
+ 
+ /* todo:add multi battery process */
+@@ -2472,13 +2469,6 @@
+ /* now only support single 1S battery, 1S2P battery to do */
+ static int mca_qc_get_vbus_change_trend(struct mca_quick_charge_info *info)
+ {
+-	static int ibatt_count;
+-	static int vbatt_count;
+-	static int ibatt_change = 1;
+-	static int vbatt_change = 1;
+-	static int vbat_now_mv_before;
+-	static int ibat_now_ma_before;
+-	static int decrement_count;
+ 	int dir = DIR_HOLD, ibus = 0, vbus = 0, ret = 0;
+ 	int vbat_now_mv = info->proc_data.vbat[FG_IC_MASTER];
+ 	int ibat_now_ma = info->proc_data.ibat_total;
+@@ -2535,43 +2525,43 @@
+ 		return DIR_HOLD;
+ 	}
+ 
+-	if (ibat_now_ma == ibat_now_ma_before && ibatt_count < 5) {
+-		ibatt_count++;
+-		ibatt_change = 0;
++	if (ibat_now_ma == info->trend_ibat_now_ma_before && info->trend_ibatt_count < 5) {
++		info->trend_ibatt_count++;
++		info->trend_ibatt_change = 0;
+ 	} else {
+-		ibatt_change = 1;
+-		ibatt_count = 0;
+-		ibat_now_ma_before = ibat_now_ma;
+-	}
+-
+-	if (vbat_now_mv == vbat_now_mv_before && vbatt_count < 5) {
+-		vbatt_count++;
+-		vbatt_change = 0;
++		info->trend_ibatt_change = 1;
++		info->trend_ibatt_count = 0;
++		info->trend_ibat_now_ma_before = ibat_now_ma;
++	}
++
++	if (vbat_now_mv == info->trend_vbat_now_mv_before && info->trend_vbatt_count < 5) {
++		info->trend_vbatt_count++;
++		info->trend_vbatt_change = 0;
+ 	} else {
+-		vbatt_change = 1;
+-		vbatt_count = 0;
+-		vbat_now_mv_before = vbat_now_mv;
++		info->trend_vbatt_change = 1;
++		info->trend_vbatt_count = 0;
++		info->trend_vbat_now_mv_before = vbat_now_mv;
+ 	}
+ 
+ 	switch (info->proc_data.adp_type) {
+ 	case XM_CHARGER_TYPE_HVDCP3_B:
+ 		if (vbus <= info->qc3_max_vbus_limit_mv &&
+ 		    ibus < target_limit_ibus_ma - 500 &&
+-		    (vbatt_change &&
++		    (info->trend_vbatt_change &&
+ 		     vbat_now_mv < info->qc_normal_charge_fv_max_mv - 50 -
+ 					   delta_fv) &&
+-		    (ibatt_change && ibat_now_ma < target_limit_fcc_ma - 700)) {
++		    (info->trend_ibatt_change && ibat_now_ma < target_limit_fcc_ma - 700)) {
+ 			dir = DIR_UP;
+ 			mca_log_info("QC3 D plus pluse sent\n");
+ 		}
+-		if ((vbatt_change &&
++		if ((info->trend_vbatt_change &&
+ 		     vbat_now_mv > info->qc_normal_charge_fv_max_mv - delta_fv -
+ 					   15) ||
+-		    (ibatt_change && ibat_now_ma > target_limit_fcc_ma) ||
++		    (info->trend_ibatt_change && ibat_now_ma > target_limit_fcc_ma) ||
+ 		    ibus > target_limit_ibus_ma + 300) {
+-			decrement_count++;
+-			if (decrement_count == 2) {
+-				decrement_count = 0;
++			info->trend_decrement_count++;
++			if (info->trend_decrement_count == 2) {
++				info->trend_decrement_count = 0;
+ 				dir = DIR_DOWN;
+ 				mca_log_info("QC3 D mius pluse sent\n");
+ 			}
+@@ -2580,17 +2570,17 @@
+ 	case XM_CHARGER_TYPE_HVDCP3P5:
+ 		if (vbus <= info->qc3p5_max_vbus_limit_mv &&
+ 		    ibus < target_limit_ibus_ma - 100 &&
+-		    (vbatt_change &&
++		    (info->trend_vbatt_change &&
+ 		     vbat_now_mv < info->qc_normal_charge_fv_max_mv - 20 -
+ 					   delta_fv) &&
+-		    (ibatt_change && ibat_now_ma < target_limit_fcc_ma - 50)) {
++		    (info->trend_ibatt_change && ibat_now_ma < target_limit_fcc_ma - 50)) {
+ 			dir = DIR_UP;
+ 			mca_log_info("QC3P5 D plus pluse sent\n");
+ 		}
+-		if ((vbatt_change &&
++		if ((info->trend_vbatt_change &&
+ 		     vbat_now_mv > info->qc_normal_charge_fv_max_mv - 10 -
+ 					   delta_fv) ||
+-		    (ibatt_change && ibat_now_ma > target_limit_fcc_ma + 50) ||
++		    (info->trend_ibatt_change && ibat_now_ma > target_limit_fcc_ma + 50) ||
+ 		    (ibus > target_limit_ibus_ma + 50)) {
+ 			dir = DIR_DOWN;
+ 			mca_log_info("QC3P5 D mius pluse sent\n");
+@@ -2693,7 +2683,7 @@
+ 		info->last_override_vterm, pack_vbat);
+ 
+ 	if (info->override_vterm != info->last_override_vterm) {
+-		mca_vote_override(info->term_volt_voter, "single_cp_pmic", true,
++		mca_vote_named_override("term_volt", "single_cp_pmic", true,
+ 				  info->override_vterm);
+ 		info->last_override_vterm = info->override_vterm;
+ 	}
+@@ -2715,7 +2705,7 @@
+ 	if (!fastcharge && (cur_max < SINGLE_CP_CUR_MAX_TH ||
+ 			    info->proc_data.adp_type !=
+ 				    XM_CHARGER_TYPE_PD_VERIFY)) {
+-		mca_vote_override(info->term_volt_voter, "single_cp_pmic",
++		mca_vote_named_override("term_volt", "single_cp_pmic",
+ 				  false, 0);
+ 		info->ffc_final_vterm = 0;
+ 		info->last_override_vterm = 0;
+@@ -2745,10 +2735,10 @@
+ 	    info->single_cp_buck_disabled) {
+ 		info->single_cp_buck_disabled = true;
+ 		info->last_pmih_fcc = 0;
+-		mca_vote(info->input_suspend_voter, "wire_qc", true, 1);
+-		mca_vote_override(info->buck_input_voter, "icl_limit", false,
++		mca_vote_named("input_suspend", "wire_qc", true, 1);
++		mca_vote_named_override("buck_input", "icl_limit", false,
+ 				  0);
+-		mca_vote_override(info->buck_charge_curr_voter, "fcc_limit",
++		mca_vote_named_override("buck_charge_curr", "fcc_limit",
+ 				  false, 0);
+ 		return;
+ 	}
+@@ -2770,9 +2760,9 @@
+ 		icl += SINGLE_CP_ICL_BOOST;
+ 	info->last_pmih_fcc = fcc;
+ 
+-	mca_vote(info->input_suspend_voter, "wire_qc", false, 0);
+-	mca_vote_override(info->buck_input_voter, "icl_limit", true, icl);
+-	mca_vote_override(info->buck_charge_curr_voter, "fcc_limit", true, fcc);
++	mca_vote_named("input_suspend", "wire_qc", false, 0);
++	mca_vote_named_override("buck_input", "icl_limit", true, icl);
++	mca_vote_named_override("buck_charge_curr", "fcc_limit", true, fcc);
+ 	(void)platform_class_buckchg_ops_set_restart_aicl(MAIN_BUCK_CHARGER,
+ 							  true);
+ 	mca_log_err("enable cp and buck charging, pmih_fcc :%d, pmih_icl :%d\n",
+@@ -2786,37 +2776,35 @@
+ {
+ 	int ret = 0;
+ 	bool cp_enabled = false;
+-	static bool enable_once = true;
+-	static bool disable_once = false;
+ 	ret |= platform_class_cp_get_charging_enabled(
+ 		info->proc_data.cur_work_cp, &cp_enabled);
+ 	mca_quick_charge_update_ibus(info);
+-	if (enable && cp_enabled && enable_once &&
++	if (enable && cp_enabled && info->buck_enable_once &&
+ 	    info->proc_data.ibus > 2500) {
+-		enable_once = false;
+-		disable_once = true;
++		info->buck_enable_once = false;
++		info->buck_disable_once = true;
+ 		platform_class_buckchg_ops_set_buck_fsw(MAIN_BUCK_CHARGER,
+ 							18000);
+-		mca_vote(info->input_suspend_voter, "wire_qc", false, 0);
+-		mca_vote_override(info->buck_input_voter, "icl_limit", true,
++		mca_vote_named("input_suspend", "wire_qc", false, 0);
++		mca_vote_named_override("buck_input", "icl_limit", true,
+ 				  buck_icl_val); // ICL
+-		mca_vote_override(info->buck_charge_curr_voter, "fcc_limit",
++		mca_vote_named_override("buck_charge_curr", "fcc_limit",
+ 				  true, buck_fcc_val); // FCC
+ 		platform_class_buckchg_ops_set_restart_aicl(MAIN_BUCK_CHARGER,
+ 							    true);
+ 		mca_log_err(
+ 			"enable buck parallel charging, pmih_fcc :%d, pmih_icl :%d\n",
+ 			buck_fcc_val, buck_icl_val);
+-	} else if (!enable && disable_once) {
++	} else if (!enable && info->buck_disable_once) {
+ 		if (info->proc_data.ibus > 0 && info->proc_data.ibus < 3850) {
+-			disable_once = false;
+-			enable_once = true;
++			info->buck_disable_once = false;
++			info->buck_enable_once = true;
+ 			platform_class_buckchg_ops_set_buck_fsw(
+ 				MAIN_BUCK_CHARGER, 5000);
+-			mca_vote(info->input_suspend_voter, "wire_qc", true, 1);
+-			mca_vote_override(info->buck_input_voter, "icl_limit",
++			mca_vote_named("input_suspend", "wire_qc", true, 1);
++			mca_vote_named_override("buck_input", "icl_limit",
+ 					  false, buck_icl_val); // ICL
+-			mca_vote_override(info->buck_charge_curr_voter,
++			mca_vote_named_override("buck_charge_curr",
+ 					  "fcc_limit", false,
+ 					  buck_fcc_val); // FCC
+ 			mca_log_err(
+@@ -3302,7 +3290,7 @@
+ 	platform_class_cp_enable_busucp(proc_data->cur_work_cp, true);
+ 	if (ret) {
+ 		proc_data->total_err++;
+-		mca_vote(info->input_suspend_voter, "wire_qc", false, 0);
++		mca_vote_named("input_suspend", "wire_qc", false, 0);
+ 		platform_class_cp_set_charging_enable(proc_data->cur_work_cp,
+ 						      false);
+ 		info->pd_switch_to_pmic = true;
+@@ -3337,7 +3325,10 @@
+ {
+ 	struct mca_quick_charge_info *info = container_of(
+ 		work, struct mca_quick_charge_info, pps_ptf_work.work);
+-	static int check_mum;
++
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping || !info->online)
++		return;
+ 
+ 	if ((info->proc_data.adp_type == XM_CHARGER_TYPE_PD_VERIFY &&
+ 	     info->is_eu_model) ||
+@@ -3345,16 +3336,16 @@
+ 		protocol_class_get_adapter_pps_ptf(info->proc_data.cur_protocol,
+ 						   &info->pps_ptf);
+ 		if (info->pps_ptf) {
+-			check_mum = 0;
++			info->pps_check_count = 0;
+ 		} else {
+ 			info->pps_ptf = info->fake_pps_ptf;
+-			check_mum++;
++			info->pps_check_count++;
+ 			mca_log_info("pps_ptf: %d, check_num: %d\n",
+-				     info->pps_ptf, check_mum);
+-			if (check_mum >= 5) {
++				     info->pps_ptf, info->pps_check_count);
++			if (info->pps_check_count >= 5) {
+ 				mca_log_info(
+ 					"this pps charger not support to get ptf, stop get action\n");
+-				check_mum = 0;
++				info->pps_check_count = 0;
+ 				return;
+ 			}
+ 		}
+@@ -3363,7 +3354,7 @@
+ 			&info->pps_ptf_work,
+ 			msecs_to_jiffies(MCA_QUICK_CHG_PPS_PTF_INTERVAL));
+ 	} else {
+-		check_mum = 0;
++		info->pps_check_count = 0;
+ 	}
+ }
+ 
+@@ -3401,7 +3392,10 @@
+ 		work, struct mca_quick_charge_info, monitor_work.work);
+ 	int ret;
+ 	bool need_goto_taper = false;
+-	static int last_ffc_flag;
++
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping || !info->online)
++		return;
+ 
+ 	if (!strategy_class_fg_is_chip_ok()) {
+ 		mca_log_info("fg i2c error, exit quick charging\n");
+@@ -3433,7 +3427,7 @@
+ 
+ 	mca_quick_charge_select_stage(info);
+ 
+-	if (info->proc_data.ffc_flag != last_ffc_flag)
++	if (info->proc_data.ffc_flag != info->last_ffc_flag)
+ 		strategy_class_fg_set_fastcharge(info->proc_data.ffc_flag);
+ 
+ 	mca_quick_charge_check_charge_done(info);
+@@ -3460,7 +3454,7 @@
+ 		goto out;
+ 	}
+ 
+-	last_ffc_flag = info->proc_data.ffc_flag;
++	info->last_ffc_flag = info->proc_data.ffc_flag;
+ 	schedule_delayed_work(&info->monitor_work,
+ 			      msecs_to_jiffies(MCA_QUICK_CHG_FAST_INTERVAL));
+ 	return;
+@@ -3474,6 +3468,10 @@
+ 		container_of(work, struct mca_quick_charge_info, vfc_work.work);
+ 	int fsw_target;
+ 
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping || !info->online)
++		return;
++
+ 	if (!info->vfc_para.support_cp_vfc)
+ 		return;
+ 
+@@ -3487,7 +3485,7 @@
+ static void
+ mca_quick_charge_force_stop_charging(struct mca_quick_charge_info *info)
+ {
+-	cancel_delayed_work_sync(&info->monitor_work);
++	cancel_delayed_work(&info->monitor_work);
+ 	mca_quick_charge_stop_charging(info);
+ }
+ 
+@@ -3499,12 +3497,28 @@
+ 	memset(&info->proc_data, 0, sizeof(info->proc_data));
+ }
+ 
++static void mca_quick_charge_stop_work(struct work_struct *work)
++{
++	struct mca_quick_charge_info *info =
++		container_of(work, struct mca_quick_charge_info, stop_work);
++
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return;
++	if (READ_ONCE(info->force_stop) || !READ_ONCE(info->sysfs_data.chg_enable))
++		mca_quick_charge_force_stop_charging(info);
++}
++
+ static int mca_quick_charge_process_event(int event, int value, void *data)
+ {
+ 	struct mca_quick_charge_info *info = data;
+ 
+ 	if (!data)
+ 		return -1;
++
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
+ 
+ 	mca_log_info("event: %d, value: %d\n", event, value);
+ 	switch (event) {
+@@ -3705,8 +3719,12 @@
+ 	int *cur_val = (int *)value;
+ 	int last_volt_stage = -1;
+ 
+-	if (!info)
+-		return -1;
++	if (!info || !value)
++		return -1;
++
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
+ 
+ 	switch (status) {
+ 	case STRATEGY_STATUS_TYPE_QC_CHARGE_STS:
+@@ -3744,6 +3762,9 @@
+ 		*cur_val = info->proc_data.ibus;
+ 		break;
+ 	case STRATEGY_STATUS_TYPE_JEITA_FFC_ITERM:
++		if (!info->proc_data.cur_volt_para[FG_IC_MASTER] ||
++		    !info->proc_data.cur_volt_para[FG_IC_MASTER]->volt_para)
++			return -ENODATA;
+ 		last_volt_stage = info->proc_data.cur_volt_para[FG_IC_MASTER]
+ 					  ->volt_para_size -
+ 				  1;
+@@ -3759,6 +3780,9 @@
+ 		*cur_val = info->proc_data.cur_max_ibat;
+ 		break;
+ 	case STRATEGY_STATUS_TYPE_QC_TERM_CURR:
++		if (!info->proc_data.cur_volt_para[FG_IC_MASTER] ||
++		    !info->proc_data.cur_volt_para[FG_IC_MASTER]->volt_para)
++			return -ENODATA;
+ 		last_volt_stage = info->proc_data.cur_volt_para[FG_IC_MASTER]
+ 					  ->volt_para_size -
+ 				  1;
+@@ -3771,6 +3795,9 @@
+ 				   .current_min;
+ 		break;
+ 	case STRATEGY_STATUS_TYPE_QC_TERM_VOLT:
++		if (!info->proc_data.cur_volt_para[FG_IC_MASTER] ||
++		    !info->proc_data.cur_volt_para[FG_IC_MASTER]->volt_para)
++			return -ENODATA;
+ 		last_volt_stage = info->proc_data.cur_volt_para[FG_IC_MASTER]
+ 					  ->volt_para_size -
+ 				  1;
+@@ -3796,6 +3823,76 @@
+ 	return 0;
+ }
+ 
++static void mca_qc_free_batt_para(struct mca_quick_charge_batt_para_info *para)
++{
++	int i;
++
++	for (i = 0; i < para->temp_para_size; i++) {
++		kfree(para->temp_info[i].volt_info.volt_para);
++		kfree(para->temp_info[i].volt_info.stage_para);
++		kfree(para->temp_info[i].volt_ffc_info.volt_para);
++		kfree(para->temp_info[i].volt_ffc_info.stage_para);
++	}
++	kfree(para->temp_info);
++	para->temp_info = NULL;
++	para->temp_para_size = 0;
++}
++
++static void mca_qc_free_tables(struct mca_quick_charge_info *info)
++{
++	int i;
++
++	for (i = 0; i < FG_IC_MAX; i++)
++		mca_qc_free_batt_para(&info->batt_para[i]);
++	for (i = 0; i < FG_SITE_MAX; i++)
++		mca_qc_free_batt_para(&info->base_flip_para[i]);
++}
++
++static int mca_qc_validate_batt_para(struct mca_quick_charge_batt_para_info *para)
++{
++	int i, j, ffc;
++
++	if (!para->temp_info || para->temp_para_size <= 0 ||
++	    para->temp_para_size > TEMP_PARA_MAX_GROUP)
++		return -EINVAL;
++	for (i = 0; i < para->temp_para_size; i++) {
++		struct mca_quick_charge_temp_para_info *entry = &para->temp_info[i];
++		struct mca_quick_charge_temp_para *temp = &entry->temp_para;
++
++		if (temp->temp_low < -65535 || temp->temp_high > 65535 ||
++		    temp->temp_low >= temp->temp_high || temp->low_temp_hysteresis < 0 ||
++		    temp->low_temp_hysteresis > 100 || temp->high_temp_hysteresis < 0 ||
++		    temp->high_temp_hysteresis > 100 || temp->max_current < 0 ||
++		    temp->max_current > 30000 || temp->normal_max_fv <= 0 ||
++		    temp->normal_max_fv > 5000 || temp->ffc_max_fv <= 0 ||
++		    temp->ffc_max_fv > 5000 ||
++		    (i && para->temp_info[i - 1].temp_para.temp_high != temp->temp_low))
++			return -EINVAL;
++		for (ffc = 0; ffc < 2; ffc++) {
++			struct mca_quick_charge_volt_para_info *volt =
++				ffc ? &entry->volt_ffc_info : &entry->volt_info;
++			int max_fv = ffc ? temp->ffc_max_fv : temp->normal_max_fv;
++
++			if (volt->volt_para_size < 0 ||
++			    volt->volt_para_size > VOLT_PARA_MAX_GROUP ||
++			    (volt->volt_para_size && !volt->volt_para) ||
++			    (!ffc && temp->max_current && !volt->volt_para_size))
++				return -EINVAL;
++			for (j = 0; j < volt->volt_para_size; j++) {
++				struct mca_quick_charge_volt_para *step = &volt->volt_para[j];
++
++				if (step->voltage <= 0 || step->voltage > max_fv ||
++				    step->current_min <= 0 ||
++				    step->current_max < step->current_min ||
++				    step->current_max > temp->max_current ||
++				    (j && volt->volt_para[j - 1].voltage >= step->voltage))
++					return -EINVAL;
++			}
++		}
++	}
++	return 0;
++}
++
+ static int mca_quick_charge_parse_volt_para(
+ 	struct device_node *node, const char *name,
+ 	struct mca_quick_charge_volt_para_info *volt_info)
+@@ -3810,9 +3907,9 @@
+ 	}
+ 	array_len = mca_parse_dts_count_strings(node, name, VOLT_PARA_MAX_GROUP,
+ 						MCA_QUICK_CHG_VOLT_PARA_MAX);
+-	if (array_len < 0) {
++	if (array_len <= 0) {
+ 		mca_log_err("parse %s failed\n", name);
+-		return -1;
++		return -EINVAL;
+ 	}
+ 
+ 	volt_info->volt_para_size = array_len / MCA_QUICK_CHG_VOLT_PARA_MAX;
+@@ -3825,7 +3922,7 @@
+ 	volt_para = volt_info->volt_para;
+ 	for (i = 0; i < array_len; i++) {
+ 		if (mca_parse_dts_string_index(node, name, i, &tmp_string))
+-			return -1;
++			goto error;
+ 
+ 		row = i / MCA_QUICK_CHG_VOLT_PARA_MAX;
+ 		col = i % MCA_QUICK_CHG_VOLT_PARA_MAX;
+@@ -3856,28 +3953,28 @@
+ 	return 0;
+ error:
+ 	kfree(volt_para);
+-	volt_para = NULL;
+-	return -1;
+-}
+-
+-static void mca_quick_charge_parse_stage_para(
++	volt_info->volt_para = NULL;
++	volt_info->volt_para_size = 0;
++	return -EINVAL;
++}
++static int mca_quick_charge_parse_stage_para(
+ 	struct device_node *node, const char *name,
+ 	struct mca_quick_charge_volt_para_info *volt_info)
+ {
+-	if (strcmp(name, "null") == 0) {
+-		mca_log_info("no need parse stage para\n");
+-		return;
+-	}
+-
+-	volt_info->stage_para =
+-		kcalloc(volt_info->volt_para_size * 2, sizeof(int), GFP_KERNEL);
+-	if (!volt_info->volt_para) {
+-		mca_log_err("volt para no mem\n");
+-		return;
+-	}
+-
+-	mca_parse_dts_u32_array(node, name, volt_info->stage_para,
+-				volt_info->volt_para_size * 2);
++	int ret;
++
++	if (!strcmp(name, "null"))
++		return 0;
++	if (volt_info->volt_para_size <= 0 || !volt_info->volt_para)
++		return -EINVAL;
++	volt_info->stage_para = kcalloc(volt_info->volt_para_size * 2, sizeof(int), GFP_KERNEL);
++	if (!volt_info->stage_para)
++		return -ENOMEM;
++	ret = mca_parse_dts_u32_array(node, name, volt_info->stage_para,
++				    volt_info->volt_para_size * 2);
++	if (ret)
++		return ret;
++	return 0;
+ }
+ 
+ #define BATT_PARA_CC_NAME_LEN 50
+@@ -3890,22 +3987,25 @@
+ 					    struct mca_quick_charge_info *info,
+ 					    int mode)
+ {
+-	struct mca_quick_charge_batt_para_info *batt_para_info =
+-		&(info->batt_para[batt_role]);
+-	int array_len, row, col, i;
++	struct mca_quick_charge_batt_para_info candidate = { 0 };
++	struct mca_quick_charge_batt_para_info *target;
++	struct mca_quick_charge_batt_para_info *batt_para_info = &candidate;
++	int array_len, row, col, i, ret = -EINVAL;
+ 	const char *tmp_string = NULL;
+ 	struct mca_quick_charge_temp_para_info *temp_info = NULL;
+ 
++	if (mode < 0 || mode > 1 || batt_role < 0 || batt_role >= FG_IC_MAX)
++		return -EINVAL;
+ 	array_len = mca_parse_dts_count_strings(node, name, TEMP_PARA_MAX_GROUP,
+ 						MCA_QUICK_CHG_TEMP_PARA_MAX);
+-	if (array_len < 0) {
++	if (array_len <= 0) {
+ 		mca_log_err("parse %s failed\n", name);
+ 		return -1;
+ 	}
+ 	if (mode == 0)
+-		batt_para_info = &(info->batt_para[batt_role]);
++		target = &(info->batt_para[batt_role]);
+ 	else
+-		batt_para_info = &(info->base_flip_para[batt_role]);
++		target = &(info->base_flip_para[batt_role]);
+ 
+ 	batt_para_info->temp_para_size =
+ 		array_len / MCA_QUICK_CHG_TEMP_PARA_MAX;
+@@ -3918,7 +4018,7 @@
+ 	temp_info = batt_para_info->temp_info;
+ 	for (i = 0; i < array_len; i++) {
+ 		if (mca_parse_dts_string_index(node, name, i, &tmp_string))
+-			return -1;
++			goto error;
+ 
+ 		row = i / MCA_QUICK_CHG_TEMP_PARA_MAX;
+ 		col = i % MCA_QUICK_CHG_TEMP_PARA_MAX;
+@@ -3969,7 +4069,7 @@
+ 		case MCA_QUICK_CHG_VOLT_FFC_PARA_NAME: {
+ 			const char *ffc_name = tmp_string;
+ 			struct device_node *ffc_node = node;
+-			struct device_node *cc_node;
++			struct device_node *cc_node = NULL;
+ 			char cc_name[BATT_PARA_CC_NAME_LEN] = { 0 };
+ 			if (info->support_base_flip &&
+ 			    (temp_info[row].temp_para.temp_low ==
+@@ -3992,20 +4092,23 @@
+ 					ffc_node = cc_node;
+ 				}
+ 			}
+-			if (mca_quick_charge_parse_volt_para(
+-				    ffc_node, ffc_name,
+-				    &temp_info[row].volt_ffc_info))
++			ret = mca_quick_charge_parse_volt_para(
++				ffc_node, ffc_name, &temp_info[row].volt_ffc_info);
++			of_node_put(cc_node);
++			if (ret)
+ 				goto error;
+ 			break;
+ 		}
+ 		case MCA_QUICK_CHG_STAGE_PARA_NAME:
+-			mca_quick_charge_parse_stage_para(
+-				node, tmp_string, &temp_info[row].volt_info);
++			if (mca_quick_charge_parse_stage_para(
++				node, tmp_string, &temp_info[row].volt_info))
++				goto error;
+ 			break;
+ 		case MCA_QUICK_CHG_FFC_STAGE_PARA_NAME:
+-			mca_quick_charge_parse_stage_para(
++			if (mca_quick_charge_parse_stage_para(
+ 				node, tmp_string,
+-				&temp_info[row].volt_ffc_info);
++				&temp_info[row].volt_ffc_info))
++				goto error;
+ 			break;
+ 		default:
+ 			break;
+@@ -4022,11 +4125,19 @@
+ 			     temp_info[i].temp_para.ffc_max_fv,
+ 			     temp_info[i].volt_info.volt_para_size,
+ 			     temp_info[i].volt_ffc_info.volt_para_size);
++	ret = mca_qc_validate_batt_para(&candidate);
++	if (ret)
++		goto error;
++	mca_qc_free_batt_para(target);
++	*target = candidate;
++	info->init_volt_para = true;
++	info->parall_init_volt_para = true;
++	memset(info->proc_data.cur_volt_para, 0, sizeof(info->proc_data.cur_volt_para));
++	memset(info->proc_data.cur_volt_paraller, 0, sizeof(info->proc_data.cur_volt_paraller));
+ 	return 0;
+ error:
+-	kfree(temp_info);
+-	temp_info = NULL;
+-	return -1;
++	mca_qc_free_batt_para(&candidate);
++	return ret ?: -EINVAL;
+ }
+ 
+ static const char *
+@@ -4054,7 +4165,7 @@
+ static int mca_quick_charge_parse_batt_info(struct mca_quick_charge_info *info,
+ 					    int mode)
+ {
+-	struct device_node *node = info->dev->of_node;
++	struct device_node *node __free(device_node) = of_node_get(info->dev->of_node);
+ 	int array_len, row, col, i;
+ 	int batt_role = 0;
+ 	const char *tmp_string = NULL;
+@@ -4063,10 +4174,16 @@
+ 	const struct mca_hwid *hwid = mca_get_hwid_info();
+ 	char *battpara[] = { "batt_para", "base_flip_para" };
+ 
++	if (mode < 0 || mode > 1)
++		return -EINVAL;
++	if (!hwid)
++		return -EPROBE_DEFER;
+ 	if (hwid && info->has_gbl_batt_para &&
+-	    hwid->country_version != CountryCN)
++	    hwid->country_version != CountryCN) {
++		of_node_put(node);
+ 		node = of_find_node_by_name(NULL,
+ 					    "mca_quick_charge_batt_para_gbl");
++	}
+ 
+ 	if (!node) {
+ 		mca_log_err("node in null\n");
+@@ -4107,6 +4224,8 @@
+ 		case MCA_QUICK_CHG_BATT_ROLE:
+ 			if (kstrtoint(tmp_string, 10, &batt_role))
+ 				return -1;
++			if (batt_role < 0)
++				return -EINVAL;
+ 			if (batt_role > FG_IC_SLAVE)
+ 				i += 2;
+ 			break;
+@@ -4147,11 +4266,11 @@
+ 
+ static void update_batt_para(struct mca_quick_charge_info *info)
+ {
+-	static int curr_batt_index[FG_SITE_MAX];
+-	static int last_batt_index[FG_SITE_MAX];
+ 	int cc[FG_SITE_MAX] = { 0 };
+ 	int i, j;
+ 
++	if (!info->support_base_flip)
++		return;
+ 	(void)platform_fg_ops_get_cyclecount(FG_IC_SLAVE, &cc[FG_IC_SLAVE]);
+ 	(void)platform_fg_ops_get_cyclecount(FG_IC_MASTER, &cc[FG_IC_MASTER]);
+ 	mca_log_err("base_flip_cc, update_batt_para, master:%d, slave:%d\n",
+@@ -4160,23 +4279,23 @@
+ 	for (i = 0; i < FG_SITE_MAX; i++) {
+ 		for (j = 0; j < ARRAY_SIZE(batt_para_cc_thr_list); j++) {
+ 			if (cc[i] > batt_para_cc_thr_list[j]) {
+-				curr_batt_index[i] = j;
++				info->batt_curr_batt_index[i] = j;
+ 				info->batt_para_cc_thr[i] =
+ 					batt_para_cc_thr_list[j];
+ 			}
+ 		}
+ 	}
+ 
+-	if (last_batt_index[FG_IC_MASTER] != curr_batt_index[FG_IC_MASTER] ||
+-	    last_batt_index[FG_IC_SLAVE] != curr_batt_index[FG_IC_SLAVE]) {
+-		(void)mca_quick_charge_parse_batt_info(info, info->batt_type);
++	if (info->batt_last_batt_index[FG_IC_MASTER] != info->batt_curr_batt_index[FG_IC_MASTER] ||
++	    info->batt_last_batt_index[FG_IC_SLAVE] != info->batt_curr_batt_index[FG_IC_SLAVE]) {
++		(void)mca_quick_charge_parse_batt_info(info, 1);
+ 		mca_log_err("base_flip_cc, update cc data\n");
+-		last_batt_index[FG_IC_MASTER] = curr_batt_index[FG_IC_MASTER];
+-		last_batt_index[FG_IC_SLAVE] = curr_batt_index[FG_IC_SLAVE];
++		info->batt_last_batt_index[FG_IC_MASTER] = info->batt_curr_batt_index[FG_IC_MASTER];
++		info->batt_last_batt_index[FG_IC_SLAVE] = info->batt_curr_batt_index[FG_IC_SLAVE];
+ 	}
+ 	mca_log_err(
+ 		"base_flip_cc, curr_batt_index_master:%d, curr_batt_index_slave:%d\n",
+-		curr_batt_index[FG_IC_MASTER], curr_batt_index[FG_IC_SLAVE]);
++		info->batt_curr_batt_index[FG_IC_MASTER], info->batt_curr_batt_index[FG_IC_SLAVE]);
+ }
+ 
+ static void
+@@ -4606,7 +4725,7 @@
+ 	ret = mca_quick_charge_parse_batt_info(info, 0);
+ 	if (info->support_base_flip) {
+ 		mca_log_err("parse mode for paraller batt\n");
+-		ret = mca_quick_charge_parse_batt_info(info, info->batt_type);
++		ret = mca_quick_charge_parse_batt_info(info, 1);
+ 	}
+ 	mca_quick_charge_parse_vfc_info(info);
+ 
+@@ -4662,6 +4781,10 @@
+ 	if (!info)
+ 		return -1;
+ 
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
++
+ 	attr_info = mca_sysfs_lookup_attr(attr->attr.name,
+ 					  mca_quick_charge_sysfs_field_tbl,
+ 					  MCA_QUICK_CHG_ATTRS_SIZE);
+@@ -4760,7 +4883,7 @@
+ 	}
+ }
+ 
+-static void mca_quick_charge_set_chg_enable(const char *buf,
++static int mca_quick_charge_set_chg_enable(const char *buf,
+ 					    struct mca_quick_charge_info *info)
+ {
+ 	char type_name[MCA_QUICK_CHG_NAME_LEN] = { 0 };
+@@ -4768,11 +4891,13 @@
+ 	int value;
+ 	int i;
+ 
+-	if (sscanf(buf, "%s %d", type_name, &value) != 2) {
++	if (sscanf(buf, "%15s %d", type_name, &value) != 2) {
+ 		mca_log_err("unable to parse input:%s\n", buf);
+-		return;
+-	}
+-
++		return -EINVAL;
++	}
++
++	if (value != 0 && value != 1)
++		return -EINVAL;
+ 	if (strcmp(type_name, "all") == 0) {
+ 		mca_log_info("set all mode enable %d\n", value);
+ 		for (i = 0; i < CHG_MODE_MAX; i++)
+@@ -4787,7 +4912,7 @@
+ 			info->cur_support_mode = info->support_mode;
+ 		}
+ 
+-		return;
++		return 0;
+ 	}
+ 
+ 	if (strcmp(type_name, "div4") == 0)
+@@ -4797,28 +4922,28 @@
+ 	else if (strcmp(type_name, "div1") == 0)
+ 		mode = CHG_MODE_DIV1;
+ 	else
+-		return;
++		return -EINVAL;
+ 
+ 	mca_quick_charge_set_single_mode_chg_enable(mode, value, info);
+-}
+-
+-static void
+-mca_quick_charge_set_cp_path_enable(const char *buf,
++	return 0;
++}
++static int mca_quick_charge_set_cp_path_enable(const char *buf,
+ 				    struct mca_quick_charge_info *info)
+ {
+-	char path_name[MCA_QUICK_CHG_NAME_LEN] = { 0 };
+-	int mode;
+-	int cp_role;
+-	int value;
+-
++	int pending[CHG_MODE_MAX][CP_ROLE_MAX];
++	char path_name[MCA_QUICK_CHG_NAME_LEN];
++	int mode, cp_role, value, consumed;
++
++	memcpy(pending, info->sysfs_data.cp_path_enable, sizeof(pending));
+ 	while (*buf) {
+-		if (*buf == ' ') {
++		while (isspace(*buf))
+ 			buf++;
+-			continue;
+-		}
+-		if (sscanf(buf, "div%d_%s %d", &mode, path_name, &value) != 3)
+-			return;
+-
++		if (!*buf)
++			break;
++		consumed = 0;
++		if (sscanf(buf, "div%d_%15s %d%n", &mode, path_name, &value, &consumed) != 3 ||
++		    consumed <= 0 || (value != 0 && value != 1))
++			return -EINVAL;
+ 		switch (mode) {
+ 		case MCA_QUICK_CHG_MODE_DIV_4:
+ 			mode = CHG_MODE_DIV4;
+@@ -4830,21 +4955,19 @@
+ 			mode = CHG_MODE_DIV1;
+ 			break;
+ 		default:
+-			return;
+-		}
+-
+-		if (strcmp(path_name, "master") == 0) {
++			return -EINVAL;
++		}
++		if (!strcmp(path_name, "master"))
+ 			cp_role = CP_ROLE_MASTER;
+-			buf += strlen("div1_master 1");
+-		} else if (strcmp(path_name, "slave") == 0) {
++		else if (!strcmp(path_name, "slave"))
+ 			cp_role = CP_ROLE_SLAVE;
+-			buf += strlen("div1_slave 1");
+-		} else {
+-			return;
+-		}
+-
+-		info->sysfs_data.cp_path_enable[mode][cp_role] = value;
+-	}
++		else
++			return -EINVAL;
++		pending[mode][cp_role] = value;
++		buf += consumed;
++	}
++	memcpy(info->sysfs_data.cp_path_enable, pending, sizeof(pending));
++	return 0;
+ }
+ 
+ static ssize_t mca_quick_charge_sysfs_store(struct device *dev,
+@@ -4853,9 +4976,14 @@
+ {
+ 	struct mca_quick_charge_info *info = dev_get_drvdata(dev);
+ 	struct mca_sysfs_attr_info *attr_info;
++	int ret, value;
+ 
+ 	if (!info)
+ 		return -1;
++
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
+ 
+ 	attr_info = mca_sysfs_lookup_attr(attr->attr.name,
+ 					  mca_quick_charge_sysfs_field_tbl,
+@@ -4865,26 +4993,37 @@
+ 
+ 	switch (attr_info->sysfs_attr_name) {
+ 	case MCA_QUICK_CHG_MODE_ENABLE:
+-		mca_quick_charge_set_chg_enable(buf, info);
++		ret = mca_quick_charge_set_chg_enable(buf, info);
++		if (ret)
++			return ret;
+ 		break;
+ 	case MCA_QUICK_CHG_CP_PATH_ENABLE:
+-		mca_quick_charge_set_cp_path_enable(buf, info);
++		ret = mca_quick_charge_set_cp_path_enable(buf, info);
++		if (ret)
++			return ret;
+ 		break;
+ 	case MCA_QUICK_CHG_FAKE_PPS_PTF:
+-		(void)sscanf(buf, "%d", &info->fake_pps_ptf);
++		if (kstrtoint(buf, 0, &value) || value < 0 ||
++		    value > USBPD_QUICK_DPM_PORT_PPS_PTF_NOT_OVERTEMP)
++			return -EINVAL;
++		info->fake_pps_ptf = value;
+ 		info->pps_ptf = info->fake_pps_ptf;
+ 		mca_strategy_func_process(STRATEGY_FUNC_TYPE_BUCK_CHARGE,
+ 					  MCA_EVENT_PPS_PTF, info->pps_ptf);
+-		mca_strategy_func_process(STRATEGY_FUNC_TYPE_QUICK_CHARGE,
+-					  MCA_EVENT_PPS_PTF, info->pps_ptf);
++		mca_vote(info->chg_en_voter, "ptf",
++			 info->pps_ptf == USBPD_QUICK_DPM_PORT_PPS_PTF_NOT_OVERTEMP, 0);
+ 		break;
+ 	case MCA_QUICK_CHG_CURR_LIMIT:
+ 		break;
+ 	case MCA_QUICK_CHG_CURR_RATIO:
+-		(void)sscanf(buf, "%d", &info->sysfs_data.cur_ratio);
++		if (kstrtoint(buf, 0, &value) || value < 0 || value > 100)
++			return -EINVAL;
++		info->sysfs_data.cur_ratio = value;
+ 		break;
+ 	case MCA_QUICK_CHG_VOLT_DEC:
+-		(void)sscanf(buf, "%d", &info->sysfs_data.volt_dec);
++		if (kstrtoint(buf, 0, &value) || value < 0 || value > 1000)
++			return -EINVAL;
++		info->sysfs_data.volt_dec = value;
+ 		break;
+ 	default:
+ 		break;
+@@ -4940,6 +5079,8 @@
+ 		nb, struct mca_quick_charge_info, shutdown_notifier);
+ 	struct mca_event_notify_data n_data = { 0 };
+ 
++	if (!READ_ONCE(info->ready) || READ_ONCE(info->stopping))
++		return NOTIFY_DONE;
+ 	mca_log_err("receive shutdown\n");
+ 
+ 	if (info->online)
+@@ -5057,14 +5198,14 @@
+ {
+ 	struct mca_quick_charge_info *info = data;
+ 
+-	if (!data)
+-		return -1;
+-
+-	info->force_stop = effective_result;
++	if (!data || !READ_ONCE(info->ready) || READ_ONCE(info->stopping))
++		return -1;
++
++	WRITE_ONCE(info->force_stop, effective_result);
+ 	mca_log_info("force_stop: %d\n", info->force_stop);
+ 
+ 	if (info->force_stop)
+-		mca_quick_charge_force_stop_charging(info);
++		schedule_work(&info->stop_work);
+ 
+ 	return 0;
+ }
+@@ -5075,12 +5216,12 @@
+ {
+ 	struct mca_quick_charge_info *info = data;
+ 
+-	if (!data)
+-		return -1;
+-
+-	info->sysfs_data.chg_enable = effective_result;
++	if (!data || !READ_ONCE(info->ready) || READ_ONCE(info->stopping))
++		return -1;
++
++	WRITE_ONCE(info->sysfs_data.chg_enable, effective_result);
+ 	if (!info->sysfs_data.chg_enable)
+-		mca_quick_charge_force_stop_charging(info);
++		schedule_work(&info->stop_work);
+ 
+ 	return 0;
+ }
+@@ -5093,7 +5234,7 @@
+ 	struct mca_quick_charge_info *info = data;
+ 	int i;
+ 
+-	if (!data)
++	if (!data || !READ_ONCE(info->ready) || READ_ONCE(info->stopping))
+ 		return -1;
+ 
+ 	info->sysfs_data.chg_limit[MCA_QUICK_CHG_CH_SINGLE] = effective_result;
+@@ -5133,7 +5274,7 @@
+ 	struct mca_quick_charge_info *info = data;
+ 	int i;
+ 
+-	if (!data)
++	if (!data || !READ_ONCE(info->ready) || READ_ONCE(info->stopping))
+ 		return -1;
+ 
+ 	info->sysfs_data.chg_limit[MCA_QUICK_CHG_CH_MULTI] = effective_result;
+@@ -5147,78 +5288,126 @@
+ 
+ 	return 0;
+ }
++static void mca_quick_charge_destroy_voters(struct mca_quick_charge_info *info)
++{
++	int i;
++
++	if (!IS_ERR_OR_NULL(info->multi_chg_cur_voter))
++		mca_destroy_votable(info->multi_chg_cur_voter);
++	if (!IS_ERR_OR_NULL(info->single_chg_cur_voter))
++		mca_destroy_votable(info->single_chg_cur_voter);
++	if (!IS_ERR_OR_NULL(info->chg_en_voter))
++		mca_destroy_votable(info->chg_en_voter);
++	if (!IS_ERR_OR_NULL(info->chg_disable_voter))
++		mca_destroy_votable(info->chg_disable_voter);
++	if (!IS_ERR_OR_NULL(info->thermal_flip_voter))
++		mca_destroy_votable(info->thermal_flip_voter);
++	for (i = 0; i < ARRAY_SIZE(info->voter); i++) {
++		if (!IS_ERR_OR_NULL(info->voter[i]))
++			mca_destroy_votable(info->voter[i]);
++		info->voter[i] = NULL;
++	}
++	info->multi_chg_cur_voter = NULL;
++	info->single_chg_cur_voter = NULL;
++	info->chg_en_voter = NULL;
++	info->chg_disable_voter = NULL;
++	info->thermal_flip_voter = NULL;
++}
++
+ 
+ static int mca_quick_charge_create_voter(struct mca_quick_charge_info *info)
+ {
+-	struct mca_votable *smartchg_ichg_voter = NULL;
++	int ret;
+ 
+ 	info->voter[0] = mca_create_votable(
+ 		"div1_single", MCA_VOTE_MIN,
+ 		mca_quick_charge_div1_single_voter_cb, 0, info);
+-	if (IS_ERR(info->voter[0]))
++	if (IS_ERR(info->voter[0])) {
++		ret = PTR_ERR(info->voter[0]);
+ 		goto error;
++	}
+ 	info->voter[1] = mca_create_votable(
+ 		"div1_multi", MCA_VOTE_MIN,
+ 		mca_quick_charge_div1_multi_voter_cb, 0, info);
+-	if (IS_ERR(info->voter[1]))
++	if (IS_ERR(info->voter[1])) {
++		ret = PTR_ERR(info->voter[1]);
+ 		goto error;
++	}
+ 	info->voter[2] = mca_create_votable(
+ 		"div2_single", MCA_VOTE_MIN,
+ 		mca_quick_charge_div2_single_voter_cb, 0, info);
+-	if (IS_ERR(info->voter[2]))
++	if (IS_ERR(info->voter[2])) {
++		ret = PTR_ERR(info->voter[2]);
+ 		goto error;
++	}
+ 	info->voter[3] = mca_create_votable(
+ 		"div2_multi", MCA_VOTE_MIN,
+ 		mca_quick_charge_div2_multi_voter_cb, 0, info);
+-	if (IS_ERR(info->voter[3]))
++	if (IS_ERR(info->voter[3])) {
++		ret = PTR_ERR(info->voter[3]);
+ 		goto error;
++	}
+ 	info->voter[4] = mca_create_votable(
+ 		"div4_single", MCA_VOTE_MIN,
+ 		mca_quick_charge_div4_single_voter_cb, 0, info);
+-	if (IS_ERR(info->voter[4]))
++	if (IS_ERR(info->voter[4])) {
++		ret = PTR_ERR(info->voter[4]);
+ 		goto error;
++	}
+ 	info->voter[5] = mca_create_votable(
+ 		"div4_multi", MCA_VOTE_MIN,
+ 		mca_quick_charge_div4_multi_voter_cb, 0, info);
+-	if (IS_ERR(info->voter[5]))
++	if (IS_ERR(info->voter[5])) {
++		ret = PTR_ERR(info->voter[5]);
+ 		goto error;
++	}
+ 	info->thermal_flip_voter = mca_create_votable(
+ 		"thermal_flip", MCA_VOTE_MIN,
+ 		mca_quick_charge_thermal_flip_voter_cb, 0, info);
+-	if (IS_ERR(info->thermal_flip_voter))
++	if (IS_ERR(info->thermal_flip_voter)) {
++		ret = PTR_ERR(info->thermal_flip_voter);
+ 		goto error;
++	}
+ 
+ 	info->chg_disable_voter = mca_create_votable(
+ 		"quick_chg_disable", MCA_VOTE_OR,
+ 		mca_quick_charge_chg_disable_voter_cb, 0, info);
+-	if (IS_ERR(info->chg_disable_voter))
++	if (IS_ERR(info->chg_disable_voter)) {
++		ret = PTR_ERR(info->chg_disable_voter);
+ 		goto error;
++	}
+ 	info->chg_en_voter =
+ 		mca_create_votable("quick_chg_en", MCA_VOTE_AND,
+ 				   mca_quick_charge_chg_en_voter_cb, 1, info);
+-	if (IS_ERR(info->chg_en_voter))
++	if (IS_ERR(info->chg_en_voter)) {
++		ret = PTR_ERR(info->chg_en_voter);
+ 		goto error;
++	}
+ 	info->single_chg_cur_voter = mca_create_votable(
+ 		"single_chg_cur", MCA_VOTE_MIN,
+ 		mca_quick_charge_single_chg_cur_voter_cb, 0, info);
+-	if (IS_ERR(info->single_chg_cur_voter))
++	if (IS_ERR(info->single_chg_cur_voter)) {
++		ret = PTR_ERR(info->single_chg_cur_voter);
+ 		goto error;
++	}
+ 	info->multi_chg_cur_voter = mca_create_votable(
+ 		"multi_chg_cur", MCA_VOTE_MIN,
+ 		mca_quick_charge_multi_chg_cur_voter_cb, 0, info);
+-	if (IS_ERR(info->multi_chg_cur_voter))
++	if (IS_ERR(info->multi_chg_cur_voter)) {
++		ret = PTR_ERR(info->multi_chg_cur_voter);
+ 		goto error;
+-	smartchg_ichg_voter = mca_find_votable("smartchg_delta_ichg");
+-	if (smartchg_ichg_voter)
+-		info->smartchg_data.delta_ichg =
+-			mca_get_effective_result(smartchg_ichg_voter);
++	}
++	ret = mca_get_named_effective_result("smartchg_delta_ichg");
++	if (ret >= 0)
++		info->smartchg_data.delta_ichg = ret;
+ 	mca_log_info("create voter success\n");
+ 
+ 	return 0;
+ 
+ error:
+ 	mca_log_err("init voter failed\n");
+-	return -1;
++	mca_quick_charge_destroy_voters(info);
++	return ret;
+ }
+ 
+ static int strategy_quickchg_if_set_chg_cur(const char *user, char *value,
+@@ -5230,9 +5419,15 @@
+ 	if (!user || !value || !data)
+ 		return -1;
+ 
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
++
+ 	if (sscanf(value, "%d#%d", &single_cur, &multi_cur) != 2)
+ 		return -1;
+ 
++	if (single_cur < 0 || single_cur > 30000 || multi_cur < 0 || multi_cur > 30000)
++		return -EINVAL;
+ 	(void)mca_vote(info->single_chg_cur_voter, user, true, single_cur);
+ 	(void)mca_vote(info->multi_chg_cur_voter, user, true, multi_cur);
+ 
+@@ -5249,6 +5444,10 @@
+ 	if (!buf || !data)
+ 		return -1;
+ 
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
++
+ 	single_client = mca_get_effective_client(info->single_chg_cur_voter);
+ 	if (!single_client)
+ 		return -1;
+@@ -5273,6 +5472,10 @@
+ 
+ 	if (!user || !data)
+ 		return -1;
++
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
+ 
+ 	if (value)
+ 		(void)mca_vote(info->chg_en_voter, user, true, 1);
+@@ -5291,6 +5494,10 @@
+ 	if (!buf || !data)
+ 		return -1;
+ 
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
++
+ 	client_str = mca_get_effective_client(info->chg_en_voter);
+ 	if (!client_str)
+ 		return -1;
+@@ -5306,16 +5513,21 @@
+ 						  void *data)
+ {
+ 	int temp_value = 0;
++	struct mca_quick_charge_info *info = data;
+ 
+ 	if (!user || !value || !data)
+ 		return -1;
+ 
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
++
+ 	if (kstrtoint(value, 0, &temp_value))
+ 		return -1;
+ 
+ 	mca_log_err("set_input_suspend: %d\n", temp_value);
+ 
+-	(void)strategy_quickchg_if_set_chg_en(user, !temp_value, data);
++	return mca_vote(info->chg_en_voter, user, true, !temp_value);
+ 
+ 	return 0;
+ }
+@@ -5328,6 +5540,10 @@
+ 
+ 	if (!buf || !data)
+ 		return -1;
++
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
+ 
+ 	client_str = mca_get_effective_client(info->chg_en_voter);
+ 	if (!client_str)
+@@ -5432,6 +5648,12 @@
+ 	if (!data)
+ 		return -1;
+ 
++	if (effective_result < 0 || effective_result > 1000)
++		return -EINVAL;
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
++
+ 	mca_log_err("effective_result: %d\n", effective_result);
+ 	info->smartchg_data.delta_fv = effective_result;
+ 	return 0;
+@@ -5446,6 +5668,12 @@
+ 	if (!data)
+ 		return -1;
+ 
++	if (effective_result < 0 || effective_result > 30000)
++		return -EINVAL;
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
++
+ 	mca_log_err("effective_result: %d\n", effective_result);
+ 	info->smartchg_data.delta_ichg = effective_result;
+ 	return 0;
+@@ -5458,6 +5686,12 @@
+ 	if (!data)
+ 		return -1;
+ 
++	if (val < 0 || val > 30000)
++		return -EINVAL;
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
++
+ 	info->smartchg_data.fcc = val;
+ 
+ 	return 0;
+@@ -5471,130 +5705,175 @@
+ 
+ 	if (!data)
+ 		return -1;
++
++	if (effective_result < 0 || effective_result > 1)
++		return -EINVAL;
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
+ 
+ 	mca_log_err("effective_result: %d\n", effective_result);
+ 	mca_vote(info->chg_disable_voter, "soc_limit", true, effective_result);
+ 	return 0;
+ }
+ 
+-static int strategy_quickchg_smartchg_baa_update_volt_info(
+-	struct mca_quick_charge_temp_para_info *qc_temp_para,
+-	struct smart_batt_spec *pbatt_spec)
+-{
+-	struct mca_quick_charge_volt_para_info *volt_info = NULL;
+-	struct mca_quick_charge_volt_para *old_volt_para = NULL,
+-					  *new_volt_para = NULL;
+-
+-	if (pbatt_spec->ffc)
+-		volt_info = &qc_temp_para->volt_ffc_info;
+-	else
+-		volt_info = &qc_temp_para->volt_info;
+-
+-	mca_log_info(
+-		"wired para type: %d, ffc: %d, idx: %d, size: %d => %d, temp: %d:%d => %d:%d\n",
+-		pbatt_spec->type, pbatt_spec->ffc, pbatt_spec->t_range.idx,
+-		volt_info->volt_para_size, pbatt_spec->step_size,
+-		qc_temp_para->temp_para.temp_low,
+-		qc_temp_para->temp_para.temp_high, pbatt_spec->t_range.min,
+-		pbatt_spec->t_range.max);
+-
+-	new_volt_para = kcalloc(pbatt_spec->step_size, sizeof(*new_volt_para),
+-				GFP_KERNEL);
+-	if (!new_volt_para) {
+-		mca_log_err("volt para no mem\n");
+-		return -ENOMEM;
+-	}
+-
+-	for (int i = 0; i < volt_info->volt_para_size; i++) {
+-		mca_log_debug(
+-			"volt_para[%d] voltage: %d, current_max: %d, current_min: %d\n",
+-			i, volt_info->volt_para[i].voltage,
+-			volt_info->volt_para[i].current_max,
+-			volt_info->volt_para[i].current_min);
+-	}
+-
+-	for (int i = 0; i < pbatt_spec->step_size; i++) {
+-		new_volt_para[i].voltage = pbatt_spec->steps[i].mv;
+-		new_volt_para[i].current_max = pbatt_spec->steps[i].ma_h;
+-		new_volt_para[i].current_min = pbatt_spec->steps[i].ma_l;
+-		mca_log_info(
+-			"new_volt_para[%d] voltage: %d, current_max: %d, current_min: %d\n",
+-			i, new_volt_para[i].voltage,
+-			new_volt_para[i].current_max,
+-			new_volt_para[i].current_min);
+-	}
+-
+-	old_volt_para = volt_info->volt_para;
+-	volt_info->volt_para = new_volt_para;
+-	volt_info->volt_para_size = pbatt_spec->step_size;
+-	kfree(old_volt_para);
+-
+-	return 0;
+-}
+-
+-#define MCA_QUICK_CHARGE_MAX_VOLT_STEP_SIZE 8
+-static int strategy_quickchg_smartchg_update_baa_para(void *data,
+-						      char *baa_para,
+-						      int ffc_size,
+-						      int normal_size)
++
++
++
++static int strategy_quickchg_smartchg_pwr_boost_sts_callback(void *data,
++							     int enable)
+ {
+ 	struct mca_quick_charge_info *info =
+ 		(struct mca_quick_charge_info *)data;
+-	struct smart_batt_spec *pbatt_spec = NULL;
+-	struct smart_batt_spec_curve
+-		curve[MCA_QUICK_CHARGE_MAX_VOLT_STEP_SIZE] = { 0 };
+-	int offset = 0;
+-
+-	if (!data || !baa_para) {
+-		mca_log_err("data or baa_para is NULL\n");
+-		return -1;
+-	}
+-
+-	for (int i = 0; i < ffc_size + normal_size; i++) {
+-		pbatt_spec = (struct smart_batt_spec *)(baa_para + offset);
+-		offset += offsetof(struct smart_batt_spec, steps);
+-
+-		memset(curve, 0, sizeof(curve));
+-		memcpy(curve, baa_para + offset,
+-		       pbatt_spec->step_size *
+-			       sizeof(struct smart_batt_spec_curve));
+-		pbatt_spec->steps = curve;
+-		offset += pbatt_spec->step_size *
+-			  sizeof(struct smart_batt_spec_curve);
+-
+-		if (pbatt_spec->t_range.idx < 0 ||
+-		    pbatt_spec->t_range.idx >=
+-			    info->batt_para[FG_IC_MASTER].temp_para_size) {
+-			mca_log_err(
+-				"temp_para_size: %d, temp_range.idx: %d is invalid\n",
+-				pbatt_spec->t_range.idx >=
+-					info->batt_para[FG_IC_MASTER]
+-						.temp_para_size,
+-				pbatt_spec->t_range.idx);
+-		} else {
+-			strategy_quickchg_smartchg_baa_update_volt_info(
+-				&(info->batt_para[FG_IC_MASTER]
+-					  .temp_info[pbatt_spec->t_range.idx]),
+-				pbatt_spec);
+-		}
+-	}
++
++	if (!data)
++		return -1;
++
++	if (enable < 0 || enable > 1)
++		return -EINVAL;
++	guard(mutex)(&info->policy_lock);
++	if (!info->ready || info->stopping)
++		return -ENODEV;
++
++	info->smartchg_data.pwr_boost_state = enable;
+ 
+ 	return 0;
+ }
+ 
+-static int strategy_quickchg_smartchg_pwr_boost_sts_callback(void *data,
+-							     int enable)
+-{
+-	struct mca_quick_charge_info *info =
+-		(struct mca_quick_charge_info *)data;
+-
+-	if (!data)
+-		return -1;
+-
+-	info->smartchg_data.pwr_boost_state = enable;
+-
++struct mca_qc_basp_pending {
++	struct mca_quick_charge_volt_para_info *target;
++	struct mca_quick_charge_volt_para *curve;
++	int *stage;
++	u32 count;
++};
++
++static void mca_qc_basp_abort(void *data)
++{
++	struct mca_quick_charge_info *info = data;
++	u32 i;
++
++	for (i = 0; i < info->pending_basp_count; i++) {
++		kfree(info->pending_basp[i].curve);
++		kfree(info->pending_basp[i].stage);
++	}
++	kfree(info->pending_basp);
++	info->pending_basp = NULL;
++	info->pending_basp_count = 0;
++	mutex_unlock(&info->policy_lock);
++}
++
++static int mca_qc_basp_prepare(void *data, const struct mca_basp_update *update)
++{
++	struct mca_quick_charge_info *info = data;
++	u32 total, i, j;
++	int ret = -EINVAL;
++
++	if (!info || !update || !update->spec ||
++	    update->ffc_size > TEMP_PARA_MAX_GROUP ||
++	    update->normal_size > TEMP_PARA_MAX_GROUP)
++		return -EINVAL;
++	if (!mutex_trylock(&info->policy_lock))
++		return -EBUSY;
++	if (!info->ready || info->stopping) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	if (info->pending_basp) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	total = update->ffc_size + update->normal_size;
++	for (i = 0; i < total; i++) {
++		const struct smart_batt_spec *spec = &update->spec[i];
++		struct mca_quick_charge_temp_para_info *temp;
++		int max_fv;
++
++		if (spec->type != 1 || spec->ffc != (i < update->ffc_size) ||
++		    spec->t_range.idx < 0 ||
++		    spec->t_range.idx >= info->batt_para[FG_IC_MASTER].temp_para_size ||
++		    !spec->steps || !spec->step_size || spec->step_size > MCA_BASP_MAX_STEPS)
++			goto unlock;
++		temp = &info->batt_para[FG_IC_MASTER].temp_info[spec->t_range.idx];
++		max_fv = spec->ffc ? temp->temp_para.ffc_max_fv : temp->temp_para.normal_max_fv;
++		if (spec->t_range.min != temp->temp_para.temp_low ||
++		    spec->t_range.max != temp->temp_para.temp_high ||
++		    !temp->temp_para.max_current || max_fv <= 0)
++			goto unlock;
++		for (j = 0; j < spec->step_size; j++)
++			if (spec->steps[j].mv <= 0 || spec->steps[j].mv > max_fv ||
++			    spec->steps[j].ma_l <= 0 ||
++			    spec->steps[j].ma_h < spec->steps[j].ma_l ||
++			    spec->steps[j].ma_h > temp->temp_para.max_current ||
++			    (j && spec->steps[j].mv <= spec->steps[j - 1].mv))
++				goto unlock;
++		for (j = i < update->ffc_size ? 0 : update->ffc_size; j < i; j++)
++			if (update->spec[j].t_range.idx == spec->t_range.idx)
++				goto unlock;
++	}
++	info->pending_basp = kcalloc(total, sizeof(*info->pending_basp), GFP_KERNEL);
++	if (!info->pending_basp) {
++		ret = -ENOMEM;
++		goto unlock;
++	}
++	info->pending_basp_count = total;
++	for (i = 0; i < total; i++) {
++		const struct smart_batt_spec *spec = &update->spec[i];
++		struct mca_qc_basp_pending *pending = &info->pending_basp[i];
++		struct mca_quick_charge_temp_para_info *temp =
++			&info->batt_para[FG_IC_MASTER].temp_info[spec->t_range.idx];
++		struct mca_quick_charge_volt_para_info *target = spec->ffc ?
++			&temp->volt_ffc_info : &temp->volt_info;
++
++		pending->target = target;
++		pending->count = spec->step_size;
++		pending->curve = kcalloc(spec->step_size, sizeof(*pending->curve), GFP_KERNEL);
++		pending->stage = kcalloc(spec->step_size * 2, sizeof(*pending->stage), GFP_KERNEL);
++		if (!pending->curve || !pending->stage) {
++			mca_qc_basp_abort(data);
++			return -ENOMEM;
++		}
++		for (j = 0; j < spec->step_size; j++) {
++			pending->curve[j].voltage = spec->steps[j].mv;
++			pending->curve[j].current_max = spec->steps[j].ma_h;
++			pending->curve[j].current_min = spec->steps[j].ma_l;
++		}
++		if (target->stage_para)
++			memcpy(pending->stage, target->stage_para,
++			       min_t(u32, spec->step_size, target->volt_para_size) *
++			       2 * sizeof(*pending->stage));
++	}
++	/* Keep policy_lock held until the transaction commits or aborts. */
+ 	return 0;
+-}
++unlock:
++	mutex_unlock(&info->policy_lock);
++	return ret;
++}
++
++static void mca_qc_basp_commit(void *data)
++{
++	struct mca_quick_charge_info *info = data;
++	u32 i;
++
++	for (i = 0; i < info->pending_basp_count; i++) {
++		struct mca_qc_basp_pending *pending = &info->pending_basp[i];
++		struct mca_quick_charge_volt_para_info *target = pending->target;
++
++		kfree(target->volt_para);
++		kfree(target->stage_para);
++		target->volt_para = pending->curve;
++		target->stage_para = pending->stage;
++		target->volt_para_size = pending->count;
++		target->basp_owned = true;
++		pending->curve = NULL;
++		pending->stage = NULL;
++	}
++	info->init_volt_para = true;
++	info->proc_data.zone_changed = 1;
++	info->proc_data.cur_stage[FG_IC_MASTER] = 0;
++	info->proc_data.secure_info.secure_cur = 0;
++	mca_qc_basp_abort(data);
++}
++
+ 
+ static struct mca_smartchg_if_ops g_quickchg_smartchg_if_ops = {
+ 	.type = MCA_SMARTCHG_IF_CHG_TYPE_QC,
+@@ -5603,104 +5882,114 @@
+ 	.set_delta_ichg = strategy_quickchg_smartchg_delta_ichg_callback,
+ 	.set_fcc = strategy_quickchg_smartchg_set_fcc_callback,
+ 	.set_soc_limit_sts = strategy_quickchg_smartchg_soc_limit_callback,
+-	.update_baa_para = strategy_quickchg_smartchg_update_baa_para,
++	.prepare_baa_para = mca_qc_basp_prepare,
++	.commit_baa_para = mca_qc_basp_commit,
++	.abort_baa_para = mca_qc_basp_abort,
+ 	.set_pwr_boost_sts = strategy_quickchg_smartchg_pwr_boost_sts_callback,
+ };
+-
+ static int mca_quick_charge_probe(struct platform_device *pdev)
+ {
+-	int ret = 0;
+ 	struct mca_quick_charge_info *info;
+-
+-	mca_log_info("probe begin\n");
+-
+-	if (strategy_class_fg_ops_is_init_ok() <= 0) {
+-		mca_log_info("fg is not ready, wait for it\n");
++	struct mca_charge_if_ops charge_ops = g_strategy_quickchg_if_ops;
++	struct mca_smartchg_if_ops smart_ops = g_quickchg_smartchg_if_ops;
++	int ret;
++
++	if (strategy_class_fg_ops_is_init_ok() <= 0)
+ 		return -EPROBE_DEFER;
+-	}
+-
++	if (!mca_named_votable_exists("input_suspend") ||
++	    !mca_named_votable_exists("buck_input") ||
++	    !mca_named_votable_exists("buck_charge_curr") ||
++	    !mca_named_votable_exists("term_volt") ||
++	    !mca_named_votable_exists("flip_charge_curr"))
++		return -EPROBE_DEFER;
+ 	info = devm_kzalloc(&pdev->dev, sizeof(*info), GFP_KERNEL);
+ 	if (!info)
+ 		return -ENOMEM;
+-
+-	platform_class_cp_get_chip_vendor(CP_ROLE_MASTER, &info->cp_chip_vendor);
+-	if (!info->cp_chip_vendor) {
+-		if (platform_class_cp_get_probe_ok(CP_ROLE_MASTER) |
+-		    platform_class_cp_get_probe_ok(CP_ROLE_SLAVE)) {
+-			mca_log_err("cp is not ready, wait for it\n");
+-			return -EPROBE_DEFER;
+-		}
+-	}
+-
+-	info->input_suspend_voter = mca_find_votable("input_suspend");
+-	if (!info->input_suspend_voter) {
+-		mca_log_info("get voter fail, wait for it\n");
+-		return -EPROBE_DEFER;
+-	}
+-	info->buck_input_voter = mca_find_votable("buck_input");
+-	if (!info->buck_input_voter) {
+-		mca_log_info("get buck_input voter fail, wait for it\n");
+-		return -EPROBE_DEFER;
+-	}
+-	info->buck_charge_curr_voter = mca_find_votable("buck_charge_curr");
+-	if (!info->buck_charge_curr_voter) {
+-		mca_log_info("get buck_charge_curr voter fail, wait for it\n");
+-		return -EPROBE_DEFER;
+-	}
+-	info->term_volt_voter = mca_find_votable("term_volt");
+-	if (!info->term_volt_voter) {
+-		mca_log_info("get term_volt voter fail, wait for it\n");
+-		return -EPROBE_DEFER;
+-	}
+-	info->flip_charge_curr_voter = mca_find_votable("flip_charge_curr");
+-	if (!info->flip_charge_curr_voter) {
+-		mca_log_info("get flip_charge_curr voter fail, wait for it\n");
+-		return -EPROBE_DEFER;
+-	}
+-
+ 	info->dev = &pdev->dev;
+-	platform_set_drvdata(pdev, info);
+-	ret = mca_quick_charge_parse_dt(info);
+-	if (ret) {
+-		mca_log_err("parst dts failed, ret: %d\n", ret);
+-		if (ret != -1)
+-			ret = -EPROBE_DEFER;
+-		return ret;
+-	}
+-	ret = mca_quick_charge_create_voter(info);
+-	if (ret)
+-		return -EPROBE_DEFER;
+-	mca_quick_charge_init_data(info);
+-	mca_quick_charge_create_group(info->dev);
++	info->trend_ibatt_change = 1;
++	info->trend_vbatt_change = 1;
++	info->buck_enable_once = true;
++	mutex_init(&info->policy_lock);
+ 	mutex_init(&info->data_lock);
+-
++	INIT_WORK(&info->stop_work, mca_quick_charge_stop_work);
+ 	INIT_DELAYED_WORK(&info->monitor_work, mca_quick_charge_monitor_work);
+ 	INIT_DELAYED_WORK(&info->pps_ptf_work, mca_quick_charge_pps_ptf_work);
+ 	INIT_DELAYED_WORK(&info->vfc_work, mca_quick_charge_vfc_work);
+-
+-	(void)mca_strategy_ops_register(STRATEGY_FUNC_TYPE_QUICK_CHARGE,
+-					mca_quick_charge_process_event,
+-					mca_quick_charge_get_status, NULL,
+-					info);
+-	g_strategy_quickchg_if_ops.data = info;
+-	mca_charge_if_ops_register(&g_strategy_quickchg_if_ops);
+-	g_quickchg_smartchg_if_ops.data = info;
+-	mca_smartchg_if_ops_register(&g_quickchg_smartchg_if_ops);
++	platform_set_drvdata(pdev, info);
++	ret = platform_class_cp_get_chip_vendor(CP_ROLE_MASTER, &info->cp_chip_vendor);
++	if (ret || (!info->cp_chip_vendor &&
++	    (platform_class_cp_get_probe_ok(CP_ROLE_MASTER) ||
++	     platform_class_cp_get_probe_ok(CP_ROLE_SLAVE))))
++		return -EPROBE_DEFER;
++	ret = mca_quick_charge_parse_dt(info);
++	if (ret) {
++		mca_qc_free_tables(info);
++		return ret;
++	}
++	ret = mca_quick_charge_create_voter(info);
++	if (ret) {
++		mca_qc_free_tables(info);
++		return ret;
++	}
++	mca_quick_charge_init_data(info);
++	ret = mca_strategy_ops_register(STRATEGY_FUNC_TYPE_QUICK_CHARGE,
++		mca_quick_charge_process_event, mca_quick_charge_get_status, NULL, info);
++	if (ret)
++		goto voters;
++	charge_ops.data = info;
++	ret = mca_charge_if_ops_register(&charge_ops);
++	if (ret)
++		goto strategy;
++	smart_ops.data = info;
++	ret = mca_smartchg_if_ops_register(&smart_ops);
++	if (ret)
++		goto charge;
+ 	info->shutdown_notifier.notifier_call = mca_quick_charge_shutdown;
+ 	info->shutdown_notifier.priority = 255;
+ 	ret = register_reboot_notifier(&info->shutdown_notifier);
+-	if (ret < 0)
+-		mca_log_err("register reboot notify failed\n");
+-	mca_log_err("probe end\n");
+-
++	if (ret)
++		goto smart;
++	ret = mca_quick_charge_create_group(info->dev);
++	if (ret)
++		goto reboot;
++	WRITE_ONCE(info->ready, true);
+ 	return 0;
+-}
+-
+-static int mca_quick_charge_remove(struct platform_device *pdev)
+-{
+-	mca_quick_charge_remove_group(&pdev->dev);
+-	return 0;
+-}
++reboot:
++	unregister_reboot_notifier(&info->shutdown_notifier);
++smart:
++	mca_smartchg_if_ops_unregister(MCA_SMARTCHG_IF_CHG_TYPE_QC, info);
++charge:
++	mca_charge_if_ops_unregister("quick", info);
++strategy:
++	mca_strategy_ops_unregister(STRATEGY_FUNC_TYPE_QUICK_CHARGE, info);
++voters:
++	mca_quick_charge_destroy_voters(info);
++	mca_qc_free_tables(info);
++	return ret;
++}
++static void mca_quick_charge_remove(struct platform_device *pdev)
++{
++	struct mca_quick_charge_info *info = platform_get_drvdata(pdev);
++
++	WRITE_ONCE(info->ready, false);
++	WRITE_ONCE(info->stopping, true);
++	mca_quick_charge_remove_group(info->dev);
++	unregister_reboot_notifier(&info->shutdown_notifier);
++	/* No consumer lock may be held while a provider SRCU reader drains. */
++	mca_smartchg_if_ops_unregister(MCA_SMARTCHG_IF_CHG_TYPE_QC, info);
++	mca_charge_if_ops_unregister("quick", info);
++	mca_strategy_ops_unregister(STRATEGY_FUNC_TYPE_QUICK_CHARGE, info);
++	disable_delayed_work_sync(&info->monitor_work);
++	disable_delayed_work_sync(&info->pps_ptf_work);
++	disable_delayed_work_sync(&info->vfc_work);
++	cancel_work_sync(&info->stop_work);
++	mutex_lock(&info->policy_lock);
++	mca_quick_charge_stop_charging(info);
++	mca_qc_free_tables(info);
++	mutex_unlock(&info->policy_lock);
++	mca_quick_charge_destroy_voters(info);
++}
++
+ 
+ static const struct of_device_id mca_quick_charge_info_of_match[] = {
+ 	{
+--- a/drivers/power/supply/mca/mca_strategy/strategy_charger/inc/mca_buckchg_jeita.h
++++ b/drivers/power/supply/mca/mca_strategy/strategy_charger/inc/mca_buckchg_jeita.h
+@@ -58,6 +58,7 @@
+ };
+ 
+ struct mca_buckchg_jeita_data {
++	int design_vterm;
+ 	int temp_low;
+ 	int temp_high;
+ 	int low_temp_hys;
+@@ -87,6 +88,19 @@
+ };
+ 
+ struct mca_buckchg_jeita_dev {
++	/* Protects policy tables, event state and prepared BASP transaction. */
++	struct mutex state_lock;
++	bool ready;
++	bool stopping;
++	bool wired_online;
++	bool wireless_online;
++	struct smart_batt_jeita_term_para *pending_basp;
++	u32 pending_ffc_size;
++	u32 pending_normal_size;
++	int last_fastcharge_mode[3];
++	int last_chg_curr[3];
++	bool runswocp[3];
++	int base_over_curr_count[3];
+ 	struct device *dev;
+ 	int online;
+ 	int voter_ok;
+--- a/drivers/power/supply/mca/mca_strategy/strategy_charger/inc/mca_quick_charger.h
++++ b/drivers/power/supply/mca/mca_strategy/strategy_charger/inc/mca_quick_charger.h
+@@ -261,6 +261,7 @@
+ };
+ 
+ struct mca_quick_charge_volt_para_info {
++	bool basp_owned;
+ 	int volt_para_size;
+ 	int *stage_para;
+ 	struct mca_quick_charge_volt_para *volt_para;
+@@ -448,7 +449,38 @@
+ 	int fcc;
+ };
+ 
++struct mca_qc_basp_pending;
++
+ struct mca_quick_charge_info {
++	int base_over_curr_count;
++	bool base_runswocp;
++	int tune_vbus_cp_mv_before;
++	int tune_vbus_counts;
++	int done_count;
++	int secure_over_volt_count;
++	s64 eu_pps_timer_start;
++	bool eu_pps_start_flag;
++	bool eu_pps_trigger;
++	int eu_pps_count;
++	int trend_ibatt_count;
++	int trend_vbatt_count;
++	int trend_ibatt_change;
++	int trend_vbatt_change;
++	int trend_vbat_now_mv_before;
++	int trend_ibat_now_ma_before;
++	int trend_decrement_count;
++	bool buck_enable_once;
++	bool buck_disable_once;
++	int batt_curr_batt_index[FG_SITE_MAX];
++	int batt_last_batt_index[FG_SITE_MAX];
++	struct mutex policy_lock;
++	struct work_struct stop_work;
++	bool ready;
++	bool stopping;
++	int last_ffc_flag;
++	int pps_check_count;
++	struct mca_qc_basp_pending *pending_basp;
++	u32 pending_basp_count;
+ 	struct device *dev;
+ 	struct mca_votable *input_suspend_voter;
+ 	struct mca_votable *buck_input_voter;

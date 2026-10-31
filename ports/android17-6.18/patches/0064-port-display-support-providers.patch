@@ -1,0 +1,997 @@
+--- a/qcom/opensource/mm-drivers/msm_ext_display/src/msm_ext_display.c
++++ b/qcom/opensource/mm-drivers/msm_ext_display/src/msm_ext_display.c
+@@ -33,6 +33,7 @@
+ 	struct list_head display_list;
+ 	struct mutex lock;
+ 	bool update_audio;
++	unsigned long extcon_registered;
+ };
+ 
+ static const unsigned int msm_ext_disp_supported_cable[] = {
+@@ -45,7 +46,7 @@
+ {
+ 	int ret = 0;
+ 
+-	if (!ext_disp || !ext_disp->pdev || id >= MSM_EXT_DISP_MAX_CODECS) {
++	if (!ext_disp || !ext_disp->pdev || id < 0 || id >= MSM_EXT_DISP_MAX_CODECS) {
+ 		pr_err("invalid params\n");
+ 		return -EINVAL;
+ 	}
+@@ -63,6 +64,7 @@
+ 		return ret;
+ 	}
+ 
++	set_bit(id, &ext_disp->extcon_registered);
+ 	pr_debug("extcon registration done\n");
+ 
+ 	return ret;
+@@ -71,13 +73,23 @@
+ static void msm_ext_disp_extcon_unregister(struct msm_ext_disp *ext_disp,
+ 		int id)
+ {
+-	if (!ext_disp || !ext_disp->pdev || id >= MSM_EXT_DISP_MAX_CODECS) {
++	if (!ext_disp || !ext_disp->pdev || id < 0 || id >= MSM_EXT_DISP_MAX_CODECS) {
+ 		pr_err("Invalid params\n");
+ 		return;
+ 	}
+ 
++	if (!test_and_clear_bit(id, &ext_disp->extcon_registered))
++		return;
+ 	devm_extcon_dev_unregister(&ext_disp->pdev->dev,
+ 			ext_disp->audio_sdev[id]);
++}
++
++static bool msm_ext_disp_codec_valid(const struct msm_ext_disp_codec_id *codec)
++{
++	return codec &&
++		(codec->type == EXT_DISPLAY_TYPE_HDMI || codec->type == EXT_DISPLAY_TYPE_DP) &&
++		codec->ctrl_id >= 0 && codec->ctrl_id < 2 &&
++		codec->stream_id >= 0 && codec->stream_id < MSM_EXT_DISP_MAX_CODECS;
+ }
+ 
+ static const char *msm_ext_disp_name(enum msm_ext_disp_type type)
+@@ -220,10 +232,7 @@
+ 		goto err;
+ 	}
+ 
+-	if (!codec ||
+-		codec->type >= EXT_DISPLAY_TYPE_MAX ||
+-		((codec->ctrl_id != 0) && (codec->ctrl_id != 1)) ||
+-		codec->stream_id >= MSM_EXT_DISP_MAX_CODECS) {
++	if (!msm_ext_disp_codec_valid(codec)) {
+ 		pr_err("invalid display codec id\n");
+ 		goto err;
+ 	}
+@@ -402,7 +411,7 @@
+ 
+ end:
+ 	mutex_unlock(&ext_disp->lock);
+-	if (ext_disp->current_codec.type != EXT_DISPLAY_TYPE_MAX)
++	if (!ret && ext_disp->current_codec.type != EXT_DISPLAY_TYPE_MAX)
+ 		msm_ext_disp_ready_for_display(ext_disp);
+ 
+ 	return ret;
+@@ -416,7 +425,7 @@
+ 	struct msm_ext_disp *ext_disp = NULL;
+ 	struct msm_ext_disp_data *ext_disp_data = NULL;
+ 
+-	if (!pdev || !codec) {
++	if (!pdev || !msm_ext_disp_codec_valid(codec)) {
+ 		pr_err("Invalid params\n");
+ 		return -EINVAL;
+ 	}
+@@ -463,10 +472,7 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (init_data->codec.type >= EXT_DISPLAY_TYPE_MAX ||
+-		((init_data->codec.ctrl_id != 0) &&
+-		(init_data->codec.ctrl_id != 1)) ||
+-		init_data->codec.stream_id >= MSM_EXT_DISP_MAX_CODECS) {
++	if (!msm_ext_disp_codec_valid(&init_data->codec)) {
+ 		pr_err("Invalid codec info type(%d), ctrl(%d) stream(%d)\n",
+ 				init_data->codec.type,
+ 				init_data->codec.ctrl_id,
+@@ -517,6 +523,7 @@
+ 
+ 	ret = msm_ext_disp_get_intf_data(ext_disp, &init_data->codec, &data);
+ 	if (!ret) {
++		ret = -EEXIST;
+ 		pr_err("%s already registered. ctrl(%d) stream(%d)\n",
+ 			msm_ext_disp_name(init_data->codec.type),
+ 			init_data->codec.ctrl_id,
+@@ -605,8 +612,11 @@
+ 		goto end;
+ 	}
+ 
++	ext_disp->pdev = pdev;
++	mutex_init(&ext_disp->lock);
++	INIT_LIST_HEAD(&ext_disp->display_list);
++	ext_disp->current_codec.type = EXT_DISPLAY_TYPE_MAX;
+ 	platform_set_drvdata(pdev, &ext_disp->ext_disp_data);
+-	ext_disp->pdev = pdev;
+ 
+ 	for (id = 0; id < MSM_EXT_DISP_MAX_CODECS; id++) {
+ 		ret = msm_ext_disp_extcon_register(ext_disp, id);
+@@ -622,54 +632,28 @@
+ 		pr_debug("%s: Added child devices.\n", __func__);
+ 	}
+ 
+-	mutex_init(&ext_disp->lock);
+-
+-	INIT_LIST_HEAD(&ext_disp->display_list);
+-	ext_disp->current_codec.type = EXT_DISPLAY_TYPE_MAX;
+-	ext_disp->update_audio = false;
+-
+-	return ret;
++	/* Exported codec callback storage has no live revocation API. */
++	__module_get(THIS_MODULE);
++	return 0;
+ 
+ child_node_failure:
++	of_platform_depopulate(&pdev->dev);
+ 	for (id = 0; id < MSM_EXT_DISP_MAX_CODECS; id++)
+ 		msm_ext_disp_extcon_unregister(ext_disp, id);
+ 
+-	devm_kfree(&ext_disp->pdev->dev, ext_disp);
+-end:
+-	return ret;
+-}
+-
+-static int msm_ext_disp_remove(struct platform_device *pdev)
+-{
+-	int ret = 0, id;
+-	struct msm_ext_disp *ext_disp = NULL;
+-	struct msm_ext_disp_data *ext_disp_data = NULL;
+-
+-	if (!pdev) {
+-		pr_err("No platform device\n");
+-		ret = -ENODEV;
+-		goto end;
+-	}
+-
+-	ext_disp_data = platform_get_drvdata(pdev);
+-	if (!ext_disp_data) {
+-		pr_err("No drvdata found\n");
+-		ret = -ENODEV;
+-		goto end;
+-	}
+-
+-	ext_disp = container_of(ext_disp_data, struct msm_ext_disp,
+-				ext_disp_data);
+-
+-	for (id = 0; id < MSM_EXT_DISP_MAX_CODECS; id++)
+-		msm_ext_disp_extcon_unregister(ext_disp, id);
+-
++	platform_set_drvdata(pdev, NULL);
+ 	mutex_destroy(&ext_disp->lock);
+ 	devm_kfree(&ext_disp->pdev->dev, ext_disp);
+-
+-end:
+-	return ret;
+-}
++end:
++	return ret;
++}
++
++static void msm_ext_disp_remove(struct platform_device *pdev)
++{
++	/* Successful firmware-provider binding is deliberately permanent. */
++	WARN_ON_ONCE(platform_get_drvdata(pdev));
++}
++
+ 
+ static const struct of_device_id msm_ext_dt_match[] = {
+ 	{.compatible = "qcom,msm-ext-disp",},
+@@ -682,6 +666,7 @@
+ 	.remove = msm_ext_disp_remove,
+ 	.driver = {
+ 		.name = "msm-ext-disp",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = msm_ext_dt_match,
+ 	},
+ };
+--- a/qcom/opensource/mmrm-driver/driver/src/mmrm_clk_rsrc_mgr_sw.c
++++ b/qcom/opensource/mmrm-driver/driver/src/mmrm_clk_rsrc_mgr_sw.c
+@@ -34,6 +34,9 @@
+ 
+ 	clk_val_min = clk_round_rate(tbl_entry->clk, 1);
+ 	clk_val_max = clk_round_rate(tbl_entry->clk, ~0UL);
++	if (clk_val_min <= 0 || clk_val_max <= 0 || clk_val_max < clk_val_min)
++		return clk_val_min < 0 ? clk_val_min :
++			(clk_val_max < 0 ? clk_val_max : -EINVAL);
+ 	d_mpr_h("%s: csid(0x%x): min_clk_rate(%lu) max_clk_rate(%lu)\n",
+ 		__func__,
+ 		tbl_entry->clk_src_id,
+@@ -49,13 +52,15 @@
+ 	for (clk_val = clk_val_min; clk_val < clk_val_max; clk_val += CLK_RATE_STEP) {
+ 		/* get next clk rate */
+ 		clk_val_round = clk_round_rate(tbl_entry->clk, clk_val);
++		if (clk_val_round < 0)
++			return clk_val_round;
+ 		if (clk_val_round > clk_val_min) {
+ 			clk_val_min = clk_val_round;
+ 
+ 			/* Get voltage corner */
+ 			voltage_corner = qcom_clk_get_voltage(tbl_entry->clk, clk_val_round);
+ 			if (voltage_corner < 0 || voltage_corner > mmrm_sw_vdd_corner[MMRM_VDD_LEVEL_TURBO]) {
+-				break;
++				return voltage_corner < 0 ? voltage_corner : -EINVAL;
+ 			}
+ 
+ 			/* voltage corner is below svsl1 */
+@@ -264,6 +269,11 @@
+ 	u32 c = 0;
+ 	u32 clk_client_src_id = 0;
+ 
++	if (IS_ERR_OR_NULL(clk_desc.clk) ||
++	    (priority != MMRM_CLIENT_PRIOR_HIGH && priority != MMRM_CLIENT_PRIOR_LOW) ||
++		clk_desc.client_domain > U16_MAX || clk_desc.client_id > U16_MAX ||
++		!memchr(clk_desc.name, 0, sizeof(clk_desc.name)))
++		return NULL;
+ 	mutex_lock(&sw_clk_mgr->lock);
+ 
+ 	/* check if entry is free in table */
+@@ -483,7 +493,11 @@
+ 	 * Clients may set rates that are higher than max supported rate for a clock.
+ 	 * Round the rate to get the max supported corner.
+ 	 */
+-	clk_round_val = clk_round_rate(tbl_entry->clk, clk_val);
++	long rounded = clk_round_rate(tbl_entry->clk, clk_val);
++
++	if (rounded < 0)
++		return rounded;
++	clk_round_val = rounded;
+ 
+ 	/* get voltage corner */
+ 	voltage_corner = qcom_clk_get_voltage(tbl_entry->clk, clk_round_val);
+@@ -493,7 +507,7 @@
+ 			tbl_entry->clk_src_id,
+ 			voltage_corner,
+ 			clk_round_val);
+-		rc = voltage_corner;
++		rc = voltage_corner < 0 ? voltage_corner : -EINVAL;
+ 		goto err_invalid_corner;
+ 	}
+ 
+@@ -634,10 +648,13 @@
+ 	init_completion(&timeout);
+ 
+ 	for (i = 0; i < sinfo->throttle_clients_data_length ; i++) {
++		if (sinfo->throttle_clients_info[i].tbl_entry_id >= sinfo->tot_clk_clients)
++			continue;
+ 		tbl_entry_throttle_client =
+ 			&sinfo->clk_client_tbl[sinfo->throttle_clients_info[i].tbl_entry_id];
+ 
+-		if (IS_ERR_OR_NULL(tbl_entry_throttle_client))
++		if (!tbl_entry_throttle_client->client ||
++		    IS_ERR_OR_NULL(tbl_entry_throttle_client->clk))
+ 			continue;
+ 
+ 		now_cur_ma = tbl_entry_throttle_client->current_ma
+@@ -1257,7 +1274,6 @@
+ 	struct mmrm_clk_platform_resources *cres = &drv_data->clk_res;
+ 	struct mmrm_sw_clk_mgr_info *sinfo = NULL;
+ 	struct mmrm_clk_mgr *sw_clk_mgr = NULL;
+-	u32 tbl_size = 0;
+ 
+ 	/* mmrm_sw_clk_mgr */
+ 	sw_clk_mgr = kzalloc(sizeof(*sw_clk_mgr), GFP_KERNEL);
+@@ -1269,12 +1285,11 @@
+ 	}
+ 
+ 	/* initialize the tables */
+-	tbl_size = sizeof(struct mmrm_sw_clk_client_tbl_entry) *
+-		cres->nom_clk_set.count;
+ 
+ 	sinfo = &(sw_clk_mgr->data.sw_info);
+ 	sinfo->driver_data = drv_data;
+-	sinfo->clk_client_tbl = kzalloc(tbl_size, GFP_KERNEL);
++	sinfo->clk_client_tbl = kcalloc(cres->nom_clk_set.count,
++			       sizeof(*sinfo->clk_client_tbl), GFP_KERNEL);
+ 	if (!sinfo->clk_client_tbl) {
+ 		d_mpr_e(
+ 			"%s: failed to allocate memory for clk_client_tbl (%d)\n",
+@@ -1290,7 +1305,6 @@
+ 	rc = mmrm_sw_prepare_table(cres, sinfo);
+ 	if (rc) {
+ 		d_mpr_e("%s: failed to prepare clk table\n", __func__);
+-		rc = -ENOMEM;
+ 		goto err_fail_prep_tbl;
+ 	}
+ 
+@@ -1300,6 +1314,7 @@
+ 	sinfo->peak_cur_data.aggreg_level = 0;
+ 	sinfo->throttle_clients_data_length = cres->throttle_clients_data_length;
+ 	for (i = 0; i < sinfo->throttle_clients_data_length; i++) {
++		sinfo->throttle_clients_info[i].tbl_entry_id = sinfo->tot_clk_clients;
+ 		for (j = 0; j < sinfo->tot_clk_clients; j++) {
+ 			if (sinfo->clk_client_tbl[j].clk_src_id
+ 					== cres->clsid_threshold_clients[i]) {
+@@ -1330,26 +1345,26 @@
+ 	d_mpr_e("%s: error = %d\n", __func__, rc);
+ 	return rc;
+ }
+-
+ int mmrm_destroy_sw_clk_mgr(struct mmrm_clk_mgr *sw_clk_mgr)
+ {
+-	int rc = 0;
+-	struct mmrm_sw_clk_mgr_info *sinfo = &(sw_clk_mgr->data.sw_info);
+-	struct mmrm_sw_throttled_clients_data *iter, *safe_iter = NULL;
+-
+-	list_for_each_entry_safe(iter, safe_iter, &sinfo->throttled_clients, list) {
++	struct mmrm_sw_clk_mgr_info *sinfo;
++	struct mmrm_sw_throttled_clients_data *iter, *next;
++	u32 i;
++
++	if (!sw_clk_mgr)
++		return -EINVAL;
++	sinfo = &sw_clk_mgr->data.sw_info;
++	list_for_each_entry_safe(iter, next, &sinfo->throttled_clients, list) {
+ 		list_del(&iter->list);
+ 		kfree(iter);
+ 	}
+-
+-	if (!sw_clk_mgr) {
+-		d_mpr_e("%s: sw_clk_mgr null\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	kfree(sw_clk_mgr->data.sw_info.clk_client_tbl);
++	for (i = 0; i < sinfo->tot_clk_clients; i++) {
++		kfree(sinfo->clk_client_tbl[i].crm_client_tbl);
++		kfree(sinfo->clk_client_tbl[i].client);
++	}
++	kfree(sinfo->clk_client_tbl);
+ 	mutex_destroy(&sw_clk_mgr->lock);
+ 	kfree(sw_clk_mgr);
+-
+-	return rc;
+-}
++	return 0;
++}
++
+--- a/qcom/opensource/mmrm-driver/driver/src/mmrm_debug.c
++++ b/qcom/opensource/mmrm-driver/driver/src/mmrm_debug.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/slab.h>
++#include <linux/module.h>
+ 
+ #include "mmrm_debug.h"
+ 
+@@ -36,7 +37,8 @@
+ 	return len;
+ }
+ 
+-const struct file_operations msm_mmrm_debugfs_info_fops = {
++static const struct file_operations msm_mmrm_debugfs_info_fops = {
++	.owner = THIS_MODULE,
+ 	.open = simple_open,
+ 	.read = msm_mmrm_debugfs_info_read,
+ };
+@@ -44,7 +46,6 @@
+ struct dentry *msm_mmrm_debugfs_init(void)
+ {
+ 	struct dentry *dir;
+-	int file_val;
+ 
+ 	/* create a directory in debugfs root (/sys/kernel/debug) */
+ 	dir = debugfs_create_dir("msm_mmrm", NULL);
+@@ -54,7 +55,8 @@
+ 	}
+ 
+ 	/* basic info */
+-	if (!debugfs_create_file("info", 0444, dir, &file_val, &msm_mmrm_debugfs_info_fops)) {
++	if (IS_ERR_OR_NULL(debugfs_create_file("info", 0444, dir, NULL,
++					     &msm_mmrm_debugfs_info_fops))) {
+ 		d_mpr_e("%s: Call to debugfs_create_file(%s) failed!\n", __func__, "info");
+ 		goto failed_create_dir;
+ 	}
+@@ -67,6 +69,7 @@
+ 	return dir;
+ 
+ failed_create_dir:
++	debugfs_remove_recursive(dir);
+ 	d_mpr_e("%s: error\n", __func__);
+ 	return NULL;
+ }
+--- a/qcom/opensource/mmrm-driver/driver/src/mmrm_res_parse.c
++++ b/qcom/opensource/mmrm-driver/driver/src/mmrm_res_parse.c
+@@ -41,6 +41,8 @@
+ 					"qcom,mmrm_clk_mgr_scheme");
+ 	d_mpr_h("%s: configured mmrm scheme %d\n",
+ 		__func__, cres->scheme);
++	if (pdata->throttle_clk_clients_data_length > MMRM_MAX_THROTTLE_CLIENTS)
++		return -E2BIG;
+ 	cres->throttle_clients_data_length = pdata->throttle_clk_clients_data_length;
+ 
+ 	for (i = 0; i < pdata->throttle_clk_clients_data_length; i++) {
+@@ -68,15 +70,21 @@
+ 
+ 	num_corners = of_property_count_strings(pdev->dev.of_node,
+ 		"mm-rail-corners");
+-	if (num_corners <= 0) {
++	if (num_corners != MMRM_VDD_LEVEL_MAX) {
+ 		d_mpr_e("%s: no mm rail corners found\n",
+ 			__func__);
+ 		corners->count = 0;
++		rc = -EINVAL;
+ 		goto err_load_corner_tbl;
+ 	}
+ 
+-	corners->corner_tbl = devm_kzalloc(&pdev->dev,
+-		sizeof(*corners->corner_tbl) * num_corners, GFP_KERNEL);
++	if (of_property_count_u32_elems(pdev->dev.of_node, "mm-rail-fact-volt") != num_corners ||
++	    of_property_count_u32_elems(pdev->dev.of_node, "scaling-fact-dyn") != num_corners ||
++	    of_property_count_u32_elems(pdev->dev.of_node, "scaling-fact-leak") != num_corners)
++		return -EINVAL;
++
++	corners->corner_tbl = devm_kcalloc(&pdev->dev,
++				   num_corners, sizeof(*corners->corner_tbl), GFP_KERNEL);
+ 	if (!corners->corner_tbl) {
+ 		d_mpr_e("%s: failed to allocate memory for corner_tbl\n",
+ 			__func__);
+@@ -90,14 +98,24 @@
+ 	for (c = 0; c < num_corners; c++) {
+ 		struct corner_info *ci = &corners->corner_tbl[c];
+ 
+-		of_property_read_string_index(pdev->dev.of_node,
+-			"mm-rail-corners", c, &ci->name);
+-		of_property_read_u32_index(pdev->dev.of_node,
+-			"mm-rail-fact-volt", c, &ci->volt_factor);
+-		of_property_read_u32_index(pdev->dev.of_node,
+-			"scaling-fact-dyn", c, &ci->scaling_factor_dyn);
+-		of_property_read_u32_index(pdev->dev.of_node,
+-			"scaling-fact-leak", c, &ci->scaling_factor_leak);
++		rc = of_property_read_string_index(pdev->dev.of_node,
++					   "mm-rail-corners", c, &ci->name);
++		if (rc)
++			return rc;
++		rc = of_property_read_u32_index(pdev->dev.of_node,
++					   "mm-rail-fact-volt", c, &ci->volt_factor);
++		if (rc)
++			return rc;
++		rc = of_property_read_u32_index(pdev->dev.of_node,
++					   "scaling-fact-dyn", c, &ci->scaling_factor_dyn);
++		if (rc)
++			return rc;
++		rc = of_property_read_u32_index(pdev->dev.of_node,
++					   "scaling-fact-leak", c, &ci->scaling_factor_leak);
++		if (rc)
++			return rc;
++		if (!ci->volt_factor)
++			return -EINVAL;
+ 	}
+ 
+ 	/* print corner tables */
+@@ -141,12 +159,14 @@
+ 	d_mpr_h("%s: mmrm-peak-threshold threshold:%d\n",
+ 		__func__, cres->peak_threshold);
+ 
+-	of_find_property(pdev->dev.of_node, "mmrm-client-info", &size_clk_src);
++	if (!of_find_property(pdev->dev.of_node, "mmrm-client-info", &size_clk_src))
++		return -EINVAL;
+ 	if ((size_clk_src < sizeof(*clk_srcs->clk_src_tbl)) ||
+ 		(size_clk_src % sizeof(*clk_srcs->clk_src_tbl))) {
+ 		d_mpr_e("%s: invalid size(%d) of clk src table\n",
+ 			__func__, size_clk_src);
+ 		clk_srcs->count = 0;
++		rc = -EINVAL;
+ 		goto err_load_clk_src_tbl;
+ 	}
+ 
+@@ -230,18 +250,17 @@
+ 	mmrm_free_rail_corner_table(cres);
+ 	return rc;
+ }
+-
+ int mmrm_count_clk_clients_frm_dt(struct platform_device *pdev)
+ {
+-	u32 size_clk_src = 0, num_clk_src = 0;
+-
+-	of_find_property(pdev->dev.of_node, "mmrm-client-info", &size_clk_src);
+-	num_clk_src = size_clk_src / sizeof(struct nom_clk_src_info);
+-	d_mpr_h("%s: found %d clk_srcs size %d\n",
+-		__func__, num_clk_src, size_clk_src);
+-
+-	return num_clk_src;
+-}
++	int cells = of_property_count_u32_elems(pdev->dev.of_node, "mmrm-client-info");
++
++	if (cells == -EINVAL && !of_find_property(pdev->dev.of_node, "mmrm-client-info", NULL))
++		return 0;
++	if (cells <= 0 || cells % 5)
++		return -EINVAL;
++	return cells / 5;
++}
++
+ 
+ int mmrm_read_platform_resources(struct platform_device *pdev,
+ 	struct mmrm_driver_data *drv_data)
+--- a/qcom/opensource/mmrm-driver/driver/src/msm_mmrm.c
++++ b/qcom/opensource/mmrm-driver/driver/src/msm_mmrm.c
+@@ -10,6 +10,7 @@
+ #include <linux/soc/qcom/msm_mmrm.h>
+ #include <linux/fs.h>
+ #include <linux/of.h>
++#include <linux/mutex.h>
+ 
+ #include "mmrm_internal.h"
+ #include "mmrm_debug.h"
+@@ -24,11 +25,6 @@
+ 	}						\
+ }
+ 
+-#define RESET_DRV_DATA(drv_data)	\
+-{									\
+-	kfree(drv_data);				\
+-	drv_data = (void *) -EPROBE_DEFER; \
+-}
+ 
+ #define CHECK_SKIP_MMRM_CLK_RSRC(drv_data)	\
+ {									\
+@@ -44,11 +40,14 @@
+ extern u8 msm_mmrm_enable_throttle_feature;
+ extern u8 msm_mmrm_allow_multiple_register;
+ 
+-struct mmrm_driver_data *drv_data = (void *) -EPROBE_DEFER;
++static struct mmrm_driver_data *drv_data;
++static bool mmrm_ready;
++static DEFINE_MUTEX(mmrm_probe_lock);
+ 
+ bool mmrm_client_check_scaling_supported(enum mmrm_client_type client_type, u32 client_domain)
+ {
+-	if (drv_data == (void *)-EPROBE_DEFER) {
++	/* Pair with readiness publication after the complete driver setup. */
++	if (!smp_load_acquire(&mmrm_ready)) {
+ 		d_mpr_e("%s: mmrm probe_init not done\n", __func__);
+ 		goto err_exit;
+ 	}
+@@ -77,7 +76,8 @@
+ 		goto err_exit;
+ 	}
+ 
+-	if (drv_data == (void *) -EPROBE_DEFER) {
++	/* Pair with readiness publication after the complete driver setup. */
++	if (!smp_load_acquire(&mmrm_ready)) {
+ 		d_mpr_e("%s: mmrm probe_init not done\n", __func__);
+ 		goto err_exit;
+ 	}
+@@ -119,8 +119,10 @@
+ 		goto err_exit;
+ 	}
+ 
+-	if (drv_data == (void *) -EPROBE_DEFER) {
++	/* Pair with readiness publication after the complete driver setup. */
++	if (!smp_load_acquire(&mmrm_ready)) {
+ 		d_mpr_e("%s: mmrm probe_init not done\n", __func__);
++		rc = -EPROBE_DEFER;
+ 		goto err_exit;
+ 	}
+ 
+@@ -137,6 +139,7 @@
+ 	} else {
+ 		d_mpr_e("%s: unknown client_type %d\n",
+ 			__func__, client->client_type);
++		rc = -EINVAL;
+ 	}
+ 
+ skip_mmrm:
+@@ -161,8 +164,10 @@
+ 		goto err_exit;
+ 	}
+ 
+-	if (drv_data == (void *) -EPROBE_DEFER) {
++	/* Pair with readiness publication after the complete driver setup. */
++	if (!smp_load_acquire(&mmrm_ready)) {
+ 		d_mpr_e("%s: mmrm probe_init not done\n", __func__);
++		rc = -EPROBE_DEFER;
+ 		goto err_exit;
+ 	}
+ 
+@@ -180,6 +185,7 @@
+ 	} else {
+ 		d_mpr_e("%s: unknown client_type %d\n",
+ 			__func__, client->client_type);
++		rc = -EINVAL;
+ 	}
+ 
+ skip_mmrm:
+@@ -206,8 +212,10 @@
+ 		goto err_exit;
+ 	}
+ 
+-	if (drv_data == (void *) -EPROBE_DEFER) {
++	/* Pair with readiness publication after the complete driver setup. */
++	if (!smp_load_acquire(&mmrm_ready)) {
+ 		d_mpr_e("%s: mmrm probe_init not done\n", __func__);
++		rc = -EPROBE_DEFER;
+ 		goto err_exit;
+ 	}
+ 
+@@ -225,6 +233,7 @@
+ 	} else {
+ 		d_mpr_e("%s: unknown client_type %d\n",
+ 			__func__, client->client_type);
++		rc = -EINVAL;
+ 	}
+ 
+ skip_mmrm:
+@@ -249,8 +258,10 @@
+ 		goto err_exit;
+ 	}
+ 
+-	if (drv_data == (void *) -EPROBE_DEFER) {
++	/* Pair with readiness publication after the complete driver setup. */
++	if (!smp_load_acquire(&mmrm_ready)) {
+ 		d_mpr_e("%s: mmrm probe_init not done\n", __func__);
++		rc = -EPROBE_DEFER;
+ 		goto err_exit;
+ 	}
+ 
+@@ -268,6 +279,7 @@
+ 	} else {
+ 		d_mpr_e("%s: unknown client_type %d\n",
+ 			__func__, client->client_type);
++		rc = -EINVAL;
+ 	}
+ 
+ skip_mmrm:
+@@ -278,35 +290,22 @@
+ 	return rc;
+ }
+ EXPORT_SYMBOL(mmrm_client_get_value);
+-
+ int mmrm_client_get_clk_count(void)
+ {
+-	struct mmrm_sw_clk_mgr_info *sinfo;
+-
+-	if (drv_data == (void *) -EPROBE_DEFER)
++	/* Pair with readiness publication after the complete driver setup. */
++	if (!smp_load_acquire(&mmrm_ready) || !drv_data->clk_mgr)
+ 		return 0;
+-
+-	sinfo = &(drv_data->clk_mgr->data.sw_info);
+-
+-	return sinfo->tot_clk_clients;
+-}
++	return drv_data->clk_mgr->data.sw_info.tot_clk_clients;
++}
++
+ EXPORT_SYMBOL(mmrm_client_get_clk_count);
+-
+ static int sysfs_get_param(const char *buf, u32 *param)
+ {
+-	int base;
+-
+-	if (buf) {
+-		if ((buf[1] == 'x') || (buf[1] == 'X'))
+-			base = 16;
+-		else
+-			base = 10;
+-
+-		if (kstrtou32(buf, base, param) != 0)
+-			return -EINVAL;
+-	}
+-	return 0;
+-}
++	if (!buf || !param)
++		return -EINVAL;
++	return kstrtou32(buf, 0, param);
++}
++
+ 
+ static ssize_t mmrm_sysfs_debug_get(struct device *dev,
+ 		struct device_attribute *attr, char *buf)
+@@ -318,19 +317,19 @@
+ 
+ 	return ret;
+ }
+-
+ static ssize_t mmrm_sysfs_debug_set(struct device *dev,
+ 		struct device_attribute *attr, const char *buf, size_t count)
+ {
+-	int ret;
+-	u32 reg_addr;
+-
+-	ret = sysfs_get_param(buf, &reg_addr);
+-	if (ret == 0)
+-		msm_mmrm_debug = reg_addr;
+-
++	u32 value;
++	int ret = sysfs_get_param(buf, &value);
++
++	if (ret)
++		return ret;
++
++	WRITE_ONCE(msm_mmrm_debug, value);
+ 	return count;
+ }
++
+ 
+ static ssize_t mmrm_sysfs_enable_throttle_get(struct device *dev,
+ 		struct device_attribute *attr, char *buf)
+@@ -342,19 +341,20 @@
+ 
+ 	return ret;
+ }
+-
+ static ssize_t mmrm_sysfs_enable_throttle_set(struct device *dev,
+ 		struct device_attribute *attr, const char *buf, size_t count)
+ {
+-	u32 reg_addr;
+-	int ret;
+-
+-	ret = sysfs_get_param(buf, &reg_addr);
+-	if (ret == 0)
+-		msm_mmrm_enable_throttle_feature = (u8)reg_addr;
+-
++	u32 value;
++	int ret = sysfs_get_param(buf, &value);
++
++	if (ret)
++		return ret;
++	if (value > 1)
++		return -ERANGE;
++	WRITE_ONCE(msm_mmrm_enable_throttle_feature, value);
+ 	return count;
+ }
++
+ 
+ static ssize_t mmrm_sysfs_allow_multiple_get(struct device *dev,
+ 		struct device_attribute *attr, char *buf)
+@@ -366,19 +366,20 @@
+ 
+ 	return ret;
+ }
+-
+ static ssize_t mmrm_sysfs_allow_multiple_set(struct device *dev,
+ 		struct device_attribute *attr, const char *buf, size_t count)
+ {
+-	u32 reg_addr;
+-	int ret;
+-
+-	ret = sysfs_get_param(buf, &reg_addr);
+-	if (ret == 0)
+-		msm_mmrm_allow_multiple_register = (u8)reg_addr;
+-
++	u32 value;
++	int ret = sysfs_get_param(buf, &value);
++
++	if (ret)
++		return ret;
++	if (value > 1)
++		return -ERANGE;
++	WRITE_ONCE(msm_mmrm_allow_multiple_register, value);
+ 	return count;
+ }
++
+ 
+ 
+ static ssize_t dump_enabled_client_info_show(struct device *dev,
+@@ -386,7 +387,11 @@
+ {
+ 	int rc;
+ 
+-	rc = mmrm_clk_print_enabled_client_info(drv_data->clk_mgr, buf, MMRM_SYSFS_ENTRY_MAX_LEN);
++	struct mmrm_driver_data *data = dev_get_drvdata(dev);
++
++	if (!data || !data->clk_mgr)
++		return -ENODEV;
++	rc = mmrm_clk_print_enabled_client_info(data->clk_mgr, buf, MMRM_SYSFS_ENTRY_MAX_LEN);
+ 	if (rc == 0)
+ 		d_mpr_e("%s: failed to dump client info\n", __func__);
+ 
+@@ -397,7 +402,8 @@
+ 		struct device_attribute *attr, char *buf)
+ {
+ 	int    i, len;
+-	struct mmrm_clk_platform_resources *cres = &drv_data->clk_res;
++	struct mmrm_driver_data *data = dev_get_drvdata(dev);
++	struct mmrm_clk_platform_resources *cres = &data->clk_res;
+ 	struct nom_clk_src_set *clk_set = &cres->nom_clk_set;
+ 	struct nom_clk_src_info *pclk;
+ 	int left_spaces = MMRM_SYSFS_ENTRY_MAX_LEN;
+@@ -449,79 +455,68 @@
+ static struct attribute_group mmrm_fs_attrs_group = {
+ 		.attrs = mmrm_fs_attrs,
+ };
+-
+ static int msm_mmrm_probe_init(struct platform_device *pdev)
+ {
+-	int rc = 0;
+-	u32 clk_clients = 0;
+-
+-	drv_data = kzalloc(sizeof(*drv_data), GFP_KERNEL);
+-	if (!drv_data) {
+-		d_mpr_e("%s: unable to allocate memory for mmrm driver\n",
+-			__func__);
++	struct mmrm_driver_data *data;
++	int rc, clients;
++
++	mutex_lock(&mmrm_probe_lock);
++	/* Observe the completed setup before testing for a second provider. */
++	if (smp_load_acquire(&mmrm_ready)) {
++		rc = -EBUSY;
++		goto unlock;
++	}
++	data = kzalloc(sizeof(*data), GFP_KERNEL);
++	if (!data) {
+ 		rc = -ENOMEM;
+-		goto err_no_mem;
+-	}
+-
+-	/* check for clk clients needing admission control */
+-	clk_clients = mmrm_count_clk_clients_frm_dt(pdev);
+-	if (clk_clients) {
+-		d_mpr_h("%s: %d clk clients managed for admission control\n",
+-			__func__, clk_clients);
+-		drv_data->is_clk_scaling_supported = true;
+-	} else {
+-		d_mpr_h("%s: no clk clients managed for admission control\n",
+-			__func__);
+-		drv_data->is_clk_scaling_supported = false;
+-		goto skip_mmrm;
+-	}
+-
+-	drv_data->platform_data = mmrm_get_platform_data(&pdev->dev);
+-	if (!drv_data->platform_data) {
+-		d_mpr_e("%s: unable to get platform data\n",
+-			__func__);
+-		rc = -EINVAL;
+-		goto err_get_drv_data;
+-	}
+-
+-	drv_data->debugfs_root = msm_mmrm_debugfs_init();
+-	if (!drv_data->debugfs_root)
+-		d_mpr_e("%s: failed to create debugfs for mmrm\n", __func__);
+-
+-	dev_set_drvdata(&pdev->dev, drv_data);
+-
+-	rc = mmrm_read_platform_resources(pdev, drv_data);
+-	if (rc) {
+-		d_mpr_e("%s: unable to read platform resources for mmrm\n",
+-			__func__);
+-		goto err_read_pltfrm_rsc;
+-	}
+-
+-	rc = mmrm_init(drv_data);
+-	if (rc) {
+-		d_mpr_e("%s: failed to init mmrm\n",
+-			__func__);
+-		goto err_mmrm_init;
+-	}
+-
+-	if (sysfs_create_group(&pdev->dev.kobj, &mmrm_fs_attrs_group)) {
+-		d_mpr_e("%s: failed to create sysfs\n",
+-			__func__);
+-	}
+-
+-skip_mmrm:
+-	return rc;
+-
+-err_mmrm_init:
+-	msm_mmrm_debugfs_deinit(drv_data->debugfs_root);
+-err_read_pltfrm_rsc:
+-	mmrm_free_platform_resources(drv_data);
+-err_get_drv_data:
+-	RESET_DRV_DATA(drv_data);
+-err_no_mem:
+-	d_mpr_e("%s: error = %d\n", __func__, rc);
+-	return rc;
+-}
++		goto unlock;
++	}
++	clients = mmrm_count_clk_clients_frm_dt(pdev);
++	if (clients < 0) {
++		rc = clients;
++		goto free_data;
++	}
++	data->is_clk_scaling_supported = clients > 0;
++	platform_set_drvdata(pdev, data);
++	if (!clients)
++		goto publish;
++	data->platform_data = mmrm_get_platform_data(&pdev->dev);
++	if (!data->platform_data) {
++		rc = -EINVAL;
++		goto clear_data;
++	}
++	rc = mmrm_read_platform_resources(pdev, data);
++	if (rc)
++		goto free_resources;
++	rc = mmrm_init(data);
++	if (rc)
++		goto free_resources;
++	data->debugfs_root = msm_mmrm_debugfs_init();
++	rc = sysfs_create_group(&pdev->dev.kobj, &mmrm_fs_attrs_group);
++	if (rc)
++		goto destroy_manager;
++publish:
++	/* Client handles have no live provider revocation protocol. */
++	__module_get(THIS_MODULE);
++	drv_data = data;
++	/* Publish all resources to clients checking readiness with acquire. */
++	smp_store_release(&mmrm_ready, true);
++	mutex_unlock(&mmrm_probe_lock);
++	return 0;
++destroy_manager:
++	msm_mmrm_debugfs_deinit(data->debugfs_root);
++	mmrm_deinit(data);
++free_resources:
++	mmrm_free_platform_resources(data);
++clear_data:
++	platform_set_drvdata(pdev, NULL);
++free_data:
++	kfree(data);
++unlock:
++	mutex_unlock(&mmrm_probe_lock);
++	return rc;
++}
++
+ 
+ static int msm_mmrm_probe(struct platform_device *pdev)
+ {
+@@ -542,34 +537,16 @@
+ 	return rc;
+ }
+ 
+-static int msm_mmrm_remove(struct platform_device *pdev)
+-{
+-	int rc = 0;
+-
+-	VERIFY_PDEV(pdev);
+-
+-	drv_data = dev_get_drvdata(&pdev->dev);
+-	if (!drv_data) {
+-		d_mpr_e("%s: null driver data\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if (drv_data->is_clk_scaling_supported) {
+-		sysfs_remove_group(&pdev->dev.kobj, &mmrm_fs_attrs_group);
+-		msm_mmrm_debugfs_deinit(drv_data->debugfs_root);
+-		mmrm_deinit(drv_data);
+-		mmrm_free_platform_resources(drv_data);
+-	}
+-
+-	dev_set_drvdata(&pdev->dev, NULL);
+-	RESET_DRV_DATA(drv_data);
+-
+-	return rc;
+-
+-err_exit:
+-	d_mpr_e("%s: error = %d\n", __func__, rc);
+-	return rc;
+-}
++static void msm_mmrm_remove(struct platform_device *pdev)
++{
++	struct mmrm_driver_data *data = platform_get_drvdata(pdev);
++
++	if (!data)
++		return;
++	/* Successful firmware-provider binding is deliberately permanent. */
++	WARN_ON_ONCE(smp_load_acquire(&mmrm_ready));
++}
++
+ 
+ static const struct of_device_id msm_mmrm_dt_match[] = {
+ 	{.compatible = "qcom,msm-mmrm"},
+@@ -583,6 +560,7 @@
+ 	.remove = msm_mmrm_remove,
+ 	.driver = {
+ 		.name = "msm-mmrm",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = msm_mmrm_dt_match,
+ 	},
+ };
+--- a/include/linux/soc/qcom/msm_mmrm.h
++++ b/include/linux/soc/qcom/msm_mmrm.h
+@@ -312,4 +312,6 @@
+ 
+ #endif
+ 
++int mmrm_client_get_clk_count(void);
++
+ #endif

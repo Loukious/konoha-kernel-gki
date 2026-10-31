@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 190 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 205 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 190 platform `.ko` files, their symbol tables and DDK configurations.
+- 205 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 9,242
-imported symbol CRCs across all 189 modules.
+used. The current [validation report](validation-20261031.json) checks 10,979
+imported symbol CRCs across all 205 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -912,12 +912,13 @@ after successful report delivery. `verify_smartcharge.py` passes ASan/UBSan cont
 SOC, telemetry, callback and eight probe-failure scenarios; the battery interface
 checks were rerun against the changed voter support.
 
-**BASP remains an unresolved configured feature.** Onyx enables the binary aging/
-spec override, but its pinned header explicitly labels its layout as inferred and
-unverified. `smart_charge_cdev` currently returns EOPNOTSUPP. Ordinary policy
-remains implemented; this rejection is not equivalent functionality. The source/
-DT evidence is in [smartcharge-compatibility-20261031.json](smartcharge-compatibility-20261031.json).
-A verified producer ABI is required before this feature can be completed.
+The later BASP overlay replaces the inferred layout with a bounded decoder based
+on static evidence from the exact stock producer binary. JEITA and wired quick
+charge now provide transactional consumers. The [BASP ABI record](basp-abi.md)
+describes observed fields, implementation choices and unresolved runtime evidence.
+The actual producer payload has not been captured or exercised on the phone.
+The earlier [compatibility snapshot](smartcharge-compatibility-20261031.json)
+records the pre-overlay state.
 
 The 176-module combined build passes 8,034 imported-symbol CRCs with no compiler/
 modpost warnings; device-tree checks pass with 1,084 existing vendor DTC warnings.
@@ -1041,3 +1042,82 @@ The combined 190-module archive `artifacts/20261031T122433629874Z` passes
 checks pass with 1,084 existing vendor DTC warnings. ROM module build coverage
 is 189/466 (40.6%), leaving 277 names to assess or port. No flashable 6.18 ZIP
 exists.
+
+
+## Secure services and display
+
+Seven native providers add QSEE proxy, SI-core, memory objects, smcinvoke,
+QSEECOM compatibility, HDCP and SMMU proxy. The ROM's SI-core implementation,
+QSEECOM_COMPAT choice and nine unchanged vendor UAPI headers are retained.
+Message, callback, firmware ELF and split-image sizes are checked before access.
+Invocation and callback replies reserve file descriptors before constructing
+files, install them after both reply copies succeed, and unwind pending exports
+on allocation or copy failures. The heap overlay publishes a coherent immutable
+map/unmap callback pair. Failed setup unwinds resources; failed firmware mapping
+withdrawal retains the advertised mapping and its references.
+
+Four display support modules provide native 6.18 DRM helpers, DP AUX, MMRM and
+external display. The main `msm_drm.ko` retains the Onyx display tables, panel
+commands and seven unchanged UAPI inputs. Its dependency-name set matches the
+stock ROM. Upstream DRM_MSM stays disabled and DRM_MSM_HELPER supplies the native
+MDSS provider. GEM uses a private mutex, shared reservation state and correct
+read/write fence usage; page and DMA-map failures unwind. Last close retains
+the DRM device and serializes concurrent opens. Xiaomi asynchronous requests
+own their TX buffers, client publication follows initialization, and worker
+startup and debugger teardown drain prior work. Procfs writes and log-ring
+formatting/read bounds are checked.
+
+Successful secure singleton services, display, MMRM and external-display
+bindings retain module references because firmware or consumers hold handles
+without a revocation protocol. Their manual unbind interfaces are suppressed.
+Probe failures still unwind. Dynamic removal, live VFS/RCU/SRCU, secure firmware,
+memory isolation, DRM atomic commits, display hardware and suspend remain
+unverified.
+
+[Secure host checks](secure-validation-20261031.json) pass eight ASan/UBSan groups,
+including 901 invocation/callback export fault cases and concurrent heap-callback
+publication. [Display checks](display-validation-20261031.json) and
+[support checks](display-support-validation-20261031.json) pass seven groups.
+The retained negative-control runners reproduce six failures from the original
+source bodies. Exact pinned-source replay, unchanged UAPI and ROM configuration
+evidence are recorded alongside the verifiers.
+
+## Fuel-gauge strategy and BASP wired consumers
+
+The FG strategy uses per-device smoothing/history, an ordered workqueue and
+serialized sampling. Failed gauge reads preserve output state, SOC arithmetic
+uses bounded 64-bit calculations, malformed tables are rejected, and probe
+failure/removal withdraw callbacks and drain all eight works. Named voter
+operations avoid retaining raw owner pointers. The actual single-gauge Onyx
+topology is retained. [FG host checks](fgstrategy-validation-20261031.json)
+cover sampling, smoothing, event and lifecycle behavior.
+
+The BASP byte decoder uses statically evidenced stock header/record offsets and
+command 0xd0001001. Each open owns a zeroed mmap page and immutable transaction
+snapshot. Ioctl commits synchronously; the final VMA release retains mmap commit
+behavior. Prepare/commit/abort callbacks support atomic replacement of JEITA and
+wired quick-charge data, and detach drains persistent file/VMA contexts.
+JEITA validates the selected stock temperature/voltage tables and owns its
+hysteresis history. Wired quick charge prepares curves and stage data before
+commit, defers election stops to work, and unwinds owned voters and tables.
+The wired prepare uses trylock when JEITA holds its transaction lock, returning
+EBUSY and aborting prepared groups to avoid a reverse lock-order cycle.
+Charging-interface withdrawal drains active callbacks before owner teardown.
+
+[BASP checks](basp-validation-20261031.json) and
+[wired-consumer checks](chargeconsumers-validation-20261031.json) pass decoder,
+allocation, mmap lifetime, malformed-table, transactional rollback, 200 concurrent
+lock-order iterations and callback-withdrawal cases under ASan/UBSan. Earlier
+charging, hardware, protocol, battery-business and smart-charge host checks also
+pass against the integrated support. The actual producer payload and live kernel
+workqueue/SRCU, gauge calibration, firmware and phone charging remain untested.
+Onyx wireless DT stays disabled; a nonempty wireless update requires a live
+consumer. Buck, charger business, thermal, authentication and protection policy
+components remain to port.
+
+The combined 205-module archive `artifacts/20261031T124045154059Z` passes
+10,979 imported-symbol CRC checks without compiler/modpost warnings. Device-tree
+and overlay checks pass with 1,084 existing vendor DTC warnings. ROM module build
+coverage is 203/466 (43.6%), leaving 263 names to assess or port. The denominator
+includes alternative hardware; this measures build coverage. No flashable 6.18
+ZIP or phone validation exists yet.

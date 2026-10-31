@@ -1,0 +1,559 @@
+--- a/drivers/power/supply/mca/mca_smart_charge/mca_smart_charge.c
++++ b/drivers/power/supply/mca/mca_smart_charge/mca_smart_charge.c
+@@ -36,6 +36,10 @@
+ #include <linux/srcu.h>
+ #include <linux/mutex.h>
+ #include <linux/overflow.h>
++#include <linux/unaligned.h>
++#include <linux/uaccess.h>
++#include <linux/kref.h>
++#include <linux/compat.h>
+ #include <mca/protocol/protocol_class.h>
+ #include <mca/strategy/strategy_class.h>
+ #include <mca/strategy/strategy_fg_class.h>
+@@ -1443,15 +1447,401 @@
+ 				    &smartchg_sysfs_attr_group);
+ }
+ 
+-/*
+- * The pinned drop explicitly labels the BASP layout as inferred. Do not parse
+- * that guessed ABI or map kernel heap pages. The ordinary smart-charge policy
+- * and sysfs controls remain available; this separate override transport is not.
+- */
++/* Stock producer ABI and exact field offsets are recorded in the handoff. */
++struct smart_basp_record {
++	struct smart_batt_spec spec;
++	struct smart_batt_spec_curve steps[MCA_BASP_MAX_STEPS];
++};
++
++struct smart_basp_decoded {
++	struct mca_basp_update update[3];
++	struct smart_batt_jeita_term_para *jeita;
++	struct smart_basp_record *records;
++	struct smart_batt_spec *specs;
++};
++
++struct smart_basp_transport {
++	struct kref ref;
++	/* Serializes detach, file acquisition and policy commits. */
++	struct mutex lock;
++	struct smart_charge_info *info;
++	bool opened;
++};
++
++struct smart_basp_file {
++	struct kref ref;
++	struct smart_basp_transport *transport;
++	struct page *page;
++	/* Serializes ioctl and mmap setup for one open file description. */
++	struct mutex lock;
++	bool mapped;
++	bool committed;
++};
++
++static void smart_basp_free_decoded(struct smart_basp_decoded *decoded)
++{
++	kfree(decoded->specs);
++	kfree(decoded->records);
++	kfree(decoded->jeita);
++	memset(decoded, 0, sizeof(*decoded));
++}
++
++static int smart_basp_decode(const u8 *bytes, size_t size,
++			     struct smart_basp_decoded *decoded)
++{
++	u32 count[6], total, checksum = 0, jeita_count, record_count;
++	size_t offset = MCA_BASP_HEADER_SIZE;
++	u32 i, j, cursor = 0;
++	int ret = -EINVAL;
++
++	memset(decoded, 0, sizeof(*decoded));
++	if (!bytes || size < MCA_BASP_HEADER_SIZE || size > MCA_BASP_MAX_SIZE)
++		return -EINVAL;
++	total = get_unaligned_le32(bytes + 8);
++	if (total < MCA_BASP_HEADER_SIZE || total > size || total % sizeof(u32))
++		return -EINVAL;
++	if (get_unaligned_le32(bytes + 4))
++		return -EOPNOTSUPP;
++	for (i = sizeof(u32); i < total; i++)
++		checksum += bytes[i];
++	if (checksum != get_unaligned_le32(bytes))
++		return -EBADMSG;
++	for (i = 0; i < ARRAY_SIZE(count); i++) {
++		count[i] = get_unaligned_le32(bytes + 12 + i * sizeof(u32));
++		if (count[i] > MCA_BASP_MAX_SIZE / 20)
++			return -EINVAL;
++	}
++	jeita_count = count[0] + count[1];
++	record_count = count[2] + count[3] + count[4] + count[5];
++	if (jeita_count > (total - offset) / 20)
++		return -EINVAL;
++	if (record_count > (total - offset - jeita_count * 20) / 24)
++		return -EINVAL;
++	if (jeita_count) {
++		decoded->jeita = kcalloc(jeita_count, sizeof(*decoded->jeita), GFP_KERNEL);
++		if (!decoded->jeita)
++			return -ENOMEM;
++	}
++	if (record_count) {
++		decoded->records = kcalloc(record_count, sizeof(*decoded->records), GFP_KERNEL);
++		decoded->specs = kcalloc(record_count, sizeof(*decoded->specs), GFP_KERNEL);
++		if (!decoded->records || !decoded->specs) {
++			ret = -ENOMEM;
++			goto fail;
++		}
++	}
++	decoded->update[0].jeita = decoded->jeita;
++	decoded->update[0].ffc_size = count[0];
++	decoded->update[0].normal_size = count[1];
++	for (i = 0; i < jeita_count; i++, offset += 20) {
++		struct smart_batt_jeita_term_para *para = &decoded->jeita[i];
++
++		para->t_range.idx = (s32)get_unaligned_le32(bytes + offset);
++		para->t_range.min = (s32)get_unaligned_le32(bytes + offset + 4);
++		para->t_range.max = (s32)get_unaligned_le32(bytes + offset + 8);
++		para->vterm = (s32)get_unaligned_le32(bytes + offset + 12);
++		para->iterm = (s32)get_unaligned_le32(bytes + offset + 16);
++		if (para->t_range.idx < 0 || para->t_range.min >= para->t_range.max ||
++		    para->vterm < 0 || para->iterm < 0)
++			goto fail;
++		for (j = i < count[0] ? 0 : count[0]; j < i; j++)
++			if (decoded->jeita[j].t_range.idx == para->t_range.idx)
++				goto fail;
++	}
++	for (i = 2; i < ARRAY_SIZE(count); i++) {
++		u32 first = cursor;
++
++		for (j = 0; j < count[i]; j++, cursor++) {
++			struct smart_basp_record *record = &decoded->records[cursor];
++			struct smart_batt_spec *spec = &record->spec;
++			u32 k;
++
++			if (total - offset < 24)
++				goto fail;
++			spec->type = get_unaligned_le32(bytes + offset);
++			spec->ffc = get_unaligned_le32(bytes + offset + 4);
++			spec->t_range.idx = (s32)get_unaligned_le32(bytes + offset + 8);
++			spec->t_range.min = (s32)get_unaligned_le32(bytes + offset + 12);
++			spec->t_range.max = (s32)get_unaligned_le32(bytes + offset + 16);
++			spec->step_size = get_unaligned_le32(bytes + offset + 20);
++			offset += 24;
++			if (spec->type != (i < 4) || spec->ffc != !(i % 2) ||
++			    spec->t_range.idx < 0 || spec->t_range.min >= spec->t_range.max ||
++			    !spec->step_size || spec->step_size > MCA_BASP_MAX_STEPS ||
++			    spec->step_size > (total - offset) / 12)
++				goto fail;
++			for (k = first; k < cursor; k++)
++				if (decoded->records[k].spec.t_range.idx == spec->t_range.idx)
++					goto fail;
++			for (k = 0; k < spec->step_size; k++, offset += 12) {
++				struct smart_batt_spec_curve *step = &record->steps[k];
++
++				step->mv = (s32)get_unaligned_le32(bytes + offset);
++				step->ma_h = (s32)get_unaligned_le32(bytes + offset + 4);
++				step->ma_l = (s32)get_unaligned_le32(bytes + offset + 8);
++				if (step->mv < 0 || step->ma_l < 0 || step->ma_h < step->ma_l ||
++				    (k && step->mv <= record->steps[k - 1].mv))
++					goto fail;
++			}
++			spec->steps = record->steps;
++			decoded->specs[cursor] = *spec;
++		}
++	}
++	decoded->update[1].spec = decoded->specs;
++	decoded->update[1].ffc_size = count[2];
++	decoded->update[1].normal_size = count[3];
++	if (decoded->specs)
++		decoded->update[2].spec = decoded->specs + count[2] + count[3];
++	decoded->update[2].ffc_size = count[4];
++	decoded->update[2].normal_size = count[5];
++	if (offset != total)
++		goto fail;
++	return 0;
++fail:
++	smart_basp_free_decoded(decoded);
++	return ret;
++}
++
++static int smart_basp_dispatch(struct smart_basp_transport *transport,
++			       const struct smart_basp_decoded *decoded)
++{
++	static const unsigned int types[] = {
++		MCA_SMARTCHG_IF_CHG_TYPE_JEITA,
++		MCA_SMARTCHG_IF_CHG_TYPE_QC,
++		MCA_SMARTCHG_IF_CHG_TYPE_WL_QC,
++	};
++	struct mca_smartchg_if_ops *prepared[ARRAY_SIZE(types)] = { };
++	struct smart_charge_info *info;
++	unsigned int i;
++	int ret = 0;
++
++	guard(mutex)(&transport->lock);
++	info = transport->info;
++	if (!info)
++		return -ENODEV;
++	guard(mutex)(&info->state_lock);
++	if (info->stopping || !info->enable_fv_dec_by_cc)
++		return -ENODEV;
++	guard(srcu)(&smart_ops_srcu);
++	for (i = 0; i < ARRAY_SIZE(types); i++) {
++		const struct mca_basp_update *update = &decoded->update[i];
++		struct mca_smartchg_if_ops *ops;
++
++		if (!update->ffc_size && !update->normal_size)
++			continue;
++		ops = mca_smartchg_if_get_ops(types[i]);
++		if (!ops || !ops->prepare_baa_para || !ops->commit_baa_para ||
++		    !ops->abort_baa_para) {
++			ret = -ENODEV;
++			goto abort;
++		}
++		ret = ops->prepare_baa_para(ops->data, update);
++		if (ret)
++			goto abort;
++		prepared[i] = ops;
++	}
++	for (i = 0; i < ARRAY_SIZE(prepared); i++)
++		if (prepared[i])
++			prepared[i]->commit_baa_para(prepared[i]->data);
++	return 0;
++abort:
++	for (i = ARRAY_SIZE(prepared); i-- > 0;)
++		if (prepared[i])
++			prepared[i]->abort_baa_para(prepared[i]->data);
++	return ret;
++}
++
++static int smart_basp_commit(struct smart_basp_file *ctx, const u8 *bytes, size_t size)
++{
++	struct smart_basp_decoded decoded;
++	int ret;
++
++	ret = smart_basp_decode(bytes, size, &decoded);
++	if (ret)
++		return ret;
++	ret = smart_basp_dispatch(ctx->transport, &decoded);
++	smart_basp_free_decoded(&decoded);
++	return ret;
++}
++
++static void smart_basp_transport_free(struct kref *ref)
++{
++	struct smart_basp_transport *transport =
++		container_of(ref, struct smart_basp_transport, ref);
++
++	kfree(transport);
++}
++
++static void smart_basp_detach(struct smart_charge_info *info)
++{
++	struct smart_basp_transport *transport = info->basp;
++
++	if (!transport)
++		return;
++	mutex_lock(&transport->lock);
++	transport->info = NULL;
++	mutex_unlock(&transport->lock);
++	info->basp = NULL;
++	kref_put(&transport->ref, smart_basp_transport_free);
++}
++
++static void smart_basp_file_free(struct kref *ref)
++{
++	struct smart_basp_file *ctx = container_of(ref, struct smart_basp_file, ref);
++
++	__free_page(ctx->page);
++	kref_put(&ctx->transport->ref, smart_basp_transport_free);
++	kfree(ctx);
++}
++
+ static int smart_charge_file_open(struct inode *inode, struct file *filp)
+ {
+-	return -EOPNOTSUPP;
+-}
++	struct smart_charge_info *info =
++		container_of(filp->private_data, struct smart_charge_info, misc);
++	struct smart_basp_transport *transport = info->basp;
++	struct smart_basp_file *ctx;
++	int ret = -ENODEV;
++
++	/* misc_open holds misc_mtx until this callback returns. */
++	if (!transport)
++		return -ENODEV;
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++	ctx->page = alloc_page(GFP_KERNEL | __GFP_ZERO);
++	if (!ctx->page) {
++		kfree(ctx);
++		return -ENOMEM;
++	}
++	mutex_lock(&transport->lock);
++	if (!transport->info || rcu_access_pointer(global_smartchg_info) != info ||
++	    !info->enable_fv_dec_by_cc)
++		goto unlock;
++	if (transport->opened) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	transport->opened = true;
++	kref_get(&transport->ref);
++	ctx->transport = transport;
++	kref_init(&ctx->ref);
++	mutex_init(&ctx->lock);
++	filp->private_data = ctx;
++	ret = 0;
++unlock:
++	mutex_unlock(&transport->lock);
++	if (ret) {
++		__free_page(ctx->page);
++		kfree(ctx);
++	}
++	return ret;
++}
++
++static int smart_charge_file_close(struct inode *inode, struct file *filp)
++{
++	struct smart_basp_file *ctx = filp->private_data;
++	u8 *snapshot;
++	int ret = 0;
++
++	if (ctx->mapped && !ctx->committed) {
++		snapshot = kmemdup(page_address(ctx->page), MCA_BASP_MAX_SIZE, GFP_KERNEL);
++		if (!snapshot)
++			ret = -ENOMEM;
++		else {
++			ret = smart_basp_commit(ctx, snapshot, MCA_BASP_MAX_SIZE);
++			kfree(snapshot);
++		}
++		if (ret)
++			pr_err("mca_smart_charge: BASP release commit failed: %d\n", ret);
++	}
++	mutex_lock(&ctx->transport->lock);
++	ctx->transport->opened = false;
++	mutex_unlock(&ctx->transport->lock);
++	kref_put(&ctx->ref, smart_basp_file_free);
++	return ret;
++}
++
++static void smart_basp_vma_open(struct vm_area_struct *vma)
++{
++	struct smart_basp_file *ctx = vma->vm_private_data;
++
++	__module_get(THIS_MODULE);
++	kref_get(&ctx->ref);
++}
++
++static void smart_basp_vma_close(struct vm_area_struct *vma)
++{
++	struct smart_basp_file *ctx = vma->vm_private_data;
++
++	kref_put(&ctx->ref, smart_basp_file_free);
++	module_put(THIS_MODULE);
++}
++
++static const struct vm_operations_struct smart_basp_vm_ops = {
++	.open = smart_basp_vma_open,
++	.close = smart_basp_vma_close,
++};
++
++static int smart_charge_mmap(struct file *filp, struct vm_area_struct *vma)
++{
++	struct smart_basp_file *ctx = filp->private_data;
++	int ret;
++
++	if (vma->vm_pgoff || vma->vm_end - vma->vm_start != PAGE_SIZE ||
++	    !(vma->vm_flags & VM_SHARED) || (vma->vm_flags & VM_EXEC))
++		return -EINVAL;
++	guard(mutex)(&ctx->lock);
++	if (ctx->mapped || ctx->committed)
++		return -EBUSY;
++	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
++	vm_flags_clear(vma, VM_MAYEXEC);
++	ret = vm_insert_page(vma, vma->vm_start, ctx->page);
++	if (ret)
++		return ret;
++	vma->vm_ops = &smart_basp_vm_ops;
++	vma->vm_private_data = ctx;
++	smart_basp_vma_open(vma);
++	ctx->mapped = true;
++	return 0;
++}
++
++static long smart_charge_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++	struct smart_basp_file *ctx = filp->private_data;
++	void __user *user = (void __user *)arg;
++	u8 header[MCA_BASP_HEADER_SIZE], *snapshot;
++	u32 total;
++	int ret;
++
++	/* The stock producer passes this exact nonstandard command value. */
++	if (cmd != 0xd0001001U)
++		return -ENOTTY;
++	guard(mutex)(&ctx->lock);
++	if (ctx->mapped || ctx->committed)
++		return -EBUSY;
++	if (copy_from_user(header, user, sizeof(header)))
++		return -EFAULT;
++	total = get_unaligned_le32(header + 8);
++	if (total < sizeof(header) || total > MCA_BASP_MAX_SIZE)
++		return -EINVAL;
++	snapshot = memdup_user(user, total);
++	if (IS_ERR(snapshot))
++		return PTR_ERR(snapshot);
++	/* A changed header between the two user copies cannot grow this copy. */
++	ret = smart_basp_commit(ctx, snapshot, total);
++	kfree(snapshot);
++	if (!ret)
++		ctx->committed = true;
++	return ret;
++}
++
++#ifdef CONFIG_COMPAT
++static long smart_charge_compat_ioctl(struct file *filp, unsigned int cmd,
++				      unsigned long arg)
++{
++	return smart_charge_ioctl(filp, cmd, (unsigned long)compat_ptr(arg));
++}
++#endif
+ 
+ static int smart_charge_panel_notifier_cb(struct notifier_block *nb,
+ 					  unsigned long event, void *val)
+@@ -1481,6 +1871,12 @@
+ static const struct file_operations g_smt_chg_file_ops = {
+ 	.owner = THIS_MODULE,
+ 	.open = smart_charge_file_open,
++	.release = smart_charge_file_close,
++	.mmap = smart_charge_mmap,
++	.unlocked_ioctl = smart_charge_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl = smart_charge_compat_ioctl,
++#endif
+ };
+ 
+ static int smart_charge_parse_dt(struct smart_charge_info *info)
+@@ -1623,6 +2019,14 @@
+ 	ret = smart_charge_init_voter(info);
+ 	if (ret)
+ 		return ret;
++	info->basp = kzalloc(sizeof(*info->basp), GFP_KERNEL);
++	if (!info->basp) {
++		ret = -ENOMEM;
++		goto voters;
++	}
++	kref_init(&info->basp->ref);
++	mutex_init(&info->basp->lock);
++	info->basp->info = info;
+ 	info->misc.minor = MISC_DYNAMIC_MINOR;
+ 	info->misc.name = "smart_charge_cdev";
+ 	info->misc.fops = &g_smt_chg_file_ops;
+@@ -1674,6 +2078,7 @@
+ 	smart_charge_stop_work(info);
+ 	misc_deregister(&info->misc);
+ voters:
++	smart_basp_detach(info);
+ 	smart_charge_destroy_voters(info);
+ 	return ret;
+ }
+@@ -1684,6 +2089,8 @@
+ 
+ 	guard(mutex)(&smart_instance_lock);
+ 
++	misc_deregister(&info->misc);
++	smart_basp_detach(info);
+ 	smart_charge_sysfs_remove_group(&pdev->dev);
+ 	rcu_assign_pointer(global_smartchg_info, NULL);
+ 	synchronize_srcu(&smart_instance_srcu);
+@@ -1701,7 +2108,6 @@
+ 	smart_charge_fv_control(NULL, info, 0, NULL);
+ 	smart_charge_ichg_control(NULL, info, 0, NULL);
+ 	smart_charge_set_fcc_control(NULL, info, 0, NULL);
+-	misc_deregister(&info->misc);
+ 	smart_charge_destroy_voters(info);
+ }
+ 
+--- a/drivers/power/supply/mca/mca_smart_charge/inc/mca_smart_charge.h
++++ b/drivers/power/supply/mca/mca_smart_charge/inc/mca_smart_charge.h
+@@ -168,7 +168,10 @@
+ 	int fcc;
+ };
+ 
++struct smart_basp_transport;
++
+ struct smart_charge_info {
++	struct smart_basp_transport *basp;
+ 	atomic_t replay_needed;
+ 	struct mutex state_lock;
+ 	bool stopping;
+--- a/drivers/power/supply/mca/include/mca/smartchg/smart_chg_class.h
++++ b/drivers/power/supply/mca/include/mca/smartchg/smart_chg_class.h
+@@ -3,16 +3,7 @@
+ 
+ #include <linux/types.h>
+ 
+-/*
+- * BASP (battery aging safety/spec) blob layout, parsed by mca_smart_charge.c
+- * from mmap'd memory via sizeof()/offsetof().
+- *
+- * WARNING: the open-source drop ships NO definition for these structs. The
+- * layout below is INFERRED from field usage only and is NOT verified against
+- * the real binary format. It lets the module build; the BAA/spec-override
+- * runtime path is unreliable and should be treated as unsupported until the
+- * true layout is obtained.
+- */
++/* Decoded host records; never cast producer wire bytes to these structs. */
+ struct smart_batt_spec_curve {
+ 	int mv;
+ 	int ma_h;
+@@ -38,19 +29,23 @@
+ 		int max;
+ 	} t_range;
+ 	u32 step_size;
+-	struct smart_batt_spec_curve *steps;
++	const struct smart_batt_spec_curve *steps;
+ };
+ 
+-struct smart_basp_header {
+-	u32 type;
+-	u32 total_len;
+-	u32 checksum;
+-	u32 jeita_ffc_term_size;
+-	u32 jeita_normal_term_size;
+-	u32 wired_ffc_size;
+-	u32 wired_normal_size;
+-	u32 wls_ffc_size;
+-	u32 wls_normal_size;
++/*
++ * Stock BASP wire ABI: nine little-endian u32s, checksum first. JEITA
++ * records are five s32s. Curve prefixes are six u32/s32s followed by
++ * inline (mV, mA_h, mA_l) triples, without a serialized pointer.
++ */
++#define MCA_BASP_HEADER_SIZE 36
++#define MCA_BASP_MAX_SIZE 4096
++#define MCA_BASP_MAX_STEPS 8
++
++struct mca_basp_update {
++	const struct smart_batt_jeita_term_para *jeita;
++	const struct smart_batt_spec *spec;
++	u32 ffc_size;
++	u32 normal_size;
+ };
+ 
+ enum mca_smartchg_if_chg_type {
+@@ -73,8 +68,13 @@
+ 	int (*set_soc_limit_sts)(void *data, int en);
+ 	int (*set_wls_quiet_sts)(void *data, int en);
+ 	int (*set_wls_super_sts)(void *data, int en);
+-	int (*update_baa_para)(void *data, char *baa_para, int ffc_size,
+-			       int normal_size);
++	/* Prepare allocates/validates without changing live policy. Commit cannot
++	 * fail after a successful prepare; abort releases prepared resources.
++	 * The caller holds provider SRCU across all three phases.
++	 */
++	int (*prepare_baa_para)(void *data, const struct mca_basp_update *update);
++	void (*commit_baa_para)(void *data);
++	void (*abort_baa_para)(void *data);
+ };
+ 
+ int mca_smartchg_if_ops_register(struct mca_smartchg_if_ops *ops);

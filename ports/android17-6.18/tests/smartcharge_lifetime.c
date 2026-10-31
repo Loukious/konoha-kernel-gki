@@ -10,6 +10,9 @@ typedef uint32_t u32;typedef long long ktime_t;typedef int atomic_t;
 #define mutex pthread_mutex_t
 struct device{void *data;};struct work_struct{};struct delayed_work{struct work_struct work;int initialized,pending,disabled;};struct mca_votable{};struct notifier_block{int (*notifier_call)(struct notifier_block *,unsigned long,void *);};struct miscdevice{int minor;const char *name;void *fops;struct device *parent;};struct platform_device{struct device dev;};
 /* SMART_HEADER */
+struct kref {int refs;};
+struct smart_basp_transport {struct kref ref; pthread_mutex_t lock; struct smart_charge_info *info; bool opened;};
+static int fail_basp,basp_allocations;
 static struct smart_charge_info *global_smartchg_info;
 static pthread_mutex_t smart_instance_lock=PTHREAD_MUTEX_INITIALIZER;
 static int smart_instance_srcu,system_wq,g_smt_chg_file_ops;
@@ -35,6 +38,9 @@ static void mutex_guard_cleanup(struct mutex_guard *g){pthread_mutex_unlock(g->l
 #define guard(t) struct mutex_guard g __attribute__((cleanup(mutex_guard_cleanup)))=mutex_guard_init
 static void synchronize_srcu(int *p){(void)p;assert(!global_smartchg_info);}
 static void *devm_kzalloc(struct device *d,size_t n,int flags){(void)flags;if(fail_stage==-1)return NULL;d->data=calloc(1,n);return d->data;}
+static void *kzalloc(size_t n,int flags){(void)flags;if(fail_basp)return NULL;void *p=calloc(1,n);if(p)basp_allocations++;return p;}
+static void kref_init(struct kref *ref){ref->refs=1;}
+static void smart_basp_detach(struct smart_charge_info *info){if(!info->basp)return;assert(info->basp->info==info);assert(info->basp->ref.refs==1);pthread_mutex_destroy(&info->basp->lock);free(info->basp);info->basp=NULL;basp_allocations--;}
 static void platform_set_drvdata(struct platform_device *p,void *v){p->dev.data=v;}
 static void *platform_get_drvdata(struct platform_device *p){return p->dev.data;}
 #define INIT_DELAYED_WORK(w,f) ((w)->initialized=1)
@@ -68,6 +74,7 @@ static int smart_charge_fv_control(struct mca_votable *v,void *i,int n,const cha
 /* STAGED_DEFINITIONS */
 int main(void){
  for(int f=-1;f<=7;f++){if(!f)continue;fail_stage=f;stage=0;struct platform_device p={0};int ret=smart_charge_probe(&p);assert(ret==(f==-1?-ENOMEM:-EREMOTEIO));assert(!global_smartchg_info);for(int i=2;i<=7;i++)assert(!resources[i]);if(p.dev.data){struct smart_charge_info *d=p.dev.data;assert(!d->smart_charge_work.pending);free(d);}}
- fail_stage=0;stage=0;status_error=1;struct platform_device p={0};assert(!smart_charge_probe(&p));struct smart_charge_info *i=p.dev.data;assert(!i->online&&i->replay_needed==1&&i->fake_scene==-1);struct platform_device duplicate={0};assert(smart_charge_probe(&duplicate)==-EBUSY);smart_charge_remove(&p);assert(!global_smartchg_info&&i->stopping&&i->smart_charge_work.disabled&&i->smart_soc_limit_work.disabled&&i->smart_sense_chg_work.disabled);for(int n=2;n<=7;n++)assert(!resources[n]);free(i);
- puts("{\"passed\":true,\"registration_failure_points\":8,\"complete_resource_unwind\":true,\"three_workers_disabled\":true,\"duplicate_device_rejected\":true,\"failed_initial_status_not_online\":true}");
+ fail_stage=0;fail_basp=1;stage=0;struct platform_device failed={0};assert(smart_charge_probe(&failed)==-ENOMEM);assert(!basp_allocations&&!resources[2]&&!global_smartchg_info);free(failed.dev.data);fail_basp=0;
+ fail_stage=0;stage=0;status_error=1;struct platform_device p={0};assert(!smart_charge_probe(&p));struct smart_charge_info *i=p.dev.data;assert(!i->online&&i->replay_needed==1&&i->fake_scene==-1);struct platform_device duplicate={0};assert(smart_charge_probe(&duplicate)==-EBUSY);smart_charge_remove(&p);assert(!global_smartchg_info&&i->stopping&&i->smart_charge_work.disabled&&i->smart_soc_limit_work.disabled&&i->smart_sense_chg_work.disabled);for(int n=2;n<=7;n++)assert(!resources[n]);assert(!basp_allocations);free(i);
+ puts("{\"passed\":true,\"registration_failure_points\":9,\"complete_resource_unwind\":true,\"basp_allocation_failure_unwinds_voters\":true,\"three_workers_disabled\":true,\"duplicate_device_rejected\":true,\"failed_initial_status_not_online\":true}");
 }

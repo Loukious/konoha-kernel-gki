@@ -1,0 +1,309 @@
+--- a/drivers/power/supply/mca/mca_common/mca_charge_interface.c
++++ b/drivers/power/supply/mca/mca_common/mca_charge_interface.c
+@@ -25,6 +25,8 @@
+ #include <linux/of.h>
+ #include <linux/of_device.h>
+ #include <linux/platform_device.h>
++#include <linux/srcu.h>
++#include <linux/mutex.h>
+ #include <mca/common/mca_log.h>
+ #include <mca/common/mca_sysfs.h>
+ #include <mca/common/mca_charge_interface.h>
+@@ -76,7 +78,9 @@
+ 		[MCA_CHARGE_IF_CHG_TYPE_ALL] = "all",
+ 	};
+ 
+-static struct mca_charge_if_ops *g_mca_charge_if_ops[MCA_CHARGE_IF_CHG_TYPE_END];
++static struct mca_charge_if_ops __rcu *g_mca_charge_if_ops[MCA_CHARGE_IF_CHG_TYPE_END];
++static DEFINE_MUTEX(charge_if_lock);
++DEFINE_STATIC_SRCU(charge_if_srcu);
+ 
+ static int mca_charge_if_get_op_type(const char *type_name)
+ {
+@@ -94,7 +98,9 @@
+ #ifdef CONFIG_SYSFS
+ static struct mca_charge_if_ops *mca_charge_if_get_ops(unsigned int type)
+ {
+-	return g_mca_charge_if_ops[type];
++	if (type >= MCA_CHARGE_IF_CHG_TYPE_ALL)
++		return NULL;
++	return srcu_dereference(g_mca_charge_if_ops[type], &charge_if_srcu);
+ }
+ 
+ static const char *mca_charge_if_get_type_name(unsigned int type)
+@@ -108,12 +114,13 @@
+ static int mca_charge_if_op_set(char *user, unsigned int type,
+ 				unsigned int sysfs_type, char *value)
+ {
++	guard(srcu)(&charge_if_srcu);
+ 	struct mca_charge_if_ops *if_ops = mca_charge_if_get_ops(type);
+ 	int ret = 0;
+ 	unsigned int uint_value = 0;
+ 
+ 	if (!if_ops)
+-		return 0;
++		return -ENODEV;
+ 
+ 	switch (sysfs_type) {
+ 	case MCA_CHRAGE_IF_SYSFS_INPUT_SUSPEND:
+@@ -124,7 +131,8 @@
+ 							if_ops->data);
+ 		break;
+ 	case MCA_CHRAGE_IF_SYSFS_CHARGE_ENABLE:
+-		(void)kstrtouint(value, 0, &uint_value);
++		if (kstrtouint(value, 0, &uint_value))
++			return -EINVAL;
+ 		if (if_ops->set_charge_enable)
+ 			ret = if_ops->set_charge_enable(user, uint_value,
+ 							if_ops->data);
+@@ -140,13 +148,15 @@
+ 							       if_ops->data);
+ 		break;
+ 	case MCA_CHRAGE_IF_SYSFS_POWER_LIMIT:
+-		(void)kstrtouint(value, 0, &uint_value);
++		if (kstrtouint(value, 0, &uint_value))
++			return -EINVAL;
+ 		if (if_ops->set_charge_power_limit)
+ 			ret = if_ops->set_charge_power_limit(user, uint_value,
+ 							     if_ops->data);
+ 		break;
+ 	case MCA_CHRAGE_IF_SYSFS_SHIPMODE:
+-		(void)kstrtouint(value, 10, &uint_value);
++		if (kstrtouint(value, 10, &uint_value))
++			return -EINVAL;
+ 		if (if_ops->set_ship_mode_en)
+ 			ret = if_ops->set_ship_mode_en(user, uint_value,
+ 						       if_ops->data);
+@@ -175,8 +185,14 @@
+ 		end = type + 1;
+ 	}
+ 
+-	for (; begin < end; begin++)
+-		ret |= mca_charge_if_op_set(user, begin, sysfs_type, value);
++	for (; begin < end; begin++) {
++		int error = mca_charge_if_op_set(user, begin, sysfs_type, value);
++
++		if (error == -ENODEV && type == MCA_CHARGE_IF_CHG_TYPE_ALL)
++			continue;
++		if (error && !ret)
++			ret = error;
++	}
+ 
+ 	if (sysfs_type == MCA_CHRAGE_IF_SYSFS_INPUT_SUSPEND)
+ 		mca_event_block_notify(MCA_EVENT_TYPE_BATTERY_INFO,
+@@ -187,6 +203,7 @@
+ 
+ static int mca_charge_if_op_get(unsigned int sys_type, int chg_type, char *buf)
+ {
++	guard(srcu)(&charge_if_srcu);
+ 	struct mca_charge_if_ops *if_ops = NULL;
+ 	int ret = -1;
+ 	char value_buf[MCA_CHARGE_IF_MAX_VALUE_BUFF] = { 0 };
+@@ -245,7 +262,7 @@
+ 		last_chars[i] = '\0';
+ 		ret = mca_charge_if_op_get(MCA_CHRAGE_IF_SYSFS_INPUT_SUSPEND, i,
+ 					   rd_buf);
+-		if (ret != 0 || strlen(rd_buf) == 0) {
++		if (ret != 0 || strlen(rd_buf) < 2) {
+ 			last_chars[i] = '0';
+ 			continue;
+ 		}
+@@ -268,10 +285,13 @@
+ 
+ static int mca_charge_ship_mode_show(bool *pdata)
+ {
++	guard(srcu)(&charge_if_srcu);
+ 	struct mca_charge_if_ops *if_ops =
+ 		mca_charge_if_get_ops(MCA_CHARGE_IF_CHG_TYPE_BUCK);
+ 	int ret = 0;
+ 
++	if (!if_ops || !if_ops->get_ship_mode_status)
++		return -ENODEV;
+ 	if (if_ops->get_ship_mode_status)
+ 		ret = if_ops->get_ship_mode_status(pdata, if_ops->data);
+ 
+@@ -318,7 +338,7 @@
+ 	struct mca_sysfs_attr_info *info = NULL;
+ 	char rd_buf[MCA_CHARGE_IF_MAX_RW_BUFF] = { 0 };
+ 	int i;
+-	int ret;
++	int ret, offset = 0;
+ 	bool val = false;
+ 
+ 	info = mca_sysfs_lookup_attr(attr->attr.name,
+@@ -331,19 +351,24 @@
+ 		mca_charge_suspend_state_show(&val);
+ 		return snprintf(buf, PAGE_SIZE, "%d\n", val);
+ 	} else if (info->sysfs_attr_name == MCA_CHRAGE_IF_SYSFS_SHIPMODE) {
+-		mca_charge_ship_mode_show(&val);
+-		return snprintf(buf, PAGE_SIZE, "%d\n", val);
++		ret = mca_charge_ship_mode_show(&val);
++		if (ret)
++			return ret;
++		return sysfs_emit(buf, "%d\n", val);
+ 	}
+ 
+ 	for (i = 0; i < MCA_CHARGE_IF_CHG_TYPE_ALL; i++) {
+ 		ret = mca_charge_if_op_get(info->sysfs_attr_name, i, rd_buf);
+ 		if (ret)
+ 			continue;
+-		strncat(buf, rd_buf, strlen(rd_buf));
++		ret = sysfs_emit_at(buf, offset, "%s", rd_buf);
++		if (ret <= 0)
++			break;
++		offset += ret;
+ 		memset(rd_buf, 0, MCA_CHARGE_IF_MAX_RW_BUFF);
+ 	}
+ 
+-	return strlen(buf);
++	return offset;
+ }
+ 
+ static ssize_t mca_charge_if_sysfs_store(struct device *dev,
+@@ -354,26 +379,22 @@
+ 	char user_name[MCA_CHARGE_IF_MAX_RW_BUFF] = { 0 };
+ 	char type_name[MCA_CHARGE_IF_MAX_RW_BUFF] = { 0 };
+ 	char value_str[MCA_CHARGE_IF_MAX_RW_BUFF] = { 0 };
+-	int type;
++	int type, ret;
+ 
+ 	info = mca_sysfs_lookup_attr(attr->attr.name,
+ 				     mca_charge_if_sysfs_field_tbl,
+ 				     MCA_CHARGE_IF_SYSFS_ATTRS_SIZE);
+ 	if (!info)
+ 		return -EINVAL;
++	if (!count || count >= MCA_CHARGE_IF_MAX_RW_BUFF - 2)
++		return -EINVAL;
+ 	if (info->sysfs_attr_name == MCA_CHRAGE_IF_SYSFS_SHIPMODE) {
+-		strcpy(value_str, buf);
++		memcpy(value_str, buf, count);
+ 		strcpy(type_name, "buck");
+ 		strcpy(user_name, "micharger");
+ 	} else {
+-		/* reserve 2 bytes to prevent buffer overflow */
+-		if (count >= (MCA_CHARGE_IF_MAX_RW_BUFF - 2)) {
+-			mca_log_err("input too long\n");
+-			return -EINVAL;
+-		}
+-
+ 		/* 3: the fields of "user type value" */
+-		if (sscanf(buf, "%s %s %s", user_name, type_name, value_str) !=
++		if (sscanf(buf, "%255s %255s %255s", user_name, type_name, value_str) !=
+ 		    3) {
+ 			mca_log_err("unable to parse input:%s\n", buf);
+ 			return -EINVAL;
+@@ -384,10 +405,10 @@
+ 	if (type < 0)
+ 		return -EINVAL;
+ 
+-	mca_charge_if_common_sysfs_set(user_name, type, info->sysfs_attr_name,
++	ret = mca_charge_if_common_sysfs_set(user_name, type, info->sysfs_attr_name,
+ 				       value_str);
+ 
+-	return count;
++	return ret ? ret : count;
+ }
+ 
+ static int mca_charge_if_sysfs_create_group(struct mca_charge_if_dev *info)
+@@ -419,22 +440,52 @@
+ 
+ int mca_charge_if_ops_register(struct mca_charge_if_ops *ops)
+ {
++	struct mca_charge_if_ops *entry;
+ 	int type;
+ 
+-	if (!ops || !ops->type_name)
+-		return -1;
+-
++	if (!ops || !ops->type_name || !ops->data)
++		return -EINVAL;
+ 	type = mca_charge_if_get_op_type(ops->type_name);
+-	if (type < 0) {
+-		mca_log_err("type is invalid %s\n", ops->type_name);
+-		return -1;
+-	}
+-
+-	g_mca_charge_if_ops[type] = ops;
+-
++	if (type < 0 || type >= MCA_CHARGE_IF_CHG_TYPE_ALL)
++		return -EINVAL;
++	entry = kmemdup(ops, sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++	mutex_lock(&charge_if_lock);
++	if (rcu_access_pointer(g_mca_charge_if_ops[type])) {
++		mutex_unlock(&charge_if_lock);
++		kfree(entry);
++		return -EBUSY;
++	}
++	rcu_assign_pointer(g_mca_charge_if_ops[type], entry);
++	mutex_unlock(&charge_if_lock);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(mca_charge_if_ops_register);
++
++void mca_charge_if_ops_unregister(const char *type_name, void *data)
++{
++	struct mca_charge_if_ops *entry;
++	int type;
++
++	if (!type_name || !data)
++		return;
++	type = mca_charge_if_get_op_type(type_name);
++	if (type < 0 || type >= MCA_CHARGE_IF_CHG_TYPE_ALL)
++		return;
++	mutex_lock(&charge_if_lock);
++	entry = rcu_dereference_protected(g_mca_charge_if_ops[type],
++					lockdep_is_held(&charge_if_lock));
++	if (!entry || entry->data != data) {
++		mutex_unlock(&charge_if_lock);
++		return;
++	}
++	rcu_assign_pointer(g_mca_charge_if_ops[type], NULL);
++	mutex_unlock(&charge_if_lock);
++	synchronize_srcu(&charge_if_srcu);
++	kfree(entry);
++}
++EXPORT_SYMBOL(mca_charge_if_ops_unregister);
+ 
+ static int mca_charge_if_probe(struct platform_device *pdev)
+ {
+--- a/drivers/power/supply/mca/include/mca/common/mca_charge_interface.h
++++ b/drivers/power/supply/mca/include/mca/common/mca_charge_interface.h
+@@ -51,5 +51,7 @@
+ };
+ 
+ int mca_charge_if_ops_register(struct mca_charge_if_ops *ops);
++/* Call before freeing data, outside provider callbacks. */
++void mca_charge_if_ops_unregister(const char *type_name, void *data);
+ 
+ #endif /* _MCA_COMMON_MCA_CHARGE_INTERFACE_H_ */
+--- a/drivers/power/supply/mca/mca_common/mca_voter.c
++++ b/drivers/power/supply/mca/mca_common/mca_voter.c
+@@ -967,3 +967,17 @@
+ MODULE_DESCRIPTION("mca voter");
+ MODULE_AUTHOR("getian@xiaomi.com");
+ MODULE_LICENSE("GPL v2");
++
++int mca_rerun_named_election(const char *name)
++{
++	struct mca_votable *votable;
++
++	guard(srcu)(&votable_lookup_srcu);
++	if (!name)
++		return -EINVAL;
++	votable = mca_find_votable(name);
++	if (!votable)
++		return -ENODEV;
++	return mca_rerun_election(votable);
++}
++EXPORT_SYMBOL(mca_rerun_named_election);
+--- a/drivers/power/supply/mca/include/mca/common/mca_voter.h
++++ b/drivers/power/supply/mca/include/mca/common/mca_voter.h
+@@ -51,4 +51,6 @@
+ bool mca_is_named_override_vote_enabled(const char *name);
+ bool mca_named_votable_exists(const char *name);
+ 
++int mca_rerun_named_election(const char *name);
++
+ #endif /* _MCA_COMMON_MCA_VOTER_H_ */

@@ -1,0 +1,3778 @@
+--- a/qcom/opensource/display-drivers/hdcp/msm_hdcp.c
++++ b/qcom/opensource/display-drivers/hdcp/msm_hdcp.c
+@@ -20,6 +20,7 @@
+ #include <linux/msm_hdcp.h>
+ #include <linux/of.h>
+ #include <linux/version.h>
++#include "msm_drv.h"
+ 
+ #define CLASS_NAME "hdcp"
+ #define DRIVER_NAME "msm_hdcp"
+@@ -309,13 +310,13 @@
+ 	return ret;
+ }
+ 
+-static int msm_hdcp_remove(struct platform_device *pdev)
++static void msm_hdcp_remove(struct platform_device *pdev)
+ {
+ 	struct msm_hdcp *hdcp;
+ 
+ 	hdcp = platform_get_drvdata(pdev);
+ 	if (!hdcp)
+-		return -ENODEV;
++		return;
+ 
+ 	sysfs_remove_group(&hdcp->device->kobj,
+ 	&msm_hdcp_fs_attr_group);
+@@ -324,7 +325,7 @@
+ 	class_destroy(hdcp->class);
+ 	unregister_chrdev_region(hdcp->dev_num, 1);
+ 
+-	return 0;
++	return;
+ }
+ 
+ static struct platform_driver msm_hdcp_driver = {
+@@ -332,6 +333,7 @@
+ 	.remove = msm_hdcp_remove,
+ 	.driver = {
+ 		.name = "msm_hdcp",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = msm_hdcp_dt_match,
+ 		.pm = NULL,
+ 	}
+--- a/qcom/opensource/display-drivers/msm/dp/dp_altmode.c
++++ b/qcom/opensource/display-drivers/msm/dp/dp_altmode.c
+@@ -352,8 +352,8 @@
+ 	altmode = container_of(dp_altmode, struct dp_altmode_private,
+ 			dp_altmode);
+ 
++	altmode_deregister_notifier(altmode->dev, altmode);
+ 	altmode_deregister_client(altmode->amclient);
+-	altmode_deregister_notifier(altmode->dev, altmode);
+ 
+ 	kfree(altmode);
+ }
+--- a/qcom/opensource/display-drivers/msm/dp/dp_ctrl.c
++++ b/qcom/opensource/display-drivers/msm/dp/dp_ctrl.c
+@@ -1435,7 +1435,7 @@
+ 		dp_ctrl_idle_patterns_sent(ctrl);
+ }
+ 
+-void dp_ctrl_set_sim_mode(struct dp_ctrl *dp_ctrl, bool en)
++static void dp_ctrl_set_sim_mode(struct dp_ctrl *dp_ctrl, bool en)
+ {
+ 	struct dp_ctrl_private *ctrl;
+ 
+@@ -1447,7 +1447,7 @@
+ 	DP_INFO("sim_mode=%d\n", ctrl->sim_mode);
+ }
+ 
+-int dp_ctrl_setup_misr(struct dp_ctrl *dp_ctrl)
++static int dp_ctrl_setup_misr(struct dp_ctrl *dp_ctrl)
+ {
+ 	struct dp_ctrl_private *ctrl;
+ 
+@@ -1459,7 +1459,7 @@
+ 	return ctrl->catalog->setup_misr(ctrl->catalog);
+ }
+ 
+-int dp_ctrl_read_misr(struct dp_ctrl *dp_ctrl, struct dp_misr40_data *data)
++static int dp_ctrl_read_misr(struct dp_ctrl *dp_ctrl, struct dp_misr40_data *data)
+ {
+ 	struct dp_ctrl_private *ctrl;
+ 
+--- a/qcom/opensource/display-drivers/msm/dp/dp_display.c
++++ b/qcom/opensource/display-drivers/msm/dp/dp_display.c
+@@ -4268,12 +4268,12 @@
+ 		dp->mst.cbs.set_drv_state(dp_display, mst_state);
+ }
+ 
+-static int dp_display_remove(struct platform_device *pdev)
++static void dp_display_remove(struct platform_device *pdev)
+ {
+ 	struct dp_display_private *dp;
+ 
+ 	if (!pdev)
+-		return -EINVAL;
++		return;
+ 
+ 	dp = platform_get_drvdata(pdev);
+ 
+@@ -4295,7 +4295,7 @@
+ 		dp->dp_display.dp_aux_ipc_log = NULL;
+ 	}
+ 
+-	return 0;
++	return;
+ }
+ 
+ static int dp_pm_prepare(struct device *dev)
+--- a/qcom/opensource/display-drivers/msm/dp/dp_drm.c
++++ b/qcom/opensource/display-drivers/msm/dp/dp_drm.c
+@@ -60,6 +60,7 @@
+ }
+ 
+ static int dp_bridge_attach(struct drm_bridge *dp_bridge,
++			    struct drm_encoder *encoder,
+ 				enum drm_bridge_attach_flags flags)
+ {
+ 	struct dp_bridge *bridge = to_dp_bridge(dp_bridge);
+--- a/qcom/opensource/display-drivers/msm/dp/dp_gpio_hpd.c
++++ b/qcom/opensource/display-drivers/msm/dp/dp_gpio_hpd.c
+@@ -187,7 +187,7 @@
+ 	return rc;
+ }
+ 
+-int dp_gpio_hpd_register(struct dp_hpd *dp_hpd)
++static int dp_gpio_hpd_register(struct dp_hpd *dp_hpd)
+ {
+ 	struct dp_gpio_hpd_private *gpio_hpd;
+ 	int edge;
+--- a/qcom/opensource/display-drivers/msm/dp/dp_lphw_hpd.c
++++ b/qcom/opensource/display-drivers/msm/dp/dp_lphw_hpd.c
+@@ -245,7 +245,7 @@
+ 	return 0;
+ }
+ 
+-int dp_lphw_hpd_register(struct dp_hpd *dp_hpd)
++static int dp_lphw_hpd_register(struct dp_hpd *dp_hpd)
+ {
+ 	struct dp_lphw_hpd_private *lphw_hpd;
+ 	int rc = 0;
+--- a/qcom/opensource/display-drivers/msm/dp/dp_mst_drm.c
++++ b/qcom/opensource/display-drivers/msm/dp/dp_mst_drm.c
+@@ -27,6 +27,7 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include "dp_mst_drm.h"
+ #include <linux/init.h>
+ #include <linux/errno.h>
+ #include <linux/version.h>
+@@ -75,7 +76,6 @@
+ 			struct drm_dp_mst_topology_state *mst_state,
+ 			struct drm_dp_mst_atomic_payload *payload);
+ 	int (*update_payload_part2)(struct drm_dp_mst_topology_mgr *mgr,
+-			struct drm_atomic_state *state,
+ 			struct drm_dp_mst_atomic_payload *payload);
+ #if (KERNEL_VERSION(6, 7, 0) <= LINUX_VERSION_CODE)
+ 	void (*reset_vcpi_slots)(struct drm_dp_mst_topology_mgr *mgr,
+@@ -397,6 +397,7 @@
+ /* DP MST Bridge OPs */
+ 
+ static int dp_mst_bridge_attach(struct drm_bridge *dp_bridge,
++				struct drm_encoder *encoder,
+ 				enum drm_bridge_attach_flags flags)
+ {
+ 	struct dp_mst_bridge *bridge;
+@@ -770,7 +771,7 @@
+ 		return;
+ 	}
+ 
+-	mst->mst_fw_cbs->update_payload_part2(&mst->mst_mgr, mst_state->base.state, payload);
++	mst->mst_fw_cbs->update_payload_part2(&mst->mst_mgr, payload);
+ #else
+ 	mst->mst_fw_cbs->update_payload_part2(&mst->mst_mgr);
+ #endif
+@@ -1312,7 +1313,7 @@
+ 	return rc;
+ }
+ 
+-enum drm_mode_status dp_mst_connector_mode_valid(
++static enum drm_mode_status dp_mst_connector_mode_valid(
+ 		struct drm_connector *connector,
+ 		struct drm_display_mode *mode,
+ 		void *display, const struct msm_resource_caps_info *avail_res)
+@@ -1390,7 +1391,7 @@
+ 	return dp_display->validate_mode(dp_display, dp_panel, mode, avail_res);
+ }
+ 
+-int dp_mst_connector_get_mode_info(struct drm_connector *connector,
++static int dp_mst_connector_get_mode_info(struct drm_connector *connector,
+ 		const struct drm_display_mode *drm_mode,
+ 		struct msm_sub_mode *sub_mode,
+ 		struct msm_mode_info *mode_info,
+--- a/qcom/opensource/display-drivers/msm/dp/dp_mst_sim.c
++++ b/qcom/opensource/display-drivers/msm/dp/dp_mst_sim.c
+@@ -1648,7 +1648,7 @@
+ 	return 0;
+ }
+ 
+-int dp_sim_probe(struct platform_device *pdev)
++static int __maybe_unused dp_sim_probe(struct platform_device *pdev)
+ {
+ 	struct dp_sim_device *dp_sim_dev;
+ 	struct dp_aux_bridge *bridge;
+@@ -1689,7 +1689,7 @@
+ 	return ret;
+ }
+ 
+-int dp_sim_remove(struct platform_device *pdev)
++static int __maybe_unused dp_sim_remove(struct platform_device *pdev)
+ {
+ 	struct dp_sim_device *dp_sim_dev;
+ 
+--- a/qcom/opensource/display-drivers/msm/dp/dp_panel.c
++++ b/qcom/opensource/display-drivers/msm/dp/dp_panel.c
+@@ -2118,7 +2118,7 @@
+ 	catalog->pps_flush(catalog);
+ }
+ 
+-int dp_panel_get_src_crc(struct dp_panel *dp_panel, u16 *crc)
++static int dp_panel_get_src_crc(struct dp_panel *dp_panel, u16 *crc)
+ {
+ 	struct dp_catalog_panel *catalog;
+ 	struct dp_panel_private *panel;
+@@ -2129,7 +2129,7 @@
+ 	return catalog->get_src_crc(catalog, crc);
+ }
+ 
+-int dp_panel_get_sink_crc(struct dp_panel *dp_panel, u16 *crc)
++static int dp_panel_get_sink_crc(struct dp_panel *dp_panel, u16 *crc)
+ {
+ 	int rc = 0;
+ 	struct dp_panel_private *panel;
+@@ -2157,7 +2157,7 @@
+ 	return rc;
+ }
+ 
+-int dp_panel_sink_crc_enable(struct dp_panel *dp_panel, bool enable)
++static int dp_panel_sink_crc_enable(struct dp_panel *dp_panel, bool enable)
+ {
+ 	int rc = 0;
+ 	struct dp_panel_private *panel;
+@@ -2187,7 +2187,7 @@
+ 	return rc;
+ }
+ 
+-bool dp_panel_get_panel_on(struct dp_panel *dp_panel)
++static bool dp_panel_get_panel_on(struct dp_panel *dp_panel)
+ {
+ 	struct dp_panel_private *panel;
+ 
+--- a/qcom/opensource/display-drivers/msm/dp/dp_panel_tu.c
++++ b/qcom/opensource/display-drivers/msm/dp/dp_panel_tu.c
+@@ -462,7 +462,7 @@
+ 	tu->extra_pclk_cycles_in_link_clk = fixp2int_ceil(temp1_fp);
+ }
+ 
+-void dp_tu_update_timings(struct dp_tu_calc_input *in, struct tu_algo_data *tu)
++static void dp_tu_update_timings(struct dp_tu_calc_input *in, struct tu_algo_data *tu)
+ {
+ 	int nlanes = in->nlanes;
+ 	int dsc_num_slices = in->num_of_dsc_slices;
+--- a/qcom/opensource/display-drivers/msm/dp/dp_pll.c
++++ b/qcom/opensource/display-drivers/msm/dp/dp_pll.c
+@@ -256,7 +256,7 @@
+ 	return rc;
+ }
+ 
+-static int dp_pll_driver_remove(struct platform_device *pdev)
++static void dp_pll_driver_remove(struct platform_device *pdev)
+ {
+ 	struct dp_pll *pll = platform_get_drvdata(pdev);
+ 
+@@ -266,7 +266,7 @@
+ 
+ 	platform_set_drvdata(pdev, NULL);
+ 
+-	return 0;
++	return;
+ }
+ 
+ static struct platform_driver dp_pll_platform_driver = {
+--- a/qcom/opensource/display-drivers/msm/dp/dp_pll_3nm.c
++++ b/qcom/opensource/display-drivers/msm/dp/dp_pll_3nm.c
+@@ -372,7 +372,7 @@
+ 	TSYNC_DONE,
+ };
+ 
+-char *dp_3nm_pll_get_status_name(enum dp_3nm_pll_status status)
++static char *dp_3nm_pll_get_status_name(enum dp_3nm_pll_status status)
+ {
+ 	switch (status) {
+ 	case C_READY:
+@@ -624,7 +624,7 @@
+ 	return rc;
+ }
+ 
+-unsigned long dp_vco_recalc_rate_3nm(struct dp_pll *pll)
++static unsigned long __maybe_unused dp_vco_recalc_rate_3nm(struct dp_pll *pll)
+ {
+ 	u32 hsclk_sel, link_clk_divsel, hsclk_div, link_clk_div = 0;
+ 	unsigned long vco_rate = 0;
+--- a/qcom/opensource/display-drivers/msm/dp/dp_pll_4nm.c
++++ b/qcom/opensource/display-drivers/msm/dp/dp_pll_4nm.c
+@@ -392,7 +392,7 @@
+ 	TSYNC_DONE,
+ };
+ 
+-char *dp_4nm_pll_get_status_name(enum dp_4nm_pll_status status)
++static char *dp_4nm_pll_get_status_name(enum dp_4nm_pll_status status)
+ {
+ 	switch (status) {
+ 	case C_READY:
+@@ -652,7 +652,7 @@
+ 	return rc;
+ }
+ 
+-unsigned long dp_vco_recalc_rate_4nm(struct dp_pll *pll)
++static unsigned long __maybe_unused dp_vco_recalc_rate_4nm(struct dp_pll *pll)
+ {
+ 	u32 hsclk_sel, link_clk_divsel, hsclk_div, link_clk_div = 0;
+ 	unsigned long vco_rate = 0;
+--- a/qcom/opensource/display-drivers/msm/dp/dp_pll_5nm.c
++++ b/qcom/opensource/display-drivers/msm/dp/dp_pll_5nm.c
+@@ -374,7 +374,7 @@
+ 	TSYNC_DONE,
+ };
+ 
+-char *dp_5nm_pll_get_status_name(enum dp_5nm_pll_status status)
++static char *dp_5nm_pll_get_status_name(enum dp_5nm_pll_status status)
+ {
+ 	switch (status) {
+ 	case C_READY:
+@@ -634,7 +634,7 @@
+ 	return rc;
+ }
+ 
+-unsigned long dp_vco_recalc_rate_5nm(struct dp_pll *pll)
++static unsigned long __maybe_unused dp_vco_recalc_rate_5nm(struct dp_pll *pll)
+ {
+ 	u32 hsclk_sel, link_clk_divsel, hsclk_div, link_clk_div = 0;
+ 	unsigned long vco_rate = 0;
+--- a/qcom/opensource/display-drivers/msm/dsi/dsi_clk_manager.c
++++ b/qcom/opensource/display-drivers/msm/dsi/dsi_clk_manager.c
+@@ -284,7 +284,7 @@
+ 	clk_disable_unprepare(clk->byte_clk);
+ }
+ 
+-int dsi_core_clk_start(struct dsi_core_clks *c_clks)
++static int dsi_core_clk_start(struct dsi_core_clks *c_clks)
+ {
+ 	int rc = 0;
+ 
+@@ -347,7 +347,7 @@
+ 	return rc;
+ }
+ 
+-int dsi_core_clk_stop(struct dsi_core_clks *c_clks)
++static int dsi_core_clk_stop(struct dsi_core_clks *c_clks)
+ {
+ 	int rc = 0;
+ 
+@@ -1351,7 +1351,7 @@
+ 	return rc;
+ }
+ 
+-int dsi_clk_req_state(void *client, enum dsi_clk_type clk,
++static int dsi_clk_req_state(void *client, enum dsi_clk_type clk,
+ 	enum dsi_clk_state state, bool take_lock)
+ {
+ 	int rc = 0;
+--- a/qcom/opensource/display-drivers/msm/dsi/dsi_ctrl.c
++++ b/qcom/opensource/display-drivers/msm/dsi/dsi_ctrl.c
+@@ -2060,16 +2060,16 @@
+ 
+ 		msm_gem_put_iova(dsi_ctrl->tx_cmd_buf, aspace);
+ 
+-		mutex_lock(&dsi_ctrl->drm_dev->struct_mutex);
++		mutex_lock(msm_gem_mutex(dsi_ctrl->drm_dev));
+ 		msm_gem_free_object(dsi_ctrl->tx_cmd_buf);
+-		mutex_unlock(&dsi_ctrl->drm_dev->struct_mutex);
++		mutex_unlock(msm_gem_mutex(dsi_ctrl->drm_dev));
+ 		dsi_ctrl->tx_cmd_buf = NULL;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-int dsi_ctrl_buffer_init(struct dsi_ctrl *dsi_ctrl)
++static int __maybe_unused dsi_ctrl_buffer_init(struct dsi_ctrl *dsi_ctrl)
+ {
+ 	int rc = 0;
+ 	u64 iova = 0;
+@@ -2269,7 +2269,7 @@
+ 	return rc;
+ }
+ 
+-static int dsi_ctrl_dev_remove(struct platform_device *pdev)
++static void dsi_ctrl_dev_remove(struct platform_device *pdev)
+ {
+ 	int rc = 0;
+ 	struct dsi_ctrl *dsi_ctrl;
+@@ -2311,7 +2311,7 @@
+ 	devm_kfree(&pdev->dev, dsi_ctrl);
+ 
+ 	platform_set_drvdata(pdev, NULL);
+-	return 0;
++	return;
+ }
+ 
+ static struct platform_driver dsi_ctrl_driver = {
+--- a/qcom/opensource/display-drivers/msm/dsi/dsi_display.c
++++ b/qcom/opensource/display-drivers/msm/dsi/dsi_display.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/list.h>
++#include <linux/vmalloc.h>
+ #include <linux/of.h>
+ #include <linux/of_gpio.h>
+ #include <linux/err.h>
+@@ -696,9 +697,9 @@
+ 	msm_gem_address_space_unregister_cb(display->aspace,
+ 			dsi_display_aspace_cb_locked, display);
+ free_gem:
+-	mutex_lock(&display->drm_dev->struct_mutex);
++	mutex_lock(msm_gem_mutex(display->drm_dev));
+ 	msm_gem_free_object(display->tx_cmd_buf);
+-	mutex_unlock(&display->drm_dev->struct_mutex);
++	mutex_unlock(msm_gem_mutex(display->drm_dev));
+ error:
+ 	return rc;
+ }
+@@ -1216,7 +1217,7 @@
+ 	return rc;
+ }
+ 
+-void dsi_display_toggle_error_interrupt_status(struct dsi_display * display, bool enable)
++static void dsi_display_toggle_error_interrupt_status(struct dsi_display *display, bool enable)
+ {
+ 	int i = 0;
+ 	struct dsi_display_ctrl *ctrl;
+@@ -4957,7 +4958,7 @@
+ 	return true;
+ }
+ 
+-void dsi_display_update_byte_intf_div(struct dsi_display *display)
++static void dsi_display_update_byte_intf_div(struct dsi_display *display)
+ {
+ 	struct dsi_host_common_cfg *config;
+ 	struct dsi_display_ctrl *m_ctrl;
+@@ -6796,22 +6797,22 @@
+ 	return rc;
+ }
+ 
+-int dsi_display_dev_remove(struct platform_device *pdev)
+-{
+-	int rc = 0, i = 0;
++void dsi_display_dev_remove(struct platform_device *pdev)
++{
++	int i = 0;
+ 	struct dsi_display *display;
+ 	struct dsi_display_ctrl *ctrl;
+ 
+ 	if (!pdev) {
+ 		DSI_ERR("Invalid device\n");
+-		return -EINVAL;
++		return;
+ 	}
+ 
+ 	display = platform_get_drvdata(pdev);
+ 	if (!display || !display->panel_node) {
+ 		DSI_ERR("invalid param, display %pK, display panel node %pK\n",
+ 				display, display ? display->panel_node : NULL);
+-		return -EINVAL;
++		return;
+ 	}
+ 
+ #ifdef MI_DISPLAY_MODIFY
+@@ -6844,7 +6845,7 @@
+ 
+ 	platform_set_drvdata(pdev, NULL);
+ 	devm_kfree(&pdev->dev, display);
+-	return rc;
++	return;
+ }
+ 
+ int dsi_display_get_num_of_displays(struct drm_device *dev)
+@@ -7591,7 +7592,7 @@
+ 	return 0;
+ }
+ 
+-void dsi_display_adjust_mode_timing(struct dsi_display *display,
++static void dsi_display_adjust_mode_timing(struct dsi_display *display,
+ 			struct dsi_display_mode *dsi_mode,
+ 			int lanes, int bpp)
+ {
+@@ -7860,7 +7861,7 @@
+ 	dsi_panel_put_mode(mode);
+ }
+ 
+-int dsi_display_get_modes_helper(struct dsi_display *display,
++static int dsi_display_get_modes_helper(struct dsi_display *display,
+ 	struct dsi_display_ctrl *ctrl, u32 timing_mode_count,
+ 	struct dsi_dfps_capabilities dfps_caps, struct dsi_qsync_capabilities *qsync_caps,
+ 	struct dsi_dyn_clk_caps *dyn_clk_caps, struct dsi_avr_capabilities *avr_caps)
+@@ -10151,7 +10152,12 @@
+ 	}
+ 
+ 	dsi = &panel->mipi_device;
+-	rc = mipi_dsi_dcs_set_tear_off(dsi);
++	{
++		struct mipi_dsi_multi_context ctx = { .dsi = dsi };
++
++		mipi_dsi_dcs_set_tear_off_multi(&ctx);
++		rc = ctx.accum_err;
++	}
+ 
+ error:
+ 	mutex_unlock(&panel->panel_lock);
+--- a/qcom/opensource/display-drivers/msm/dsi/dsi_display.h
++++ b/qcom/opensource/display-drivers/msm/dsi/dsi_display.h
+@@ -311,7 +311,7 @@
+ };
+ 
+ int dsi_display_dev_probe(struct platform_device *pdev);
+-int dsi_display_dev_remove(struct platform_device *pdev);
++void dsi_display_dev_remove(struct platform_device *pdev);
+ 
+ /**
+  * dsi_display_get_num_of_displays() - returns number of display devices
+--- a/qcom/opensource/display-drivers/msm/dsi/dsi_drm.c
++++ b/qcom/opensource/display-drivers/msm/dsi/dsi_drm.c
+@@ -185,6 +185,7 @@
+ }
+ 
+ static int dsi_bridge_attach(struct drm_bridge *bridge,
++			     struct drm_encoder *encoder,
+ 			enum drm_bridge_attach_flags flags)
+ {
+ 	struct dsi_bridge *c_bridge = to_dsi_bridge(bridge);
+@@ -625,7 +626,7 @@
+ 	return true;
+ }
+ 
+-u32 dsi_drm_get_dfps_maxfps(void *display)
++static u32 dsi_drm_get_dfps_maxfps(void *display)
+ {
+ 	u32 dfps_maxfps = 0;
+ 	struct dsi_display *dsi_display = display;
+--- a/qcom/opensource/display-drivers/msm/dsi/dsi_parser.c
++++ b/qcom/opensource/display-drivers/msm/dsi/dsi_parser.c
+@@ -747,7 +747,7 @@
+ 	return (struct device_node *)matched_node;
+ }
+ 
+-struct dsi_parser_node *dsi_parser_get_node_by_name(
++static struct dsi_parser_node *dsi_parser_get_node_by_name(
+ 				struct dsi_parser_node *node,
+ 				char *name)
+ {
+--- a/qcom/opensource/display-drivers/msm/dsi/dsi_phy.c
++++ b/qcom/opensource/display-drivers/msm/dsi/dsi_phy.c
+@@ -493,7 +493,7 @@
+ 	return rc;
+ }
+ 
+-static int dsi_phy_driver_remove(struct platform_device *pdev)
++static void dsi_phy_driver_remove(struct platform_device *pdev)
+ {
+ 	int rc = 0;
+ 	struct msm_dsi_phy *phy = platform_get_drvdata(pdev);
+@@ -501,7 +501,7 @@
+ 
+ 	if (!pdev || !phy) {
+ 		DSI_PHY_ERR(phy, "Invalid device\n");
+-		return -EINVAL;
++		return;
+ 	}
+ 
+ 	mutex_lock(&dsi_phy_list_lock);
+@@ -538,7 +538,7 @@
+ 
+ 	platform_set_drvdata(pdev, NULL);
+ 
+-	return 0;
++	return;
+ }
+ 
+ static struct platform_driver dsi_phy_platform_driver = {
+--- a/qcom/opensource/display-drivers/msm/dsi/dsi_pll_3nm.c
++++ b/qcom/opensource/display-drivers/msm/dsi/dsi_pll_3nm.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include "dsi_catalog.h"
+ #include <linux/err.h>
+ #include <linux/iopoll.h>
+ #include <linux/delay.h>
+@@ -1607,7 +1608,7 @@
+ 	wmb();
+ }
+ 
+-void dsi_pll_3nm_trigger_resets_pre_enable(struct dsi_pll_resource *rsc)
++static void dsi_pll_3nm_trigger_resets_pre_enable(struct dsi_pll_resource *rsc)
+ {
+ 	int i;
+ 
+@@ -1682,7 +1683,7 @@
+ 	return rc;
+ }
+ 
+-int dsi_pll_3nm_program_slave(struct dsi_pll_resource *pll, bool skip_op)
++static int __maybe_unused dsi_pll_3nm_program_slave(struct dsi_pll_resource *pll, bool skip_op)
+ {
+ 	struct dsi_pll_resource *m_pll = pll_rsc_db[DSI_PLL_0];
+ 	u32 pll_post_div;
+--- a/qcom/opensource/display-drivers/msm/dsi/dsi_pll_4nm.c
++++ b/qcom/opensource/display-drivers/msm/dsi/dsi_pll_4nm.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include "dsi_catalog.h"
+ #include <linux/err.h>
+ #include <linux/iopoll.h>
+ #include <linux/delay.h>
+@@ -1597,7 +1598,7 @@
+ 	wmb();
+ }
+ 
+-void dsi_pll_4nm_trigger_resets_pre_enable(struct dsi_pll_resource *rsc)
++static void dsi_pll_4nm_trigger_resets_pre_enable(struct dsi_pll_resource *rsc)
+ {
+ 	int i;
+ 
+--- a/qcom/opensource/display-drivers/msm/dsi/dsi_pll_5nm.c
++++ b/qcom/opensource/display-drivers/msm/dsi/dsi_pll_5nm.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include "dsi_catalog.h"
+ #include <linux/err.h>
+ #include <linux/iopoll.h>
+ #include <linux/delay.h>
+--- a/qcom/opensource/display-drivers/msm/hdmi/hdmi_drm.c
++++ b/qcom/opensource/display-drivers/msm/hdmi/hdmi_drm.c
+@@ -401,6 +401,7 @@
+ }
+ 
+ static int hdmi_bridge_attach(struct drm_bridge *hdmi_bridge,
++				struct drm_encoder *encoder,
+ 				enum drm_bridge_attach_flags flags)
+ {
+ 	struct hdmi_bridge *bridge = to_hdmi_bridge(hdmi_bridge);
+--- a/qcom/opensource/display-drivers/msm/mi_disp/mi_disp_feature.c
++++ b/qcom/opensource/display-drivers/msm/mi_disp/mi_disp_feature.c
+@@ -38,15 +38,8 @@
+ 
+ struct disp_feature *mi_get_disp_feature(void)
+ {
+-	int ret = 0;
+-
+-	if (!g_disp_feature) {
+-		ret = mi_disp_feature_init();
+-		if (ret < 0)
+-			return NULL;
+-	}
+-
+-	return g_disp_feature;
++	/* Pair with publication after all client state and cdev setup. */
++	return smp_load_acquire(&g_disp_feature);
+ }
+ 
+ static int mi_disp_feature_thread_create(struct disp_feature *df, int disp_id)
+@@ -65,7 +58,9 @@
+ 	if (IS_ERR(dd_ptr->worker)) {
+ 		DISP_ERROR("failed to create disp_feature:%d kthread\n",
+ 			   disp_id);
+-		return PTR_ERR(dd_ptr->worker);
++		ret = PTR_ERR(dd_ptr->worker);
++		dd_ptr->worker = NULL;
++		return ret;
+ 	}
+ 	/* set realtime priority */
+ 	sched_set_fifo(dd_ptr->worker->task);
+@@ -91,6 +86,7 @@
+ 	dd_ptr = &df->d_display[disp_id];
+ 	if (dd_ptr->worker) {
+ 		kthread_destroy_worker(dd_ptr->worker);
++		dd_ptr->worker = NULL;
+ 	}
+ 
+ 	DISP_INFO("destroy disp_feature:%d kthread success\n", disp_id);
+@@ -185,6 +181,10 @@
+ 	device_unregister(dd_ptr->dev);
+ 	dd_ptr->dev = NULL;
+ err_exit:
++	dd_ptr->dev = NULL;
++	dd_ptr->display = NULL;
++	dd_ptr->disp_id = MI_DISP_MAX;
++	dd_ptr->intf_type = MI_INTF_MAX;
+ 	return ret;
+ }
+ 
+@@ -256,7 +256,8 @@
+ 	struct disp_pending_event *notify;
+ 	int len = 0;
+ 
+-	if (!df || !event || !event->length || !payload) {
++	if (!df || !event || !event->length || !payload ||
++	    event->length > 4096 - sizeof(struct disp_event_resp)) {
+ 		DISP_ERROR("dev %pK, event %pK disp_id %d len %d payload %pK\n",
+ 			   df, event, ((event) ? (event->disp_id) : -1),
+ 			   ((event) ? (event->length) : -1), payload);
+@@ -313,7 +314,8 @@
+ {
+ 	struct disp_event event;
+ 
+-	if (!is_support_disp_id(disp_id) || !is_support_disp_event_type(type)) {
++	if (!is_support_disp_id(disp_id) || !is_support_disp_event_type(type) ||
++	    len > sizeof(val)) {
+ 		DISP_ERROR("invalid display id(%d) or event type(%d)!\n",
+ 			   disp_id, type);
+ 		return -EINVAL;
+@@ -355,7 +357,7 @@
+ #endif
+ 	.poll = mi_disp_poll,
+ 	.read = mi_disp_read,
+-	.llseek = no_llseek,
++
+ };
+ 
+ int mi_disp_feature_init(void)
+@@ -368,8 +370,6 @@
+ 	ret = mi_disp_core_init();
+ 	if (ret < 0)
+ 		return -ENODEV;
+-
+-	mi_disp_log_init();
+ 
+ 	disp_core = mi_get_disp_core();
+ 	if (!disp_core)
+@@ -386,6 +386,17 @@
+ 		ret = -ENOMEM;
+ 		goto err_core_deinit;
+ 	}
++
++	df->version = MI_DISP_FEATURE_VERSION;
++	for (i = MI_DISP_PRIMARY; i < MI_DISP_MAX; i++) {
++		df->d_display[i].dev = NULL;
++		df->d_display[i].display = NULL;
++		df->d_display[i].disp_id = MI_DISP_MAX;
++		df->d_display[i].intf_type = MI_INTF_MAX;
++		mutex_init(&df->d_display[i].mutex_lock);
++	}
++	INIT_LIST_HEAD(&df->client_list);
++	spin_lock_init(&df->client_spinlock);
+ 
+ 	ret = mi_disp_cdev_register(DISP_FEATURE_DEVICE_NAME,
+ 				    &disp_feature_fops, &df->cdev);
+@@ -406,18 +417,10 @@
+ 		goto err_cdev_register;
+ 	}
+ 
+-	df->version = MI_DISP_FEATURE_VERSION;
+-	for (i = MI_DISP_PRIMARY; i < MI_DISP_MAX; i++) {
+-		df->d_display[i].dev = NULL;
+-		df->d_display[i].display = NULL;
+-		df->d_display[i].disp_id = MI_DISP_MAX;
+-		df->d_display[i].intf_type = MI_INTF_MAX;
+-		mutex_init(&df->d_display[i].mutex_lock);
+-	}
+-	INIT_LIST_HEAD(&df->client_list);
+-	spin_lock_init(&df->client_spinlock);
+-
+-	g_disp_feature = df;
++	/* Publish initialized locks, lists and the successful cdev together. */
++	smp_store_release(&g_disp_feature, df);
++
++	mi_disp_log_init();
+ 
+ 	DISP_INFO("mi disp_feature driver initialized!\n");
+ 
+--- a/qcom/opensource/display-drivers/msm/mi_disp/mi_disp_file.c
++++ b/qcom/opensource/display-drivers/msm/mi_disp/mi_disp_file.c
+@@ -35,6 +35,9 @@
+ 	struct disp_feature_client *client;
+ 	struct disp_feature *df = mi_get_disp_feature();
+ 
++	if (!df || inode->i_cdev != df->cdev)
++		return -ENODEV;
++
+ 	client = kzalloc(sizeof(*client), GFP_KERNEL);
+ 	if (!client)
+ 		return -ENOMEM;
+@@ -43,16 +46,17 @@
+ 	INIT_LIST_HEAD(&client->link);
+ 	init_waitqueue_head(&client->event_wait);
+ 	memset(client->disp, 0, sizeof(client->disp));
+-
+-	spin_lock(&df->client_spinlock);
+-	list_add_tail(&client->link, &df->client_list);
+-	spin_unlock(&df->client_spinlock);
+ 
+ 	INIT_LIST_HEAD(&client->event_list);
+ 	mutex_init(&client->event_lock);
+ 	mutex_init(&client->client_lock);
+ 	/* set aside 4k for event buffer */
+ 	client->event_space = 4096;
++	spin_lock(&df->client_spinlock);
++	list_add_tail(&client->link, &df->client_list);
++	spin_unlock(&df->client_spinlock);
++
++
+ 	file->private_data = client;
+ 
+ 	return 0;
+@@ -100,7 +104,10 @@
+ {
+ 	struct disp_feature_client *client = filp->private_data;
+ 	struct disp_feature *df = client->df;
+-	int ret = 0;
++	ssize_t ret = 0;
++
++	if (!count)
++		return 0;
+ 
+ 	ret = mutex_lock_interruptible(&client->event_lock);
+ 	if (ret)
+@@ -207,26 +214,44 @@
+ 		(struct disp_feature_ctl *)cur_work->data;
+ 
+ 	mi_dsi_display_set_disp_param(dd_ptr->display, ctl);
++	kfree(ctl->tx_ptr);
+ 
+ 	kfree(cur_work);
+ }
+ 
+ static int mi_disp_set_feature_queue_work(struct disp_display *dd_ptr,
+-					  void *data, u32 size)
+-{
++					void *data, u32 size)
++{
++	struct disp_feature_ctl *input = data, *copy;
+ 	struct disp_work *cur_work;
+ 
+-	cur_work = kzalloc(sizeof(struct disp_work) + size, GFP_ATOMIC);
++	if (size != sizeof(*input) || input->rx_len)
++		return -EINVAL;
++	if (IS_ERR_OR_NULL(dd_ptr->worker))
++		return -ENODEV;
++	cur_work = kzalloc(sizeof(*cur_work) + sizeof(*copy), GFP_KERNEL);
+ 	if (!cur_work)
+ 		return -ENOMEM;
+ 
++	copy = (void *)(cur_work + 1);
++	*copy = *input;
++	copy->tx_ptr = NULL;
++	if (input->tx_len) {
++		copy->tx_ptr = kmemdup(input->tx_ptr, input->tx_len, GFP_KERNEL);
++		if (!copy->tx_ptr) {
++			kfree(cur_work);
++			return -ENOMEM;
++		}
++	}
+ 	kthread_init_work(&cur_work->work, mi_disp_set_feature_work_handler);
+ 	cur_work->dd_ptr = dd_ptr;
+ 	cur_work->wq = &dd_ptr->pending_wq;
+-	cur_work->data = (u8 *)cur_work + sizeof(struct disp_work);
+-	memcpy(cur_work->data, data, size);
+-
+-	kthread_queue_work(dd_ptr->worker, &cur_work->work);
++	cur_work->data = copy;
++	if (!kthread_queue_work(dd_ptr->worker, &cur_work->work)) {
++		kfree(copy->tx_ptr);
++		kfree(cur_work);
++		return -ENODEV;
++	}
+ 
+ 	return 0;
+ }
+@@ -516,6 +541,10 @@
+ {
+ 	struct disp_work *cur_work;
+ 
++	if (size != sizeof(u32))
++		return -EINVAL;
++	if (IS_ERR_OR_NULL(dd_ptr->worker))
++		return -ENODEV;
+ 	cur_work = kzalloc(sizeof(struct disp_work) + size, GFP_ATOMIC);
+ 	if (!cur_work)
+ 		return -ENOMEM;
+@@ -527,7 +556,10 @@
+ 	cur_work->data = (u8 *)cur_work + sizeof(struct disp_work);
+ 	memcpy(cur_work->data, data, size);
+ 
+-	kthread_queue_work(dd_ptr->worker, &cur_work->work);
++	if (!kthread_queue_work(dd_ptr->worker, &cur_work->work)) {
++		kfree(cur_work);
++		return -ENODEV;
++	}
+ 
+ 	return 0;
+ }
+@@ -869,7 +901,7 @@
+ 		dd_ptr = &df->d_display[disp_id];
+ 		if (dd_ptr->intf_type == MI_INTF_DSI) {
+ 			ctl.tx_state = req->tx_state;
+-			if (!req->tx_len || !req->rx_len) {
++			if (!req->tx_len || !req->rx_len || req->rx_len > U32_MAX - 3) {
+ 				DISP_ERROR("invalid params\n");
+ 				ret = -EINVAL;
+ 				goto exit;
+@@ -982,27 +1014,44 @@
+ 		(struct disp_count_info *)cur_work->data;
+ 
+ 	mi_dsi_display_set_count_info(dd_ptr->display, count_info);
++	kfree(count_info->tx_ptr);
+ 
+ 	kfree(cur_work);
+ }
+ 
+ static int mi_disp_ioctl_set_count_info_queue_work(struct disp_display *dd_ptr,
+-						   void *data, u32 size)
+-{
++					void *data, u32 size)
++{
++	struct disp_count_info *input = data, *copy;
+ 	struct disp_work *cur_work;
+ 
+-	cur_work = kzalloc(sizeof(struct disp_work) + size, GFP_ATOMIC);
++	if (size != sizeof(*input) || input->rx_len)
++		return -EINVAL;
++	if (IS_ERR_OR_NULL(dd_ptr->worker))
++		return -ENODEV;
++	cur_work = kzalloc(sizeof(*cur_work) + sizeof(*copy), GFP_KERNEL);
+ 	if (!cur_work)
+ 		return -ENOMEM;
+ 
+-	kthread_init_work(&cur_work->work,
+-			  mi_disp_ioctl_set_count_info_work_handler);
++	copy = (void *)(cur_work + 1);
++	*copy = *input;
++	copy->tx_ptr = NULL;
++	if (input->tx_len) {
++		copy->tx_ptr = kmemdup(input->tx_ptr, input->tx_len, GFP_KERNEL);
++		if (!copy->tx_ptr) {
++			kfree(cur_work);
++			return -ENOMEM;
++		}
++	}
++	kthread_init_work(&cur_work->work, mi_disp_ioctl_set_count_info_work_handler);
+ 	cur_work->dd_ptr = dd_ptr;
+ 	cur_work->wq = &dd_ptr->pending_wq;
+-	cur_work->data = (u8 *)cur_work + sizeof(struct disp_work);
+-	memcpy(cur_work->data, data, size);
+-
+-	kthread_queue_work(dd_ptr->worker, &cur_work->work);
++	cur_work->data = copy;
++	if (!kthread_queue_work(dd_ptr->worker, &cur_work->work)) {
++		kfree(copy->tx_ptr);
++		kfree(cur_work);
++		return -ENODEV;
++	}
+ 
+ 	return 0;
+ }
+--- a/qcom/opensource/display-drivers/msm/mi_disp/mi_disp_log.c
++++ b/qcom/opensource/display-drivers/msm/mi_disp/mi_disp_log.c
+@@ -84,7 +84,7 @@
+ 
+ struct disp_log *g_disp_log = NULL;
+ 
+-bool mi_disp_log_is_initialized(void)
++static bool mi_disp_log_is_initialized(void)
+ {
+ 	return g_disp_log ? g_disp_log->initialized : false;
+ }
+@@ -92,7 +92,7 @@
+ static int mi_disp_log_printk_func(struct log_buf *log_buf, const char *fmt,
+ 				   va_list args)
+ {
+-	static char textbuf[1024];
++	char textbuf[1024];
+ 	char *text = textbuf;
+ 	u64 ts_usec, ts_sec;
+ 	u32 text_len;
+@@ -103,9 +103,9 @@
+ 	ts_usec = local_clock() / 1000;
+ 	ts_sec = ts_usec / 1000000;
+ 	ts_usec %= 1000000;
+-	text_len = snprintf(text, sizeof(textbuf), "Timestamp:[%5lld.%06lld] ",
++	text_len = scnprintf(text, sizeof(textbuf), "Timestamp:[%5lld.%06lld] ",
+ 			    ts_sec, ts_usec);
+-	text_len += vsnprintf(text + text_len, sizeof(textbuf) - text_len, fmt,
++	text_len += vscnprintf(text + text_len, sizeof(textbuf) - text_len, fmt,
+ 			      args);
+ 	for (i = 0; i < text_len; i++) {
+ 		log_buf->buf[log_buf->pos.offset++] = *text++;
+@@ -236,52 +236,30 @@
+ 	va_end(args);
+ }
+ EXPORT_SYMBOL(disp_kernel_timer_log_printk);
+-
+ static int mi_disp_log_read_stats(struct log_buf *log,
+-				  struct disp_log_read *read_ptr, size_t count)
+-{
+-	uint32_t wrap_start;
+-	uint32_t wrap_end;
+-	uint32_t wrap_cnt;
+-	int max_len = DISP_LOG_BUF_SIZE;
+-	int len = 0;
+-	int i = 0;
+-	struct log_pos *log_start = &read_ptr->read_pos;
+-
+-	wrap_start = log_start->wrap;
+-	wrap_end = log->pos.wrap;
+-
+-	/* Calculate difference in # of buffer wrap-arounds */
+-	if (wrap_end >= wrap_start)
+-		wrap_cnt = wrap_end - wrap_start;
+-	else {
+-		/* wrap counter has wrapped around, invalidate start position */
+-		wrap_cnt = 2;
+-	}
+-
+-	if (wrap_cnt > 1) {
+-		/* end position has wrapped around more than once, */
+-		/* current start no longer valid                   */
+-		log_start->wrap = log->pos.wrap - 1;
+-		log_start->offset = log->pos.offset + 1;
+-	} else if ((wrap_cnt == 1) && (log->pos.offset > log_start->offset)) {
+-		/* end position has overwritten start */
+-		log_start->offset = log->pos.offset + 1;
+-	}
+-
+-	max_len = (count > DISP_LOG_BUF_SIZE) ? DISP_LOG_BUF_SIZE : count;
+-
+-	/* Read from ring buff while there is data and space in return buff */
+-	while ((log_start->offset != log->pos.offset) && (len < max_len)) {
+-		read_ptr->buf[i++] = log->buf[log_start->offset];
+-		log_start->offset = (log_start->offset + 1) % log->size;
+-		if (log_start->offset == 0)
+-			++log_start->wrap;
+-		++len;
+-	}
+-	if (log_start->offset == log->pos.offset) {
++				struct disp_log_read *read_ptr, size_t count)
++{
++	struct log_pos *start = &read_ptr->read_pos;
++	unsigned long flags;
++	u32 wraps;
++	int len = 0, max_len = min_t(size_t, count, DISP_LOG_BUF_SIZE);
++
++	spin_lock_irqsave(&log->lock, flags);
++	wraps = log->pos.wrap - start->wrap;
++	if (start->offset >= log->size || wraps > 1 ||
++	    (wraps == 1 && log->pos.offset >= start->offset)) {
++		start->offset = (log->pos.offset + 1) % log->size;
++		start->wrap = log->pos.wrap - (start->offset > log->pos.offset);
++	}
++	while (start->offset != log->pos.offset && len < max_len) {
++		read_ptr->buf[len++] = log->buf[start->offset];
++		start->offset = (start->offset + 1) % log->size;
++		if (!start->offset)
++			start->wrap++;
++	}
++	if (start->offset == log->pos.offset)
+ 		atomic_set(&log->wait, 1);
+-	}
++	spin_unlock_irqrestore(&log->lock, flags);
+ 
+ 	return len;
+ }
+@@ -326,7 +304,11 @@
+ 	struct disp_log_read *read_ptr = file->private_data;
+ 	char *input = NULL;
+ 
+-	input = kmalloc(count, GFP_KERNEL);
++	if (!count)
++		return 0;
++	if (count > PAGE_SIZE)
++		return -E2BIG;
++	input = kmalloc(count + 1, GFP_KERNEL);
+ 	if (!input) {
+ 		return -ENOMEM;
+ 	}
+@@ -335,8 +317,14 @@
+ 		ret = -EFAULT;
+ 		goto exit;
+ 	}
+-	input[count - 1] = '\0';
++	input[count] = '\0';
++	ret = mutex_lock_interruptible(&read_ptr->lock);
++	if (ret)
++		goto exit;
+ 	ret = kstrtou8(input, 10, &read_ptr->log_type);
++	if (!ret && read_ptr->log_type >= LOG_TYPE_MAX)
++		ret = -EINVAL;
++	mutex_unlock(&read_ptr->lock);
+ 	if (ret) {
+ 		DISP_ERROR("input buffer conversion failed\n");
+ 		goto exit;
+@@ -347,7 +335,7 @@
+ 	return ret ? ret : count;
+ }
+ 
+-int mi_disp_log_debugfs_open(struct inode *inode, struct file *file)
++static int mi_disp_log_debugfs_open(struct inode *inode, struct file *file)
+ {
+ 	struct disp_log_read *read_ptr = NULL;
+ 
+@@ -391,11 +379,15 @@
+ 	struct log_buf *log_buf = NULL;
+ 	char *input = NULL;
+ 
++	if (!count)
++		return 0;
++	if (count > PAGE_SIZE)
++		return -E2BIG;
+ 	ret = mutex_lock_interruptible(&disp_log->lock);
+ 	if (ret)
+ 		return ret;
+ 
+-	input = kmalloc(count, GFP_KERNEL);
++	input = kmalloc(count + 1, GFP_KERNEL);
+ 	if (!input) {
+ 		ret = -ENOMEM;
+ 		goto err_exit;
+@@ -406,6 +398,7 @@
+ 		goto err_free_mem;
+ 	}
+ 
++	input[count] = '\0';
+ 	log_buf = &disp_log->log[LOG_TYPE_USER];
+ 	ret = mi_disp_log_user_printk(log_buf, "%s", input);
+ 
+@@ -413,7 +406,7 @@
+ 	kfree(input);
+ err_exit:
+ 	mutex_unlock(&disp_log->lock);
+-	return ret;
++	return ret < 0 ? ret : count;
+ }
+ 
+ static ssize_t mi_disp_log_read(struct file *file, char __user *buf,
+@@ -444,24 +437,35 @@
+ 	return ret;
+ }
+ 
+-int mi_disp_log_open(struct inode *inode, struct file *file)
+-{
+-	struct disp_log_read *read_ptr = NULL;
+-
+-	file->private_data = g_disp_log;
+-
+-	if (g_disp_log->read_ptr) {
+-		DISP_ERROR("dev is opend \n");
+-		return -ENOMEM;
+-	}
+-	read_ptr = kzalloc(sizeof(struct disp_log_read), GFP_KERNEL);
+-	if (!read_ptr)
+-		return -ENOMEM;
+-	mutex_init(&read_ptr->lock);
+-	g_disp_log->read_ptr = read_ptr;
+-	return 0;
+-}
+-__poll_t mi_disp_log_poll(struct file *filp, struct poll_table_struct *wait)
++static int mi_disp_log_open(struct inode *inode, struct file *file)
++{
++	struct disp_log *log;
++	struct disp_log_read *reader;
++	int ret = 0;
++
++	/* Pair with publication after all ring buffers and cdev setup. */
++	log = smp_load_acquire(&g_disp_log);
++	if (!log || !log->initialized || inode->i_cdev != log->cdev)
++		return -ENODEV;
++
++	mutex_lock(&log->lock);
++	if (log->read_ptr) {
++		ret = -EBUSY;
++		goto out;
++	}
++	reader = kzalloc(sizeof(*reader), GFP_KERNEL);
++	if (!reader) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	mutex_init(&reader->lock);
++	log->read_ptr = reader;
++	file->private_data = log;
++out:
++	mutex_unlock(&log->lock);
++	return ret;
++}
++static __poll_t mi_disp_log_poll(struct file *filp, struct poll_table_struct *wait)
+ {
+ 	struct disp_log *disp_log = filp->private_data;
+ 	__poll_t mask = 0;
+@@ -470,14 +474,17 @@
+ 		mask |= EPOLLIN | EPOLLRDNORM;
+ 	return mask;
+ }
+-int mi_disp_log_release(struct inode *inode, struct file *file)
++static int mi_disp_log_release(struct inode *inode, struct file *file)
+ {
+ 	struct disp_log *disp_log = file->private_data;
+ 	if (!disp_log)
+ 		return 0;
++	mutex_lock(&disp_log->lock);
+ 	mutex_destroy(&disp_log->read_ptr->lock);
+ 	kfree(disp_log->read_ptr);
+ 	disp_log->read_ptr = NULL;
++	file->private_data = NULL;
++	mutex_unlock(&disp_log->lock);
+ 	return 0;
+ }
+ 
+@@ -488,7 +495,7 @@
+ 	.write = mi_disp_log_write,
+ 	.release = mi_disp_log_release,
+ 	.poll = mi_disp_log_poll,
+-	.llseek = no_llseek,
++
+ };
+ 
+ static ssize_t info_show(struct device *device, struct device_attribute *attr,
+@@ -647,7 +654,8 @@
+ 	}
+ 
+ 	disp_log->initialized = true;
+-	g_disp_log = disp_log;
++	/* Publish initialized buffers, cdev identity and the reader lock together. */
++	smp_store_release(&g_disp_log, disp_log);
+ 
+ 	DISP_INFO("mi disp_log driver initialized!\n");
+ 
+--- a/qcom/opensource/display-drivers/msm/mi_disp/mi_disp_parser.c
++++ b/qcom/opensource/display-drivers/msm/mi_disp/mi_disp_parser.c
+@@ -6,6 +6,7 @@
+ 
+ #define pr_fmt(fmt) "mi-disp-parse:[%s:%d] " fmt, __func__, __LINE__
+ #include <linux/delay.h>
++#include "mi_disp_parser.h"
+ #include <linux/slab.h>
+ #include <linux/gpio.h>
+ #include <linux/of_gpio.h>
+--- a/qcom/opensource/display-drivers/msm/mi_disp/mi_disp_procfs.c
++++ b/qcom/opensource/display-drivers/msm/mi_disp/mi_disp_procfs.c
+@@ -6,6 +6,7 @@
+ 
+ #define pr_fmt(fmt) "mi-disp-procfs:[%s:%d] " fmt, __func__, __LINE__
+ #include <linux/slab.h>
++#include "mi_disp_procfs.h"
+ #include <linux/uaccess.h>
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
+@@ -69,7 +70,11 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	input = kmalloc(count, GFP_KERNEL);
++	if (!count)
++		return 0;
++	if (count > PAGE_SIZE)
++		return -E2BIG;
++	input = kmalloc(count + 1, GFP_KERNEL);
+ 	if (!input) {
+ 		return -ENOMEM;
+ 	}
+@@ -78,7 +83,7 @@
+ 		kfree(input);
+ 		return -EFAULT;
+ 	}
+-	input[count - 1] = '\0';
++	input[count] = '\0';
+ 	DISP_DEBUG("copy_from_user input: %s\n", input);
+ 	input_dup = input;
+ 
+@@ -153,16 +158,19 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	input = kmalloc(count, GFP_KERNEL);
+-	if (!input) {
++	if (!count)
++		return 0;
++	if (count > PAGE_SIZE)
++		return -E2BIG;
++	input = kmalloc(count + 1, GFP_KERNEL);
++	if (!input)
+ 		return -ENOMEM;
+-	}
+ 	if (copy_from_user(input, buf, count)) {
+ 		DISP_ERROR("copy from user failed\n");
+ 		ret = -EFAULT;
+ 		goto exit;
+ 	}
+-	input[count - 1] = '\0';
++	input[count] = '\0';
+ 	DISP_DEBUG("copy_from_user input: %s\n", input);
+ 
+ 	ret = mi_dsi_display_set_mipi_rw(dd_ptr->display, input);
+@@ -225,12 +233,16 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (copy_from_user(&cmd_buffer, buf, count)) {
++	if (!count)
++		return 0;
++	if (count >= sizeof(cmd_buffer))
++		return -E2BIG;
++	if (copy_from_user(cmd_buffer, buf, count)) {
+ 		DISP_ERROR("copy from user failed\n");
+ 		ret = -EFAULT;
+ 		goto exit;
+ 	}
+-	cmd_buffer[count - 1] = '\0';
++	cmd_buffer[count] = '\0';
+ 
+ 	DISP_DEBUG("copy_from_user input: %s\n", cmd_buffer);
+ 	mi_dsi_display_set_dsi_phy_rw(dd_ptr, cmd_buffer);
+@@ -290,12 +302,16 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (copy_from_user(&cmd_buffer, buf, count)) {
++	if (!count)
++		return 0;
++	if (count >= sizeof(cmd_buffer))
++		return -E2BIG;
++	if (copy_from_user(cmd_buffer, buf, count)) {
+ 		DISP_ERROR("copy from user failed\n");
+ 		ret = -EFAULT;
+ 		goto exit;
+ 	}
+-	cmd_buffer[count - 1] = '\0';
++	cmd_buffer[count] = '\0';
+ 
+ 	DISP_DEBUG("copy_from_user input: %s\n", cmd_buffer);
+ 	mi_dsi_display_set_dsi_porch_rw(dd_ptr, cmd_buffer);
+@@ -355,12 +371,16 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (copy_from_user(&cmd_buffer, buf, count)) {
++	if (!count)
++		return 0;
++	if (count >= sizeof(cmd_buffer))
++		return -E2BIG;
++	if (copy_from_user(cmd_buffer, buf, count)) {
+ 		DISP_ERROR("copy from user failed\n");
+ 		ret = -EFAULT;
+ 		goto exit;
+ 	}
+-	cmd_buffer[count - 1] = '\0';
++	cmd_buffer[count] = '\0';
+ 
+ 	DISP_DEBUG("copy_from_user input: %s\n", cmd_buffer);
+ 	//mi_dsi_display_set_pps_rw(dd_ptr, cmd_buffer);
+--- a/qcom/opensource/display-drivers/msm/mi_disp/mi_disp_sysfs.c
++++ b/qcom/opensource/display-drivers/msm/mi_disp/mi_disp_sysfs.c
+@@ -7,6 +7,7 @@
+ #define pr_fmt(fmt) "mi_disp_sysfs:[%s:%d] " fmt, __func__, __LINE__
+ 
+ #include <linux/device.h>
++#include "mi_disp_sysfs.h"
+ #include <linux/err.h>
+ #include <linux/export.h>
+ #include <linux/gfp.h>
+--- a/qcom/opensource/display-drivers/msm/mi_disp/mi_dsi_panel.c
++++ b/qcom/opensource/display-drivers/msm/mi_disp/mi_dsi_panel.c
+@@ -277,10 +277,12 @@
+ 		return -EINVAL;
+ 	}
+ 
++	mi_display_pwrkey_callback_set(NULL);
+ 	mi_cfg = &panel->mi_cfg;
+ 
+ 	if (mi_cfg->disp_wakelock) {
+ 		wakeup_source_unregister(mi_cfg->disp_wakelock);
++		mi_cfg->disp_wakelock = NULL;
+ 	}
+ 	return 0;
+ }
+@@ -408,7 +410,7 @@
+ 	kfree(delayed_work);
+ }
+ 
+-int mi_dsi_panel_tigger_dimming_delayed_work(struct dsi_panel *panel)
++static int mi_dsi_panel_tigger_dimming_delayed_work(struct dsi_panel *panel)
+ {
+ 	int disp_id = 0;
+ 	struct disp_feature *df = mi_get_disp_feature();
+@@ -465,7 +467,7 @@
+ 	kfree(delayed_work);
+ }
+ 
+-int mi_dsi_panel_tigger_timming_switch_delayed_work(struct dsi_panel *panel)
++static int __maybe_unused mi_dsi_panel_tigger_timming_switch_delayed_work(struct dsi_panel *panel)
+ {
+ 	int disp_id = 0;
+ 	struct disp_feature *df = mi_get_disp_feature();
+@@ -566,7 +568,7 @@
+ 	return is_fod_on;
+ }
+ 
+-bool is_dc_on_skip_backlight(struct dsi_panel *panel, u32 bl_lvl)
++static bool is_dc_on_skip_backlight(struct dsi_panel *panel, u32 bl_lvl)
+ {
+ 	struct mi_dsi_panel_cfg *mi_cfg = &panel->mi_cfg;
+ 
+@@ -1096,22 +1098,22 @@
+ 	ssize_t count = 0;
+ 	int type = 0;
+ 
+-	if (!panel || !buf) {
+-		DISP_ERROR("invalid params\n");
+-		return -EINVAL;
+-	}
+-
+-	count = snprintf(buf, size, "%s: dsi cmd_set name\n", "id");
+-
+-	for (type = DSI_CMD_SET_PRE_ON; type < DSI_CMD_SET_MAX; type++) {
+-		count += snprintf(buf + count, size - count, "%02d: %s\n", type,
++	if (!panel || !buf || !size) {
++		DISP_ERROR("invalid params\n");
++		return -EINVAL;
++	}
++
++	count = scnprintf(buf, size, "%s: dsi cmd_set name\n", "id");
++
++	for (type = DSI_CMD_SET_PRE_ON; type < DSI_CMD_SET_MAX && count < size - 1; type++) {
++		count += scnprintf(buf + count, size - count, "%02d: %s\n", type,
+ 				  cmd_set_prop_map[type]);
+ 	}
+ 
+ 	return count;
+ }
+ 
+-int mi_dsi_panel_update_doze_cmd_locked(struct dsi_panel *panel, u8 value)
++static int __maybe_unused mi_dsi_panel_update_doze_cmd_locked(struct dsi_panel *panel, u8 value)
+ {
+ 	int rc = 0;
+ 	struct dsi_display_mode *cur_mode = NULL;
+@@ -1685,7 +1687,7 @@
+ 	return rc;
+ }
+ 
+-int mi_dsi_panel_set_dbi_by_temp(struct dsi_panel *panel, int temp_val)
++static int __maybe_unused mi_dsi_panel_set_dbi_by_temp(struct dsi_panel *panel, int temp_val)
+ {
+ 	int rc = 0;
+ 
+@@ -4131,4 +4133,4 @@
+ }
+ EXPORT_SYMBOL(mi_dsi_panel_lockdown_info_read);
+ 
+-MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
++MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+--- a/qcom/opensource/display-drivers/msm/mi_disp/mi_dsi_panel.h
++++ b/qcom/opensource/display-drivers/msm/mi_disp/mi_dsi_panel.h
+@@ -390,4 +390,10 @@
+ int mi_dsi_panel_gamma_by_temper_comp_locked(struct dsi_panel *panel,
+ 					     int temp_val);
+ 
++void dsi_panel_gesture_enable(bool enable);
++
++void mi_display_gesture_callback_register(void (*cb)(void));
++
++ssize_t mi_dsi_panel_lockdown_info_read(unsigned char *plockdowninfo);
++
+ #endif /* _MI_DSI_PANEL_H_ */
+--- a/qcom/opensource/display-drivers/msm/mi_disp/mi_sde_connector.c
++++ b/qcom/opensource/display-drivers/msm/mi_disp/mi_sde_connector.c
+@@ -7,6 +7,7 @@
+ #define pr_fmt(fmt) "mi_sde_connector:[%s:%d] " fmt, __func__, __LINE__
+ 
+ #include <drm/sde_drm.h>
++#include <linux/vmalloc.h>
+ #include "msm_drv.h"
+ #include "sde_connector.h"
+ #include "sde_encoder.h"
+--- a/qcom/opensource/display-drivers/msm/msm_atomic.c
++++ b/qcom/opensource/display-drivers/msm/msm_atomic.c
+@@ -386,7 +386,7 @@
+  * and do the plane commits at the end. This is useful for drivers doing runtime
+  * PM since planes updates then only happen when the CRTC is actually enabled.
+  */
+-void msm_atomic_helper_commit_modeset_disables(struct drm_device *dev,
++static void msm_atomic_helper_commit_modeset_disables(struct drm_device *dev,
+ 		struct drm_atomic_state *old_state)
+ {
+ 	msm_disable_outputs(dev, old_state);
+@@ -563,7 +563,7 @@
+ }
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0))
+-struct dma_fence *msm_dma_resv_get_excl(struct drm_plane_state *new_plane_state,
++static struct dma_fence *msm_dma_resv_get_excl(struct drm_plane_state *new_plane_state,
+ 		struct msm_gem_object *msm_obj)
+ {
+ 	enum dma_resv_usage usage;
+--- a/qcom/opensource/display-drivers/msm/msm_drv.c
++++ b/qcom/opensource/display-drivers/msm/msm_drv.c
+@@ -151,7 +151,7 @@
+  * RETURNS
+  * Zero for success or -errorno.
+  */
+-int msm_atomic_check(struct drm_device *dev,
++static int msm_atomic_check(struct drm_device *dev,
+ 			    struct drm_atomic_state *state)
+ {
+ 	struct msm_drm_private *priv;
+@@ -166,7 +166,6 @@
+ 
+ static const struct drm_mode_config_funcs mode_config_funcs = {
+ 	.fb_create = msm_framebuffer_create,
+-	.output_poll_changed = msm_fb_output_poll_changed,
+ 	.atomic_check = msm_atomic_check,
+ 	.atomic_commit = msm_atomic_commit,
+ 	.atomic_state_alloc = msm_atomic_state_alloc,
+@@ -504,14 +503,18 @@
+ 		}
+ 	}
+ 
++	if (priv->pp_event_thread) {
++		kthread_flush_worker(&priv->pp_event_worker);
++		kthread_stop(priv->pp_event_thread);
++		priv->pp_event_thread = NULL;
++	}
++
+ 	drm_kms_helper_poll_fini(ddev);
+ 	if (kms && kms->funcs)
+ 		kms->funcs->debugfs_destroy(kms);
+ 
+ 	sde_dbg_destroy();
+ 	debugfs_remove_recursive(priv->debug_root);
+-	drm_mode_config_cleanup(ddev);
+-
+ 	if (priv->registered) {
+ 		drm_dev_unregister(ddev);
+ 		priv->registered = false;
+@@ -527,6 +530,8 @@
+ #else
+ 	drm_irq_uninstall(ddev);
+ #endif
++
++	drm_mode_config_cleanup(ddev);
+ 
+ 	if (kms && kms->funcs) {
+ 		kms->funcs->destroy(kms);
+@@ -630,7 +635,7 @@
+ 		 * Grab the entire CMA chunk carved out in early startup in
+ 		 * mach-msm:
+ 		 */
+-	} else if (!iommu_present(&platform_bus_type)) {
++	} else if (IS_ERR_OR_NULL(msm_gem_smmu_address_space_get(dev, MSM_SMMU_DOMAIN_UNSECURE))) {
+ 		u32 vram_size;
+ 
+ 		ret = of_property_read_u32(dev->dev->of_node,
+@@ -694,92 +699,69 @@
+ static int msm_drm_display_thread_create(struct msm_drm_private *priv, struct drm_device *ddev,
+ 	struct device *dev)
+ {
+-	int i, ret = 0;
++	int i, ret;
+ 
+ 	for (i = 0; i < priv->num_crtcs; i++) {
+-		/* initialize display thread */
+ 		priv->disp_thread[i].crtc_id = priv->crtcs[i]->base.id;
+ 		kthread_init_worker(&priv->disp_thread[i].worker);
+ 		priv->disp_thread[i].dev = ddev;
+-		priv->disp_thread[i].thread =
+-			kthread_run(kthread_worker_fn,
+-				&priv->disp_thread[i].worker,
+-				"crtc_commit:%d", priv->disp_thread[i].crtc_id);
++		priv->disp_thread[i].thread = kthread_run(kthread_worker_fn,
++			&priv->disp_thread[i].worker, "crtc_commit:%d",
++			priv->disp_thread[i].crtc_id);
++		if (IS_ERR(priv->disp_thread[i].thread)) {
++			ret = PTR_ERR(priv->disp_thread[i].thread);
++			priv->disp_thread[i].thread = NULL;
++			goto fail;
++		}
+ 		kthread_init_work(&priv->thread_priority_work,
+-				  msm_drm_display_thread_priority_worker);
++			msm_drm_display_thread_priority_worker);
+ 		kthread_queue_work(&priv->disp_thread[i].worker, &priv->thread_priority_work);
+ 		kthread_flush_work(&priv->thread_priority_work);
+ 
+-		if (IS_ERR(priv->disp_thread[i].thread)) {
+-			DISP_DEV_ERR(dev, "failed to create crtc_commit kthread\n");
+-			priv->disp_thread[i].thread = NULL;
+-		}
+-
+-		/* initialize event thread */
+ 		priv->event_thread[i].crtc_id = priv->crtcs[i]->base.id;
+ 		kthread_init_worker(&priv->event_thread[i].worker);
+ 		priv->event_thread[i].dev = ddev;
+-		priv->event_thread[i].thread =
+-			kthread_run(kthread_worker_fn,
+-				&priv->event_thread[i].worker,
+-				"crtc_event:%d", priv->event_thread[i].crtc_id);
+-		/**
+-		 * event thread should also run at same priority as disp_thread
+-		 * because it is handling frame_done events. A lower priority
+-		 * event thread and higher priority disp_thread can causes
+-		 * frame_pending counters beyond 2. This can lead to commit
+-		 * failure at crtc commit level.
+-		 */
++		priv->event_thread[i].thread = kthread_run(kthread_worker_fn,
++			&priv->event_thread[i].worker, "crtc_event:%d",
++			priv->event_thread[i].crtc_id);
++		if (IS_ERR(priv->event_thread[i].thread)) {
++			ret = PTR_ERR(priv->event_thread[i].thread);
++			priv->event_thread[i].thread = NULL;
++			goto fail;
++		}
+ 		kthread_init_work(&priv->thread_priority_work,
+-				  msm_drm_display_thread_priority_worker);
++			msm_drm_display_thread_priority_worker);
+ 		kthread_queue_work(&priv->event_thread[i].worker, &priv->thread_priority_work);
+ 		kthread_flush_work(&priv->thread_priority_work);
+-
+-		if (IS_ERR(priv->event_thread[i].thread)) {
+-			DISP_DEV_ERR(dev, "failed to create crtc_event kthread\n");
+-			priv->event_thread[i].thread = NULL;
+-		}
+-
+-		if ((!priv->disp_thread[i].thread) ||
+-				!priv->event_thread[i].thread) {
+-			/* clean up previously created threads if any */
+-			for ( ; i >= 0; i--) {
+-				if (priv->disp_thread[i].thread) {
+-					kthread_stop(
+-						priv->disp_thread[i].thread);
+-					priv->disp_thread[i].thread = NULL;
+-				}
+-
+-				if (priv->event_thread[i].thread) {
+-					kthread_stop(
+-						priv->event_thread[i].thread);
+-					priv->event_thread[i].thread = NULL;
+-				}
+-			}
+-			return -EINVAL;
+-		}
+-	}
+-
+-	/**
+-	 * Since pp interrupt is heavy weight, try to queue the work
+-	 * into a dedicated worker thread, so that they dont interrupt
+-	 * other important events.
+-	 */
++	}
++
+ 	kthread_init_worker(&priv->pp_event_worker);
+ 	priv->pp_event_thread = kthread_run(kthread_worker_fn,
+-			&priv->pp_event_worker, "pp_event");
++		&priv->pp_event_worker, "pp_event");
++	if (IS_ERR(priv->pp_event_thread)) {
++		ret = PTR_ERR(priv->pp_event_thread);
++		priv->pp_event_thread = NULL;
++		goto fail;
++	}
+ 	kthread_init_work(&priv->thread_priority_work, msm_drm_display_thread_priority_worker);
+ 	kthread_queue_work(&priv->pp_event_worker, &priv->thread_priority_work);
+ 	kthread_flush_work(&priv->thread_priority_work);
+ 
+-	if (IS_ERR(priv->pp_event_thread)) {
+-		DISP_DEV_ERR(dev, "failed to create pp_event kthread\n");
+-		ret = PTR_ERR(priv->pp_event_thread);
+-		priv->pp_event_thread = NULL;
+-		return ret;
+-	}
+-
+ 	return 0;
++fail:
++	DISP_DEV_ERR(dev, "failed to create display worker: %d\n", ret);
++	for (i = 0; i < priv->num_crtcs; i++) {
++		if (priv->disp_thread[i].thread) {
++			kthread_stop(priv->disp_thread[i].thread);
++			priv->disp_thread[i].thread = NULL;
++		}
++		if (priv->event_thread[i].thread) {
++			kthread_stop(priv->event_thread[i].thread);
++			priv->event_thread[i].thread = NULL;
++		}
++	}
++
++	return ret;
+ }
+ 
+ static struct msm_kms *_msm_drm_component_init_helper(
+@@ -860,6 +842,7 @@
+ 
+ 	ddev->dev_private = priv;
+ 	priv->dev = ddev;
++	mutex_init(&priv->gem_lock);
+ 
+ 	ret = sde_power_resource_init(pdev, &priv->phandle);
+ 	if (ret) {
+@@ -899,6 +882,7 @@
+ 	return ret;
+ 
+ pm_runtime_error:
++	pm_runtime_disable(dev);
+ 	sde_dbg_destroy();
+ dbg_init_fail:
+ 	sde_power_resource_deinit(pdev, &priv->phandle);
+@@ -908,6 +892,24 @@
+ 	return ret;
+ }
+ 
++static void msm_drm_client_unregister(struct drm_client_dev *client)
++{
++	drm_client_release(client);
++	client->dev = NULL;
++}
++
++static int msm_drm_client_hotplug(struct drm_client_dev *client)
++{
++	msm_fb_output_poll_changed(client->dev);
++	return drm_client_modeset_probe(client, 0, 0);
++}
++
++static const struct drm_client_funcs msm_drm_client_funcs = {
++	.owner = THIS_MODULE,
++	.unregister = msm_drm_client_unregister,
++	.hotplug = msm_drm_client_hotplug,
++};
++
+ static int msm_drm_component_init(struct device *dev)
+ {
+ 	struct platform_device *pdev = to_platform_device(dev);
+@@ -922,6 +924,10 @@
+ 		goto mdss_init_fail;
+ 
+ 	priv->wq = alloc_ordered_workqueue("msm_drm", 0);
++	if (!priv->wq) {
++		ret = -ENOMEM;
++		goto bind_fail;
++	}
+ 	init_waitqueue_head(&priv->pending_crtcs_event);
+ 
+ 	INIT_LIST_HEAD(&priv->client_event_list);
+@@ -938,6 +944,8 @@
+ 	ret = msm_component_bind_all(dev, ddev);
+ 	if (ret == -EPROBE_DEFER) {
+ 		destroy_workqueue(priv->wq);
++		priv->wq = NULL;
++		msm_mdss_destroy(ddev);
+ 		return ret;
+ 	} else if (ret) {
+ 		goto bind_fail;
+@@ -953,6 +961,7 @@
+ 	kms = _msm_drm_component_init_helper(priv, ddev, dev, pdev);
+ 	if (IS_ERR_OR_NULL(kms)) {
+ 		DISP_DEV_ERR(dev, "msm_drm_component_init_helper failed\n");
++		ret = IS_ERR(kms) ? PTR_ERR(kms) : -ENODEV;
+ 		goto fail;
+ 	}
+ 
+@@ -1018,7 +1027,7 @@
+ 
+ 	/* create drm client only when fbdev is not supported */
+ 	if (!priv->fbdev) {
+-		ret = drm_client_init(ddev, &kms->client, "kms_client", NULL);
++		ret = drm_client_init(ddev, &kms->client, "kms_client", &msm_drm_client_funcs);
+ 		if (ret) {
+ 			DRM_ERROR("failed to init kms_client: %d\n", ret);
+ 			kms->client.dev = NULL;
+@@ -1051,6 +1060,10 @@
+ 	msm_drm_uninit(dev);
+ 	return ret;
+ bind_fail:
++	if (priv->wq) {
++		destroy_workqueue(priv->wq);
++		priv->wq = NULL;
++	}
+ 	msm_mdss_destroy(ddev);
+ mdss_init_fail:
+ 	sde_dbg_destroy();
+@@ -1142,16 +1155,16 @@
+ 	struct msm_file_private *ctx = file->driver_priv;
+ 	struct msm_kms *kms = priv->kms;
+ 
+-	if (!kms)
++	if (!ctx)
+ 		return;
+ 
+-	if (kms->funcs && kms->funcs->postclose)
++	if (kms && kms->funcs && kms->funcs->postclose)
+ 		kms->funcs->postclose(kms, file);
+ 
+-	mutex_lock(&dev->struct_mutex);
++	mutex_lock(msm_gem_mutex(dev));
+ 	if (ctx == priv->lastctx)
+ 		priv->lastctx = NULL;
+-	mutex_unlock(&dev->struct_mutex);
++	mutex_unlock(msm_gem_mutex(dev));
+ 
+ 	mutex_lock(&ctx->power_lock);
+ 	if (ctx->enable_refcnt) {
+@@ -1198,7 +1211,7 @@
+ 		struct drm_vblank_crtc *vblank = &dev->vblank[i];
+ 		struct timer_list *disable_timer = &vblank->disable_timer;
+ 
+-		if (del_timer_sync(disable_timer))
++		if (timer_delete_sync(disable_timer))
+ 			disable_timer->function(disable_timer);
+ 	}
+ 
+@@ -1244,6 +1257,9 @@
+ {
+ 	struct drm_msm_gem_new *args = data;
+ 
++	if (!args->size || args->size > U32_MAX - (PAGE_SIZE - 1))
++		return -EINVAL;
++
+ 	if (args->flags & ~MSM_BO_FLAGS) {
+ 		DRM_ERROR("invalid flags: %08x\n", args->flags);
+ 		return -EINVAL;
+@@ -1315,7 +1331,7 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = mutex_lock_interruptible(&dev->struct_mutex);
++	ret = mutex_lock_interruptible(msm_gem_mutex(dev));
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1334,7 +1350,7 @@
+ 	drm_gem_object_put(obj);
+ 
+ unlock:
+-	mutex_unlock(&dev->struct_mutex);
++	mutex_unlock(msm_gem_mutex(dev));
+ 	return ret;
+ }
+ 
+@@ -1680,8 +1696,13 @@
+ 		msm_preclose(dev, file_priv);
+ 	}
+ 
++	/* Keep the device alive after drm_release drops the file's reference. */
++	drm_dev_get(dev);
+ 	ret = drm_release(inode, filp);
+ 	filp->private_data = NULL;
++	if (!atomic_read(&dev->open_count))
++		msm_lastclose(dev);
++	drm_dev_put(dev);
+ end:
+ 	mutex_unlock(&msm_release_lock);
+ 	return ret;
+@@ -1743,7 +1764,7 @@
+  * @file_priv: drm file for the ioctl call
+  *
+  */
+-int msm_ioctl_power_ctrl(struct drm_device *dev, void *data,
++static int msm_ioctl_power_ctrl(struct drm_device *dev, void *data,
+ 			struct drm_file *file_priv)
+ {
+ 	struct msm_file_private *ctx = file_priv->driver_priv;
+@@ -1803,7 +1824,7 @@
+  * @file_priv: drm file for the ioctl call
+  *
+  */
+-int msm_ioctl_display_hint_ops(struct drm_device *dev, void *data,
++static int msm_ioctl_display_hint_ops(struct drm_device *dev, void *data,
+ 			struct drm_file *file_priv)
+ {
+ 	struct drm_msm_display_hint *display_hint = data;
+@@ -1855,7 +1876,7 @@
+  * @file_priv: drm file for the ioctl call
+  *
+  */
+-int msm_ioctl_display_early_ept(struct drm_device *dev, void *data,
++static int msm_ioctl_display_early_ept(struct drm_device *dev, void *data,
+ 			struct drm_file *file_priv)
+ {
+ 	struct drm_msm_display_early_ept *early_ept = data;
+@@ -1900,15 +1921,27 @@
+ 			DRM_UNLOCKED),
+ };
+ 
++static int msm_fops_open(struct inode *inode, struct file *filp)
++{
++	int ret;
++
++	mutex_lock(&msm_release_lock);
++	ret = drm_open(inode, filp);
++	mutex_unlock(&msm_release_lock);
++
++	return ret;
++}
++
+ static const struct file_operations fops = {
+ 	.owner              = THIS_MODULE,
+-	.open               = drm_open,
++	.fop_flags          = FOP_UNSIGNED_OFFSET,
++	.open               = msm_fops_open,
+ 	.release            = msm_release,
+ 	.unlocked_ioctl     = drm_ioctl,
+ 	.compat_ioctl       = drm_compat_ioctl,
+ 	.poll               = drm_poll,
+ 	.read               = drm_read,
+-	.llseek             = no_llseek,
++
+ 	.mmap               = msm_gem_mmap,
+ };
+ 
+@@ -1919,7 +1952,6 @@
+ 				DRIVER_MODESET,
+ 	.open               = msm_open,
+ 	.postclose          = msm_postclose,
+-	.lastclose          = msm_lastclose,
+ 	.release	    = msm_drm_release,
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0))
+ 	.irq_handler        = msm_irq,
+@@ -1949,7 +1981,6 @@
+ 	.fops               = &fops,
+ 	.name               = "msm_drm",
+ 	.desc               = "MSM Snapdragon DRM",
+-	.date               = "20130625",
+ 	.major              = MSM_VERSION_MAJOR,
+ 	.minor              = MSM_VERSION_MINOR,
+ 	.patchlevel         = MSM_VERSION_PATCHLEVEL,
+@@ -2122,7 +2153,7 @@
+ 	return 0;
+ }
+ 
+-static int compare_name_mdp(struct device *dev, void *data)
++static int compare_name_mdp(struct device *dev, const void *data)
+ {
+ 	return (strnstr(dev_name(dev), "mdp", strlen("mdp")) != NULL);
+ }
+@@ -2143,7 +2174,8 @@
+ 			if (!node)
+ 				break;
+ 
+-			component_match_add(dev, matchptr, compare_of, node);
++			drm_of_component_match_add(dev, matchptr, compare_of, node);
++			of_node_put(node);
+ 		}
+ 
+ 		return 0;
+@@ -2254,9 +2286,6 @@
+ 	const struct msm_kms_funcs *funcs;
+ 	struct msm_gem_address_space *aspace;
+ 
+-	if (!iommu_present(&platform_bus_type))
+-		return ERR_PTR(-ENODEV);
+-
+ 	if ((!dev) || (!dev->dev_private))
+ 		return ERR_PTR(-EINVAL);
+ 
+@@ -2361,13 +2390,17 @@
+ 				&& of_device_is_available(node)
+ 				&& of_node_check_flag(node, OF_POPULATED)) {
+ 			struct platform_device *pdev = of_find_device_by_node(node);
+-
+-			if (!platform_get_drvdata(pdev)) {
++			bool ready = pdev && platform_get_drvdata(pdev);
++
++			if (pdev)
++				put_device(&pdev->dev);
++			of_node_put(node);
++			if (!ready) {
+ 				DISP_DEV_ERR(dev, "qcom,sde_rscc/qcom,sde_cesta not probed yet\n");
+ 				return -EPROBE_DEFER;
+-			} else {
+-				return 0;
+ 			}
++		} else {
++			of_node_put(node);
+ 		}
+ 	}
+ 
+@@ -2400,12 +2433,12 @@
+ 	return component_master_add_with_match(&pdev->dev, &msm_drm_ops, match);
+ }
+ 
+-static int msm_pdev_remove(struct platform_device *pdev)
++static void msm_pdev_remove(struct platform_device *pdev)
+ {
+ 	component_master_del(&pdev->dev, &msm_drm_ops);
+ 	of_platform_depopulate(&pdev->dev);
+ 
+-	return 0;
++	return;
+ }
+ 
+ static void msm_pdev_shutdown(struct platform_device *pdev)
+@@ -2470,6 +2503,8 @@
+ 	msm_edp_register();
+ 	sde_shd_register();
+ 	msm_lease_drm_register();
++	/* Display clients retain callbacks and singleton interfaces for this boot. */
++	__module_get(THIS_MODULE);
+ 	return 0;
+ }
+ 
+--- a/qcom/opensource/display-drivers/msm/msm_drv.h
++++ b/qcom/opensource/display-drivers/msm/msm_drv.h
+@@ -1250,6 +1250,7 @@
+ 	 */
+ 	struct list_head inactive_list;
+ 	struct mutex mm_lock;
++	struct mutex gem_lock;
+ 
+ 	struct workqueue_struct *wq;
+ 
+@@ -1535,7 +1536,8 @@
+ 		const struct drm_mode_fb_cmd2 *mode_cmd,
+ 		struct drm_gem_object **bos);
+ struct drm_framebuffer *msm_framebuffer_create(struct drm_device *dev,
+-		struct drm_file *file, const struct drm_mode_fb_cmd2 *mode_cmd);
++		struct drm_file *file, const struct drm_format_info *info,
++		const struct drm_mode_fb_cmd2 *mode_cmd);
+ int msm_framebuffer_set_cache_hint(struct drm_framebuffer *fb,
+ 		u32 flags, u32 rd_type, u32 wr_type);
+ int msm_framebuffer_get_cache_hint(struct drm_framebuffer *fb,
+@@ -1857,4 +1859,14 @@
+  */
+ int msm_drm_notify_components(struct drm_device *dev, enum msm_component_event event);
+ 
++static inline struct mutex *msm_gem_mutex(struct drm_device *dev)
++{
++	struct msm_drm_private *priv = dev->dev_private;
++
++	return &priv->gem_lock;
++}
++
++int msm_ioctl_rmfb2(struct drm_device *dev, void *data,
++		   struct drm_file *file_priv);
++
+ #endif /* __MSM_DRV_H__ */
+--- a/qcom/opensource/display-drivers/msm/msm_fb.c
++++ b/qcom/opensource/display-drivers/msm/msm_fb.c
+@@ -17,6 +17,7 @@
+  * this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include <linux/overflow.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_fourcc.h>
+ #include <drm/drm_damage_helper.h>
+@@ -143,10 +144,9 @@
+ }
+ 
+ struct drm_framebuffer *msm_framebuffer_create(struct drm_device *dev,
+-		struct drm_file *file, const struct drm_mode_fb_cmd2 *mode_cmd)
+-{
+-	const struct drm_format_info *info = drm_get_format_info(dev,
+-								mode_cmd);
++		struct drm_file *file, const struct drm_format_info *info,
++		const struct drm_mode_fb_cmd2 *mode_cmd)
++{
+ 	struct drm_gem_object *bos[4] = {0};
+ 	struct drm_framebuffer *fb;
+ 	int ret, i, n = info->num_planes;
+@@ -173,12 +173,38 @@
+ 	return ERR_PTR(ret);
+ }
+ 
++static int msm_framebuffer_check_size(const struct drm_mode_fb_cmd2 *mode_cmd,
++		const struct drm_format_info *info, int num_planes,
++		struct drm_gem_object **bos)
++{
++	int i;
++
++	if (!info || !mode_cmd->width || !mode_cmd->height || num_planes <= 0 ||
++	    num_planes > ARRAY_SIZE(info->cpp) || !info->hsub || !info->vsub)
++		return -EINVAL;
++
++	for (i = 0; i < num_planes; i++) {
++		u64 width = DIV_ROUND_UP_ULL(mode_cmd->width, i ? info->hsub : 1);
++		u64 height = DIV_ROUND_UP_ULL(mode_cmd->height, i ? info->vsub : 1);
++		u64 row = width * info->cpp[i], min_size;
++
++		if (!bos[i] || !info->cpp[i] || row > mode_cmd->pitches[i] ||
++		    check_mul_overflow(height - 1, (u64)mode_cmd->pitches[i], &min_size) ||
++		    check_add_overflow(min_size, row, &min_size) ||
++		    check_add_overflow(min_size, (u64)mode_cmd->offsets[i], &min_size) ||
++		    bos[i]->size < min_size)
++			return -EINVAL;
++	}
++
++	return 0;
++}
++
+ struct drm_framebuffer *msm_framebuffer_init(struct drm_device *dev,
+ 		const struct drm_mode_fb_cmd2 *mode_cmd,
+ 		struct drm_gem_object **bos)
+ {
+-	const struct drm_format_info *info = drm_get_format_info(dev,
+-								mode_cmd);
++	const struct drm_format_info *info =
++		drm_get_format_info(dev, mode_cmd->pixel_format, mode_cmd->modifier[0]);
+ 	struct msm_drm_private *priv = dev->dev_private;
+ 	struct msm_kms *kms = priv->kms;
+ 	struct msm_framebuffer *msm_fb = NULL;
+@@ -238,36 +264,16 @@
+ 				goto fail;
+ 		}
+ 	} else {
+-		const struct drm_format_info *info;
+-
+-		info = drm_format_info(mode_cmd->pixel_format);
+-		if (!info || num_planes > ARRAY_SIZE(info->cpp)) {
+-			ret = -EINVAL;
++		ret = msm_framebuffer_check_size(mode_cmd,
++				drm_format_info(mode_cmd->pixel_format), num_planes, bos);
++		if (ret)
+ 			goto fail;
+-		}
+-
+-		for (i = 0; i < num_planes; i++) {
+-			unsigned int width = mode_cmd->width / (i ?
+-					info->hsub : 1);
+-			unsigned int height = mode_cmd->height / (i ?
+-					info->vsub : 1);
+-			unsigned int min_size;
+-
+-			min_size = (height - 1) * mode_cmd->pitches[i]
+-				+ width * info->cpp[i]
+-				+ mode_cmd->offsets[i];
+-
+-			if (!bos[i] || bos[i]->size < min_size) {
+-				ret = -EINVAL;
+-				goto fail;
+-			}
+-		}
+ 	}
+ 
+ 	for (i = 0; i < num_planes; i++)
+ 		msm_fb->base.obj[i] = bos[i];
+ 
+-	drm_helper_mode_fill_fb_struct(dev, fb, mode_cmd);
++	drm_helper_mode_fill_fb_struct(dev, fb, info, mode_cmd);
+ 
+ 	ret = drm_framebuffer_init(dev, fb, &msm_framebuffer_funcs);
+ 	if (ret) {
+--- a/qcom/opensource/display-drivers/msm/msm_gem.c
++++ b/qcom/opensource/display-drivers/msm/msm_gem.c
+@@ -18,10 +18,10 @@
+  */
+ 
+ #include <linux/qcom-dma-mapping.h>
++#include <linux/vmalloc.h>
+ #include <linux/spinlock.h>
+ #include <linux/shmem_fs.h>
+ #include <linux/dma-buf.h>
+-#include <linux/pfn_t.h>
+ #include <linux/version.h>
+ #include <linux/module.h>
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0))
+@@ -37,6 +37,7 @@
+ #define ALIGNED_OFFSET (U32_MAX & ~(GUARD_BYTES))
+ 
+ static void msm_gem_vunmap_locked(struct drm_gem_object *obj);
++static void put_pages(struct drm_gem_object *obj);
+ 
+ 
+ static dma_addr_t physaddr(struct drm_gem_object *obj)
+@@ -115,6 +116,7 @@
+ 
+ 			DISP_DEV_ERR(dev->dev, "failed to allocate sgt\n");
+ 			msm_obj->sgt = NULL;
++			put_pages(obj);
+ 			return ptr;
+ 		}
+ 
+@@ -127,8 +129,11 @@
+ 		} else if (msm_obj->flags & (MSM_BO_WC|MSM_BO_UNCACHED)) {
+ 			aspace_dev = msm_gem_get_aspace_device(msm_obj->aspace);
+ 			if (aspace_dev) {
+-				dma_map_sg(aspace_dev, msm_obj->sgt->sgl,
+-					msm_obj->sgt->nents, DMA_BIDIRECTIONAL);
++				if (!dma_map_sg(aspace_dev, msm_obj->sgt->sgl,
++					msm_obj->sgt->orig_nents, DMA_BIDIRECTIONAL)) {
++					put_pages(obj);
++					return ERR_PTR(-ENOMEM);
++				}
+ 				/* mark the buffer as external buffer */
+ 				msm_obj->flags |= MSM_BO_EXTBUF;
+ 			} else {
+@@ -159,8 +164,17 @@
+ 
+ 	if (msm_obj->pages) {
+ 		if (msm_obj->sgt) {
++			if (msm_obj->flags & MSM_BO_EXTBUF) {
++				struct device *dev = msm_gem_get_aspace_device(msm_obj->aspace);
++
++				if (dev)
++					dma_unmap_sg(dev, msm_obj->sgt->sgl,
++						msm_obj->sgt->orig_nents, DMA_BIDIRECTIONAL);
++				msm_obj->flags &= ~MSM_BO_EXTBUF;
++			}
+ 			sg_free_table(msm_obj->sgt);
+ 			kfree(msm_obj->sgt);
++			msm_obj->sgt = NULL;
+ 		}
+ 
+ 		if (use_pages(obj))
+@@ -213,7 +227,7 @@
+ 	aspace_dev = msm_gem_get_aspace_device(msm_obj->aspace);
+ 	if (aspace_dev)
+ 		dma_sync_sg_for_device(aspace_dev, msm_obj->sgt->sgl,
+-				msm_obj->sgt->nents, DMA_BIDIRECTIONAL);
++				msm_obj->sgt->orig_nents, DMA_BIDIRECTIONAL);
+ 	else
+ 		DRM_ERROR("failed to get aspace_device\n");
+ }
+@@ -310,7 +324,7 @@
+ 	VERB("Inserting %pK pfn %lx, pa %lx", (void *)vmf->address,
+ 			pfn, pfn << PAGE_SHIFT);
+ 
+-	ret = vmf_insert_mixed(vma, vmf->address, __pfn_to_pfn_t(pfn, PFN_DEV));
++	ret = vmf_insert_mixed(vma, vmf->address, pfn);
+ out_unlock:
+ 	mutex_unlock(&msm_obj->lock);
+ out:
+@@ -549,7 +563,7 @@
+ 	if (dev && !dev_is_dma_coherent(dev) && (msm_obj->flags & MSM_BO_CACHED)
+ 		&& (msm_obj->sgt)) {
+ 		dma_sync_sg_for_device(dev, msm_obj->sgt->sgl,
+-			msm_obj->sgt->nents, DMA_BIDIRECTIONAL);
++			msm_obj->sgt->orig_nents, DMA_BIDIRECTIONAL);
+ 	}
+ 
+ 	return 0;
+@@ -682,8 +696,18 @@
+ int msm_gem_dumb_create(struct drm_file *file, struct drm_device *dev,
+ 		struct drm_mode_create_dumb *args)
+ {
+-	args->pitch = align_pitch(args->width, args->bpp);
+-	args->size  = PAGE_ALIGN(args->pitch * args->height);
++	u64 pitch, size;
++
++	if (!args->width || !args->height || !args->bpp)
++		return -EINVAL;
++	pitch = DIV_ROUND_UP_ULL(args->bpp, 8) * ALIGN((u64)args->width, 32);
++	if (pitch > U32_MAX)
++		return -EINVAL;
++	size = pitch * args->height;
++	if (size > U32_MAX - (PAGE_SIZE - 1))
++		return -EINVAL;
++	args->pitch = pitch;
++	args->size = PAGE_ALIGN(size);
+ 	return msm_gem_new_handle(dev, file, args->size,
+ 			MSM_BO_SCANOUT | MSM_BO_CACHED, &args->handle, "dumb");
+ }
+@@ -808,7 +832,7 @@
+ 
+ 	mutex_lock(&msm_obj->lock);
+ 
+-	WARN_ON(!mutex_is_locked(&obj->dev->struct_mutex));
++	WARN_ON(!mutex_is_locked(msm_gem_mutex(obj->dev)));
+ 
+ 	if (msm_obj->madv != __MSM_MADV_PURGED)
+ 		msm_obj->madv = madv;
+@@ -869,7 +893,8 @@
+ 	long ret;
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0))
+-	ret = dma_resv_wait_timeout(msm_obj->resv, write, true, remain);
++	ret = dma_resv_wait_timeout(msm_obj->resv,
++			dma_resv_usage_rw(write), true, remain);
+ #else
+ 	ret = dma_resv_wait_timeout_rcu(msm_obj->resv, write, true, remain);
+ #endif
+@@ -910,6 +935,12 @@
+ 
+ 	mutex_lock(&msm_obj->lock);
+ 
++	/* A VRAM allocation uses the VMA node that put_iova() releases. */
++	if (msm_obj->vram_node) {
++		msm_gem_vunmap_locked(obj);
++		put_pages(obj);
++		msm_obj->vram_node = NULL;
++	}
+ 	put_iova(obj);
+ 	if (msm_obj->aspace) {
+ 		mutex_lock(&msm_obj->aspace->list_lock);
+@@ -1035,6 +1066,7 @@
+ 		dma_resv_init(msm_obj->resv);
+ 	}
+ 
++	INIT_LIST_HEAD(&msm_obj->mm_list);
+ 	INIT_LIST_HEAD(&msm_obj->submit_entry);
+ 	INIT_LIST_HEAD(&msm_obj->vmas);
+ 	INIT_LIST_HEAD(&msm_obj->iova_list);
+@@ -1052,6 +1084,7 @@
+ #endif
+ 
+ 	*obj = &msm_obj->base;
++	(*obj)->resv = msm_obj->resv;
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0))
+ 	(*obj)->funcs = &msm_gem_object_funcs;
+ #endif
+@@ -1074,7 +1107,7 @@
+ 
+ 	size = PAGE_ALIGN(size);
+ 
+-	if (!iommu_present(&platform_bus_type))
++	if (IS_ERR_OR_NULL(msm_gem_smmu_address_space_get(dev, MSM_SMMU_DOMAIN_UNSECURE)))
+ 		use_vram = true;
+ 	else if ((flags & (MSM_BO_STOLEN | MSM_BO_SCANOUT)) && priv->vram.size)
+ 		use_vram = true;
+@@ -1102,6 +1135,7 @@
+ 		struct msm_gem_vma *vma;
+ 		struct page **pages;
+ 
++		drm_gem_private_object_init(dev, obj, size);
+ 		mutex_lock(&msm_obj->lock);
+ 
+ 		vma = add_vma(obj, NULL);
+@@ -1112,8 +1146,6 @@
+ 		}
+ 
+ 		to_msm_bo(obj)->vram_node = &vma->node;
+-
+-		drm_gem_private_object_init(dev, obj, size);
+ 
+ 		pages = get_pages(obj);
+ 		if (IS_ERR(pages)) {
+@@ -1413,5 +1445,5 @@
+ }
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0))
+-MODULE_IMPORT_NS(DMA_BUF);
+-#endif
++MODULE_IMPORT_NS("DMA_BUF");
++#endif
+--- a/qcom/opensource/display-drivers/msm/msm_gem_prime.c
++++ b/qcom/opensource/display-drivers/msm/msm_gem_prime.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "msm_drv.h"
++#include <linux/vmalloc.h>
+ #include "msm_gem.h"
+ #include "msm_mmu.h"
+ #include "msm_kms.h"
+@@ -224,7 +225,8 @@
+ 		if (!attach_dev)
+ 			attach_dev = kms->funcs->get_address_space_device(kms,
+ 					MSM_SMMU_DOMAIN_UNSECURE);
+-	} else if (!iommu_present(&platform_bus_type) || vmid_flags.is_tvm
++	} else if (IS_ERR_OR_NULL(msm_gem_smmu_address_space_get(dev, MSM_SMMU_DOMAIN_UNSECURE)) ||
++		   vmid_flags.is_tvm
+ 		   || vmid_flags.is_cam_preview || vmid_flags.is_sec_display) {
+ 		attach_dev = dev->dev;
+ 		lazy_unmap = false;
+@@ -313,5 +315,5 @@
+ }
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0))
+-MODULE_IMPORT_NS(DMA_BUF);
+-#endif
++MODULE_IMPORT_NS("DMA_BUF");
++#endif
+--- a/qcom/opensource/display-drivers/msm/msm_prop.c
++++ b/qcom/opensource/display-drivers/msm/msm_prop.c
+@@ -217,7 +217,7 @@
+  * @property_idx: Property index
+  * @force_dirty: Whether or not to filter 'dirty' status on unchanged values
+  */
+-void msm_property_install_enum_helper(struct msm_property_info *info,
++static void msm_property_install_enum_helper(struct msm_property_info *info,
+ 		const char *name, int flags, int is_bitmask,
+ 		const struct drm_prop_enum_list *values, int num_values,
+ 		u32 init_idx, uint32_t property_idx, bool force_dirty)
+--- a/qcom/opensource/display-drivers/msm/msm_smmu.c
++++ b/qcom/opensource/display-drivers/msm/msm_smmu.c
+@@ -259,7 +259,7 @@
+ 	kfree(smmu);
+ }
+ 
+-struct device *msm_smmu_get_dev(struct msm_mmu *mmu)
++static struct device *msm_smmu_get_dev(struct msm_mmu *mmu)
+ {
+ 	struct msm_smmu *smmu = to_msm_smmu(mmu);
+ 
+@@ -606,7 +606,7 @@
+ 	return ret;
+ }
+ 
+-static int msm_smmu_remove(struct platform_device *pdev)
++static void msm_smmu_remove(struct platform_device *pdev)
+ {
+ 	struct msm_smmu_client *client;
+ 	struct msm_smmu_client *curr, *next;
+@@ -623,7 +623,7 @@
+ 	}
+ 	mutex_unlock(&smmu_list_lock);
+ 
+-	return 0;
++	return;
+ }
+ 
+ static struct platform_driver msm_smmu_driver = {
+@@ -655,5 +655,5 @@
+ MODULE_LICENSE("GPL v2");
+ MODULE_DESCRIPTION("MSM SMMU driver");
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0))
+-MODULE_IMPORT_NS(DMA_BUF);
++MODULE_IMPORT_NS("DMA_BUF");
+ #endif
+--- a/qcom/opensource/display-drivers/msm/sde/sde_color_processing.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_color_processing.c
+@@ -7,6 +7,7 @@
+ #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
+ 
+ #include <linux/dma-buf.h>
++#include <linux/vmalloc.h>
+ #include <linux/string.h>
+ #include <drm/msm_drm_pp.h>
+ #include <drm/msm_drm_aiqe.h>
+@@ -1364,7 +1365,7 @@
+ 	return ret;
+ }
+ 
+-u32 _sde_cp_get_num_dspp_mixers(struct sde_crtc *sde_crtc)
++static u32 _sde_cp_get_num_dspp_mixers(struct sde_crtc *sde_crtc)
+ {
+ 	int i;
+ 	u32 num_mixers = 0;
+@@ -2286,7 +2287,7 @@
+ 		sde_cp_disable_features(crtc);
+ }
+ 
+-void sde_cp_reset_unsupported_feature_wrappers(struct sde_mdss_cfg *catalog)
++static void sde_cp_reset_unsupported_feature_wrappers(struct sde_mdss_cfg *catalog)
+ {
+ 	if (!catalog) {
+ 		DRM_ERROR("invalid catalog\n");
+--- a/qcom/opensource/display-drivers/msm/sde/sde_connector.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_connector.c
+@@ -6,6 +6,7 @@
+ 
+ #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
+ #include "msm_drv.h"
++#include <linux/vmalloc.h>
+ #include "sde_dbg.h"
+ 
+ #include "sde_kms.h"
+@@ -1211,7 +1212,7 @@
+ 	return rc;
+ }
+ 
+-void sde_connector_set_colorspace(struct sde_connector *c_conn)
++static void sde_connector_set_colorspace(struct sde_connector *c_conn)
+ {
+ 	int rc = 0;
+ 
+@@ -1493,7 +1494,7 @@
+ 	return false;
+ }
+ 
+-int sde_connector_check_update_vhm_cmd(struct drm_connector *connector)
++static int sde_connector_check_update_vhm_cmd(struct drm_connector *connector)
+ {
+ 	struct sde_connector *c_conn;
+ 	struct msm_freq_step_pattern *freq_pattern;
+@@ -3574,7 +3575,7 @@
+ 
+ static enum drm_mode_status
+ sde_connector_mode_valid(struct drm_connector *connector,
+-		struct drm_display_mode *mode)
++		const struct drm_display_mode *mode)
+ {
+ 	struct sde_connector *c_conn;
+ 	struct msm_resource_caps_info avail_res;
+@@ -3590,9 +3591,12 @@
+ 	memset(&avail_res, 0, sizeof(avail_res));
+ 	sde_connector_get_avail_res_info(connector, &avail_res);
+ 
+-	if (c_conn->ops.mode_valid)
+-		return c_conn->ops.mode_valid(connector, mode, c_conn->display,
++	if (c_conn->ops.mode_valid) {
++		struct drm_display_mode mode_copy = *mode;
++
++		return c_conn->ops.mode_valid(connector, &mode_copy, c_conn->display,
+ 				&avail_res);
++	}
+ 
+ 	/* assume all modes okay by default */
+ 	return MODE_OK;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_crtc.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_crtc.c
+@@ -53,6 +53,7 @@
+ #include "sde_power_handle.h"
+ #include "sde_core_perf.h"
+ #include "sde_trace.h"
++#include <linux/vmalloc.h>
+ #include "msm_drv.h"
+ #include "sde_vm.h"
+ #include "sde_color_processing_aiqe.h"
+@@ -416,7 +417,7 @@
+ 	}
+ }
+ 
+-int sde_crtc_get_lb_layout_split(struct drm_crtc *crtc, struct drm_crtc_state *crtc_state)
++static int sde_crtc_get_lb_layout_split(struct drm_crtc *crtc, struct drm_crtc_state *crtc_state)
+ {
+ 	struct sde_crtc_state *cstate;
+ 	struct drm_plane *plane;
+@@ -858,7 +859,7 @@
+ 	kfree(sde_crtc);
+ }
+ 
+-struct sde_connector_state *_sde_crtc_get_sde_connector_state(struct drm_crtc *crtc,
++static struct sde_connector_state *_sde_crtc_get_sde_connector_state(struct drm_crtc *crtc,
+ 		struct drm_atomic_state *state)
+ {
+ 	struct drm_connector *conn;
+@@ -3145,7 +3146,7 @@
+ 	sde_crtc->frame_data.idx = ++sde_crtc->frame_data.idx % sde_crtc->frame_data.cnt;
+ }
+ 
+-void sde_crtc_get_frame_data(struct drm_crtc *crtc)
++static void sde_crtc_get_frame_data(struct drm_crtc *crtc)
+ {
+ 	struct sde_crtc *sde_crtc;
+ 	struct drm_plane *plane;
+@@ -3497,7 +3498,7 @@
+ 	SDE_ATRACE_END("signal_retire_fence");
+ }
+ 
+-void sde_crtc_opr_event_notify(struct drm_crtc *crtc)
++static void sde_crtc_opr_event_notify(struct drm_crtc *crtc)
+ {
+ 	struct sde_crtc *sde_crtc;
+ 	uint32_t current_opr_value[MAX_DSI_DISPLAYS] = {0};
+@@ -4360,7 +4361,7 @@
+  *
+  * return 0 if success non-zero otherwise
+  */
+-int sde_crtc_sw_fence_error_handle(struct drm_crtc *crtc, int err_status)
++static int sde_crtc_sw_fence_error_handle(struct drm_crtc *crtc, int err_status)
+ {
+ 	struct sde_crtc *sde_crtc = NULL;
+ 	struct drm_encoder *drm_encoder;
+@@ -8805,7 +8806,7 @@
+ /*
+  * __sde_crtc_static_cache_read_work - transition to cache read
+  */
+-void __sde_crtc_static_cache_read_work(struct kthread_work *work)
++static void __sde_crtc_static_cache_read_work(struct kthread_work *work)
+ {
+ 	struct sde_crtc *sde_crtc = container_of(work, struct sde_crtc,
+ 			static_cache_read_work.work);
+--- a/qcom/opensource/display-drivers/msm/sde/sde_encoder.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_encoder.c
+@@ -270,7 +270,8 @@
+ 	return is_vid ? phys->pf_time_in_us : 0;
+ }
+ 
+-ktime_t sde_encoder_event_timestamp_adjust(u32 drm_enc_id, u32 event_fps, u64 event_timestamp_hw)
++static ktime_t sde_encoder_event_timestamp_adjust(u32 drm_enc_id,
++		u32 event_fps, u64 event_timestamp_hw)
+ {
+ 	u64 cur_timestamp_hw, hw_diff, hw_diff_ns, event_period_ns;
+ 	ktime_t event_timestamp_sw, cur_time_sw;
+@@ -350,7 +351,7 @@
+ 	return sde_encoder_event_timestamp_adjust(DRMID(drm_enc), fps, vsync_counter);
+ }
+ 
+-ktime_t sde_encoder_calc_last_empulse_timestamp(struct drm_encoder *drm_enc)
++static ktime_t sde_encoder_calc_last_empulse_timestamp(struct drm_encoder *drm_enc)
+ {
+ 	struct sde_encoder_virt *sde_enc;
+ 	struct sde_encoder_phys *cur_master;
+@@ -2297,7 +2298,7 @@
+ 			ctrl_cfg.req_mode, ctrl_cfg.hw_sleep_enable, sde_enc->cesta_scc_override);
+ }
+ 
+-void sde_encoder_cancel_vrr_timers(struct drm_encoder *encoder)
++static void sde_encoder_cancel_vrr_timers(struct drm_encoder *encoder)
+ {
+ 	struct sde_encoder_virt *sde_enc;
+ 	struct sde_encoder_phys *phys_enc;
+@@ -4643,7 +4644,7 @@
+ 	return WB_MAX;
+ }
+ 
+-void sde_encoder_hw_fence_status(struct sde_kms *sde_kms,
++static void sde_encoder_hw_fence_status(struct sde_kms *sde_kms,
+ 	struct drm_crtc *crtc, struct sde_hw_ctl *hw_ctl)
+ {
+ 	u64 start_timestamp, end_timestamp;
+@@ -4672,7 +4673,7 @@
+ 	}
+ }
+ 
+-void sde_encoder_perf_uidle_status(struct sde_kms *sde_kms,
++static void sde_encoder_perf_uidle_status(struct sde_kms *sde_kms,
+ 	struct drm_crtc *crtc)
+ {
+ 	struct sde_hw_uidle *uidle;
+@@ -5096,7 +5097,7 @@
+ 		phys->ops.control_esync_vsync_irq(phys, false, true);
+ }
+ 
+-void sde_encoder_check_prog_fetch_region(struct drm_encoder *drm_enc)
++static void sde_encoder_check_prog_fetch_region(struct drm_encoder *drm_enc)
+ {
+ 	struct sde_encoder_virt *sde_enc = to_sde_encoder_virt(drm_enc);
+ 	struct msm_mode_info *mode_info = &sde_enc->mode_info;
+@@ -6424,7 +6425,7 @@
+ 	}
+ }
+ 
+-void sde_encoder_phys_arp_sw_timer_frequency_stepping(struct sde_encoder_phys *phys_enc,
++static void sde_encoder_phys_arp_sw_timer_frequency_stepping(struct sde_encoder_phys *phys_enc,
+ 	u32 new_commit)
+ {
+ 	struct sde_encoder_virt *sde_enc = to_sde_encoder_virt(phys_enc->parent);
+@@ -6549,7 +6550,8 @@
+ 
+ }
+ 
+-void sde_encoder_handle_self_refresh_video_psr(struct sde_encoder_phys *phys_enc, u32 new_commit)
++static void sde_encoder_handle_self_refresh_video_psr(struct sde_encoder_phys *phys_enc,
++		u32 new_commit)
+ {
+ 	struct sde_encoder_virt *sde_enc = to_sde_encoder_virt(phys_enc->parent);
+ 	struct sde_encoder_vrr_cfg *vrr_cfg = &phys_enc->sde_vrr_cfg;
+@@ -6923,7 +6925,7 @@
+ 	return ret;
+ }
+ 
+-void _sde_encoder_delay_kickoff_processing(struct sde_encoder_virt *sde_enc)
++static void _sde_encoder_delay_kickoff_processing(struct sde_encoder_virt *sde_enc)
+ {
+ 	ktime_t current_ts, ept_ts;
+ 	u32 avr_step_fps, min_fps = 0, qsync_mode, fps;
+@@ -7211,7 +7213,7 @@
+ }
+ 
+ #ifdef MI_DISPLAY_MODIFY
+-int sde_encoder_vid_wait_for_active(
++static int sde_encoder_vid_wait_for_active(
+ 			struct drm_encoder *drm_enc)
+ {
+ 	struct drm_display_mode mode;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_encoder_dce.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_encoder_dce.c
+@@ -6,6 +6,7 @@
+ 
+ #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
+ #include <linux/kthread.h>
++#include "sde_encoder_dce.h"
+ #include <linux/debugfs.h>
+ #include <linux/seq_file.h>
+ #include <linux/sde_rsc.h>
+@@ -832,7 +833,7 @@
+ 	 */
+ }
+ 
+-bool _dce_dsc_is_dirty(struct sde_encoder_virt *sde_enc)
++static bool _dce_dsc_is_dirty(struct sde_encoder_virt *sde_enc)
+ {
+ 	int i;
+ 
+@@ -848,7 +849,7 @@
+ 	return false;
+ }
+ 
+-bool _dce_vdc_is_dirty(struct sde_encoder_virt *sde_enc)
++static bool _dce_vdc_is_dirty(struct sde_encoder_virt *sde_enc)
+ {
+ 	int i;
+ 
+@@ -883,7 +884,7 @@
+ 	}
+ }
+ 
+-void _dce_helper_flush_vdc(struct sde_encoder_virt *sde_enc)
++static void _dce_helper_flush_vdc(struct sde_encoder_virt *sde_enc)
+ {
+ 	int i;
+ 	struct sde_hw_ctl *hw_ctl = NULL;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_encoder_dce.h
++++ b/qcom/opensource/display-drivers/msm/sde/sde_encoder_dce.h
+@@ -34,6 +34,6 @@
+  * sde_encoder_dce_flush :function to flush the compression configuration
+  * @sde_enc: pointer to virtual encoder structure
+  */
+-void sde_encoder_dce_flush(struct sde_encoder_virt *sde_enc);
++int sde_encoder_dce_flush(struct sde_encoder_virt *sde_enc);
+ 
+ #endif /* __SDE_ENCODER_DCE_H__ */
+--- a/qcom/opensource/display-drivers/msm/sde/sde_encoder_phys_cmd.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_encoder_phys_cmd.c
+@@ -1258,7 +1258,7 @@
+ 	return ret;
+ }
+ 
+-void sde_encoder_phys_cmd_dynamic_irq_control(struct sde_encoder_phys *phys_enc, bool enable)
++static void sde_encoder_phys_cmd_dynamic_irq_control(struct sde_encoder_phys *phys_enc, bool enable)
+ {
+ 	struct sde_encoder_virt *sde_enc;
+ 
+@@ -1301,7 +1301,7 @@
+ 	}
+ }
+ 
+-void sde_encoder_phys_cmd_irq_control(struct sde_encoder_phys *phys_enc,
++static void sde_encoder_phys_cmd_irq_control(struct sde_encoder_phys *phys_enc,
+ 		bool enable)
+ {
+ 	struct sde_encoder_phys_cmd *cmd_enc;
+@@ -2601,7 +2601,7 @@
+ 				vsync_source);
+ }
+ 
+-void sde_encoder_phys_cmd_add_enc_to_minidump(struct sde_encoder_phys *phys_enc)
++static void sde_encoder_phys_cmd_add_enc_to_minidump(struct sde_encoder_phys *phys_enc)
+ {
+ 	struct sde_encoder_phys_cmd *cmd_enc;
+ 	cmd_enc =  to_sde_encoder_phys_cmd(phys_enc);
+@@ -2609,7 +2609,7 @@
+ 	sde_mini_dump_add_va_region("sde_enc_phys_cmd", sizeof(*cmd_enc), cmd_enc);
+ }
+ 
+-void sde_encoder_phys_cmd_cesta_ctrl_cfg(struct sde_encoder_phys *phys_enc,
++static void sde_encoder_phys_cmd_cesta_ctrl_cfg(struct sde_encoder_phys *phys_enc,
+ 		struct sde_cesta_ctrl_cfg *cfg, bool *req_flush, bool *req_scc)
+ {
+ 	struct sde_encoder_virt *sde_enc = to_sde_encoder_virt(phys_enc->parent);
+@@ -2828,15 +2828,12 @@
+ 		list_add(&cmd_enc->te_timestamp[i].list,
+ 				&cmd_enc->te_timestamp_list);
+ 
+-	hrtimer_init(&phys_enc->sde_vrr_cfg.self_refresh_timer,
++	hrtimer_setup(&phys_enc->sde_vrr_cfg.self_refresh_timer,
++			sde_encoder_phys_phys_self_refresh_helper,
+ 		CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-	phys_enc->sde_vrr_cfg.self_refresh_timer.function =
+-		sde_encoder_phys_phys_self_refresh_helper;
+-
+-	hrtimer_init(&phys_enc->sde_vrr_cfg.backlight_timer,
++
++	hrtimer_setup(&phys_enc->sde_vrr_cfg.backlight_timer, sde_encoder_phys_backlight_timer_cb,
+ 		CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-	phys_enc->sde_vrr_cfg.backlight_timer.function =
+-		sde_encoder_phys_backlight_timer_cb;
+ 
+ 	SDE_DEBUG_CMDENC(cmd_enc, "created\n");
+ 
+--- a/qcom/opensource/display-drivers/msm/sde/sde_encoder_phys_vid.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_encoder_phys_vid.c
+@@ -570,7 +570,7 @@
+ 			sde_enc->disp_info.is_te_using_watchdog_timer);
+ }
+ 
+-void _sde_encoder_phys_vid_setup_panic_ctrl(struct sde_encoder_phys *phys_enc)
++static void _sde_encoder_phys_vid_setup_panic_ctrl(struct sde_encoder_phys *phys_enc)
+ {
+ 	struct sde_encoder_virt *sde_enc = to_sde_encoder_virt(phys_enc->parent);
+ 	struct sde_encoder_phys_vid *vid_enc = to_sde_encoder_phys_vid(phys_enc);
+@@ -2468,7 +2468,7 @@
+ 	}
+ }
+ 
+-void sde_encoder_phys_vid_idle_pc_enter(struct sde_encoder_phys *phys_enc)
++static void sde_encoder_phys_vid_idle_pc_enter(struct sde_encoder_phys *phys_enc)
+ {
+ 	struct sde_encoder_virt *sde_enc;
+ 	struct sde_hw_intf_cfg_v1 *intf_cfg;
+@@ -2521,7 +2521,7 @@
+ 	sde_connector_esync_clk_ctrl(drm_conn, false);
+ }
+ 
+-void sde_encoder_phys_vid_idle_pc_exit(struct sde_encoder_phys *phys_enc)
++static void sde_encoder_phys_vid_idle_pc_exit(struct sde_encoder_phys *phys_enc)
+ {
+ 	struct drm_connector *drm_conn = phys_enc->connector;
+ 	struct sde_hw_intf *intf;
+@@ -2882,7 +2882,7 @@
+ 	return -EINVAL;
+ }
+ 
+-void sde_encoder_phys_vid_add_enc_to_minidump(struct sde_encoder_phys *phys_enc)
++static void sde_encoder_phys_vid_add_enc_to_minidump(struct sde_encoder_phys *phys_enc)
+ {
+ 	struct sde_encoder_phys_vid *vid_enc;
+ 	vid_enc =  to_sde_encoder_phys_vid(phys_enc);
+@@ -2890,7 +2890,7 @@
+ 	sde_mini_dump_add_va_region("sde_enc_phys_vid", sizeof(*vid_enc), vid_enc);
+ }
+ 
+-void sde_encoder_phys_vid_cesta_ctrl_cfg(struct sde_encoder_phys *phys_enc,
++static void sde_encoder_phys_vid_cesta_ctrl_cfg(struct sde_encoder_phys *phys_enc,
+ 		struct sde_cesta_ctrl_cfg *cfg, bool *req_flush, bool *req_scc)
+ {
+ 	struct sde_encoder_virt *sde_enc = to_sde_encoder_virt(phys_enc->parent);
+@@ -3053,28 +3053,21 @@
+ 
+ skip_irq_init:
+ 	phys_enc->enable_state = SDE_ENC_DISABLED;
+-	hrtimer_init(&phys_enc->sde_vrr_cfg.freq_step_timer,
++	hrtimer_setup(&phys_enc->sde_vrr_cfg.freq_step_timer,
++			sde_encoder_phys_vid_freq_step_callback,
+ 		CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-	phys_enc->sde_vrr_cfg.freq_step_timer.function =
+-		sde_encoder_phys_vid_freq_step_callback;
+-	hrtimer_init(&phys_enc->sde_vrr_cfg.arp_transition_timer,
++	hrtimer_setup(&phys_enc->sde_vrr_cfg.arp_transition_timer,
++			sde_encoder_phys_vid_arp_transition_timer_cb,
+ 		CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-	phys_enc->sde_vrr_cfg.arp_transition_timer.function =
+-		sde_encoder_phys_vid_arp_transition_timer_cb;
+-	hrtimer_init(&phys_enc->sde_vrr_cfg.self_refresh_timer,
++	hrtimer_setup(&phys_enc->sde_vrr_cfg.self_refresh_timer,
++			sde_encoder_phys_phys_self_refresh_helper,
+ 		CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-	phys_enc->sde_vrr_cfg.self_refresh_timer.function =
+-		sde_encoder_phys_phys_self_refresh_helper;
+-
+-	hrtimer_init(&phys_enc->sde_vrr_cfg.backlight_timer,
++
++	hrtimer_setup(&phys_enc->sde_vrr_cfg.backlight_timer, sde_encoder_phys_backlight_timer_cb,
+ 		CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-	phys_enc->sde_vrr_cfg.backlight_timer.function =
+-		sde_encoder_phys_backlight_timer_cb;
+-
+-	hrtimer_init(&phys_enc->empulse_backup_timer,
++
++	hrtimer_setup(&phys_enc->empulse_backup_timer, sde_encoder_phys_vid_esync_backup_sim,
+ 		CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-	phys_enc->empulse_backup_timer.function =
+-		sde_encoder_phys_vid_esync_backup_sim;
+ 
+ 	SDE_DEBUG_VIDENC(vid_enc, "created intf idx:%d\n", p->intf_idx);
+ 
+--- a/qcom/opensource/display-drivers/msm/sde/sde_encoder_phys_wb.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_encoder_phys_wb.c
+@@ -2606,7 +2606,7 @@
+ 	}
+ 
+ 	/* allocate gem tracking object */
+-	info = drm_get_format_info(dev, &mode_cmd);
++	info = drm_get_format_info(dev, mode_cmd.pixel_format, mode_cmd.modifier[0]);
+ 	nplanes = info->num_planes;
+ 	if (nplanes >= SDE_MAX_PLANES) {
+ 		SDE_ERROR("[enc:%d wb:%d] requested format has too many planes:%d\n",
+@@ -2887,14 +2887,14 @@
+ 	kfree(wb_enc);
+ }
+ 
+-void sde_encoder_phys_wb_add_enc_to_minidump(struct sde_encoder_phys *phys_enc)
++static void sde_encoder_phys_wb_add_enc_to_minidump(struct sde_encoder_phys *phys_enc)
+ {
+ 	struct sde_encoder_phys_wb *wb_enc = to_sde_encoder_phys_wb(phys_enc);
+ 
+ 	sde_mini_dump_add_va_region("sde_enc_phys_wb", sizeof(*wb_enc), wb_enc);
+ }
+ 
+-void sde_encoder_phys_wb_cesta_ctrl_cfg(struct sde_encoder_phys *phys_enc,
++static void sde_encoder_phys_wb_cesta_ctrl_cfg(struct sde_encoder_phys *phys_enc,
+ 		struct sde_cesta_ctrl_cfg *cfg, bool *req_flush, bool *req_scc)
+ {
+ 	cfg->enable = true;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_fence.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_fence.c
+@@ -133,7 +133,7 @@
+ 		{5, 11}, 0, 46, 25, 0, 0}
+ };
+ 
+-void msm_hw_fence_error_cb(u32 handle, int error, void *cb_data)
++static void msm_hw_fence_error_cb(u32 handle, int error, void *cb_data)
+ {
+ 	struct msm_hw_fence_cb_data *msm_hw_fence_cb_data;
+ 	struct sde_hw_fence_error_cb_data *sde_hw_fence_error_data;
+@@ -820,7 +820,7 @@
+ void *sde_sync_get(uint64_t fd)
+ {
+ 	/* force signed compare, fdget accepts an int argument */
+-	return (signed int)fd >= 0 ? sync_file_get_fence(fd) : NULL;
++	return fd <= INT_MAX ? sync_file_get_fence(fd) : NULL;
+ }
+ 
+ void sde_sync_put(void *fence)
+@@ -829,12 +829,15 @@
+ 		dma_fence_put(fence);
+ }
+ 
++static struct dma_fence_ops sde_fence_ops;
++static void sde_fence_timeline_value_str(struct dma_fence *fence, char *str, int size);
++
+ void sde_fence_dump(struct dma_fence *fence)
+ {
+-	char timeline_str[TIMELINE_VAL_LENGTH];
+-
+-	if (fence->ops->timeline_value_str)
+-		fence->ops->timeline_value_str(fence, timeline_str, TIMELINE_VAL_LENGTH);
++	char timeline_str[TIMELINE_VAL_LENGTH] = "unavailable";
++
++	if (fence->ops == &sde_fence_ops)
++		sde_fence_timeline_value_str(fence, timeline_str, TIMELINE_VAL_LENGTH);
+ 
+ 	SDE_ERROR(
+ 		"fence drv name:%s timeline name:%s seqno:0x%llx timeline:%s signaled:0x%x status:%d flags:0x%lx\n",
+@@ -983,14 +986,6 @@
+ 	}
+ }
+ 
+-static void sde_fence_value_str(struct dma_fence *fence, char *str, int size)
+-{
+-	if (!fence || !str)
+-		return;
+-
+-	snprintf(str, size, "%llu", fence->seqno);
+-}
+-
+ static void sde_fence_timeline_value_str(struct dma_fence *fence, char *str,
+ 		int size)
+ {
+@@ -1009,8 +1004,6 @@
+ 	.signaled = sde_fence_signaled,
+ 	.wait = dma_fence_default_wait,
+ 	.release = sde_fence_release,
+-	.fence_value_str = sde_fence_value_str,
+-	.timeline_value_str = sde_fence_timeline_value_str,
+ };
+ 
+ /**
+@@ -1305,10 +1298,10 @@
+ 
+ void sde_fence_list_dump(struct dma_fence *fence, struct seq_file **s)
+ {
+-	char timeline_str[TIMELINE_VAL_LENGTH];
+-
+-	if (fence->ops->timeline_value_str)
+-		fence->ops->timeline_value_str(fence,
++	char timeline_str[TIMELINE_VAL_LENGTH] = "unavailable";
++
++	if (fence->ops == &sde_fence_ops)
++		sde_fence_timeline_value_str(fence,
+ 		timeline_str, TIMELINE_VAL_LENGTH);
+ 
+ 	seq_printf(*s, "fence name:%s timeline name:%s seqno:0x%llx timeline:%s signaled:0x%x\n",
+--- a/qcom/opensource/display-drivers/msm/sde/sde_hw_catalog.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_hw_catalog.c
+@@ -6,6 +6,7 @@
+ 
+ #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
+ #include <linux/nvmem-consumer.h>
++#include <linux/vmalloc.h>
+ #include <linux/slab.h>
+ #include <linux/of_address.h>
+ #include <linux/platform_device.h>
+--- a/qcom/opensource/display-drivers/msm/sde/sde_hw_cdm.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_hw_cdm.c
+@@ -212,7 +212,7 @@
+ 	return 0;
+ }
+ 
+-int sde_hw_cdm_enable(struct sde_hw_cdm *ctx,
++static int sde_hw_cdm_enable(struct sde_hw_cdm *ctx,
+ 		struct sde_hw_cdm_cfg *cdm)
+ {
+ 	struct sde_hw_blk_reg_map *c = &ctx->hw;
+@@ -255,7 +255,7 @@
+ 	return 0;
+ }
+ 
+-void sde_hw_cdm_disable(struct sde_hw_cdm *ctx)
++static void sde_hw_cdm_disable(struct sde_hw_cdm *ctx)
+ {
+ 	struct cdm_output_cfg cdm_cfg = { 0 };
+ 
+--- a/qcom/opensource/display-drivers/msm/sde/sde_hw_dsc_1_2.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_hw_dsc_1_2.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "sde_hw_mdss.h"
++#include "sde_hw_dsc_1_2.h"
+ #include "sde_hwio.h"
+ #include "sde_hw_catalog.h"
+ #include "sde_hw_dsc.h"
+--- a/qcom/opensource/display-drivers/msm/sde/sde_hw_dsc_1_2.h
++++ b/qcom/opensource/display-drivers/msm/sde/sde_hw_dsc_1_2.h
+@@ -7,6 +7,8 @@
+ #define _SDE_HW_DSC_1_2_H
+ 
+ 
++struct sde_hw_dsc_ops;
++
+ void sde_dsc1_2_setup_ops(struct sde_hw_dsc_ops *ops,
+ 		const unsigned long features);
+ 
+--- a/qcom/opensource/display-drivers/msm/sde/sde_hw_rc.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_hw_rc.c
+@@ -6,6 +6,7 @@
+ 
+ #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
+ #include <drm/msm_drm_pp.h>
++#include <linux/vmalloc.h>
+ #include "sde_kms.h"
+ #include "sde_hw_rc.h"
+ #include "sde_hw_catalog.h"
+--- a/qcom/opensource/display-drivers/msm/sde/sde_hw_reg_dma_v1.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_hw_reg_dma_v1.c
+@@ -1325,9 +1325,9 @@
+ 	msm_gem_address_space_unregister_cb(aspace,
+ 			sde_reg_dma_aspace_cb_locked, dma_buf);
+ free_gem:
+-	mutex_lock(&reg_dma[dpu_idx]->drm_dev->struct_mutex);
++	mutex_lock(msm_gem_mutex(reg_dma[dpu_idx]->drm_dev));
+ 	msm_gem_free_object(dma_buf->buf);
+-	mutex_unlock(&reg_dma[dpu_idx]->drm_dev->struct_mutex);
++	mutex_unlock(msm_gem_mutex(reg_dma[dpu_idx]->drm_dev));
+ fail:
+ 	kfree(dma_buf);
+ 	return ERR_PTR(rc);
+@@ -1349,9 +1349,9 @@
+ 		msm_gem_put_iova(dma_buf->buf, 0);
+ 		msm_gem_address_space_unregister_cb(dma_buf->aspace,
+ 				sde_reg_dma_aspace_cb_locked, dma_buf);
+-		mutex_lock(&reg_dma[dpu_idx]->drm_dev->struct_mutex);
++		mutex_lock(msm_gem_mutex(reg_dma[dpu_idx]->drm_dev));
+ 		msm_gem_free_object(dma_buf->buf);
+-		mutex_unlock(&reg_dma[dpu_idx]->drm_dev->struct_mutex);
++		mutex_unlock(msm_gem_mutex(reg_dma[dpu_idx]->drm_dev));
+ 	}
+ 
+ 	kfree(dma_buf);
+--- a/qcom/opensource/display-drivers/msm/sde/sde_hw_reg_dma_v1_color_proc.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_hw_reg_dma_v1_color_proc.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <drm/msm_drm_pp.h>
++#include <linux/vmalloc.h>
+ #include "sde_reg_dma.h"
+ #include "sde_hw_reg_dma_v1_color_proc.h"
+ #include "sde_hw_color_proc_common_v4.h"
+@@ -1844,7 +1845,7 @@
+ 		DRM_ERROR("failed to kick off ret %d\n", rc);
+ }
+ 
+-void reg_dmav1_setup_dspp_pcc_common(struct sde_hw_dspp *ctx, void *cfg)
++static void reg_dmav1_setup_dspp_pcc_common(struct sde_hw_dspp *ctx, void *cfg)
+ {
+ 	struct sde_hw_reg_dma_ops *dma_ops;
+ 	struct sde_reg_dma_kickoff_cfg kick_off;
+@@ -5837,7 +5838,7 @@
+ 	return rc;
+ }
+ 
+-int reg_dmav1_setup_spr_cfg3_params(struct sde_hw_dspp *ctx,
++static int reg_dmav1_setup_spr_cfg3_params(struct sde_hw_dspp *ctx,
+ 		struct drm_msm_spr_init_cfg *payload,
+ 		struct sde_reg_dma_setup_ops_cfg *dma_write_cfg,
+ 		struct sde_hw_reg_dma_ops *dma_ops)
+@@ -5884,7 +5885,7 @@
+ 	return rc;
+ }
+ 
+-int reg_dmav1_setup_spr_cfg4_params(struct sde_hw_dspp *ctx,
++static int reg_dmav1_setup_spr_cfg4_params(struct sde_hw_dspp *ctx,
+ 		struct drm_msm_spr_init_cfg *payload,
+ 		struct sde_reg_dma_setup_ops_cfg *dma_write_cfg,
+ 		struct sde_hw_reg_dma_ops *dma_ops)
+@@ -5916,7 +5917,7 @@
+ 	return rc;
+ }
+ 
+-int reg_dmav1_setup_spr_cfg5_params(struct sde_hw_dspp *ctx,
++static int reg_dmav1_setup_spr_cfg5_params(struct sde_hw_dspp *ctx,
+ 		struct drm_msm_spr_init_cfg *payload,
+ 		struct sde_reg_dma_setup_ops_cfg *dma_write_cfg,
+ 		struct sde_hw_reg_dma_ops *dma_ops)
+@@ -5960,7 +5961,7 @@
+ 	return rc;
+ }
+ 
+-void reg_dmav1_disable_spr(struct sde_hw_dspp *ctx, void *cfg)
++static void reg_dmav1_disable_spr(struct sde_hw_dspp *ctx, void *cfg)
+ {
+ 	struct sde_reg_dma_setup_ops_cfg dma_write_cfg;
+ 	struct sde_hw_cp_cfg *hw_cfg = cfg;
+@@ -6006,7 +6007,7 @@
+ 	ctx->spr_cfg_18_default = 0;
+ }
+ 
+-int reg_dmav1_setup_spr_init_common(struct sde_hw_dspp *ctx,
++static int reg_dmav1_setup_spr_init_common(struct sde_hw_dspp *ctx,
+ 		struct drm_msm_spr_init_cfg *payload,
+ 		struct sde_reg_dma_setup_ops_cfg *dma_write_cfg,
+ 		struct sde_hw_reg_dma_ops *dma_ops)
+@@ -6064,7 +6065,7 @@
+ 	return rc;
+ }
+ 
+-int reg_dmav1_get_spr_target(struct sde_hw_dspp *ctx, void *cfg,
++static int reg_dmav1_get_spr_target(struct sde_hw_dspp *ctx, void *cfg,
+ 		struct sde_hw_reg_dma_ops **dma_ops, uint32_t *base_off,
+ 		struct sde_reg_dma_buffer **buffer, bool *disable)
+ {
+@@ -6096,7 +6097,7 @@
+ 	return rc;
+ }
+ 
+-int reg_dmav1_setup_spr_init_kickoff(uint32_t dpu_idx,
++static int reg_dmav1_setup_spr_init_kickoff(uint32_t dpu_idx,
+ 		uint32_t version, uint32_t base_off,
+ 		struct sde_hw_reg_dma_ops *dma_ops,
+ 		struct sde_hw_cp_cfg *hw_cfg,
+@@ -6418,7 +6419,7 @@
+ 	kvfree(reg);
+ }
+ 
+-int reg_dmav1_setup_spr_pu_config(struct sde_hw_dspp *ctx,
++static int reg_dmav1_setup_spr_pu_config(struct sde_hw_dspp *ctx,
+ 	struct msm_roi_list *roi_list,
+ 	struct sde_hw_reg_dma_ops *dma_ops, struct sde_reg_dma_buffer *buffer)
+ {
+@@ -6453,7 +6454,7 @@
+ 	return rc;
+ }
+ 
+-int reg_dmav1_setup_spr_pu_common(struct sde_hw_dspp *ctx, struct sde_hw_cp_cfg *hw_cfg,
++static int reg_dmav1_setup_spr_pu_common(struct sde_hw_dspp *ctx, struct sde_hw_cp_cfg *hw_cfg,
+ 		struct msm_roi_list *roi_list,
+ 		struct sde_hw_reg_dma_ops *dma_ops, struct sde_reg_dma_buffer *buffer)
+ {
+--- a/qcom/opensource/display-drivers/msm/sde/sde_hw_sspp.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_hw_sspp.c
+@@ -1048,7 +1048,7 @@
+ 	}
+ }
+ 
+-u32 sde_hw_sspp_get_source_addr(struct sde_hw_pipe *ctx, bool is_virtual)
++static u32 sde_hw_sspp_get_source_addr(struct sde_hw_pipe *ctx, bool is_virtual)
+ {
+ 	u32 idx;
+ 	u32 offset = 0;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_hw_top.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_hw_top.c
+@@ -394,7 +394,7 @@
+ 	_update_vsync_source(mdp, cfg);
+ }
+ 
+-void sde_hw_reset_ubwc(struct sde_hw_mdp *mdp, struct sde_mdss_cfg *m)
++static void sde_hw_reset_ubwc(struct sde_hw_mdp *mdp, struct sde_mdss_cfg *m)
+ {
+ 	struct sde_hw_blk_reg_map c;
+ 	u32 ubwc_dec_version;
+@@ -476,7 +476,7 @@
+ 	SDE_REG_WRITE(c, HW_EVENTS_CTL, enable);
+ }
+ 
+-void sde_hw_set_vm_sid_v2(struct sde_hw_sid *sid, u32 vm, struct sde_mdss_cfg *m)
++static void sde_hw_set_vm_sid_v2(struct sde_hw_sid *sid, u32 vm, struct sde_mdss_cfg *m)
+ {
+ 	u32 offset = 0;
+ 	int i;
+@@ -509,7 +509,7 @@
+ 	SDE_REG_WRITE(&sid->hw, MDP_SID_V2_DSI1, vm << 2);
+ }
+ 
+-void sde_hw_set_vm_sid(struct sde_hw_sid *sid, u32 vm, struct sde_mdss_cfg *m)
++static void sde_hw_set_vm_sid(struct sde_hw_sid *sid, u32 vm, struct sde_mdss_cfg *m)
+ {
+ 	if (!sid || !m)
+ 		return;
+@@ -826,7 +826,7 @@
+ 	SDE_REG_WRITE(&c, offset, val);
+ }
+ 
+-void sde_hw_top_set_ppb_fifo_size(struct sde_hw_mdp *mdp, u32 pp, u32 sz)
++static void sde_hw_top_set_ppb_fifo_size(struct sde_hw_mdp *mdp, u32 pp, u32 sz)
+ {
+ 	struct sde_hw_blk_reg_map c;
+ 	u32 offset, val, pp_index;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_hw_uidle.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_hw_uidle.c
+@@ -77,7 +77,7 @@
+ 	return ERR_PTR(-EINVAL);
+ }
+ 
+-void sde_hw_uidle_get_status(struct sde_hw_uidle *uidle,
++static void sde_hw_uidle_get_status(struct sde_hw_uidle *uidle,
+ 		struct sde_uidle_status *status)
+ {
+ 	struct sde_hw_blk_reg_map *c = &uidle->hw;
+@@ -105,7 +105,7 @@
+ 		(status->uidle_status & BIT(2)) ? 1 : 0;
+ }
+ 
+-void sde_hw_uidle_get_status_ext1(struct sde_hw_uidle *uidle,
++static void sde_hw_uidle_get_status_ext1(struct sde_hw_uidle *uidle,
+ 		struct sde_uidle_status *status)
+ {
+ 	struct sde_hw_blk_reg_map *c = &uidle->hw;
+@@ -120,7 +120,7 @@
+ 	status->uidle_fal_status_3 = SDE_REG_READ(c, UIDLE_FAL_STATUS_3);
+ }
+ 
+-void sde_hw_uidle_get_cntr(struct sde_hw_uidle *uidle,
++static void sde_hw_uidle_get_cntr(struct sde_hw_uidle *uidle,
+ 		struct sde_uidle_cntr *cntr)
+ {
+ 	struct sde_hw_blk_reg_map *c = &uidle->hw;
+@@ -149,7 +149,7 @@
+ 	SDE_REG_WRITE(c, UIDLE_GATE_CNTR_CTL, reg_val);
+ }
+ 
+-void sde_hw_uidle_setup_cntr(struct sde_hw_uidle *uidle, bool enable)
++static void sde_hw_uidle_setup_cntr(struct sde_hw_uidle *uidle, bool enable)
+ {
+ 	struct sde_hw_blk_reg_map *c = &uidle->hw;
+ 	u32 reg_val;
+@@ -160,7 +160,7 @@
+ 	SDE_REG_WRITE(c, UIDLE_GATE_CNTR_CTL, reg_val);
+ }
+ 
+-void sde_hw_uidle_setup_wd_timer(struct sde_hw_uidle *uidle,
++static void sde_hw_uidle_setup_wd_timer(struct sde_hw_uidle *uidle,
+ 		struct sde_uidle_wd_cfg *cfg)
+ {
+ 	struct sde_hw_blk_reg_map *c = &uidle->hw;
+@@ -184,7 +184,7 @@
+ 	SDE_REG_WRITE(c, UIDLE_WD_TIMER_LOAD_VALUE, val_ld);
+ }
+ 
+-void sde_hw_uidle_setup_ctl(struct sde_hw_uidle *uidle,
++static void sde_hw_uidle_setup_ctl(struct sde_hw_uidle *uidle,
+ 		struct sde_uidle_ctl_cfg *cfg)
+ {
+ 	struct sde_hw_blk_reg_map *c = &uidle->hw;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_kms.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_kms.c
+@@ -1361,7 +1361,7 @@
+ 	return rc;
+ }
+ 
+-void sde_kms_vm_set_sid(struct sde_kms *sde_kms, u32 vm)
++static void sde_kms_vm_set_sid(struct sde_kms *sde_kms, u32 vm)
+ {
+ 	struct drm_plane *plane;
+ 	struct drm_device *ddev;
+@@ -1618,7 +1618,7 @@
+ 	}
+ }
+ 
+-int sde_kms_vm_pre_release(struct sde_kms *sde_kms,
++static int sde_kms_vm_pre_release(struct sde_kms *sde_kms,
+ 	struct drm_atomic_state *state, bool is_primary)
+ {
+ 	struct drm_crtc *crtc;
+@@ -2094,7 +2094,7 @@
+ 	sde_kms->dsi_display_count = 0;
+ }
+ 
+-int setup_hdmi_displays(struct drm_device *dev,
++static int setup_hdmi_displays(struct drm_device *dev,
+ 						struct msm_drm_private *priv,
+ 						struct sde_kms *sde_kms,
+ 						int max_encoders,
+@@ -4437,7 +4437,7 @@
+ }
+ 
+ 
+-void sde_kms_display_early_wakeup(struct drm_device *dev,
++static void sde_kms_display_early_wakeup(struct drm_device *dev,
+ 				const int32_t connector_id)
+ {
+ 	struct drm_connector_list_iter conn_iter;
+@@ -4463,7 +4463,7 @@
+ 	drm_connector_list_iter_end(&conn_iter);
+ }
+ 
+-void sde_kms_display_early_ept_hint(struct drm_device *dev,
++static void sde_kms_display_early_ept_hint(struct drm_device *dev,
+ 	const int32_t connector_id, u64 frame_interval, u64 ept_ns)
+ {
+ 	struct drm_connector_list_iter conn_iter;
+@@ -4595,7 +4595,7 @@
+ 	msm_atomic_flush_display_threads(priv);
+ }
+ 
+-struct msm_display_mode *sde_kms_get_msm_mode(struct drm_connector_state *conn_state)
++static struct msm_display_mode *sde_kms_get_msm_mode(struct drm_connector_state *conn_state)
+ {
+ 	struct sde_connector_state *sde_conn_state;
+ 
+@@ -5656,7 +5656,7 @@
+ 	return rc;
+ }
+ 
+-int _sde_kms_get_tvm_inclusion_mem(struct sde_mdss_cfg *catalog, struct list_head *mem_list)
++static int _sde_kms_get_tvm_inclusion_mem(struct sde_mdss_cfg *catalog, struct list_head *mem_list)
+ {
+ 	struct list_head temp_head;
+ 	struct msm_io_mem_entry *io_mem;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_plane.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_plane.c
+@@ -20,6 +20,7 @@
+ #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
+ 
+ #include <linux/debugfs.h>
++#include <linux/vmalloc.h>
+ #include <linux/dma-buf.h>
+ #include <drm/sde_drm.h>
+ #include <drm/msm_drm_pp.h>
+@@ -455,7 +456,7 @@
+ 	psde->revalidate = enable;
+ }
+ 
+-int sde_plane_danger_signal_ctrl(struct drm_plane *plane, bool enable)
++static int sde_plane_danger_signal_ctrl(struct drm_plane *plane, bool enable)
+ {
+ 	struct sde_plane *psde;
+ 	int rc;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_reg_dma.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_reg_dma.c
+@@ -47,13 +47,13 @@
+ 	return -EINVAL;
+ }
+ 
+-struct sde_reg_dma_buffer *default_alloc_reg_dma_buf(u32 size, u32 dpu_idx)
++static struct sde_reg_dma_buffer *default_alloc_reg_dma_buf(u32 size, u32 dpu_idx)
+ {
+ 	DRM_ERROR("not implemented\n");
+ 	return ERR_PTR(-EINVAL);
+ }
+ 
+-int default_dealloc_reg_dma(struct sde_reg_dma_buffer *lut_buf, u32 dpu_idx)
++static int default_dealloc_reg_dma(struct sde_reg_dma_buffer *lut_buf, u32 dpu_idx)
+ {
+ 	DRM_ERROR("not implemented\n");
+ 	return -EINVAL;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_rm.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_rm.c
+@@ -2877,7 +2877,7 @@
+ }
+ 
+ /* call this only after rm_mutex held */
+-struct sde_rm_rsvp *_sde_rm_poll_get_rsvp_nxt_locked(struct sde_rm *rm,
++static struct sde_rm_rsvp *_sde_rm_poll_get_rsvp_nxt_locked(struct sde_rm *rm,
+ 		struct drm_encoder *enc)
+ {
+ 	int i;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_trace.h
++++ b/qcom/opensource/display-drivers/msm/sde/sde_trace.h
+@@ -127,7 +127,7 @@
+ 	TP_fast_assign(
+ 			__entry->trace_type = trace_type;
+ 			__entry->pid = task ? task->tgid : 0;
+-			__assign_str(trace_name, name);
++			__assign_str(trace_name);
+ 			__entry->value = value;
+ 	),
+ 	TP_printk("%c|%d|%s|%d", __entry->trace_type,
+@@ -161,7 +161,7 @@
+ 	),
+ 	TP_fast_assign(
+ 			__entry->pid = current->tgid;
+-			__assign_str(evtlog_tag, tag);
++			__assign_str(evtlog_tag);
+ 			__entry->tag_id = tag_id;
+ 			if (cnt > SDE_TRACE_EVTLOG_SIZE)
+ 				cnt = SDE_TRACE_EVTLOG_SIZE;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_vm_common.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_vm_common.c
+@@ -54,7 +54,7 @@
+ }
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0))
+-int __mem_sort_cmp(void *priv, const struct list_head *a, const struct list_head *b)
++static int __mem_sort_cmp(void *priv, const struct list_head *a, const struct list_head *b)
+ {
+ 	const struct msm_io_mem_entry *left =
+ 		container_of(a, struct msm_io_mem_entry, list);
+@@ -64,7 +64,7 @@
+ 	return (left->base - right->base);
+ }
+ #else
+-int __mem_sort_cmp(void *priv, struct list_head *a, struct list_head *b)
++static int __mem_sort_cmp(void *priv, struct list_head *a, struct list_head *b)
+ {
+ 	struct msm_io_mem_entry *left =
+ 		container_of(a, struct msm_io_mem_entry, list);
+@@ -75,7 +75,7 @@
+ }
+ #endif
+ 
+-bool __merge_on_overlap(struct msm_io_mem_entry *res,
++static bool __merge_on_overlap(struct msm_io_mem_entry *res,
+ 		const struct msm_io_mem_entry *left,
+ 		const struct msm_io_mem_entry *right)
+ {
+@@ -96,7 +96,7 @@
+ 	return false;
+ }
+ 
+-void _sde_vm_sort_and_align(struct list_head *mem)
++static void _sde_vm_sort_and_align(struct list_head *mem)
+ {
+ 	struct msm_io_mem_entry *entry, *tmp, *prev = NULL;
+ 	struct msm_io_mem_entry merged_entry;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_vm_msgq.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_vm_msgq.c
+@@ -9,6 +9,7 @@
+ #include <linux/kthread.h>
+ #include "sde_kms.h"
+ #include "sde_vm.h"
++#include "sde_vm_msgq.h"
+ 
+ static void _sde_vm_msgq_process_msg(struct kthread_work *work)
+ {
+--- a/qcom/opensource/display-drivers/msm/sde/sde_vm_primary.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_vm_primary.c
+@@ -31,7 +31,7 @@
+ 	return (owns_irq & owns_mem_io);
+ }
+ 
+-void sde_vm_irq_release_notification_handler(void *req,
++static void sde_vm_irq_release_notification_handler(void *req,
+ 		unsigned long notif_type, enum gh_irq_label label)
+ {
+ 	if (req)
+@@ -49,7 +49,7 @@
+ 	SDE_INFO("mem release notification for tag: %d\n", tag);
+ }
+ 
+-int _sde_vm_reclaim_mem(struct sde_kms *sde_kms)
++static int _sde_vm_reclaim_mem(struct sde_kms *sde_kms)
+ {
+ 	struct sde_vm_primary *sde_vm = to_vm_primary(sde_kms->vm);
+ 	int rc = 0;
+@@ -75,7 +75,7 @@
+ 	return rc;
+ }
+ 
+-int _sde_vm_reclaim_irq(struct sde_kms *sde_kms)
++static int _sde_vm_reclaim_irq(struct sde_kms *sde_kms)
+ {
+ 	struct sde_vm_primary *sde_vm = to_vm_primary(sde_kms->vm);
+ 	struct sde_vm_irq_desc *irq_desc;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_vm_trusted.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_vm_trusted.c
+@@ -7,6 +7,7 @@
+ #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
+ 
+ #include <linux/gunyah/gh_rm_drv.h>
++#include <linux/vmalloc.h>
+ #include <linux/gunyah/gh_irq_lend.h>
+ #include <linux/gunyah/gh_mem_notifier.h>
+ #include <linux/sort.h>
+@@ -28,7 +29,7 @@
+ 	return  (l->ipa_base - r->ipa_base);
+ }
+ 
+-int _sde_vm_validate_sgl(struct gh_sgl_desc *expected,
++static int _sde_vm_validate_sgl(struct gh_sgl_desc *expected,
+ 			 struct gh_sgl_desc *assigned)
+ {
+ 	u32 idx;
+@@ -97,7 +98,7 @@
+ 			tag, payload->label, payload->mem_handle);
+ }
+ 
+-void sde_vm_irq_lend_notification_handler(void *req,
++static void sde_vm_irq_lend_notification_handler(void *req,
+ 		unsigned long notif_type, enum gh_irq_label label)
+ {
+ 	SDE_INFO("IRQ LEND notification for label: %d\n", label);
+@@ -192,7 +193,7 @@
+ 	return rc;
+ }
+ 
+-int _sde_vm_resource_init(struct sde_kms *sde_kms,
++static int _sde_vm_resource_init(struct sde_kms *sde_kms,
+ 		struct drm_atomic_state *state)
+ {
+ 	int rc = 0;
+@@ -204,7 +205,7 @@
+ 	return rc;
+ }
+ 
+-int _sde_vm_populate_res(struct sde_kms *sde_kms, struct sde_vm_trusted *vm)
++static int _sde_vm_populate_res(struct sde_kms *sde_kms, struct sde_vm_trusted *vm)
+ {
+ 	struct msm_io_res io_res;
+ 	int rc = 0;
+--- a/qcom/opensource/display-drivers/msm/sde/sde_wb.c
++++ b/qcom/opensource/display-drivers/msm/sde/sde_wb.c
+@@ -1039,14 +1039,14 @@
+  * sde_wb_remove - unload writeback module
+  * @pdev:	Pointer to platform device
+  */
+-static int sde_wb_remove(struct platform_device *pdev)
++static void sde_wb_remove(struct platform_device *pdev)
+ {
+ 	struct sde_wb_device *wb_dev;
+ 	struct sde_wb_device *curr, *next;
+ 
+ 	wb_dev = platform_get_drvdata(pdev);
+ 	if (!wb_dev)
+-		return 0;
++		return;
+ 
+ 	SDE_DEBUG("\n");
+ 
+@@ -1067,7 +1067,7 @@
+ 	platform_set_drvdata(pdev, NULL);
+ 	devm_kfree(&pdev->dev, wb_dev);
+ 
+-	return 0;
++	return;
+ }
+ 
+ static const struct of_device_id dt_match[] = {
+--- a/qcom/opensource/display-drivers/msm/sde_cesta.c
++++ b/qcom/opensource/display-drivers/msm/sde_cesta.c
+@@ -807,7 +807,7 @@
+ 	return client;
+ }
+ 
+-void sde_cesta_destroy_client(struct sde_cesta_client *client)
++static void __maybe_unused sde_cesta_destroy_client(struct sde_cesta_client *client)
+ {
+ 	struct sde_cesta *cesta;
+ 
+@@ -1037,7 +1037,7 @@
+ 	return 0;
+ }
+ 
+-int sde_cesta_bind(struct device *dev, struct device *master, void *data)
++static int sde_cesta_bind(struct device *dev, struct device *master, void *data)
+ {
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	struct sde_cesta *cesta;
+@@ -1079,7 +1079,7 @@
+ 	return 0;
+ }
+ 
+-void sde_cesta_unbind(struct device *dev, struct device *master, void *data)
++static void sde_cesta_unbind(struct device *dev, struct device *master, void *data)
+ {
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	struct sde_cesta *cesta;
+@@ -1318,13 +1318,13 @@
+ 	return ret;
+ }
+ 
+-static int sde_cesta_remove(struct platform_device *pdev)
++static void sde_cesta_remove(struct platform_device *pdev)
+ {
+ 	struct sde_cesta *cesta = platform_get_drvdata(pdev);
+ 
+ 	sde_cesta_deinit(pdev, cesta);
+ 
+-	return 0;
++	return;
+ }
+ 
+ static const struct of_device_id dt_match[] = {
+--- a/qcom/opensource/display-drivers/msm/sde_cesta_hw.c
++++ b/qcom/opensource/display-drivers/msm/sde_cesta_hw.c
+@@ -27,7 +27,7 @@
+ #define DEBUG_FLUSH_MISSED_CLEAR	0x24
+ #define DISP_CC_MISC_CMD		0x0
+ 
+-void _sde_cesta_hw_init(struct sde_cesta *cesta)
++static void _sde_cesta_hw_init(struct sde_cesta *cesta)
+ {
+ 	int i;
+ 
+@@ -62,7 +62,7 @@
+ 	}
+ }
+ 
+-void _sde_cesta_hw_force_db_update(struct sde_cesta *cesta, u32 idx,
++static void _sde_cesta_hw_force_db_update(struct sde_cesta *cesta, u32 idx,
+ 		bool en_auto_active, enum sde_cesta_ctrl_pwr_req_mode req_mode, bool en_hw_sleep,
+ 		bool en_mdp_clk_gate, bool cmd_mode)
+ {
+@@ -98,13 +98,13 @@
+ 	wmb(); /* for reset to be applied immediately */
+ }
+ 
+-void _sde_cesta_hw_reset(struct sde_cesta *cesta, u32 idx, bool en)
++static void _sde_cesta_hw_reset(struct sde_cesta *cesta, u32 idx, bool en)
+ {
+ 	dss_reg_w(&cesta->scc_io[idx], SCC_OVERRIDE_CTRL, en ? BIT(31) : 0, cesta->debug_mode);
+ 	wmb(); /* for reset to be applied immediately */
+ }
+ 
+-void _sde_cesta_hw_override_ctrl_setup(struct sde_cesta *cesta, u32 idx, u32 force_flags)
++static void _sde_cesta_hw_override_ctrl_setup(struct sde_cesta *cesta, u32 idx, u32 force_flags)
+ {
+ 	u32 val = 0;
+ 
+@@ -121,7 +121,8 @@
+ 	wmb(); /* for force votes to be applied immediately */
+ }
+ 
+-void _sde_cesta_hw_ctrl_setup(struct sde_cesta *cesta, u32 idx, struct sde_cesta_ctrl_cfg *cfg)
++static void _sde_cesta_hw_ctrl_setup(struct sde_cesta *cesta,
++		u32 idx, struct sde_cesta_ctrl_cfg *cfg)
+ {
+ 	u32 val = 0;
+ 
+@@ -154,7 +155,7 @@
+ 	dss_reg_w(&cesta->scc_io[idx], SCC_CTRL, val, cesta->debug_mode);
+ }
+ 
+-int _sde_cesta_hw_poll_handshake(struct sde_cesta *cesta, u32 idx)
++static int _sde_cesta_hw_poll_handshake(struct sde_cesta *cesta, u32 idx)
+ {
+ 	void __iomem *addr = cesta->scc_io[idx].base + SCC_HW_STATE_READBACK;
+ 	u32 handshake_mask = BIT(4) | BIT(5);
+@@ -166,7 +167,8 @@
+ 			100, 1000);
+ }
+ 
+-void _sde_cesta_hw_get_status(struct sde_cesta *cesta, u32 idx, struct sde_cesta_scc_status *status)
++static void _sde_cesta_hw_get_status(struct sde_cesta *cesta,
++		u32 idx, struct sde_cesta_scc_status *status)
+ {
+ 	u32 val;
+ 
+@@ -183,12 +185,12 @@
+ 	dss_reg_w(&cesta->scc_io[idx], DEBUG_FLUSH_MISSED_CLEAR, 0x1, cesta->debug_mode);
+ }
+ 
+-u32 _sde_cesta_hw_get_pwr_event(struct sde_cesta *cesta)
++static u32 _sde_cesta_hw_get_pwr_event(struct sde_cesta *cesta)
+ {
+ 	return dss_reg_r(&cesta->wrapper_io, RSCC_PWR_CTRL, cesta->debug_mode);
+ }
+ 
+-u32 _sde_get_rscc_pwr_ctrl_status(struct sde_cesta *cesta)
++static u32 _sde_get_rscc_pwr_ctrl_status(struct sde_cesta *cesta)
+ {
+ 	return dss_reg_r(&cesta->rscc_io, RSCC_SEQ_PWR_CTRL_STATUS, cesta->debug_mode);
+ }
+--- a/qcom/opensource/display-drivers/msm/sde_dbg.c
++++ b/qcom/opensource/display-drivers/msm/sde_dbg.c
+@@ -7,6 +7,7 @@
+ #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
+ 
+ #include <linux/delay.h>
++#include <linux/vmalloc.h>
+ #include <linux/spinlock.h>
+ #include <linux/ktime.h>
+ #include <linux/debugfs.h>
+@@ -735,15 +736,28 @@
+ 	.priority = INT_MAX,
+ };
+ 
++static bool sde_md_registered;
++
+ static int sde_register_md_panic_notifer(void)
+ {
+-	qcom_va_md_register("display", &sde_md_notify_blk);
+-	return 0;
++	int ret = qcom_va_md_register("display", &sde_md_notify_blk);
++
++	if (!ret)
++		sde_md_registered = true;
++	return ret;
++}
++
++static void sde_unregister_md_panic_notifier(void)
++{
++	if (sde_md_registered) {
++		qcom_va_md_unregister("display", &sde_md_notify_blk);
++		sde_md_registered = false;
++	}
+ }
+ 
+ void sde_mini_dump_add_va_region(const char *name, u32 size, void *virt_addr)
+ {
+-	struct va_md_entry md_entry;
++	struct va_md_entry md_entry = { };
+ 	int ret;
+ 
+ 	strscpy(md_entry.owner, name, sizeof(md_entry.owner));
+@@ -761,6 +775,10 @@
+ static int sde_register_md_panic_notifer(void)
+ {
+ 	return 0;
++}
++
++static void sde_unregister_md_panic_notifier(void)
++{
+ }
+ 
+ void sde_mini_dump_add_va_region(const char *name, u32 size, void *virt_addr)
+@@ -1288,7 +1306,7 @@
+ 	mutex_unlock(&sde_dbg_dsi_mutex);
+ }
+ 
+-void sde_evtlog_dump_all(struct sde_dbg_evtlog *evtlog)
++static void sde_evtlog_dump_all(struct sde_dbg_evtlog *evtlog)
+ {
+ 	char buf[SDE_EVTLOG_BUF_MAX];
+ 	bool update_last_entry = true;
+@@ -2921,6 +2939,8 @@
+  */
+ void sde_dbg_destroy(void)
+ {
++	sde_unregister_md_panic_notifier();
++	cancel_work_sync(&sde_dbg_base.dump_work);
+ 	vfree(sde_dbg_base.regbuf.buf);
+ 	memset(&sde_dbg_base.regbuf, 0, sizeof(sde_dbg_base.regbuf));
+ 	_sde_dbg_debugfs_destroy();
+--- a/qcom/opensource/display-drivers/msm/sde_dbg_evtlog.c
++++ b/qcom/opensource/display-drivers/msm/sde_dbg_evtlog.c
+@@ -7,6 +7,7 @@
+ #define pr_fmt(fmt)	"sde_dbg:[%s] " fmt, __func__
+ 
+ #include <linux/delay.h>
++#include <linux/vmalloc.h>
+ #include <linux/spinlock.h>
+ #include <linux/ktime.h>
+ #include <linux/debugfs.h>
+--- a/qcom/opensource/display-drivers/msm/sde_dsc_helper.c
++++ b/qcom/opensource/display-drivers/msm/sde_dsc_helper.c
+@@ -313,7 +313,7 @@
+ 	return -EINVAL;
+ }
+ 
+-u8 _get_dsc_v1_2_bpg_offset(struct drm_dsc_config *dsc)
++static u8 _get_dsc_v1_2_bpg_offset(struct drm_dsc_config *dsc)
+ {
+ 	u8 bpg_offset = 0;
+ 	u8 uncompressed_bpg_rate;
+--- a/qcom/opensource/display-drivers/msm/sde_io_util.c
++++ b/qcom/opensource/display-drivers/msm/sde_io_util.c
+@@ -176,8 +176,6 @@
+ 	struct list_head temp_head;
+ 	struct msm_io_mem_entry *io_mem;
+ 	struct resource *res = NULL;
+-	struct property *prop;
+-	const __be32 *cur;
+ 	int rc = 0;
+ 	u32 val;
+ 
+@@ -188,7 +186,7 @@
+ 		return -ENOMEM;
+ 
+ 	of_property_for_each_u32(pdev->dev.of_node, "qcom,pmic-arb-address",
+-			prop, cur, val) {
++			val) {
+ 		rc = spmi_pmic_arb_map_address(&pdev->dev, val, res);
+ 		if (rc < 0) {
+ 			DEV_ERR("%pS - failed to map pmic address, rc:%d\n",
+--- a/qcom/opensource/display-drivers/msm/sde_power_handle.c
++++ b/qcom/opensource/display-drivers/msm/sde_power_handle.c
+@@ -632,7 +632,7 @@
+ 	return ret;
+ }
+ 
+-int sde_power_mmrm_callback(
++static int sde_power_mmrm_callback(
+ 	struct mmrm_client_notifier_data *notifier_data)
+ {
+ 	struct dss_clk_mmrm_cb *mmrm_cb_data =

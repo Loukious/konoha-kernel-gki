@@ -1,0 +1,90 @@
+--- a/drivers/dma-buf/heaps/qcom_sg_ops.c
++++ b/drivers/dma-buf/heaps/qcom_sg_ops.c
+@@ -24,6 +24,7 @@
+ #include <linux/highmem.h>
+ #include <linux/mm.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/scatterlist.h>
+ #include <linux/slab.h>
+ #include <linux/vmalloc.h>
+@@ -53,6 +54,19 @@
+ 	.unmap_sgtable = proxy_invalid_unmap,
+ };
+ 
++static DEFINE_MUTEX(smmu_proxy_ops_lock);
++static bool smmu_proxy_ops_registered;
++
++static struct smmu_proxy_callbacks smmu_proxy_callbacks_get(void)
++{
++	struct smmu_proxy_callbacks ops;
++
++	/* Pair with map publication after the matching unmap callback is stored. */
++	ops.map_sgtable = smp_load_acquire(&smmu_proxy_callback_ops.map_sgtable);
++	ops.unmap_sgtable = READ_ONCE(smmu_proxy_callback_ops.unmap_sgtable);
++	return ops;
++}
++
+ static struct sg_table *dup_sg_table(struct sg_table *table)
+ {
+ 	struct sg_table *new_table;
+@@ -129,6 +143,7 @@
+ struct sg_table *qcom_sg_map_dma_buf(struct dma_buf_attachment *attachment,
+ 				     enum dma_data_direction direction)
+ {
++	struct smmu_proxy_callbacks proxy_ops = smmu_proxy_callbacks_get();
+ 	struct dma_heap_attachment *a = attachment->priv;
+ 	struct sg_table *table = a->table;
+ 	struct qcom_sg_buffer *buffer;
+@@ -139,9 +154,9 @@
+ 	buffer = attachment->dmabuf->priv;
+ 	vmperm = buffer->vmperm;
+ 
+-	if (smmu_proxy_callback_ops.map_sgtable &&
++	if (proxy_ops.map_sgtable &&
+ 	    (attrs & DMA_ATTR_QTI_SMMU_PROXY_MAP)) {
+-		ret = smmu_proxy_callback_ops.map_sgtable(attachment->dev, table,
++		ret = proxy_ops.map_sgtable(attachment->dev, table,
+ 							  attachment->dmabuf);
+ 		return ret ? ERR_PTR(ret) : table;
+ 	}
+@@ -184,6 +199,7 @@
+ 			   struct sg_table *table,
+ 			   enum dma_data_direction direction)
+ {
++	struct smmu_proxy_callbacks proxy_ops = smmu_proxy_callbacks_get();
+ 	struct dma_heap_attachment *a = attachment->priv;
+ 	struct qcom_sg_buffer *buffer;
+ 	struct mem_buf_vmperm *vmperm;
+@@ -192,9 +208,9 @@
+ 	buffer = attachment->dmabuf->priv;
+ 	vmperm = buffer->vmperm;
+ 
+-	if (smmu_proxy_callback_ops.unmap_sgtable &&
++	if (proxy_ops.unmap_sgtable &&
+ 	    (attrs & DMA_ATTR_QTI_SMMU_PROXY_MAP)) {
+-		smmu_proxy_callback_ops.unmap_sgtable(attachment->dev, table,
++		proxy_ops.unmap_sgtable(attachment->dev, table,
+ 						      attachment->dmabuf);
+ 		return;
+ 	}
+@@ -605,9 +621,16 @@
+ int qti_smmu_proxy_register_callbacks(smmu_proxy_map_sgtable map_sgtable_fn_ptr,
+ 				      smmu_proxy_unmap_sgtable unmap_sgtable_fn_ptr)
+ {
+-	smmu_proxy_callback_ops.map_sgtable = map_sgtable_fn_ptr;
+-	smmu_proxy_callback_ops.unmap_sgtable = unmap_sgtable_fn_ptr;
+-
++	if (!!map_sgtable_fn_ptr != !!unmap_sgtable_fn_ptr)
++		return -EINVAL;
++	guard(mutex)(&smmu_proxy_ops_lock);
++	if (smmu_proxy_ops_registered)
++		return -EBUSY;
++	/* The provider stays resident while firmware mappings/destructors exist. */
++	WRITE_ONCE(smmu_proxy_callback_ops.unmap_sgtable, unmap_sgtable_fn_ptr);
++	/* Publish the pair; callbacks never change after successful registration. */
++	smp_store_release(&smmu_proxy_callback_ops.map_sgtable, map_sgtable_fn_ptr);
++	smmu_proxy_ops_registered = true;
+ 	return 0;
+ }
+ EXPORT_SYMBOL(qti_smmu_proxy_register_callbacks);

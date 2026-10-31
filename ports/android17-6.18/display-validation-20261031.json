@@ -1,0 +1,72 @@
+{
+  "tests": {
+    "procfs_write_bounds_cases": 16399,
+    "log_format_and_write_cases": 8194,
+    "log_ring_wrap_cases": 28728,
+    "command_list_truncation_cases": 4097,
+    "dumb_buffer_bounds_cases": 1728,
+    "cpu_fence_usage_cases": 12,
+    "page_and_sg_fault_cases": 5,
+    "framebuffer_bounds_cases": 100011,
+    "async_payload_ownership_cases": 514,
+    "async_allocator_and_queue_faults": 6,
+    "event_length_and_id_cases": 8448,
+    "display_worker_failure_cases": 289,
+    "display_worker_success_cases": 17,
+    "sync_fd_cases": 7,
+    "minidump_registration_lifetime": true,
+    "minidump_zeroed_entry": true,
+    "last_close_device_reference": true,
+    "open_waits_for_last_close": true,
+    "multiple_file_close_cases": 3
+  },
+  "source_contracts": [
+    "GEM lock exists before display resources initialize",
+    "All migrated GEM paths share the same private mutex",
+    "Last close retains device around core release",
+    "DRM file operations retain unsigned offset requirement",
+    "Device and callback ownership keeps successful display module resident",
+    "Client list and locks precede cdev exposure",
+    "Feature singleton publishes after complete cdev and device setup",
+    "Feature lookup cannot reenter initialization",
+    "Client event state exists before notification publication",
+    "Old cdev identities cannot open the current singleton",
+    "Raw events cannot overflow the 4 KiB event budget",
+    "DSI receive alignment rejects unsigned overflow",
+    "Debug notification and work drain before buffers free",
+    "Panel withdraws the draining pwrkey callback before teardown",
+    "CPU read/write waits use the Linux reservation usage enum",
+    "Base and private GEM objects share reservation state",
+    "Failed GEM setup can remove an initialized inactive-list entry",
+    "VRAM pages release before their VMA node is freed",
+    "Embedded DRM client owns its unregister callback",
+    "Log formatter reports only bytes present in its local buffer",
+    "Log reads serialize with ring writes",
+    "Procfs stack writes reserve space for the terminator"
+  ],
+  "source_sha256": {
+    "qcom/opensource/display-drivers/msm/msm_drv.c": "24b558918a2c5c3e7f21164d48738ff90152635512ca0ea63bfd959868879a96",
+    "qcom/opensource/display-drivers/msm/msm_drv.h": "d774e12b5d19777e9eac6d428ee125d8f7bab93d45146028d13ebc145d5887b4",
+    "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_feature.c": "1c85f055857aa7cdfd6bc9229d80513df7b87f93a20fd81be9d79406681a59f6",
+    "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_file.c": "d8859dbf78542ff4db0f343f4c5a7bb0757a5945096fb826d12552088eebed62",
+    "qcom/opensource/display-drivers/msm/sde/sde_fence.c": "0b5a4da1068e73b593c865e8f3a7755651f8a7ab51e3744845ac30f6ea251df8",
+    "qcom/opensource/display-drivers/msm/sde_dbg.c": "212e95b44a88b645a2d080638e3726defab2dc6587773401e82692b016841256",
+    "qcom/opensource/display-drivers/msm/mi_disp/mi_dsi_panel.c": "1c38c6d21c3c54d8f18012a2c6e85d558daffd6ac2d3d42fd0e73152260d7f13",
+    "qcom/opensource/display-drivers/msm/msm_gem.c": "4888ac947731cdbb56aac31e090f62fc4565659963a698d06586dd1b1d9a024c",
+    "qcom/opensource/display-drivers/msm/msm_fb.c": "bd53647ffa0ef278dc822983d5b117586210e53399c28d888e17482c6fdc79f6",
+    "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_log.c": "425879058f76b59fb7a55020f17ba20a6440349f77157a4297533642ed3db321",
+    "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_procfs.c": "585aa60371301e48a7779b3a19a6959d742d93aceecbaea0fee79dfeac8c282a"
+  },
+  "harness_sha256": {
+    "display_main_text.c": "8b3d287becb4d3414f3f1793f3eacb2af64fc9f040f33e9c056b8fa32536f701",
+    "display_main_gem.c": "d55f61da8fdeb46d3537d8a3b82848b4e895269ccb50636587a052dc44198d58",
+    "display_main_async.c": "d9f7e6658a1eb130ab2202df66491689a88fdeb39bde1548c0c48edc526f2482",
+    "display_main_workers.c": "4ed40cdd9f83305e3961bbcef93d87fd60c534c63f701eb2bc4cf421c7a3baf5",
+    "display_main_close.c": "70bf723da5c2c414a17e7868706d18ae305e463b806833b171db243a3e49973d"
+  },
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Extracted functions with simulated allocator, workers, DRM reference counting, notifier and OF services. Tests do not establish kernel scheduling, DRM atomic commits, hardware fences, display firmware, suspend/resume or phone compatibility."
+}

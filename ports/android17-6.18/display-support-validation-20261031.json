@@ -1,0 +1,38 @@
+{
+  "tests": {
+    "mmrm_probe_fault_cases": 5,
+    "mmrm_client_table_bounds_cases": 132,
+    "mmrm_rail_corner_cases": 16030,
+    "mmrm_clock_error_cases": 3018,
+    "mmrm_crm_max_rate_cases": 70000,
+    "external_display_probe_fault_cases": 6,
+    "external_codec_bounds_cases": 30420
+  },
+  "source_contracts": [
+    "MMRM global state publishes only after manager and sysfs initialization",
+    "MMRM client storage keeps successful provider resident",
+    "MMRM manager allocation uses overflow-safe count allocation",
+    "MMRM null manager is checked before dereference",
+    "MMRM active voltage table exactly matches fixed array size",
+    "MMRM missing throttle client cannot select default row zero",
+    "External display locks and list exist before child devices can probe",
+    "External display failed child population drains children before extcon withdrawal",
+    "External display extcon unwind touches only registered devices",
+    "External codec callback provider remains resident"
+  ],
+  "source_sha256": {
+    "qcom/opensource/mmrm-driver/driver/src/msm_mmrm.c": "d32b0b3eb95d6a2678fa4f3da30df6ec896ecb1f4fa763fbdc3630a4112fc18b",
+    "qcom/opensource/mmrm-driver/driver/src/mmrm_res_parse.c": "d28248926874351f2c2dda836429680e37908c2bbd22f2f922b52431fbd9c82e",
+    "qcom/opensource/mmrm-driver/driver/src/mmrm_clk_rsrc_mgr_sw.c": "854aaa768fb37516ba4012789da884560d219f9cf81d9c3303c891d3d35d63c0",
+    "qcom/opensource/mm-drivers/msm_ext_display/src/msm_ext_display.c": "b550866a80e3e82dc6bc1f82f433831cbc6df14d5208673df67143449c009cc3"
+  },
+  "harness_sha256": {
+    "display_support_mmrm.c": "25465de985757d5f8efce1297463f4f4fbb2c7fc8f59f4016e05320320eb4678",
+    "display_support_ext.c": "678c38d8602513bfa648cc4951bcfaa5e2d035876da43d03199f079484f9c3ba"
+  },
+  "sanitizers": [
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer"
+  ],
+  "limits": "Extracted source bodies with simulated allocator, OF, clock, sysfs and platform services; no real driver binding, DRM atomic commit, display firmware, kernel callback concurrency, suspend/resume or hardware validation."
+}

@@ -1,0 +1,78 @@
+--- a/drivers/power/supply/mca/mca_common/mca_voter.c
++++ b/drivers/power/supply/mca/mca_common/mca_voter.c
+@@ -730,6 +730,61 @@
+ }
+ EXPORT_SYMBOL(mca_get_named_client_vote);
+ 
++int mca_vote_named(const char *name, const char *client, bool enabled, int value)
++{
++	guard(srcu)(&votable_lookup_srcu);
++	struct mca_votable *votable = mca_find_votable(name);
++
++	if (!votable)
++		return -ENODEV;
++	return mca_vote(votable, client, enabled, value);
++}
++EXPORT_SYMBOL(mca_vote_named);
++
++int mca_vote_named_override(const char *name, const char *client, bool enabled, int value)
++{
++	guard(srcu)(&votable_lookup_srcu);
++	struct mca_votable *votable = mca_find_votable(name);
++
++	if (!votable)
++		return -ENODEV;
++	return mca_vote_override(votable, client, enabled, value);
++}
++EXPORT_SYMBOL(mca_vote_named_override);
++
++int mca_get_named_effective_result(const char *name)
++{
++	guard(srcu)(&votable_lookup_srcu);
++	struct mca_votable *votable = mca_find_votable(name);
++
++	if (!votable)
++		return -ENODEV;
++	return mca_get_effective_result(votable);
++}
++EXPORT_SYMBOL(mca_get_named_effective_result);
++
++bool mca_is_named_override_vote_enabled(const char *name)
++{
++	guard(srcu)(&votable_lookup_srcu);
++	struct mca_votable *votable = mca_find_votable(name);
++
++	if (!votable)
++		return false;
++	return mca_is_override_vote_enabled(votable);
++}
++EXPORT_SYMBOL(mca_is_named_override_vote_enabled);
++
++bool mca_named_votable_exists(const char *name)
++{
++	guard(srcu)(&votable_lookup_srcu);
++	struct mca_votable *votable = mca_find_votable(name);
++
++	if (!votable)
++		return false;
++	return true;
++}
++EXPORT_SYMBOL(mca_named_votable_exists);
++
+ static int mca_force_active_get(void *data, u64 *val)
+ {
+ 	struct mca_votable *votable = data;
+--- a/drivers/power/supply/mca/include/mca/common/mca_voter.h
++++ b/drivers/power/supply/mca/include/mca/common/mca_voter.h
+@@ -44,4 +44,11 @@
+ /* Safe one-shot lookup; no raw pointer survives this call. */
+ int mca_get_named_client_vote(const char *name, const char *client);
+ 
++/* Named operations drain before owner destruction. Do not destroy from a callback. */
++int mca_vote_named(const char *name, const char *client, bool enabled, int value);
++int mca_vote_named_override(const char *name, const char *client, bool enabled, int value);
++int mca_get_named_effective_result(const char *name);
++bool mca_is_named_override_vote_enabled(const char *name);
++bool mca_named_votable_exists(const char *name);
++
+ #endif /* _MCA_COMMON_MCA_VOTER_H_ */

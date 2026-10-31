@@ -2399,6 +2399,212 @@ ddk_module(
     visibility = ["//visibility:public"],
 )
 
+ddk_headers(
+    name = "secure_headers",
+    hdrs = ["qcom/opensource/securemsm-kernel/include/linux/CTrustedCameraDriver.h", "qcom/opensource/securemsm-kernel/include/linux/IClientEnv.h", "qcom/opensource/securemsm-kernel/include/linux/ITrustedCameraDriver.h", "qcom/opensource/securemsm-kernel/include/linux/ctrusted_camera_driver.h", "qcom/opensource/securemsm-kernel/include/linux/smci_clientenv.h", "qcom/opensource/securemsm-kernel/include/linux/smci_object.h", "qcom/opensource/securemsm-kernel/include/linux/smcinvoke.h", "qcom/opensource/securemsm-kernel/include/linux/smcinvoke_object.h", "qcom/opensource/securemsm-kernel/include/linux/trusted_camera_driver.h", "qcom/opensource/securemsm-kernel/include/smci/interface/IAppClient.h", "qcom/opensource/securemsm-kernel/include/smci/interface/IAppController.h", "qcom/opensource/securemsm-kernel/include/smci/interface/IAppLoader.h", "qcom/opensource/securemsm-kernel/include/smci/interface/IOpener.h", "qcom/opensource/securemsm-kernel/include/smci/interface/smci_appclient.h", "qcom/opensource/securemsm-kernel/include/smci/interface/smci_appcontroller.h", "qcom/opensource/securemsm-kernel/include/smci/interface/smci_apploader.h", "qcom/opensource/securemsm-kernel/include/smci/interface/smci_opener.h", "qcom/opensource/securemsm-kernel/include/smci/uid/CAppClient.h", "qcom/opensource/securemsm-kernel/include/smci/uid/CAppLoader.h", "qcom/opensource/securemsm-kernel/include/uapi/linux/compat_qcedev.h", "qcom/opensource/securemsm-kernel/include/uapi/linux/qcedev.h", "qcom/opensource/securemsm-kernel/include/uapi/linux/qcota.h", "qcom/opensource/securemsm-kernel/include/uapi/linux/qrng.h", "qcom/opensource/securemsm-kernel/include/uapi/linux/qseecom.h", "qcom/opensource/securemsm-kernel/include/uapi/linux/qseecom_32bit_impl.h", "qcom/opensource/securemsm-kernel/include/uapi/linux/qseecom_api.h", "qcom/opensource/securemsm-kernel/include/uapi/linux/smcinvoke.h", "qcom/opensource/securemsm-kernel/linux/misc/qseecom_kernel.h", "qcom/opensource/securemsm-kernel/linux/misc/qseecom_priv.h", "qcom/opensource/securemsm-kernel/linux/misc/qseecomi.h", "qcom/opensource/securemsm-kernel/config/sec-kernel_defconfig.h", "qcom/opensource/securemsm-kernel/config/sec-kernel_defconfig_qcedev_fe.h", "qcom/opensource/securemsm-kernel/config/sec-kernel_defconfig_qrng.h", "qcom/opensource/securemsm-kernel/config/sec-kernel_defconfig_qseecom.h", "qcom/opensource/securemsm-kernel/config/sec-kernel_defconfig_qseecom_compat.h", "qcom/opensource/securemsm-kernel/config/sec-kernel_defconfig_si_core.h", "qcom/opensource/securemsm-kernel/config/sec-kernel_defconfig_si_core_test.h", "qcom/opensource/securemsm-kernel/config/sec-kernel_defconfig_smcinvoke.h", "qcom/opensource/securemsm-kernel/config/sec-kernel_defconfig_smmu_proxy.h", "qcom/opensource/securemsm-kernel/hdcp/hdcp1.h", "qcom/opensource/securemsm-kernel/hdcp/hdcp1_ops.h", "qcom/opensource/securemsm-kernel/hdcp/hdcp2p2.h", "qcom/opensource/securemsm-kernel/hdcp/hdcp_main.h", "qcom/opensource/securemsm-kernel/hdcp/hdcp_qseecom.h", "qcom/opensource/securemsm-kernel/hdcp/hdcp_smcinvoke.h", "qcom/opensource/securemsm-kernel/smmu-proxy/include/uapi/linux/qti-smmu-proxy.h", "qcom/opensource/securemsm-kernel/smmu-proxy/linux/qti-smmu-proxy.h", "qcom/opensource/securemsm-kernel/smmu-proxy/qti-smmu-proxy-common.h", "qcom/opensource/securemsm-kernel/smmu-proxy/qti-smmu-proxy-msgq.h", "qcom/opensource/securemsm-kernel/qseecom/ice.h", "qcom/opensource/securemsm-kernel/smcinvoke/si_core_xts/smci_impl.h", "qcom/opensource/securemsm-kernel/smcinvoke/IQSEEComCompat.h", "qcom/opensource/securemsm-kernel/smcinvoke/IQSEEComCompatAppLoader.h", "drivers/firmware/qcom/si_core/si_core.h", "drivers/firmware/qcom/si_core/si_core_adci.h", "include/linux/qseecom_kernel.h", "include/linux/hdcp_qseecom.h", "include/linux/firmware/qcom/si_object.h", "include/linux/firmware/qcom/si_core_xts.h"],
+    linux_includes = ["include", "qcom/opensource/securemsm-kernel/include"],
+    includes = ["qcom/opensource/securemsm-kernel", "qcom/opensource/securemsm-kernel/include", "qcom/opensource/securemsm-kernel/include/linux", "qcom/opensource/securemsm-kernel/include/uapi", "qcom/opensource/securemsm-kernel/include/uapi/linux", "qcom/opensource/securemsm-kernel/linux", "qcom/opensource/securemsm-kernel/config", "qcom/opensource/securemsm-kernel/smmu-proxy", "drivers/firmware/qcom/si_core"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "qseecom_proxy",
+    srcs = ["drivers/misc/qseecom_proxy.c"],
+    out = "qseecom_proxy.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    copts = ["-Wno-#pragma-messages"],
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":secure_headers", ":scm_headers", ":platform_headers", ":mem_buf_headers", ":iommu_headers", ":gunyah_headers", ":clock_headers", ":regulator_headers", ":loader_headers", ":ufs_headers", ":smmu_headers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "si_core_module",
+    srcs = ["drivers/firmware/qcom/si_core/qcom_scm_invoke.c", "drivers/firmware/qcom/si_core/si_core_async.c", "drivers/firmware/qcom/si_core/si_core.c", "drivers/firmware/qcom/si_core/si_core_adci.c", "drivers/firmware/qcom/si_core/si_core_helpers.c", "drivers/firmware/qcom/si_core/si_core_wq.c"],
+    out = "si_core_module.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    copts = ["-Wno-#pragma-messages"],
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":secure_headers", ":scm_headers", ":platform_headers", ":mem_buf_headers", ":iommu_headers", ":gunyah_headers", ":clock_headers", ":regulator_headers", ":loader_headers", ":ufs_headers", ":smmu_headers", ":qcom_scm", ":qseecom_proxy"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mem_object",
+    srcs = ["drivers/firmware/qcom/si_core/xts/mem-object.c"],
+    out = "mem_object.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    copts = ["-Wno-#pragma-messages"],
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":secure_headers", ":scm_headers", ":platform_headers", ":mem_buf_headers", ":iommu_headers", ":gunyah_headers", ":clock_headers", ":regulator_headers", ":loader_headers", ":ufs_headers", ":smmu_headers", ":si_core_module", ":qcom_scm", ":mem_buf_dev"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "smcinvoke_dlkm",
+    srcs = ["qcom/opensource/securemsm-kernel/smcinvoke/si_core_xts/qseecom.c", "qcom/opensource/securemsm-kernel/smcinvoke/si_core_xts/smci_kernel.c", "qcom/opensource/securemsm-kernel/smcinvoke/si_core_xts/smci.c"],
+    out = "smcinvoke_dlkm.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    copts = ["-Wno-#pragma-messages"],
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":secure_headers", ":scm_headers", ":platform_headers", ":mem_buf_headers", ":iommu_headers", ":gunyah_headers", ":clock_headers", ":regulator_headers", ":loader_headers", ":ufs_headers", ":smmu_headers", ":qseecom_proxy", ":si_core_module", ":mem_object", ":qcom_scm"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "qseecom_dlkm",
+    srcs = ["qcom/opensource/securemsm-kernel/qseecom/qseecom.c", "qcom/opensource/securemsm-kernel/qseecom/qseecom_32bit_impl.c"],
+    out = "qseecom_dlkm.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    copts = ["-Wno-#pragma-messages"],
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":secure_headers", ":scm_headers", ":platform_headers", ":mem_buf_headers", ":iommu_headers", ":gunyah_headers", ":clock_headers", ":regulator_headers", ":loader_headers", ":ufs_headers", ":smmu_headers", ":qcom_scm", ":mem_buf_dev"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "hdcp_qseecom_dlkm",
+    srcs = ["qcom/opensource/securemsm-kernel/hdcp/hdcp_main.c", "qcom/opensource/securemsm-kernel/hdcp/hdcp_smcinvoke.c", "qcom/opensource/securemsm-kernel/hdcp/hdcp_qseecom.c"],
+    out = "hdcp_qseecom_dlkm.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    copts = ["-Wno-#pragma-messages"],
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":secure_headers", ":scm_headers", ":platform_headers", ":mem_buf_headers", ":iommu_headers", ":gunyah_headers", ":clock_headers", ":regulator_headers", ":loader_headers", ":ufs_headers", ":smmu_headers", ":smcinvoke_dlkm", ":qseecom_proxy", ":qcom_scm"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "smmu_proxy_dlkm",
+    srcs = ["qcom/opensource/securemsm-kernel/smmu-proxy/qti-smmu-proxy-common.c", "qcom/opensource/securemsm-kernel/smmu-proxy/qti-smmu-proxy-pvm.c"],
+    out = "smmu_proxy_dlkm.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    copts = ["-Wno-#pragma-messages"],
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":secure_headers", ":scm_headers", ":platform_headers", ":mem_buf_headers", ":iommu_headers", ":gunyah_headers", ":clock_headers", ":regulator_headers", ":loader_headers", ":ufs_headers", ":smmu_headers", ":smcinvoke_dlkm", ":mem_buf_dev", ":gh_msgq", ":qcom_dma_heaps"],
+    visibility = ["//visibility:public"],
+)
+
+
+ddk_headers(
+    name = "display_support_headers",
+    hdrs = ["qcom/opensource/mm-drivers/msm_ext_display/include/msm_ext_display.h", "qcom/opensource/mmrm-driver/driver/src/mmrm_clk_rsrc_mgr.h", "qcom/opensource/mmrm-driver/driver/src/mmrm_debug.h", "qcom/opensource/mmrm-driver/driver/src/mmrm_fixedpoint.h", "qcom/opensource/mmrm-driver/driver/src/mmrm_internal.h", "qcom/opensource/mmrm-driver/driver/src/mmrm_resources.h", "include/linux/soc/qcom/msm_mmrm.h", "drivers/gpu/drm/display/drm_dp_helper_internal.h", "drivers/gpu/drm/display/drm_dp_mst_topology_internal.h"],
+    linux_includes = ["include"],
+    includes = ["qcom/opensource/mmrm-driver/driver/src", "qcom/opensource/mm-drivers/msm_ext_display/include", "drivers/gpu/drm/display"],
+)
+
+ddk_module(
+    name = "drm_display_helper",
+    srcs = ["drivers/gpu/drm/display/drm_display_helper_mod.c", "drivers/gpu/drm/display/drm_dp_dual_mode_helper.c", "drivers/gpu/drm/display/drm_dp_helper.c", "drivers/gpu/drm/display/drm_dp_mst_topology.c", "drivers/gpu/drm/display/drm_dsc_helper.c", "drivers/gpu/drm/display/drm_hdcp_helper.c"],
+    out = "drm_display_helper.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":display_support_headers"],
+)
+
+ddk_module(
+    name = "drm_dp_aux_bus",
+    srcs = ["drivers/gpu/drm/display/drm_dp_aux_bus.c"],
+    out = "drm_dp_aux_bus.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":display_support_headers"],
+)
+
+ddk_module(
+    name = "msm_mmrm",
+    srcs = ["qcom/opensource/mmrm-driver/driver/src/msm_mmrm.c", "qcom/opensource/mmrm-driver/driver/src/mmrm_internal.c", "qcom/opensource/mmrm-driver/driver/src/mmrm_res_parse.c", "qcom/opensource/mmrm-driver/driver/src/mmrm_debug.c", "qcom/opensource/mmrm-driver/driver/src/mmrm_clk_rsrc_mgr_sw.c", "qcom/opensource/mmrm-driver/driver/src/mmrm_clk_rsrc_mgr.c"],
+    out = "msm-mmrm.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":display_support_headers", ":clock_headers", ":platform_headers", ":regulator_headers", ":clk_qcom"],
+)
+
+ddk_module(
+    name = "msm_ext_display",
+    srcs = ["qcom/opensource/mm-drivers/msm_ext_display/src/msm_ext_display.c"],
+    out = "msm_ext_display.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":display_support_headers"],
+)
+
+
+ddk_headers(
+    name = "display_main_headers",
+    hdrs = ["qcom/opensource/display-drivers/config/augen3dispconf.h", "qcom/opensource/display-drivers/config/bengaldispconf.h", "qcom/opensource/display-drivers/config/gki_holidispconf.h", "qcom/opensource/display-drivers/config/gki_kalamadispconf.h", "qcom/opensource/display-drivers/config/gki_kalamadisptuiconf.h", "qcom/opensource/display-drivers/config/gki_lahainadispconf.h", "qcom/opensource/display-drivers/config/gki_monacodispconf.h", "qcom/opensource/display-drivers/config/gki_neodispconf.h", "qcom/opensource/display-drivers/config/gki_niobedispconf.h", "qcom/opensource/display-drivers/config/gki_parrotdispconf.h", "qcom/opensource/display-drivers/config/gki_pineappledispconf.h", "qcom/opensource/display-drivers/config/gki_pineappledisptuiconf.h", "qcom/opensource/display-drivers/config/gki_sundispconf.h", "qcom/opensource/display-drivers/config/gki_sundisptuiconf.h", "qcom/opensource/display-drivers/config/gki_waipiodispconf.h", "qcom/opensource/display-drivers/config/gki_waipiodisptuiconf.h", "qcom/opensource/display-drivers/config/holidispconf.h", "qcom/opensource/display-drivers/config/konadispconf.h", "qcom/opensource/display-drivers/config/lahainadispconf.h", "qcom/opensource/display-drivers/config/saipdispconf.h", "qcom/opensource/display-drivers/include/linux/msm_hdcp.h", "qcom/opensource/display-drivers/include/linux/sde_io_util.h", "qcom/opensource/display-drivers/include/linux/sde_rsc.h", "qcom/opensource/display-drivers/include/linux/sde_vm_event.h", "qcom/opensource/display-drivers/include/uapi/display/drm/mi_disp.h", "qcom/opensource/display-drivers/include/uapi/display/drm/msm_drm_aiqe.h", "qcom/opensource/display-drivers/include/uapi/display/drm/msm_drm_pp.h", "qcom/opensource/display-drivers/include/uapi/display/drm/sde_drm.h", "qcom/opensource/display-drivers/include/uapi/display/hdcp/msm_hdmi_hdcp_mgr.h", "qcom/opensource/display-drivers/include/uapi/display/media/mmm_color_fmt.h", "qcom/opensource/display-drivers/include/uapi/display/media/msm_sde_rotator.h", "qcom/opensource/display-drivers/msm/dp/dp_altmode.h", "qcom/opensource/display-drivers/msm/dp/dp_audio.h", "qcom/opensource/display-drivers/msm/dp/dp_aux.h", "qcom/opensource/display-drivers/msm/dp/dp_aux_bridge.h", "qcom/opensource/display-drivers/msm/dp/dp_bridge_hpd.h", "qcom/opensource/display-drivers/msm/dp/dp_catalog.h", "qcom/opensource/display-drivers/msm/dp/dp_ctrl.h", "qcom/opensource/display-drivers/msm/dp/dp_debug.h", "qcom/opensource/display-drivers/msm/dp/dp_display.h", "qcom/opensource/display-drivers/msm/dp/dp_drm.h", "qcom/opensource/display-drivers/msm/dp/dp_gpio_hpd.h", "qcom/opensource/display-drivers/msm/dp/dp_hpd.h", "qcom/opensource/display-drivers/msm/dp/dp_link.h", "qcom/opensource/display-drivers/msm/dp/dp_lphw_hpd.h", "qcom/opensource/display-drivers/msm/dp/dp_mst_drm.h", "qcom/opensource/display-drivers/msm/dp/dp_mst_sim.h", "qcom/opensource/display-drivers/msm/dp/dp_mst_sim_helper.h", "qcom/opensource/display-drivers/msm/dp/dp_panel.h", "qcom/opensource/display-drivers/msm/dp/dp_panel_tu.h", "qcom/opensource/display-drivers/msm/dp/dp_parser.h", "qcom/opensource/display-drivers/msm/dp/dp_pll.h", "qcom/opensource/display-drivers/msm/dp/dp_power.h", "qcom/opensource/display-drivers/msm/dp/dp_reg.h", "qcom/opensource/display-drivers/msm/dp/dp_usbpd.h", "qcom/opensource/display-drivers/msm/dsi/dsi_catalog.h", "qcom/opensource/display-drivers/msm/dsi/dsi_clk.h", "qcom/opensource/display-drivers/msm/dsi/dsi_ctrl.h", "qcom/opensource/display-drivers/msm/dsi/dsi_ctrl_hw.h", "qcom/opensource/display-drivers/msm/dsi/dsi_ctrl_reg.h", "qcom/opensource/display-drivers/msm/dsi/dsi_defs.h", "qcom/opensource/display-drivers/msm/dsi/dsi_display.h", "qcom/opensource/display-drivers/msm/dsi/dsi_display_manager.h", "qcom/opensource/display-drivers/msm/dsi/dsi_display_test.h", "qcom/opensource/display-drivers/msm/dsi/dsi_drm.h", "qcom/opensource/display-drivers/msm/dsi/dsi_hw.h", "qcom/opensource/display-drivers/msm/dsi/dsi_panel.h", "qcom/opensource/display-drivers/msm/dsi/dsi_parser.h", "qcom/opensource/display-drivers/msm/dsi/dsi_phy.h", "qcom/opensource/display-drivers/msm/dsi/dsi_phy_hw.h", "qcom/opensource/display-drivers/msm/dsi/dsi_phy_timing_calc.h", "qcom/opensource/display-drivers/msm/dsi/dsi_pll.h", "qcom/opensource/display-drivers/msm/dsi/dsi_pll_3nm.h", "qcom/opensource/display-drivers/msm/dsi/dsi_pll_4nm.h", "qcom/opensource/display-drivers/msm/dsi/dsi_pll_5nm.h", "qcom/opensource/display-drivers/msm/dsi/dsi_pwr.h", "qcom/opensource/display-drivers/msm/hdmi/hdmi_audio.h", "qcom/opensource/display-drivers/msm/hdmi/hdmi_debug.h", "qcom/opensource/display-drivers/msm/hdmi/hdmi_display.h", "qcom/opensource/display-drivers/msm/hdmi/hdmi_drm.h", "qcom/opensource/display-drivers/msm/hdmi/hdmi_panel.h", "qcom/opensource/display-drivers/msm/hdmi/hdmi_parser.h", "qcom/opensource/display-drivers/msm/hdmi/hdmi_phy.h", "qcom/opensource/display-drivers/msm/hdmi/hdmi_pll.h", "qcom/opensource/display-drivers/msm/hdmi/hdmi_power.h", "qcom/opensource/display-drivers/msm/hdmi/hdmi_reg_snps.h", "qcom/opensource/display-drivers/msm/hdmi/hdmi_regs.h", "qcom/opensource/display-drivers/msm/hdmi/hdmi_util.h", "qcom/opensource/display-drivers/msm/mi_disp/internals.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_config.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_core.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_dbv_data.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_debugfs.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_feature.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_file.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_flatmode.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_lhbm.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_log.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_parser.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_print.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_procfs.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_sysfs.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_dsi_display.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_dsi_panel.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_panel_id.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_sde_connector.h", "qcom/opensource/display-drivers/msm/mi_disp/mi_sde_encoder.h", "qcom/opensource/display-drivers/msm/msm_cooling_device.h", "qcom/opensource/display-drivers/msm/msm_drv.h", "qcom/opensource/display-drivers/msm/msm_gem.h", "qcom/opensource/display-drivers/msm/msm_kms.h", "qcom/opensource/display-drivers/msm/msm_mmu.h", "qcom/opensource/display-drivers/msm/msm_prop.h", "qcom/opensource/display-drivers/msm/sde/sde_ad4.h", "qcom/opensource/display-drivers/msm/sde/sde_aiqe_common.h", "qcom/opensource/display-drivers/msm/sde/sde_color_proc_property_helper.h", "qcom/opensource/display-drivers/msm/sde/sde_color_processing.h", "qcom/opensource/display-drivers/msm/sde/sde_color_processing_aiqe.h", "qcom/opensource/display-drivers/msm/sde/sde_connector.h", "qcom/opensource/display-drivers/msm/sde/sde_core_irq.h", "qcom/opensource/display-drivers/msm/sde/sde_core_perf.h", "qcom/opensource/display-drivers/msm/sde/sde_crtc.h", "qcom/opensource/display-drivers/msm/sde/sde_encoder.h", "qcom/opensource/display-drivers/msm/sde/sde_encoder_dce.h", "qcom/opensource/display-drivers/msm/sde/sde_encoder_phys.h", "qcom/opensource/display-drivers/msm/sde/sde_fence.h", "qcom/opensource/display-drivers/msm/sde/sde_formats.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_catalog.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_catalog_format.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_cdm.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_color_proc_aiqe_v1.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_color_proc_common_v4.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_color_proc_v4.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_color_processing.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_color_processing_v1_7.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_ctl.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_dnsc_blur.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_ds.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_dsc.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_dsc_1_2.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_dspp.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_interrupts.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_intf.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_lm.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_mdss.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_pingpong.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_qdss.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_rc.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_reg_dma_v1.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_reg_dma_v1_color_proc.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_sspp.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_top.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_uidle.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_util.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_vbif.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_vdc.h", "qcom/opensource/display-drivers/msm/sde/sde_hw_wb.h", "qcom/opensource/display-drivers/msm/sde/sde_hwio.h", "qcom/opensource/display-drivers/msm/sde/sde_irq.h", "qcom/opensource/display-drivers/msm/sde/sde_kms.h", "qcom/opensource/display-drivers/msm/sde/sde_loopback.h", "qcom/opensource/display-drivers/msm/sde/sde_plane.h", "qcom/opensource/display-drivers/msm/sde/sde_reg_dma.h", "qcom/opensource/display-drivers/msm/sde/sde_rm.h", "qcom/opensource/display-drivers/msm/sde/sde_trace.h", "qcom/opensource/display-drivers/msm/sde/sde_vbif.h", "qcom/opensource/display-drivers/msm/sde/sde_vm.h", "qcom/opensource/display-drivers/msm/sde/sde_vm_common.h", "qcom/opensource/display-drivers/msm/sde/sde_vm_msgq.h", "qcom/opensource/display-drivers/msm/sde/sde_wb.h", "qcom/opensource/display-drivers/msm/sde_cesta.h", "qcom/opensource/display-drivers/msm/sde_dbg.h", "qcom/opensource/display-drivers/msm/sde_dsc_helper.h", "qcom/opensource/display-drivers/msm/sde_edid_parser.h", "qcom/opensource/display-drivers/msm/sde_hdcp.h", "qcom/opensource/display-drivers/msm/sde_hdcp_2x.h", "qcom/opensource/display-drivers/msm/sde_power_handle.h", "qcom/opensource/display-drivers/msm/sde_rsc_hw.h", "qcom/opensource/display-drivers/msm/sde_rsc_priv.h", "qcom/opensource/display-drivers/msm/sde_vdc_helper.h", "qcom/opensource/display-drivers/msm/shd_drm.h", "qcom/opensource/display-drivers/msm/shd_hw.h", "qcom/opensource/display-drivers/rotator/sde_rotator_base.h", "qcom/opensource/display-drivers/rotator/sde_rotator_core.h", "qcom/opensource/display-drivers/rotator/sde_rotator_debug.h", "qcom/opensource/display-drivers/rotator/sde_rotator_dev.h", "qcom/opensource/display-drivers/rotator/sde_rotator_formats.h", "qcom/opensource/display-drivers/rotator/sde_rotator_hwio.h", "qcom/opensource/display-drivers/rotator/sde_rotator_inline.h", "qcom/opensource/display-drivers/rotator/sde_rotator_io_util.h", "qcom/opensource/display-drivers/rotator/sde_rotator_r1.h", "qcom/opensource/display-drivers/rotator/sde_rotator_r1_debug.h", "qcom/opensource/display-drivers/rotator/sde_rotator_r1_hwio.h", "qcom/opensource/display-drivers/rotator/sde_rotator_r1_internal.h", "qcom/opensource/display-drivers/rotator/sde_rotator_r3.h", "qcom/opensource/display-drivers/rotator/sde_rotator_r3_debug.h", "qcom/opensource/display-drivers/rotator/sde_rotator_r3_hwio.h", "qcom/opensource/display-drivers/rotator/sde_rotator_r3_internal.h", "qcom/opensource/display-drivers/rotator/sde_rotator_smmu.h", "qcom/opensource/display-drivers/rotator/sde_rotator_sync.h", "qcom/opensource/display-drivers/rotator/sde_rotator_trace.h", "qcom/opensource/display-drivers/rotator/sde_rotator_util.h", "qcom/opensource/display-drivers/rotator/sde_rotator_vbif.h"],
+    linux_includes = ["include", "qcom/opensource/display-drivers/include"],
+    includes = ["qcom/opensource/display-drivers", "qcom/opensource/display-drivers/include", "qcom/opensource/display-drivers/include/linux", "qcom/opensource/display-drivers/include/uapi/display", "qcom/opensource/display-drivers/rotator", "qcom/opensource/display-drivers/msm", "qcom/opensource/display-drivers/msm/dp", "qcom/opensource/display-drivers/msm/hdmi", "qcom/opensource/display-drivers/msm/dsi", "qcom/opensource/display-drivers/msm/sde", "qcom/opensource/display-drivers/msm/mi_disp", "qcom/opensource/mmrm-driver/driver/src", "qcom/opensource/mm-drivers/msm_ext_display/include", "drivers/gpu/drm/display"],
+)
+
+ddk_module(
+    name = "msm_drm",
+    srcs = ["qcom/opensource/display-drivers/hdcp/msm_hdcp.c", "qcom/opensource/display-drivers/msm/dp/dp_hdcp2p2.c", "qcom/opensource/display-drivers/msm/sde_hdcp_1x.c", "qcom/opensource/display-drivers/msm/sde_hdcp_2x.c", "qcom/opensource/display-drivers/msm/sde/sde_vm_common.c", "qcom/opensource/display-drivers/msm/sde/sde_vm_primary.c", "qcom/opensource/display-drivers/msm/sde/sde_vm_trusted.c", "qcom/opensource/display-drivers/msm/sde/sde_vm_msgq.c", "qcom/opensource/display-drivers/msm/dp/dp_altmode.c", "qcom/opensource/display-drivers/msm/dp/dp_parser.c", "qcom/opensource/display-drivers/msm/dp/dp_power.c", "qcom/opensource/display-drivers/msm/dp/dp_catalog.c", "qcom/opensource/display-drivers/msm/dp/dp_catalog_v420.c", "qcom/opensource/display-drivers/msm/dp/dp_catalog_v200.c", "qcom/opensource/display-drivers/msm/dp/dp_catalog_v500.c", "qcom/opensource/display-drivers/msm/dp/dp_aux.c", "qcom/opensource/display-drivers/msm/dp/dp_panel.c", "qcom/opensource/display-drivers/msm/dp/dp_panel_tu.c", "qcom/opensource/display-drivers/msm/dp/dp_link.c", "qcom/opensource/display-drivers/msm/dp/dp_ctrl.c", "qcom/opensource/display-drivers/msm/dp/dp_audio.c", "qcom/opensource/display-drivers/msm/dp/dp_debug.c", "qcom/opensource/display-drivers/msm/dp/dp_hpd.c", "qcom/opensource/display-drivers/msm/dp/dp_aux_bridge.c", "qcom/opensource/display-drivers/msm/dp/dp_bridge_hpd.c", "qcom/opensource/display-drivers/msm/dp/dp_mst_sim.c", "qcom/opensource/display-drivers/msm/dp/dp_mst_sim_helper.c", "qcom/opensource/display-drivers/msm/dp/dp_gpio_hpd.c", "qcom/opensource/display-drivers/msm/dp/dp_lphw_hpd.c", "qcom/opensource/display-drivers/msm/dp/dp_display.c", "qcom/opensource/display-drivers/msm/dp/dp_drm.c", "qcom/opensource/display-drivers/msm/dp/dp_pll.c", "qcom/opensource/display-drivers/msm/dp/dp_pll_5nm.c", "qcom/opensource/display-drivers/msm/dp/dp_pll_4nm.c", "qcom/opensource/display-drivers/msm/dp/dp_pll_3nm.c", "qcom/opensource/display-drivers/msm/dp/dp_mst_drm.c", "qcom/opensource/display-drivers/msm/sde/sde_crtc.c", "qcom/opensource/display-drivers/msm/sde/sde_encoder.c", "qcom/opensource/display-drivers/msm/sde/sde_encoder_dce.c", "qcom/opensource/display-drivers/msm/sde/sde_encoder_phys_vid.c", "qcom/opensource/display-drivers/msm/sde/sde_encoder_phys_cmd.c", "qcom/opensource/display-drivers/msm/sde/sde_irq.c", "qcom/opensource/display-drivers/msm/sde/sde_core_irq.c", "qcom/opensource/display-drivers/msm/sde/sde_core_perf.c", "qcom/opensource/display-drivers/msm/sde/sde_rm.c", "qcom/opensource/display-drivers/msm/sde/sde_kms_utils.c", "qcom/opensource/display-drivers/msm/sde/sde_kms.c", "qcom/opensource/display-drivers/msm/sde/sde_plane.c", "qcom/opensource/display-drivers/msm/sde/sde_connector.c", "qcom/opensource/display-drivers/msm/sde/sde_color_processing.c", "qcom/opensource/display-drivers/msm/sde/sde_vbif.c", "qcom/opensource/display-drivers/msm/sde_dbg.c", "qcom/opensource/display-drivers/msm/sde_dbg_evtlog.c", "qcom/opensource/display-drivers/msm/sde_io_util.c", "qcom/opensource/display-drivers/msm/sde_vm_event.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_reg_dma_v1_color_proc.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_color_proc_v4.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_ad4.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_uidle.c", "qcom/opensource/display-drivers/msm/sde_edid_parser.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_catalog.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_cdm.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_dspp.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_intf.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_lm.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_ctl.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_util.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_sspp.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_wb.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_pingpong.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_top.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_interrupts.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_vbif.c", "qcom/opensource/display-drivers/msm/sde/sde_formats.c", "qcom/opensource/display-drivers/msm/sde_power_handle.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_color_processing_v1_7.c", "qcom/opensource/display-drivers/msm/sde/sde_reg_dma.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_reg_dma_v1.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_dsc.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_dsc_1_2.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_vdc.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_ds.c", "qcom/opensource/display-drivers/msm/sde/sde_fence.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_qdss.c", "qcom/opensource/display-drivers/msm/sde_dsc_helper.c", "qcom/opensource/display-drivers/msm/sde_vdc_helper.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_dnsc_blur.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_rc.c", "qcom/opensource/display-drivers/msm/sde/sde_color_proc_property_helper.c", "qcom/opensource/display-drivers/msm/sde/sde_color_processing_aiqe.c", "qcom/opensource/display-drivers/msm/sde/sde_hw_color_proc_aiqe_v1.c", "qcom/opensource/display-drivers/msm/sde/sde_aiqe_common.c", "qcom/opensource/display-drivers/msm/sde/sde_loopback.c", "qcom/opensource/display-drivers/msm/sde/sde_wb.c", "qcom/opensource/display-drivers/msm/sde/sde_encoder_phys_wb.c", "qcom/opensource/display-drivers/msm/sde_cesta.c", "qcom/opensource/display-drivers/msm/sde_cesta_hw.c", "qcom/opensource/display-drivers/msm/dsi/dsi_phy.c", "qcom/opensource/display-drivers/msm/dsi/dsi_pwr.c", "qcom/opensource/display-drivers/msm/dsi/dsi_phy_hw_v3_0.c", "qcom/opensource/display-drivers/msm/dsi/dsi_phy_hw_v4_0.c", "qcom/opensource/display-drivers/msm/dsi/dsi_phy_hw_v5_0.c", "qcom/opensource/display-drivers/msm/dsi/dsi_phy_hw_v7_2.c", "qcom/opensource/display-drivers/msm/dsi/dsi_phy_timing_calc.c", "qcom/opensource/display-drivers/msm/dsi/dsi_phy_timing_v3_0.c", "qcom/opensource/display-drivers/msm/dsi/dsi_phy_timing_v4_0.c", "qcom/opensource/display-drivers/msm/dsi/dsi_pll.c", "qcom/opensource/display-drivers/msm/dsi/dsi_pll_5nm.c", "qcom/opensource/display-drivers/msm/dsi/dsi_pll_4nm.c", "qcom/opensource/display-drivers/msm/dsi/dsi_pll_3nm.c", "qcom/opensource/display-drivers/msm/dsi/dsi_ctrl_hw_cmn.c", "qcom/opensource/display-drivers/msm/dsi/dsi_ctrl_hw_2_2.c", "qcom/opensource/display-drivers/msm/dsi/dsi_ctrl.c", "qcom/opensource/display-drivers/msm/dsi/dsi_catalog.c", "qcom/opensource/display-drivers/msm/dsi/dsi_drm.c", "qcom/opensource/display-drivers/msm/dsi/dsi_display.c", "qcom/opensource/display-drivers/msm/dsi/dsi_display_manager.c", "qcom/opensource/display-drivers/msm/dsi/dsi_panel.c", "qcom/opensource/display-drivers/msm/dsi/dsi_clk_manager.c", "qcom/opensource/display-drivers/msm/dsi/dsi_display_test.c", "qcom/opensource/display-drivers/msm/dsi/dsi_parser.c", "qcom/opensource/display-drivers/msm/msm_cooling_device.c", "qcom/opensource/display-drivers/msm/hdmi/hdmi_audio.c", "qcom/opensource/display-drivers/msm/hdmi/hdmi_cec.c", "qcom/opensource/display-drivers/msm/hdmi/hdmi_debug.c", "qcom/opensource/display-drivers/msm/hdmi/hdmi_display.c", "qcom/opensource/display-drivers/msm/hdmi/hdmi_drm.c", "qcom/opensource/display-drivers/msm/hdmi/hdmi_hdcp2p2.c", "qcom/opensource/display-drivers/msm/hdmi/hdmi_panel.c", "qcom/opensource/display-drivers/msm/hdmi/hdmi_parser.c", "qcom/opensource/display-drivers/msm/hdmi/hdmi_phy.c", "qcom/opensource/display-drivers/msm/hdmi/hdmi_phy_snps.c", "qcom/opensource/display-drivers/msm/hdmi/hdmi_pll.c", "qcom/opensource/display-drivers/msm/hdmi/hdmi_pll_snps.c", "qcom/opensource/display-drivers/msm/hdmi/hdmi_power.c", "qcom/opensource/display-drivers/msm/hdmi/hdmi_util.c", "qcom/opensource/display-drivers/msm/msm_atomic.c", "qcom/opensource/display-drivers/msm/msm_fb.c", "qcom/opensource/display-drivers/msm/msm_drv.c", "qcom/opensource/display-drivers/msm/msm_gem.c", "qcom/opensource/display-drivers/msm/msm_gem_prime.c", "qcom/opensource/display-drivers/msm/msm_gem_vma.c", "qcom/opensource/display-drivers/msm/msm_smmu.c", "qcom/opensource/display-drivers/msm/msm_prop.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_core.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_feature.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_sysfs.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_file.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_print.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_procfs.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_debugfs.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_log.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_flatmode.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_lhbm.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_disp_parser.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_dsi_display.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_dsi_panel.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_sde_encoder.c", "qcom/opensource/display-drivers/msm/mi_disp/mi_sde_connector.c"],
+    out = "msm_drm.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":display_main_headers", ":display_support_headers", ":drm_display_helper", ":drm_dp_aux_bus", ":msm_mmrm", ":msm_ext_display", ":gpu_stack_headers", ":sync_fence", ":msm_hw_fence", ":synx_driver", ":secure_headers", ":altmode_headers", ":platform_headers", ":clock_headers", ":regulator_headers", ":scm_headers", ":soc_headers", ":gunyah_headers", ":iommu_headers", ":smmu_headers", ":cache_irq_headers", ":mailbox_headers", ":mem_buf_headers", ":minidump_headers", ":input_headers", ":redriver_headers", ":wcd_headers", ":ucsi_glink_headers", ":pmic_glink_headers", ":qcom_ipc_logging", ":gh_rm_drv", ":gh_irq_lend", ":gh_mem_notifier", ":gh_msgq", ":dwc3_msm", ":wcd_usbss_i2c", ":llcc_qcom", ":panel_event_notifier", ":qcom_scm", ":pinctrl_msm", ":spmi_pmic_arb", ":clk_qcom", ":crm_v2", ":hwid", ":mem_buf_dev", ":qcom_iommu_util", ":msm_dma_iommu_mapping", ":smem", ":pm8941_pwrkey", ":usb_phy_headers", ":pinctrl_headers", ":hdcp_qseecom_dlkm", ":smmu_proxy_dlkm", ":altmode_glink", ":fsa4480_i2c", ":qcom_va_minidump"],
+    copts = ["-DMI_DISPLAY_MODIFY"],
+)
+
+
+ddk_headers(
+    name = "fgstrategy_headers",
+    hdrs = ["drivers/power/supply/mca/mca_strategy/strategy_fg/inc/strategy_fg.h", "drivers/power/supply/mca/mca_strategy/strategy_fg/inc/mca_soc_smooth.h", "drivers/power/supply/mca/mca_strategy/strategy_fg/inc/xm_battery_auth.h", "drivers/power/supply/mca/mca_strategy/strategy_fg/inc/mca_battery_shutdown.h"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_strategy_fg_comp",
+    srcs = ["drivers/power/supply/mca/mca_strategy/strategy_fg/mca_strategy_fg.c", "drivers/power/supply/mca/mca_strategy/strategy_fg/mca_soc_smooth.c", "drivers/power/supply/mca/mca_strategy/strategy_fg/mca_battery_shutdown.c"],
+    out = "mca_strategy_fg_comp.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":fgstrategy_headers", ":smartcharge_headers", ":chargebusiness_headers", ":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_common", ":mca_sysfs", ":mca_hwid", ":mca_workqueue", ":mca_qcom_smem", ":mca_smart_charge", ":mca_charge_mievent", ":mca_strategy_fg_class", ":mca_strategy_class", ":mca_platform_fg_ic_ops", ":mca_platform_buckchg_class", ":mca_platform_loadsw_class", ":mca_protocol_pd_class", ":mca_protocol_class", ":charger_partition"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_headers(
+    name = "chargeconsumer_headers",
+    hdrs = ["drivers/power/supply/mca/mca_strategy/strategy_charger/inc/mca_buckchg_jeita.h", "drivers/power/supply/mca/mca_strategy/strategy_charger/inc/mca_quick_charger.h"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_buckchg_jeita",
+    srcs = ["drivers/power/supply/mca/mca_strategy/strategy_charger/mca_buckchg_jeita.c"],
+    out = "mca_buckchg_jeita.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargeconsumer_headers", ":smartcharge_headers", ":chargebusiness_headers", ":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_common", ":mca_sysfs", ":mca_hwid", ":mca_workqueue", ":mca_qcom_smem", ":mca_charge_interface", ":mca_smart_charge", ":mca_charge_mievent", ":mca_strategy_fg_class", ":mca_strategy_class", ":mca_platform_fg_ic_ops", ":mca_platform_buckchg_class", ":mca_platform_loadsw_class", ":mca_platform_cp_class", ":mca_platform_wireless_class", ":mca_protocol_pd_class", ":mca_protocol_qc_class", ":mca_protocol_class", ":charger_partition"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mca_strategy_quickchg",
+    srcs = ["drivers/power/supply/mca/mca_strategy/strategy_charger/mca_strategy_quickchg.c"],
+    out = "mca_strategy_quickchg.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":chargeconsumer_headers", ":smartcharge_headers", ":chargebusiness_headers", ":chargepolicy_headers", ":chargehw_headers", ":mca_headers", ":mca_log", ":mca_event", ":mca_parse_dts", ":mca_common", ":mca_sysfs", ":mca_hwid", ":mca_workqueue", ":mca_qcom_smem", ":mca_charge_interface", ":mca_smart_charge", ":mca_charge_mievent", ":mca_strategy_fg_class", ":mca_strategy_class", ":mca_platform_fg_ic_ops", ":mca_platform_buckchg_class", ":mca_platform_loadsw_class", ":mca_platform_cp_class", ":mca_platform_wireless_class", ":mca_protocol_pd_class", ":mca_protocol_qc_class", ":mca_protocol_class", ":charger_partition"],
+    visibility = ["//visibility:public"],
+)
+
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -2579,6 +2785,21 @@ kernel_module_group(
         ":altmode_glink",
         ":fsa4480_i2c",
         ":qcom_va_minidump",
+        ":qseecom_proxy",
+        ":si_core_module",
+        ":mem_object",
+        ":smcinvoke_dlkm",
+        ":qseecom_dlkm",
+        ":hdcp_qseecom_dlkm",
+        ":smmu_proxy_dlkm",
+        ":drm_display_helper",
+        ":drm_dp_aux_bus",
+        ":msm_mmrm",
+        ":msm_ext_display",
+        ":msm_drm",
+        ":mca_strategy_fg_comp",
+        ":mca_buckchg_jeita",
+        ":mca_strategy_quickchg",
     ],
 )
 

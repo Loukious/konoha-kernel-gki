@@ -1,0 +1,3141 @@
+--- a/drivers/power/supply/mca/mca_strategy/strategy_fg/mca_strategy_fg.c
++++ b/drivers/power/supply/mca/mca_strategy/strategy_fg/mca_strategy_fg.c
+@@ -31,6 +31,8 @@
+ #include <linux/workqueue.h>
+ #include <linux/platform_device.h>
+ #include <linux/reboot.h>
++#include <linux/overflow.h>
++#include <linux/math64.h>
+ #include <mca/common/mca_log.h>
+ #include <mca/common/mca_event.h>
+ #include <mca/strategy/strategy_class.h>
+@@ -136,7 +138,7 @@
+ static int strategy_fg_ops_get_curr(void *data, int *curr);
+ static int strategy_fg_ops_get_rsoc(void *data, int *rsoc);
+ static void strategy_fg_set_fake_soc(struct strategy_fg *info, int val);
+-static void strategy_fg_set_fake_temp(struct strategy_fg *info, int val);
++static int strategy_fg_set_fake_temp(struct strategy_fg *info, int val);
+ 
+ static ssize_t strategy_fg_sysfs_show(struct device *dev,
+ 					   struct device_attribute *attr,
+@@ -159,7 +161,6 @@
+ static int
+ strategy_fg_check_extreme_cold_temp_compensation(struct strategy_fg *fg,
+ 						 int real_temp);
+-static int strategy_fg_get_parallel_curr(struct strategy_fg *fg, int *curr);
+ static int strategy_fg_get_parallel_rsoc(struct strategy_fg *fg, int *rsoc);
+ static int strategy_fg_get_soh_new(struct strategy_fg *fg, int *soh_new);
+ static unsigned long strategy_fg_get_calc_rvalue(struct strategy_fg *fg);
+@@ -248,7 +249,7 @@
+ 		    (val >= 0 && val <= 100)) {
+ 			info->fake_soc = val;
+ 			cancel_delayed_work_sync(&info->monitor_work);
+-			mca_queue_delayed_work(&info->monitor_work, 0);
++			queue_delayed_work(info->wq, &info->monitor_work, 0);
+ 
+ 			mca_event_block_notify(MCA_EVENT_TYPE_BATTERY_INFO,
+ 					       MCA_EVENT_BATTERY_STS_CHANGE,
+@@ -257,21 +258,22 @@
+ 	}
+ }
+ 
+-static void strategy_fg_set_fake_temp(struct strategy_fg *info, int val)
+-{
++static int strategy_fg_set_fake_temp(struct strategy_fg *info, int val)
++{
++	int ret;
+ 	mca_log_err("set fake_temp: %d\n", val);
+ 	if (val != info->fake_temp) {
++		ret = platform_fg_ops_set_temp(FG_IC_MASTER, val);
++		if (ret)
++			return ret;
+ 		info->fake_temp = val;
+-		platform_fg_ops_set_temp(FG_IC_MASTER, val);
+-		if (info->cfg.fg_type > MCA_FG_TYPE_SINGLE_NUM_MAX)
+-			platform_fg_ops_set_temp(FG_IC_SLAVE, val);
+-
+-		cancel_delayed_work_sync(&info->monitor_work);
+-		mca_queue_delayed_work(&info->monitor_work, 0);
++
++		mod_delayed_work(info->wq, &info->monitor_work, 0);
+ 
+ 		mca_event_block_notify(MCA_EVENT_TYPE_BATTERY_INFO,
+ 				       MCA_EVENT_BATTERY_STS_CHANGE, NULL);
+ 	}
++	return 0;
+ }
+ 
+ static ssize_t strategy_fg_sysfs_store(struct device *dev,
+@@ -280,11 +282,13 @@
+ {
+ 	struct strategy_fg *info = dev_get_drvdata(dev);
+ 	struct mca_sysfs_attr_info *attr_info;
+-	int val;
++	int val, ret;
+ 	int match = 0;
+ 
+-	if (!info)
+-		return -1;
++	if (!info || READ_ONCE(info->stopping))
++		return -ENODEV;
++	if (!READ_ONCE(info->ready))
++		return -EAGAIN;
+ 
+ 	attr_info = mca_sysfs_lookup_attr(attr->attr.name,
+ 					  strategy_fg_sysfs_field_tbl,
+@@ -296,7 +300,11 @@
+ 	case FG_PROP_MAIN_AUTH:
+ 		if (kstrtoint(buf, 10, &val))
+ 			return -EINVAL;
+-		platform_fg_ops_set_authentic(FG_IC_MASTER, val);
++		if (val != 0 && val != 1)
++			return -EINVAL;
++		ret = platform_fg_ops_set_authentic(FG_IC_MASTER, val);
++		if (ret)
++			return ret;
+ 		info->batt_auth = val;
+ 		strategy_fg_check_battery_adapt_power(info, &match);
+ 		if (val && info->cfg.fg_type <= MCA_FG_TYPE_SINGLE_NUM_MAX &&
+@@ -305,18 +313,12 @@
+ 					       MCA_EVENT_BATT_AUTH_PASS, NULL);
+ 		break;
+ 	case FG_PROP_SLAVE_AUTH:
+-		if (kstrtoint(buf, 10, &val))
+-			return -EINVAL;
+-		platform_fg_ops_set_authentic(FG_IC_SLAVE, val);
+-		info->batt_slave_auth = val;
+-		strategy_fg_check_battery_adapt_power(info, &match);
+-		if (info->batt_auth && info->batt_slave_auth && match)
+-			mca_event_block_notify(MCA_EVENT_TYPE_HW_INFO,
+-					       MCA_EVENT_BATT_AUTH_PASS, NULL);
+-		break;
++		return -EOPNOTSUPP;
+ 	case FG_PROP_BATT_INDEX:
+ 		if (kstrtoint(buf, 10, &val))
+ 			return -EINVAL;
++		if (val != FG_IC_MASTER)
++			return -EOPNOTSUPP;
+ 		info->batt_index = val;
+ 		break;
+ 	case FG_PROP_VERIFY_DIGEST:
+@@ -332,21 +334,29 @@
+ 	case FG_PROP_FAKE_SOC:
+ 		if (kstrtoint(buf, 10, &val))
+ 			return -EINVAL;
++		if (val != STRATEGY_FG_FAKE_SOC_NONE && (val < 0 || val > 100))
++			return -ERANGE;
+ 		strategy_fg_set_fake_soc(info, val);
+ 		break;
+ 	case FG_PROP_FAKE_TEMP:
+ 		if (kstrtoint(buf, 10, &val))
+ 			return -EINVAL;
+-		strategy_fg_set_fake_temp(info, val);
++		if (val < -1000 || val > 2000)
++			return -ERANGE;
++		ret = strategy_fg_set_fake_temp(info, val);
++		if (ret)
++			return ret;
+ 		break;
+ 	case FG_PROP_UPDATE_PERIOD:
+ 		if (kstrtoint(buf, 10, &val))
+ 			return -EINVAL;
++		if (val != STRATEGY_FG_UPDATE_PERIOD_NONE && (val < 100 || val > 3600000))
++			return -ERANGE;
+ 		mca_log_err("set fg update period: %d\n", val);
+ 		if (val != info->update_period) {
+ 			info->update_period = val;
+ 			cancel_delayed_work_sync(&info->monitor_work);
+-			mca_queue_delayed_work(&info->monitor_work, 0);
++			queue_delayed_work(info->wq, &info->monitor_work, 0);
+ 
+ 			mca_event_block_notify(MCA_EVENT_TYPE_BATTERY_INFO,
+ 					       MCA_EVENT_BATTERY_STS_CHANGE,
+@@ -357,6 +367,8 @@
+ 		if (kstrtoint(buf, 10, &val))
+ 			return -EINVAL;
+ 		mca_log_err("set fake_dod_count: %d\n", val);
++		if (val < 0)
++			return -ERANGE;
+ 		info->fake_dod_count = val;
+ 		break;
+ 	case FG_PROP_ENABLE_ROLLBACK:
+@@ -369,6 +381,8 @@
+ 		if (kstrtoint(buf, 10, &val))
+ 			return -EINVAL;
+ 		mca_log_err("set self_equal_count_max: %d\n", val);
++		if (val < 0 || val > 1000000)
++			return -ERANGE;
+ 		info->self_equal_max_count = val;
+ 		break;
+ 	case FG_PROP_FIRST_USAGE_DATE:
+@@ -388,12 +402,14 @@
+ 	ssize_t count = 0;
+ 	struct mca_sysfs_attr_info *attr_info;
+ 	struct strategy_fg *info = dev_get_drvdata(dev);
+-	int val = 0;
++	int val = 0, ret;
+ 	int temp = 0;
+ 	unsigned long rvalue;
+ 
+-	if (!info)
+-		return -1;
++	if (!info || READ_ONCE(info->stopping))
++		return -ENODEV;
++	if (!READ_ONCE(info->ready))
++		return -EAGAIN;
+ 
+ 	attr_info = mca_sysfs_lookup_attr(attr->attr.name,
+ 					  strategy_fg_sysfs_field_tbl,
+@@ -403,13 +419,13 @@
+ 
+ 	switch (attr_info->sysfs_attr_name) {
+ 	case FG_PROP_MAIN_AUTH:
+-		platform_fg_ops_get_authentic(FG_IC_MASTER, &val);
++		ret = platform_fg_ops_get_authentic(FG_IC_MASTER, &val);
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%x\n", val);
+ 		break;
+ 	case FG_PROP_SLAVE_AUTH:
+-		platform_fg_ops_get_authentic(FG_IC_SLAVE, &val);
+-		count = scnprintf(buf, PAGE_SIZE, "%x\n", val);
+-		break;
++		return -EOPNOTSUPP;
+ 	case FG_PROP_BATT_INDEX:
+ 		count = scnprintf(buf, PAGE_SIZE, "%x\n", info->batt_index);
+ 		break;
+@@ -418,18 +434,24 @@
+ 							  (char *)buf);
+ 		break;
+ 	case FG_PROP_BATT_POWER_MATCH:
+-		strategy_fg_check_battery_adapt_power(info, &val);
++		ret = strategy_fg_check_battery_adapt_power(info, &val);
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%x\n", val);
+ 		break;
+ 	case FG_PROP_FAST_CHARGE:
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", info->fast_charge);
+ 		break;
+ 	case FG_PROP_SOC_DECIMAL:
+-		strategy_fg_ops_get_soc_decimal(info, &val, &temp);
++		ret = strategy_fg_ops_get_soc_decimal(info, &val, &temp);
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
+ 		break;
+ 	case FG_PROP_SOC_DECIMAL_RATE:
+-		strategy_fg_ops_get_soc_decimal(info, &val, &temp);
++		ret = strategy_fg_ops_get_soc_decimal(info, &val, &temp);
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", temp);
+ 		break;
+ 	case FG_PROP_FAKE_SOC:
+@@ -452,7 +474,9 @@
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
+ 		break;
+ 	case FG_PROP_DOD_COUNT:
+-		strategy_fg_get_dod_count(info, &val);
++		ret = strategy_fg_get_dod_count(info, &val);
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
+ 		break;
+ 	case FG_PROP_ENABLE_ROLLBACK:
+@@ -460,7 +484,9 @@
+ 				  info->enable_rollback);
+ 		break;
+ 	case FG_PROP_SOH_NEW:
+-		strategy_fg_get_soh_new(info, &val);
++		ret = strategy_fg_get_soh_new(info, &val);
++		if (ret)
++			return ret;
+ 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
+ 		break;
+ 	case FG_PROP_MASTER_SELF_EQUAL_COUNT:
+@@ -511,24 +537,24 @@
+ #define MEAN_CUR_NUM 5
+ static void strategy_fg_record_curr_mean(struct strategy_fg *fg)
+ {
+-	static int current_nums[MEAN_CUR_NUM] = { 0 };
+-	static int cur_num = 0;
+-	int sum = 0;
++	s64 sum = 0;
+ 
+ 	if (!fg || !fg->fg_init_flag)
+ 		return;
+ 
+-	current_nums[cur_num] = fg->batt_current;
+-	cur_num = (cur_num + 1) % MEAN_CUR_NUM;
++	fg->current_history[fg->current_cursor] = fg->batt_current;
++	fg->current_cursor = (fg->current_cursor + 1) % MEAN_CUR_NUM;
+ 	mca_log_debug(
+ 		"record_i:%d, record_cur [0]= %d, [1]= %d, [2]= %d, [3]= %d, [4]= %d\n",
+-		cur_num, current_nums[0], current_nums[1], current_nums[2],
+-		current_nums[3], current_nums[4]);
++		fg->current_cursor, fg->current_history[0], fg->current_history[1],
++		fg->current_history[2],
++		fg->current_history[3], fg->current_history[4]);
+ 
+ 	for (int i = 0; i < MEAN_CUR_NUM; i++)
+-		sum = sum + current_nums[i];
+-
+-	fg->batt_current_mean = sum / MEAN_CUR_NUM;
++		sum = sum + fg->current_history[i];
++
++	fg->current_count = min(fg->current_count + 1, MEAN_CUR_NUM);
++	fg->batt_current_mean = div_s64(sum, fg->current_count);
+ 	mca_log_info("mean_cur:%d\n", fg->batt_current_mean);
+ 	return;
+ }
+@@ -540,30 +566,29 @@
+ #define VABTT_EMPTY_HY 100
+ void strategy_fg_record_volt_mean(struct strategy_fg *fg)
+ {
+-	static int vol_i = 0, voltage_nums[MEAN_VOL_NUM] = { 0 };
+-	int sum = 0, cnt_i = 0;
+-	static int empty_count;
++	s64 sum = 0;
++	int cnt_i = 0;
+ 	int empty_count_th = DISCHARGING_MAX_EMPTY_COUNT;
+ 	struct timespec64 ts;
+-	static int is_zero_speed = 0;
+ 
+ 	if (!fg || !fg->fg_init_flag)
+ 		return;
+ 	if (fg->batt_voltage < 1000)
+ 		return;
+ 
+-	voltage_nums[vol_i] = fg->batt_voltage;
++	fg->voltage_history[fg->voltage_cursor] = fg->batt_voltage;
+ 	mca_log_debug(
+ 		"record_i:%d record_vol [0]= %d, [1]= %d, [2]= %d, [3]= %d, [4]= %d\n",
+-		vol_i, voltage_nums[0], voltage_nums[1], voltage_nums[2],
+-		voltage_nums[3], voltage_nums[4]);
+-	vol_i = (vol_i + 1) % MEAN_VOL_NUM;
++		fg->voltage_cursor, fg->voltage_history[0], fg->voltage_history[1],
++		fg->voltage_history[2],
++		fg->voltage_history[3], fg->voltage_history[4]);
++	fg->voltage_cursor = (fg->voltage_cursor + 1) % MEAN_VOL_NUM;
+ 
+ 	for (cnt_i = 0; cnt_i < MEAN_VOL_NUM; cnt_i++) {
+-		if (voltage_nums[cnt_i] == 0)
++		if (fg->voltage_history[cnt_i] == 0)
+ 			break;
+-		if (voltage_nums[cnt_i] > 0)
+-			sum += voltage_nums[cnt_i];
++		if (fg->voltage_history[cnt_i] > 0)
++			sum += fg->voltage_history[cnt_i];
+ 	}
+ 	if (cnt_i == 0)
+ 		fg->batt_voltage_mean = 0;
+@@ -579,22 +604,23 @@
+ 					  NORMAL_CHARGING_MAX_EMPTY_COUNT);
+ 
+ 	ktime_get_boottime_ts64(&ts);
+-	if (!is_zero_speed && fg->chg_status == POWER_SUPPLY_STATUS_CHARGING &&
++	if (!fg->zero_speed && fg->chg_status == POWER_SUPPLY_STATUS_CHARGING &&
+ 	    (u64)ts.tv_sec < 120)
+-		get_smem_battery_info(&is_zero_speed);
+-	if (fg->chg_status == POWER_SUPPLY_STATUS_CHARGING && is_zero_speed &&
++		get_smem_battery_info(&fg->zero_speed);
++	if (fg->chg_status == POWER_SUPPLY_STATUS_CHARGING && fg->zero_speed &&
+ 	    (u64)ts.tv_sec < 120) {
+ 		mca_log_err(
+ 			"chg_status = %d, is_zero_speed = %d, tv_sec = %llu, ignore vbatt_empty...\n",
+-			fg->chg_status, is_zero_speed, (u64)ts.tv_sec);
++			fg->chg_status, fg->zero_speed, (u64)ts.tv_sec);
+ 	} else {
+ 		if (fg->batt_voltage_mean <= fg->vcutoff_sw) {
+-			empty_count++;
++			if (fg->empty_count <= empty_count_th)
++				fg->empty_count++;
+ 			fg->vbatt_empty =
+-				(empty_count > empty_count_th) ? true : false;
++				(fg->empty_count > empty_count_th) ? true : false;
+ 		} else if (fg->batt_voltage_mean >
+ 			   (fg->vcutoff_sw + VABTT_EMPTY_HY)) {
+-			empty_count = 0;
++			fg->empty_count = 0;
+ 			fg->vbatt_empty = false;
+ 		}
+ 	}
+@@ -634,93 +660,77 @@
+ 
+ static int strategy_fg_get_cutoff_voltage(void *data)
+ {
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-	int cutoff_voltage = 0;
+-	int ret;
+-
+-	if (fg->cfg.fg_type <= MCA_FG_TYPE_SINGLE_NUM_MAX)
+-		ret = platform_fg_ops_get_cutoff_voltage(FG_IC_MASTER,
+-							 &cutoff_voltage);
+-	else if (fg->cfg.fg_type > MCA_FG_TYPE_SINGLE_NUM_MAX) {
+-		ret = platform_fg_ops_get_cutoff_voltage(FG_IC_MASTER,
+-							 &cutoff_voltage);
+-	}
+-
+-	return cutoff_voltage;
++	int voltage, ret;
++
++	ret = platform_fg_ops_get_cutoff_voltage(FG_IC_MASTER, &voltage);
++	return ret ?: voltage;
+ }
+ 
+ static int strategy_fg_set_cutoff_voltage(void *data, int value)
+ {
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-
+-	if (fg->cfg.fg_type <= MCA_FG_TYPE_SINGLE_NUM_MAX)
+-		platform_fg_ops_set_cutoff_voltage(FG_IC_MASTER, value);
+-	else {
+-		platform_fg_ops_set_cutoff_voltage(FG_IC_MASTER, value);
+-		platform_fg_ops_set_cutoff_voltage(FG_IC_SLAVE, value);
+-	}
+-
+-	return 0;
++	return platform_fg_ops_set_cutoff_voltage(FG_IC_MASTER, value);
+ }
+ 
+ #define WEIGHT_SCALE 10
+ static int strategy_fg_get_dod_count(void *data, int *value)
+ {
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-	int count_level1 = 0, count_level2 = 0, count_level3 = 0,
+-	    count_lowtemp = 0;
+-	int ret = 0;
+-
+-	if (!fg->support_dod_vcutoff)
++	struct strategy_fg *fg = data;
++	int a, b, c, lowtemp, ret;
++	s64 result;
++
++	if (!fg || !value)
++		return -EINVAL;
++	if (!fg->support_dod_vcutoff) {
++		*value = 0;
+ 		return 0;
+-
++	}
+ 	if (fg->fake_dod_count) {
+ 		*value = fg->fake_dod_count;
+ 		return 0;
+ 	}
+ 	ret = platform_fg_ops_get_dod_count(FG_IC_MASTER);
+-	ret |= platform_fg_ops_get_count_level1(FG_IC_MASTER, &count_level1);
+-	ret |= platform_fg_ops_get_count_level2(FG_IC_MASTER, &count_level2);
+-	ret |= platform_fg_ops_get_count_level3(FG_IC_MASTER, &count_level3);
+-	ret |= platform_fg_ops_get_count_lowtemp(FG_IC_MASTER, &count_lowtemp);
+-
+-	*value = (fg->weight[WEIGHT_LEVEL_1] * count_level1 +
+-		  fg->weight[WEIGHT_LEVEL_2] * count_level2 +
+-		  fg->weight[WEIGHT_LEVEL_3] * count_level3) /
+-		 WEIGHT_SCALE;
+-
+-	if (fg->cfg.fg_type > MCA_FG_TYPE_SINGLE_NUM_MAX)
+-		ret |= platform_fg_ops_get_dod_count(FG_IC_SLAVE);
+-
+-	return 0;
+-}
+-
+-static void strategy_fg_ops_get_single_soh_new(struct strategy_fg *fg,
+-					       int *soh_new)
+-{
+-	int master_ui_soh;
+-
+-	platform_fg_ops_get_ui_soh(FG_IC_MASTER, &master_ui_soh);
+-	*soh_new = master_ui_soh;
++	if (ret)
++		return ret;
++	ret = platform_fg_ops_get_count_level1(FG_IC_MASTER, &a);
++	if (ret)
++		return ret;
++	ret = platform_fg_ops_get_count_level2(FG_IC_MASTER, &b);
++	if (ret)
++		return ret;
++	ret = platform_fg_ops_get_count_level3(FG_IC_MASTER, &c);
++	if (ret)
++		return ret;
++	ret = platform_fg_ops_get_count_lowtemp(FG_IC_MASTER, &lowtemp);
++	if (ret)
++		return ret;
++	if (a < 0 || b < 0 || c < 0)
++		return -ERANGE;
++	for (int i = 0; i < WEIGHT_LEVEL_MAX; i++)
++		if (fg->weight[i] < 0 || fg->weight[i] > 1000)
++			return -ERANGE;
++	result = div_s64((s64)fg->weight[WEIGHT_LEVEL_1] * a +
++		(s64)fg->weight[WEIGHT_LEVEL_2] * b + (s64)fg->weight[WEIGHT_LEVEL_3] * c,
++		WEIGHT_SCALE);
++	if (result < 0 || result > INT_MAX)
++		return -ERANGE;
++	*value = result;
++	return 0;
++}
++
++static int strategy_fg_ops_get_single_soh_new(struct strategy_fg *fg, int *soh_new)
++{
++	int value = -ENODATA;
++
++	platform_fg_ops_get_ui_soh(FG_IC_MASTER, &value);
++	if (value < 0 || value > 100)
++		return value < 0 ? value : -ERANGE;
++	*soh_new = value;
++	return 0;
+ }
+ 
+ static int strategy_fg_get_soh_new(struct strategy_fg *fg, int *soh_new)
+ {
+-	switch (fg->cfg.fg_type) {
+-	case MCA_FG_TYPE_SINGLE:
+-	case MCA_FG_TYPE_SINGLE_SERIES:
+-		strategy_fg_ops_get_single_soh_new(fg, soh_new);
+-		break;
+-	case MCA_FG_TYPE_PARALLEL:
+-		/* to do for parallel battery such as o81a */
+-		/* strateg_fg_ops_get_parallel_soh_new(fg, soh_new); */
+-		break;
+-	case MCA_FG_TYPE_SERIES:
+-		break;
+-	default:
+-		return -1;
+-	}
+-	return 0;
++	return strategy_fg_ops_get_single_soh_new(fg, soh_new);
+ }
+ 
+ static unsigned long
+@@ -762,14 +772,20 @@
+ 	int vcutoff_reg = 0;
+ 	int ret = 0;
+ 
++	if (fg->support_dod_vcutoff && fg->dod_error)
++		return fg->dod_error;
+ 	ret = mca_battery_shutdown_update_vcutoff_para(fg);
+ 	if (ret)
+ 		return 0;
+ 
+ 	vcutoff_reg = strategy_fg_get_cutoff_voltage(fg);
++	if (vcutoff_reg < 0)
++		return vcutoff_reg;
+ 
+ 	if (vcutoff_reg != fg->vcutoff_fw) {
+-		strategy_fg_set_cutoff_voltage(fg, fg->vcutoff_fw);
++		ret = strategy_fg_set_cutoff_voltage(fg, fg->vcutoff_fw);
++		if (ret)
++			return ret;
+ 		mca_log_err("vcutoff_reg:%d, vcutoff_fw %d", vcutoff_reg,
+ 			    fg->vcutoff_fw);
+ 	}
+@@ -792,8 +808,9 @@
+ 					fg->batt_cyclecount, real_temp,
+ 					fg->cfg.extreme_cold_para[i]
+ 						.compensation);
+-				temp = real_temp -
+-				       fg->cfg.extreme_cold_para[i].compensation;
++				temp = clamp_t(s64, (s64)real_temp -
++					fg->cfg.extreme_cold_para[i].compensation,
++					INT_MIN, INT_MAX);
+ 				break;
+ 			}
+ 		}
+@@ -802,160 +819,21 @@
+ 	return temp;
+ }
+ 
+-static int strategy_fg_get_parallel_temp(struct strategy_fg *fg)
+-{
+-	int ret;
+-
+-	ret = platform_fg_ops_get_temp(FG_IC_SLAVE,
+-				       &(fg->slave_batt_info.temp));
+-	ret |= platform_fg_ops_get_temp(FG_IC_MASTER,
+-					&(fg->master_batt_info.temp));
+-	pr_err("%s master %d slave %d\n", __func__, fg->master_batt_info.temp,
+-	       fg->slave_batt_info.temp);
+-	if (ret)
+-		return -1;
+-
+-	if (fg->master_batt_info.temp <= JEITA_COOL_THR_DEGREE ||
+-	    fg->slave_batt_info.temp <= JEITA_COOL_THR_DEGREE)
+-		fg->batt_info.temp = min(fg->master_batt_info.temp,
+-					 fg->slave_batt_info.temp);
+-	else if (min(fg->master_batt_info.temp, fg->slave_batt_info.temp) >
+-		 EXTREME_HIGH_DEGREE)
+-		fg->batt_info.temp = min(fg->master_batt_info.temp,
+-					 fg->slave_batt_info.temp);
+-	else
+-		fg->batt_info.temp = max(fg->master_batt_info.temp,
+-					 fg->slave_batt_info.temp);
+-
+-	return 0;
+-}
+-
+-static int strategy_fg_get_series_temp(struct strategy_fg *fg)
+-{
+-	return 0;
+-}
+-
+-static int strategy_fg_get_parallel_original_temp(struct strategy_fg *fg)
+-{
+-	int ret;
+-
+-	ret = platform_fg_ops_get_original_temp(FG_IC_SLAVE, &(fg->slave_batt_info.temp));
+-	ret |= platform_fg_ops_get_original_temp(FG_IC_MASTER, &(fg->master_batt_info.temp));
+-	pr_err("%s master %d slave %d\n", __func__, fg->master_batt_info.temp, fg->slave_batt_info.temp);
+-	if (ret)
+-		return -1;
+-
+-	if (fg->master_batt_info.temp <= JEITA_COOL_THR_DEGREE ||
+-	    fg->slave_batt_info.temp <= JEITA_COOL_THR_DEGREE)
+-		fg->original_temp = min(fg->master_batt_info.temp, fg->slave_batt_info.temp);
+-	else if (min(fg->master_batt_info.temp, fg->slave_batt_info.temp) > EXTREME_HIGH_DEGREE)
+-		fg->original_temp = min(fg->master_batt_info.temp, fg->slave_batt_info.temp);
+-	else
+-		fg->original_temp = max(fg->master_batt_info.temp, fg->slave_batt_info.temp);
+-
+-	return 0;
+-}
+-
+-static int strategy_fg_update_original_temp(struct strategy_fg *fg)
+-{
+-	int ret = 0;
+-
+-	if (fg->fg_error) {
+-		fg->original_temp = STRATEGY_FG_ERROR_FAKE_TEMP;
+-		return 0;
+-	}
+-
+-	switch (fg->cfg.fg_type) {
+-	case MCA_FG_TYPE_SINGLE:
+-	case MCA_FG_TYPE_SINGLE_SERIES:
+-		ret = platform_fg_ops_get_original_temp(FG_IC_MASTER, &fg->original_temp);
+-		break;
+-	case MCA_FG_TYPE_PARALLEL:
+-		ret = strategy_fg_get_parallel_original_temp(fg);
+-		break;
+-	case MCA_FG_TYPE_SERIES:
+-		break;
+-	default:
+-		return -1;
+-	}
+-
+-	return ret ? -1 : 0;
+-}
+-
+-static int strategy_fg_update_batt_temp(struct strategy_fg *fg)
+-{
+-	int ret = 0;
+-
+-	if (fg->fg_error) {
+-		fg->batt_temperature = STRATEGY_FG_ERROR_FAKE_TEMP;
+-		return 0;
+-	}
+-
+-	switch (fg->cfg.fg_type) {
+-	case MCA_FG_TYPE_SINGLE:
+-	case MCA_FG_TYPE_SINGLE_SERIES:
+-		ret = platform_fg_ops_get_temp(FG_IC_MASTER,
+-					       &fg->batt_temperature);
+-		break;
+-	case MCA_FG_TYPE_PARALLEL:
+-		ret = strategy_fg_get_parallel_temp(fg);
+-		break;
+-	case MCA_FG_TYPE_SERIES:
+-		ret = strategy_fg_get_series_temp(fg);
+-		break;
+-	default:
+-		return -1;
+-	}
+-
+-	if (ret)
+-		return -1;
+-
+-	fg->batt_temperature = strategy_fg_check_extreme_cold_temp_compensation(
+-		fg, fg->batt_temperature);
+-	return 0;
+-}
+-
+-static int strategy_fg_get_parallel_error_state(struct strategy_fg *fg)
+-{
+-	bool fg_error_master;
+-	bool fg_error_slave;
+-	int ret;
+-
+-	ret = platform_fg_ops_get_error_state(FG_IC_SLAVE, &fg_error_master);
+-	ret |= platform_fg_ops_get_error_state(FG_IC_MASTER, &fg_error_slave);
+-	pr_err("%s master %d slave %d\n", __func__, fg_error_master,
+-	       fg_error_slave);
+-	mca_log_info("master %d slave %d\n", fg_error_master, fg_error_slave);
+-	if (ret)
+-		return -1;
+-
+-	if (fg_error_master | fg_error_slave)
+-		fg->fg_error = 1;
+-	else
+-		fg->fg_error = 0;
+-
+-	fg->dual_error[FG_IC_MASTER] = fg_error_slave;
+-	fg->dual_error[FG_IC_SLAVE] = fg_error_master;
+-
+-	return 0;
+-}
++
++
++
++
++
++
++
++
++
++
++
+ 
+ static int strategy_fg_get_error_state(struct strategy_fg *fg)
+ {
+-	switch (fg->cfg.fg_type) {
+-	case MCA_FG_TYPE_SINGLE:
+-	case MCA_FG_TYPE_SINGLE_SERIES:
+-		platform_fg_ops_get_error_state(FG_IC_MASTER, &fg->fg_error);
+-		break;
+-	case MCA_FG_TYPE_PARALLEL:
+-		strategy_fg_get_parallel_error_state(fg);
+-		break;
+-	case MCA_FG_TYPE_SERIES:
+-		break;
+-	default:
+-		return -1;
+-	}
+-	return 0;
++	return platform_fg_ops_get_error_state(FG_IC_MASTER, &fg->fg_error);
+ }
+ 
+ static int strategy_fg_update_fw(struct strategy_fg *fg)
+@@ -1020,46 +898,11 @@
+ 	return ret;
+ }
+ 
+-static int strategy_fg_get_parallel_soh(struct strategy_fg *fg)
+-{
+-	int ret;
+-
+-	ret = platform_fg_ops_get_soh(FG_IC_SLAVE, &(fg->slave_batt_info.soh));
+-	ret |= platform_fg_ops_get_soh(FG_IC_MASTER,
+-				       &(fg->master_batt_info.soh));
+-	if (ret)
+-		return -1;
+-
+-	fg->batt_info.soh =
+-		max(fg->master_batt_info.soh, fg->slave_batt_info.soh);
+-
+-	return 0;
+-}
+-
+-static int strategy_fg_get_series_soh(struct strategy_fg *fg)
+-{
+-	return 0;
+-}
+-
+-static int strategy_fg_update_soh(struct strategy_fg *fg)
+-{
+-	int ret = 0;
+-
+-	switch (fg->cfg.fg_type) {
+-	case MCA_FG_TYPE_SINGLE:
+-	case MCA_FG_TYPE_SINGLE_SERIES:
+-		ret = platform_fg_ops_get_soh(FG_IC_MASTER, &fg->batt_soh);
+-		break;
+-	case MCA_FG_TYPE_PARALLEL:
+-		return strategy_fg_get_parallel_soh(fg);
+-	case MCA_FG_TYPE_SERIES:
+-		return strategy_fg_get_series_soh(fg);
+-	default:
+-		return -1;
+-	}
+-
+-	return 0;
+-}
++
++
++
++
++
+ 
+ static int strategy_fg_get_parallel_rm(struct strategy_fg *fg)
+ {
+@@ -1100,184 +943,42 @@
+ 	return ret;
+ }
+ 
+-static int strategy_fg_get_parallel_fcc(struct strategy_fg *fg)
+-{
+-	int ret;
+-
+-	ret = platform_fg_ops_get_fcc(FG_IC_SLAVE, &(fg->slave_batt_info.fcc));
+-	ret |= platform_fg_ops_get_fcc(FG_IC_MASTER,
+-				       &(fg->master_batt_info.fcc));
+-	if (ret)
+-		return -1;
+-
+-	fg->batt_info.fcc = fg->master_batt_info.fcc + fg->slave_batt_info.fcc;
+-
+-	return 0;
+-}
+-
+-static int strategy_fg_get_series_fcc(struct strategy_fg *fg)
+-{
+-	return 0;
+-}
+-
+-static int strategy_fg_update_fcc(struct strategy_fg *fg)
+-{
+-	int ret = 0;
+-
+-	switch (fg->cfg.fg_type) {
+-	case MCA_FG_TYPE_SINGLE:
+-	case MCA_FG_TYPE_SINGLE_SERIES:
+-		ret = platform_fg_ops_get_fcc(FG_IC_MASTER, &fg->batt_fcc);
+-		break;
+-	case MCA_FG_TYPE_PARALLEL:
+-		return strategy_fg_get_parallel_fcc(fg);
+-	case MCA_FG_TYPE_SERIES:
+-		return strategy_fg_get_series_fcc(fg);
+-	default:
+-		return -1;
+-	}
+-
+-	return ret;
+-}
+-
+-static int strategy_fg_get_parallel_volt(struct strategy_fg *fg)
+-{
+-	int ret;
+-
+-	ret = platform_fg_ops_get_volt(FG_IC_MASTER,
+-				       &(fg->master_batt_info.volt));
+-	ret = platform_fg_ops_get_volt(FG_IC_SLAVE,
+-				       &(fg->slave_batt_info.volt));
+-	if (ret)
+-		return -1;
+-
+-	fg->batt_info.volt =
+-		max(fg->master_batt_info.volt, fg->slave_batt_info.volt);
+-
+-	return 0;
+-}
+-
+-static int strategy_fg_get_series_volt(struct strategy_fg *fg)
+-{
+-	return 0;
+-}
+-
+-static int strategy_fg_update_batt_volt(struct strategy_fg *fg)
+-{
+-	int ret = 0;
+-
+-	if (!fg || !fg->fg_init_flag)
+-		return -1;
+-
+-	if (fg->update_interval == STRATEGY_FG_WORK_INTERVAL_FAST)
+-		return 0;
+-
+-	switch (fg->cfg.fg_type) {
+-	case MCA_FG_TYPE_SINGLE:
+-	case MCA_FG_TYPE_SINGLE_SERIES:
+-		ret = platform_fg_ops_get_volt(FG_IC_MASTER, &fg->batt_voltage);
+-		break;
+-	case MCA_FG_TYPE_PARALLEL:
+-		return strategy_fg_get_parallel_volt(fg);
+-	case MCA_FG_TYPE_SERIES:
+-		return strategy_fg_get_series_volt(fg);
+-	default:
+-		return -1;
+-	}
+-
+-	return ret;
+-}
+-
+-static int strategy_fg_get_parallel_batt_info(struct strategy_fg *fg)
+-{
+-	int ret = 0;
+-	int i = 0;
+-	struct fg_batt_info batt_info;
+-
+-	ret = strategy_fg_get_parallel_curr(fg, &(fg->batt_info.curr));
+-	ret |= strategy_fg_get_parallel_temp(fg);
+-	ret |= strategy_fg_get_parallel_rsoc(fg, &(fg->batt_info.rsoc));
+-	ret |= strategy_fg_get_parallel_volt(fg);
+-	ret |= strategy_fg_get_parallel_cyclecount(fg);
+-	ret |= strategy_fg_get_parallel_soh(fg);
+-	ret |= strategy_fg_get_parallel_rm(fg);
+-	ret |= strategy_fg_get_parallel_fcc(fg);
+-
+-	for (i = 0; i <= 1; i++) {
+-		batt_info = i ? fg->slave_batt_info : fg->master_batt_info;
+-		mca_log_err(
+-			"fg_index[%d], CURRENT:%d RSOC:%d VOLTAGE:%d TEMP:%d\n",
+-			i, batt_info.curr, batt_info.rsoc, batt_info.volt,
+-			batt_info.temp);
+-		mca_log_info("fg_index[%d], CC:%d S:%d RM:%d F:%d\n", i,
+-			     batt_info.cycle_count, batt_info.soh, batt_info.rm,
+-			     batt_info.fcc);
+-	}
+-
+-	return ret;
+-}
++
++
++
++
++
++
++
++
++
++
++
++
++
+ 
+ #define DFX_VBAT_DIFF_CHECK_DELAY_NS (180 * NSEC_PER_SEC)
+ #define DFX_VBAT_DIFF_THR 201
+ 
+-static void dfx_fg_check_vbat_diff(struct strategy_fg *fg)
+-{
+-	static bool checked;
+-	int diff;
+-	int param[2];
+-
+-	if (fg->cfg.fg_type != MCA_FG_TYPE_PARALLEL)
+-		return;
+-
+-	if (!checked) {
+-		s64 time_now = ktime_get_coarse_boottime_ns();
+-
+-		if (time_now >= DFX_VBAT_DIFF_CHECK_DELAY_NS)
+-			checked = true;
+-		else
+-			mca_log_err("time_now: %lld\n",
+-				    time_now / NSEC_PER_SEC);
+-		return;
+-	}
+-
+-	diff = abs(fg->master_batt_info.volt - fg->slave_batt_info.volt);
+-	mca_log_err("batt volt diff = %d\n", diff);
+-	if (diff >= DFX_VBAT_DIFF_THR) {
+-		param[0] = fg->master_batt_info.volt;
+-		param[1] = fg->slave_batt_info.volt;
+-		mca_charge_mievent_report(CHARGE_DFX_BATTERY_VOLTAGE_DIFFER,
+-					  param, 2);
+-	} else {
+-		mca_charge_mievent_set_state(MIEVENT_STATE_END,
+-					     CHARGE_DFX_BATTERY_VOLTAGE_DIFFER);
+-	}
+-}
++
+ 
+ static int strategy_fg_get_batt_info(struct strategy_fg *fg)
+ {
+-	int ret = 0;
++	struct fg_batt_info sample = { 0 };
++	int ret;
+ 
+ 	if (!fg || !fg->fg_init_flag)
+-		return -1;
+-
+-	switch (fg->cfg.fg_type) {
+-	case MCA_FG_TYPE_SINGLE:
+-	case MCA_FG_TYPE_SINGLE_SERIES:
+-		ret = platform_fg_ops_get_batt_info(FG_IC_MASTER,
+-						    &fg->batt_info);
+-		break;
+-	case MCA_FG_TYPE_PARALLEL:
+-		ret = strategy_fg_get_parallel_batt_info(fg);
+-		break;
+-	case MCA_FG_TYPE_SERIES:
+-		break;
+-	default:
+-		return -1;
+-	}
+-
+-	dfx_fg_check_vbat_diff(fg);
+-
+-	return ret;
++		return -EAGAIN;
++	ret = platform_fg_ops_get_batt_info(FG_IC_MASTER, &sample);
++	if (ret)
++		return ret;
++	if (sample.fcc <= 0 || sample.rm < 0 || sample.rsoc < 0 || sample.rsoc > 100 ||
++	    sample.soh < 0 || sample.soh > 100 || sample.cycle_count < 0 ||
++	    sample.volt <= 0 || sample.volt > 10000 || sample.temp < -1000 || sample.temp > 2000 ||
++	    sample.curr < -100000000 || sample.curr > 100000000)
++		return -ERANGE;
++	fg->batt_info = sample;
++	return 0;
+ }
+ 
+ static int strategy_fg_set_clear_count_data(struct strategy_fg *fg)
+@@ -1304,14 +1005,13 @@
+ 
+ static void strategy_fg_report_battery_status_changed(struct strategy_fg *fg)
+ {
+-	static int last_soc, last_temp;
+ 	int batt_temp = fg->batt_temperature / 10;
+ 
+-	if (fg->batt_ui_soc != last_soc || batt_temp != last_temp) {
+-		mca_log_err("ui_soc: %d => %d, temp: %d => %d\n", last_soc,
+-			    fg->batt_ui_soc, last_temp, batt_temp);
+-		last_soc = fg->batt_ui_soc;
+-		last_temp = batt_temp;
++	if (fg->batt_ui_soc != fg->last_report_soc || batt_temp != fg->last_report_temp) {
++		mca_log_err("ui_soc: %d => %d, temp: %d => %d\n", fg->last_report_soc,
++			    fg->batt_ui_soc, fg->last_report_temp, batt_temp);
++		fg->last_report_soc = fg->batt_ui_soc;
++		fg->last_report_temp = batt_temp;
+ 		mca_event_block_notify(MCA_EVENT_TYPE_BATTERY_INFO,
+ 				       MCA_EVENT_BATTERY_STS_CHANGE, NULL);
+ 	}
+@@ -1333,7 +1033,6 @@
+ 
+ static int mca_strategy_check_sigle_termination(struct strategy_fg *fg)
+ {
+-	static int count;
+ 	int iterm = STRATEGY_FG_DEFAULT_ITERM;
+ 	int vterm = STRATEGY_FG_DEFAULT_VTERM;
+ 	int soft_iterm = STRATEGY_FG_DEFAULT_ITERM;
+@@ -1357,8 +1056,8 @@
+ 	}
+ 
+ 	if (fg->voter_ok) {
+-		iterm = mca_get_effective_result(fg->iterm_voter);
+-		vterm = mca_get_effective_result(fg->vterm_voter);
++		iterm = mca_get_named_effective_result("term_curr");
++		vterm = mca_get_named_effective_result("term_volt");
+ 	}
+ 	soft_iterm = iterm >= 1000 ? (iterm * 110 / 100) : (iterm * 120 / 100);
+ 	soft_vterm = iterm >= 1000 ? (vterm - 5) : (vterm - 3);
+@@ -1392,18 +1091,18 @@
+ 	} else if (-fg->batt_current / 1000 < soft_iterm &&
+ 		   vbat_for_term >= soft_vterm) {
+ 		fg->near_vterm = true;
+-		if (++count >= 5) {
+-			count = 0;
++		if (++fg->termination_count >= 5) {
++			fg->termination_count = 0;
+ 			strategy_class_fg_ops_set_charging_done(true);
+ 		}
+ 		mca_log_err(
+ 			"soft_vterm: %d, soft_iterm: %d, vbat: %d, vcell_max: %d, ibat: %d, pvbat: %d, count: %d, charging_done: %d\n",
+ 			soft_vterm, soft_iterm, fg->batt_voltage,
+-			fg->batt_vcell_max, fg->batt_current, fg->pack_vbat, count,
++			fg->batt_vcell_max, fg->batt_current, fg->pack_vbat, fg->termination_count,
+ 			fg->charging_done);
+ 	} else {
+ 		fg->near_vterm = false;
+-		count = 0;
++		fg->termination_count = 0;
+ 	}
+ 
+ 	if (fg->charging_done && fg->batt_ui_soc != 100) {
+@@ -1610,11 +1309,11 @@
+ 		fg->qbg_chg_data.term_volt = QBG_CHG_DATA_DEFAULT_TERM_VOLT;
+ 	} else {
+ 		fg->qbg_chg_data.ibat_max =
+-			mca_get_effective_result(fg->charge_limit_voter);
++			mca_get_named_effective_result("buck_charge_curr");
+ 		fg->qbg_chg_data.term_curr =
+-			mca_get_effective_result(fg->iterm_voter);
++			mca_get_named_effective_result("term_curr");
+ 		fg->qbg_chg_data.term_volt =
+-			mca_get_effective_result(fg->vterm_voter);
++			mca_get_named_effective_result("term_volt");
+ 	}
+ 
+ 	fg->qbg_chg_data.chg_status = fg->chg_status;
+@@ -1643,7 +1342,7 @@
+ 			int offset = 0;
+ 			bool bump = true;
+ 
+-			vterm = mca_get_effective_result(fg->vterm_voter);
++			vterm = mca_get_named_effective_result("term_volt");
+ 			if (fg->fg1_batt_ctr_enabled) {
+ 				if (!fg->co_ctrl_active &&
+ 				    fg->slave_batt_info.temp >=
+@@ -1673,11 +1372,11 @@
+ 				    vterm_target);
+ 			if (vterm_target == vterm)
+ 				goto term_curr;
+-			mca_vote_override(fg->vterm_voter, "para_term", true,
++			mca_vote_named_override("term_volt", "para_term", true,
+ 					  vterm_target);
+ 		} else {
+ 			mca_log_err("last_first_termination: clean para_term");
+-			mca_vote_override(fg->vterm_voter, "para_term", false,
++			mca_vote_named_override("term_volt", "para_term", false,
+ 					  0);
+ 		}
+ 	}
+@@ -1706,15 +1405,15 @@
+ 		ret |= platform_fg_ops_get_fc(FG_IC_MASTER, &fc_master);
+ 		if (fg->fast_charge && fg->batt_temperature >= 401 &&
+ 		    fg->fg2_batt_ctr_enabled && !fc_master)
+-			mca_vote(fg->iterm_voter, "high_temp_para", true, 200);
++			mca_vote_named("term_curr", "high_temp_para", true, 200);
+ 		else
+-			mca_vote(fg->iterm_voter, "high_temp_para", false, 0);
++			mca_vote_named("term_curr", "high_temp_para", false, 0);
+ 	}
+ 
+ 	mca_log_info("final_term_curr:%d", final_term_curr);
+ 	if (final_term_curr != fg->last_final_term_curr) {
+ 		fg->last_final_term_curr = final_term_curr;
+-		mca_vote(fg->iterm_voter, "para_term", true, final_term_curr);
++		mca_vote_named("term_curr", "para_term", true, final_term_curr);
+ 	}
+ 
+ 	mca_strategy_check_sigle_termination(fg);
+@@ -1747,7 +1446,6 @@
+ 	int force_iterm, force_vterm;
+ 	int iterm = STRATEGY_FG_DEFAULT_ITERM;
+ 	int vterm = STRATEGY_FG_DEFAULT_VTERM;
+-	static int force_full_count;
+ 	int quick_charge_jeita_iterm = 0;
+ 	int quick_charge_status = MCA_QUICK_CHG_STS_NO_CHARGING;
+ 	int online;
+@@ -1765,8 +1463,8 @@
+ 	}
+ 
+ 	if (fg->voter_ok) {
+-		iterm = mca_get_effective_result(fg->iterm_voter);
+-		vterm = mca_get_effective_result(fg->vterm_voter);
++		iterm = mca_get_named_effective_result("term_curr");
++		vterm = mca_get_named_effective_result("term_volt");
+ 	}
+ 
+ 	if (!fg->cfg.terminated_by_cp) {
+@@ -1801,23 +1499,22 @@
+ 	if (fg->power_present && fg->fast_charge && !fg->charging_done) {
+ 		if (-fg->batt_current / 1000 < force_iterm &&
+ 		    fg->batt_voltage > force_vterm && !fg->start_force_full) {
+-			force_full_count++;
+-			mca_log_info("force_full_count = %d", force_full_count);
+-			if (force_full_count >= 6) {
++			fg->force_full_count++;
++			mca_log_info("force_full_count = %d", fg->force_full_count);
++			if (fg->force_full_count >= 6) {
+ 				platform_fg_ops_set_force_report_full(
+ 					FG_IC_MASTER);
+-				force_full_count = 0;
++				fg->force_full_count = 0;
+ 				fg->start_force_full = true;
+ 				mca_log_info("force fw report full");
+-				schedule_delayed_work(
+-					&fg->force_report_full_work,
++				queue_delayed_work(fg->wq, &fg->force_report_full_work,
+ 					msecs_to_jiffies(8000));
+ 			}
+ 		} else {
+-			force_full_count = 0;
++			fg->force_full_count = 0;
+ 		}
+ 	} else {
+-		force_full_count = 0;
++		fg->force_full_count = 0;
+ 		fg->start_force_full = false;
+ 	}
+ }
+@@ -1834,7 +1531,7 @@
+ 
+ 	if (!fg->co_ctrl_support)
+ 		return;
+-	if (mca_get_effective_result(fg->en_voter) == 0)
++	if (mca_get_named_effective_result("chg_enable") == 0)
+ 		return;
+ 
+ 	batt_info = fg_index ? fg->slave_batt_info : fg->master_batt_info;
+@@ -1849,7 +1546,7 @@
+ 
+ 	if (fg->voter_ok) {
+ 		iterm = fg->dual_iterm[fg_index];
+-		vterm = mca_get_client_vote(fg->vterm_voter, "jeita");
++		vterm = mca_get_named_client_vote("term_volt", "jeita");
+ 	} else {
+ 		iterm = STRATEGY_FG_DEFAULT_ITERM;
+ 		vterm = STRATEGY_FG_DEFAULT_VTERM;
+@@ -2007,16 +1704,16 @@
+ 	fg->recharging = true;
+ 	strategy_class_fg_ops_set_charging_done(false);
+ 	strategy_class_fg_set_fastcharge(false);
+-	mca_vote(fg->en_voter, "term_recharge", false, 0);
+-
+-	mca_mod_delayed_work(&fg->monitor_work,
++	mca_vote_named("chg_enable", "term_recharge", false, 0);
++
++	mod_delayed_work(fg->wq, &fg->monitor_work,
+ 			     msecs_to_jiffies(STRATEGY_FG_WORK_INTERVAL_FAST));
+ }
+ 
+ #define EU_RECHARGER_SOC 95
+ static int charge_get_batt_rm_threshold(void)
+ {
+-	static int device_power_max;
++	int device_power_max = 0;
+ 	int batt_rm_thr;
+ 
+ 	if (device_power_max == 0)
+@@ -2038,8 +1735,9 @@
+ 
+ static void charge_slowly_monitor_func(struct strategy_fg *fg)
+ {
+-	static time64_t nowtime, nowplugintime;
+-	static int now_rm, now_soc;
++	time64_t nowtime = ktime_get_boottime_seconds();
++	time64_t nowplugintime = nowtime;
++	int now_rm = fg->batt_rm / 1000, now_soc = fg->batt_ui_soc;
+ 	unsigned int powermax = 0;
+ 	int batt_rm_thr, usable_capacity, expect_soc;
+ 	int dfx_data[CHARGE_SLOWLY_DFX_PARA_NUM];
+@@ -2069,8 +1767,8 @@
+ 		goto reset;
+ 
+ 	fg->online_time = ktime_get_boottime_seconds();
+-	(void)protocol_class_get_adapter_max_power(ADAPTER_PROTOCOL_PPS,
+-						   &powermax);
++	if (protocol_class_get_adapter_max_power(ADAPTER_PROTOCOL_PPS, &powermax))
++		return;
+ 	batt_rm_thr = charge_get_batt_rm_threshold();
+ 	mca_log_err("powermax:%d designcapacity:%d curr_batt_rm_thr:%d\n",
+ 		    powermax, fg->batt_dc, batt_rm_thr);
+@@ -2193,7 +1891,6 @@
+ 
+ static void mca_strategy_check_fl4p0_status(struct strategy_fg *fg)
+ {
+-	static int count;
+ 	int real_supplement_energy;
+ 	int iterm = STRATEGY_FG_DEFAULT_ITERM;
+ 	int vterm = STRATEGY_FG_DEFAULT_VTERM;
+@@ -2203,25 +1900,25 @@
+ 		return;
+ 
+ 	if (fg->fast_charge)
+-		mca_vote(fg->iterm_voter, "calibration", true,
++		mca_vote_named("term_curr", "calibration", true,
+ 			 mca_strategy_get_ffc_safe_item(fg));
+ 	else
+-		mca_vote(fg->iterm_voter, "calibration", false, 0);
++		mca_vote_named("term_curr", "calibration", false, 0);
+ 
+ 	iterm = mca_strategy_get_fl4p0_iterm(fg);
+-	vterm = mca_get_effective_result(fg->vterm_voter);
++	vterm = mca_get_named_effective_result("term_volt");
+ 
+ 	if (-fg->batt_current / 1000 < iterm &&
+ 	    (fg->batt_voltage >= vterm - 11) &&
+ 	    vterm >= STRATEGY_FG_DEFAULT_VTERM && !fg->ffc_continue_charge) {
+-		if (count++ >= 2) {
+-			count = 0;
++		if (fg->fl4p0_count++ >= 2) {
++			fg->fl4p0_count = 0;
+ 			fg->ffc_continue_charge = true;
+ 		}
+ 		mca_log_info("vterm: %d, iterm: %d, vbat: %d, ibat: %d", vterm,
+ 			     iterm, fg->batt_voltage, fg->batt_current);
+ 	} else {
+-		count = 0;
++		fg->fl4p0_count = 0;
+ 	}
+ 
+ 	if (fg->ffc_continue_charge) {
+@@ -2233,7 +1930,7 @@
+ 			strategy_class_fg_ops_set_charging_done(true);
+ 		} else {
+ 			mca_log_info("continue calibration");
+-			schedule_delayed_work(&fg->fl4p0_calibration_work, 0);
++			queue_delayed_work(fg->wq, &fg->fl4p0_calibration_work, 0);
+ 		}
+ 	}
+ }
+@@ -2241,14 +1938,13 @@
+ #define EU_LOSSES_START_CYCLECOUNT 300
+ static int mca_strategy_check_lossless_recharge(struct strategy_fg *fg)
+ {
+-	static ktime_t last_time;
+ 	ktime_t time_now = ktime_get();
+ 	ktime_t time_diff = 0;
+ 	int batt_temp = 0;
+ 	int vterm = 0;
+ 
+ 	if (!fg->charging_done) {
+-		last_time = time_now;
++		fg->lossless_last_time = time_now;
+ 		return 0;
+ 	}
+ 
+@@ -2260,10 +1956,10 @@
+ 		}
+ 	}
+ 
+-	time_diff = ktime_to_ms(ktime_sub(time_now, last_time));
++	time_diff = ktime_to_ms(ktime_sub(time_now, fg->lossless_last_time));
+ 	time_diff /= 1000;
+ 	mca_log_info("time_now: %lld, last_time: %lld, time_diff: %lld\n",
+-		     time_now, last_time, time_diff);
++		     time_now, fg->lossless_last_time, time_diff);
+ 
+ 	(void)strategy_class_fg_ops_get_temperature(&batt_temp);
+ 	batt_temp /= 10;
+@@ -2274,10 +1970,10 @@
+ 	    time_diff >= fg->cfg.rechg_cfg.rest_time) {
+ 		fg->lossless_recharge = true;
+ 		if (fg->cfg.support_base_flip) {
+-			vterm = mca_get_effective_result(fg->vterm_voter);
+-			mca_vote(fg->vterm_voter, "losslessRec", true,
++			vterm = mca_get_named_effective_result("term_volt");
++			mca_vote_named("term_volt", "losslessRec", true,
+ 				 vterm - 10);
+-			mca_vote(fg->charge_limit_voter, "losslessRec", true,
++			mca_vote_named("buck_charge_curr", "losslessRec", true,
+ 				 350);
+ 		}
+ 	}
+@@ -2296,73 +1992,43 @@
+ 
+ static int mca_strategy_update_fg_info(struct strategy_fg *fg)
+ {
+-	static int exit_lowpower_pending;
+-	int ret;
+-
+-	strategy_fg_get_error_state(fg);
++	int original_temp, ret;
++
++	ret = strategy_fg_get_error_state(fg);
++	if (ret)
++		return ret;
+ 	if (fg->fg_error) {
+-		if (fg->cfg.support_base_flip &&
+-		    fg->dual_error[FG_IC_MASTER] &&
+-		    !fg->dual_error[FG_IC_SLAVE])
+-			exit_lowpower_pending = 1;
+-
+-		mca_charge_mievent_report(CHARGE_DFX_FG_IIC_ERR,
+-					  &fg->batt_ui_soc, 1);
+-		fg->batt_ui_soc = STRATEGY_FG_ERROR_FAKE_SOC;
+-		fg->batt_temperature = STRATEGY_FG_ERROR_FAKE_TEMP;
+-		fg->original_temp = STRATEGY_FG_ERROR_FAKE_TEMP;
+-		strategy_fg_report_battery_status_changed(fg);
+-		return -1;
+-	}
+-
+-	if (exit_lowpower_pending == 1 && fg->power_present) {
+-		mca_log_err(
+-			"last master i2c error and slave i2c is ok, now dual i2c is ok, so set exit lowpower \n");
+-		platform_class_loadsw_set_lowpower_mode(LOADSW_ROLE_MASTER,
+-							false);
+-		exit_lowpower_pending = 0;
+-	}
+-
++		mca_charge_mievent_report(CHARGE_DFX_FG_IIC_ERR, &fg->batt_ui_soc, 1);
++		return -EIO;
++	}
+ 	ret = strategy_fg_get_batt_info(fg);
+ 	if (ret)
+ 		return ret;
+-
+-	if (fg->cyclecount_hundred != fg->batt_cyclecount / 100 &&
+-	    fg->batt_cyclecount % 100 == 0) {
+-		fg->cyclecount_hundred = fg->batt_cyclecount / 100;
+-		mca_charge_mievent_report(CHARGE_DFX_BATTERY_CYCLECOUNT,
+-					  &fg->batt_cyclecount, 1);
+-		strategy_fg_set_clear_count_data(fg);
+-	}
++	ret = platform_fg_ops_get_original_temp(FG_IC_MASTER, &original_temp);
++	if (ret)
++		return ret;
+ 
+ 	fg->batt_current = fg->batt_info.curr;
+ 	fg->batt_voltage = fg->batt_info.volt;
+ 	fg->batt_vcell_max = fg->batt_info.vcell_max;
+ 	fg->batt_temperature = strategy_fg_check_extreme_cold_temp_compensation(
+ 		fg, fg->batt_info.temp);
+-	strategy_fg_update_original_temp(fg);
++	fg->original_temp = original_temp;
+ 	fg->batt_rsoc = fg->batt_info.rsoc;
+ 	fg->batt_rm = fg->batt_info.rm;
+ 	fg->batt_fcc = fg->batt_info.fcc;
+ 	fg->batt_cyclecount = fg->batt_info.cycle_count;
+ 	fg->batt_soh = fg->batt_info.soh;
+-	fg->batt_raw_soc =
+-		((fg->batt_rm / 1000) * 10000) / (fg->batt_fcc / 1000);
+-
+-	if (0) {
+-		ret = strategy_fg_ops_get_curr(fg, &fg->batt_current);
+-		ret |= strategy_fg_update_batt_temp(fg);
+-		ret |= strategy_fg_ops_get_rsoc(fg, &fg->batt_rsoc);
+-		ret |= strategy_fg_update_batt_volt(fg);
+-		ret |= strategy_fg_update_cycle(fg);
+-		ret |= strategy_fg_update_soh(fg);
+-		ret |= strategy_fg_update_rm(fg);
+-		ret |= strategy_fg_update_fcc(fg);
+-	}
+-	ret |= strategy_fg_get_dod_count(fg, &fg->dod_count);
++	/* uAh/uAh; multiply before dividing, and never divide truncated capacity. */
++	fg->batt_raw_soc = min_t(s64, 10000, div_s64((s64)fg->batt_rm * 10000, fg->batt_fcc));
++	fg->dod_error = strategy_fg_get_dod_count(fg, &fg->dod_count);
+ 	fg->fast_charge = strategy_fg_get_fast_charge(fg);
+-
+-	return ret;
++	if (fg->cyclecount_hundred != fg->batt_cyclecount / 100 && fg->batt_cyclecount % 100 == 0) {
++		fg->cyclecount_hundred = fg->batt_cyclecount / 100;
++		mca_charge_mievent_report(CHARGE_DFX_BATTERY_CYCLECOUNT, &fg->batt_cyclecount, 1);
++		strategy_fg_set_clear_count_data(fg);
++	}
++	return 0;
+ }
+ 
+ #define BATTERY_TEMP_HOT_THRESHOLD 550
+@@ -2413,14 +2079,13 @@
+ static int fg_check_batt_auth(struct strategy_fg *fg)
+ {
+ 	time64_t time_now;
+-	static bool checked = false;
+-
+-	if (!checked) {
++
++	if (!fg->auth_checked) {
+ 		time_now = ktime_get_boottime_seconds();
+ 		if (time_now > DFS_CHECK_BATT_AUTH_TIME_SEC) {
+ 			mca_log_info("check batt_auth: %d, time_now: %lld\n",
+ 				     fg->batt_auth, time_now);
+-			checked = true;
++			fg->auth_checked = true;
+ 			if (!fg->batt_auth)
+ 				mca_charge_mievent_report(
+ 					CHARGE_DFX_BATTERY_AUTH_FAIL, NULL, 0);
+@@ -2466,18 +2131,22 @@
+ 	int ret;
+ 	union power_supply_propval pval = { 0 };
+ 
++	guard(mutex)(&fg->sample_lock);
++	if (READ_ONCE(fg->stopping))
++		return -ENODEV;
++
+ 	if (fg->batt_psy) {
+-		power_supply_get_property(fg->batt_psy,
+-					  POWER_SUPPLY_PROP_STATUS, &pval);
+-		fg->chg_status = pval.intval;
++		ret = power_supply_get_property(fg->batt_psy, POWER_SUPPLY_PROP_STATUS, &pval);
++		fg->chg_status = ret ? POWER_SUPPLY_STATUS_UNKNOWN : pval.intval;
+ 	} else {
+ 		fg->batt_psy = power_supply_get_by_name("battery");
+ 	}
+ 
+ 	ret = mca_strategy_update_fg_info(fg);
+-	if (ret || fg->fg_error) {
++	if (ret) {
+ 		mca_log_err("get batt info fail\n");
+-		return -1;
++		WRITE_ONCE(fg->sample_error, ret);
++		return ret;
+ 	}
+ 	fg_update_batt_health(fg);
+ 	strategy_fg_record_volt_mean(fg);
+@@ -2486,6 +2155,7 @@
+ 	strategy_fg_update_fw(fg);
+ 
+ 	fg->batt_ui_soc = fg_ui_soc_smooth(fg, prohibit_jump);
++	WRITE_ONCE(fg->sample_error, 0);
+ 	strategy_fg_report_battery_status_changed(fg);
+ 
+ 	fg_abnormal_temp_notify_mievent(fg);
+@@ -2569,7 +2239,7 @@
+ 		fg->batt_dc = dc_master;
+ }
+ 
+-void strategy_fg_update_batt_info(struct strategy_fg *fg)
++static void strategy_fg_update_batt_info(struct strategy_fg *fg)
+ {
+ 	strategy_fg_update_batt_dc(fg);
+ 	strategy_fg_update_cycle(fg);
+@@ -2586,13 +2256,17 @@
+ 	int flag;
+ 	bool master_ok, slave_ok;
+ 
++	if (READ_ONCE(fg->stopping))
++		return;
++
+ 	if (!fg->fg_init_flag) {
+ 		flag = platform_fg_ops_probe_ok(FG_IC_MASTER, &master_ok);
+ 		if (fg->cfg.fg_type > MCA_FG_TYPE_SINGLE_NUM_MAX)
+ 			flag |= platform_fg_ops_probe_ok(FG_IC_SLAVE,
+ 							 &slave_ok);
+-		if (flag) {
+-			mca_queue_delayed_work(&fg->monitor_work,
++		if (flag || !master_ok ||
++		    (fg->cfg.fg_type > MCA_FG_TYPE_SINGLE_NUM_MAX && !slave_ok)) {
++			queue_delayed_work(fg->wq, &fg->monitor_work,
+ 					       msecs_to_jiffies(1000));
+ 			return;
+ 		}
+@@ -2618,10 +2292,13 @@
+ 		mca_log_info("boot_update_soc update is_eu_model done\n");
+ 	}
+ 
+-	if (!fg->voter_ok)
+-		strategy_fg_init_voter(fg);
++	strategy_fg_init_voter(fg);
+ 
+ 	ret = fg_update_status(fg, prohibit_jump);
++	if (ret || !fg->voter_ok) {
++		queue_delayed_work(fg->wq, &fg->monitor_work, msecs_to_jiffies(1000));
++		return;
++	}
+ 	strategy_fg_update_qbg_chg_data(fg);
+ 	mca_strategy_check_termination(fg);
+ 	if (fg->cfg.base_flip_same) {
+@@ -2642,7 +2319,7 @@
+ 	fg_check_batt_auth(fg);
+ 
+ 	strategy_fg_adjust_interval(fg);
+-	mca_queue_delayed_work(&fg->monitor_work,
++	queue_delayed_work(fg->wq, &fg->monitor_work,
+ 			       msecs_to_jiffies(fg->update_interval));
+ }
+ 
+@@ -2653,7 +2330,6 @@
+ 	int master_isc_alert = 0, slave_isc_alert = 0, master_soa_alert = 0,
+ 	    slave_soa_alert = 0;
+ 	int interval = STRATEGY_FG_WORK_INTERVAL_DTPT;
+-	static int last_dtpt_status;
+ 	int dtpt_status = 0;
+ 	int ret;
+ 
+@@ -2668,6 +2344,9 @@
+ 							   &slave_soa_alert);
+ 	}
+ 
++	if (ret)
++		goto retry;
++
+ 	master_isc_alert = max(master_isc_alert, slave_isc_alert);
+ 	master_soa_alert = max(master_soa_alert, slave_soa_alert);
+ 
+@@ -2679,13 +2358,14 @@
+ 	else
+ 		dtpt_status = 0;
+ 
+-	if (dtpt_status != last_dtpt_status) {
+-		last_dtpt_status = dtpt_status;
++	if (dtpt_status != fg->last_dtpt_status) {
++		fg->last_dtpt_status = dtpt_status;
+ 		mca_event_block_notify(MCA_EVENT_CHARGE_STATUS,
+ 				       MCA_EVENT_BATTERY_DTPT, &dtpt_status);
+ 	}
+ 
+-	schedule_delayed_work(&fg->dtpt_monitor_work,
++retry:
++	queue_delayed_work(fg->wq, &fg->dtpt_monitor_work,
+ 			      msecs_to_jiffies(interval));
+ }
+ 
+@@ -2693,15 +2373,19 @@
+ {
+ 	struct strategy_fg *fg = container_of(work, struct strategy_fg,
+ 					      fl4p0_calibration_work.work);
+-	int supplement_energy, charge_energy;
++	int supplement_energy, charge_energy, ret;
+ 
+ 	if (fg->charging_done)
+ 		return;
+ 
+-	platform_fg_ops_get_real_supplement_energy(FG_IC_MASTER,
++	ret = platform_fg_ops_get_real_supplement_energy(FG_IC_MASTER,
+ 						   &supplement_energy);
+-	platform_fg_ops_get_calibration_charge_energy(FG_IC_MASTER,
++	if (ret)
++		goto retry;
++	ret = platform_fg_ops_get_calibration_charge_energy(FG_IC_MASTER,
+ 						      &charge_energy);
++	if (ret)
++		goto retry;
+ 	mca_log_info("supplement_energy = %d, charge_energy = %d",
+ 		     supplement_energy, charge_energy);
+ 
+@@ -2713,7 +2397,8 @@
+ 		return;
+ 	}
+ 
+-	schedule_delayed_work(&fg->fl4p0_calibration_work,
++retry:
++	queue_delayed_work(fg->wq, &fg->fl4p0_calibration_work,
+ 			      msecs_to_jiffies(5000));
+ }
+ 
+@@ -2721,10 +2406,9 @@
+ {
+ 	struct strategy_fg *fg = container_of(work, struct strategy_fg,
+ 					      force_report_full_work.work);
+-	static int count = 0;
+ 
+ 	if (!fg->power_present || !fg->fast_charge || fg->charging_done) {
+-		count = 0;
++		fg->force_report_count = 0;
+ 		return;
+ 	}
+ 
+@@ -2733,16 +2417,16 @@
+ 		mca_log_info(
+ 			"fg not report full, send force_report_full cmd again...");
+ 	} else {
+-		count = 0;
++		fg->force_report_count = 0;
+ 		mca_log_info("fg check report full ok");
+ 		return;
+ 	}
+ 
+-	if (++count < FG_FORCE_REPORT_FULL_TIMES)
+-		schedule_delayed_work(&fg->force_report_full_work,
++	if (++fg->force_report_count < FG_FORCE_REPORT_FULL_TIMES)
++		queue_delayed_work(fg->wq, &fg->force_report_full_work,
+ 				      msecs_to_jiffies(8000));
+ 	else
+-		count = 0;
++		fg->force_report_count = 0;
+ }
+ 
+ #define NVT1000_OTA_UPDATE_FLAG 0xAA55AA55
+@@ -2757,50 +2441,60 @@
+ {
+ 	struct strategy_fg *fg =
+ 		container_of(work, struct strategy_fg, ota_update_work.work);
+-	static int update_count;
+ 	union power_supply_propval pval = { 0 };
+ 	int ota_flag = 0;
+ 	int average_current = 0;
+ 	bool cid_status = 0;
+-	int event_val;
++	int event_val, ret;
++
++	if (READ_ONCE(fg->sample_error) || !READ_ONCE(fg->fg_init_flag))
++		goto retry;
+ 
+ 	if (fg->batt_psy) {
+-		power_supply_get_property(fg->batt_psy, POWER_SUPPLY_PROP_STATUS,
++		ret = power_supply_get_property(fg->batt_psy, POWER_SUPPLY_PROP_STATUS,
+ 					  &pval);
++		if (ret)
++			goto retry;
+ 		fg->chg_status = pval.intval;
+ 	}
+ 
+ 	if (fg->chg_status == POWER_SUPPLY_STATUS_FULL ||
+ 	    fg->chg_status == POWER_SUPPLY_STATUS_CHARGING) {
+ 		mca_log_err("do not ota when charging\n");
+-		update_count = 0;
++		fg->ota_update_count = 0;
+ 		return;
+ 	}
+ 
+-	platform_fg_ops_get_ota_update_flag(FG_IC_MASTER, &ota_flag);
++	ret = platform_fg_ops_get_ota_update_flag(FG_IC_MASTER, &ota_flag);
++	if (ret)
++		goto retry;
+ 	if (ota_flag != NVT1000_OTA_UPDATE_FLAG) {
+ 		mca_log_err("already ota update done\n");
+-		update_count = 0;
++		fg->ota_update_count = 0;
+ 		return;
+ 	}
+ 
+-	platform_fg_ops_get_average_current(FG_IC_MASTER, &average_current);
+-	protocol_class_pd_get_cid_status(FG_IC_MASTER, &cid_status);
++	ret = platform_fg_ops_get_average_current(FG_IC_MASTER, &average_current);
++	if (ret)
++		goto retry;
++	ret = protocol_class_pd_get_cid_status(FG_IC_MASTER, &cid_status);
++	if (ret)
++		goto retry;
+ 
+ 	if (fg->batt_rsoc > NVT1000_OTA_SOC_THR &&
+ 	    fg->batt_temperature >= NVT1000_OTA_TEMP_THR &&
+ 	    average_current >= NVT1000_OTA_CURR_MIN &&
+ 	    average_current <= NVT1000_OTA_CURR_MAX && !cid_status)
+-		update_count++;
++		fg->ota_update_count = min(fg->ota_update_count + 1, NVT1000_OTA_TRIGGER_COUNT);
+ 	else
+-		update_count = 0;
++		fg->ota_update_count = 0;
+ 
+ 	mca_log_err(
+ 		"cid_status = %d, batt_rsoc = %d, batt_temperature = %d, average_current = %d, update_count = %d",
+ 		cid_status, fg->batt_rsoc, fg->batt_temperature,
+-		average_current, update_count);
+-
+-	if (update_count >= NVT1000_OTA_TRIGGER_COUNT) {
++		average_current, fg->ota_update_count);
++
++	if (fg->ota_update_count >= NVT1000_OTA_TRIGGER_COUNT) {
+ 		mca_log_err("start nvt1000 ota\n");
+ 		event_val = 1;
+ 		mca_event_block_notify(MCA_EVENT_CHARGE_STATUS,
+@@ -2813,7 +2507,8 @@
+ 		return;
+ 	}
+ 
+-	queue_delayed_work(system_wq, &fg->ota_update_work,
++retry:
++	queue_delayed_work(fg->wq, &fg->ota_update_work,
+ 			   msecs_to_jiffies(NVT1000_OTA_MONITOR_INTERVAL));
+ }
+ 
+@@ -2878,44 +2573,45 @@
+ 
+ static int strategy_fg_ops_get_soc(void *data)
+ {
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
++	struct strategy_fg *fg = data;
++	int error;
+ 
+ 	if (!fg)
+-		return STRATEGY_FG_ERROR_FAKE_SOC;
+-
+-	if (fg->fake_soc != STRATEGY_FG_FAKE_SOC_NONE)
+-		return fg->fake_soc;
+-
+-	if (!fg->fg_init_flag)
+-		return STRATEGY_FG_ERROR_FAKE_SOC;
+-
+-	return fg->batt_ui_soc;
++		return -ENODEV;
++	if (READ_ONCE(fg->fake_soc) != STRATEGY_FG_FAKE_SOC_NONE)
++		return READ_ONCE(fg->fake_soc);
++	error = READ_ONCE(fg->sample_error);
++	if (!READ_ONCE(fg->fg_init_flag) || error)
++		return error ?: -EAGAIN;
++	return READ_ONCE(fg->batt_ui_soc);
+ }
+ 
+ static int strategy_fg_ops_get_temp(void *data, int *temp)
+ {
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-
+-	if (!fg || !fg->fg_init_flag)
+-		*temp = STRATEGY_FG_ERROR_FAKE_TEMP;
+-	else
+-		*temp = fg->batt_temperature;
+-
++	struct strategy_fg *fg = data;
++	int error;
++
++	if (!fg || !temp)
++		return -EINVAL;
++	if (READ_ONCE(fg->fake_temp) != STRATEGY_FG_FAKE_TEMP_NONE) {
++		*temp = READ_ONCE(fg->fake_temp);
++		return 0;
++	}
++	error = READ_ONCE(fg->sample_error);
++	if (!READ_ONCE(fg->fg_init_flag) || error)
++		return error ?: -EAGAIN;
++	*temp = READ_ONCE(fg->batt_temperature);
+ 	return 0;
+ }
+ 
+ static int strategy_fg_ops_get_thermal_temp(void *data, int *temp)
+ {
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-
+-	if (!fg || !fg->fg_init_flag)
+-		*temp = STRATEGY_FG_ERROR_FAKE_TEMP;
+-	else if (fg->thermal_temp_select == 0)
+-		*temp = fg->batt_temperature;
+-	else
+-		*temp = fg->original_temp;
+-
+-	return 0;
++	struct strategy_fg *fg = data;
++	int ret = strategy_fg_ops_get_temp(data, temp);
++
++	if (!ret && READ_ONCE(fg->thermal_temp_select))
++		*temp = READ_ONCE(fg->original_temp);
++	return ret;
+ }
+ 
+ static int strategy_fg_ops_get_model_name(void *data, const char **model_name)
+@@ -2951,7 +2647,7 @@
+ 	*model_name = fg->cfg.model_name;
+ 
+ country_select:
+-	if (!fg->cfg.show_model_by_country)
++	if (!fg->cfg.show_model_by_country || !hwid)
+ 		return 0;
+ 
+ 	switch (hwid->country_version) {
+@@ -2970,85 +2666,53 @@
+ 	return 0;
+ }
+ 
+-static int strategy_fg_get_parallel_curr(struct strategy_fg *fg, int *curr)
+-{
+-	int ret;
+-
+-	ret = platform_fg_ops_get_curr(FG_IC_SLAVE,
+-				       &(fg->slave_batt_info.curr));
+-	ret |= platform_fg_ops_get_curr(FG_IC_MASTER,
+-					&(fg->master_batt_info.curr));
+-	if (ret)
+-		return -1;
+-
+-	*curr = fg->slave_batt_info.curr + fg->master_batt_info.curr;
+-
+-	return 0;
+-}
+-
+-static int strategy_fg_get_series_curr(struct strategy_fg *fg, int *curr)
+-{
+-	return 0;
+-}
++
++
++
+ 
+ static int strategy_fg_ops_get_curr(void *data, int *curr)
+ {
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-
+-	if (!fg || !fg->fg_init_flag) {
+-		*curr = STRATEGY_FG_ERROR_FAKE_CURR;
+-		return 0;
+-	}
+-
+-	if (fg->update_interval == STRATEGY_FG_WORK_INTERVAL_FAST) {
+-		*curr = fg->batt_current;
+-		return 0;
+-	}
+-
+-	switch (fg->cfg.fg_type) {
+-	case MCA_FG_TYPE_SINGLE:
+-	case MCA_FG_TYPE_SINGLE_SERIES:
+-		return platform_fg_ops_get_curr(FG_IC_MASTER, curr);
+-	case MCA_FG_TYPE_PARALLEL:
+-		return strategy_fg_get_parallel_curr(fg, curr);
+-	case MCA_FG_TYPE_SERIES:
+-		return strategy_fg_get_series_curr(fg, curr);
+-	default:
+-		return -1;
+-	}
+-
+-	*curr = fg->batt_current;
++	struct strategy_fg *fg = data;
++	int error;
++
++	if (!fg || !curr)
++		return -EINVAL;
++	error = READ_ONCE(fg->sample_error);
++	if (!READ_ONCE(fg->fg_init_flag) || error)
++		return error ?: -EAGAIN;
++	*curr = READ_ONCE(fg->batt_current);
+ 	return 0;
+ }
+ 
+ static int strategy_fg_ops_get_volt(void *data, int *volt)
+ {
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-
+-	if (!fg || !fg->fg_init_flag) {
+-		*volt = STRATEGY_FG_ERROR_FAKE_VOLT;
+-		return 0;
+-	}
+-
+-	strategy_fg_update_batt_volt(fg);
+-	*volt = fg->batt_voltage;
+-
++	struct strategy_fg *fg = data;
++	int error;
++
++	if (!fg || !volt)
++		return -EINVAL;
++	error = READ_ONCE(fg->sample_error);
++	if (!READ_ONCE(fg->fg_init_flag) || error)
++		return error ?: -EAGAIN;
++	*volt = READ_ONCE(fg->batt_voltage);
+ 	return 0;
+ }
+ 
+ static int strategy_fg_ops_get_cycle(void *data, int *cycle)
+ {
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-
+-	if (!fg || !fg->fg_init_flag)
+-		return -1;
+-
+-	*cycle = fg->batt_cyclecount;
+-
+-	return 0;
+-}
+-
+-int strategy_lossless_rechg_parse_dt(struct strategy_fg *fg)
++	struct strategy_fg *fg = data;
++	int error;
++
++	if (!fg || !cycle)
++		return -EINVAL;
++	error = READ_ONCE(fg->sample_error);
++	if (!READ_ONCE(fg->fg_init_flag) || error)
++		return error ?: -EAGAIN;
++	*cycle = READ_ONCE(fg->batt_cyclecount);
++	return 0;
++}
++
++static int strategy_lossless_rechg_parse_dt(struct strategy_fg *fg)
+ {
+ 	struct device_node *node = fg->dev->of_node;
+ 	int ret = 0;
+@@ -3077,7 +2741,7 @@
+ 	return ret;
+ }
+ 
+-int strategy_full_design_parse_dt(struct strategy_fg *fg)
++static int strategy_full_design_parse_dt(struct strategy_fg *fg)
+ {
+ 	struct device_node *node = fg->dev->of_node;
+ 	const struct mca_hwid *hwid = mca_get_hwid_info();
+@@ -3095,6 +2759,8 @@
+ 					DEFAULT_DESIGN_CAPACITY);
+ 	}
+ 
++	if (fg->cfg.design_capacity <= 0 || fg->cfg.design_capacity > INT_MAX / 1000)
++		return -ERANGE;
+ 	return 0;
+ }
+ 
+@@ -3143,8 +2809,11 @@
+ 					 int batt_role, const char *name,
+ 					 struct strategy_fg *fg)
+ {
+-	struct term_curr_para *iterm_para =
+-		&(fg->cfg.term_curr_data[batt_role]);
++	struct term_curr_para *iterm_para;
++
++	if (batt_role < 0 || batt_role >= FG_IC_MAX)
++		return -EINVAL;
++	iterm_para = &(fg->cfg.term_curr_data[batt_role]);
+ 	int array_len, row, col, i;
+ 	const char *tmp_string = NULL;
+ 	struct term_curr_data *iterm_data = NULL;
+@@ -3157,7 +2826,7 @@
+ 	}
+ 
+ 	iterm_para->iterm_para_size = array_len / MCA_FG_ITERM_PARA_MAX;
+-	iterm_para->iterm_data = kcalloc(iterm_para->iterm_para_size,
++	iterm_para->iterm_data = devm_kcalloc(fg->dev, iterm_para->iterm_para_size,
+ 					 sizeof(*iterm_data), GFP_KERNEL);
+ 	if (!iterm_para->iterm_data) {
+ 		mca_log_err("iterm para no mem\n");
+@@ -3204,8 +2873,6 @@
+ 
+ 	return 0;
+ error:
+-	kfree(iterm_data);
+-	iterm_data = NULL;
+ 	return -1;
+ }
+ 
+@@ -3241,7 +2908,7 @@
+ 		case MCA_FG_BATT_ROLE:
+ 			if (kstrtoint(tmp_string, 10, &batt_role))
+ 				return -1;
+-			if (batt_role > FG_IC_SLAVE)
++			if (batt_role < 0 || batt_role > FG_IC_SLAVE)
+ 				i += 1;
+ 			break;
+ 		case MCA_FG_BATT_PARA_NAME:
+@@ -3313,7 +2980,15 @@
+ 	fg->cfg.support_qbg = !!of_find_property(node, "support-qbg", NULL);
+ 	if (ret) {
+ 		mca_log_err("strategy fg parse dt failed, ret=%d\n", ret);
+-	}
++		return ret;
++	}
++
++	if (fg->cfg.fg_type != MCA_FG_TYPE_SINGLE)
++		return -EOPNOTSUPP;
++	if (fg->cfg.soc_proportion <= 0 || fg->cfg.soc_proportion > 100 ||
++	    fg->cfg.soc_proportion_c <= 0 || fg->cfg.soc_proportion_c > 100 ||
++	    fg->cfg.report_full_raw_soc <= 0 || fg->cfg.report_full_raw_soc > 10000)
++		return -EINVAL;
+ 
+ 	mca_parse_dts_u32(node, "support_fl4p0", &(fg->cfg.support_fl4p0),
+ 			  STRATEGY_FG_SUPPORT_FL4P0);
+@@ -3348,6 +3023,10 @@
+ 		j = SOC_DECIMAL_MAX * i;
+ 		fg->cfg.soc_decimal[i].soc = soc_decimal[j + SOC_DECIMAL_SOC];
+ 		fg->cfg.soc_decimal[i].rate = soc_decimal[j + SOC_DECIMAL_RATE];
++		if (fg->cfg.soc_decimal[i].soc < 0 || fg->cfg.soc_decimal[i].soc > 100 ||
++		    fg->cfg.soc_decimal[i].rate < 0 || fg->cfg.soc_decimal[i].rate > 100 ||
++		    (i && fg->cfg.soc_decimal[i].soc <= fg->cfg.soc_decimal[i - 1].soc))
++			return -EINVAL;
+ 	}
+ 
+ 	ret = mca_battery_shutdown_parse_dt(fg);
+@@ -3359,26 +3038,26 @@
+ 	ret = strategy_lossless_rechg_parse_dt(fg);
+ 	if (ret < 0) {
+ 		mca_log_err("parse lossless recharging failed %d\n", ret);
+-		return 0;
++		return ret;
+ 	}
+ 
+ 	ret = strategy_full_design_parse_dt(fg);
+ 	if (ret < 0) {
+ 		mca_log_err("parse full design capacity dt failed %d\n", ret);
+-		return 0;
++		return ret;
+ 	}
+ 
+ 	ret = strategy_soc_smooth_parse_dt(fg);
+ 	if (ret < 0) {
+ 		mca_log_err("parse soc smooth failed %d\n", ret);
+ 		fg->smooth.suppot_RSOC_0_smooth = 0;
+-		return 0;
++		return ret;
+ 	}
+ 
+ 	ret = strategy_fg_parse_extreme_cold_dt(fg);
+ 	if (ret < 0) {
+ 		mca_log_err("parse extreme cold dt failed %d\n", ret);
+-		return 0;
++		return ret;
+ 	}
+ 
+ 	fg->cfg.support_base_flip =
+@@ -3389,7 +3068,7 @@
+ 		ret = strategy_term_curr_parse_dt(fg);
+ 		if (ret < 0) {
+ 			mca_log_err("parse iterm failed %d\n", ret);
+-			return 0;
++			return ret;
+ 		}
+ 	}
+ 
+@@ -3397,49 +3076,50 @@
+ }
+ 
+ #define STRATEGY_FG_SOC_DECIMAL_DEFAULT_RATE 10
+-static int strategy_fg_ops_get_soc_decimal(void *data, int *soc_decimal,
+-					   int *rate)
+-{
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-	int i;
+-
+-	if (!data)
+-		return -1;
+-
++static int strategy_fg_ops_get_soc_decimal(void *data, int *soc_decimal, int *rate)
++{
++	struct strategy_fg *fg = data;
++	int i, soc;
++
++	if (!fg || !soc_decimal || !rate)
++		return -EINVAL;
++	soc = strategy_fg_ops_get_soc(fg);
++	if (soc < 0)
++		return soc;
+ 	*rate = STRATEGY_FG_SOC_DECIMAL_DEFAULT_RATE;
+-	for (i = fg->cfg.soc_decimal_cnt - 1; i >= 0; i--) {
+-		if (fg->batt_ui_soc > fg->cfg.soc_decimal[i].soc) {
++	for (i = fg->cfg.soc_decimal_cnt - 1; i >= 0; i--)
++		if (soc > fg->cfg.soc_decimal[i].soc) {
+ 			*rate = fg->cfg.soc_decimal[i].rate;
+ 			break;
+ 		}
+-	}
+-	// make sure the decimal growth does not exceed 99
+-	*soc_decimal = fg->batt_ui_soc_decimal * (100 - *rate) / 100 - 1;
+-
++	*soc_decimal = clamp(fg->batt_ui_soc_decimal * (100 - *rate) / 100 - 1, 0, 99);
+ 	return 0;
+ }
+ 
+ static bool strategy_fg_ops_get_charging_done(void *data)
+ {
++	struct strategy_fg *fg = data;
++
++	return fg && READ_ONCE(fg->fg_init_flag) && !READ_ONCE(fg->sample_error) &&
++		READ_ONCE(fg->charging_done);
++}
++
++static int strategy_fg_ops_set_charging_done(void *data, bool charging_done)
++{
+ 	struct strategy_fg *fg = (struct strategy_fg *)data;
++	int ret;
+ 
+ 	if (!fg || !fg->fg_init_flag)
+ 		return -1;
+ 
+-	return fg->charging_done;
+-}
+-
+-static int strategy_fg_ops_set_charging_done(void *data, bool charging_done)
+-{
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-
+-	if (!fg || !fg->fg_init_flag)
+-		return -1;
+-
+ 	mca_log_info("set charging_done: %d\n", charging_done);
+ 	if (charging_done) {
+-		mca_vote(fg->en_voter, "term_recharge", true, 0);
+-		mca_vote(fg->charge_limit_voter, "qc_done", false, 0);
++		ret = mca_vote_named("chg_enable", "term_recharge", true, 0);
++		if (ret)
++			return ret;
++		ret = mca_vote_named("buck_charge_curr", "qc_done", false, 0);
++		if (ret)
++			return ret;
+ 		fg->charging_done = true;
+ 		fg->recharging = false;
+ 		fg->lossless_recharge = false;
+@@ -3518,8 +3198,8 @@
+ 		ret |= platform_fg_ops_set_fastcharge(FG_IC_SLAVE, en);
+ 
+ 	if (!en && fg->cfg.fg_type > MCA_FG_TYPE_SINGLE_NUM_MAX &&
+-	    mca_is_override_vote_enabled(fg->vterm_voter)) {
+-		mca_vote_override(fg->vterm_voter, "para_term", false, 0);
++	    mca_is_named_override_vote_enabled("term_volt")) {
++		mca_vote_named_override("term_volt", "para_term", false, 0);
+ 		mca_log_err("fastcharge off, clean para_term override\n");
+ 	}
+ 
+@@ -3575,67 +3255,74 @@
+ 
+ static int strategy_fg_ops_get_rm(void *data, int *rm)
+ {
++	struct strategy_fg *fg = data;
++	int error;
++
++	if (!fg || !rm)
++		return -EINVAL;
++	error = READ_ONCE(fg->sample_error);
++	if (!READ_ONCE(fg->fg_init_flag) || error)
++		return error ?: -EAGAIN;
++	*rm = READ_ONCE(fg->batt_rm);
++	return 0;
++}
++
++static int strategy_fg_ops_get_fcc(void *data, int *fcc)
++{
++	struct strategy_fg *fg = data;
++	int error;
++
++	if (!fg || !fcc)
++		return -EINVAL;
++	error = READ_ONCE(fg->sample_error);
++	if (!READ_ONCE(fg->fg_init_flag) || error)
++		return error ?: -EAGAIN;
++	*fcc = READ_ONCE(fg->batt_fcc);
++	return 0;
++}
++
++static int strategy_fg_ops_get_health(void *data, int *health)
++{
++	struct strategy_fg *fg = data;
++	int error;
++
++	if (!fg || !health)
++		return -EINVAL;
++	error = READ_ONCE(fg->sample_error);
++	if (!READ_ONCE(fg->fg_init_flag) || error)
++		return error ?: -EAGAIN;
++	*health = READ_ONCE(fg->batt_health);
++	return 0;
++}
++
++static int strategy_fg_ops_get_soh(void *data, int *soh)
++{
++	struct strategy_fg *fg = data;
++	int error;
++
++	if (!fg || !soh)
++		return -EINVAL;
++	error = READ_ONCE(fg->sample_error);
++	if (!READ_ONCE(fg->fg_init_flag) || error)
++		return error ?: -EAGAIN;
++	*soh = READ_ONCE(fg->batt_soh);
++	return 0;
++}
++
++static int strategy_fg_ops_is_init_ok(void *data)
++{
++	struct strategy_fg *fg = data;
++
++	return fg && READ_ONCE(fg->fg_init_flag) && !READ_ONCE(fg->sample_error);
++}
++
++static int strategy_fg_ops_is_chip_ok(void *data)
++{
+ 	struct strategy_fg *fg = (struct strategy_fg *)data;
+ 
+-	if (!fg || !fg->fg_init_flag)
+-		return -1;
+-
+-	*rm = fg->batt_rm;
+-
+-	return 0;
+-}
+-
+-static int strategy_fg_ops_get_fcc(void *data, int *fcc)
+-{
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-
+-	if (!fg || !fg->fg_init_flag)
+-		return -1;
+-
+-	*fcc = fg->batt_fcc;
+-
+-	return 0;
+-}
+-
+-static int strategy_fg_ops_get_health(void *data, int *health)
+-{
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-
+-	if (!fg || !fg->fg_init_flag)
+-		return -1;
+-
+-	*health = fg->batt_health;
+-	return 0;
+-}
+-
+-static int strategy_fg_ops_get_soh(void *data, int *soh)
+-{
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-
+-	if (!fg || !fg->fg_init_flag)
+-		return -1;
+-
+-	*soh = fg->batt_soh;
+-	return 0;
+-}
+-
+-int strategy_fg_ops_is_init_ok(void *data)
+-{
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-
+-	if (!fg || !fg->fg_init_flag)
+-		return -1;
+-
+-	return fg->fg_init_flag;
+-}
+-
+-int strategy_fg_ops_is_chip_ok(void *data)
+-{
+-	struct strategy_fg *fg = (struct strategy_fg *)data;
+-
+ 	return fg->fg_init_flag && !fg->fg_error;
+ }
+-int strategy_fg_dual_ops_is_chip_ok(void *data, int index)
++static int strategy_fg_dual_ops_is_chip_ok(void *data, int index)
+ {
+ 	struct strategy_fg *fg = (struct strategy_fg *)data;
+ 
+@@ -3651,7 +3338,7 @@
+ 	return !fg->dual_error[FG_IC_MASTER];
+ }
+ 
+-int strategy_fg_ops_get_pack_vendor_id(void *data, int *vendor_id)
++static int strategy_fg_ops_get_pack_vendor_id(void *data, int *vendor_id)
+ {
+ 	struct strategy_fg *fg = (struct strategy_fg *)data;
+ 
+@@ -3695,7 +3382,9 @@
+ 	int match = 0;
+ 
+ 	if (!value || !fg)
+-		return -1;
++		return -EINVAL;
++	if (!READ_ONCE(fg->ready) || READ_ONCE(fg->stopping))
++		return -EAGAIN;
+ 
+ 	switch (status) {
+ 	case STRATEGY_STATUS_TYPE_FG_FIRST_TERM:
+@@ -3897,13 +3586,21 @@
+ {
+ 	struct strategy_fg *info = data;
+ 
+-	if (!data)
+-		return -1;
++	if (!info || READ_ONCE(info->stopping))
++		return -ENODEV;
++	if (!READ_ONCE(info->ready))
++		return -EAGAIN;
+ 
+ 	mca_log_info("receive event %d, value %d", event, value);
+ 	switch (event) {
+ 	case MCA_EVENT_USB_CONNECT:
+ 	case MCA_EVENT_WIRELESS_CONNECT:
++		if (event == MCA_EVENT_USB_CONNECT)
++			WRITE_ONCE(info->wired_present, true);
++		else
++			WRITE_ONCE(info->wireless_present, true);
++		if (info->power_present)
++			break;
+ 		info->power_present = true;
+ 		info->plugin_time = ktime_get_boottime_seconds();
+ 		info->online_time = info->plugin_time;
+@@ -3912,7 +3609,7 @@
+ 		info->co_ctrl_active = true;
+ 		if (info->is_eu_model) {
+ 			if (info->batt_ui_soc < EU_MODEL_RECHARGE_SOC) {
+-				mca_vote(info->en_voter, "term_recharge", false,
++				mca_vote_named("chg_enable", "term_recharge", false,
+ 					 0);
+ 				info->charging_done = false;
+ 				mca_log_info(
+@@ -3921,13 +3618,11 @@
+ 		}
+ 		mca_log_info("plugin keep_full_flag: %d, plugin_time: %lld\n",
+ 			     info->keep_full_flag, info->plugin_time);
+-		mca_mod_delayed_work(
+-			&info->monitor_work,
++		mod_delayed_work(info->wq, &info->monitor_work,
+ 			msecs_to_jiffies(STRATEGY_FG_WORK_INTERVAL_FAST));
+ 		cancel_delayed_work_sync(&info->delay_reset_full_flag_work);
+ 		if (info->cfg.support_dtpt)
+-			schedule_delayed_work(
+-				&info->dtpt_monitor_work,
++			queue_delayed_work(info->wq, &info->dtpt_monitor_work,
+ 				msecs_to_jiffies(
+ 					STRATEGY_FG_WORK_INTERVAL_DTPT));
+ 		if (info->cfg.support_nvt1000_ota)
+@@ -3935,20 +3630,26 @@
+ 		break;
+ 	case MCA_EVENT_USB_DISCONNECT:
+ 	case MCA_EVENT_WIRELESS_DISCONNECT:
++		if (event == MCA_EVENT_USB_DISCONNECT)
++			WRITE_ONCE(info->wired_present, false);
++		else
++			WRITE_ONCE(info->wireless_present, false);
++		if (READ_ONCE(info->wired_present) || READ_ONCE(info->wireless_present))
++			break;
+ 		if (!info->is_eu_model) {
+-			mca_vote(info->en_voter, "term_recharge", false, 0);
++			mca_vote_named("chg_enable", "term_recharge", false, 0);
+ 			info->charging_done = false;
+ 		} else {
+ 			if (info->batt_ui_soc < EU_MODEL_RECHARGE_SOC) {
+-				mca_vote(info->en_voter, "term_recharge", false,
++				mca_vote_named("chg_enable", "term_recharge", false,
+ 					 0);
+ 				info->charging_done = false;
+ 				mca_log_info(
+ 					"usb disonnect clear charging_done\n");
+ 			}
+ 		}
+-		mca_vote(info->iterm_voter, "calibration", false, 0);
+-		mca_vote(info->charge_limit_voter, "qc_done", false, 0);
++		mca_vote_named("term_curr", "calibration", false, 0);
++		mca_vote_named("buck_charge_curr", "qc_done", false, 0);
+ 		info->recharging = false;
+ 		info->power_present = false;
+ 		info->en_smooth_full = false;
+@@ -3957,12 +3658,12 @@
+ 		mca_log_info("plugout keep_full_flag = %d\n",
+ 			     info->keep_full_flag);
+ 		if (info->keep_full_flag)
+-			schedule_delayed_work(&info->delay_reset_full_flag_work,
++			queue_delayed_work(info->wq, &info->delay_reset_full_flag_work,
+ 					      msecs_to_jiffies(60 * 1000));
+ 		if (info->cfg.support_dtpt)
+ 			cancel_delayed_work_sync(&info->dtpt_monitor_work);
+ 		if (info->cfg.fg_type > MCA_FG_TYPE_SINGLE_NUM_MAX) {
+-			mca_vote(info->vterm_voter, "losslessRec", false, 0);
++			mca_vote_named("term_volt", "losslessRec", false, 0);
+ 			info->co_ctrl_active = false;
+ 			info->fg1_batt_ctr_enabled = false;
+ 			info->fg2_batt_ctr_enabled = false;
+@@ -3976,8 +3677,7 @@
+ 			platform_fg_ops_get_ota_update_flag(FG_IC_MASTER,
+ 							    &ota_flag);
+ 			if (ota_flag == NVT1000_OTA_UPDATE_FLAG)
+-				queue_delayed_work(
+-					system_wq, &info->ota_update_work,
++				queue_delayed_work(info->wq, &info->ota_update_work,
+ 					msecs_to_jiffies(
+ 						NVT1000_OTA_MONITOR_INTERVAL));
+ 		}
+@@ -3995,7 +3695,8 @@
+ 		break;
+ 	case MCA_EVENT_BQ_FG_ERROR:
+ 		info->fg_error = 1;
+-		fg_update_status(info, true);
++		WRITE_ONCE(info->sample_error, -EIO);
++		mod_delayed_work(info->wq, &info->monitor_work, 0);
+ 		break;
+ 	default:
+ 		break;
+@@ -4006,28 +3707,10 @@
+ 
+ static void strategy_fg_init_voter(struct strategy_fg *fg)
+ {
+-	fg->voter_ok = false;
+-
+-	fg->en_voter = mca_find_votable("chg_enable");
+-	if (!fg->en_voter)
+-		return;
+-	fg->vterm_voter = mca_find_votable("term_volt");
+-	if (!fg->vterm_voter)
+-		return;
+-	fg->iterm_voter = mca_find_votable("term_curr");
+-	if (!fg->iterm_voter)
+-		return;
+-	fg->charge_limit_voter = mca_find_votable("buck_charge_curr");
+-	if (!fg->charge_limit_voter)
+-		return;
+-	fg->flip_charge_curr_voter = mca_find_votable("flip_charge_curr");
+-	if (!fg->flip_charge_curr_voter)
+-		return;
+-	fg->buck_input_voter = mca_find_votable("buck_input");
+-	if (!fg->buck_input_voter)
+-		return;
+-
+-	fg->voter_ok = true;
++	fg->voter_ok = mca_named_votable_exists("chg_enable") &&
++		mca_named_votable_exists("term_volt") &&
++		mca_named_votable_exists("term_curr") &&
++		mca_named_votable_exists("buck_charge_curr");
+ }
+ 
+ static int strategy_fg_panel_notifier_cb(struct notifier_block *nb,
+@@ -4036,6 +3719,8 @@
+ 	struct strategy_fg *fg = container_of(nb, struct strategy_fg, panel_nb);
+ 	int status;
+ 
++	if (!val || READ_ONCE(fg->stopping))
++		return NOTIFY_DONE;
+ 	switch (event) {
+ 	case MCA_EVENT_PANEL_SCREEN_STATE_CHANGE:
+ 		status = *(int *)val;
+@@ -4056,6 +3741,8 @@
+ 	struct strategy_fg *fg =
+ 		container_of(nb, struct strategy_fg, thermal_board_nb);
+ 
++	if (!val || READ_ONCE(fg->stopping))
++		return NOTIFY_DONE;
+ 	switch (event) {
+ 	case MCA_EVENT_THERMAL_BOARD_TEMP_CHANGE:
+ 		fg->thermal_board_temp = *(int *)val / NTC_SCALE_BOARDTEMP;
+@@ -4066,85 +3753,122 @@
+ 	return NOTIFY_DONE;
+ }
+ 
++static void strategy_fg_stop_work(struct strategy_fg *fg)
++{
++	WRITE_ONCE(fg->stopping, true);
++	disable_delayed_work_sync(&fg->monitor_work);
++	disable_delayed_work_sync(&fg->delay_reset_full_flag_work);
++	disable_delayed_work_sync(&fg->reset_default_work);
++	disable_delayed_work_sync(&fg->batt_abnormal_dfx_work);
++	disable_delayed_work_sync(&fg->dtpt_monitor_work);
++	disable_delayed_work_sync(&fg->fl4p0_calibration_work);
++	disable_delayed_work_sync(&fg->force_report_full_work);
++	disable_delayed_work_sync(&fg->ota_update_work);
++	destroy_workqueue(fg->wq);
++}
++
+ static int strategy_fg_probe(struct platform_device *pdev)
+ {
+ 	struct strategy_fg *fg;
+-	int ret = 0;
+-	static int probe_cnt;
+-
+-	mca_log_info("%s probe_begin, probe_cnt = %d\n", __func__, ++probe_cnt);
++	int ret;
++
+ 	fg = devm_kzalloc(&pdev->dev, sizeof(*fg), GFP_KERNEL);
+-	if (!fg) {
+-		mca_log_err("out of memory\n");
++	if (!fg)
+ 		return -ENOMEM;
+-	}
+ 	fg->dev = &pdev->dev;
+-	platform_set_drvdata(pdev, fg);
+-	ret = strategy_fg_parse_dt(fg);
+-	if (ret) {
+-		ret = -EPROBE_DEFER;
+-		mca_log_err("fg device found: %d\n", ret);
+-		if (probe_cnt > PROBE_CNT_MAX)
+-			return 0;
+-		else
+-			return ret;
+-	}
+-
+-	fg->batt_psy = power_supply_get_by_name("battery");
+-	charger_partition_get_eu_model(&fg->is_eu_model);
+-	if (fg->is_eu_model)
+-		fg->boot_update_soc = true;
+-	mca_log_info("probe is_eu_model[%d]\n", fg->is_eu_model);
+-	INIT_DELAYED_WORK(&fg->monitor_work, strategy_fg_monitor_workfunc);
+-	mca_queue_delayed_work(&fg->monitor_work, 0);
+-	ret = strategy_class_fg_ops_register(fg, &g_strategy_fg_ops);
+-	strategy_fg_auth_create_group(fg->dev);
+-	(void)mca_strategy_ops_register(STRATEGY_FUNC_TYPE_FG,
+-					strategy_fg_process_event,
+-					strategy_fg_get_status, NULL, fg);
+-	INIT_DELAYED_WORK(&fg->delay_reset_full_flag_work,
+-			  delay_reset_full_flag_work);
+-	INIT_DELAYED_WORK(&fg->reset_default_work,
+-			  strategy_fg_reset_default_work);
+-	INIT_DELAYED_WORK(&fg->batt_abnormal_dfx_work,
+-			  strategy_batt_abnormal_dfx_work);
+-	queue_delayed_work(system_wq, &fg->batt_abnormal_dfx_work,
+-			   msecs_to_jiffies(STRATEGY_FG_ABNORMAL_DFX_DELAY));
+-	strategy_fg_init_voter(fg);
+-	INIT_DELAYED_WORK(&fg->dtpt_monitor_work,
+-			  strategy_fg_dtpt_monitor_work);
+-	INIT_DELAYED_WORK(&fg->fl4p0_calibration_work,
+-			  strategy_fl4p0_calibration_work);
+-	INIT_DELAYED_WORK(&fg->force_report_full_work,
+-			  strategy_force_report_full_work);
+-	INIT_DELAYED_WORK(&fg->ota_update_work,
+-			  strategy_nvt1000_ota_monitor_work);
+ 	fg->fake_bap_match = STRATEGY_FG_FAKE_BAP_MATCH_NONE;
+ 	fg->fake_soc = STRATEGY_FG_FAKE_SOC_NONE;
+ 	fg->fake_temp = STRATEGY_FG_FAKE_TEMP_NONE;
+ 	fg->update_period = STRATEGY_FG_UPDATE_PERIOD_NONE;
+-	fg->batt_health = POWER_SUPPLY_HEALTH_GOOD;
++	fg->sample_error = -EAGAIN;
++	fg->last_ui_soc = -1;
++	mutex_init(&fg->sample_lock);
++	fg->batt_health = POWER_SUPPLY_HEALTH_UNKNOWN;
++	INIT_DELAYED_WORK(&fg->monitor_work, strategy_fg_monitor_workfunc);
++	INIT_DELAYED_WORK(&fg->delay_reset_full_flag_work, delay_reset_full_flag_work);
++	INIT_DELAYED_WORK(&fg->reset_default_work, strategy_fg_reset_default_work);
++	INIT_DELAYED_WORK(&fg->batt_abnormal_dfx_work, strategy_batt_abnormal_dfx_work);
++	INIT_DELAYED_WORK(&fg->dtpt_monitor_work, strategy_fg_dtpt_monitor_work);
++	INIT_DELAYED_WORK(&fg->fl4p0_calibration_work, strategy_fl4p0_calibration_work);
++	INIT_DELAYED_WORK(&fg->force_report_full_work, strategy_force_report_full_work);
++	INIT_DELAYED_WORK(&fg->ota_update_work, strategy_nvt1000_ota_monitor_work);
++	platform_set_drvdata(pdev, fg);
++	ret = strategy_fg_parse_dt(fg);
++	if (ret)
++		return dev_err_probe(&pdev->dev, ret, "invalid FG configuration\n");
++	fg->batt_psy = power_supply_get_by_name("battery");
++	if (!fg->batt_psy)
++		return -EPROBE_DEFER;
++	fg->wq = alloc_ordered_workqueue("mca_fg", WQ_MEM_RECLAIM);
++	if (!fg->wq) {
++		power_supply_put(fg->batt_psy);
++		return -ENOMEM;
++	}
++	ret = charger_partition_get_eu_model(&fg->is_eu_model);
++	if (ret)
++		fg->is_eu_model = false;
++	fg->boot_update_soc = fg->is_eu_model;
++	strategy_fg_init_voter(fg);
+ 	fg->panel_nb.notifier_call = strategy_fg_panel_notifier_cb;
+-	mca_event_block_notify_register(MCA_EVENT_TYPE_PANEL, &fg->panel_nb);
++	ret = mca_event_block_notify_register(MCA_EVENT_TYPE_PANEL, &fg->panel_nb);
++	if (ret)
++		goto supply;
+ 	fg->thermal_board_nb.notifier_call = strategy_fg_thermal_notifier_cb;
+-	mca_event_block_notify_register(MCA_EVENT_TYPE_THERMAL_TEMP,
+-					&fg->thermal_board_nb);
++	ret = mca_event_block_notify_register(MCA_EVENT_TYPE_THERMAL_TEMP, &fg->thermal_board_nb);
++	if (ret)
++		goto panel;
+ 	fg->reboot_nb.notifier_call = mca_strategy_fg_shutdown_cb;
+-	register_reboot_notifier(&fg->reboot_nb);
+-
++	ret = register_reboot_notifier(&fg->reboot_nb);
++	if (ret)
++		goto thermal;
++	ret = mca_strategy_ops_register(STRATEGY_FUNC_TYPE_FG,
++		strategy_fg_process_event, strategy_fg_get_status, NULL, fg);
++	if (ret)
++		goto reboot;
++	ret = strategy_class_fg_ops_register(fg, &g_strategy_fg_ops);
++	if (ret)
++		goto strategy;
++	ret = strategy_fg_auth_create_group(fg->dev);
++	if (ret)
++		goto provider;
++	WRITE_ONCE(fg->ready, true);
++	queue_delayed_work(fg->wq, &fg->monitor_work, 0);
++	queue_delayed_work(fg->wq, &fg->batt_abnormal_dfx_work,
++		msecs_to_jiffies(STRATEGY_FG_ABNORMAL_DFX_DELAY));
+ 	if (fg->cfg.support_nvt1000_ota)
+-		queue_delayed_work(
+-			system_wq, &fg->ota_update_work,
++		queue_delayed_work(fg->wq, &fg->ota_update_work,
+ 			msecs_to_jiffies(NVT1000_OTA_MONITOR_INTERVAL));
+-
+-	mca_log_info("%s probe end\n", __func__);
++	return 0;
++provider:
++	strategy_class_fg_ops_unregister(fg);
++strategy:
++	mca_strategy_ops_unregister(STRATEGY_FUNC_TYPE_FG, fg);
++reboot:
++	unregister_reboot_notifier(&fg->reboot_nb);
++thermal:
++	mca_event_block_notify_unregister(MCA_EVENT_TYPE_THERMAL_TEMP, &fg->thermal_board_nb);
++panel:
++	mca_event_block_notify_unregister(MCA_EVENT_TYPE_PANEL, &fg->panel_nb);
++supply:
++	strategy_fg_stop_work(fg);
++	power_supply_put(fg->batt_psy);
+ 	return ret;
+ }
+ 
+-static int strategy_fg_remove(struct platform_device *pdev)
+-{
++static void strategy_fg_remove(struct platform_device *pdev)
++{
++	struct strategy_fg *fg = platform_get_drvdata(pdev);
++
++	WRITE_ONCE(fg->stopping, true);
++	WRITE_ONCE(fg->ready, false);
+ 	strategy_fg_auth_remove_group(&pdev->dev);
+-	return 0;
++	strategy_class_fg_ops_unregister(fg);
++	mca_strategy_ops_unregister(STRATEGY_FUNC_TYPE_FG, fg);
++	unregister_reboot_notifier(&fg->reboot_nb);
++	mca_event_block_notify_unregister(MCA_EVENT_TYPE_THERMAL_TEMP, &fg->thermal_board_nb);
++	mca_event_block_notify_unregister(MCA_EVENT_TYPE_PANEL, &fg->panel_nb);
++	strategy_fg_stop_work(fg);
++	power_supply_put(fg->batt_psy);
+ }
+ 
+ static int strategy_fg_suspend(struct platform_device *pdev, pm_message_t state)
+@@ -4182,7 +3906,7 @@
+ 		fg->resume_update_soc = false;
+ 	}
+ 
+-	mca_queue_delayed_work(&fg->monitor_work, msecs_to_jiffies(interval));
++	queue_delayed_work(fg->wq, &fg->monitor_work, msecs_to_jiffies(interval));
+ 	return 0;
+ }
+ 
+@@ -4201,6 +3925,8 @@
+ 	{ .compatible = "xiaomi,strategy_fg" },
+ 	{},
+ };
++
++MODULE_DEVICE_TABLE(of, match_table);
+ 
+ static struct platform_driver strategy_fg_driver = {
+ 	.driver = {
+--- a/drivers/power/supply/mca/mca_strategy/strategy_fg/mca_soc_smooth.c
++++ b/drivers/power/supply/mca/mca_strategy/strategy_fg/mca_soc_smooth.c
+@@ -113,7 +113,7 @@
+ 
+ 	for (int i = VOL_SMOOTH_LEN - 1; i >= 0; i--) {
+ 		if (fg->batt_voltage_mean >
+-		    fg->vcutoff_shutdown_delay +
++		    (s64)fg->vcutoff_shutdown_delay +
+ 			    fg->smooth.smooth_vol_offset[i]) {
+ 			for (int j = CURR_SMOOTH_LEN - 1; j >= 0; j--) {
+ 				if (fg->batt_current_mean >
+@@ -258,24 +258,23 @@
+ int fg_ui_soc_smooth(struct strategy_fg *fg, bool prohibit_jump)
+ {
+ 	int ui_soc = 0;
+-	static int last_ui_soc = -1;
+-	int soc_delta = 0, delta_time = 0;
++	int soc_delta = 0;
++	time64_t delta_time = 0;
+ 	int soc_keep_time = 10;
+ 	int soc_changed = 0;
+ 	time64_t time_now = ktime_get_boottime_seconds();
+-	static time64_t time_last;
+ 
+ 	fg_update_mapped_soc(fg);
+ 	ui_soc = fg->batt_mapped_soc;
+ 
+ 	// Get the initial value for the first time
+-	if (last_ui_soc == -1) {
+-		time_last = time_now;
++	if (fg->last_ui_soc == -1) {
++		fg->smooth_last_time = time_now;
+ 		if (ui_soc > 0)
+-			last_ui_soc = ui_soc;
++			fg->last_ui_soc = ui_soc;
+ 		else
+-			last_ui_soc = fg->batt_rsoc;
+-		return last_ui_soc;
++			fg->last_ui_soc = fg->batt_rsoc;
++		return fg->last_ui_soc;
+ 	}
+ 
+ 	// If the soc jump, will smooth one cap every 10S
+@@ -283,33 +282,33 @@
+ 		soc_keep_time = 30;
+ 		mca_log_info("start en_smooth_full soc increase per 30s \n");
+ 	}
+-	soc_delta = abs(ui_soc - last_ui_soc);
++	soc_delta = abs(ui_soc - fg->last_ui_soc);
+ 	if (soc_delta >= 1 && prohibit_jump) {
+ 		if (fg->smooth.suppot_RSOC_0_smooth && fg->batt_raw_soc == 0 &&
+ 		    fg->batt_current > 0)
+ 			get_unit_time_low_soc(fg, &soc_keep_time);
+-		delta_time = (time_now - time_last) / soc_keep_time;
++		delta_time = (time_now - fg->smooth_last_time) / soc_keep_time;
+ 		if (delta_time < 0)
+ 			delta_time = 0;
+ 
+-		soc_changed = min(1, delta_time);
+-		if (ui_soc > last_ui_soc)
+-			ui_soc = last_ui_soc + soc_changed;
+-		else if (ui_soc < last_ui_soc)
+-			ui_soc = last_ui_soc - soc_changed;
++		soc_changed = min_t(time64_t, 1, delta_time);
++		if (ui_soc > fg->last_ui_soc)
++			ui_soc = fg->last_ui_soc + soc_changed;
++		else if (ui_soc < fg->last_ui_soc)
++			ui_soc = fg->last_ui_soc - soc_changed;
+ 		else
+-			ui_soc = last_ui_soc;
++			ui_soc = fg->last_ui_soc;
+ 
+ 		mca_log_info(
+ 			"ui_soc: %d, last_ui_soc: %d, soc_delta: %d, soc_changed: %d, batt_mapped_soc:%d, is_eu_model=%d, soc_keep_time:%d\n",
+-			ui_soc, last_ui_soc, soc_delta, soc_changed,
++			ui_soc, fg->last_ui_soc, soc_delta, soc_changed,
+ 			fg->batt_mapped_soc, fg->is_eu_model, soc_keep_time);
+ 	}
+ 
+ 	if (prohibit_jump) {
+-		ui_soc = fg_ui_soc_process_special_conditions(fg, last_ui_soc,
++		ui_soc = fg_ui_soc_process_special_conditions(fg, fg->last_ui_soc,
+ 							      ui_soc);
+-		fg_ui_soc_update_decimal(fg, last_ui_soc, ui_soc);
++		fg_ui_soc_update_decimal(fg, fg->last_ui_soc, ui_soc);
+ 	}
+ 
+ 	// NOTICE: check vbatt_empty and shutdown delay must be the final step
+@@ -321,12 +320,12 @@
+ 	}
+ 
+ 	mca_log_info("ui_soc: %d => %d, time_now: %lld prohibit_jump:%d\n",
+-		     last_ui_soc, ui_soc, time_now, prohibit_jump);
+-	if (ui_soc != last_ui_soc) {
+-		if (last_ui_soc == 100)
++		     fg->last_ui_soc, ui_soc, time_now, prohibit_jump);
++	if (ui_soc != fg->last_ui_soc) {
++		if (fg->last_ui_soc == 100)
+ 			fg->keep_full_flag = false;
+-		time_last = time_now;
+-		last_ui_soc = ui_soc;
++		fg->smooth_last_time = time_now;
++		fg->last_ui_soc = ui_soc;
+ 	}
+ 
+ 	return ui_soc;
+--- a/drivers/power/supply/mca/mca_strategy/strategy_fg/mca_battery_shutdown.c
++++ b/drivers/power/supply/mca/mca_strategy/strategy_fg/mca_battery_shutdown.c
+@@ -64,7 +64,7 @@
+ };
+ 
+ static int mca_battery_shutdown_parse_vcutoff_para(
+-	struct device_node *node, const char *name,
++	struct device *dev, struct device_node *node, const char *name,
+ 	struct mca_battery_shutdown_vcutoff_para_info *vcutoff_info)
+ {
+ 	struct mca_battery_shutdown_vcutoff_para *vcutoff_para;
+@@ -85,7 +85,7 @@
+ 
+ 	vcutoff_info->vcutoff_para_size =
+ 		array_len / MCA_BATTERY_SHUTDOWN_VCUTOFF_PARA_MAX;
+-	vcutoff_info->vcutoff_para = kcalloc(vcutoff_info->vcutoff_para_size,
++	vcutoff_info->vcutoff_para = devm_kcalloc(dev, vcutoff_info->vcutoff_para_size,
+ 					     sizeof(*vcutoff_para), GFP_KERNEL);
+ 	if (!vcutoff_info->vcutoff_para) {
+ 		mca_log_err("vcutoff para no mem\n");
+@@ -127,9 +127,47 @@
+ 
+ 	return 0;
+ error:
+-	kfree(vcutoff_para);
+-	vcutoff_para = NULL;
+ 	return -1;
++}
++
++static int mca_battery_shutdown_validate_tables(struct strategy_fg *fg)
++{
++	struct mca_battery_shutdown_para_info *tables[] = {
++		&fg->batt_health_para, &fg->batt_spec_para,
++	};
++
++	for (int n = 0; n < ARRAY_SIZE(tables); n++) {
++		struct mca_battery_shutdown_para_info *table = tables[n];
++
++		if (!(n ? fg->support_dod_vcutoff : fg->support_cc_vcutoff))
++			continue;
++		if (!table->temp_info || table->temp_para_size <= 0)
++			return -EINVAL;
++		for (int i = 0; i < table->temp_para_size; i++) {
++			struct mca_battery_shutdown_temp_para_info *entry = &table->temp_info[i];
++			struct mca_battery_shutdown_temp_para *temp = &entry->temp_para;
++			struct mca_battery_shutdown_vcutoff_para_info *volt = &entry->vcutoff_info;
++
++			if (temp->temp_low >= temp->temp_high || temp->low_temp_hysteresis < 0 ||
++			    temp->high_temp_hysteresis < 0 || !volt->vcutoff_para ||
++			    volt->vcutoff_para_size <= 0 ||
++			    (i && temp->temp_low < table->temp_info[i - 1].temp_para.temp_high))
++				return -EINVAL;
++			for (int j = 0; j < volt->vcutoff_para_size; j++) {
++				struct mca_battery_shutdown_vcutoff_para *v =
++					&volt->vcutoff_para[j];
++
++				if (v->range_upper < 0 || v->vcutoff_fw < 2500 ||
++				    v->vcutoff_fw > 5000 ||
++				    v->vcutoff_shutdown_delay < 2500 ||
++				    v->vcutoff_shutdown_delay > 5000 ||
++				    v->vcutoff_sw < 2500 || v->vcutoff_sw > 5000 ||
++				    (j && v->range_upper <= volt->vcutoff_para[j - 1].range_upper))
++					return -EINVAL;
++			}
++		}
++	}
++	return 0;
+ }
+ 
+ int mca_battery_shutdown_parse_dt(void *data)
+@@ -147,7 +185,6 @@
+ 	const struct mca_hwid *hwid = mca_get_hwid_info();
+ 	const char *dev_name = NULL;
+ 	bool is_gl_unit, use_cc_gl, use_dod_gl, notsupport_dod_gl;
+-	int retry;
+ 
+ 	rc = mca_parse_dts_u32(node, "vcutoff_shutdown_delay",
+ 			       &fg->vcutoff_shutdown_delay,
+@@ -169,20 +206,10 @@
+ 	notsupport_dod_gl =
+ 		of_property_read_bool(node, "notsupport-dod-vcutoff-global");
+ 
+-	for (retry = 1; retry <= BATT_SHUTDOWN_NAME_RETRY; retry++) {
+-		(void)platform_fg_ops_get_device_name(FG_IC_MASTER, &dev_name);
+-		msleep(BATT_SHUTDOWN_NAME_RETRY_MS);
+-		mca_log_err("retry get device name:%d\n", retry);
+-		if (dev_name)
+-			break;
+-	}
+-	if (dev_name) {
+-		mca_log_err("CN device name: %s\n", dev_name);
+-		fg->is_nvt_unique_scheme =
+-			!strcmp(dev_name, BATT_SHUTDOWN_NVT_NAME);
+-	} else {
+-		fg->is_nvt_unique_scheme = false;
+-	}
++	rc = platform_fg_ops_get_device_name(FG_IC_MASTER, &dev_name);
++	if (rc || !dev_name)
++		return -EPROBE_DEFER;
++	fg->is_nvt_unique_scheme = !strcmp(dev_name, BATT_SHUTDOWN_NVT_NAME);
+ 	mca_log_err("is nvt unique scheme %d\n", fg->is_nvt_unique_scheme);
+ 
+ 	fg->support_cc_vcutoff =
+@@ -203,7 +230,7 @@
+ 		batt_health_para_info->temp_para_size =
+ 			array_len / MCA_BATTERY_SHUTDOWN_TEMP_PARA_MAX;
+ 		batt_health_para_info->temp_info =
+-			kcalloc(batt_health_para_info->temp_para_size,
++			devm_kcalloc(fg->dev, batt_health_para_info->temp_para_size,
+ 				sizeof(*temp_info), GFP_KERNEL);
+ 		if (!batt_health_para_info->temp_info) {
+ 			mca_log_err("vcutoff_para_info->temp_para no mem\n");
+@@ -249,7 +276,7 @@
+ 				break;
+ 			case MCA_BATTERY_SHUTDOWN_VCUTOFF_PARA_NAME:
+ 				if (mca_battery_shutdown_parse_vcutoff_para(
+-					    node, tmp_string,
++					    fg->dev, node, tmp_string,
+ 					    &temp_info[row].vcutoff_info))
+ 					goto error;
+ 				break;
+@@ -275,7 +302,7 @@
+ 		batt_spec_para_info->temp_para_size =
+ 			array_len / MCA_BATTERY_SHUTDOWN_TEMP_PARA_MAX;
+ 		batt_spec_para_info->temp_info =
+-			kcalloc(batt_spec_para_info->temp_para_size,
++			devm_kcalloc(fg->dev, batt_spec_para_info->temp_para_size,
+ 				sizeof(*temp_info), GFP_KERNEL);
+ 		if (!batt_spec_para_info->temp_info) {
+ 			mca_log_err("batt_para_info->temp_para no mem\n");
+@@ -322,7 +349,7 @@
+ 				break;
+ 			case MCA_BATTERY_SHUTDOWN_VCUTOFF_PARA_NAME:
+ 				if (mca_battery_shutdown_parse_vcutoff_para(
+-					    node, tmp_string,
++					    fg->dev, node, tmp_string,
+ 					    &temp_info[row].vcutoff_info))
+ 					goto error;
+ 				break;
+@@ -337,11 +364,9 @@
+ 
+ 	fg->support_vpack_low_shutdown =
+ 		of_property_read_bool(node, "support-vpack-low-shutdown");
+-	return 0;
++	return mca_battery_shutdown_validate_tables(fg);
+ 
+ error:
+-	kfree(temp_info);
+-	temp_info = NULL;
+ 	return -1;
+ }
+ 
+@@ -385,14 +410,14 @@
+ 				.temp_info[fg->batt_health_para.cur_temp_index]
+ 				.temp_para;
+ 		if (cur_temp_index > fg->batt_health_para.cur_temp_index) {
+-			if (temp >= temp_para.temp_high +
++			if (temp >= (s64)temp_para.temp_high +
+ 					    temp_para.high_temp_hysteresis)
+ 				fg->batt_health_para.cur_temp_index =
+ 					cur_temp_index;
+ 		} else if (cur_temp_index <
+ 			   fg->batt_health_para.cur_temp_index) {
+ 			if (temp <
+-			    temp_para.temp_low - temp_para.low_temp_hysteresis)
++			    (s64)temp_para.temp_low - temp_para.low_temp_hysteresis)
+ 				fg->batt_health_para.cur_temp_index =
+ 					cur_temp_index;
+ 		}
+@@ -411,7 +436,7 @@
+ 		}
+ 
+ 		if (cur_vcuttoff_index < 0 ||
+-		    cur_vcuttoff_index > vcutoff_info->vcutoff_para_size) {
++		    cur_vcuttoff_index >= vcutoff_info->vcutoff_para_size) {
+ 			mca_log_err("cyclecount over range invalid\n");
+ 			return -1;
+ 		}
+@@ -432,7 +457,7 @@
+ 			cur_vcuttoff_index);
+ 	}
+ 
+-	if (fg->support_dod_vcutoff) {
++	if (fg->support_dod_vcutoff && !fg->dod_error) {
+ 		int cur_temp_index = -1;
+ 		int cur_vcuttoff_index = -1;
+ 		struct mca_battery_shutdown_vcutoff_para_info *vcutoff_info;
+@@ -459,13 +484,13 @@
+ 				.temp_info[fg->batt_spec_para.cur_temp_index]
+ 				.temp_para;
+ 		if (cur_temp_index > fg->batt_spec_para.cur_temp_index) {
+-			if (temp >= temp_para.temp_high +
++			if (temp >= (s64)temp_para.temp_high +
+ 					    temp_para.high_temp_hysteresis)
+ 				fg->batt_spec_para.cur_temp_index =
+ 					cur_temp_index;
+ 		} else if (cur_temp_index < fg->batt_spec_para.cur_temp_index) {
+ 			if (temp <
+-			    temp_para.temp_low - temp_para.low_temp_hysteresis)
++			    (s64)temp_para.temp_low - temp_para.low_temp_hysteresis)
+ 				fg->batt_spec_para.cur_temp_index =
+ 					cur_temp_index;
+ 		}
+@@ -483,7 +508,7 @@
+ 		}
+ 
+ 		if (cur_vcuttoff_index < 0 ||
+-		    cur_vcuttoff_index > vcutoff_info->vcutoff_para_size) {
++		    cur_vcuttoff_index >= vcutoff_info->vcutoff_para_size) {
+ 			mca_log_err("dod_count over range invalid\n");
+ 			return -1;
+ 		}
+@@ -556,18 +581,18 @@
+ static bool mca_battery_shutdown_heavy_load_check(void *data)
+ {
+ 	struct strategy_fg *fg = (struct strategy_fg *)data;
+-	static int heavy_load_count;
+ 
+ 	if (fg->batt_voltage_mean < (fg->vcutoff_shutdown_delay +
+ 				     MCA_BATTERY_SHUTDOWN_VOLTAGE_HYST) &&
+ 	    fg->batt_current > MCA_HEAVY_LOAD_DISCHARGING_CURRENT)
+-		heavy_load_count++;
++		fg->heavy_load_count = min(fg->heavy_load_count + 1,
++			MCA_HEAVY_LOAD_DISCHARGING_COUNT + 1);
+ 	else
+-		heavy_load_count = 0;
+-
+-	mca_log_info("heavy_load_count: %d\n", heavy_load_count);
+-
+-	if (heavy_load_count > MCA_HEAVY_LOAD_DISCHARGING_COUNT)
++		fg->heavy_load_count = 0;
++
++	mca_log_info("heavy_load_count: %d\n", fg->heavy_load_count);
++
++	if (fg->heavy_load_count > MCA_HEAVY_LOAD_DISCHARGING_COUNT)
+ 		return true;
+ 	else
+ 		return false;
+@@ -577,7 +602,6 @@
+ {
+ 	struct strategy_fg *fg = (struct strategy_fg *)data;
+ 	int vpack_vol_now_mv = 0, chip_ok = 0;
+-	static int count = 0;
+ 
+ #ifdef CONFIG_FACTORY_BUILD
+ 	return false;
+@@ -594,14 +618,14 @@
+ 	chip_ok = strategy_class_fg_is_chip_ok();
+ 	mca_log_info("chip_ok:%d vpack_vol_now_mv:%d fg->vcutoff_sw:%d",
+ 		     chip_ok, vpack_vol_now_mv, fg->vcutoff_sw);
+-	if (!chip_ok && count < 10 &&
++	if (chip_ok == 0 && vpack_vol_now_mv > 0 &&
+ 	    vpack_vol_now_mv <= fg->vcutoff_sw + 100) {
+-		count++;
++		fg->vpack_low_count = min(fg->vpack_low_count + 1, 10);
+ 	} else {
+-		count = 0;
+-	}
+-
+-	if (count >= 10)
++		fg->vpack_low_count = 0;
++	}
++
++	if (fg->vpack_low_count >= 10)
+ 		return true;
+ 	else
+ 		return false;
+@@ -612,8 +636,6 @@
+ 	struct strategy_fg *fg = (struct strategy_fg *)data;
+ 	int soc = *ui_soc;
+ 	int charging_status = POWER_SUPPLY_STATUS_UNKNOWN;
+-	static bool shutdown_dealy, last_shutdown_delay;
+-	static bool shutdown_delay_cancel;
+ 	int len;
+ 	char event[MCA_EVENT_NOTIFY_SIZE] = { 0 };
+ 	union power_supply_propval pval = {
+@@ -623,15 +645,14 @@
+ 	bool heavy_load_off = false;
+ 
+ 	if (fg->batt_psy) {
+-		power_supply_get_property(fg->batt_psy,
+-					  POWER_SUPPLY_PROP_STATUS, &pval);
+-		charging_status = pval.intval;
++		if (!power_supply_get_property(fg->batt_psy, POWER_SUPPLY_PROP_STATUS, &pval))
++			charging_status = pval.intval;
+ 	}
+ 
+ 	if (mca_shutdown_due_to_vpack_low_of_vpack_inside_fg_absent(fg) &&
+ 	    charging_status != POWER_SUPPLY_STATUS_CHARGING) {
+-		shutdown_dealy = true;
+-		shutdown_delay_cancel = false;
++		fg->shutdown_delay = true;
++		fg->shutdown_delay_cancel = false;
+ 		soc = 1;
+ 		goto report_shutdown;
+ 	}
+@@ -642,42 +663,42 @@
+ 		if ((fg->batt_voltage_mean <= fg->vcutoff_shutdown_delay ||
+ 		     heavy_load_off) &&
+ 		    charging_status != POWER_SUPPLY_STATUS_CHARGING) {
+-			shutdown_dealy = true;
+-			shutdown_delay_cancel = false;
++			fg->shutdown_delay = true;
++			fg->shutdown_delay_cancel = false;
+ 			soc = 1;
+ 		} else if (charging_status == POWER_SUPPLY_STATUS_CHARGING) {
+-			if (shutdown_dealy) {
+-				shutdown_dealy = false;
+-				shutdown_delay_cancel = true;
++			if (fg->shutdown_delay) {
++				fg->shutdown_delay = false;
++				fg->shutdown_delay_cancel = true;
+ 			}
+ 			soc = 1;
+ 		} else {
+-			shutdown_dealy = false;
++			fg->shutdown_delay = false;
+ 			soc = 1;
+ 		}
+ 	} else {
+-		shutdown_dealy = false;
+-		shutdown_delay_cancel = false;
++		fg->shutdown_delay = false;
++		fg->shutdown_delay_cancel = false;
+ 	}
+ 
+ report_shutdown:
+ 	mca_log_info(
+ 		"ui_soc: %d, soc: %d, last_shutdown_delay: %d, shutdown_dealy: %d\n",
+-		*ui_soc, soc, last_shutdown_delay, shutdown_dealy);
++		*ui_soc, soc, fg->last_shutdown_delay, fg->shutdown_delay);
+ 
+ 	*ui_soc = soc;
+ 
+-	if (last_shutdown_delay != shutdown_dealy &&
++	if (fg->last_shutdown_delay != fg->shutdown_delay &&
+ 	    fg->fake_soc == STRATEGY_FG_FAKE_SOC_NONE) {
+ 		mca_log_err("shutdown_dealy changed: %d => %d\n",
+-			    last_shutdown_delay, shutdown_dealy);
++			    fg->last_shutdown_delay, fg->shutdown_delay);
+ 		len = snprintf(event, MCA_EVENT_NOTIFY_SIZE,
+ 			       "POWER_SUPPLY_SHUTDOWN_DELAY=%u\n",
+-			       shutdown_dealy);
++			       fg->shutdown_delay);
+ 		n_data.event = event;
+ 		n_data.event_len = len;
+ 		mca_event_report_uevent(&n_data);
+-		last_shutdown_delay = shutdown_dealy;
++		fg->last_shutdown_delay = fg->shutdown_delay;
+ 	}
+ 
+ 	return 0;
+--- a/drivers/power/supply/mca/mca_strategy/strategy_fg/inc/strategy_fg.h
++++ b/drivers/power/supply/mca/mca_strategy/strategy_fg/inc/strategy_fg.h
+@@ -166,6 +166,38 @@
+ };
+ 
+ struct strategy_fg {
++	bool ready;
++	bool wired_present;
++	bool wireless_present;
++	struct workqueue_struct *wq;
++	int current_history[5];
++	int current_cursor;
++	int current_count;
++	int voltage_cursor;
++	int voltage_history[5];
++	int empty_count;
++	int zero_speed;
++	int last_report_soc;
++	int last_report_temp;
++	int termination_count;
++	int force_full_count;
++	int fl4p0_count;
++	ktime_t lossless_last_time;
++	bool auth_checked;
++	int last_dtpt_status;
++	int force_report_count;
++	int ota_update_count;
++	int last_ui_soc;
++	time64_t smooth_last_time;
++	int heavy_load_count;
++	int vpack_low_count;
++	bool shutdown_delay;
++	bool last_shutdown_delay;
++	bool shutdown_delay_cancel;
++	bool stopping;
++	int sample_error;
++	int dod_error;
++	struct mutex sample_lock;
+ 	struct device *dev;
+ 
+ 	struct delayed_work monitor_work;
+@@ -202,12 +234,6 @@
+ 	int real_type;
+ 
+ 	bool voter_ok;
+-	struct mca_votable *en_voter;
+-	struct mca_votable *vterm_voter;
+-	struct mca_votable *iterm_voter;
+-	struct mca_votable *charge_limit_voter;
+-	struct mca_votable *flip_charge_curr_voter;
+-	struct mca_votable *buck_input_voter;
+ 
+ 	int batt_current;
+ 	int batt_current_mean;
