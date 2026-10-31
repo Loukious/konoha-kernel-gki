@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 253 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 254 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 253 platform `.ko` files, their symbol tables and DDK configurations.
+- 254 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
@@ -71,8 +71,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 15,366
-imported symbol CRCs across all 253 modules.
+used. The current [validation report](validation-20261031.json) checks 15,441
+imported symbol CRCs across all 254 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1636,3 +1636,21 @@ ROM module-name coverage is 250/466 (53.6%); this does not measure overall
 completion. Remaining audio/Bluetooth, camera/video/DSP and peripheral work,
 shared clock lifetime fixes, KernelSU/NetHunter requirements and boot/DLKM
 images/installer remain. No flashable 6.18 ZIP or hardware validation exists.
+
+
+## Native WCD core
+
+The native WCD core retains four compilation units and all 27 exports. Pinctrl
+calls and removal are serialized, DT/MMIO inputs are bounded, IRQ-domain
+ownership is balanced, regulator errors propagate, and failed initialization
+unwinds acquired resources. Fifteen sanitizer scenarios (185 cases) and sixteen
+rejecting controls pass against the integrated source. Codec consumers must
+drain borrowed IRQ-domain pointers and free nested IRQs before provider exit;
+the full contract is in [the WCD port record](audio-wcdcore-port.md).
+
+Archive `artifacts/20261031T175506600607Z` contains 254 platform modules and
+passes 15,441 CRC checks without compiler/modpost warnings. Device-tree checks
+pass with 1,084 existing vendor DTC warnings. ROM module-name coverage is
+251/466 (53.9%). LPASS/codec/machine consumers, remaining peripherals and
+boot/DLKM packaging are still in progress. No flashable ZIP or hardware test
+is claimed by this checkpoint.

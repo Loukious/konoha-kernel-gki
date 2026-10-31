@@ -3343,6 +3343,23 @@ ddk_module(
 )
 
 
+ddk_headers(
+    name = "audio_wcdcore_headers",
+    hdrs = ["qcom/opensource/audio-kernel/include/asoc/core.h", "qcom/opensource/audio-kernel/include/asoc/msm-cdc-pinctrl.h", "qcom/opensource/audio-kernel/include/asoc/msm-cdc-supply.h", "qcom/opensource/audio-kernel/include/asoc/pdata.h", "qcom/opensource/audio-kernel/include/asoc/wcd-irq.h", "qcom/opensource/audio-kernel/include/asoc/wcd9xxx-irq.h"],
+    includes = ["qcom/opensource/audio-kernel/include"],
+)
+
+ddk_module(
+    name = "wcd_core_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/msm-cdc-pinctrl.c", "qcom/opensource/audio-kernel/asoc/codecs/msm-cdc-supply.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd-irq.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd9xxx-core-init.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wcd_core_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wcdcore_headers", ":audio_foundation_headers", ":pinctrl_headers", ":pinctrl_msm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
@@ -3586,6 +3603,7 @@ kernel_module_group(
         ":bt_fm_swr",
         ":onyx_relay",
         ":qca_cld3_wcn7750",
+        ":wcd_core_dlkm",
     ],
 )
 

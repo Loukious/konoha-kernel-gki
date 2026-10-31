@@ -1,0 +1,1091 @@
+Subject: Port native WCD core support to 6.18
+
+Drain pinctrl API users before removal and bound device-tree arrays.
+Unwind IRQ domains and preserve regulator operation errors.
+
+---
+
+--- a/qcom/opensource/audio-kernel/asoc/codecs/msm-cdc-pinctrl.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/msm-cdc-pinctrl.c
+@@ -8,6 +8,7 @@
+ #include <linux/io.h>
+ #include <linux/err.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/of_device.h>
+ #include <linux/platform_device.h>
+@@ -36,28 +37,27 @@
+ 	bool chip_wakeup_reg;
+ };
+ 
++/* Protect exported operations against platform removal and state changes. */
++static DEFINE_MUTEX(msm_cdc_pinctrl_lock);
++
++/* A successful lookup returns with msm_cdc_pinctrl_lock held. */
+ static struct msm_cdc_pinctrl_info *msm_cdc_pinctrl_get_gpiodata(
+ 						struct device_node *np)
+ {
+ 	struct platform_device *pdev;
+ 	struct msm_cdc_pinctrl_info *gpio_data;
+ 
+-	if (!np) {
+-		pr_err_ratelimited("%s: device node is null\n", __func__);
++	if (!np)
+ 		return NULL;
+-	}
+-
+ 	pdev = of_find_device_by_node(np);
+-	if (!pdev) {
+-		pr_err_ratelimited("%s: platform device not found!\n", __func__);
++	if (!pdev)
+ 		return NULL;
+-	}
+-
++
++	mutex_lock(&msm_cdc_pinctrl_lock);
+ 	gpio_data = dev_get_drvdata(&pdev->dev);
+-	if (!gpio_data)
+-		dev_err_ratelimited(&pdev->dev, "%s: cannot find cdc gpio info\n",
+-			__func__);
+-
++	put_device(&pdev->dev);
++	if (!gpio_data)
++		mutex_unlock(&msm_cdc_pinctrl_lock);
+ 	return gpio_data;
+ }
+ 
+@@ -79,6 +79,7 @@
+ 	if (gpio_is_valid(gpio_data->gpio))
+ 		value = gpio_get_value_cansleep(gpio_data->gpio);
+ 
++	mutex_unlock(&msm_cdc_pinctrl_lock);
+ 	return value;
+ }
+ EXPORT_SYMBOL(msm_cdc_get_gpio_state);
+@@ -92,19 +93,23 @@
+ int msm_cdc_pinctrl_select_sleep_state(struct device_node *np)
+ {
+ 	struct msm_cdc_pinctrl_info *gpio_data;
++	int ret;
+ 
+ 	gpio_data = msm_cdc_pinctrl_get_gpiodata(np);
+ 	if (!gpio_data)
+ 		return -EINVAL;
+ 
+ 	if (!gpio_data->pinctrl_sleep) {
+-		pr_err_ratelimited("%s: pinctrl sleep state is null\n", __func__);
+-		return -EINVAL;
+-	}
+-	gpio_data->state = false;
+-
+-	return pinctrl_select_state(gpio_data->pinctrl,
+-				    gpio_data->pinctrl_sleep);
++		ret = -EINVAL;
++		goto unlock;
++	}
++	ret = pinctrl_select_state(gpio_data->pinctrl,
++				   gpio_data->pinctrl_sleep);
++	if (!ret)
++		gpio_data->state = false;
++unlock:
++	mutex_unlock(&msm_cdc_pinctrl_lock);
++	return ret;
+ }
+ EXPORT_SYMBOL(msm_cdc_pinctrl_select_sleep_state);
+ 
+@@ -117,19 +122,23 @@
+ int msm_cdc_pinctrl_select_alt_active_state(struct device_node *np)
+ {
+ 	struct msm_cdc_pinctrl_info *gpio_data;
++	int ret;
+ 
+ 	gpio_data = msm_cdc_pinctrl_get_gpiodata(np);
+ 	if (!gpio_data)
+ 		return -EINVAL;
+ 
+ 	if (!gpio_data->pinctrl_alt_active) {
+-		pr_err_ratelimited("%s: pinctrl alt_active state is null\n", __func__);
+-		return -EINVAL;
+-	}
+-	gpio_data->state = true;
+-
+-	return pinctrl_select_state(gpio_data->pinctrl,
+-				    gpio_data->pinctrl_alt_active);
++		ret = -EINVAL;
++		goto unlock;
++	}
++	ret = pinctrl_select_state(gpio_data->pinctrl,
++				   gpio_data->pinctrl_alt_active);
++	if (!ret)
++		gpio_data->state = true;
++unlock:
++	mutex_unlock(&msm_cdc_pinctrl_lock);
++	return ret;
+ }
+ EXPORT_SYMBOL(msm_cdc_pinctrl_select_alt_active_state);
+ 
+@@ -142,19 +151,23 @@
+ int msm_cdc_pinctrl_select_active_state(struct device_node *np)
+ {
+ 	struct msm_cdc_pinctrl_info *gpio_data;
++	int ret;
+ 
+ 	gpio_data = msm_cdc_pinctrl_get_gpiodata(np);
+ 	if (!gpio_data)
+ 		return -EINVAL;
+ 
+ 	if (!gpio_data->pinctrl_active) {
+-		pr_err_ratelimited("%s: pinctrl active state is null\n", __func__);
+-		return -EINVAL;
+-	}
+-	gpio_data->state = true;
+-
+-	return pinctrl_select_state(gpio_data->pinctrl,
+-				    gpio_data->pinctrl_active);
++		ret = -EINVAL;
++		goto unlock;
++	}
++	ret = pinctrl_select_state(gpio_data->pinctrl,
++				   gpio_data->pinctrl_active);
++	if (!ret)
++		gpio_data->state = true;
++unlock:
++	mutex_unlock(&msm_cdc_pinctrl_lock);
++	return ret;
+ }
+ EXPORT_SYMBOL(msm_cdc_pinctrl_select_active_state);
+ 
+@@ -168,12 +181,14 @@
+ int msm_cdc_pinctrl_get_state(struct device_node *np)
+ {
+ 	struct msm_cdc_pinctrl_info *gpio_data;
+-
+-	gpio_data = msm_cdc_pinctrl_get_gpiodata(np);
+-	if (!gpio_data)
+-		return -EINVAL;
+-
+-	return gpio_data->state;
++	int state;
++
++	gpio_data = msm_cdc_pinctrl_get_gpiodata(np);
++	if (!gpio_data)
++		return -EINVAL;
++	state = gpio_data->state;
++	mutex_unlock(&msm_cdc_pinctrl_lock);
++	return state;
+ }
+ EXPORT_SYMBOL(msm_cdc_pinctrl_get_state);
+ 
+@@ -206,165 +221,140 @@
+ 		for (i = 0; i < gpio_data->wakeup_reg_count; i++) {
+ 			temp = ioread32(gpio_data->chip_wakeup_register[i]);
+ 			if (enable)
+-				temp |= (1 <<
+-					 gpio_data->chip_wakeup_maskbit[i]);
++				temp |= BIT(gpio_data->chip_wakeup_maskbit[i]);
+ 			else
+-				temp &= ~(1 <<
+-					  gpio_data->chip_wakeup_maskbit[i]);
++				temp &= ~BIT(gpio_data->chip_wakeup_maskbit[i]);
+ 			iowrite32(temp, gpio_data->chip_wakeup_register[i]);
+ 		}
+ 	}
+ exit:
++	mutex_unlock(&msm_cdc_pinctrl_lock);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(msm_cdc_pinctrl_set_wakeup_capable);
+ 
++static void msm_cdc_pinctrl_free_gpio(void *data)
++{
++	struct msm_cdc_pinctrl_info *gpio_data = data;
++
++	gpio_free(gpio_data->gpio);
++}
++
+ static int msm_cdc_pinctrl_probe(struct platform_device *pdev)
+ {
+-	int ret = 0;
+-	struct msm_cdc_pinctrl_info *gpio_data;
+-	u32 tlmm_gpio[MAX_GPIOS] = {0};
+-	u32 chip_wakeup_reg[MAX_GPIOS] = {0};
+-	u32 chip_wakeup_default_val[MAX_GPIOS] = {0};
+-	u32 i = 0, temp = 0;
+-	int count = 0;
+-
+-	gpio_data = devm_kzalloc(&pdev->dev,
+-				 sizeof(struct msm_cdc_pinctrl_info),
+-				 GFP_KERNEL);
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct msm_cdc_pinctrl_info *gpio_data;
++	u32 chip_wakeup_reg[MAX_GPIOS];
++	u32 defaults[MAX_GPIOS];
++	bool has_defaults = false;
++	int count, ret;
++	u32 i, value;
++
++	gpio_data = devm_kzalloc(dev, sizeof(*gpio_data), GFP_KERNEL);
+ 	if (!gpio_data)
+ 		return -ENOMEM;
+-
+-	gpio_data->pinctrl = devm_pinctrl_get(&pdev->dev);
+-	if (IS_ERR_OR_NULL(gpio_data->pinctrl)) {
+-		dev_err(&pdev->dev, "%s: Cannot get cdc gpio pinctrl:%ld\n",
+-			__func__, PTR_ERR(gpio_data->pinctrl));
+-		ret = PTR_ERR(gpio_data->pinctrl);
+-		goto err_pctrl_get;
+-	}
+-
+-	gpio_data->pinctrl_active = pinctrl_lookup_state(
+-					gpio_data->pinctrl, "aud_active");
+-	if (IS_ERR_OR_NULL(gpio_data->pinctrl_active)) {
+-		dev_err(&pdev->dev, "%s: Cannot get aud_active pinctrl state:%ld\n",
+-			__func__, PTR_ERR(gpio_data->pinctrl_active));
+-		ret = PTR_ERR(gpio_data->pinctrl_active);
+-		goto err_lookup_state;
+-	}
+-
+-	gpio_data->pinctrl_sleep = pinctrl_lookup_state(
+-					gpio_data->pinctrl, "aud_sleep");
+-	if (IS_ERR_OR_NULL(gpio_data->pinctrl_sleep)) {
+-		dev_err(&pdev->dev, "%s: Cannot get aud_sleep pinctrl state:%ld\n",
+-			__func__, PTR_ERR(gpio_data->pinctrl_sleep));
+-		ret = PTR_ERR(gpio_data->pinctrl_sleep);
+-		goto err_lookup_state;
+-	}
+-
+-	gpio_data->pinctrl_alt_active = pinctrl_lookup_state(
+-					gpio_data->pinctrl, "aud_alt_active");
+-	if (IS_ERR_OR_NULL(gpio_data->pinctrl_alt_active)) {
+-		dev_dbg(&pdev->dev, "%s: Cannot get aud_alt_active pinctrl state:%ld\n",
+-			__func__, PTR_ERR(gpio_data->pinctrl_alt_active));
+-	}
+-
+-	/* skip setting to sleep state for LPI_TLMM GPIOs */
+-	if (!of_property_read_bool(pdev->dev.of_node, "qcom,lpi-gpios")) {
+-		/* Set pinctrl state to aud_sleep by default */
++	gpio_data->pinctrl = devm_pinctrl_get(dev);
++	if (IS_ERR(gpio_data->pinctrl))
++		return PTR_ERR(gpio_data->pinctrl);
++	gpio_data->pinctrl_active = pinctrl_lookup_state(gpio_data->pinctrl,
++							 "aud_active");
++	if (IS_ERR(gpio_data->pinctrl_active))
++		return PTR_ERR(gpio_data->pinctrl_active);
++	gpio_data->pinctrl_sleep = pinctrl_lookup_state(gpio_data->pinctrl,
++							"aud_sleep");
++	if (IS_ERR(gpio_data->pinctrl_sleep))
++		return PTR_ERR(gpio_data->pinctrl_sleep);
++	gpio_data->pinctrl_alt_active = pinctrl_lookup_state(gpio_data->pinctrl,
++							     "aud_alt_active");
++	if (IS_ERR(gpio_data->pinctrl_alt_active)) {
++		ret = PTR_ERR(gpio_data->pinctrl_alt_active);
++		if (ret == -EPROBE_DEFER)
++			return ret;
++		gpio_data->pinctrl_alt_active = NULL;
++	}
++
++	if (of_property_present(np, "qcom,chip-wakeup-reg")) {
++		count = of_property_count_u32_elems(np, "qcom,chip-wakeup-reg");
++		if (count <= 0 || count > MAX_GPIOS)
++			return -EINVAL;
++		ret = of_property_read_u32_array(np, "qcom,chip-wakeup-reg",
++						 chip_wakeup_reg, count);
++		if (ret)
++			return ret;
++		ret = of_property_read_u32_array(np, "qcom,chip-wakeup-maskbit",
++						 gpio_data->chip_wakeup_maskbit, count);
++		if (ret)
++			return ret;
++		for (i = 0; i < count; i++) {
++			if (gpio_data->chip_wakeup_maskbit[i] >= 32)
++				return -EINVAL;
++			gpio_data->chip_wakeup_register[i] =
++				devm_ioremap(dev, chip_wakeup_reg[i], sizeof(u32));
++			if (!gpio_data->chip_wakeup_register[i])
++				return -ENOMEM;
++		}
++		if (of_property_present(np, "qcom,chip-wakeup-default-val")) {
++			ret = of_property_read_u32_array(np, "qcom,chip-wakeup-default-val",
++							 defaults, count);
++			if (ret)
++				return ret;
++			has_defaults = true;
++		}
++		gpio_data->wakeup_reg_count = count;
++		gpio_data->chip_wakeup_reg = true;
++	}
++	if (of_property_present(np, "qcom,tlmm-pins")) {
++		count = of_property_count_u32_elems(np, "qcom,tlmm-pins");
++		if (count <= 0 || count > MAX_GPIOS)
++			return -EINVAL;
++		ret = of_property_read_u32_array(np, "qcom,tlmm-pins",
++						 gpio_data->tlmm_gpio, count);
++		if (ret)
++			return ret;
++		gpio_data->count = count;
++		gpio_data->wakeup_capable = true;
++	}
++	gpio_data->gpio = of_get_named_gpio(np, "qcom,cdc-rst-n-gpio", 0);
++	if (gpio_data->gpio == -EPROBE_DEFER)
++		return -EPROBE_DEFER;
++	if (gpio_is_valid(gpio_data->gpio)) {
++		ret = gpio_request(gpio_data->gpio, "MSM_CDC_RESET");
++		if (ret)
++			return ret;
++		ret = devm_add_action_or_reset(dev, msm_cdc_pinctrl_free_gpio, gpio_data);
++		if (ret)
++			return ret;
++	}
++	/* Apply defaults only after validating and acquiring all resources. */
++	if (!of_property_read_bool(np, "qcom,lpi-gpios")) {
+ 		ret = pinctrl_select_state(gpio_data->pinctrl,
+ 					   gpio_data->pinctrl_sleep);
+ 		if (ret)
+-			dev_err(&pdev->dev, "%s: set cdc gpio sleep state fail: %d\n",
+-				__func__, ret);
+-	}
+-
+-
+-	count = of_property_count_u32_elems(pdev->dev.of_node, "qcom,chip-wakeup-reg");
+-	if (count <= 0)
+-		goto cdc_tlmm_gpio;
+-	if (!of_property_read_u32_array(pdev->dev.of_node, "qcom,chip-wakeup-reg",
+-				chip_wakeup_reg, count)) {
+-		if (of_property_read_u32_array(pdev->dev.of_node,
+-					   "qcom,chip-wakeup-maskbit",
+-					   gpio_data->chip_wakeup_maskbit, count)) {
+-			dev_err(&pdev->dev,
+-				"chip-wakeup-maskbit needed if chip-wakeup-reg is defined!\n");
+-			goto cdc_tlmm_gpio;
+-		}
+-		gpio_data->chip_wakeup_reg = true;
+-		for (i = 0; i < count; i++) {
+-			gpio_data->chip_wakeup_register[i] =
+-				devm_ioremap(&pdev->dev, chip_wakeup_reg[i], 0x4);
+-		}
+-		if (!of_property_read_u32_array(pdev->dev.of_node,
+-					"qcom,chip-wakeup-default-val",
+-					chip_wakeup_default_val, count)) {
+-			for (i = 0; i < count; i++) {
+-				temp = ioread32(gpio_data->chip_wakeup_register[i]);
+-				if (chip_wakeup_default_val[i])
+-					temp |= (1 <<
+-						 gpio_data->chip_wakeup_maskbit[i]);
+-				else
+-					temp &= ~(1 <<
+-						  gpio_data->chip_wakeup_maskbit[i]);
+-				iowrite32(temp, gpio_data->chip_wakeup_register[i]);
+-			}
+-		}
+-		gpio_data->wakeup_reg_count = count;
+-	}
+-
+-cdc_tlmm_gpio:
+-	count = of_property_count_u32_elems(pdev->dev.of_node, "qcom,tlmm-pins");
+-	if (count <= 0)
+-		goto cdc_rst;
+-	if (!of_property_read_u32_array(pdev->dev.of_node, "qcom,tlmm-pins",
+-				tlmm_gpio, count)) {
+-		gpio_data->wakeup_capable = true;
+-		for (i = 0; i < count; i++)
+-			gpio_data->tlmm_gpio[i] = tlmm_gpio[i];
+-		gpio_data->count = count;
+-	}
+-
+-cdc_rst:
+-	gpio_data->gpio = of_get_named_gpio(pdev->dev.of_node,
+-					    "qcom,cdc-rst-n-gpio", 0);
+-	if (gpio_is_valid(gpio_data->gpio)) {
+-		ret = gpio_request(gpio_data->gpio, "MSM_CDC_RESET");
+-		if (ret) {
+-			dev_err(&pdev->dev, "%s: Failed to request gpio %d\n",
+-				__func__, gpio_data->gpio);
+-			goto err_lookup_state;
+-		}
+-	}
+-
+-	dev_set_drvdata(&pdev->dev, gpio_data);
++			return ret;
++	}
++	if (has_defaults) {
++		for (i = 0; i < gpio_data->wakeup_reg_count; i++) {
++			value = ioread32(gpio_data->chip_wakeup_register[i]);
++			if (defaults[i])
++				value |= BIT(gpio_data->chip_wakeup_maskbit[i]);
++			else
++				value &= ~BIT(gpio_data->chip_wakeup_maskbit[i]);
++			iowrite32(value, gpio_data->chip_wakeup_register[i]);
++		}
++	}
++	mutex_lock(&msm_cdc_pinctrl_lock);
++	dev_set_drvdata(dev, gpio_data);
++	mutex_unlock(&msm_cdc_pinctrl_lock);
+ 	return 0;
+-
+-err_lookup_state:
+-	devm_pinctrl_put(gpio_data->pinctrl);
+-err_pctrl_get:
+-	devm_kfree(&pdev->dev, gpio_data);
+-	return ret;
+-}
+-
+-static int msm_cdc_pinctrl_remove(struct platform_device *pdev)
+-{
+-	struct msm_cdc_pinctrl_info *gpio_data;
+-
+-	gpio_data = dev_get_drvdata(&pdev->dev);
+-
+-	/* to free the requested gpio before exiting */
+-	if (gpio_data) {
+-		if (gpio_is_valid(gpio_data->gpio))
+-			gpio_free(gpio_data->gpio);
+-
+-		if (gpio_data->pinctrl)
+-			devm_pinctrl_put(gpio_data->pinctrl);
+-	}
+-
+-	devm_kfree(&pdev->dev, gpio_data);
+-
+-	return 0;
++}
++
++static void msm_cdc_pinctrl_remove(struct platform_device *pdev)
++{
++	/* Drain API users before devres releases GPIOs, pinctrl and MMIO. */
++	mutex_lock(&msm_cdc_pinctrl_lock);
++	dev_set_drvdata(&pdev->dev, NULL);
++	mutex_unlock(&msm_cdc_pinctrl_lock);
+ }
+ 
+ static const struct of_device_id msm_cdc_pinctrl_match[] = {
+--- a/qcom/opensource/audio-kernel/asoc/codecs/msm-cdc-supply.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/msm-cdc-supply.c
+@@ -92,6 +92,7 @@
+ 		 cdc_vreg->lpm_supported, cdc_vreg->rem_supported);
+ 
+ done:
++	of_node_put(regulator_node);
+ 	return rc;
+ }
+ 
+@@ -308,16 +309,16 @@
+ 	for (i = 0; i < num_supplies; i++) {
+ 		if (!strcmp(cdc_vreg[i].name, supply_name)) {
+ 			if (override_min_vol)
+-				regulator_set_voltage(supplies[i].consumer,
+-					vval_min, cdc_vreg[i].max_uV);
++				rc = regulator_set_voltage(supplies[i].consumer,
++							   vval_min, cdc_vreg[i].max_uV);
+ 			else
+-				regulator_set_voltage(supplies[i].consumer,
+-				    cdc_vreg[i].min_uV, cdc_vreg[i].max_uV);
++				rc = regulator_set_voltage(supplies[i].consumer,
++							   cdc_vreg[i].min_uV, cdc_vreg[i].max_uV);
+ 			break;
+ 		}
+ 	}
+ 
+-	return rc;
++	return i == num_supplies ? -EINVAL : rc;
+ }
+ EXPORT_SYMBOL(msm_cdc_set_supply_min_voltage);
+ 
+@@ -359,7 +360,8 @@
+ 				dev_err_ratelimited(dev,
+ 					"%s: failed to disable supply %s, err:%d\n",
+ 					__func__, supplies[i].supply, rc);
+-			cdc_vreg[i].vote = false;
++			else
++				cdc_vreg[i].vote = false;
+ 			break;
+ 		}
+ 	}
+@@ -410,7 +412,8 @@
+ 			if (rc)
+ 				dev_err_ratelimited(dev, "%s: failed to enable supply %s, rc: %d\n",
+ 					__func__, supplies[i].supply, rc);
+-			cdc_vreg[i].vote = true;
++			else
++				cdc_vreg[i].vote = true;
+ 			break;
+ 		}
+ 	}
+@@ -443,7 +446,7 @@
+ 				int num_supplies,
+ 				bool flag)
+ {
+-	int rc = 0, i;
++	int rc = 0, i, first_error = 0;
+ 
+ 	if (!supplies) {
+ 		pr_err_ratelimited("%s: supplies is NULL\n",
+@@ -471,9 +474,11 @@
+ 					__func__, supplies[i].supply,
+ 					flag ? "LPM" : "NOM");
+ 		}
+-	}
+-
+-	return rc;
++		if (rc && !first_error)
++			first_error = rc;
++	}
++
++	return first_error;
+ }
+ EXPORT_SYMBOL(msm_cdc_set_supplies_lpm_mode);
+ 
+@@ -493,7 +498,7 @@
+ 				    struct cdc_regulator *cdc_vreg,
+ 				    int num_supplies)
+ {
+-	int rc, i;
++	int rc, i, first_error = 0;
+ 
+ 	if ((!dev) || (!supplies) || (!cdc_vreg)) {
+ 		pr_err("%s: either dev or supplies or cdc_vreg is NULL\n",
+@@ -518,9 +523,11 @@
+ 			dev_dbg(dev, "%s: disabled regulator %s\n",
+ 				__func__, supplies[i].supply);
+ 		}
+-	}
+-
+-	return rc;
++		if (rc && !first_error)
++			first_error = rc;
++	}
++
++	return first_error;
+ }
+ EXPORT_SYMBOL(msm_cdc_disable_static_supplies);
+ 
+@@ -541,7 +548,7 @@
+ 			     int num_supplies)
+ {
+ 	int rc = 0;
+-	int i;
++	int i, ret;
+ 
+ 	if ((!dev) || (!supplies) || (!cdc_vreg)) {
+ 		pr_err("%s: either dev or supplies or cdc_vreg is NULL\n",
+@@ -553,15 +560,19 @@
+ 	if (rc)
+ 		return rc;
+ 
+-	msm_cdc_disable_static_supplies(dev, supplies, cdc_vreg,
+-					num_supplies);
++	rc = msm_cdc_disable_static_supplies(dev, supplies, cdc_vreg,
++					     num_supplies);
+ 	for (i = 0; i < num_supplies; i++) {
+ 		if (regulator_count_voltages(supplies[i].consumer) < 0)
+ 			continue;
+ 
+-		regulator_set_voltage(supplies[i].consumer, 0,
+-				      cdc_vreg[i].max_uV);
+-		regulator_set_load(supplies[i].consumer, 0);
++		ret = regulator_set_voltage(supplies[i].consumer, 0,
++					    cdc_vreg[i].max_uV);
++		if (ret && !rc)
++			rc = ret;
++		ret = regulator_set_load(supplies[i].consumer, 0);
++		if (ret && !rc)
++			rc = ret;
+ 	}
+ 
+ 	return rc;
+@@ -666,10 +677,11 @@
+ 			  int num_supplies, u32 vote_regulator_on_demand)
+ {
+ 	struct regulator_bulk_data *vsup;
++	void *group;
+ 	int rc;
+-	int i;
+-
+-	if (!dev || !cdc_vreg) {
++	int i, j;
++
++	if (!dev || !cdc_vreg || !supplies) {
+ 		pr_err("%s: device pointer or dce_vreg is NULL\n",
+ 				__func__);
+ 		return -EINVAL;
+@@ -679,11 +691,17 @@
+ 	if (rc)
+ 		return rc;
+ 
++	*supplies = NULL;
++	group = devres_open_group(dev, NULL, GFP_KERNEL);
++	if (!group)
++		return -ENOMEM;
+ 	vsup = devm_kcalloc(dev, num_supplies,
+ 			    sizeof(struct regulator_bulk_data),
+ 			    GFP_KERNEL);
+-	if (!vsup)
+-		return -ENOMEM;
++	if (!vsup) {
++		rc = -ENOMEM;
++		goto err_supply;
++	}
+ 
+ 	for (i = 0; i < num_supplies; i++) {
+ 		if (!cdc_vreg[i].name) {
+@@ -718,22 +736,32 @@
+ 		if (rc) {
+ 			dev_err(dev, "%s: set regulator voltage failed for %s, err:%d\n",
+ 				__func__, vsup[i].supply, rc);
+-			goto err_supply;
++			goto err_voltage;
+ 		}
+ 		rc = regulator_set_load(vsup[i].consumer,
+ 					cdc_vreg[i].optimum_uA);
+ 		if (rc < 0) {
+ 			dev_err(dev, "%s: set regulator optimum mode failed for %s, err:%d\n",
+ 				__func__, vsup[i].supply, rc);
+-			goto err_supply;
+-		}
+-	}
+-
++			goto err_voltage;
++		}
++	}
++
++	devres_remove_group(dev, group);
+ 	*supplies = vsup;
+ 
+ 	return 0;
+ 
++err_voltage:
++	for (j = 0; j <= i; j++) {
++		if (cdc_vreg[j].regulator != vsup[j].consumer)
++			continue;
++		regulator_set_load(vsup[j].consumer, 0);
++		regulator_set_voltage(vsup[j].consumer, 0, cdc_vreg[j].max_uV);
++		cdc_vreg[j].regulator = NULL;
++	}
+ err_supply:
++	devres_release_group(dev, group);
+ 	return rc;
+ }
+ EXPORT_SYMBOL(msm_cdc_init_supplies_v2);
+@@ -764,10 +792,12 @@
+ 	struct cdc_regulator *cdc_reg;
+ 	int rc;
+ 
+-	if (!dev) {
++	if (!dev || !cdc_vreg || !total_num_supplies) {
+ 		pr_err_ratelimited("%s: device pointer is NULL\n", __func__);
+ 		return -EINVAL;
+ 	}
++	*cdc_vreg = NULL;
++	*total_num_supplies = 0;
+ 	static_sup_cnt = of_property_count_strings(dev->of_node,
+ 						   static_prop_name);
+ 	if (static_sup_cnt < 0) {
+@@ -832,6 +862,7 @@
+ 	return 0;
+ 
+ err_sup:
++	devm_kfree(dev, cdc_reg);
+ err_supply_cnt:
+ err_mem_alloc:
+ 	return rc;
+@@ -853,7 +884,7 @@
+ {
+ 	struct platform_device *pdev = NULL;
+ 
+-	if (!np || !cdc_supply)
++	if (!np || !cdc_supply || !name)
+ 		return -EINVAL;
+ 
+ 	pdev = of_find_device_by_node(np);
+@@ -864,6 +895,12 @@
+ 	cdc_supply->name = name;
+ 	cdc_supply->component = snd_soc_lookup_component(&pdev->dev, NULL);
+ 
++	if (!cdc_supply->component) {
++		put_device(&pdev->dev);
++		cdc_supply->dev = NULL;
++		return -EPROBE_DEFER;
++	}
++	/* The caller owns this device reference until its supply is unused. */
+ 	return 0;
+ }
+ EXPORT_SYMBOL(msm_cdc_init_wcd_supply);
+@@ -879,9 +916,12 @@
+  */
+ int msm_cdc_enable_wcd_supply(struct cdc_wcd_supply *cdc_supply, bool enable)
+ {
+-	struct snd_soc_component *component = cdc_supply->component;
++	struct snd_soc_component *component;
+ 	int rc;
+ 
++	if (!cdc_supply)
++		return -EINVAL;
++	component = cdc_supply->component;
+ 	if (!component) {
+ 		pr_err_ratelimited("%s: Component memory is NULL\n", __func__);
+ 		return -EINVAL;
+@@ -897,7 +937,7 @@
+ 					cdc_supply->name);
+ 
+ 	if (!rc)
+-		snd_soc_dapm_sync(snd_soc_component_get_dapm(component));
++		rc = snd_soc_dapm_sync(snd_soc_component_get_dapm(component));
+ 	else
+ 		dev_err_ratelimited(component->dev, "%s: micbias %s force %s pin failed\n",
+ 			__func__, cdc_supply->name, (enable ? "enable" : "disable"));
+--- a/qcom/opensource/audio-kernel/asoc/codecs/wcd-irq.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/wcd-irq.c
+@@ -3,6 +3,7 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include <linux/device.h>
+ #include <linux/module.h>
+ #include <linux/irq.h>
+ #include <linux/of.h>
+@@ -14,7 +15,7 @@
+ 
+ static int wcd_map_irq(struct wcd_irq_info *irq_info, int irq)
+ {
+-	if (!irq_info) {
++	if (!irq_info || !irq_info->irq_chip) {
+ 		pr_err("%s: Null IRQ handle\n", __func__);
+ 		return -EINVAL;
+ 	}
+@@ -39,8 +40,8 @@
+ 		return -EINVAL;
+ 	}
+ 	irq = wcd_map_irq(irq_info, irq);
+-	if (irq < 0)
+-		return irq;
++	if (irq <= 0)
++		return irq ? irq : -EINVAL;
+ 
+ 	return devm_request_threaded_irq(irq_info->dev, irq, NULL, handler,
+ 				    IRQF_ONESHOT | IRQF_TRIGGER_RISING,
+@@ -62,7 +63,7 @@
+ 	}
+ 
+ 	irq = wcd_map_irq(irq_info, irq);
+-	if (irq < 0)
++	if (irq <= 0)
+ 		return;
+ 
+ 	devm_free_irq(irq_info->dev, irq, data);
+@@ -76,10 +77,9 @@
+  */
+ void wcd_enable_irq(struct wcd_irq_info *irq_info, int irq)
+ {
+-	if (!irq_info)
+-		pr_err("%s: Null IRQ handle\n", __func__);
+-	else
+-		enable_irq(wcd_map_irq(irq_info, irq));
++	irq = wcd_map_irq(irq_info, irq);
++	if (irq > 0)
++		enable_irq(irq);
+ }
+ EXPORT_SYMBOL(wcd_enable_irq);
+ 
+@@ -90,10 +90,9 @@
+  */
+ void wcd_disable_irq(struct wcd_irq_info *irq_info, int irq)
+ {
+-	if (!irq_info)
+-		pr_err("%s: Null IRQ handle\n", __func__);
+-	else
+-		disable_irq_nosync(wcd_map_irq(irq_info, irq));
++	irq = wcd_map_irq(irq_info, irq);
++	if (irq > 0)
++		disable_irq_nosync(irq);
+ }
+ EXPORT_SYMBOL(wcd_disable_irq);
+ 
+@@ -105,19 +104,27 @@
+ {
+ }
+ 
+-static struct irq_chip wcd_irq_chip = {
++static const struct irq_chip wcd_irq_chip = {
+ 	.name = NULL,
+ 	.irq_disable = wcd_irq_chip_disable,
+ 	.irq_enable = wcd_irq_chip_enable,
+ };
+ 
++struct wcd_irq_domain {
++	struct irq_chip chip;
++	struct irq_domain *domain;
++	unsigned int parent_irq;
++};
++
+ static struct lock_class_key wcd_irq_lock_class;
+ static struct lock_class_key wcd_irq_lock_requested_class;
+ 
+ static int wcd_irq_chip_map(struct irq_domain *irqd, unsigned int virq,
+ 			irq_hw_number_t hw)
+ {
+-	irq_set_chip_and_handler(virq, &wcd_irq_chip, handle_simple_irq);
++	struct wcd_irq_domain *ctx = irqd->host_data;
++
++	irq_set_chip_and_handler(virq, &ctx->chip, handle_simple_irq);
+ 	irq_set_lockdep_class(virq, &wcd_irq_lock_class,
+ 			&wcd_irq_lock_requested_class);
+ 	irq_set_nested_thread(virq, 1);
+@@ -130,57 +137,87 @@
+ 	.map = wcd_irq_chip_map,
+ };
+ 
++static void wcd_irq_domain_release(void *data)
++{
++	struct wcd_irq_domain *ctx = data;
++
++	irq_dispose_mapping(ctx->parent_irq);
++	irq_domain_remove(ctx->domain);
++	kfree(ctx);
++}
++
+ /**
+  * wcd_irq_init: Initializes IRQ module
+  * @irq_info: pointer to IRQ info structure
++ * @virq: receives the parent IRQ domain
+  *
+  * Returns 0 on success or error on failure
+  */
+ int wcd_irq_init(struct wcd_irq_info *irq_info, struct irq_domain **virq)
+ {
+-	int ret = 0;
+-
+-	if (!irq_info) {
+-		pr_err("%s: Null IRQ handle\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	wcd_irq_chip.name = irq_info->codec_name;
+-
+-	*virq = irq_domain_add_linear(NULL, 1, &wcd_domain_ops, NULL);
+-	if (!(*virq)) {
+-		pr_err("%s: Failed to add IRQ domain\n", __func__);
+-		return -EINVAL;
+-	}
+-
++	struct wcd_irq_domain *ctx;
++	int ret;
++
++	if (!irq_info || !virq || !irq_info->dev || !irq_info->regmap ||
++	    !irq_info->wcd_regmap_irq_chip)
++		return -EINVAL;
++	if (irq_info->irq_chip)
++		return -EBUSY;
++	*virq = NULL;
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++	ctx->chip = wcd_irq_chip;
++	ctx->chip.name = irq_info->codec_name;
++	ctx->domain = irq_domain_add_linear(NULL, 1, &wcd_domain_ops, ctx);
++	if (!ctx->domain) {
++		kfree(ctx);
++		return -ENOMEM;
++	}
++	ctx->parent_irq = irq_create_mapping(ctx->domain, 0);
++	if (!ctx->parent_irq) {
++		irq_domain_remove(ctx->domain);
++		kfree(ctx);
++		return -ENOMEM;
++	}
++	/* Devres unwinds the regmap chip before its parent IRQ/domain. */
++	ret = devm_add_action_or_reset(irq_info->dev, wcd_irq_domain_release, ctx);
++	if (ret)
++		return ret;
+ 	ret = devm_regmap_add_irq_chip(irq_info->dev, irq_info->regmap,
+-				 irq_create_mapping(*virq, 0),
+-				 IRQF_ONESHOT, 0, irq_info->wcd_regmap_irq_chip,
+-				 &irq_info->irq_chip);
+-	if (ret)
+-		pr_err("%s: Failed to add IRQs: %d\n",
+-			__func__, ret);
+-
+-	return ret;
++				       ctx->parent_irq, IRQF_ONESHOT, 0,
++				       irq_info->wcd_regmap_irq_chip,
++				       &irq_info->irq_chip);
++	if (ret) {
++		irq_info->irq_chip = NULL;
++		devm_remove_action(irq_info->dev, wcd_irq_domain_release, ctx);
++		wcd_irq_domain_release(ctx);
++		return ret;
++	}
++	*virq = ctx->domain;
++	return 0;
+ }
+ EXPORT_SYMBOL(wcd_irq_init);
+ 
+ /**
+  * wcd_irq_exit: Uninitialize regmap IRQ and free IRQ resources
+  * @irq_info: pointer to IRQ info structure
++ * @virq: parent IRQ domain returned by wcd_irq_init
+  *
+  * Returns 0 on success or error on failure
+  */
+ int wcd_irq_exit(struct wcd_irq_info *irq_info, struct irq_domain *virq)
+ {
+-	if (!irq_info) {
+-		pr_err("%s: Null pointer handle\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	devm_regmap_del_irq_chip(irq_info->dev, irq_find_mapping(virq, 0),
++	struct wcd_irq_domain *ctx;
++
++	if (!irq_info || !irq_info->dev || !irq_info->irq_chip || !virq)
++		return -EINVAL;
++	ctx = virq->host_data;
++	devm_regmap_del_irq_chip(irq_info->dev, ctx->parent_irq,
+ 				 irq_info->irq_chip);
+-
++	irq_info->irq_chip = NULL;
++	devm_remove_action(irq_info->dev, wcd_irq_domain_release, ctx);
++	wcd_irq_domain_release(ctx);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(wcd_irq_exit);
+--- a/qcom/opensource/audio-kernel/asoc/codecs/wcd9xxx-core-init.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/wcd9xxx-core-init.c
+@@ -7,31 +7,24 @@
+ #include <asoc/wcd9xxx-irq.h>
+ #include <asoc/core.h>
+ 
+-#define NUM_DRIVERS_REG_RET 3
+-
+ static int __init wcd9xxx_core_init(void)
+ {
+-	int ret[NUM_DRIVERS_REG_RET] = {0};
+-	int i = 0;
++	int ret;
+ 
+-	ret[0] = msm_cdc_pinctrl_drv_init();
+-	if (ret[0])
+-		pr_err("%s: Failed init pinctrl drv: %d\n", __func__, ret[0]);
++	ret = msm_cdc_pinctrl_drv_init();
++	if (ret)
++		return ret;
++	ret = wcd9xxx_irq_drv_init();
++	if (ret)
++		goto unregister_pinctrl;
++	ret = wcd9xxx_init();
++	if (!ret)
++		return 0;
+ 
+-	ret[1] = wcd9xxx_irq_drv_init();
+-	if (ret[1])
+-		pr_err("%s: Failed init irq drv: %d\n", __func__, ret[1]);
+-
+-	ret[2] = wcd9xxx_init();
+-	if (ret[2])
+-		pr_err("%s: Failed wcd core drv: %d\n", __func__, ret[2]);
+-
+-	for (i = 0; i < NUM_DRIVERS_REG_RET; i++) {
+-		if (ret[i])
+-			return ret[i];
+-	}
+-
+-	return 0;
++	wcd9xxx_irq_drv_exit();
++unregister_pinctrl:
++	msm_cdc_pinctrl_drv_exit();
++	return ret;
+ }
+ module_init(wcd9xxx_core_init);
+ 
+--- a/qcom/opensource/audio-kernel/include/asoc/wcd9xxx-irq.h
++++ b/qcom/opensource/audio-kernel/include/asoc/wcd9xxx-irq.h
+@@ -28,54 +28,63 @@
+ int wcd9xxx_irq_drv_init(void);
+ void wcd9xxx_irq_drv_exit(void);
+ #else
+-bool wcd9xxx_lock_sleep(struct wcd9xxx_core_resource *wcd9xxx_res)
++static inline bool wcd9xxx_lock_sleep(struct wcd9xxx_core_resource *wcd9xxx_res)
+ {
+ 	return false;
+ }
+-void wcd9xxx_unlock_sleep(struct wcd9xxx_core_resource *wcd9xxx_res)
++
++static inline void wcd9xxx_unlock_sleep(struct wcd9xxx_core_resource *wcd9xxx_res)
+ {
+ }
+-void wcd9xxx_nested_irq_lock(struct wcd9xxx_core_resource *wcd9xxx_res)
++
++static inline void wcd9xxx_nested_irq_lock(struct wcd9xxx_core_resource *wcd9xxx_res)
+ {
+ }
+-void wcd9xxx_nested_irq_unlock(struct wcd9xxx_core_resource *wcd9xxx_res)
++
++static inline void wcd9xxx_nested_irq_unlock(struct wcd9xxx_core_resource *wcd9xxx_res)
+ {
+ }
+-int wcd9xxx_request_irq(struct wcd9xxx_core_resource *wcd9xxx_res, int irq,
+-			irq_handler_t handler, const char *name, void *data)
++
++static inline int wcd9xxx_request_irq(struct wcd9xxx_core_resource *wcd9xxx_res, int irq,
++				      irq_handler_t handler, const char *name, void *data)
+ {
+ 	return 0;
+ }
+ 
+-void wcd9xxx_free_irq(struct wcd9xxx_core_resource *wcd9xxx_res,
+-			int irq, void *data)
+-{
+-}
+-void wcd9xxx_enable_irq(struct wcd9xxx_core_resource *wcd9xxx_res, int irq)
+-{
+-}
+-void wcd9xxx_disable_irq(struct wcd9xxx_core_resource *wcd9xxx_res,
+-			int irq)
+-{
+-}
+-void wcd9xxx_disable_irq_sync(struct wcd9xxx_core_resource *wcd9xxx_res,
+-			int irq)
++static inline void wcd9xxx_free_irq(struct wcd9xxx_core_resource *wcd9xxx_res,
++				    int irq, void *data)
+ {
+ }
+ 
+-int wcd9xxx_irq_init(struct wcd9xxx_core_resource *wcd9xxx_res)
+-{
+-	return 0;
+-}
+-void wcd9xxx_irq_exit(struct wcd9xxx_core_resource *wcd9xxx_res)
++static inline void wcd9xxx_enable_irq(struct wcd9xxx_core_resource *wcd9xxx_res, int irq)
+ {
+ }
+-int wcd9xxx_irq_drv_init(void)
++
++static inline void wcd9xxx_disable_irq(struct wcd9xxx_core_resource *wcd9xxx_res,
++				       int irq)
++{
++}
++
++static inline void wcd9xxx_disable_irq_sync(struct wcd9xxx_core_resource *wcd9xxx_res,
++					    int irq)
++{
++}
++
++static inline int wcd9xxx_irq_init(struct wcd9xxx_core_resource *wcd9xxx_res)
+ {
+ 	return 0;
+ }
+ 
+-void wcd9xxx_irq_drv_exit(void)
++static inline void wcd9xxx_irq_exit(struct wcd9xxx_core_resource *wcd9xxx_res)
++{
++}
++
++static inline int wcd9xxx_irq_drv_init(void)
++{
++	return 0;
++}
++
++static inline void wcd9xxx_irq_drv_exit(void)
+ {
+ }
+ #endif

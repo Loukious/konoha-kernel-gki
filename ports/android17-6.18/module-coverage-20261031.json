@@ -6,8 +6,8 @@
     "/home/loukious/Android/custom-rom/out/target/product/onyx/vendor_dlkm/lib/modules/modules.load": "71ddc08a21c19c67a0f5a12fac978ccae626b64adc10b244309764ca7afb24b8"
   },
   "vendor_names": 466,
-  "built_vendor_names": 250,
-  "percent": 53.6,
+  "built_vendor_names": 251,
+  "percent": 53.9,
   "built_extra_names": [
     "deferred-free-helper",
     "onyx_relay",
@@ -226,7 +226,6 @@
     "wcd939x_dlkm",
     "wcd939x_slave_dlkm",
     "wcd9xxx_dlkm",
-    "wcd_core_dlkm",
     "wsa883x_dlkm",
     "wsa884x_dlkm",
     "xhci-sideband"
@@ -244,6 +243,7 @@
     "RMNET core/control are resident because IPA exposes no synchronized withdrawal for pending readiness callbacks. Native data paths compile and tested error paths pass; modem/data-plane behavior remains unvalidated.",
     "Bluetooth codec and SoundWire consumers preserve the native shared hw_params contract, which has no DAI identifier. Their host tests do not establish real ALSA/SoundWire concurrency, firmware behavior or DMA quiescence.",
     "Main WCN7750 WLAN now compiles with native ICNSS2/HIF_IPCI, monitor and management-frame injection paths preserved. Firmware boot, RF, monitor capture, injection and recovery remain unvalidated; arbitrary raw data/control injection is not established.",
-    "Relay requires clients to quiesce producers before close and file-removal callbacks to withdraw and drain new opens. Host tests cover ownership and hotplug serialization but do not establish actual kernel CPU-hotplug or VFS behavior."
+    "Relay requires clients to quiesce producers before close and file-removal callbacks to withdraw and drain new opens. Host tests cover ownership and hotplug serialization but do not establish actual kernel CPU-hotplug or VFS behavior.",
+    "WCD core requires codec consumers to withdraw/drain borrowed IRQ-domain pointers and free nested handlers before wcd_irq_exit. Its supply helpers require caller serialization and balanced votes. Host tests do not establish hardware IRQ, regulator, DSP or playback behavior."
   ]
 }

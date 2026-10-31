@@ -1,0 +1,29 @@
+/* SERVICES */
+struct pinctrl {int value;};struct pinctrl_state {int value;};
+static struct pinctrl pins;static struct pinctrl_state active,sleep_state,alt;
+static int pin_error,optional_error,select_error,gpio_result=-ENOENT,gpio_error,gpios,mmio_reads,mmio_writes,wake_error,wake_calls;
+static atomic_bool hold_selection,selection_entered,selection_release,removal_done;
+static struct pinctrl *devm_pinctrl_get(struct device*d){(void)d;return pin_error?ERR_PTR(pin_error):&pins;}
+static struct pinctrl_state *pinctrl_lookup_state(struct pinctrl*p,const char*n){assert(p==&pins);if(!strcmp(n,"aud_active"))return &active;if(!strcmp(n,"aud_sleep"))return &sleep_state;return optional_error?ERR_PTR(optional_error):&alt;}
+static int pinctrl_select_state(struct pinctrl*p,struct pinctrl_state*s){assert(p==&pins&&(s==&active||s==&sleep_state||s==&alt));if(hold_selection){selection_entered=true;while(!selection_release)usleep(100);}return select_error;}
+static bool gpio_is_valid(int n){return n>=0;}
+static int gpio_get_value_cansleep(int n){assert(n>=0);return 1;}
+static int of_get_named_gpio(struct device_node*np,const char*n,int index){(void)np;(void)n;(void)index;return gpio_result;}
+static int gpio_request(int n,const char*name){assert(n>=0&&name);if(gpio_error)return gpio_error;gpios++;return 0;}
+static void gpio_free(int n){assert(n>=0&&gpios>0);gpios--;}
+static void *devm_ioremap(struct device*d,u32 addr,size_t n){(void)addr;return devm_kzalloc(d,n,0);}
+static u32 ioread32(void*p){assert(p);mmio_reads++;return *(u32*)p;}
+static void iowrite32(u32 v,void*p){assert(p);mmio_writes++;*(u32*)p=v;}
+static int msm_gpio_mpm_wake_set(u32 n,bool enable){(void)n;(void)enable;wake_calls++;return wake_error;}
+/* SOURCE */
+static struct device_node node;static struct platform_device pdev;
+static void setup(void){node=(struct device_node){0};pdev=(struct platform_device){.dev.of_node=&node};found=&pdev;fail_step=step=pin_error=optional_error=select_error=gpio_error=mmio_reads=mmio_writes=wake_error=wake_calls=0;gpio_result=-ENOENT;}
+static void remove_clean(void){msm_cdc_pinctrl_remove(&pdev);assert(!pdev.dev.data);clean(&pdev.dev);assert(!gpios);}
+static unsigned bounds(void){unsigned cases=0;for(int which=0;which<2;which++)for(int n=17;n<=20;n++){setup();prop(&node,which?"qcom,tlmm-pins":"qcom,chip-wakeup-reg",n,0);assert(msm_cdc_pinctrl_probe(&pdev)==-EINVAL&&!pdev.dev.data&&!mmio_writes);clean(&pdev.dev);cases++;}for(u32 bit=32;bit<36;bit++){setup();prop(&node,"qcom,chip-wakeup-reg",1,0);prop(&node,"qcom,chip-wakeup-maskbit",1,bit);assert(msm_cdc_pinctrl_probe(&pdev)==-EINVAL&&!mmio_writes);clean(&pdev.dev);cases++;}setup();prop(&node,"qcom,chip-wakeup-reg",1,0);assert(msm_cdc_pinctrl_probe(&pdev)==-EINVAL);clean(&pdev.dev);return cases+1;}
+static unsigned failures(void){for(int n=1;n<=4;n++){setup();gpio_result=4;prop(&node,"qcom,chip-wakeup-reg",1,0);prop(&node,"qcom,chip-wakeup-maskbit",1,31);prop(&node,"qcom,chip-wakeup-default-val",1,1);fail_step=n;int ret=msm_cdc_pinctrl_probe(&pdev);if(!ret)msm_cdc_pinctrl_remove(&pdev);else assert(ret==-ENOMEM&&!pdev.dev.data&&!mmio_writes);clean(&pdev.dev);assert(!gpios);}setup();pin_error=-EPROBE_DEFER;assert(msm_cdc_pinctrl_probe(&pdev)==-EPROBE_DEFER);clean(&pdev.dev);setup();gpio_result=-EPROBE_DEFER;assert(msm_cdc_pinctrl_probe(&pdev)==-EPROBE_DEFER);clean(&pdev.dev);setup();select_error=-EIO;assert(msm_cdc_pinctrl_probe(&pdev)==-EIO&&!pdev.dev.data);clean(&pdev.dev);setup();optional_error=-EPROBE_DEFER;assert(msm_cdc_pinctrl_probe(&pdev)==-EPROBE_DEFER);clean(&pdev.dev);return 8;}
+static unsigned states(void){setup();optional_error=-ENOENT;gpio_result=4;assert(!msm_cdc_pinctrl_probe(&pdev));assert(msm_cdc_pinctrl_select_alt_active_state(&node)==-EINVAL);assert(!msm_cdc_pinctrl_select_active_state(&node)&&msm_cdc_pinctrl_get_state(&node)==1);select_error=-EIO;assert(msm_cdc_pinctrl_select_sleep_state(&node)==-EIO&&msm_cdc_pinctrl_get_state(&node)==1);select_error=0;assert(!msm_cdc_pinctrl_select_sleep_state(&node)&&!msm_cdc_pinctrl_get_state(&node));for(int i=0;i<100;i++)assert(msm_cdc_get_gpio_state(&node)==1&&!pdev.dev.refs);remove_clean();assert(msm_cdc_pinctrl_get_state(&node)==-EINVAL&&!pdev.dev.refs);return 105;}
+static unsigned wake(void){setup();prop(&node,"qcom,chip-wakeup-reg",1,0);prop(&node,"qcom,chip-wakeup-maskbit",1,31);prop(&node,"qcom,chip-wakeup-default-val",1,1);prop(&node,"qcom,tlmm-pins",1,4);assert(!msm_cdc_pinctrl_probe(&pdev));struct msm_cdc_pinctrl_info*d=pdev.dev.data;assert(*(u32*)d->chip_wakeup_register[0]==0x80000000u);assert(!msm_cdc_pinctrl_set_wakeup_capable(&node,false)&&!*(u32*)d->chip_wakeup_register[0]);wake_error=-EIO;int writes=mmio_writes;assert(msm_cdc_pinctrl_set_wakeup_capable(&node,true)==-EIO&&mmio_writes==writes);remove_clean();return 3;}
+static void *select_thread(void*p){(void)p;assert(!msm_cdc_pinctrl_select_active_state(&node));return NULL;}
+static void *remove_thread(void*p){(void)p;msm_cdc_pinctrl_remove(&pdev);removal_done=true;return NULL;}
+static unsigned lifetime(void){setup();assert(!msm_cdc_pinctrl_probe(&pdev));hold_selection=true;pthread_t a,b;pthread_create(&a,NULL,select_thread,NULL);while(!selection_entered)usleep(100);pthread_create(&b,NULL,remove_thread,NULL);usleep(2000);assert(!removal_done);selection_release=true;pthread_join(a,NULL);pthread_join(b,NULL);assert(removal_done&&!pdev.dev.data&&!pdev.dev.refs);assert(msm_cdc_get_gpio_state(&node)==-EINVAL);clean(&pdev.dev);return 3;}
+int main(int argc,char**argv){assert(argc==2);unsigned n;if(!strcmp(argv[1],"bounds"))n=bounds();else if(!strcmp(argv[1],"failures"))n=failures();else if(!strcmp(argv[1],"states"))n=states();else if(!strcmp(argv[1],"wake"))n=wake();else if(!strcmp(argv[1],"lifetime"))n=lifetime();else abort();printf("{\"pinctrl_%s\":%u}\n",argv[1],n);}
