@@ -1,7 +1,7 @@
 # Onyx Android 17 / Linux 6.18 port
 
 This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 97 vendor modules build successfully**. This is
+The pinned **6.18.33 GKI and 98 vendor modules build successfully**. This is
 an initial platform build, **not a flashable kernel or a boot-tested port**.
 
 The branch stores the port recipe in this directory. Its top-level kernel is
@@ -35,7 +35,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 97 platform `.ko` files, their symbol tables and DDK configurations.
+- 98 platform `.ko` files, their symbol tables and DDK configurations.
 - Input manifests, source/blob pins, patches and staged-file hashes.
 - A build log and `report.json` with SHA-256 hashes, imported-CRC checks and
   duplicate-provider rejection. The build/staging/verification tools are archived too.
@@ -70,8 +70,8 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 4262
-imported symbol CRCs across all 97 modules.
+used. The current [validation report](validation-20261031.json) checks 4284
+imported symbol CRCs across all 98 modules.
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -230,7 +230,7 @@ wake, receive threads stop, and queued memory work drains before descriptors
 are freed. The deferred-free worker also supports stop and drain. Unknown queue
 names fail cleanly, and receiver allocation/thread failures unwind registration.
 These adaptations pass checkpatch with no errors, warnings or style checks;
-the full build passes 4262 imported-symbol CRC checks without compiler/modpost
+the full build passes 4284 imported-symbol CRC checks without compiler/modpost
 warnings. Cross-VM sharing, secure-display allocation and memory pressure still
 require device testing. `ZONE_DEVICE` and reserved-IPA support remain disabled,
 matching the Onyx HLOS baseline; guest-only mapping paths are not validated.
@@ -444,3 +444,18 @@ the former 32-bit multiplication overflow. The [recorded result](bcl-validation-
 covers host helpers; it does not exercise real IRQ concurrency or the PMIC.
 The adapter passes checkpatch and the full platform build without warnings.
 Battery accuracy, voltage-threshold propagation and mitigation need phone tests.
+
+
+The state-of-charge group adds `bcl_soc`. The sensor retains the Onyx
+`100 - battery capacity` reading and uses the 6.18 core's writable hysteresis.
+Each device owns its callbacks and work. Battery references are acquired and
+released per read; unavailable or invalid readings report an error without
+inventing a charge level. Battery notifications retry initial reads when the
+power-supply device appears after the thermal driver.
+
+Work starts only after thermal-zone setup and managed cleanup are ready.
+Teardown prevents further submissions, unregisters the power-supply notifier,
+and cancels work before unregistering the zone. The module includes its OF
+autoload alias. The adaptation passes checkpatch and the full platform build
+without warnings; capacity notifications and low-charge cooling still need
+phone validation.
