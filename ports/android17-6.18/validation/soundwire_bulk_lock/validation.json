@@ -1,0 +1,36 @@
+{
+  "status": "PASS",
+  "production_source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.c",
+  "source_sha256": "0410bec29dd0ff2c5ef37fadc5c4da2e808af2f5aca3b745e5c977ef5226fb76",
+  "results": {
+    "candidate": {
+      "returncode": 0,
+      "stdout": "PASS: 342 transfer/error/invalid/internal/concurrent scenarios; 6400 concurrent MMIO/callback writes\n",
+      "stderr": ""
+    },
+    "original": {
+      "returncode": -6,
+      "stdout": "",
+      "stderr": "original-test: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/soundwire_bulk_lock/original-test.c:29: mutex_lock: Assertion `rc==0' failed.\n"
+    },
+    "recursive-public-call": {
+      "returncode": -6,
+      "stdout": "",
+      "stderr": "recursive-public-call-test: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/soundwire_bulk_lock/recursive-public-call-test.c:29: mutex_lock: Assertion `rc==0' failed.\n"
+    },
+    "discard-backend-error": {
+      "returncode": -6,
+      "stdout": "",
+      "stderr": "discard-backend-error-test: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/soundwire_bulk_lock/discard-backend-error-test.c:237: main: Assertion `rc==expected' failed.\n"
+    },
+    "unlocked-internal-path": {
+      "returncode": -6,
+      "stdout": "",
+      "stderr": "unlocked-internal-path-test: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/soundwire_bulk_lock/unlocked-internal-path-test.c:36: assert_held: Assertion `m->held&&pthread_equal(m->owner,pthread_self())' failed.\n"
+    }
+  },
+  "scenarios": 342,
+  "concurrent_writes": 6400,
+  "scope": "Complete production bulk helper, public callback, ID packer. Error-checking pthread mutex exposes recursive acquisition; callbacks assert lock ownership. Allocation, PM and callback failures; 4 concurrent producers on both backends validate contiguous command batches and IDs.",
+  "limits": "No physical audio, SoundWire protocol/IRQ timing, real PM or netlink validation. FIFO and MMIO backend operations are host adapters. CMD Ignored origin remains unresolved."
+}

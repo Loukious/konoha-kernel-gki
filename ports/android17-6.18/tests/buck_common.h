@@ -144,6 +144,8 @@ static int sink_cb(struct mca_votable *v,void *data,int value,const char *client
 #define strategy_buckchg_set_iterm sink_cb
 #define strategy_buckchg_set_vterm sink_cb
 static int platform_class_buckchg_ops_get_online(int role,int *value) { (void)role;if(fault()||online_error)return -EIO;*value=0;return 0; }
+static int pmic_ready_status = 1;
+static int platform_class_buckchg_ops_is_init_ok(int role) { (void)role;return pmic_ready_status; }
 static int strategy_class_buckchg_ops_set_chg(struct strategy_buckchg_dev *i,bool en) { (void)i;hardware_enable=en;if(!en)direct_disable++;return 0; }
 static int strategy_class_buckchg_ops_adc_enable(struct strategy_buckchg_dev *i,bool en) { (void)i;if(!en)adc_disable++;return 0; }
 static int platform_class_buckchg_ops_set_ship_mode(int role,bool en) { (void)role;hardware_enable=en;return provider_error; }

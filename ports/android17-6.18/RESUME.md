@@ -1,46 +1,445 @@
-# Current Onyx 6.18 checkpoint
+# Current Onyx 6.18 experimental ZIP work
 
-Use `/home/loukious/Android/konoha-6.18-port-control` on `port/android17-6.18-onyx`.
-The 6.18 build workspace is `/home/loukious/Android/konoha-android17-6.18-port-20261031`.
-The original `konoha-kernel-gki` checkout remains the stable 6.6 tree.
+## Runtime result — 2026-11-01: BOOT FAILED, rollback verified
 
-Latest successful archive: `artifacts/20261031T232938953896Z`.
-288 platform modules; 18,369 imported CRCs; DT/overlay checks pass with the
-existing 1,084 vendor warnings. 285/466 ROM module names (61.2%) are covered;
-181 remain, including alternative hardware. No phone flash or boot is claimed.
-After this build, one extra terminal blank line was removed from the recipe's
-Kconfig; no configuration entries or driver source changed. The archive retains
-the exact Kconfig text consumed by its build.
+The user authorized backup and installation through Windows adb.exe/fastboot.exe.
+The original package required a system_dlkm resize that fastbootd refused before
+any image write. A device-fit variant used compact EROFS with unchanged file
+contents, exact existing DLKM partition sizes, and repeated offline validation.
+All five device-fit images flashed successfully to active slot A; vendor_boot
+readback matched. The user reported a white flash after the POCO logo followed
+by reboot. Android/ADB never appeared on 6.18. Offline checks did not establish
+runtime bootability; neither package is a successful boot-tested release.
 
-This checkpoint integrates native WCD9xxx/MBHC (2 modules), WSA/WSA2 (2) and
-RMNET extensions (7). Their isolated and integrated evidence, verifiers and
-fixtures are tracked under `validation/`; 52 compiled regression controls pass.
-The archived inputs include that directory. `audio-data-validation-20261101.json`
-links the integrated reports and module metadata. All source changes are in
-recipe patches 0121 through 0123; no build-warning or KMI bypass was introduced.
+All five modified partitions were restored from verified preflash backups.
+The phone now boots 6.6.144-Kono-Ha-Kernel, sys.boot_completed=1, with root.
+Device SHA-256 checks of all nine backed-up active-slot partitions match the
+original backups, including unchanged init_boot/recovery/vbmeta partitions.
+No userdata erase was performed.
 
-The old temporary handoffs are frozen and integrated. Do not run their setup or
-integration scripts again. Future Bazel or staging operations share
-`flock /tmp/onyx-6.18-build.lock`. Use the tracked build/stage scripts from this
-port directory, not the top-level 6.6 scripts. Current source/header hashes are
-in the per-group validation records. Keep baseline/common source pins intact.
+Pstore was empty after rollback; /proc/last_kmsg and recovery last_kmsg were
+unavailable. Previous-boot kernel logcat returned no saved log. The captured
+current dmesg belongs to restored 6.6 and cannot identify the 6.18 failure.
+The durable Qualcomm rawdump was subsequently recovered. It records repeated
+SMMU registration failures, storage-partition timeout and an init-exit panic.
+Patch 0137 fixes the driver-bound SMMU lookup during eager 6.18 IOMMU
+registration. See BOOT_DIAGNOSTICS.md and the current corrected candidate below.
+Do not repeat the same failing flash or infer the cause from the white flash.
 
-Next work: the WCD93xx codec/slave variants, WSA/third-party amplifiers and
-machine/audio consumers; remaining data, charging, diagnostic and peripheral
-drivers; matched vendor-ramdisk/system/vendor DLKM and boot images; then phone
-bring-up and KernelSU/NetHunter integration. `module-coverage-20261031.json`
-contains the exact remaining-name inventory. Establish actual provider and DT
-requirements when deciding whether an alternative module is needed.
+Backup and verification evidence:
+`/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z`
+See rollback-618.json and post-rollback/. ZIPs remain unchanged as test evidence.
 
-SHS OOM reclaim intentionally handles only the current online CPU. Stock GKI
-does not retain `cpus_read_trylock`, and blocking CPU-hotplug locks from OOM
-could deadlock. The normal RMNET paths remain native. Read the port records for
-the clock, codec, SoundWire and provider lifetime contracts and test limits.
+Goal: keep going until there is a verified flashable ZIP. The user explicitly
+selected **Experimental boot-test ZIP first**. Finish image/installer assembly
+before resuming optional-driver parity. See EXPERIMENTAL_ZIP.md.
 
-Onyx WLAN is ICNSS2/HIF_IPCI. ROM-listed CNSS2/PCIe/MHI support is not evidence
-that this phone needs a standard PCIe/MHI host for its active Wi-Fi transport.
-The selected custom monitor/direct-injection WLAN source pin is preserved.
+Control checkout: /home/loukious/Android/konoha-6.18-port-control on
+port/android17-6.18-onyx. Build workspace:
+/home/loukious/Android/konoha-android17-6.18-port-20261031.
+The stable 6.6 checkout remains untouched.
 
-User status estimate given: roughly 2–4 more working days to a first testable
-image, with low confidence. Overall completion cannot be timed reliably before
-boot and hardware testing. Module-name coverage is not hardware functionality.
+Current verified kernel archive: artifacts/20261101T170423790381Z.
+The failed runtime candidate is retained at artifacts/20261101T150526062786Z.
+314 platform modules, 20,074 platform imported CRC checks, DT/overlay checks pass.
+Vendor-name coverage is 310/466 (66.5%); the remaining 156 names include optional
+hardware and are recorded as experimental gaps. QRTR MHI/SMD/TUN selectors are
+all enabled as modules. Earlier 314 archive 20261101T150223403813Z had disabled
+selectors and is superseded. GKI Image and existing provider CRCs are unchanged
+from preceding checkpoints.
+
+Current module bundle: packaging/experimental-bundle-20261101-smmu-fix.
+Earlier failed-candidate bundle: packaging/experimental-bundle-20261101-314-v5.
+395 unique modules packaged; 424 catalog modules and 26,475 classic+extended
+imports verified. Vendor ramdisk and vendor DLKM each contain 319 modules;
+system DLKM contains 78. Four load lists pass dry runs; each physical partition
+tree passes clean depmod CRC checks. First-stage load order has 99 modules.
+Nineteen inactive first-stage variants have DT/consumer/init-reference evidence.
+USB, graphics and IPA are retained in vendor/recovery load lists.
+
+Three legacy soft dependencies (subsys_pil_tz, qcom_arm_smmu_mod,
+phy_msm_snps_hs) are absent from the shipping ROM module payloads and native
+modules.builtin. Native parent softdeps and their hashes prove these requests
+are optional; the bundle preserves that behavior. Hard dependencies remain
+mandatory. See experimental-module-bundle-20261101.json for all omissions.
+
+verify_modules.py now reads classic and extended ELF CRC sections directly.
+All 237 Rust Binder imports match; an extended-only CRC mutation is rejected.
+kmod 34.2 depmod -E disagrees on 41 long Rust symbols despite exact CRC matches;
+only those exact diagnostics are accepted after independent full verification.
+Rust Binder is not requested in the baseline load lists and is outside the
+physical partition closures, which have no depmod diagnostics. Failed/older
+bundle v1-v4 directories are retained as evidence; use v5.
+
+Completed offline assembly checklist (historical):
+1. Build boot, vendor_boot, DTBO, system_dlkm and vendor_dlkm images using the
+   current archive/bundle, packaging/baseline-20261101T011044Z layouts and local
+   Android host tools under custom-rom/out/host/linux-x86/bin.
+2. Preserve non-module vendor ramdisk contents, bootconfig, legacy-LZ4 format,
+   WALT android_arch_task_struct_size=512 argument, filesystem contexts, AVB
+   descriptors and partition limits. Boot ramdisk is empty; init_boot stays
+   untouched. Check filesystem/image sizes before choosing logical resizing.
+3. Unpack/audit generated images, then create an Onyx-checked AnyKernel3 ZIP.
+   Validate payload hashes/sizes and installer preflight-before-write with
+   mocked recovery/block devices. Package creation does not authorize flashing
+   a connected phone.
+4. Record omitted optional modules and deferred KernelSU/NetHunter completion
+   in the experimental manifest. Do not claim boot or working hardware.
+
+Use flock /tmp/onyx-6.18-build.lock for staging/building. Old setup, adaptation
+and integration scripts are one-shot and must not be rerun. Current patches
+run through 0137; source/evidence is tracked under validation/. GLINK ADC
+quarantines timeouts until DOWN/UP because native messages lack transaction IDs;
+duplicate successful same-channel replies remain a firmware assumption. No
+phone boot, physical hardware, firmware behavior or complete removal sequencing
+has been validated. Experimental ZIP now exists; see the completed package record below.
+
+COMPLETED EXPERIMENTAL BOOT-TEST ZIP: /home/loukious/Android/konoha-android17-6.18-port-20261031/release/Konoha-Onyx-6.18.33-Android17-experimental-boot-test-20261101.zip
+SHA256: 839e00566b3e3099578aec1829fb2b6f395e7f00fce64b39f71f1d663846240b
+Five images pass AVB, EROFS extraction, CPIO preservation and boot unpack checks. Archive hashes/modes/paths and payload manifest pass final audit. The real installer/patched AK3 core pass 24 mocked recovery scenarios, including both active slots, resize create/fallback, preflight rejection, write/readback failure and inactive-slot protection. Requirements: recovery on unlocked Onyx, active-slot DLKM mappings, and AVB/verity already disabled (vbmeta flags 3), matching the baseline. System DLKM grows approximately 1 MiB. init_boot/recovery/vbmeta are not flashed. At offline validation time no phone had been flashed. The later authorized runtime test failed; see the current result above. User-selected optional-driver parity and KernelSU/NetHunter completion remain future work after the boot test. See experimental-zip-validation-20261101.json.
+
+## Corrected diagnostic package — 2026-11-01
+
+Archive 20261101T170423790381Z has 314 modules and 20,074 import CRC checks.
+Only arm_smmu.ko changes; all GKI files are identical to the failed candidate.
+Five focused SMMU scenarios and three compiled negative controls pass.
+The corrected module bundle contains 395 unique modules with 26,475 classic
+plus extended import checks and four verified load lists.
+
+Images: packaging/experimental-images-20261101-smmu-fix-diagnostic.
+Boot cmdline adds ignore_loglevel initcall_debug to the preserved WALT argument.
+All five images pass unpack/AVB/filesystem checks and exact device DLKM limits.
+The installer passes 24 mocked scenarios; final ZIP hashes/modes/payloads pass.
+ZIP: /home/loukious/Android/konoha-android17-6.18-port-20261031/release/Konoha-Onyx-6.18.33-Android17-smmu-fix-diagnostic-20261101.zip
+SHA256: 150b529f76ddaa9410569415896e5347eafa16e64024e24c0267f56a044ba5a9
+
+Corrected diagnostic images flashed to slot A; vendor_boot readback matched.
+The corrected attempt FAILED: white flash and reboot, no Android ADB.
+Rollback completed and all five restored hashes match. Android boot is complete
+on 6.6.144. New rawdump is saved under logging-investigation/after-smmu-diagnostic.
+It confirms SMMU/UFS success and init second stage at 0.678251 seconds, then
+a silent stop/reset after the last console entry at 1.384110 seconds.
+Only coresight_funnel and qcom_spmi_adc5_gen3 initcalls remain unfinished.
+Prepare an explicitly recorded module-isolation diagnostic; these are leads,
+not proven causes. Do not repeat the same unmodified candidate.
+Installation receipt: installation-smmu-diagnostic.json under the backups.
+Before retry evidence: logging-investigation/pre-smmu-retry under the backups.
+Live pstore is a valid empty archive; Android archives contain 38 files;
+rescue archives are unavailable because the rescue hook has not run. Rawdump
+is valid and independently preserved. Do not rerun the single controlled
+panic; that approval covered one crash and has already been consumed.
+
+Previous module-isolation test FAILED: POCO logo then bootloops. Original
+images were restored; Android 6.6.144 boot completion and current pre-test
+partition hashes have been verified. Its collected rawdump had firmware
+records and reset status 0x42 but no kernel console; cause is unproven.
+
+COMPLETED AUTHORIZED VOLUME DOWN CAPTURE REPEAT:
+Same isolation build still failed to boot, but Volume Down alone reached
+FASTBOOT and automatic rollback restored original 6.6.144 on slot A.
+Android boot completion and all five restored partition hashes match backups.
+Recovered 566,404-byte / 6,820-line console confirms both blacklist entries.
+Last entry is at 1.584209 seconds without recorded panic/oops.
+Both SPMI and qti_devfreq_cdev device-link warnings recur from previous dump.
+Unfinished i2c_msm_geni and ipam initcalls are leads, not established causes.
+One successful capture does not establish why the previous dump lacked logs.
+Evidence and durable scripts: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/volume-down-capture-20261101T175009Z
+Result: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/volume-down-capture-20261101T175009Z/RESULT.md
+Phone remains on verified restored 6.6; no new hardware test started.
+
+NEXT REPAIR INVESTIGATION: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/volume-down-capture-20261101T175009Z/FIX_PLAN.md
+Read-only source/state analysis found qti_devfreq_cdev managed supplier-link
+ordering error; warning is not proven to cause reset. Panic/runqueue/task
+stack buffers remain zero. Watchdog initial pet precedes first periodic
+timer and does not prove a pet failure. Instrument I2C adapter/client
+probing (88c000), IPA platform probes, and watchdog progress before another
+test; change one variable at a time. No source changes/new boot performed.
+
+## Current diagnostic repair candidate — 2026-11-01
+
+User authorized implementing the repair and diagnostic plan. Patch 0138
+defers GPU cooling until its supplier is bound, using nonblocking locking.
+Patch 0139 adds opt-in I2C/IPA/watchdog checkpoints. Five exact-helper host
+cases and four compiled negative controls pass; strict checkpatch/replay
+and staged source hashes pass. New strict archive:
+/home/loukious/Android/konoha-android17-6.18-port-20261031/artifacts/20261101T181548804743Z
+314 platform modules, 20,080 import CRC checks; GKI Image is unchanged.
+Only i2c-msm-geni, ipam, qcom_wdt_core and qti_devfreq_cdev modules change.
+Current patches run through 0139.
+
+The new 395-module bundle, four load lists, five images, AVB/EROFS/CPIO/
+header audits and final ZIP hashes pass. The unchanged installer/core reuse
+the verified 24 mock scenarios after matching their exact hashes.
+ZIP: /home/loukious/Android/konoha-android17-6.18-port-20261031/release/Konoha-Onyx-6.18.33-Android17-boot-checkpoints-20261101.zip
+SHA256: 73e8cd2ab7cf5f45ba0d1bcebe95e6d481e1b414eb4e0cb0e2adfc50f31dff0b
+No module blacklist. Cmdline: android_arch_task_struct_size=512 ignore_loglevel initcall_debug i2c_msm_geni.boot_trace=1 ipam.boot_trace=1 qcom_wdt_core.boot_trace=1 watchdog_thresh=2 nmi_watchdog=panic,1 softlockup_panic=1 sysctl.kernel.hung_task_timeout_secs=5 sysctl.kernel.hung_task_panic=1 panic=1
+
+CURRENT LIVE TEST PREPARATION: candidate Windows images staged, all nine
+original images verified in both local and Windows backup sets.
+Pre-test logs and install/rollback/watcher scripts: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/boot-checkpoints-20261101T182307Z
+Phone remains on 6.6 until installation starts. Preserve rollback continuity.
+
+LIVE DIAGNOSTIC TEST: all five checkpoint images flashed successfully,
+vendor_boot readback matched, reboot issued. Watcher waits for Android or
+Volume Down FASTBOOT, then automatically restores/collects/verifies.
+Current attempt: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/boot-checkpoints-20261101T182307Z
+Do not leave failed test unobserved or start another candidate before rollback.
+
+CHECKPOINT HARDWARE RESULT: boot still fails; rollback completed and five
+original hashes plus Android 6.6.144 boot verified. New 501,407-byte console
+confirms checkpoint command line, init second stage at 0.793403 s and ends
+at 1.688437 s without panic/oops. GPU cooling now defers and device-link
+warning disappears. I2C/IPA not called before capture ends; pending modules
+are flash LED, power key, coresight funnel and GENI SPI, all unproven leads.
+Current attempt evidence: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/boot-checkpoints-20261101T182307Z
+Next diagnostic tests serial module loading; native vendor/system loaders
+fork each module, so their concurrent init makes the final module unreliable.
+Phone is on restored 6.6. No second diagnostic test has been flashed yet.
+
+
+## Serial module diagnostic prepared — 2026-11-01
+
+{
+  "status": "READY: waiting for user to be beside phone; no flash yet",
+  "attempt": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/serial-modules-20261101T184917Z",
+  "images": "/home/loukious/Android/konoha-android17-6.18-port-20261031/packaging/experimental-images-20261101-serial-modules-v3",
+  "loaders": "/home/loukious/Android/konoha-android17-6.18-port-20261031/packaging/serial-module-loaders-20261101-v2",
+  "checks": [
+    "six native/serial loader cases",
+    "three init service-selection cases",
+    "eleven actual device-policy access checks",
+    "on-device exact syscall read-only mount and vendor_modprobe domain probe",
+    "vendor_boot unpack/AVB audit; four other image bytes unchanged",
+    "all nine local and Windows originals hash-verified"
+  ],
+  "change": "Sequential module loads only, plus stderr begin/end traces; no blacklist or kernel/module byte changes",
+  "source_unchanged": "native ROM, stable 6.6 checkout and pinned kernel build workspace",
+  "bootability": "unproven"
+}
+
+Custom init imports services first, then all six standard config paths. Do not
+change to late overrides: Android rejects vendor service replacement across
+the Treble context boundary. Host selection controls prove both native service
+definitions are ignored duplicates and the custom definitions remain selected.
+Metadata mount is nosuid; the diagnostic bind clone is remounted read-only
+without nosuid, tested with exact mount syscalls in a private namespace.
+Metadata files are inert during original 6.6 boot; staging hash/labels required
+before flashing. User availability question is pending; do not reboot until
+they are beside the phone for Volume Down rescue. Current phone remains 6.6.
+
+USER AUTHORIZED LIVE SERIAL TEST: do it. Installation starting; maintain automatic rollback continuity.
+
+LIVE SERIAL TEST: five images flashed, vendor_boot readback verified. Watcher starting diagnostic reboot with automatic rollback on FASTBOOT. Do not leave failure unobserved.
+
+SERIAL TEST COMPLETE: failed; FASTBOOT at 38.64 seconds. Original 6.6.144 and five partition hashes verified. Console 629,555 bytes ends at 3.726891 seconds without panic. All I2C probe checkpoints complete. Only coresight_funnel initcall remains unfinished. DT/probe order: first eight ordinary dynamic funnels complete; next is /soc/funnel@10940000 with qcom,duplicate-funnel and real base 0x10983000. Native driver uses named real resource with shared devm_ioremap; upstream GKI driver uses dummy resource and claim MMIO. Patch 0140 adds native mapping to separately built 6.18 funnel module; archived recipe explicitly authorizes replacing only the matching GKI member. New strict archive 20261101T190442080906Z passed; GKI files and all old platform modules unchanged. Packaging underway; do not flash until checks pass. Stderr shell checkpoints are per-fd ratelimited; new diagnostic printk.devkmsg=on corrects capture.
+
+DUPLICATE-FUNNEL TEST READY: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/duplicate-funnel-20261101T191006Z
+Images /home/loukious/Android/konoha-android17-6.18-port-20261031/packaging/experimental-images-20261101-duplicate-funnel-serial; 315 platform modules, same GKI Image and all other module bytes unchanged. Full bundle/image audits pass. Metadata labels restored after original Android relabeling. No new flash yet; user authorized continuation and previous rescue worked.
+
+LIVE DUPLICATE-FUNNEL TEST: five images flashed and readback verified. Watcher rebooting with automatic rollback. Current attempt /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/duplicate-funnel-20261101T191006Z.
+
+LIVE TEST HAS NOT RETURNED USB AT 180 SECONDS. Experimental images remain installed; continuation watcher active without another reboot. User instructed Power+VolumeDown if stuck, release Power at screen-off then hold VolumeDown untilFASTBOOT. DO NOT CLAIM RESTORED or start another candidate; prioritize rescue.
+
+DUPLICATE-FUNNEL TEST RESTORED: user returned FASTBOOT, continuation watcher restored all five originals and verified Android 6.6.144 + hashes. New console is full 2MiB ring, SHA256 b1bc0b6bd2cbe6adefe58e5bd00c5594ef7cd4db11865452d2cb2d6655c2e45a. CPU7 reports CPU0 hard LOCKUP at 9.615122s then panic. SPI a90000 floods cb_ev=5, status2435, which is source-line no-pending-descriptor callback. Funnel module loaded; nt36532_touch remains in init. Earlier checkpoint output was overwritten by storm. Next inspect GPI ring RP conversion: driver reads low32 hardware RP then subtracts full64 DMA ring address, which can make the circular-ring loop target unreachable for high IOVAs. Phone safely restored; no live experiment remains.
+
+GPI RING TEST READY: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/gpi-rings-20261101T193410Z
+Patch 0141, strict archive 20261101T192956094941Z; only msm_gpi.ko changed, all GKI files identical. 14807 exact pointer/event-walk cases pass under ASan/UBSan; five compiled regressions rejected. Five matched images and original partition sizes audited. Native lists retained, no blacklist. Metadata verified and labels reapplied. No flash yet.
+
+LIVE GPI RING TEST: all five repaired images flashed; vendor_boot readback matches. Starting diagnostic reboot and automatic rollback watcher. Attempt /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/gpi-rings-20261101T193410Z. Do not start another candidate before restoring/validating or confirming 6.18 completion.
+
+GPI RING TEST RESTORED: 6.6.144 boot and five original partition hashes verified. New console 9edb20c8951d87dcf6435580634094574d6169d4cc1511314c810cd2c4d4ceb4; ring DMA 0x0ffffd9000 confirms high IOVA, event RP reconstructed to 0x0ffffd9010. SPI callbacks zero, nt36532 probe/init completes. Later panic at 6.825s in of_iommu_get_resv_regions+0x158; Cannot reserve IOVA region of 0 size followed by NULL dereference creating cvp_non_secure_cb. Investigate shared memory-region/iommu-addresses tuple parser and DMA translation before next patch/test. No live experiment remains.
+
+CVP BUS-CELL TEST READY: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/cvp-cells-20261101T194752Z
+Recipe CVP overlay, strict archive 20261101T194321288581Z. All kernel/module files unchanged since GPI repair. Only two parent DT properties added; native IOVA reservation bytes unchanged. Both board variants and exact pinned OF helper checks pass; three rejecting controls per board. DT-only reuse verifies only vendor_boot image bytes change. Five matched images and original partition sizes audited. Native lists retained, no blacklist. Metadata verified and labels reapplied. No flash yet.
+
+LIVE CVP BUS-CELL TEST: five images flashed and vendor_boot readback verified. Only vendor_boot image differs from GPI test. Watcher rebooting and preserving automatic rollback. Current attempt /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/cvp-cells-20261101T194752Z. Do not abandon rescue or claim restored until boot/hash checks complete.
+
+
+CVP TEST RESTORED: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/cvp-cells-20261101T194752Z. Android 6.6.144 and all five original hashes verified. CVP bus-cell correction initializes all four banks and EVA. Later WALT panic at 8.770198 seconds: REM_TASK src_nt_crs 108980 < task curr_window 196710; CPU2 main group totals already wrapped below zero. Source analysis identifies skipped transfer of retained window contributions for migrating delayed CFS tasks. Patch 0142 uses queue membership for migration and completes destination addition before runnable enqueue filtering. 24,192 extracted source lifecycle cases pass ASan/UBSan; original and two independent gate regressions rejected. Full strict build started; phone remains on 6.6, no new flash.
+
+WALT DELAYED TEST READY: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/walt-delayed-20261101T200820Z. User confirmed ready beside phone. Full build/CRC and image audits pass. Only sched_walt.ko changes; GKI and DTBs unchanged. One-shot rollback continuity prepared; phone remains on original 6.6 until installation.
+
+LIVE WALT DELAYED TEST: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/walt-delayed-20261101T200820Z. Five candidate images flashed; vendor_boot readback hash verified. Diagnostic reboot and automatic Volume Down rollback/capture watcher starting. Do not abandon rescue until original boot/hash validation or confirmed 6.18 boot completion.
+
+WALT DELAYED TEST RESTORED: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/walt-delayed-20261101T200820Z. Original 6.6.144 and five hashes verified. Corrected delayed migration does not resolve hardware panic: group removal at 8.918s, CPU5 main sum139698<task181554; CPU4/5 totals already wrapped. Patch0143 adds earlier migration source-total checks and task window/age/delayed state to the existing dump, preserving WALT debug policy. Next build/test captures the first unchecked subtraction; no experimental images currently installed.
+
+WALT PROXY SOURCE FINDING: pinned common/kernel/sched/core.c proxy_set_task_cpu() at3966 directly calls __set_task_cpu at3977, bypassing trace_android_rvh_set_task_cpu. Proxy paths move queued donors at7380 and blocked waiters at4041 without WALT subtraction or pending addition. CONFIG_SCHED_PROXY_EXEC=y and runtime enabled confirmed in captured console. Next candidate /home/loukious/Android/konoha-android17-6.18-port-20261031/packaging/experimental-images-20261101-walt-proxy-disabled uses upstream sched_proxy_exec=0 with0143 earlier invariants. Repacked boot only; all payloads and four image hashes match first-underflow candidate. That diagnostic was built but never flashed separately. Phone on verified6.6; metadata/rollback preparation underway.
+
+WALT DIAGNOSTIC TEST READY: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/walt-proxy-disabled-20261101T201805Z. User confirmed ready beside phone. Full build/CRC and image audits pass. Only sched_walt.ko changes; GKI and DTBs unchanged. One-shot rollback continuity prepared; phone remains on original 6.6 until installation.
+
+LIVE WALT PROXY DISABLED TEST: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/walt-proxy-disabled-20261101T201805Z. Five images flashed, vendor_boot readback verified, watcher rebooting. Source group-underflow checks plus sched_proxy_exec=0. Preserve automatic rollback continuity.
+
+PROXY-DISABLED TEST RESTORED: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/walt-proxy-disabled-20261101T201805Z. Original6.6 and five hashes verified. Runtime disabled confirmed; WALT-BUG absent before later audio OF IOMMU NULL dereference at8.923656s. /soc/spf_core_platform lacks explicit cells; audio child reservation uses two native1+1 tuples. Full reservation audit identifies this as the only remaining target parent missing cells after CVP fix. Audio overlay adds exactly #address-cells=1/#size-cells=1. Next full archive build running; kernel/module bytes unchanged. Boot recipe now preserves sched_proxy_exec=0 from archived boot-parameters inputs; image builder records its hash.
+
+AUDIO BUS CELLS CANDIDATE: strict archive20261101T202258312906Z. Both final boards differ only by SPF #address-cells=1/#size-cells=1. Exact pinned OF helpers preserve both native reservations; three controls per board reject. Audit covers all47 IOMMU tuples per board with valid phandles, explicit parent cells, nonzero lengths. All kernel/modules andDTBO bytes unchanged. Five matched images pass; DT-only reuse proves onlyvendor_boot changes from proxy-disabledtest; bootcmdline remains proxy0. Hardware staging in progress, phone remains verified6.6.
+
+WALT DIAGNOSTIC TEST READY: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/audio-bus-cells-20261101T202549Z. User confirmed ready beside phone. Full build/CRC and image audits pass. Only sched_walt.ko changes; GKI and DTBs unchanged. One-shot rollback continuity prepared; phone remains on original 6.6 until installation.
+
+LIVE AUDIO BUS CELLS TEST: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/audio-bus-cells-20261101T202549Z. Five images flashed and vendor_boot readback verified. Onlyvendor_boot differs from previous proxy-disabled run. Automatic watcher rebooting; keep rescue active until original boot/hash validation or successful6.18 completion.
+
+AUDIO BUS CELLS TEST RESTORED: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/audio-bus-cells-20261101T202549Z. Original6.6.144 and five partition hashes verified (observation.json). Audio IOMMU succeeds; no WALT-BUG before Wi-Fi idle shutdown at19.278s calls page_pool_destroy while holding pp_lock/BH. It now sleeps through synchronize_net in6.18 and corrupts scheduler atomic context. Watchdog cannot petCPU0 and bites21.009s. Patch0144 moves pool destruction outside locks in deinit/free/downsize; inactive timer queues work, shutdown stops producer before work drain. 700 extracted lifecycle cases pass ASan/UBSan; original-free, direct-timer-cleanup, missing-work-drain, original-resize controls fail. Strict checkpatch passes. Full build running artifacts/20261101T203629038944Z. Phone remains verified6.6; no new flash.
+
+WLAN PAGE-POOL BUILD PASS: strict archive20261101T203629038944Z; 315 modules/20,130 CRC import checks. Only qca_cld3_wcn7750.ko and its Module.symvers differ; no GKI or DTB changes. Validation inputs archived. Packaging underway. Correction: last watchdog thread/ipienter CPU0 is19.423225s, following Wi-Fi atomic fault19.278s.
+
+WLAN PAGE POOL TEST READY: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/wlan-page-pool-20261101T204000Z. User confirmed ready beside phone. Full build/CRC and image audits pass. Only WLAN module changes; GKI and DTBs unchanged. One-shot rollback continuity prepared; phone remains on original 6.6 until installation.
+
+LIVE WLAN PAGE-POOL TEST STARTING: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/wlan-page-pool-20261101T204000Z. Image checks and backup/metadata verification pass; 395-module bundle changes only WLAN module in two partition copies. Same load lists, bootcmdline proxy0, GKI andDTBs. User previously confirmed ready and authorized continuing live tests. Installer then automatic reboot/VolumeDown capture and rollback; preserve rescue continuity.
+
+WLAN PAGE-POOL TEST RESTORED: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/wlan-page-pool-20261101T204000Z. Original6.6.144 boot completion,slot_a and all five original hashes verified. New2MiB console SHA256 b316d18c94abb54f4c5b94c344cca9f1e939594596bf76d6aa89d796f5729948. Idle shutdown19.199s; scheduling-while-atomic,WALT-BUG,Apps watchdog bark all absent. CPU0 watchdog IPI returns normally through47.839s. Later modem fatal51.099641s: dog_hal_common.c:178 DOG detects stalled initialization; native recovery_disabled policy panics51.207s. Firmware fallback segments loaded and remoteproc up10.378s; GLINK IPCRTR probe succeeds10.408s. Cause unresolved. RESULT.json/RESULT.md/NEXT_INVESTIGATION.md preserve findings. USB UDC binding fails, preventing live6.18ADB. No further candidate flashed; current device is verified6.6.
+
+USB IPA TEST READY: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/usb-ipa-interconnect-20261101T205625Z. User confirmed ready beside phone. Full build/CRC and image audits pass. Only the USB IPA destination provider changes in the DTB; all kernel and module bytes match the previous test. One-shot rollback continuity prepared; phone remains on original 6.6 until installation.
+
+USB IPA CANDIDATE READY: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/usb-ipa-interconnect-20261101T205625Z. Strict archive20261101T205211724318Z passes315 module/20130 CRC checks. Both boards change exactly one destination phandle; all three directed ICC paths verified, original bad provider rejected. All kernel/module/bundle bytes unchanged; onlyvendor_boot image changes. Previous modem fatal remains unresolved. Candidate/backup/metadata verified; watcher gains one-shot receipt guard and live6.18 logcat/dmesg capture. User already confirmed ready and authorized continuing tests.
+
+USB IPA TEST COMPLETE: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/usb-ipa-interconnect-20261101T205625Z. USB controller succeeds; live6.18ADB observed kernel uptime12.73 through50.08s. 6694043 bytes live logcat/all plus2097140 bytes rawdump console saved. Modem fatal51.050744s repeats DOG stalled initialization, kernel panic51.159206s; cause unresolved. Original6.6.144 boot,slotA,boot_completed1 and all five hashes verified. RESULT.json/RESULT.md contain attribution, hashes, excerpts and limits. Baseline6.6 logcat/state saved. No experiment remains installed. QRTR ns.c is native and unchanged; do not mistake unused common QRTR for the built provider. Next fix requires modem host-dependency evidence; preserve USB provider correction and earlier fixes.
+
+MODEM SHARED-MEMORY TEST READY: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/msm-sharedmem-20261101T211233Z. User confirmed ready beside phone. Full build/CRC and image audits pass. The missing native msm_sharedmem module is added; all old module bytes, GKI and DTBs are unchanged. One-shot rollback continuity prepared; phone remains on original 6.6 until installation.
+
+MODEM STORAGE SOURCE DEFECT: live6.18vendor.rmt_storage mmap rmts failure at8.898338s; native6.6hasmsm_sharedmem,/dev/uio0,rmtfs4MiBphysical0xf1900000. Missing driver is active in both board DTs and omitted from diagnostic bundle; upstream qcom_rmtfs_mem has a different ABI and is not this provider. Patch0145 restores native sharedmem UIO, uses DMA coherent mmap and real sg physical address, preserves guard and nav sharing, handles failures/reclaim beforefree. 46 exact-helper ASan/UBSan cases and5 compiled regressions pass; checkpatch clean. Strict archive20261101T210947253145Z:316modules/20154CRC checks. All old platform andGKI files/DTBs unchanged; only newdriver+config/symvers. Bundle396modules; onlynewmsm_sharedmem copies added, native load order preserved. Test/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/msm-sharedmem-20261101T211233Z prepared with verifiedbackups/images/metadata; livecapture includesUIO attrs. User authorized sustained fixes untilcleanboot; maintain rollback continuity.
+
+USER STEERING 2026-11-01: keep USB-accessible 6.18 installed while debugging; do not routinely restore 6.6 between tests. Previous msm-sharedmem run stayed alive425.99s with Android completion unset. Rollback had already completed before steering; same byte-verified candidate was reinstalled without booting6.6 (reinstallation-live.json). Phone again runs6.18/slotA with ADB; live-return/ logs ongoing. Patch0146 repairs unlocked VIDC metadata queues and sparse BT SoundWire mapping (seven ports IDs1,2,3,5,6,7,8); reports sound-card deferred stage through dev_err_probe. Extracted queue/mapping sanitizers pass and both pre-fix regressions reject; common/card lifetime checks pass. Strict archive20261101T212516346613Z module CRC/DT checks pass. Packaging underway; onlythree module .ko files may change, GKI/DTBs unchanged.
+
+LIVE BOOT UPDATE PREPARED: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/live-boot-20261101T212740Z. Archive20261101T212516346613Z,316platformmodules/20155importCRCchecks; GKI andDTBsunchanged. Three changedmodules machine_dlkm,swr_ctrl_dlkm,msm_video. Fiveimages+AVB/filesystem/bootchecks pass. Candidateexperimental-images-20261101-live-boot-serial. Directadb rebootfastboot fromlive6.18 failed toreconnect; noimagesflashed. Bootloader briefly appeared(slotA,productonyx); directfastboot rebootfastboot also failed to reconnect. User instructedholdVolumeDown+Power untilFASTBOOT thenrelease. Recoverybridge script prepared: original3physicalbootfiles temporarilyforfastbootd,leave6.18logicalimages,flashall5candidate6.18images,readbackvendor_boot,rebootdirect6.18. Do notbootnormal6.6orrestore5images routinely; honorusersteering. Liveinstallscript hasusedone-shotreceipt; useinstall-recovery-bridge.py only afterFASTBOOT detected.
+
+
+BATTERY/BT TEST 2026-11-01: Android 6.18 boot completed on archive 20261101T214531222653Z. Patch 0147 changes gauge identity probe/vendor reads to 3 bytes, charge metadata to required 9 bytes, name prefix to 5 bytes plus NUL. Board compatibility overlay owns shared gpio80/wcn_sw_ctrl from TLMM default, keeps empty named states for Wi-Fi/BT. Both final board variants have exactly four property changes/two nodes; native mux bytes and active compatibles unchanged; helper/CRC/image checks pass. Installed through ADB bootloader and temporary verified physical boot bridge to fastbootd; five 6.18 images flashed and vendor_boot readback matches. Attempt battery-bt-20261101T214835Z. Battery now present/99%/4400mV/311 tenths Celsius/6185000uAh. BT platform driver binds and power-on ioctl reaches BT_ON, but UART open fails ENXIO: get_tx_fifo_size rejects RX depth > old 16-word software buffer. Fingerprint platform binds; vendor ANC sensor command returns16 and Xiaomi fingerprint Session crashes at0xc8. User reports fingerprint unavailable; included in scope. USB ADB remains working; no normal 6.6 restore.
+
+UART/FP CANDIDATE: patch0148 accepts RX depths to max register encoding255 and allocates corresponding 1020-byte FIFO storage; validates FIFO word count/trailing bytes before copies. Extracted FIFO/receive suite accepts every supported depth and receive count; old-depth/small-buffer/missing-bound regressions rejected under ASan/UBSan. Also logs fingerprint power supply/operation result to distinguish successful power/reset from secure sensor exchange failure. Strict archive20261101T215421775494Z build passes; only msm_geni_serial.ko/mi_fp.ko change, GKI/DT bytes unchanged. Packaging underway in experimental-images-20261101-uart-fp-serial. Phone still on battery-bt candidate. Live capture19399 died on transient host WSL/ADB timeout; restarted APPENDING via session82430 with timeout handling, so original logs preserved. Current capture script observation errors should be retried. Keep USB-accessible6.18 installed; update via verified bridge when needed. Other clean-boot defects remain (DRM bridge lifetime API, IOMMU fault-handler cookie conflict, OF cells warning, display polling sleep underflow, camera service aborts, charger status still unknown).
+
+
+UART/FP LIVE RESULT AND IRQ CORRECTION — 2026-11-01: installed UART/FP candidate boots6.18/slotA/boot_completed1. Bluetooth ON, zero crashes and encrypted LE band connection observed; audio not exercised. Battery present99%/4423mV/6117000uAh; status1 UNKNOWN remains. Fingerprint discovery Goodix power-on succeeds then disable unrequested IRQ cmd0x6704 returns-ENODEV, aborting that HAL. Later ANC secure init response16 causes service NULL crash0xc8. REA snapshot reused; ev_79dcc872b8220e5a5f35393f4f70275809190a1e278736d5e1a87d088239e08d corroborated exact assembly: AncCaSendCommand returns secure first word after successful transport, so16 is vendor response, not Linux errno. Exact error name unknown. Logs/evidence saved under uart-fp-20261101T215723Z/RESULT-before-fp-irq.json. Patch0149 restores idempotent disable-before-request behavior, preserves enable-before-request rejection. Exact IRQ lifecycle ASan/UBSan candidate passes/original rejects. Full archive20261101T220742505386Z passes316 module CRC andDT checks; packaging experimental-images-20261101-fp-irq-serial underway. Onlymi_fp.ko may change, GKI/DTBs unchanged. Current device remains USB-accessible6.18; continue verified bridge installation once packaging passes, no routine6.6 restore.
+
+FP IRQ LIVE TEST: candidate316modules/396packaged passes; GKI andDTB bytes unchanged, onlymi_fp.ko differs. Fiveimages flashed through physical-boot recovery bridge, vendor_boot readback matches. Rebootissued; capture session40569 waits6.18ADB. Attempt fp-irq-20261101T221015Z. Maintain6.18USB access; hardwarefingerprint resultpending.
+
+FP IRQ RESULT: Android6.18 bootcompleted1/ADB. Goodix now passes disable, reset, secure initialization andHALversionV03.02.05.64; fails nextGF_IOC_ENABLE_IRQ cmd0x6703 result-19. LegacyHAL usesINIT+ENABLE withoutREQUEST_RESOURCE, matching6.6baseline. Patch0150 registersIRQ lazilyonENABLE with real requesterror propagation, shares helperwithREQUEST_RESOURCE, keeps teardown unchanged. Exactsource lifecycle candidatepasses, before+prematurestate+ignoredfailure controlsreject underASan/UBSan. Fullbuildinprogress. Cameraaddedtoscope; independentread-onlyinvestigation agentactive.
+
+FP ENABLE BUILD/OFFLINE PASS: archive20261101T221421278257Z316modules/396packaged, onlymi_fp.ko changed vsFPIRQ; GKI/DT unchanged. experimental-images-20261101-fp-enable-serial AVB/filesystem/boot auditsPASS. Notflashed yet: combining camera registration correction with fingerprint to reduce reboot. Camera agenttracedCSLInitializeHW failure to missingrequest-manager entityfunction: registration resetsfunction beforeuserspaceenumeration. Workingnative assigns vendorfunction afterregistration. Currentphone still6.18FPIRQcandidate.
+
+CAMERA DIAGNOSIS/PATCH: camera service abortsCSLInitializeHW Failed to acquire requestManager invalid; dumpsys0devices. Port0119movedCAM_VNODE_DEVICE_TYPE assignment beforeregistration; commonV4L2 overwritesfunction0x10000withgeneric0x10001, whichcollides withnative sensortype. Pinnednative assignsafterregistration. Patch0151restoresafter-success assignmentwithoutchangingpad/failurecleanup. validation/camera_request_manager exactsetup success/allocation/pad/registerfail casespassesASan/UBSan; prepatchrejects. Strictcheckpatch clean. Cameraagent report /tmp/onyx-camera-findings.md. Fullcombinedcamera+fp buildrunning, willpackage andflashonceauditsPASS. Noextrauserbuttonneeded; current6.18USB preserved.
+
+COMBINEDCAMERA/FP READY AND LIVE: archive20261101T221937596411Z316platformmodules,396packaged, moduleCRC/DT/AVB/filesystem/boot auditPASS. Onlycamera.ko andmi_fp.ko differfrominstalledFPIRQcandidate, GKI/DTB identical. Attempt/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/camera-fp-20261101T222213Z. Userauthorizedcontinuedfixes. Installer10671flashingvia verifiedphysicalrecoverybridge; no normal6.6boot. Needverifycandidatevendor_bootreadbackthenrebootcapture andinspectfingerprint/camera. Battery98after99confirmslivepercentupdates; chargingstatusUNKNOWNremains.
+
+USERCONFIRMS fingerprint andcamera bothworkingoncombinedcamera-fp candidate. Previewchoppy. Logreview rearrequested30fps,median20.87(n21), render/processingtimeouts. CameraagentprovescurrentproviderCPU/cpusetcamera-daemon despitewrongcgroupmessage; baselineSYNXerrorsunchanged, noadditionalcamerasourcecauseyet. Startupdisplaydrm_bridge_attachrefcount0warnings anddetachunderflows fromoldallocator; displayagentinvestigatingmodernmanagedbridgeAPI. DisplaykickoffusleepWARN comesfromtimeout_us-1000unsignedunderflow ifEPTremaining<1ms. Patch0152clampsbackofftoavailabletime;10007exactcallcontractsPASS/originalrejects. Noadditionalimagesflashedyet, working6.18USBcandidatepreserved. OtherrealwarningsIOMMUfault-handlercookieconflictandIPAOFparentcellsremain; chargingstatusUNKNOWN.
+
+DISPLAYCORRECTIONS OFFLINEPASS: archive20261101T223545651535Z316modules, onlymsm_drm.ko differsfromworkingcamera/fpcandidate, GKI/DTunchanged. Patch0153usesdevm_drm_bridge_alloc onDRMmasterdevice(outeraggregate devresgroup) andremovesearly/manualfree; reference/lifecycle100cyclespasses, before+earlyfreecontrolsrejectASan/UBSan. Patch0152EPTbackoffclamp10007casesPASS. Notflashedyet: logreviewfindsPowerHAL6488writefailures toLLCCBWMONcontrols. Nativebwmon.ko wasomitted(noOFaliasesclassifiedneedsassessment); actual240b7400LLCCand24091000DDRplatformdevicesunbound, qcom-bwmon driverabsent. RestoreactualnativeBWMONproviderunderinvestigation, noaliases/dummycontrols. Working6.18USBinstalled.
+
+BWMON/DISPLAY INSTALL: full archive20261101T224209314131Z passes317 module verification and packaging397 modules. Added bwmon.ko; only msm_drm.ko changes versus installed camera/fingerprint archive, GKI/DTBs identical. Patches0152/0153/0154 tested offline. /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bwmon-display-20261101T225345Z. Installing through verified physical-boot bridge to fastbootd; direct6.18 reboot after five images and vendor_boot readback. User reports camera-only choppiness; limit followup to concrete kernel errors, leave ROM behavior if these clear. Hardware result pending.
+
+BWMON/DISPLAY LIVE RESULT: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bwmon-display-20261101T225345Z. Five candidate images flashed, vendor_boot readback verified, direct6.18 reboot. boot_completed1/slotA/USB. Both LLCC/DDR devices bind qcom-bwmon, all six actual controls present; LLCC max1211200 sample4 io80 hyst0 hist20 trigger3. PowerHAL LLCC failures0, DRM refcount0, display usleep warnings0 in new boot capture.7 cameras, fingerprint HAL deaths0, BT ON/crashes0. Camera preview not sampled because user0 remains RUNNING_LOCKED pending first PIN/password unlock; capture session44550 is active, console/tmp/onyx-bwmon-display-live-capture.log. User requested to leave ROM camera behavior if no kernel defect established; do not keep tuning camera without further evidence. Charging UNKNOWN/retries and IOMMU cookie/OF cell warnings remain. RESULT.json and validation/bwmon/live-result-20261101.json preserve evidence. Next action only: user unlocks/opens rear preview about30s, parse CAM-PERF cameraID/FPS/exposure and compare prior median20.87fps, check targeted warnings remain absent. No further patch/build/reboot required for that comparison.
+
+CONTINUATION 2026-11-02: installed bwmon-display archive20261101T224209314131Z stays USB-accessible6.18/boot_completed1. Rear-preview11samples median30.16FPS (28.32–32.16), zero processing/texturetimeouts; subjective pacing remains unverified. User limits camera followup to demonstrated kernel defects. ChargingUNKNOWN persists; current battery95%. Prepared155 buck PMIC readiness defer plus voltage-callback NULL-deref correction;2500probe/4001voltage cases ASan/UBSan PASS, pre-fix controls reject. Prepared156 display/EVA private IOMMU fault-handler lifetime and shared-domain teardown plus msm_eva qcom_iommu_util dependency; dispatch/caller ASan/UBSan PASS. IPA overlay adds exact parent1+1 cells to both boards;47reservation tuples and native pools/translation preserved under exact-helper sanitizer checks. Prepared157 nine presence queries for eleven observed valued properties, preserving actual OF presence semantics/data;22board fixtures PASS; fixed CPAS style. Prepared158 optional diagnostic audio device preserved, real hw votes retained;280actual-helper accounting cases and six rejection controls PASS. Strict checkpatch155–158 PASS. Reports/source snapshots in validation/. Final-stage IOMMU caller host adapter updated for of_property_present. Starting strict full build; none of155–158/IPA are installed yet. Capture process1312846 active appending old attempt logs. No routine6.6 restore; updates use physical-boot fastbootd bridge and direct6.18 boot. Full warning ledger remains incomplete.
+
+KERNEL WARNINGS BUILD/OFFLINE PASS: archive20261101T232730636087Z,317platformmodules,20227CRCchecks; exactly eight changed modules mca_strategy_buckchg/msm_drm/msm-eva/spf_core_dlkm/camera/msm_kgsl/hdcp_qseecom_dlkm/lpass_cdc_dlkm. All GKI unchanged. Both DTBs only gain two IPA parent properties; native DTBO unchanged. experimental-images-20261102-kernel-warnings-serial passes five matched image/AVB/filesystem/boot audits;397packagedmodules, identical module loaders and boot. Final composed source hashes validation/kernel-warnings-staged-source.json and final-stage IOMMU caller sanitizers PASS. Preparing bridge installation, not flashed yet. Additional BCL cause identified: PMK8550 SDAM7000 unbound while other SDAMs registered; sm1510_present reg93/len1 bits5+5 exceeds1byte and new6.18 DT NVMEM parser rejects; old6.6 accepted and expanded physical read to2bytes. DT-wide audit finds exactly one invalid cell. Preserve old effective bitfield/read geometry before proposing correction; live BCL outcome not yet verified.
+
+INSTALL ENTRY NEEDS HARDWARE FASTBOOT: attemptkernel-warnings-20261101T233135Z; ADBrebootbootloader returned Android6.18 boot_completed1, bootreasonbootloader, no images flashed. Original installation receipt contains only shell/reboot; fastboot getvar timedout60s. User instructed hardware Power+VolumeDown via async input. install-fastboot-continuation.py prepared with new one-shot receipt, previous receipt validation, and verified product/slot/unlocked/nonuserspace before any flash. Candidate remains ready. Do not rerun used installation-recovery-bridge.py.
+
+KERNEL WARNINGS INSTALLED: hardwareFASTBOOT user confirmed; install-fastboot-continuation.py flashed five matched6.18images through verified physical boot bridge and verified vendor_boot readback. Directreboot6.18, livecapture47487;ADB12s,boot_completed1at27s,uptime44s. Battery94%,status2CHARGING,ACpoweredtrue (previousUNKNOWN). Buck livechecks pending. User suspects previous bootloop; capture uptime/reboot/crash records and retain working6.18. SDAM cell overlay now integrated separately in recipe, not current installed archive; exact native/current parsers accept correctedreg2 and preserve offset5d,bits5+5,raw read2bytes plus siblingOCP.65536all possible two-byte read values identical underASan/UBSan; four malformed spansreject. Both board diffs exactlyoneproperty and full bitfield auditclean. Preserved early consoles explicitly showinvalidbits and provider registration-22. New fullbuild will validate DT-only archive; do not claimSDAM/BCLfixed untillivebinding.
+
+MICROPHONE SILENCE SOURCE DEFECT: user confirms no level or voice on built-in mic in calls and recordings. PAL starts successfully and AudioFlinger receives frames; privacy/mute clear. Native Onyx uses WCD9378 analog SoundWire capture. Port0117 explicit pending ownership accidentally excludes analog muxes from delayed unmute (native only skips synchronous reset); hw_params leaves PGA mute0x10 set. Proposed0159 preserves reset skip but queues analog channels for existing delayed unmute/ownership. Production-source analog route/cancellation/shared-stream/failure/headset tests added; validation and hardware results pending. Installed232730 remains USB-accessible6.18; SDAM overlay is ready for combined build.
+
+MICROPHONE OFFLINE TESTS PASS:0159 candidate passes all16 production-source TX groups underASan/UBSan, including24 analog route lifecycles (mux1–3,dec0–7): delayed schedule/reset skip, cancellation, idempotence, shared capture,last-owner mute,error rollback,headset mute. Pre-fix source fails specifically atmissing stream_pending bit. Strict checkpatch clean using existing no-signoff/commit-message exemption for raw recipe diffs. Fullbuild session41201, artifacts20261101T235034935544Z, includesSDAMoverlay. User also reports vibrator may not work; standard driver diagnostics underway.
+
+VIBRATOR ROOT CAUSE: user reports all vibration absent. Installed Awinicprobe fails-107/NACK; preserved native6.6 has same unusedvariant failure but actuallybinds SiliconIntegrated si_haptic at5-006b/input7 and loads native aw8697_haptic.bin. NativeSi driver hasnoOFalias so inventory omitted asrequiresassessment; DT silicon,sih_haptic_688X isenabled.0160 imports17pinnednative files, adds realmodule/aliases, modernhrtimer_setup and correct init/publication/cleanup ownership, firmware callback drain, actualinputdev teardown/devmregmap ownership, boundedmappedstream descriptors and pagelifetime.16startupfailurepoints/fournegativecontrolsASanUBSanPASS;strictcheckpatchclean. Build53694 artifacts235718 inprogress(staged firstversion); finalrestage required for alignment-only adjustments. Noimagesflashed.0159mic archive235034PASS317modules/20227CRC withonlyTXmodulechanged, GKIunchanged, SDAMbothDTBs onlyreg2; packaging paused tocombine actualSi driver.
+
+MICROPHONE/VIBRATOR FULLBUILD PASS: archive20261102T000429634944Z has318platformmodules andmatchingCRCverification; GKI byteidentical toinstalled232730; onlyexistingKOchange lpass_cdc_tx_macro_dlkm, newsi_haptic. NativeSi chip/table/firmware retained, correctOFaliasespresent. FinalstagedSi lifecycle+streamASanUBSanPASS, sourcehashese789e1b7/def9ed51;0159analogtestsPASS. Earlier235718 buildfailed due native removedAPIs/prototypes, allcorrected in0160 beforefinalpass. Standardimageassembly nowinprogress, firststage42820. Installed6.18stillstableuptime1618s, battery94/status2CHARGING. Nothingflashedyet.
+
+MICROPHONE/VIBRATOR READY FOR HARDWARE FASTBOOT: fullartifact20261102T000429634944Z318modules/20333CRCchecks,398packaged. Standardassembly/AVB/filesystem/bootchecksPASS; experimental-images-20261102-microphone-vibrator-serial. Boot+dtboimages byteidentical toinstalled; vendor_boot includes validatedSDAMreg2, vendor_dlkm TXcorrection+realSi module. Genericserialloaders unchanged (readrebuiltmodules.load, containsSi); no metadataupdate. Freshattempt/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/microphone-vibrator-20261102T000647Z; freshone-shotinstall-fastboot.py andWindowsstage in candidate-preparation.json. --verify-onlyPASS validates allimages/originalphysicalbridge/currentpreflash6.18state. Notflashed. Oldcapture1351568SIGTERMgraceful; newlive-618/capture.py prepared. Nextaction:userhardwarePower+VolumeDown untilFASTBOOT then release; installerusesoriginalphysicalbootbridge onlyforfastbootd thenallfivecandidate6.18images/readback/directreboot. Afterflashstartnewcapture immediately, thenaskunlock/micrecording+vibrationoneshot/callverification. Do notrerunusedone-shotinstallers.
+
+MICROPHONE/VIBRATOR INSTALLED AND LIVE: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/microphone-vibrator-20261102T000647Z. USBinitiallynotdetectedhardwareFASTBOOT; userreplugged, fastbootserial5493f3c6detected. Freshinstall-fastboot.py successful:originalphysicalbridge onlyforfastbootd,allfivecandidate6.18images, vendor_bootreadbackPASS,directreboot. ADBuptime12.22s/bootcomplete27.32s;monotonic29samples through435.78s(445slatestexplicit),nocurrentbootloop. Si driverbinds5-006b/inputevent2, userconfirmsvibrationworks. UserMessenger voicecaptureworks; RecorderinitiallyfailedbecauseitautoselectedFMtunerdevice24/type16. LogsRecorder_MicrophoneMana show selection24thenuserselectedbuiltin21/type15; usernowconfirmsRecorderlevelandvoiceplaybackworks. Phonecallverification pendingasyncquestion (do notclaimcallsverified). Battery93/status2CHARGING; PMK8550SDAM7000nowbinds, bothPM7550BA/PMXR2230BCLdevicesbind bcl_pmic5. Priorcamera7/2normal,fingerprintHALdeaths0,BTON/crashes0,LLCC/DDRstillbind. ResultJSONpreservesevidence. Captureallbufferssession40794 doesNOTincludekernelbuffer;explicitkernelstreamsession66179 added. Firstkernelbuffercheck~60s andlaterexplicitstream haveWARN/oops/panic/TXunmute/hwvoteerrors0;earliestbootmayalreadybeoverwrittenbySiINFOlogs, do notclaimcompleteearlybootwarningabsence. All-bufferlogcontinuousfromADB12s. Newcurrentattemptpointerupdated. Remainingfullwarningledgerunfinished;calltestawaitinguser.
+
+CALL MICROPHONE VERIFIED: user confirms normal phone calls work after the microphone/vibrator update. Patch0159 live capture verified in Messenger, Recorder (after selecting built-in mic instead of FM tuner), and calls. Patch0160 vibration also user confirmed. RESULT.json and warning ledger updated. This completes the microphone/vibrator repair; the broader kernel-warning ledger remains unfinished.
+
+CHARGING PATH/USB NEXT CANDIDATE: patches0161/0162; full strict archive20261102T003104706329Z PASS. Only dwc3-msm, mca_path_control, phy-msm-snps-eusb2 change versus installed000429; GKI and both DTBs unchanged. Native startup worker reads state without applying gates; port incorrectly adds path_apply_condition during snapshot. Restore observation-only startup.24 actual-helper states,3 per-provider failure stages,192 probe fault points,27 invalid schemas,31 controls and worker/setter removal ASan/UBSan PASS; original rejects. Explicit native missing boost rows continue ENOENT. Board sub-PMIC config source0/shared rows2; actual source hardware override and precise live ENOENT origin remain unobserved. No electrical gate/source/DT policy changed. USB extcon/regulator presence calls corrected with4 board fixtures. Packaging in progress; installed microphone/vibrator/calls/Recorder working. No new flash or reboot.
+
+PATH/USB READY FOR HARDWARE FASTBOOT: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/path-usb-20261102T003458Z. Artifact003104 has318 modules/20333CRCchecks;398packaged. All5 matched images AVB/filesystem/partition/boot auditPASS. Onlydwc3-msm/mca_path_control/phy-msm-snps-eusb2 changed; GKI/DTB/workingTX+Si unchanged. EROFS randomUUID makes system_dlkm image bytes differ, but97entries/filebytes/links/modes/extractedxattrs identical; generated hash trees/AVB validated. boot/dtbo unchanged. Windows images and9originalbackups hashed; install-fastboot.py --verify-only PASS. User asked to enter hardwareFASTBOOT; noinstallation/reboot yet. Pointer/tmp/onyx-path-usb-attempt.txt; keep/tmp/onyx-capture-attempt.txt oncurrentmic/vibattempt until actualinstallation. Newlive-618/capture.py starts explicit-bkernel before-ball immediately after6.18ADBappears. Do not rerun one-shotpackage/used installers. Next: detectFASTBOOT, runNEWattempt install-fastboot.py once, verifyFLASH_PASS then directfastboot reboot andnewcapture. Userauthorizescontinuing fixes; retain6.18 between tests.
+
+USER ASKS WHY adb reboot fastboot BOOTLOOPS: explained fastbootd recovery route versus hardware bootloaderFASTBOOT. Saved recovery header kernel_size0 confirms it uses bootkernel, so workingnormal6.18Android does not validate recovery boot. Exact crash remains uncaptured; no provenCRC/module/init cause. Marked unresolvedrecovery route inledger. CurrentADB/fastboot queries bothshow no devices during userhardwarestep; do notassume reflashed or restored. Newpath-usbcandidate stillready/unflashed.
+
+PATH/USB INSTALLED: hardwareFASTBOOT detectedserial5493f3c6. Newinstall-fastboot.py successful;5candidateimages flashed viaoriginalphysicalrecoverybridge, vendor_bootreadbackPASS. Direct6.18reboot issued; captureexecsession40367 begins explicitkernel+all atfirst6.18ADB. Currentattemptpointer now/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/path-usb-20261102T003458Z. Recoverybootissue concretelead: diagnosticandroidboot.init_rc pointsmetadata; recoveryfirststageskipsmount, LoadBootScripts usesexclusiveoverride/no fallback. Currentcandidate preservesoldbootconfig; fastbootd remainsunfixed. No furtherrecoveryreboot authorized asdiagnostic capture yet; useprovenbridge. NextwatchADB/monotonicuptime/battery/pathinitialerrors and USBbindings.
+
+PATH/USB LIVE RESULT: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/path-usb-20261102T003458Z. ADB12.76s,bootcomplete22.92s; monotonic14samples through152.43s. Explicitkernel startup+continuouscapture: pathinitialerrors0/valuedOFwarnings0/kernelWARNCPU0/panic0. Chargingstatus2,level92; actualmsm-dwc3a600000.ssusb/eUSB88e3000/sih_haptic5-006b/bothBCLbound. BluetoothON/crashes0,camera7/2normal. ExistingworkingTX/SiKO byteidentical. Oldmiccapture2127708 gracefullystopped; newcapture40367continues. RESULT.json andvalidation/path_initial_snapshot/live-result preserved. Fullgoalactive; recoveryfastbootd metadatainitoverride stillunfixed, sourceevidencevalidation/recovery_init_override/analysis.json. OneearlyBPFpolicywarning plusoneearlybatteryproviderstatusfailure nowvisible; completeearlyboot not guaranteed. No camera changes.
+
+RECOVERY PROPER SOURCE FIX PREPARED: userrejectedmetadatafallbackbootstrap; nonecreated. RECOVERY-only LoadBootScripts checksexistingro.boot.konoha_serial_modules andclearsnormalbootmetadataoverridebeforenativescriptselection; standardnon-diagnosticrecoveryoverridesandnormalAndroidunchanged. Patchrecovery/patches/0001-scope-normal-boot-serial-init-override-out-of-recovery.patch, pinnedAndroidcoreee96af. Exactshippedarmv8-2a-dotprodinitbcdc7ef7 matcheslocalSoongvariant. MinimalNinjagraph496global/rule/selectededgeblocks recoversactualcompile/link/stripflags; baselinefullbinaryreproducesbyteforbyte. Candidate0de887d9compiledlinked;17NEEDEDlibsunchanged. ProductionLoadBootScripts fullfunction16modecasesASanUBSanPASS/originalrecfails; nativefullRCdirectoryhostinitverifierPASS. Recoveryimage/home/loukious/Android/konoha-android17-6.18-port-20261031/packaging/recovery-init-fix-20261102/recovery.img SHAcd4a2ccff5bd02170ac4054780eeb72b7ff9ecacfc2c79f70010d416cc28e5f3; onlysystem/bin/init changes,659rawCPIOrecords/paths/header/keypreserved. Newattempt/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-init-20261102T005304Z; Windowsrecoveryimagehashed; install-recovery-init.py --verify-onlyPASS. Flashesrecovery_aONLY, controlledfastbootdtest,sixreadbacksverifyrec+fivecurrent6.18images then directAndroidreboot. Preparedrescue-android.py restoresoriginalrecovery+physical3bridge then SAMEcurrent6.18fiveimages ifrecoveryfails, no routine6.6boot. Notflashedyet. Currentcapturing40367 onstable6.18pathusbbuild003104. NextuserhardwareFASTBOOT needed; donotreuseoldinstallerreceipts.
+
+RECOVERY HARDWARE TEST READY: allbinary/16sourceselection/nativeRC/17lib/imageAVB/rawCPIO/headerchecksPASS. Eightactualinstaller fastbootmockcases PASS (wrongproduct/slot/locked/userspace/size, recoverytimeout, readback mismatch andsuccess); no normalrebootonfailedverification. Rescue--verify-onlyPASS. Userasked toenterhardwareFASTBOOT viaasyncquestion; currentphone6.18bootcompleteuptime1042s, noflashyet. Attempt/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-init-20261102T005304Z, pointer/tmp/onyx-recovery-init-attempt.txt. Existingkernelcapture40367stillactive. NextdetectFASTBOOT, runinstall-recovery-init.py ONCE; itflashesrecoveryonly,testfastbootd,readbacks6images,thenAndroidreboot. Startnewattemptlivecapture immediately afterREBOOT/installerfinish; userinitialphysicalFASTBOOT needed.
+
+RECOVERY CRASH CAPTURED AND ANDROID RESTORED: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-init-20261102T005304Z. Original recovery init-only candidate timed out; rescued original recovery and working6.18 images. Evidence collection initially blocked by unsupported fastboot fetch recovery; then native recovery ADBrequired Advanced/EnableADB and adbroot (userselected). NativeADBstate is recovery, ro.bootmodeunknown; correctedcollectoracceptsrecovery. Rawdumpconsole769619bytes/8922lines confirms6.18panic2.924s inmsm_gem_mmap_obj+0x70 withobjfilpNULL; recoveryparsednativeRCandstartedUI,16MiBVRAMcarveout. Patch0163 guards shmemredirectionbyobjfilp andusesvma_set_file; actualmmapharnesspending. Fullbuild/tmp/onyx-display-gem-mmap-build.log running. Samefive6.18imagesreflashed/readbackPASS/directAndroidbootcomplete21s; originalrecoveryhash verifiedviaADBroot. Newlivecapture64184 startsADB11.7s. Useraskedwhetherkernelorrecovery: now confirmed kernel displaybugtriggeredbyrecovery. No newcandidatehardwaretestyet.
+
+DISPLAY GEM/RECOVERY FIX READY: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/display-gem-20261102T011821Z. Patch0163 actualdriver+vma_set_file harness36cases ASanUBSanPASS/originalNULLcrash+offsetregressionrejected/checkpatchclean. Fullartifact20261102T011441104570ZPASS318platformmodules; onlymsm_drm.kochanges,allGKI/DTBs/otherplatformfilesbyteidenticaltoinstalled003104. Standardfirststage,bundle398modules,all5imageAVB/filesystem/headerauditsandserialloadersPASS; changedKOcopiesonlyvendor_ramdisk+vendor_dlkmmsm_drm. Newimage reportSHA62232d9e774e41fdb891ceb46945c6d06abad9adde356a52650c5b32399c5f44;boot/dtbo/loadersunchanged. Freshinstallerstagedfiveimages+recoveryinitimage;fullbackup/imagepreflightPASS. Freshrescueoriginalrecovery+previousworking6.18pathUSBpreflightPASS. No candidateflashyet; awaitinghardwareFASTBOOT. Installerflashesfivecandidateimagesthenfixedrecovery,rebootissuedseparately afterFLASH_PASS; do notuseunsupportedfastbootfetchrecovery/system/vendorDLKM. VerifyAndroid6hashesviarootsuandcontrolledadb rebootfastboot userspaceyes, thenAndroidreturn. Currentphoneworking6.18previouspathUSB,originalrecoveryrestored;livecapture64184retaineduntilinstallation. Pointer/tmp/onyx-display-gem-attempt.txt.
+
+
+DISPLAY GEM HARDWARE TEST FAILED AND ROLLED BACK: {"status": "FAILED recovery test; new NULL guard confirmed; original recovery and working previous 6.18 restored, Android boot_completed=1", "dump_sha256": "8a2bdcc13c19ba37b380b9c1633eb8ec94612f65a190b5bf8283e18ede171aba", "dump_bytes": 892949, "original_mmap_null_oops_absent": true, "new_failures": ["premature VRAM allocation: 16MiB scanout pool exhausted (-ENOSPC)", "hung-task panic at 10.463595s: ADCI firmware accept wait and unstarted disp_feature worker"], "fastbootd_started_seconds": 9.886, "usb_configured_seconds": 10.219, "restored_artifact": "20261102T003104706329Z", "current_capture": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/display-gem-20261102T011821Z/restored-618/logcat-kernel.txt"}
+0163 eliminates original NULL mmap panic; recovery reaches fastbootd and USB configuration. New dump identifies early VRAM query before KMS MMU init, unstarted kthread_create_worker callers (6.18 requires explicit wake), and indefinite ADCI accept WAITQ incorrectly accounted as uninterruptible load. Keep generic hung-task diagnostics unchanged. Prior live-618 capture spans candidate and restored baseline; ATTRIBUTION.json records this; restored-618 capture is separate. Next source patches 0164+ pending; no new flash.
+
+
+RECOVERY RUNTIME CANDIDATE READY: {"status": "READY: full image, Windows stage, source and restore preflights passed; awaiting user at phone; no flash", "artifact": "/home/loukious/Android/konoha-android17-6.18-port-20261031/artifacts/20261102T014419982366Z", "images_report": "/home/loukious/Android/konoha-android17-6.18-port-20261031/packaging/experimental-images-20261102-recovery-runtime-serial/report.json", "images_report_sha256": "a3bdf94093912d517acd34c46e629fef49795a0e9c11587e0958c84b8fb25c59", "stage": "/mnt/d/platform-tools/onyx-618-recovery-runtime-20261102T014842Z", "restore_baseline": "20261102T003104706329Z", "restore_script": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z/rescue-android.py", "candidate_capture": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z/live-618", "candidate_return_capture": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z/returned-618"}
+Patches0164VRAMafterKMS,0165explicitworkerwake,0166scopedADCIidle. 256+20+528 actual-source sanitizer cases/negative controls and strict code style PASS. Full318moduleCRC checks; four code-changed modules(msm_drm/msm_kgsl/qcom-scm/si_core);25otherKO changes only buildIDnote; old exportsCRCs/GKI/DTBs/all workingmic/vibrator/chargingUSB KO bytes preserved. Genericloadersandbootcmdlineidentical. Fresh one-shot installer/rescue and candidate capture prepared. No newflash/reboot. Original recovery currently installed with previous6.18baseline. After user is besidephone: hardwareFASTBOOT, install once, direct reboot/capture, verifyAndroidcompletion, controlledadbfastboot test and persistentuserspace/returnverification. If recoveryfailscapture with knownphysicalbridge and returnpreviousworking6.18. Never rerun usedreceipts.
+
+
+RECOVERY/FASTBOOTD FIX HARDWARE PASS: {"status": "PASS: direct Android adb reboot fastboot reaches stable userspacefastbootd; native root6.18recoveryverified; Android return pending", "artifact": "/home/loukious/Android/konoha-android17-6.18-port-20261031/artifacts/20261102T014419982366Z", "fastbootd_test": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z/fastbootd-test.json", "persistent_fastbootd": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z/fastbootd-persistence.json", "root_recovery_evidence": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z/native-618-state-detail", "recovery_log_sha256": "a268360d83e964651da47cb0af916c349a0c64089d68c47cac4c52d3c17d2b35", "panic_or_kernel_warn": false, "scanout_allocation_failures": 0, "adci_state": "TASK_IDLE; inside explicit qcom_scm_invoke_smc_adci firmware accept", "display_feature_worker_state": "TASK_INTERRUPTIBLE sleeping inside kthread_worker_fn", "hung_task_timeout_secs": 5, "hung_task_panic": 1, "four_physical_image_hashes": {"recovery_a": "cd4a2ccff5bd02170ac4054780eeb72b7ff9ecacfc2c79f70010d416cc28e5f3", "boot_a": "a2c7d0394c3cbd14c43bbb814e7981a6c8812d7df63b8cafc3b1a4009c6a0e6a", "vendor_boot_a": "b52e3dd779ee24b3af155cb2ce02e4f3c42c205efb91361e28821795003c5374", "dtbo_a": "febaa713a01e65f43146be9bf85d9ef3ff5c87e1ae4bea9a55319c580e8f6ee7"}, "logical_partition_limit": "No device-mapper logical mappings in native recovery; those two full partition readbacks unavailable. Five-image flash receipt/vendor_boot readbacks and actual loaded module build IDs verified.", "remaining_android_shutdown_warnings": ["DRM probe-only client NULL framebuffer restore", "IPA enabled-NAPI delete during modem SSR"], "uncertain_transition": "User reported accidental button press during first recovery transition; no crash attribution established; repeated adb recovery route and rootcapture passed", "return_capture": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z/returned-618"}
+PhoneCURRENTLYinrootnative6.18recovery; no6.6bridgeorrollbackusedforthistest. Nextdirectnormaladbrebootandreturned-618capture, verifyAndroidcomplete. New0167BMDoptionaltypeand0168invalidlastcloseclientrestorepreparedandsource-tested; notcompiled/flashedyet. Bootloader request on earlierbaseline returnednormalAndroidbootreasonbootloader; separateunresolvedroute. Allprevious289historicalwarningsremaininledger; fullgoalnotcomplete.
+
+
+BMD/LASTCLOSE CANDIDATE READY: {"status": "READY: source/build/package/Windows images and fresh previous6.18restore preflights pass; no flash", "artifact": "/home/loukious/Android/konoha-android17-6.18-port-20261031/artifacts/20261102T020511350870Z", "images_report": "/home/loukious/Android/konoha-android17-6.18-port-20261031/packaging/experimental-images-20261102-bmd-lastclose-serial/report.json", "images_report_sha256": "9f3a5e027a5db61873db98e510378d3175c3ed9c3ee8e14622accb1b6a20edf0", "stage": "/mnt/d/platform-tools/onyx-618-bmd-lastclose-20261102T021305Z", "previous_working_artifact": "/home/loukious/Android/konoha-android17-6.18-port-20261031/artifacts/20261102T014419982366Z", "previous_report": "/home/loukious/Android/konoha-android17-6.18-port-20261031/packaging/experimental-images-20261102-recovery-runtime-serial/report.json", "previous_attempt": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z", "installer": "install-fastbootd.py", "rescue": "rescue-android.py", "recovery_image_identical": true}
+Onlymca_bmd/msm_drmKOchanged;GKI/DTB/other318modulebytesandbootconfigloaderssameasworking014419. 0167actual336caseoptionalproperty/boardchecks;0168actual128casefbdev/KMScleanupcontrolsPASS. Needdirectcurrent6.18adbrebootfastboot, install-fastbootd.pyonce(verifybeforeflashvendor_bootagainstworkingreport),normalAndroidrebootcapture. FreshrescueusesoriginalphysicalbridgeONLYifneededandreturnsworking014419withcorrectedrecovery. Currentphoneworking0144196.18Androidbootcomplete; returnedcapturePID2361134, stopbeforeinstallation. Longnative-recovery-to-Androidblackintervaltimestampssuggest~76sec beforekernelstartbutphasecauseunproven; cabledisconnectlaterinAndroidcaptured, currentcharging93%. Useraskedoffchargingverification; answeredUSBmeterandbefore/off/aftercountertest; notperformedyet.
+
+
+BMD/LASTCLOSE INSTALLED ON REPAIRED6.18FASTBOOTD: {"status": "candidate installed and Androidbootcomplete; BMD bound andcharging97%; DRM reboot verification running", "artifact": "/home/loukious/Android/konoha-android17-6.18-port-20261031/artifacts/20261102T020511350870Z", "image_report": "/home/loukious/Android/konoha-android17-6.18-port-20261031/packaging/experimental-images-20261102-bmd-lastclose-serial/report.json", "initial_bindings": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bmd-lastclose-20261102T021305Z/initial-bindings.txt", "initial_battery": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bmd-lastclose-20261102T021305Z/initial-battery.txt", "transition_test": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bmd-lastclose-20261102T021305Z/transition-test.json", "restore": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bmd-lastclose-20261102T021305Z/rescue-android.py", "capture": "live-618/capture.py PID2391057"}
+entry-timing.jsonrecords34.202secondsnormalAndroid→workingfastbootd,beforeflashvendor_bootmatchespreviousworkingcandidate. All5newimages+samefixedrecovery flashed/readbackPASS; directAndroidkerneluptime20.74/bootcomplete1. BMDdriverlinksoc:mca_bmdnowexists(previouslyprobe-22),charging97%. NewcandidatecapturePID2391057. /tmp/onyx_test_bmd_lastclose_transition.pycurrentlyrunning viaexecsession39622, controlledadbfastboottest+4persistentuserspacechecks+DRMwarningcheckthen directAndroidreturnwithfreshreturned-618capture. Log/tmp/onyx-bmd-lastclose-transition.log. Donotreruntest/installreceipts. When itfinishes: verifyAndroidnormalreturn; updateRESULT/ledger/RESUME. NewfullgoalunresolvedIPA shutdownNAPI,SRAMOFencoding,blackrebootinterval andhistorical289records. Offchargingquestionansweredmeasurementplanonly, noofftestperformed.
+
+
+BMD/LASTCLOSE HARDWARE PASS AND ANDROID RETURN: {"status": "PASS: source/build/images and hardware BMD binding, DRMshutdown warning absence, stablefastbootd, normalAndroidreturn", "artifact": "/home/loukious/Android/konoha-android17-6.18-port-20261031/artifacts/20261102T020511350870Z", "images_report_sha256": "9f3a5e027a5db61873db98e510378d3175c3ed9c3ee8e14622accb1b6a20edf0", "bmd_binding": "soc:mca_bmd bound to mca_bmd", "battery_state": "CHARGING; level97; charge_counter6016000", "source_cases": {"optional_fg": 336, "display_restore": 128}, "drm_atomic_shutdown_warnings": 0, "remaining_kernel_shutdown_warnings": ["11-02 03:16:54.955  1800  1800 W         : WARNING: CPU: 6 PID: 1800 at net/core/dev.c:7604 __netif_napi_del_locked+0xe0/0x13c"], "kernel_panic": false, "seconds_android_to_fastbootd": 34.15546020400143, "inferred_seconds_fastbootd_return_to_kernel_start": 28.37576937675476, "timing_limit": "Kernel start inferred from host walltime and device uptime; no shutdown/bootloader phase instrumentation. Current capture proves successful Android boot; delay cause unresolved.", "android_return_state": ["6.18.33-android17-5-maybe-dirty-4k", "1", "138.73 970.27"], "current_capture": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bmd-lastclose-20261102T021305Z/returned-618/logcat-kernel.txt", "current_capture_pid": 2391946, "off_charging_verification": "Not tested; at97% recommend USBcurrentmeter or deferredbefore/off/aftercharge-counter test below80%. Normalcharging confirmed; do notclaimoffchargingtested."}
+CurrentphoneON6.18newartifact020511normalAndroid,correctedrecoveryretained,bootcomplete1. No6.6bridgeused; directworking6.18fastbootdflash. Freshrescuepreparedbutnotused. CurrentreturnedcapturePID2391946. 0167boundBMDrealnode;0168removes3shutdownDRMwarnings;oneIPANAPIwarnpersists. Goalstillactiveandhistorical289recordsnotallresolved. NextsourceauditIPA NDOclosemissingnapi_disable,lateprobe rmnet_napi_enable=falseafterregister_netdev race,pipe-teardownmaydeleteNAPIownedbynetdev; fixownershipwithstate/lifecycletests beforebuild. SRAM OFencodedreg/rangeschildaddresses also unresolved. Offchargingquestionansweredbuttestnotperformed. UsertoldphonewillremainAndroidafterthischeck; continuehostworkwithoutanotherrebootuntilpreparedandneeded.
+
+
+## Powered-off charger observation — 2026-11-02
+
+User powered off and plugged computer USB, then repeated with wall charger; both started Android. Prior 6.6/ROM behavior is uncertain. No image changes or assistant-controlled reboot during these observations. After wall test/reconnection, 6.18 Android boot_completed=1, ro.bootmode=unknown, ro.boot.mode absent, bootreason shutdown,userrequested, mca_log.charge_boot_mode=0, boot_index1519. Battery charging98%, counter6026000: Android charging confirmed, powered-off charging NOT verified. Native init supports charger event but selects normal when mode is absent; baseline/current static vendor bootconfigs add no charger-mode or force-normal setting. This points toward boot-mode selection; it does not prove ROM versus bootloader or exclude kernel shutdown handoff/transient charger failure. Evidence: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bmd-lastclose-20261102T021305Z/off-charger-observation-20261102T022651Z/OBSERVATION.json. Existing capture2391946 remains live and now spans multiple user-triggered boots; use isolated after-wall snapshot for current attribution. Goal remains active. Continue host source audits; no new flash prepared.
+
+
+## ROM charging-mode audit and IPA candidate — 2026-11-02
+
+ROM source at ~/Android/custom-rom inspected read-only. Standard init and QTI vendor.charger --charger service support charger-only UI; on-device service RC matches local source. No inspected forced-normal/autoboot setting found. QCOM restart notifier matches ROM kernel aside from remove return type. Origin of absent charger boot mode remains unproven; see /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bmd-lastclose-20261102T021305Z/off-charger-observation-20261102T022651Z/rom-source-audit.json.
+
+Patch0169 retains WAN NAPI ownership until netdev removal, enables once across normal down/up, resets state before register publication, drains endpoint work and drops borrowed references. 260 production-function lifecycle/queued-RX/shared-pipe/error cases and five negative controls passed; strict checkpatch clean. Build is running via execsession1203, artifact20261102T024104137567Z, log/tmp/onyx-ipa-napi-lifetime-build.log. No candidate installed or packaged. Installed working artifact020511 remains in Android, capture2391946 live. Full goal active; queued-work/SMP/GSI hardware assumptions and all historical findings remain. Next finish build, compare modules/GKI, package and prepare fresh current020511 restore before a hardware test.
+
+
+## Integrated IPA/SRAM candidate — 2026-11-02
+
+Previous goal turn completed read-only ROM charging audit; origin of absent charger boot mode remains unproven. Current turn integrated devicetrees/onyx-6.18-scmi-sram-layout.dts into both supported trees. Production OF helper tests prove old SRAM parent0..17d093ff becomes17d09400..17d097ff; SCMI child physical address/length and all other properties/phandles remain exact. Fifteen source cases (including nine partial-repair negative controls) pass ASan/UBSan. Full build artifact025658488162Z verifies318modules and both overlay engines; all kernel/module files identical to prior auditedIPA artifact024104137567Z. Packaging20261102-ipa-sram-v2-dt-reuse passes image/AVB/filesystem/ramdisk checks; onlyvendor_boot changes fromIPA candidate. Initial packaging stopped before output because inherited inventory DT hashes were stale; newv2inventory hashes derived from validated trees, no verifier relaxed.
+
+Fresh attempt /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-20261102T030100Z READY.json, installer and previous020511restore preflights and10installer failure fixtures PASS. NeitherIPA candidate has been installed. Combinedattempt supersedes prioruninstalledIPA attempt; keep receipts fresh. Installedphone is previousworkingartifact020511withfixedrecovery, Androidbootcomplete. Capture2391946finishednormally; no active capture now. Userphysicalpresence question pending because earlier failures requiredVolumeDownrescue; do not start next phone reboot until answered. All goal scope and289historical records remain. Next: current state then directworking6.18adbrebootfastboot, verifiedpreflashfetch, install-fastbootd.py once, normalAndroidrebootfreshcapture; validateIPA down/up/data, SRAM/SCMI, shutdownwarnings andAndroidreturn. Offchargingandrebootblackdelay unresolved; no charger/bootparameter changes.
+
+Currentworkingbefore-test snapshot saved at /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-20261102T030100Z/before-test-working. Androidreportsro.debuggable=0; adbroot requestreturnedwithoutenablingroot, idremainsshell; do notclaimrootAndroidortrybypassingit. BatteryService100%, statusFULL,6535000counter, normaltermination. Sourceaudit /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-20261102T030100Z/normal-diagnostic-source-audit.json classifies11historicalliteraldiagnostictemplates and1249currentstatusnotifications as operational, without editinglogs or claimingtheirunderlyingoperations globallycorrect. Historical289records preserved. Current268uniqueE/Wtemplates include33SoundWireCMDignoredand14WiFidata-stallfailures; newpriorityfindingsrecorded. Rebootreason source identicaltonativeexceptremove callbacktype; 7-bitrestartcelloffset1 inPMK8550SDAM7100/48confirmed. No newclaimonROM/kernel/bootloaderchargingcause. Physicalpresencequestion stillpending; nopartitionchangeorrebootperformed.
+
+
+## Wi-Fi and SoundWire bulk fixes staged — 2026-11-02
+
+Revalidated prior WLAN0170build031131665393Z: terminalPASS, all2551archived hashes,318modules. Onlyqca_cld3_wcn7750KO changed vsIPA/SRAM025658. SoundWire baselinepre-smmu-retry/state.txt proves6.6.144with28CMDIgnored events; current6.18 snapshot33. Warningoriginstillunresolved, noIRQmask/severitychange. Tracinguncoveredseparatepublicbulk recursiveiolock (VA GPIO/MMIO setsbulkcallbackNULL) and discardedintbackenderror. Added0171splitlockedhelper+wrapper; publicIDpackingandtransferlockonce, internalcallersserialized, callbackerrorspropagate. Actualproductionfunctions342scenarios/6400concurrentwrites underASan/UBSan PASS; originaland3negativecontrolsreject; strictcheckpatchPASS. Initialbuildstagingguard correctlyrefusedownmodifiedstagedfile; candidatesnapshotandpatchpreserved, restoredonlyownfiletoreceiptthencleanrestaged; guardnotrelaxed. Fullbuild032148820151ZPASS318modules/all2570hashes; onlyswr_ctrlKOchangesvsWLAN031131, both trees/GKIunchanged.
+
+Packageexperimental-images-20261102-ipa-sram-wlan-swr-bulk-serial source/build/moduleDT/AVB/filesystem/boot/serialchecksPASS. ModulecopieschangeonlyWLAN+swrcontrollerfromIPA/SRAM; workingkernel/DT/previousaudiohapticUSBbatteryFPcamerafixesretained. Freshattempt /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-wlan-swr-20261102T032453Z hasREADY.json, installer/rescuepreflightPASS and10productioninstallerfailurefixturesPASS. /tmp/onyx-wlan-swr-attempt.txt pointsnewcandidate; supersedesuninstalledIPA/SRAMattempt. Previousworking020511remainsinstalledAndroidbootcomplete, currentuptime~3400s/battery100FULL; noflash/rebootoractivecapture. Newasyncphysicalpresencequestionpending; awaitreplybeforedependentphonework.
+
+Next ifready: currentstate, directworking6.18adbrebootfastboot, freshinstall-fastbootd.pyONCE(preflashvendorbootmustmatch020511), normalrebootwithfreshcapture, verifyboot/audio/WiFi/IPAdownup/SCMIresource andshutdownwarn. Rescuefreshscriptreturns020511withfixedrecoveryifneeded. Do notrerunusedreceipts. Ifnotreadycontinuehostaudits. OperationalWLANauditclassifies4historicaloptionalpowerabsence/unsupported60GHzquerytemplates; NL80211band2is60GHz, not6GHz. PNprintercalledfromerror-dropandsuccessfuldefrag paths, so historical263remainsunresolved. All289recordsretained/fullgoalactive; offcharging,blackrebootdelay,SoundWireignoredandotherrecordsnotcomplete.
+
+
+AdditionalUSBwarningfixpreparedinROMsource: packages/modules/adb/daemon/usb_ffs.cpp two bcdVersioninitializers correctedfromcpu_to_le32(1)tocpu_to_le16(0x0100). ROMADBcheckoutwasclean; only2lineschanged, gitdiffcheckPASS. validation/adb_os_descriptor stores before/candidate, rom-fix.patch and actualC++MSOSh eaders+unchanged6.18kernelFunctionFSparser validation: original2warnings,corrected0; onlybyteoffsets5,6changeinboth11byteheaders. No fulladbd/ROMbuildorphonebinarydeploymentyet; thischangeisNOTinthepreparedkernelimagesandinstalledadbdstillwarns. Keep record20openforbuild/deploy/hardware.
+
+
+ROMadbd rebuildinprogress: prebuiltNinjaexistingcombined-lineage_onyxgraph, targetout/target/product/onyx/apex/com.android.adbd/bin/adbd, jobs12, log/tmp/onyx-adbd-descriptor-build.log, execsession28932. Dryrunexec32509terminalPASS2576neededactions; actualbuildconfirmedlive~2465/2576(lastRustgeneratedflagsdeps), nodetectedFAILED. ThisisordinaryhostROMtargetbuild; noADBroot,systemmodificationorphonewrite. Nextpollsame28932handle; whenterminalarchivecorrectedbinaryandverifycompiledBCDdescriptorsiflocalELFsymbolsallow; updateadb_os_descriptorvalidationandledger. Do notrestartmerelybecausepolltimeout. JEITAoptionaldefaultsactualbothboard/sourceauditPASS forhistorical14/15: missingbase/fliphysteresis -> native50mV; support-base-flipabsent. Nochargingtable/source/logseveritychanges. Physicalpresencequestionstillpending; kernelcandidatefreshreadyunchanged.
+
+
+ROMADB BUILD TERMINAL PASS: exec28932completedexit0; targetout/target/product/onyx/apex/com.android.adbd/bin/adbd rebuilt2576actions. Archivedcorrectedbinary at /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/adb_os_descriptor/candidate-adbd SHA256 93c15e289114383ee5855948ea191ba8782b14aa242814e37bd3358db4396b2a, plusunstrippedELF andpreviousOct19binary. ActualELFlocals_ZL14os_desc_header/_ZL14os_prop_header both11bytes withBCD0x0100; previouspreservedbinaryhasuniqueoriginal0001headerpatterns. SharedlibNEEDEDnamesidentical. Headerreadscript accidentallynamednewresultbefore-compiled whilebuildfinishedbeforecall; correctedreportnamecandidate-compiled-headers.json, valuesproveNEWbinary, nofalseoldclaim. validation/adb_os_descriptor/validation.jsonupdated. FullAPEX/ROMsigning/deploy/USBhardwareNOTtested; do notclaimsinstalledwarninggone. NoAndroidsystemwrite/rootbypass/phoneflash. Userphysicalpresencequestionstillpending; combinedkernelcandidate at/tmp/onyx-wlan-swr-attempt.txt stagedandallhostchecksPASS. Allgoalrecordsandscopepreserved; keepactive.
+
+LIVE IPA/SRAM WLAN SoundWire EVA TEST: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-wlan-swr-eva-20261102T043038Z. Fresh installer10fixtures and restore preflight pass; candidate flashed slotA andvendor_boot readback verified. Reboot sent; boot watcher active, capturePID recorded inlive-618/capture-pid.txt. Keep observing until stable Android or verified rescue. ROMsourcewebcam flagproperties/vendor.prop changedfalse->true; settings+QTIHALbothgate onthisproperty, nativeUVCconfigfs+service+modulepresent. ThisROMflagNOTinnewkernelimages; noinstalledwebcamfixclaim.
+
+ROMCHANGELOCATION: userrequiresROMchangesin~/Android/crdroid_onyx_patches. Addedpackages_modules_adb/0001-fix-functionfs-os-descriptor-bcd-version.patch anddevice_xiaomi_onyx/0016-enable-device-as-webcam.patch. apply.shmapping+gen-patches.shmanagedproject/emissions+READMEupdated, existingdirtychangespreserved. Preflight,Bashsyntax,exactselectiveregeneration,actualapply.shcleanapplication/idempotenceandROMindexpreservationPASS. Correctedvendorbuild.prop13actionbuildPASS withoneUVCtrueflag; correctedADBbinarypriorbuildPASS. NeitherROMchange deployed. Candidatefirstbootstable120s, WiFi3/3ping,SRAMdriverbindingandmultipleEVAopenswithoutcollisionobserved. Candidate directfastbootd/shutdownchecknowrunning; noadditionalpartitionwritesplanned. /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-wlan-swr-eva-20261102T043038Z
+
+COMBINEDTESTRETURNPASS: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-wlan-swr-eva-20261102T043038Z. Candidate042308 nowinstalledAndroidbootcomplete slotA stable120sboth normalboot/return; directfastbootd39.6s. SRAMdriverbound,WLAN3/3ping,EVAconcurrentinstanceopenswithoutcollision. IPAwarnPERSISTSnewipamBuildID48dd476: WANproducerTXNAPIseparatefromrmnetRX,intentionallyskippedatpipecleanup. Patch0173removesskip;64completeproductionteardowncases+original/3regressioncontrolsPASS; strictcheckpatch--no-signoffPASS; fullbuildrunning/tmp/onyx-ipa-tx-napi-build.log. Previousbaselinefornextstage is042308, not020511. CurrentreturnedcapturePIDinreturned-618/capture-pid.txt.
+
+IPA TX NAPI candidate: full build 20261102T044143670048Z passed with 318 platform modules and CRC checks. Only ipam.ko changes from installed EVA candidate 042308; GKI and DTB bytes match. Source test covers independent WAN, low-latency and other producer TX NAPI objects alongside the shared RX owner. All 64 cases pass, original WAN skip and three cleanup regressions fail. Matched image package checks pass. Fresh stage/restore preparation running; next preflash baseline and rescue target are installed EVA042308. No new flash yet. ROM ADB and webcam patches remain in crdroid_onyx_patches; neither is deployed.
+
+TX candidate install started: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-tx-napi-20261102T044411Z. Fresh installer/rescue preflight and 10 production installer fixtures passed; rollback points to verified EVA042308. Controlled fastbootd request sent. Source 0173 changes only ipam.ko; other modules, GKI, DTBs and ROM properties remain as installed. Observe through candidate boot or verified rescue.
+
+LIVE TX NAPI BOOT TEST: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-tx-napi-20261102T044411Z. Installed full matched images with only ipam module change; vendor_boot readback verified. Reboot sent, watch_boot.py and explicit kernel capture active. Preserve rescue continuity until Android stability or verified restore to EVA042308.
+
+LATEST CHECKPOINT: /home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-tx-napi-20261102T044411Z. Archive044143 and matched TX candidate images installed. Android boot complete on slot A, both initial boot and fastbootd return stable for120s. Controlled modem AFTER_SHUTDOWN completes with zero NAPI deletion warnings and zero CPU warnings in captured stream. Wi-Fi3/3ping and SRAM driver binding retained. Capture processes stopped; phone stays in Android. Hardware validation: validation/ipa_wan_tx_napi/hardware-validation.json. ROM changes pushed only to crdroid_onyx_patches/evolution-cnb commit08d7297. Other ledger findings remain active; no overall completion claim.

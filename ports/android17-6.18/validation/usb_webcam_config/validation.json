@@ -1,0 +1,29 @@
+{
+  "status": "ROM source and generated vendor property build PASS; phone still uses old disabled ROM property",
+  "root_cause": "Onyx vendor property explicitly disables UVC. Settings UsbBackend and Qualcomm Gadget HAL read ro.usb.uvc.enabled. Android shell cannot read the property because SELinux intentionally restricts it; empty getprop is not absence evidence.",
+  "change": "Set existing Onyx vendor property to true",
+  "source": "/home/loukious/Android/custom-rom/device/xiaomi/onyx/properties/vendor.prop",
+  "source_sha256": "acedb135e5142cb0cc26d5002ecccf4c51baefbb2d54474a0b1ade13b516f512",
+  "evidence_sha256": {
+    "frameworks/base/core/java/android/hardware/usb/UsbManager.java": "75881e56184c9ecc922c0d4efb71efc9707f126ceec6de5afa0b0d0510003637",
+    "packages/apps/Settings/src/com/android/settings/connecteddevice/usb/UsbBackend.java": "bc75c708d52aeafc20e0fd0198129683f20129b36ca4a7e60be97f6bfb344f67",
+    "vendor/qcom/opensource/usb/hal/UsbGadget.cpp": "03595d5504864bc39840bcfaaa21cf49f8802c2b18fa221ffc6bbe60ae50626a",
+    "vendor/qcom/opensource/usb/etc/init.qcom.usb.rc": "8f36f18ece29d70608e4d5da73d69a88e2d59f988d1bd4b9d239b3aad3986fdc",
+    "vendor/qcom/opensource/usb/etc/init.qcom.usb.sh": "c16e2b5b57964d74fbb211b32245e23782ad3e85d1bab3a08d9c7fa8428c47ea",
+    "system/sepolicy/private/property_contexts": "2a7e3fa9ff5b471369fec84a1959a8c0dc98acc505a1f57e0e43d4f9b9ab1af4"
+  },
+  "build_prop_before": "/home/loukious/Android/custom-rom/out/target/product/onyx/vendor/build.prop",
+  "dependencies": "DeviceAsWebcam installed; usb_f_uvc loaded; native QTI HAL supports UVC/UVC+ADB and init includes configfs descriptor setup.",
+  "deployment": "Requires rebuilt ROM/vendor property artifact; kernel-only five-image test does not contain this property. No system/vendor modification on phone.",
+  "limitations": [
+    "USB host enumeration and camera streaming not yet verified",
+    "Existing user ROM source changes retained"
+  ],
+  "compiled_vendor_prop": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/usb_webcam_config/candidate-build.prop",
+  "compiled_vendor_prop_sha256": "0a0b07463d40a90078a787a395bb7b30a20ab43bea8c13ff5130d661baf2b74b",
+  "build_log": "/tmp/onyx-webcam-prop-build.log",
+  "patch_repository": "/home/loukious/Android/crdroid_onyx_patches",
+  "patchset_validation": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/usb_webcam_config/patchset-validation.json",
+  "canonical_rom_patch": "/home/loukious/Android/crdroid_onyx_patches/patches/device_xiaomi_onyx/0016-enable-device-as-webcam.patch",
+  "canonical_rom_patch_sha256": "f75893ead8d271c23bb34d332700240a9f213ff0d5868f9ba456e9680b8079f8"
+}

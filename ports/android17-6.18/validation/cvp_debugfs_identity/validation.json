@@ -1,0 +1,47 @@
+{
+  "status": "PASS",
+  "production_source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/qcom/opensource/eva-kernel/msm/eva/msm_cvp_debug.c",
+  "source_sha256": "a20de0f1529810d577b46b82d9196c396689507cf6e7ba5a1f56a3063516af86",
+  "before_sha256": "f8cf96c48cb14e22b5a4e0e4bbe283300c940f17eababc51877df24eff73c908",
+  "results": {
+    "candidate": {
+      "returncode": 0,
+      "stdout": "PASS: 717 lifecycle cases, 4096 concurrent instance trees\n",
+      "stderr": ""
+    },
+    "original": {
+      "returncode": -6,
+      "stdout": "",
+      "stderr": "original-test: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/cvp_debugfs_identity/original-test.c:226: main: Assertion `!msm_cvp_debugfs_init_inst(&inst, &parent[0])' failed.\n"
+    },
+    "pointer-name": {
+      "returncode": -6,
+      "stdout": "",
+      "stderr": "pointer-name-test: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/cvp_debugfs_identity/pointer-name-test.c:245: main: Assertion `simultaneous[i].debugfs_root' failed.\n"
+    },
+    "leak-failed-creation": {
+      "returncode": -6,
+      "stdout": "",
+      "stderr": "leak-failed-creation-test: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/cvp_debugfs_identity/leak-failed-creation-test.c:127: check_empty: Assertion `!id_count && !tree_count && !atomic_load(&allocations)' failed.\n"
+    },
+    "unchecked-id-failure": {
+      "returncode": -6,
+      "stdout": "",
+      "stderr": "unchecked-id-failure-test: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/cvp_debugfs_identity/unchecked-id-failure-test.c:237: main: Assertion `!msm_cvp_debugfs_init_inst(&inst, &parent[0])' failed.\n"
+    },
+    "early-id-release": {
+      "returncode": -6,
+      "stdout": "",
+      "stderr": "early-id-release-test: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/cvp_debugfs_identity/early-id-release-test.c:75: ida_free: Assertion `strcmp(name, trees[i]->name)' failed.\n"
+    },
+    "leak-removed-tree-id": {
+      "returncode": -6,
+      "stdout": "",
+      "stderr": "leak-removed-tree-id-test: /home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/cvp_debugfs_identity/leak-removed-tree-id-test.c:127: check_empty: Assertion `!id_count && !tree_count && !atomic_load(&allocations)' failed.\n"
+    }
+  },
+  "scenarios": 717,
+  "concurrent_instance_trees": 4096,
+  "scope": "Complete production debugfs init/deinit functions; allocation, ID, directory and file failures (NULL and ERR_PTR), multiple cores, simultaneous instances, INT_MAX IDs, ID reuse after removal and eight concurrent creators/removers. Original and five regression controls reject.",
+  "limits": "IDA and debugfs are host adapters using their allocation/removal contracts. Physical firmware sessions, real allocator pressure, debugfs access/removal races and on-device warning absence still need hardware verification."
+}

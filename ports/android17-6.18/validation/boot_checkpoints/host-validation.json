@@ -1,0 +1,43 @@
+{
+  "status": "PASS",
+  "source_sha256": "fd0494baa1050623fa86de0241d5b8490ce44bc2a0f7df8bb1734efbad6fc9c8",
+  "scenarios": 5,
+  "results": [
+    {
+      "name": "production",
+      "compiled": true,
+      "returncode": 0,
+      "rejected": false,
+      "output": "Five supplier lifecycle cases pass\n"
+    },
+    {
+      "name": "unbound_success",
+      "compiled": true,
+      "returncode": -6,
+      "rejected": true,
+      "output": "unbound_success: test.c:62: int probe(struct device *, struct device *): Assertion `link.status == CONSUMER_PROBE' failed.\n"
+    },
+    {
+      "name": "unlocked_bound_check",
+      "compiled": true,
+      "returncode": -6,
+      "rejected": true,
+      "output": "unlocked_bound_check: test.c:40: _Bool device_is_bound(struct device *): Assertion `dev->locked' failed.\n"
+    },
+    {
+      "name": "supplier_lock_leak",
+      "compiled": true,
+      "returncode": -6,
+      "rejected": true,
+      "output": "supplier_lock_leak: test.c:74: int main(void): Assertion `link.status == NONE && !supplier.locked && unlocks == 1' failed.\n"
+    },
+    {
+      "name": "lost_managed_lifetime",
+      "compiled": true,
+      "returncode": -6,
+      "rejected": true,
+      "output": "lost_managed_lifetime: test.c:21: struct device_link *device_link_add(struct device *, struct device *, unsigned int): Assertion `flags == DL_FLAG_AUTOREMOVE_CONSUMER' failed.\n"
+    }
+  ],
+  "limits": "Exact production supplier-link helper with driver-core link-state and device-lock mocks; real kernel probe/unbind scheduling and hardware remain runtime checks."
+}

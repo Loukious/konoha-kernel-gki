@@ -1,0 +1,62 @@
+{
+  "tests": {
+    "provider": {
+      "identity_and_retry": true,
+      "concurrent_table_access_drained": true,
+      "ready_self_withdraw": true,
+      "extcon_self_withdraw": true,
+      "detached_ready_after_free": true,
+      "all_published_table_routes": true
+    },
+    "consumer": {
+      "probe_failure_paths": 4,
+      "node_and_device_references": true,
+      "withdraw_before_free": true,
+      "failed_withdraw_retains_storage": true,
+      "retry_cleanup": true
+    }
+  },
+  "negative_controls": {
+    "withdraw_identity_ignored": {
+      "rejected": true,
+      "diagnostic": "withdraw_identity_ignored: /tmp/onyx-extdisp-audio-test-7fbu8n64/withdraw_identity_ignored.c:746: main: Assertion `msm_ext_disp_unregister_audio_codec(&device, other) == -ENOENT && ext.ops == ops' failed."
+    },
+    "withdraw_keeps_pointer": {
+      "rejected": true,
+      "diagnostic": "withdraw_keeps_pointer: /tmp/onyx-extdisp-audio-test-7fbu8n64/withdraw_keeps_pointer.c:770: main: Assertion `!ext.ops && atomic_load(&withdraw_done)' failed."
+    },
+    "extcon_self_withdraw_lock_recursion": {
+      "rejected": true,
+      "diagnostic": "extcon_self_withdraw_lock_recursion: /tmp/onyx-extdisp-audio-test-7fbu8n64/extcon_self_withdraw_lock_recursion.c:51: mutex_lock: Assertion `READ_ONCE(m->owner) != current' failed."
+    },
+    "ready_published_under_wrong_lock": {
+      "rejected": true,
+      "diagnostic": "ready_published_under_wrong_lock: /tmp/onyx-extdisp-audio-test-7fbu8n64/ready_published_under_wrong_lock.c:348: fixture_ready: Assertion `pdev == &device && READ_ONCE(ext.lock.owner) != current' failed."
+    },
+    "hdmi_parent_node_leak": {
+      "rejected": true,
+      "diagnostic": "hdmi_parent_node_leak: /tmp/onyx-extdisp-audio-test-7fbu8n64/hdmi_parent_node_leak.c:171: main: Assertion `!live_allocations && !parent_node.refs && !parent_device.dev.refs && !dev.data' failed."
+    },
+    "hdmi_device_ref_leak": {
+      "rejected": true,
+      "diagnostic": "hdmi_device_ref_leak: /tmp/onyx-extdisp-audio-test-7fbu8n64/hdmi_device_ref_leak.c:171: main: Assertion `!live_allocations && !parent_node.refs && !parent_device.dev.refs && !dev.data' failed."
+    },
+    "hdmi_failed_withdraw_frees_live_storage": {
+      "rejected": true,
+      "diagnostic": "hdmi_failed_withdraw_frees_live_storage: /tmp/onyx-extdisp-audio-test-7fbu8n64/hdmi_failed_withdraw_frees_live_storage.c:31: kfree: Assertion `!published' failed."
+    }
+  },
+  "source_sha256": {
+    "qcom/opensource/mm-drivers/msm_ext_display/src/msm_ext_display.c": "9fb4fda4cd31dc9d740c9785702961aba5ca450e50b5ff7c9d3c4bcdaed86a5a",
+    "qcom/opensource/mm-drivers/msm_ext_display/include/msm_ext_display.h": "3a83faa99cc526392dd35103eec75e1de2194c863f9a80ebd05804b8c791d9bd"
+  },
+  "consumer_sha256": {
+    "qcom/opensource/audio-kernel/asoc/codecs/msm_hdmi_codec_rx.c": "bc7bcccc1de4493c95bbe24199fa06df4d07bc45e993549a6c3b92c1844c1590"
+  },
+  "harness_sha256": {
+    "consumer.c": "c80e7e710244d70d482f1efda238dc0a7d04d9a3d7fb9bd8b6352bca5dce8e08",
+    "mutations.json": "b5f7a3a876db44cb8e006fb8cdcd09aee00c3ef58e87af68ba9f3bcaeeb2f748",
+    "provider.c": "bbd2436f52f302564523acffda1f91197ca0a0c274ea7688139c30ab434b2c6a"
+  },
+  "limits": "Actual production functions compiled with ASan/UBSan and pthread serialization. Kernel device, mutex, extcon, display-interface lookup and ASoC services are simulated. No physical HDMI/DP, real extcon notifier ordering, ASoC card lifecycle or phone boot."
+}

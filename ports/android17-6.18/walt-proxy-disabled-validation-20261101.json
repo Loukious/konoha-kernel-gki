@@ -1,0 +1,34 @@
+{
+  "status": "FAILED BOOT; original 6.6 restored and all five hashes verified; later audio OF IOMMU panic",
+  "artifact": "/home/loukious/Android/konoha-android17-6.18-port-20261031/artifacts/20261101T201353889068Z",
+  "images": "/home/loukious/Android/konoha-android17-6.18-port-20261031/packaging/experimental-images-20261101-walt-proxy-disabled",
+  "image_report_sha256": "2db2d903d96851766aa0b45c98ce820381376de034ee4b3ca2a4d618f5150a99",
+  "source_evidence": {
+    "path": "/home/loukious/Android/konoha-android17-6.18-port-20261031/common/kernel/sched/core.c",
+    "sha256": "1d143d3585cb7bbd868a473ec0ade088b7cbd5bb992404225bc9c11724e1c113",
+    "runtime_default": "DEFINE_STATIC_KEY_TRUE(__sched_proxy_exec)",
+    "missing_hook": "proxy_set_task_cpu calls __set_task_cpu directly; bypasses set_task_cpu and trace_android_rvh_set_task_cpu",
+    "source_lines": [
+      3966,
+      3977,
+      4041,
+      7380
+    ]
+  },
+  "boot_parameter": "sched_proxy_exec=0",
+  "module_patch": "patches/0143-detect-first-walt-group-migration-underflow.patch",
+  "checks": [
+    "all kernel and board DTBs unchanged",
+    "only sched-walt.ko changed for earlier accounting invariant check",
+    "only boot cmdline differs from first-underflow images",
+    "kernel/ramdisk payload hashes preserved",
+    "four other image hashes preserved",
+    "upstream boot switch and compiled proxy-exec configuration verified"
+  ],
+  "limits": "Missing migration notification is established in the pinned source; hardware causation requires the proxy-disabled run.",
+  "attempt": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/walt-proxy-disabled-20261101T201805Z",
+  "hardware_result": "Proxy execution disabled confirmed; no WALT-BUG before later NULL dereference at 8.923656s in of_iommu_get_resv_regions during spf_core audio-ion child creation.",
+  "console": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/walt-proxy-disabled-20261101T201805Z/after-rollback/rawdump/kernel-console.txt",
+  "console_sha256": "3857a7fef701aa3baf5c7a441189ec869e6b60f772e682178e644478a82b994f",
+  "observation": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/walt-proxy-disabled-20261101T201805Z/observation.json"
+}

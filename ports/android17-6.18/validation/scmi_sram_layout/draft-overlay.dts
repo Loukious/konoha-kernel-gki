@@ -1,0 +1,19 @@
+/dts-v1/;
+/plugin/;
+
+/* Match /soc's cells and preserve the 0x17d09400, 0x400 SCMI window. */
+&{/soc} {
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	mmio-sram@17D09400 {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		reg = <0x17d09400 0x400>;
+		ranges = <0 0 0x17d09400 0 0x400>;
+
+		scmi-shmem@0 {
+			reg = <0 0 0 0x400>;
+		};
+	};
+};

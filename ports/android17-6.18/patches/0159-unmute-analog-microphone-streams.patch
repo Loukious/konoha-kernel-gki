@@ -1,0 +1,15 @@
+--- a/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-tx-macro.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-tx-macro.c
+@@ -1639,8 +1639,11 @@
+ 			adc = LPASS_CDC_TX_INP_MUX_ADC_MUX0_CFG1 +
+ 				LPASS_CDC_TX_MACRO_ADC_MUX_CFG_OFFSET * decimator;
+ 			if ((snd_soc_component_read(component, adc) & 0x3) &&
+-			    !tx_priv->swr_dmic_enable)
++			    !tx_priv->swr_dmic_enable) {
++				/* Analog inputs skip reset, but still need unmute. */
++				set_bit(decimator, &pending);
+ 				continue;
++			}
+ 			reg = LPASS_CDC_TX0_TX_PATH_CTL +
+ 				LPASS_CDC_TX_MACRO_TX_PATH_OFFSET * decimator;
+ 			if (!is_msm_dmic_enabled(component, decimator)) {

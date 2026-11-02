@@ -119,6 +119,15 @@ def main():
     subprocess.run([sys.executable, str(HERE / "prepare.py"), str(workspace),
                     "--verify-only"], check=True)
     config = json.loads((HERE / "devicetrees.json").read_text())
+    compatibility = config.get("compatibility_overlays", {})
+    if set(compatibility) - {t["base"] for t in config["trees"]}:
+        raise ValueError("compatibility overlays must target declared trees")
+    recipe_sources = sorted({name for names in compatibility.values() for name in names})
+    for name in recipe_sources:
+        source = (HERE / name).resolve()
+        if not source.is_relative_to(HERE) or not source.is_file():
+            raise ValueError(f"invalid recipe overlay: {name}")
+    recipe_hashes = {name: digest(HERE / name) for name in recipe_sources}
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = (args.output or workspace / "artifacts" / ("dt-" + stamp)).resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -172,10 +181,28 @@ def main():
             deps = dep.read_text().replace("\\\n", " ").split(":", 1)[1].split()
             dependencies.update(Path(p).resolve() for p in deps)
             compiled[name] = destination
+        compiled_compatibility = {}
+        for name in recipe_sources:
+            source = HERE / name
+            destination = raw / "compatibility" / Path(name).with_suffix(".dtbo")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            # Standalone overlays use target paths and need no native headers.
+            run([dtc, "-I", "dts", "-O", "dtb", "-@", "-b", "0",
+                 "-o", destination, source])
+            read_fdt(destination)
+            compiled_compatibility[name] = destination
         for tree in config["trees"]:
             program = "fdtoverlaymerge" if tree["base"].endswith(".dtbo") else "fdtoverlay"
+            destination = merged / tree["base"]
+            overlays = compatibility.get(tree["base"], [])
+            if overlays:
+                destination = raw / "native-merged" / tree["base"]
+                destination.parent.mkdir(parents=True, exist_ok=True)
             run([tools / program, "-i", compiled[tree["source"]],
-                 "-o", merged / tree["base"], *[compiled[p] for p in tree["overlays"]]])
+                 "-o", destination, *[compiled[p] for p in tree["overlays"]]])
+            if overlays:
+                run([tools / program, "-i", destination, "-o", merged / tree["base"],
+                     *[compiled_compatibility[name] for name in overlays]])
             original_root = read_fdt(compiled[tree["source"]])["/"]
             merged_root = read_fdt(merged / tree["base"])["/"]
             for key in ["qcom,msm-id", "qcom,board-id", "qcom,pmic-id",
@@ -228,10 +255,20 @@ def main():
                  "build_devicetrees.py", "boot-parameters.txt"]:
         shutil.copyfile(HERE / name, inputs / name)
     (inputs / "source-hashes.json").write_text(json.dumps(source_hashes, indent=2) + "\n")
+    for name, expected in recipe_hashes.items():
+        if digest(HERE / name) != expected:
+            raise ValueError(f"recipe overlay changed during compilation: {name}")
+        target = inputs / "recipe-overlays" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(HERE / name, target)
+        if digest(target) != expected:
+            raise ValueError(f"recipe overlay changed during archival: {name}")
     # A source edit during compilation must not produce an apparently pinned archive.
     subprocess.run([sys.executable, str(HERE / "prepare.py"), str(workspace),
                     "--verify-only"], check=True)
     report = {"commands": commands, "trees": checks, "source_files": len(source_hashes),
+              "compatibility_overlays": compatibility,
+              "recipe_overlay_sha256": recipe_hashes,
               "dtc_warnings": len(re.findall(r"Warning \(", log_path.read_text())),
               "overlay_engines_agree": True,
               "bootloader_ids_preserved": True,

@@ -1,0 +1,48 @@
+Subject: [PATCH] thermal: qcom: defer GPU cooling until the supplier is bound
+
+Check supplier presence after creating a managed device link, as required
+by the driver core. Use a nonblocking device lock to check bound state
+without waiting for a supplier probe while holding the consumer lock.
+Deferred probes release the lookup references and let the core remove
+the managed link; frequency registration work starts only on success.
+
+---
+diff --git a/drivers/thermal/qcom/qti_devfreq_cdev.c b/drivers/thermal/qcom/qti_devfreq_cdev.c
+--- a/drivers/thermal/qcom/qti_devfreq_cdev.c
++++ b/drivers/thermal/qcom/qti_devfreq_cdev.c
+@@ -148,6 +148,22 @@
+ 	mutex_unlock(&data->lock);
+ }
+ 
++static int devfreq_cdev_link_supplier(struct device *consumer,
++				      struct device *supplier)
++{
++	int ret;
++
++	if (!device_link_add(consumer, supplier, DL_FLAG_AUTOREMOVE_CONSUMER))
++		return -EINVAL;
++	/* Do not wait on a supplier lock while probing the consumer. */
++	if (!device_trylock(supplier))
++		return -EPROBE_DEFER;
++	ret = device_is_bound(supplier) ? 0 : -EPROBE_DEFER;
++	device_unlock(supplier);
++	/* The core drops the managed link if this consumer defers probing. */
++	return ret;
++}
++
+ static int devfreq_cdev_probe(struct platform_device *pdev)
+ {
+ 	struct devfreq_cdev_device *data;
+@@ -166,10 +182,9 @@
+ 		goto put_node;
+ 	}
+ 	data->dev = &supplier->dev;
+-	if (!device_link_add(&pdev->dev, data->dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
+-		ret = -EINVAL;
++	ret = devfreq_cdev_link_supplier(&pdev->dev, data->dev);
++	if (ret)
+ 		goto put_device;
+-	}
+ 	mutex_init(&data->lock);
+ 	data->retry_cnt = MAX_RETRY_CNT;
+ 	INIT_DEFERRABLE_WORK(&data->register_work, devfreq_cdev_work);

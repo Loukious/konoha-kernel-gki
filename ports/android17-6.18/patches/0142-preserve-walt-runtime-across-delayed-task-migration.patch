@@ -1,0 +1,58 @@
+Subject: [PATCH] sched: walt: move retained runtime for delayed task migrations
+
+A delayed CFS task remains queued and retains WALT window contributions.
+Migration must remove those contributions from the source and add them on
+the destination even though the task is absent from runnable statistics.
+Use queue membership for the source migration gate. Complete the paired
+destination addition before the runnable-only enqueue gate; keep runnable
+counts and frequency notifications below that gate. This also clears the
+pending migration before a second delayed migration or group change.
+
+---
+--- a/kernel/sched/walt/walt.c
++++ b/kernel/sched/walt/walt.c
+@@ -1156,7 +1156,8 @@
+ 	struct walt_rq *src_wrq = &per_cpu(walt_rq, cpu_of(src_rq));
+ 	struct walt_task_struct *wts = task_walt(p);
+ 
+-	if (!task_is_runnable(p) && READ_ONCE(p->__state) != TASK_WAKING)
++	/* Delayed tasks retain window contributions while they stay queued. */
++	if (!p->on_rq && READ_ONCE(p->__state) != TASK_WAKING)
+ 		return;
+ 
+ 	pstate = READ_ONCE(p->__state);
+@@ -4834,10 +4835,18 @@
+ 	if (unlikely(walt_disabled))
+ 		return;
+ 
++	walt_lockdep_assert_rq(rq, p);
++
++	/* Move retained runtime even when the destination enqueue is delayed. */
++	wallclock = walt_rq_clock(rq);
++	if (wts->enqueue_after_migration != 0) {
++		wallclock = walt_sched_clock();
++		migrate_busy_time_addition(p, cpu_of(rq), wallclock);
++		wts->enqueue_after_migration = 0;
++	}
++
+ 	if (!walt_task_enqueue_runnable(p, flags))
+ 		return;
+-
+-	walt_lockdep_assert_rq(rq, p);
+ 
+ 	if (flags & ENQUEUE_WAKEUP)
+ 		per_cpu(wakeup_ctr, cpu_of(rq)) += 1;
+@@ -4854,13 +4863,6 @@
+ 		WALT_BUG(WALT_BUG_UPSTREAM, p, "double enqueue detected: task_cpu=%d new_cpu=%d\n",
+ 			 task_cpu(p), cpu_of(rq));
+ 		double_enqueue = true;
+-	}
+-
+-	wallclock = walt_rq_clock(rq);
+-	if (wts->enqueue_after_migration != 0) {
+-		wallclock = walt_sched_clock();
+-		migrate_busy_time_addition(p, cpu_of(rq), wallclock);
+-		wts->enqueue_after_migration = 0;
+ 	}
+ 
+ 	wts->prev_on_rq = 1;

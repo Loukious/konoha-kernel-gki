@@ -1,0 +1,365 @@
+{
+  "status": "PASS",
+  "cases": [
+    {
+      "case": "no-list",
+      "status": "PASS",
+      "runs": [
+        {
+          "variant": "native",
+          "returncode": 1,
+          "calls": [],
+          "props": "",
+          "peak": 0
+        },
+        {
+          "variant": "serial",
+          "returncode": 1,
+          "calls": [],
+          "props": "",
+          "peak": 0
+        }
+      ]
+    },
+    {
+      "case": "parallel-failure",
+      "status": "PASS",
+      "runs": [
+        {
+          "variant": "native",
+          "returncode": 0,
+          "calls": [
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/vendor_dlkm/lib/modules",
+              "-a",
+              "alpha"
+            ],
+            [
+              "-b",
+              "-d",
+              "$ROOT/vendor_dlkm/lib/modules",
+              "-a",
+              "bad"
+            ],
+            [
+              "-b",
+              "-d",
+              "$ROOT/vendor_dlkm/lib/modules",
+              "-a",
+              "beta"
+            ],
+            [
+              "-b",
+              "-d",
+              "$ROOT/vendor_dlkm/lib/modules",
+              "-a",
+              "slow"
+            ]
+          ],
+          "props": "vendor.all.modules.ready 1\n",
+          "peak": 3
+        },
+        {
+          "variant": "serial",
+          "returncode": 0,
+          "calls": [
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/vendor_dlkm/lib/modules",
+              "-a",
+              "alpha"
+            ],
+            [
+              "-b",
+              "-d",
+              "$ROOT/vendor_dlkm/lib/modules",
+              "-a",
+              "slow"
+            ],
+            [
+              "-b",
+              "-d",
+              "$ROOT/vendor_dlkm/lib/modules",
+              "-a",
+              "bad"
+            ],
+            [
+              "-b",
+              "-d",
+              "$ROOT/vendor_dlkm/lib/modules",
+              "-a",
+              "beta"
+            ]
+          ],
+          "props": "vendor.all.modules.ready 1\n",
+          "peak": 1
+        }
+      ]
+    },
+    {
+      "case": "fallback",
+      "status": "PASS",
+      "runs": [
+        {
+          "variant": "native",
+          "returncode": 0,
+          "calls": [
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/vendor_dlkm/lib/modules",
+              "-a",
+              "first_fail"
+            ],
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/vendor/lib/modules",
+              "-a",
+              "alpha"
+            ],
+            [
+              "-b",
+              "-d",
+              "$ROOT/vendor/lib/modules",
+              "-a",
+              "beta"
+            ]
+          ],
+          "props": "vendor.all.modules.ready 1\n",
+          "peak": 1
+        },
+        {
+          "variant": "serial",
+          "returncode": 0,
+          "calls": [
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/vendor_dlkm/lib/modules",
+              "-a",
+              "first_fail"
+            ],
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/vendor/lib/modules",
+              "-a",
+              "alpha"
+            ],
+            [
+              "-b",
+              "-d",
+              "$ROOT/vendor/lib/modules",
+              "-a",
+              "beta"
+            ]
+          ],
+          "props": "vendor.all.modules.ready 1\n",
+          "peak": 1
+        }
+      ]
+    },
+    {
+      "case": "blocklists",
+      "status": "PASS",
+      "runs": [
+        {
+          "variant": "native",
+          "returncode": 0,
+          "calls": [
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/vendor_dlkm/lib/modules",
+              "-a",
+              "alpha"
+            ],
+            [
+              "-b",
+              "-d",
+              "$ROOT/vendor_dlkm/lib/modules",
+              "-a",
+              "beta"
+            ]
+          ],
+          "props": "vendor.all.modules.ready 1\n",
+          "peak": 1
+        },
+        {
+          "variant": "serial",
+          "returncode": 0,
+          "calls": [
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/vendor_dlkm/lib/modules",
+              "-a",
+              "alpha"
+            ],
+            [
+              "-b",
+              "-d",
+              "$ROOT/vendor_dlkm/lib/modules",
+              "-a",
+              "beta"
+            ]
+          ],
+          "props": "vendor.all.modules.ready 1\n",
+          "peak": 1
+        }
+      ]
+    },
+    {
+      "case": "system-failure",
+      "status": "PASS",
+      "runs": [
+        {
+          "variant": "native",
+          "returncode": 0,
+          "calls": [
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/system_dlkm/lib/modules",
+              "-a",
+              "alpha"
+            ],
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/system_dlkm/lib/modules",
+              "-a",
+              "slow"
+            ],
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/system_dlkm/lib/modules",
+              "-a",
+              "bad"
+            ],
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/system_dlkm/lib/modules",
+              "-a",
+              "beta"
+            ]
+          ],
+          "props": "",
+          "peak": 3
+        },
+        {
+          "variant": "serial",
+          "returncode": 0,
+          "calls": [
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/system_dlkm/lib/modules",
+              "-a",
+              "alpha"
+            ],
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/system_dlkm/lib/modules",
+              "-a",
+              "slow"
+            ],
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/system_dlkm/lib/modules",
+              "-a",
+              "bad"
+            ],
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/system_dlkm/lib/modules",
+              "-a",
+              "beta"
+            ]
+          ],
+          "props": "",
+          "peak": 1
+        }
+      ]
+    },
+    {
+      "case": "system-blocklist",
+      "status": "PASS",
+      "runs": [
+        {
+          "variant": "native",
+          "returncode": 0,
+          "calls": [
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/system_dlkm/lib/modules",
+              "-a",
+              "alpha"
+            ],
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/system_dlkm/lib/modules",
+              "-a",
+              "beta"
+            ]
+          ],
+          "props": "",
+          "peak": 1
+        },
+        {
+          "variant": "serial",
+          "returncode": 0,
+          "calls": [
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/system_dlkm/lib/modules",
+              "-a",
+              "alpha"
+            ],
+            [
+              "-b",
+              "-s",
+              "-d",
+              "$ROOT/system_dlkm/lib/modules",
+              "-a",
+              "beta"
+            ]
+          ],
+          "props": "",
+          "peak": 1
+        }
+      ]
+    }
+  ]
+}

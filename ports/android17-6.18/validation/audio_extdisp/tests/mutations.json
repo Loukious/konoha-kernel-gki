@@ -1,0 +1,37 @@
+{
+  "withdraw_identity_ignored": [
+    "provider",
+    "if (ext_disp->ops && ext_disp->ops != ops)",
+    "if (false)"
+  ],
+  "withdraw_keeps_pointer": [
+    "provider",
+    "ext_disp->ops = NULL;",
+    "(void)0;"
+  ],
+  "extcon_self_withdraw_lock_recursion": [
+    "provider",
+    "if (READ_ONCE(ext_disp->notify_owner) == current)",
+    "if (false)"
+  ],
+  "ready_published_under_wrong_lock": [
+    "provider",
+    "msm_ext_disp_prepare_ready(ext_disp, &ready);\n\tmutex_unlock(&ext_disp->lock);",
+    "mutex_unlock(&ext_disp->lock);\n\tmsm_ext_disp_prepare_ready(ext_disp, &ready);"
+  ],
+  "hdmi_parent_node_leak": [
+    "consumer",
+    "of_node_put(of_node_parent);",
+    "(void)0;"
+  ],
+  "hdmi_device_ref_leak": [
+    "consumer",
+    "put_device(&codec_data->ext_disp_core_pdev->dev);",
+    "(void)0;"
+  ],
+  "hdmi_failed_withdraw_frees_live_storage": [
+    "consumer",
+    "if (ret && ret != -ENOENT) {",
+    "if (ret && false) {"
+  ]
+}

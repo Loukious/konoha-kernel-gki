@@ -1,0 +1,18 @@
+# Imported into the diagnostic recovery only. Use init's built-in copy, so
+# capture does not depend on adbd, logd, a shell domain, or decrypted userdata.
+# This is a mount attempt only; never run fsck/format against metadata here.
+on fs
+    wait /dev/block/by-name/metadata 15
+    mount f2fs /dev/block/by-name/metadata /metadata nosuid nodev
+    mkdir /metadata/ota/onyx-boot-logs 0700 root root
+    mkdir /metadata/ota/onyx-boot-logs/rescue-${ro.boottime.init} 0700 root root
+    copy /sys/fs/pstore/console-ramoops-0 /metadata/ota/onyx-boot-logs/rescue-${ro.boottime.init}/console-ramoops-0
+    copy /sys/fs/pstore/console-ramoops /metadata/ota/onyx-boot-logs/rescue-${ro.boottime.init}/console-ramoops
+    copy /sys/fs/pstore/pmsg-ramoops-0 /metadata/ota/onyx-boot-logs/rescue-${ro.boottime.init}/pmsg-ramoops-0
+    copy /sys/fs/pstore/dmesg-ramoops-0 /metadata/ota/onyx-boot-logs/rescue-${ro.boottime.init}/dmesg-ramoops-0
+    copy /sys/fs/pstore/dmesg-ramoops-1 /metadata/ota/onyx-boot-logs/rescue-${ro.boottime.init}/dmesg-ramoops-1
+    copy /proc/cmdline /metadata/ota/onyx-boot-logs/rescue-${ro.boottime.init}/rescue-cmdline.txt
+    copy /proc/version /metadata/ota/onyx-boot-logs/rescue-${ro.boottime.init}/rescue-kernel.txt
+    write /metadata/ota/onyx-boot-logs/rescue-${ro.boottime.init}/capture-attempted "Missing pstore files indicate no surviving record; inspect init errors."
+    restorecon_recursive /metadata/ota/onyx-boot-logs
+    exec u:r:recovery:s0 root root -- /system/bin/sync

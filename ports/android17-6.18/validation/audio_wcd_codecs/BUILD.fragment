@@ -1,0 +1,79 @@
+ddk_headers(
+    name = "audio_wcd_codecs_headers",
+    hdrs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd9378/internal.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-mbhc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-reg-masks.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-registers.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd938x/internal.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x-mbhc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x-registers.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/internal.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-mbhc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-reg-masks.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-reg-shifts.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-registers.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x.h", "//onyx_swr_irq:audio_swr_irq_headers", "//onyx:soc_headers", "//onyx:audio_codec_support_headers", "//onyx_audio_small:audio_small_headers", "//onyx_audio_speakers:audio_wsa_codec_headers"],
+    includes = ["qcom/opensource/audio-kernel/asoc/codecs"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wcd9378_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-regmap.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-tables.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-mbhc.c", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wcd9378_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wcd_codecs_headers", "//onyx:wcd_core_dlkm", "//onyx_swr_irq:swr_dlkm", "//onyx:qti_regmap_debugfs", "//onyx:wcd9xxx_dlkm", "//onyx:mbhc_dlkm"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)", "-DANI_LITTLE_BYTE_ENDIAN", "-DANI_LITTLE_BIT_ENDIAN", "-DDOT11F_LITTLE_ENDIAN_HOST", "-DANI_COMPILER_TYPE_GCC", "-DANI_OS_TYPE_ANDROID=6", "-DPTT_SOCK_SVC_ENABLE", "-D__linux__"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wcd9378_slave_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-slave.c", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wcd9378_slave_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wcd_codecs_headers", "//onyx_swr_irq:swr_dlkm"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)", "-DANI_LITTLE_BYTE_ENDIAN", "-DANI_LITTLE_BIT_ENDIAN", "-DDOT11F_LITTLE_ENDIAN_HOST", "-DANI_COMPILER_TYPE_GCC", "-DANI_OS_TYPE_ANDROID=6", "-DPTT_SOCK_SVC_ENABLE", "-D__linux__"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wcd938x_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x-regmap.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x-tables.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x-mbhc.c", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wcd938x_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wcd_codecs_headers", "//onyx_swr_irq:swr_dlkm", "//onyx:wcd_core_dlkm", "//onyx:qti_regmap_debugfs", "//onyx:wcd9xxx_dlkm", "//onyx:mbhc_dlkm"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)", "-DANI_LITTLE_BYTE_ENDIAN", "-DANI_LITTLE_BIT_ENDIAN", "-DDOT11F_LITTLE_ENDIAN_HOST", "-DANI_COMPILER_TYPE_GCC", "-DANI_OS_TYPE_ANDROID=6", "-DPTT_SOCK_SVC_ENABLE", "-D__linux__"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wcd938x_slave_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x-slave.c", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wcd938x_slave_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wcd_codecs_headers", "//onyx_swr_irq:swr_dlkm"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)", "-DANI_LITTLE_BYTE_ENDIAN", "-DANI_LITTLE_BIT_ENDIAN", "-DDOT11F_LITTLE_ENDIAN_HOST", "-DANI_COMPILER_TYPE_GCC", "-DANI_OS_TYPE_ANDROID=6", "-DPTT_SOCK_SVC_ENABLE", "-D__linux__"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wcd939x_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-regmap.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-tables.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-mbhc.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-regulator.c", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wcd939x_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wcd_codecs_headers", "//onyx_swr_irq:swr_dlkm", "//onyx:wcd_core_dlkm", "//onyx:wcd_usbss_i2c", ":wcd939x_slave_dlkm", "//onyx:qti_regmap_debugfs", "//onyx:wcd9xxx_dlkm", "//onyx:mbhc_dlkm"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)", "-DANI_LITTLE_BYTE_ENDIAN", "-DANI_LITTLE_BIT_ENDIAN", "-DDOT11F_LITTLE_ENDIAN_HOST", "-DANI_COMPILER_TYPE_GCC", "-DANI_OS_TYPE_ANDROID=6", "-DPTT_SOCK_SVC_ENABLE", "-D__linux__"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wcd939x_slave_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-slave.c", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wcd939x_slave_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wcd_codecs_headers", "//onyx_swr_irq:swr_dlkm"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)", "-DANI_LITTLE_BYTE_ENDIAN", "-DANI_LITTLE_BIT_ENDIAN", "-DDOT11F_LITTLE_ENDIAN_HOST", "-DANI_COMPILER_TYPE_GCC", "-DANI_OS_TYPE_ANDROID=6", "-DPTT_SOCK_SVC_ENABLE", "-D__linux__"],
+    visibility = ["//visibility:public"],
+)
+

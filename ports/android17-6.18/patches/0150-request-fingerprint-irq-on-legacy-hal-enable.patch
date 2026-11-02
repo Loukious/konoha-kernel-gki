@@ -1,0 +1,65 @@
+--- a/drivers/input/fingerprint/mi_fp/fp_driver.c
++++ b/drivers/input/fingerprint/mi_fp/fp_driver.c
+@@ -578,6 +578,23 @@
+ /* file operation function                                              */
+ /* -------------------------------------------------------------------- */
+ 
++/* Called with fp_io_lock held, including legacy HAL enable without request. */
++static int fp_request_irq(struct fp_device *fp_dev)
++{
++	int ret;
++
++	if (fp_dev->irq_request)
++		return 0;
++	ret = request_threaded_irq(fp_dev->irq_num, NULL, fp_irq,
++				   IRQF_TRIGGER_RISING | IRQF_ONESHOT,
++				   "xiaomi_fp_irq", fp_dev);
++	if (ret)
++		return ret;
++	fp_dev->irq_request = true;
++	fp_dev->irq_enabled = true;
++	return 0;
++}
++
+ static long fp_ioctl_locked(struct file *filp, unsigned int cmd, unsigned long arg)
+ {
+ 	struct fp_device *fp_dev = &fp;
+@@ -634,7 +651,9 @@
+ 
+ 	case FP_IOC_ENABLE_IRQ:
+ 		pr_debug("FP_IOC_ENABLE_IRQ ======\n");
+-		retval = fp_enable_irq(fp_dev);
++		retval = fp_request_irq(fp_dev);
++		if (!retval)
++			retval = fp_enable_irq(fp_dev);
+ 		break;
+ 
+ 	case FP_IOC_DEV_INFO:
+@@ -778,24 +797,10 @@
+ 
+ 	case FP_IOC_REQUEST_RESOURCE:
+ 		pr_debug("FP_IOC_REQUEST_RESOURCE ======\n");
+-		if (!fp_dev->irq_request) {
+-			int ret = request_threaded_irq(
+-				fp_dev->irq_num, NULL, fp_irq,
+-				IRQF_TRIGGER_RISING | IRQF_ONESHOT,
+-				"xiaomi_fp_irq", fp_dev);
+-			if (!ret) {
+-				pr_debug("irq thread request success!\n");
+-				fp_dev->irq_request = true;
+-				fp_dev->irq_enabled = true;
+-			} else {
+-				retval = ret;
+-				pr_err("irq thread request failed, status = %d\n",
+-				       ret);
+-			}
+-		} else {
++		if (fp_dev->irq_request)
+ 			retval = -EFAULT;
+-			pr_err("irq thread already request\n");
+-		}
++		else
++			retval = fp_request_irq(fp_dev);
+ 		break;
+ 
+ 	case FP_IOC_RELEASE_RESOURCE:

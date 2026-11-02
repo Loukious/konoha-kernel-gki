@@ -1,0 +1,179 @@
+Subject: Add synchronized withdrawal of caller-owned display audio codec storage
+
+Drain all table accesses through the existing publication mutex.
+Prepare ready notifications under lock, then invoke their independent
+callback snapshot. Permit identity-checked self-withdrawal from
+synchronous extcon notifications without recursively acquiring the
+mutex. Preserve existing exported APIs.
+
+---
+
+--- a/qcom/opensource/mm-drivers/msm_ext_display/src/msm_ext_display.c
++++ b/qcom/opensource/mm-drivers/msm_ext_display/src/msm_ext_display.c
+@@ -14,6 +14,7 @@
+ #include <linux/iopoll.h>
+ #include <linux/types.h>
+ #include <linux/of_platform.h>
++#include <linux/sched.h>
+ #include <linux/extcon-provider.h>
+ #include <msm_ext_display.h>
+ #include <linux/extcon-provider.h>
+@@ -32,6 +33,7 @@
+ 	bool audio_session_on;
+ 	struct list_head display_list;
+ 	struct mutex lock;
++	struct task_struct *notify_owner;
+ 	bool update_audio;
+ 	unsigned long extcon_registered;
+ };
+@@ -208,8 +210,10 @@
+ 		goto end;
+ 	}
+ 
++	WRITE_ONCE(ext_disp->notify_owner, current);
+ 	ret = extcon_set_state_sync(audio_sdev,
+ 			codec->type, !!new_state);
++	WRITE_ONCE(ext_disp->notify_owner, NULL);
+ 	if (ret)
+ 		pr_err("Failed to set state. Error = %d\n", ret);
+ 	else
+@@ -334,15 +338,15 @@
+ 	return ret;
+ }
+ 
+-static void msm_ext_disp_ready_for_display(struct msm_ext_disp *ext_disp)
++static void msm_ext_disp_prepare_ready(struct msm_ext_disp *ext_disp,
++				       int (**ready)(struct platform_device *pdev))
+ {
+ 	int ret;
+ 	struct msm_ext_disp_init_data *data = NULL;
+ 
+-	if (!ext_disp) {
+-		pr_err("invalid input\n");
++	lockdep_assert_held(&ext_disp->lock);
++	if (!ext_disp->ops)
+ 		return;
+-	}
+ 
+ 	ret = msm_ext_disp_get_intf_data(ext_disp,
+ 			&ext_disp->current_codec, &data);
+@@ -353,7 +357,7 @@
+ 	}
+ 
+ 	*ext_disp->ops = data->codec_ops;
+-	data->codec_ops.ready(ext_disp->pdev);
++	*ready = data->codec_ops.ready;
+ }
+ 
+ int msm_hdmi_register_audio_codec(struct platform_device *pdev,
+@@ -370,9 +374,10 @@
+  *
+  */
+ int msm_ext_disp_register_audio_codec(struct platform_device *pdev,
+-		struct msm_ext_disp_audio_codec_ops *ops)
+-{
+-	int ret = 0;
++				      struct msm_ext_disp_audio_codec_ops *ops)
++{
++	int ret = 0;
++	int (*ready)(struct platform_device *pdev) = NULL;
+ 	struct msm_ext_disp *ext_disp = NULL;
+ 	struct msm_ext_disp_data *ext_disp_data = NULL;
+ 
+@@ -410,13 +415,53 @@
+ 	}
+ 
+ end:
++	if (!ret && ext_disp->current_codec.type != EXT_DISPLAY_TYPE_MAX)
++		msm_ext_disp_prepare_ready(ext_disp, &ready);
+ 	mutex_unlock(&ext_disp->lock);
+-	if (!ret && ext_disp->current_codec.type != EXT_DISPLAY_TYPE_MAX)
+-		msm_ext_disp_ready_for_display(ext_disp);
++	/* No codec-owned storage is used after unlocking, even on reentry. */
++	if (ready)
++		ready(pdev);
+ 
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(msm_ext_disp_register_audio_codec);
++
++static int msm_ext_disp_withdraw_audio_locked(struct msm_ext_disp *ext_disp,
++					      struct msm_ext_disp_audio_codec_ops *ops)
++{
++	lockdep_assert_held(&ext_disp->lock);
++	if (ext_disp->ops && ext_disp->ops != ops)
++		return -ENOENT;
++	ext_disp->ops = NULL;
++	return 0;
++}
++
++int msm_ext_disp_unregister_audio_codec(struct platform_device *pdev,
++					struct msm_ext_disp_audio_codec_ops *ops)
++{
++	struct msm_ext_disp_data *data;
++	struct msm_ext_disp *ext_disp;
++	int ret = 0;
++
++	if (!pdev || !ops)
++		return -EINVAL;
++	data = platform_get_drvdata(pdev);
++	if (!data)
++		return -ENODEV;
++	ext_disp = container_of(data, struct msm_ext_disp, ext_disp_data);
++
++	/* extcon notifiers run synchronously with the publication lock held. */
++	if (READ_ONCE(ext_disp->notify_owner) == current)
++		return msm_ext_disp_withdraw_audio_locked(ext_disp, ops);
++
++	/* Every access to the caller's table, including ready, uses this lock. */
++	mutex_lock(&ext_disp->lock);
++	ret = msm_ext_disp_withdraw_audio_locked(ext_disp, ops);
++	mutex_unlock(&ext_disp->lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(msm_ext_disp_unregister_audio_codec);
+ 
+ int msm_ext_disp_select_audio_codec(struct platform_device *pdev,
+ 		struct msm_ext_disp_codec_id *codec)
+--- a/qcom/opensource/mm-drivers/msm_ext_display/include/msm_ext_display.h
++++ b/qcom/opensource/mm-drivers/msm_ext_display/include/msm_ext_display.h
+@@ -171,7 +171,24 @@
+  *  @codec_ops: audio codec operations
+  */
+ int msm_ext_disp_register_audio_codec(struct platform_device *pdev,
+-		struct msm_ext_disp_audio_codec_ops *ops);
++				      struct msm_ext_disp_audio_codec_ops *ops);
++
++/**
++ * msm_ext_disp_unregister_audio_codec() - withdraw caller-owned codec storage
++ * @pdev: external display platform device
++ * @ops: the exact table passed to registration
++ *
++ * Drains accesses to @ops before returning. The caller must first quiesce its
++ * own users. Ready notifications use an independent callback snapshot. A
++ * synchronous extcon notifier may withdraw while its task owns publication;
++ * neither notification path accesses @ops afterwards. Self-withdrawal does
++ * not wait for its own callback. Other tasks drain the publication lock.
++ *
++ * Return: 0 if withdrawn or already absent, -ENOENT for a different live table,
++ * -EINVAL for invalid arguments, or -ENODEV if the provider is unavailable.
++ */
++int msm_ext_disp_unregister_audio_codec(struct platform_device *pdev,
++					struct msm_ext_disp_audio_codec_ops *ops);
+ 
+ /**
+  *  msm_ext_disp_select_audio_codec() - select audio codec
+@@ -212,6 +229,12 @@
+ 	return 0;
+ }
+ 
++static inline int msm_ext_disp_unregister_audio_codec(struct platform_device *pdev,
++						      struct msm_ext_disp_audio_codec_ops *ops)
++{
++	return 0;
++}
++
+ static inline int msm_ext_disp_select_audio_codec(struct platform_device *pdev,
+ 		struct msm_ext_disp_codec_id *codec)
+ {

@@ -1,0 +1,18 @@
+{
+  "status": "Source repair validated; build/hardware pending",
+  "historical_source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bwmon-display-20261101T225345Z/kernel-live-dump.txt",
+  "historical_source_sha256": "dc6b50f2453adde9d1cf557ed2601b99de0039e207f4a4bfed273f5e87332fcc",
+  "root_cause": "restricted_pointer zeroes %pK at kptr_restrict=2 or without CAP_SYSLOG at kptr_restrict=1. Multiple camera/EVA instances use inst_0000000000000000.",
+  "repair": "One thread-safe IDA identity per debugfs instance tree. ID lives in existing private core/instance pair, released after recursive removal or all post-ID failures.",
+  "instance_lifetime": "cvp_open_instance holds core->users until msm_cvp_destroy removes debugfs and frees instance; cvp_release_core withdraws opens and waits for users_zero before removing driver root/freeing core.",
+  "read_access": "Existing debugfs_create_file protected API, 0444 info permissions and open/read/release handlers remain exact. No pointer-restriction change.",
+  "allocator_lifetime": "Every acquired ID released on error/success teardown. ida_destroy docs state no destroy needed when empty; ida_free deletes empty chunks.",
+  "source_paths": [
+    "common/lib/vsprintf.c:860",
+    "common/lib/idr.c:556",
+    "common/fs/debugfs/file.c:331",
+    "onyx/qcom/opensource/eva-kernel/msm/eva/cvp.c:289",
+    "onyx/qcom/opensource/eva-kernel/msm/eva/msm_cvp_core.c:171"
+  ],
+  "limits": "Failed optional debugfs entry does not establish camera preview lag cause; no preview-related source behavior changed. Hardware warning absence pending."
+}

@@ -1,0 +1,240 @@
+--- a/drivers/firmware/qcom/si_core/qcom_scm_invoke.c
++++ b/drivers/firmware/qcom/si_core/qcom_scm_invoke.c
+@@ -22,7 +22,8 @@
+ 	do {
+ 		/* Direct invocation of callback!? */
+ 		if (!(oic->flags & OIC_FLAG_BUSY)) {
+-			ret = qcom_scm_invoke_smc(oic->in.paddr,
++			ret = (oic->flags & OIC_FLAG_ADCI_ACCEPT ?
++				qcom_scm_invoke_smc_adci : qcom_scm_invoke_smc)(oic->in.paddr,
+ 				oic->in.msg.size,
+ 				oic->out.paddr,
+ 				oic->out.msg.size,
+@@ -31,7 +32,9 @@
+ 				data);
+ 
+ 		} else {
+-			ret = qcom_scm_invoke_callback_response(oic->out.paddr,
++			ret = (oic->flags & OIC_FLAG_ADCI_ACCEPT ?
++				qcom_scm_invoke_callback_response_adci :
++				qcom_scm_invoke_callback_response)(oic->out.paddr,
+ 				oic->out.msg.size,
+ 				result,
+ 				response_type,
+--- a/drivers/firmware/qcom/si_core/si_core.c
++++ b/drivers/firmware/qcom/si_core/si_core.c
+@@ -999,6 +999,10 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/* IClientEnv_OP_adciAccept is an indefinite asynchronous service. */
++	if (object == ROOT_SI_OBJECT && op == 8)
++		oic->flags |= OIC_FLAG_ADCI_ACCEPT;
++
+ 	pr_debug("start an invocation for %s.\n", si_object_name(object));
+ 
+ 	ret = prepare_msg(oic, object, op, u);
+--- a/drivers/firmware/qcom/si_core/si_core_adci.c
++++ b/drivers/firmware/qcom/si_core/si_core_adci.c
+@@ -14,7 +14,7 @@
+ static void wait_to_die(void)
+ {
+ 	for (;;) {
+-		set_current_state(TASK_UNINTERRUPTIBLE);
++		set_current_state(TASK_IDLE);
+ 		if (kthread_should_stop())
+ 			break;
+ 
+--- a/drivers/firmware/qcom_scm-smc.c
++++ b/drivers/firmware/qcom_scm-smc.c
+@@ -123,7 +123,7 @@
+ }
+ 
+ static int scm_smc_do_quirk(struct device *dev, struct arm_smccc_args *smc,
+-		    struct arm_smccc_res *res)
++		    struct arm_smccc_res *res, bool waitq_idle)
+ {
+ 	struct completion *wq = NULL;
+ 	struct qcom_scm *qscm;
+@@ -150,7 +150,9 @@
+ 			}
+ 
+ 			if (res->a0 == QCOM_SCM_WAITQ_SLEEP) {
+-				wait_for_completion(wq);
++				/* ADCI accept waits for asynchronous firmware requests. */
++				wait_for_completion_state(wq, waitq_idle ?
++					TASK_IDLE : TASK_UNINTERRUPTIBLE);
+ 				fill_wq_resume_args(smc, smc_call_ctx);
+ 				continue;
+ 			} else {
+@@ -172,7 +174,7 @@
+ static int __scm_smc_do(struct device *dev, struct arm_smccc_args *smc,
+ 			struct arm_smccc_res *res,
+ 			enum qcom_scm_call_type call_type,
+-			bool multicall_allowed)
++			bool multicall_allowed, bool waitq_idle)
+ {
+ 	int ret, retry_count = 0;
+ 	bool multi_smc_call = qcom_scm_multi_call_allow(dev, multicall_allowed);
+@@ -186,7 +188,7 @@
+ 		if (!multi_smc_call)
+ 			mutex_lock(&qcom_scm_lock);
+ 		down(&qcom_scm_sem_lock);
+-		ret = scm_smc_do_quirk(dev, smc, res);
++		ret = scm_smc_do_quirk(dev, smc, res, waitq_idle);
+ 		up(&qcom_scm_sem_lock);
+ 		if (!multi_smc_call)
+ 			mutex_unlock(&qcom_scm_lock);
+@@ -277,7 +279,8 @@
+ 	}
+ 
+ 	/* ret error check follows after shm cleanup*/
+-	ret = __scm_smc_do(dev, &smc, &smc_res, call_type, desc->multicall_allowed);
++	ret = __scm_smc_do(dev, &smc, &smc_res, call_type,
++			   desc->multicall_allowed, desc->waitq_idle);
+ 
+ 	if (shm.vaddr) {
+ 		dma_unmap_single(dev, shm.paddr, alloc_len, DMA_TO_DEVICE);
+--- a/drivers/firmware/qcom_scm.c
++++ b/drivers/firmware/qcom_scm.c
+@@ -2313,8 +2313,8 @@
+ EXPORT_SYMBOL(qcom_scm_request_encrypted_log);
+ 
+ int qcom_scm_invoke_smc_legacy(phys_addr_t in_buf, size_t in_buf_size,
+-		phys_addr_t out_buf, size_t out_buf_size, int32_t *result,
+-		u64 *response_type, unsigned int *data)
++			       phys_addr_t out_buf, size_t out_buf_size, int32_t *result,
++			       u64 *response_type, unsigned int *data)
+ {
+ 	int ret;
+ 	struct qcom_scm_desc desc = {
+@@ -2347,9 +2347,9 @@
+ }
+ EXPORT_SYMBOL(qcom_scm_invoke_smc_legacy);
+ 
+-int qcom_scm_invoke_smc(phys_addr_t in_buf, size_t in_buf_size,
+-		phys_addr_t out_buf, size_t out_buf_size, int32_t *result,
+-		u64 *response_type, unsigned int *data)
++static int __qcom_scm_invoke_smc(phys_addr_t in_buf, size_t in_buf_size,
++				 phys_addr_t out_buf, size_t out_buf_size, int32_t *result,
++				 u64 *response_type, unsigned int *data, bool waitq_idle)
+ {
+ 	int ret;
+ 	struct qcom_scm_desc desc = {
+@@ -2363,6 +2363,7 @@
+ 		.arginfo = QCOM_SCM_ARGS(4, QCOM_SCM_RW, QCOM_SCM_VAL,
+ 					QCOM_SCM_RW, QCOM_SCM_VAL),
+ 		.multicall_allowed = true,
++		.waitq_idle = waitq_idle,
+ 	};
+ 	struct qcom_scm_res res;
+ 
+@@ -2379,11 +2380,29 @@
+ 
+ 	return ret;
+ }
++
++int qcom_scm_invoke_smc(phys_addr_t in_buf, size_t in_buf_size,
++			phys_addr_t out_buf, size_t out_buf_size, int32_t *result,
++			u64 *response_type, unsigned int *data)
++{
++	return __qcom_scm_invoke_smc(in_buf, in_buf_size, out_buf, out_buf_size,
++		result, response_type, data, false);
++}
+ EXPORT_SYMBOL(qcom_scm_invoke_smc);
+ 
+-int qcom_scm_invoke_callback_response(phys_addr_t out_buf,
+-	size_t out_buf_size, int32_t *result, u64 *response_type,
+-	unsigned int *data)
++int qcom_scm_invoke_smc_adci(phys_addr_t in_buf, size_t in_buf_size,
++			     phys_addr_t out_buf, size_t out_buf_size, int32_t *result,
++			     u64 *response_type, unsigned int *data)
++{
++	return __qcom_scm_invoke_smc(in_buf, in_buf_size, out_buf, out_buf_size,
++		result, response_type, data, true);
++}
++EXPORT_SYMBOL(qcom_scm_invoke_smc_adci);
++
++static int __qcom_scm_invoke_callback_response(phys_addr_t out_buf,
++					       size_t out_buf_size, int32_t *result,
++					       u64 *response_type,
++					       unsigned int *data, bool waitq_idle)
+ {
+ 	int ret;
+ 	struct qcom_scm_desc desc = {
+@@ -2394,6 +2413,7 @@
+ 		.args[1] = out_buf_size,
+ 		.arginfo = QCOM_SCM_ARGS(2, QCOM_SCM_RW, QCOM_SCM_VAL),
+ 		.multicall_allowed = true,
++		.waitq_idle = waitq_idle,
+ 	};
+ 	struct qcom_scm_res res;
+ 
+@@ -2410,7 +2430,24 @@
+ 
+ 	return ret;
+ }
++
++int qcom_scm_invoke_callback_response(phys_addr_t out_buf,
++				      size_t out_buf_size, int32_t *result, u64 *response_type,
++				      unsigned int *data)
++{
++	return __qcom_scm_invoke_callback_response(out_buf, out_buf_size,
++		result, response_type, data, false);
++}
+ EXPORT_SYMBOL(qcom_scm_invoke_callback_response);
++
++int qcom_scm_invoke_callback_response_adci(phys_addr_t out_buf,
++					   size_t out_buf_size, int32_t *result, u64 *response_type,
++					   unsigned int *data)
++{
++	return __qcom_scm_invoke_callback_response(out_buf, out_buf_size,
++		result, response_type, data, true);
++}
++EXPORT_SYMBOL(qcom_scm_invoke_callback_response_adci);
+ 
+ int qcom_scm_qseecom_call(u32 cmd_id, struct qseecom_scm_desc *desc, bool retry)
+ {
+--- a/drivers/firmware/qcom_scm.h
++++ b/drivers/firmware/qcom_scm.h
+@@ -55,6 +55,7 @@
+ 	u64 args[MAX_QCOM_SCM_ARGS];
+ 	u32 owner;
+ 	bool multicall_allowed;
++	bool waitq_idle; /* Indefinite ADCI accept protocol wait. */
+ };
+ 
+ /**
+--- a/include/linux/firmware/qcom/qcom_scm.h
++++ b/include/linux/firmware/qcom/qcom_scm.h
+@@ -279,12 +279,20 @@
+ extern int qcom_scm_invoke_smc(phys_addr_t in_buf, size_t in_buf_size,
+ 		phys_addr_t out_buf, size_t out_buf_size, int32_t *result,
+ 		u64 *response_type, unsigned int *data);
++/* ADCI accept and its continuations only; ordinary calls retain hang detection. */
++int qcom_scm_invoke_smc_adci(phys_addr_t in_buf, size_t in_buf_size,
++			     phys_addr_t out_buf, size_t out_buf_size, int32_t *result,
++			     u64 *response_type, unsigned int *data);
+ extern int qcom_scm_invoke_smc_legacy(phys_addr_t in_buf, size_t in_buf_size,
+ 		phys_addr_t out_buf, size_t out_buf_size, int32_t *result,
+ 		u64 *response_type, unsigned int *data);
+ extern int qcom_scm_invoke_callback_response(phys_addr_t out_buf,
+ 		size_t out_buf_size, int32_t *result, u64 *response_type,
+ 		unsigned int *data);
++/* ADCI accept and its continuations only; ordinary calls retain hang detection. */
++int qcom_scm_invoke_callback_response_adci(phys_addr_t out_buf,
++					   size_t out_buf_size, int32_t *result, u64 *response_type,
++					   unsigned int *data);
+ 
+ extern int qcom_scm_lmh_dcvsh(u32 payload_fn, u32 payload_reg, u32 payload_val,
+ 			      u64 limit_node, u32 node_id, u64 version);
+--- a/include/linux/firmware/qcom/si_object.h
++++ b/include/linux/firmware/qcom/si_object.h
+@@ -90,6 +90,7 @@
+ #define OIC_FLAG_BUSY		1	/* Context is busy. */
+ #define OIC_FLAG_NOTIFY		2	/* Context needs to notify the current object. */
+ #define OIC_FLAG_QTEE		4	/* Context has objects shared with QTEE. */
++#define OIC_FLAG_ADCI_ACCEPT	8	/* Indefinite root ADCI accept invocation. */
+ 	unsigned int flags;
+ 
+ 	/* Current object invoked in this callback context. */

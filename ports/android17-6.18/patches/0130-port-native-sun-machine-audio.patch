@@ -1,0 +1,2080 @@
+Subject: Port native SUN machine audio ownership
+
+Port the native SUN machine driver to 6.18. Keep copied card, DAI and
+amplifier names alive for their users; unwind sysfs, headset detection,
+clock votes and SSR registration before releasing owned state.
+
+---
+
+--- a/qcom/opensource/audio-kernel/asoc/msm_common.c
++++ b/qcom/opensource/audio-kernel/asoc/msm_common.c
+@@ -33,7 +33,10 @@
+ struct snd_card_pdata {
+ 	struct kobject snd_card_kobj;
+ 	int card_status;
+-}*snd_card_pdata;
++};
++
++static struct snd_card_pdata *snd_card_pdata;
++static DEFINE_MUTEX(snd_card_lock);
+ 
+ #define to_asoc_mach_common_pdata(kobj) \
+ 	container_of((kobj), struct msm_common_pdata, aud_dev_kobj)
+@@ -55,7 +58,8 @@
+ #define SAMPLING_RATE_176P4KHZ  176400
+ #define SAMPLING_RATE_352P8KHZ  352800
+ 
+-struct mutex vote_against_sleep_lock;
++static DEFINE_MUTEX(vote_against_sleep_lock);
++static DEFINE_MUTEX(audio_qos_lock);
+ 
+ static struct attribute device_state_attr = {
+ 	.name = "state",
+@@ -102,112 +106,120 @@
+ 
+ static struct dev_pm_qos_request latency_pm_qos_req; /* pm_qos request */
+ static unsigned int qos_client_active_cnt;
+-static int cluster_first_cpu[MAX_CPU_CLUSTER] = {-1, };
++static cpumask_t audio_qos_mask;
+ static struct dev_pm_qos_request *msm_audio_req = NULL;
+ static bool kregister_pm_qos_latency_controls = false;
+ #define MSM_LL_QOS_VALUE	300 /* time in us to ensure LPM doesn't go in C3/C4 */
+ 
+ static ssize_t aud_dev_sysfs_store(struct kobject *kobj,
+-		struct attribute *attr,
+-		const char *buf, size_t count)
+-{
+-	ssize_t ret = -EINVAL;
++		struct attribute *attr, const char *buf, size_t count)
++{
+ 	struct msm_common_pdata *pdata = to_asoc_mach_common_pdata(kobj);
+-	uint32_t pcm_id, state = 0;
+-
+-	if (count > MAX_USR_INPUT) {
+-		pr_err("%s: invalid string written", __func__);
+-		goto done;
+-	}
+-
+-	sscanf(buf, "%d %d", &pcm_id, &state);
+-
+-	if ((pcm_id >= pdata->num_aud_devs) || (pcm_id < 0)) {
+-		pr_err("%s: invalid pcm id %d \n", __func__, pcm_id);
+-		goto done;
+-	}
+-
+-	if ((state > DEVICE_ENABLE) || (state < DEVICE_DISABLE)) {
+-		pr_err("%s: invalid state %d \n", __func__, state);
+-		goto done;
+-	}
+-	pr_debug("%s: pcm_id %d state %d \n", __func__, pcm_id, state);
+-
++	unsigned int pcm_id, state;
++	char extra;
++
++	if (count > MAX_USR_INPUT ||
++	    sscanf(buf, "%u %u %c", &pcm_id, &state, &extra) != 2 ||
++	    pcm_id >= pdata->num_aud_devs || state > DEVICE_ENABLE)
++		return -EINVAL;
++	mutex_lock(&pdata->aud_dev_lock);
+ 	pdata->aud_dev_state[pcm_id] = state;
+-
+-	ret = count;
+-done:
+-	return ret;
++	mutex_unlock(&pdata->aud_dev_lock);
++	return count;
+ }
+ 
+ static const struct sysfs_ops aud_dev_sysfs_ops = {
+ 	.store = aud_dev_sysfs_store,
+ };
+ 
++static void aud_dev_kobj_release(struct kobject *kobj)
++{
++	struct msm_common_pdata *pdata = to_asoc_mach_common_pdata(kobj);
++	unsigned int i;
++
++	for (i = 0; i < MI2S_TDM_AUXPCM_MAX; i++)
++		mutex_destroy(&pdata->lock[i]);
++	mutex_destroy(&pdata->aud_dev_lock);
++	mutex_destroy(&pdata->hw_vote_lock);
++	kfree(pdata->aud_dev_state);
++	kfree(pdata);
++}
++
+ static struct kobj_type aud_dev_ktype = {
++	.release = aud_dev_kobj_release,
+ 	.sysfs_ops = &aud_dev_sysfs_ops,
+ };
+ 
+ static int aud_dev_sysfs_init(struct msm_common_pdata *pdata)
+ {
++	int ret;
++
++	ret = kobject_add(&pdata->aud_dev_kobj, kernel_kobj, "aud_dev");
++	if (ret)
++		return ret;
++	pdata->aud_sysfs_added = true;
++	ret = sysfs_create_file(&pdata->aud_dev_kobj, &device_state_attr);
++	if (!ret)
++		pdata->aud_attr_added = true;
++	return ret;
++}
++
++int snd_card_notify_user(snd_card_status_t card_status)
++{
+ 	int ret = 0;
+-	char dir[10] = "aud_dev";
+-
+-	ret = kobject_init_and_add(&pdata->aud_dev_kobj, &aud_dev_ktype,
+-		      kernel_kobj, dir);
+-	if (ret < 0) {
+-		 pr_err("%s: Failed to add kobject %s, err = %d\n",
+-			  __func__, dir, ret);
+-		 goto done;
+-	}
+-
+-	ret = sysfs_create_file(&pdata->aud_dev_kobj, &device_state_attr);
+-	if (ret < 0) {
+-		pr_err("%s: Failed to add wdsp_boot sysfs entry to %s\n",
+-			__func__, dir);
+-		goto fail_create_file;
+-	}
+-
+-	return ret;
+-
+-fail_create_file:
+-	kobject_put(&pdata->aud_dev_kobj);
+-done:
+-	return ret;
+-}
+-
+-int snd_card_notify_user(snd_card_status_t card_status)
+-{
+-	snd_card_pdata->card_status = card_status;
+-	sysfs_notify(&snd_card_pdata->snd_card_kobj, NULL, "card_state");
+-	if (card_status == 0) {
++
++	mutex_lock(&snd_card_lock);
++	if (snd_card_pdata) {
++		WRITE_ONCE(snd_card_pdata->card_status, card_status);
++		sysfs_notify(&snd_card_pdata->snd_card_kobj, NULL, "card_state");
++	} else {
++		ret = -ENODEV;
++	}
++	mutex_unlock(&snd_card_lock);
++	if (card_status == SND_CARD_STATUS_OFFLINE) {
+ 		mutex_lock(&vote_against_sleep_lock);
+ 		vote_against_sleep_cnt = 0;
+-		pr_debug("%s: SSR/PDR triggered reset vote_against_sleep_cnt = %d\n",
+-					__func__, vote_against_sleep_cnt);
+ 		mutex_unlock(&vote_against_sleep_lock);
+ 	}
+-	return 0;
++	return ret;
+ }
+ 
+ int snd_card_set_card_status(snd_card_status_t card_status)
+ {
+-	snd_card_pdata->card_status = card_status;
+-	return 0;
++	int ret = 0;
++
++	mutex_lock(&snd_card_lock);
++	if (snd_card_pdata)
++		WRITE_ONCE(snd_card_pdata->card_status, card_status);
++	else
++		ret = -ENODEV;
++	mutex_unlock(&snd_card_lock);
++	return ret;
+ }
+ 
+ static ssize_t snd_card_sysfs_show(struct kobject *kobj,
+ 		struct attribute *attr, char *buf)
+ {
+-	return snprintf(buf, BUF_SZ, "%d", snd_card_pdata->card_status);
++	struct snd_card_pdata *pdata = container_of(kobj, struct snd_card_pdata,
++						  snd_card_kobj);
++
++	/* Preserve the native card_state text format for existing userspace. */
++	return sysfs_emit(buf, "%d", READ_ONCE(pdata->card_status));
+ }
+ 
+ static ssize_t snd_card_sysfs_store(struct kobject *kobj,
+ 		struct attribute *attr, const char *buf, size_t count)
+ {
+-	sscanf(buf, "%d", &snd_card_pdata->card_status);
+-	sysfs_notify(&snd_card_pdata->snd_card_kobj, NULL, "card_state");
+-	return 0;
++	struct snd_card_pdata *pdata = container_of(kobj, struct snd_card_pdata,
++						  snd_card_kobj);
++	int state;
++
++	if (kstrtoint(buf, 0, &state) ||
++	    state < SND_CARD_STATUS_OFFLINE || state > SND_CARD_STATUS_ONLINE)
++		return -EINVAL;
++	WRITE_ONCE(pdata->card_status, state);
++	sysfs_notify(kobj, NULL, "card_state");
++	return count;
+ }
+ 
+ static const struct sysfs_ops snd_card_sysfs_ops = {
+@@ -215,37 +227,55 @@
+ 	.store = snd_card_sysfs_store,
+ };
+ 
++static void snd_card_kobj_release(struct kobject *kobj)
++{
++	kfree(container_of(kobj, struct snd_card_pdata, snd_card_kobj));
++}
++
+ static struct kobj_type snd_card_ktype = {
++	.release = snd_card_kobj_release,
+ 	.sysfs_ops = &snd_card_sysfs_ops,
+ };
+ 
+ int snd_card_sysfs_init(void)
+ {
+-	int ret = 0;
+-	char dir[DIR_SZ] = "snd_card";
+-
+-	snd_card_pdata = kcalloc(1, sizeof(struct snd_card_pdata), GFP_KERNEL);
+-	ret = kobject_init_and_add(&snd_card_pdata->snd_card_kobj, &snd_card_ktype,
+-		kernel_kobj, dir);
+-	if (ret < 0) {
+-		pr_err("%s: Failed to add kobject %s, err = %d\n",
+-			__func__, dir, ret);
+-		goto done;
+-	}
+-
+-	ret = sysfs_create_file(&snd_card_pdata->snd_card_kobj, &card_state_attr);
+-	if (ret < 0) {
+-		pr_err("%s: Failed to add snd_card sysfs entry to %s\n",
+-			__func__, dir);
+-		goto fail_create_file;
+-	}
+-
++	struct snd_card_pdata *pdata;
++	int ret;
++
++	pdata = kzalloc(sizeof(*pdata), GFP_KERNEL);
++	if (!pdata)
++		return -ENOMEM;
++	ret = kobject_init_and_add(&pdata->snd_card_kobj, &snd_card_ktype,
++				   kernel_kobj, "snd_card");
++	if (ret)
++		goto put;
++	ret = sysfs_create_file(&pdata->snd_card_kobj, &card_state_attr);
++	if (ret) {
++		kobject_del(&pdata->snd_card_kobj);
++		goto put;
++	}
++	mutex_lock(&snd_card_lock);
++	snd_card_pdata = pdata;
++	mutex_unlock(&snd_card_lock);
++	return 0;
++put:
++	kobject_put(&pdata->snd_card_kobj);
+ 	return ret;
+-
+-fail_create_file:
+-	kobject_put(&snd_card_pdata->snd_card_kobj);
+-done:
+-	return ret;
++}
++
++void snd_card_sysfs_deinit(void)
++{
++	struct snd_card_pdata *pdata;
++
++	mutex_lock(&snd_card_lock);
++	pdata = snd_card_pdata;
++	snd_card_pdata = NULL;
++	mutex_unlock(&snd_card_lock);
++	if (!pdata)
++		return;
++	sysfs_remove_file(&pdata->snd_card_kobj, &card_state_attr);
++	kobject_del(&pdata->snd_card_kobj);
++	kobject_put(&pdata->snd_card_kobj);
+ }
+ 
+ static int get_mi2s_tdm_auxpcm_intf_index(const char *stream_name)
+@@ -358,35 +388,26 @@
+ 	return clk_id;
+ }
+ 
+-int mi2s_tdm_hw_vote_req(struct msm_common_pdata *pdata, int enable)
++static int mi2s_tdm_hw_vote_req(struct msm_common_pdata *pdata, int enable)
+ {
+ 	int ret = 0;
+ 
+-	if (!pdata || (pdata->lpass_audio_hw_vote == NULL)) {
+-		pr_err("%s: pdata or lpass audio hw vote node NULL", __func__);
++	if (!pdata || !pdata->lpass_audio_hw_vote)
+ 		return -EINVAL;
+-	}
+-
+-	pr_debug("%s: lpass audio hw vote for fractional sample rate enable: %d\n",
+-				__func__, enable);
+-
++	mutex_lock(&pdata->hw_vote_lock);
+ 	if (enable) {
+-		if (atomic_read(&pdata->lpass_audio_hw_vote_ref_cnt) == 0) {
++		if (!atomic_read(&pdata->lpass_audio_hw_vote_ref_cnt)) {
+ 			ret = digital_cdc_rsc_mgr_hw_vote_enable(pdata->lpass_audio_hw_vote, NULL);
+-			if (ret < 0) {
+-				pr_err("%s lpass audio hw vote enable failed %d\n",
+-					__func__, ret);
+-					return ret;
+-				}
+-			}
++			if (ret < 0)
++				goto out;
++		}
+ 		atomic_inc(&pdata->lpass_audio_hw_vote_ref_cnt);
+-	} else {
+-		atomic_dec(&pdata->lpass_audio_hw_vote_ref_cnt);
+-		if (atomic_read(&pdata->lpass_audio_hw_vote_ref_cnt) == 0)
++	} else if (atomic_read(&pdata->lpass_audio_hw_vote_ref_cnt) > 0) {
++		if (atomic_dec_and_test(&pdata->lpass_audio_hw_vote_ref_cnt))
+ 			digital_cdc_rsc_mgr_hw_vote_disable(pdata->lpass_audio_hw_vote, NULL);
+-		else if (atomic_read(&pdata->lpass_audio_hw_vote_ref_cnt) < 0)
+-			atomic_set(&pdata->lpass_audio_hw_vote_ref_cnt, 0);
+-	}
++	}
++out:
++	mutex_unlock(&pdata->hw_vote_lock);
+ 	return ret;
+ }
+ 
+@@ -398,6 +419,7 @@
+ 	int slots;
+ 	int sample_width;
+ 	unsigned int rate;
++	bool hw_vote_acquired = false;
+ 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+ 	const char *stream_name = rtd->dai_link->stream_name;
+ 	struct snd_soc_card *card = rtd->card;
+@@ -439,6 +461,7 @@
+ 							__func__, ret);
+ 						goto done;
+ 					}
++					hw_vote_acquired = true;
+ 				}
+ 				pr_debug("%s: clk_id :%d clk freq %d\n", __func__,
+ 					intf_clk_cfg.clk_id, intf_clk_cfg.clk_freq_in_hz);
+@@ -483,6 +506,7 @@
+ 						__func__, ret);
+ 						goto done;
+ 					}
++					hw_vote_acquired = true;
+ 				}
+ 				pr_debug("%s: mi2s clk_id :%d clk freq %d\n", __func__,
+ 					intf_clk_cfg.clk_id, intf_clk_cfg.clk_freq_in_hz);
+@@ -500,6 +524,8 @@
+ 		}
+ 		atomic_inc(&pdata->lpass_intf_clk_ref_cnt[index]);
+ done:
++		if (ret < 0 && hw_vote_acquired)
++			mi2s_tdm_hw_vote_req(pdata, 0);
+ 		mutex_unlock(&pdata->lock[index]);
+ 	}
+ 	return ret;
+@@ -622,40 +648,27 @@
+ 
+ static void msm_audio_add_qos_request(void)
+ {
+-	int num_req = 0;
+-	int cpu = 0;
+-	int ret = 0;
+-	int cid, prev_cid = -1;
+-	int cluster_num = 0;
+-	cpumask_t *cluster_cpu_mask = NULL;
+-
+-	msm_audio_req = kcalloc(num_possible_cpus(),
+-			sizeof(struct dev_pm_qos_request), GFP_KERNEL);
++	unsigned int cpu, num_req = 0;
++	const struct cpumask *cluster;
++	int ret;
++
++	cpumask_clear(&audio_qos_mask);
++	cpu = cpumask_first(cpu_possible_mask);
++	if (cpu >= nr_cpu_ids)
++		return;
++	cluster = topology_core_cpumask(cpu);
++	cpumask_copy(&audio_qos_mask, cluster);
++	msm_audio_req = kcalloc(nr_cpu_ids, sizeof(*msm_audio_req), GFP_KERNEL);
+ 	if (!msm_audio_req)
+ 		return;
+-
+-	for_each_cpu(cpu, cpu_possible_mask) {
+-		cid = topology_cluster_id(cpu);
+-		if (cid != prev_cid) {
+-			cluster_first_cpu[cluster_num++] = cpu;
+-			prev_cid = cid;
+-		}
+-	}
+-
+-	/* Pick the first cluster as it represents the Silver cluster. */
+-	cluster_cpu_mask = topology_core_cpumask(cluster_first_cpu[0]);
+-
+-	for_each_cpu(cpu, cluster_cpu_mask) {
++	for_each_cpu(cpu, &audio_qos_mask) {
+ 		ret = dev_pm_qos_add_request(get_cpu_device(cpu),
+-			    &msm_audio_req[cpu],
+-			    DEV_PM_QOS_RESUME_LATENCY,
+-			    PM_QOS_CPU_LATENCY_DEFAULT_VALUE);
++					     &msm_audio_req[cpu],
++					     DEV_PM_QOS_RESUME_LATENCY,
++					     PM_QOS_CPU_LATENCY_DEFAULT_VALUE);
+ 		if (ret < 0)
+-			pr_err("%s error (%d) adding resume latency to cpu %d.\n",
+-                                                __func__, ret, cpu);
+-		pr_debug("%s set cpu affinity to logical core %d.\n", __func__, cpu);
+-
+-		/* Limit the request to 2 silver cpu cores. */
++			pr_err("%s: cpu %u latency request failed: %d\n", __func__, cpu, ret);
++		/* Keep the native policy: the first two CPUs of the Silver cluster. */
+ 		if (++num_req == 2)
+ 			break;
+ 	}
+@@ -663,23 +676,24 @@
+ 
+ static void msm_audio_remove_qos_request(void)
+ {
+-	int cpu = 0;
+-	int ret = 0;
+-	cpumask_t *cluster_cpu_mask = NULL;
+-
+-	cluster_cpu_mask = topology_core_cpumask(cluster_first_cpu[0]);
++	unsigned int cpu;
+ 
+ 	if (msm_audio_req) {
+-		for_each_cpu(cpu, cluster_cpu_mask) {
+-			ret = dev_pm_qos_remove_request(
+-				    &msm_audio_req[cpu]);
+-			if (ret < 0)
+-				pr_err("%s error (%d) removing request from cpu %d.\n",
+-                                                __func__, ret, cpu);
+-			pr_debug("%s remove cpu affinity of core %d.\n", __func__, cpu);
+-		}
++		for_each_cpu(cpu, &audio_qos_mask)
++			if (dev_pm_qos_request_active(&msm_audio_req[cpu]))
++				dev_pm_qos_remove_request(&msm_audio_req[cpu]);
+ 		kfree(msm_audio_req);
+-	}
++		msm_audio_req = NULL;
++	}
++	if (dev_pm_qos_request_active(&latency_pm_qos_req))
++		dev_pm_qos_remove_request(&latency_pm_qos_req);
++#ifdef CONFIG_SCHED_WALT
++	if (qos_client_active_cnt)
++		walt_unset_cpus_taken(&audio_qos_mask);
++#endif
++	cpumask_clear(&audio_qos_mask);
++	qos_client_active_cnt = 0;
++	qos_vote_status = 0;
+ }
+ 
+ int msm_common_snd_init(struct platform_device *pdev, struct snd_soc_card *card)
+@@ -688,10 +702,13 @@
+ 	int count, ret = 0;
+ 	uint32_t val_array[MI2S_TDM_AUXPCM_MAX] = {0};
+ 	struct clk *lpass_audio_hw_vote = NULL;
+-	common_pdata = kcalloc(1, sizeof(struct msm_common_pdata), GFP_KERNEL);
++	common_pdata = kzalloc(sizeof(*common_pdata), GFP_KERNEL);
+ 	if (!common_pdata)
+ 		return -ENOMEM;
+ 
++	mutex_init(&common_pdata->aud_dev_lock);
++	mutex_init(&common_pdata->hw_vote_lock);
++	kobject_init(&common_pdata->aud_dev_kobj, &aud_dev_ktype);
+ 	for (count = 0; count < MI2S_TDM_AUXPCM_MAX; count++) {
+ 		mutex_init(&common_pdata->lock[count]);
+ 		atomic_set(&common_pdata->mi2s_gpio_ref_cnt[count], 0);
+@@ -716,6 +733,8 @@
+ 		ret = PTR_ERR(lpass_audio_hw_vote);
+ 		dev_dbg(&pdev->dev, "%s: clk get %s failed %d\n",
+ 			__func__, "lpass_audio_hw_vote", ret);
++		if (ret == -EPROBE_DEFER)
++			goto fail;
+ 		lpass_audio_hw_vote = NULL;
+ 		ret = 0;
+ 	}
+@@ -780,42 +799,52 @@
+ 			"qcom,sen-mi2s-gpios", 0);
+ 	common_pdata->mi2s_gpio_p[SEP_MI2S_TDM_AUXPCM] = of_parse_phandle(pdev->dev.of_node,
+ 			"qcom,sep-mi2s-gpios", 0);
+-	common_pdata->aud_dev_state = devm_kcalloc(&pdev->dev, card->num_links,
+-						sizeof(uint8_t), GFP_KERNEL);
+-	dev_info(&pdev->dev, "num_links %d \n", card->num_links);
++
++	common_pdata->aud_dev_state = kcalloc(card->num_links, sizeof(uint8_t), GFP_KERNEL);
++	if (!common_pdata->aud_dev_state) {
++		ret = -ENOMEM;
++		goto fail;
++	}
+ 	common_pdata->num_aud_devs = card->num_links;
+-	mutex_init(&common_pdata->aud_dev_lock);
+-
+-	aud_dev_sysfs_init(common_pdata);
+-
++	ret = aud_dev_sysfs_init(common_pdata);
++	if (ret)
++		goto fail;
++	msm_audio_add_qos_request();
+ 	msm_common_set_pdata(card, common_pdata);
+-
+-	/* Add QoS request for audio tasks */
+-	msm_audio_add_qos_request();
+-
+-	mutex_init(&vote_against_sleep_lock);
+-
+ 	return 0;
+-};
+-
+-void msm_common_snd_deinit(struct msm_common_pdata *common_pdata)
+-{
+-	int count;
+-
+-	if (!common_pdata)
++fail:
++	msm_common_snd_deinit(common_pdata);
++	return ret;
++}
++
++void msm_common_snd_deinit(struct msm_common_pdata *pdata)
++{
++	unsigned int i;
++
++	if (!pdata)
+ 		return;
+-
+-	mutex_destroy(&vote_against_sleep_lock);
++	if (pdata->aud_attr_added)
++		sysfs_remove_file(&pdata->aud_dev_kobj, &device_state_attr);
++	if (pdata->aud_sysfs_added)
++		kobject_del(&pdata->aud_dev_kobj);
+ 	msm_audio_remove_qos_request();
+-
+-	mutex_destroy(&common_pdata->aud_dev_lock);
+-	for (count = 0; count < MI2S_TDM_AUXPCM_MAX; count++) {
+-		mutex_destroy(&common_pdata->lock[count]);
+-	}
+-}
+-
+-int msm_channel_map_info(struct snd_kcontrol *kcontrol,
+-			struct snd_ctl_elem_info *uinfo)
++	for (i = 0; i < MI2S_TDM_AUXPCM_MAX; i++)
++		of_node_put(pdata->mi2s_gpio_p[i]);
++	if (atomic_read(&pdata->lpass_audio_hw_vote_ref_cnt) > 0) {
++		digital_cdc_rsc_mgr_hw_vote_disable(pdata->lpass_audio_hw_vote, NULL);
++		atomic_set(&pdata->lpass_audio_hw_vote_ref_cnt, 0);
++	}
++	kregister_pm_qos_latency_controls = false;
++	kobject_put(&pdata->aud_dev_kobj);
++}
++
++void msm_common_snd_card_reset(void)
++{
++	kregister_pm_qos_latency_controls = false;
++}
++
++static int msm_channel_map_info(struct snd_kcontrol *kcontrol,
++				struct snd_ctl_elem_info *uinfo)
+ {
+ 	uinfo->type = SNDRV_CTL_ELEM_TYPE_BYTES;
+ 	uinfo->count = sizeof(uint32_t) * MAX_PORT;
+@@ -823,8 +852,8 @@
+ 	return 0;
+ }
+ 
+-int msm_channel_map_get(struct snd_kcontrol *kcontrol,
+-			struct snd_ctl_elem_value *ucontrol)
++static int msm_channel_map_get(struct snd_kcontrol *kcontrol,
++			       struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct chmap_pdata *kctl_pdata =
+ 			(struct chmap_pdata *)kcontrol->private_data;
+@@ -943,7 +972,7 @@
+ 	return ret;
+ }
+ 
+-void msm_common_get_backend_name(const char *stream_name, char **backend_name)
++static void msm_common_get_backend_name(const char *stream_name, char **backend_name)
+ {
+ 	char arg[ARRAY_SZ] = {0};
+ 	char value[61] = {0};
+@@ -961,12 +990,14 @@
+ 	int cpu = 0;
+ 	int ret = -1;
+ 	int num_req = 0;
+-	cpumask_t *cluster_cpu_mask = NULL;
+-
+-	cluster_cpu_mask = topology_core_cpumask(cluster_first_cpu[0]);
++	const cpumask_t *cluster_cpu_mask = NULL;
++
++	cluster_cpu_mask = &audio_qos_mask;
+ 
+ 	if (msm_audio_req) {
+ 		for_each_cpu(cpu, cluster_cpu_mask) {
++			if (!dev_pm_qos_request_active(&msm_audio_req[cpu]))
++				continue;
+ 			ret = dev_pm_qos_update_request(
+ 					&msm_audio_req[cpu], latency);
+ 			if (1 == ret ) {
+@@ -1009,14 +1040,14 @@
+ 	return ret;
+ }
+ 
+-static int msm_qos_ctl_put(struct snd_kcontrol *kcontrol,
+-		struct snd_ctl_elem_value *ucontrol)
++static int msm_qos_ctl_put_locked(struct snd_kcontrol *kcontrol,
++				  struct snd_ctl_elem_value *ucontrol)
+ {
+ 	cpumask_t expected_cpu_map = CPU_MASK_NONE;
+-	cpumask_t *cluster_cpu_mask = NULL;
++	const cpumask_t *cluster_cpu_mask = NULL;
+ 	qos_vote_status = ucontrol->value.enumerated.item[0];
+ 
+-	cluster_cpu_mask = topology_core_cpumask(cluster_first_cpu[0]);
++	cluster_cpu_mask = &audio_qos_mask;
+ 	pr_debug("%s: qos_vote_status = %d, qos_client_active_cnt = %d.\n",
+ 				__func__, qos_vote_status, qos_client_active_cnt);
+ 	if (qos_vote_status) {
+@@ -1072,10 +1103,22 @@
+ 	return 0;
+ }
+ 
++static int msm_qos_ctl_put(struct snd_kcontrol *kcontrol,
++			   struct snd_ctl_elem_value *ucontrol)
++{
++	int ret;
++
++	if (ucontrol->value.enumerated.item[0] > 1)
++		return -EINVAL;
++	mutex_lock(&audio_qos_lock);
++	ret = msm_qos_ctl_put_locked(kcontrol, ucontrol);
++	mutex_unlock(&audio_qos_lock);
++	return ret;
++}
+ static int msm_qos_ctl_get(struct snd_kcontrol *kcontrol,
+ 		struct snd_ctl_elem_value *ucontrol)
+ {
+-	ucontrol->value.enumerated.item[0] = qos_vote_status;
++	ucontrol->value.enumerated.item[0] = READ_ONCE(qos_vote_status);
+ 	return 0;
+ }
+ 
+@@ -1242,6 +1285,8 @@
+ 		ret = snd_soc_add_component_controls(component,
+ 				msm_common_channel_map,
+ 				ARRAY_SIZE(msm_common_channel_map));
++		if (ret)
++			goto free_mixer_str;
+ 		kctl = snd_soc_card_get_kcontrol(rtd->card, mixer_str);
+ 		if (!kctl) {
+ 			pr_err("failed to get kctl %s\n", mixer_str);
+--- a/qcom/opensource/audio-kernel/asoc/sun.c
++++ b/qcom/opensource/audio-kernel/asoc/sun.c
+@@ -72,9 +72,11 @@
+ //add for smartpa compatible begin
+ #define PA_NAME_MAX  24
+ #define  SMARTPA_MAX_NUM  4
+-static int probe_cout = 0;
+ static char smartpa_num = 0;
+ static char smartpa_type[PA_NAME_MAX] = "none";
++static DEFINE_MUTEX(smartpa_lock);
++static DEFINE_MUTEX(machine_probe_lock);
++static struct device *machine_device;
+ #if defined(CONFIG_TARGET_PRODUCT_YUPEI)
+ static int tdm_rx0_id = 0;
+ static int tdm_rx1_id = 0;
+@@ -121,8 +123,9 @@
+ 	LPASS_BE_SEP_TDM_TX_0
+ };
+ 
+-static int smartpa_count = 0;
+-struct snd_soc_dai_link_component smartpa_dails[SMARTPA_MAX_NUM] = {0};
++static unsigned int smartpa_count;
++static struct snd_soc_dai_link_component smartpa_dails[SMARTPA_MAX_NUM];
++static struct device *smartpa_devices[SMARTPA_MAX_NUM];
+ //add for smartpa compatibe end
+ 
+ enum {
+@@ -153,19 +156,20 @@
+ 	struct prm_earpa_hw_intf_config upd_config;
+ 	bool dedicated_wsa2; /* used to define how wsa2 slave devices are used */
+ 	int wcd_used;
++	struct wcd_mbhc_config mbhc_cfg;
++	struct snd_soc_component *mbhc_component;
++	bool card_registered;
++	bool ssr_registered;
++	bool dmic_enabled;
++	int dmic_gpio_count[4];
+ };
+ 
+-static bool is_initial_boot;
+-static bool codec_reg_done;
+ static struct snd_soc_card snd_soc_card_sun_msm;
+-static int dmic_0_1_gpio_cnt;
+-static int dmic_2_3_gpio_cnt;
+-static int dmic_4_5_gpio_cnt;
+-static int dmic_6_7_gpio_cnt;
+ 
+ static void *def_wcd_mbhc_cal(void);
+ 
+ static int msm_rx_tx_codec_init(struct snd_soc_pcm_runtime*);
++static void msm_rx_tx_codec_exit(struct snd_soc_pcm_runtime *rtd);
+ static int msm_int_wsa_init(struct snd_soc_pcm_runtime*);
+ static int msm_int_wsa884x_init(struct snd_soc_pcm_runtime*);
+ static int msm_int_wsa883x_init(struct snd_soc_pcm_runtime*);
+@@ -177,7 +181,7 @@
+  * Need to report LINEIN
+  * if R/L channel impedance is larger than 5K ohm
+  */
+-static struct wcd_mbhc_config wcd_mbhc_cfg = {
++static const struct wcd_mbhc_config wcd_mbhc_defaults = {
+ 	.read_fw_bin = false,
+ 	.calibration = NULL,
+ 	.detect_extn_cable = true,
+@@ -203,10 +207,15 @@
+ static int usbhs_direction_get(struct snd_kcontrol *kcontrol,
+ 				struct snd_ctl_elem_value *ucontrol)
+ {
+-	if (wcd_mbhc_cfg.flip_switch)
+-		ucontrol->value.integer.value[0] = 1;
+-	else
+-		ucontrol->value.integer.value[0] = 0;
++	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
++	struct msm_asoc_mach_data *pdata;
++
++	if (!component || !component->card)
++		return -ENODEV;
++	pdata = snd_soc_card_get_drvdata(component->card);
++	if (!pdata)
++		return -ENODEV;
++	ucontrol->value.integer.value[0] = READ_ONCE(pdata->mbhc_cfg.flip_switch);
+ 	return 0;
+ }
+ 
+@@ -223,15 +232,15 @@
+ 
+ 	if (!pdata->wcd_usbss_handle && !pdata->fsa_handle)
+ 		return false;
+-	wcd_mbhc_cfg.flip_switch = true;
++	pdata->mbhc_cfg.flip_switch = true;
+ 	if (pdata->fsa_handle) {
+ 		ret = fsa4480_switch_event(pdata->fsa_handle, FSA_MIC_GND_SWAP);
+ 	} else {
+ #if IS_ENABLED(CONFIG_QCOM_WCD_USBSS_I2C)
+-		if (wcd_mbhc_cfg.usbss_hsj_connect_enable)
++		if (pdata->mbhc_cfg.usbss_hsj_connect_enable)
+ 			ret = wcd_usbss_switch_update(WCD_USBSS_GND_MIC_SWAP_HSJ,
+ 							WCD_USBSS_CABLE_CONNECT);
+-		else if (wcd_mbhc_cfg.enable_usbc_analog)
++		else if (pdata->mbhc_cfg.enable_usbc_analog)
+ 			ret = wcd_usbss_switch_update(WCD_USBSS_GND_MIC_SWAP_AATC,
+ 							WCD_USBSS_CABLE_CONNECT);
+ #endif //need check more
+@@ -427,22 +436,22 @@
+ 	switch (dmic_idx) {
+ 	case 0:
+ 	case 1:
+-		dmic_gpio_cnt = &dmic_0_1_gpio_cnt;
++		dmic_gpio_cnt = &pdata->dmic_gpio_count[0];
+ 		dmic_gpio = pdata->dmic01_gpio_p;
+ 		break;
+ 	case 2:
+ 	case 3:
+-		dmic_gpio_cnt = &dmic_2_3_gpio_cnt;
++		dmic_gpio_cnt = &pdata->dmic_gpio_count[1];
+ 		dmic_gpio = pdata->dmic23_gpio_p;
+ 		break;
+ 	case 4:
+ 	case 5:
+-		dmic_gpio_cnt = &dmic_4_5_gpio_cnt;
++		dmic_gpio_cnt = &pdata->dmic_gpio_count[2];
+ 		dmic_gpio = pdata->dmic45_gpio_p;
+ 		break;
+ 	case 6:
+ 	case 7:
+-		dmic_gpio_cnt = &dmic_6_7_gpio_cnt;
++		dmic_gpio_cnt = &pdata->dmic_gpio_count[3];
+ 		dmic_gpio = pdata->dmic67_gpio_p;
+ 		break;
+ 	default:
+@@ -1511,6 +1520,25 @@
+ 			ARRAY_SIZE(msm_tdm_dai_links)];
+ 
+ 
++static void msm_machine_put_node(void *data)
++{
++	of_node_put(data);
++}
++
++static int msm_machine_get_node(struct device *dev, const char *name,
++				struct device_node **node)
++{
++	int ret;
++
++	*node = of_parse_phandle(dev->of_node, name, 0);
++	if (!*node)
++		return 0;
++	ret = devm_add_action_or_reset(dev, msm_machine_put_node, *node);
++	if (ret)
++		*node = NULL;
++	return ret;
++}
++
+ static int msm_populate_dai_link_component_of_node(
+ 					struct snd_soc_card *card)
+ {
+@@ -1553,6 +1581,9 @@
+ 					ret = -ENODEV;
+ 					goto err;
+ 				}
++				ret = devm_add_action_or_reset(cdev, msm_machine_put_node, np);
++				if (ret)
++					goto err;
+ 				dai_link[i].codecs[j].of_node = np;
+ 				dai_link[i].codecs[j].name = NULL;
+ 			}
+@@ -1700,23 +1731,25 @@
+ 	mbhc_calibration = def_wcd_mbhc_cal();
+ 	if (!mbhc_calibration)
+ 		return -ENOMEM;
+-	wcd_mbhc_cfg.calibration = mbhc_calibration;
++	pdata->mbhc_cfg.calibration = mbhc_calibration;
+ 
+ #if IS_ENABLED(CONFIG_QCOM_WCD_USBSS_I2C)
+ 	if (of_find_property(card->dev->of_node,
+ 				"qcom,usbss-hsj-connect-enabled", NULL))
+-		wcd_mbhc_cfg.usbss_hsj_connect_enable = true;
++		pdata->mbhc_cfg.usbss_hsj_connect_enable = true;
+ #endif
+ 
++	pdata->mbhc_component = component;
+ 	switch (pdata->wcd_used) {
+ 	case WCD9378_DEV_INDEX:
+-		ret = wcd9378_mbhc_hs_detect(component, &wcd_mbhc_cfg);
++		ret = wcd9378_mbhc_hs_detect(component, &pdata->mbhc_cfg);
+ 		break;
+ 	case WCD939X_DEV_INDEX:
+-		ret = wcd939x_mbhc_hs_detect(component, &wcd_mbhc_cfg);
++		ret = wcd939x_mbhc_hs_detect(component, &pdata->mbhc_cfg);
+ 		break;
+ 	default:
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto err_hs_detect;
+ 	}
+ 	if (ret) {
+ 		dev_err(component->dev, "%s: mbhc hs detect failed, err:%d\n",
+@@ -1726,15 +1759,49 @@
+ 	return 0;
+ 
+ err_hs_detect:
+-	kfree(mbhc_calibration);
++	msm_rx_tx_codec_exit(rtd);
+ 	return ret;
+ }
++
++static void msm_rx_tx_codec_exit(struct snd_soc_pcm_runtime *rtd)
++{
++	struct msm_asoc_mach_data *pdata = snd_soc_card_get_drvdata(rtd->card);
++
++	if (!pdata)
++		return;
++	if (pdata->mbhc_component) {
++		if (pdata->wcd_used == WCD9378_DEV_INDEX)
++			wcd9378_mbhc_hs_detect_exit(pdata->mbhc_component);
++		else if (pdata->wcd_used == WCD939X_DEV_INDEX)
++			wcd939x_mbhc_hs_detect_exit(pdata->mbhc_component);
++		pdata->mbhc_component = NULL;
++	}
++	kfree(pdata->mbhc_cfg.calibration);
++	pdata->mbhc_cfg.calibration = NULL;
++	pdata->codec_root = NULL;
++	msm_common_snd_card_reset();
++}
++
++static int msm_append_dai_links(struct snd_soc_dai_link *dest, size_t capacity,
++				unsigned int *count, const struct snd_soc_dai_link *src, size_t num)
++{
++	if (*count > capacity || num > capacity - *count)
++		return -E2BIG;
++	memcpy(dest + *count, src, num * sizeof(*src));
++	*count += num;
++	return 0;
++}
++
++/* Callers pass fixed arrays; ARRAY_SIZE does not evaluate source. */
++#define MSM_ADD_LINKS(count, source) \
++	msm_append_dai_links(msm_sun_dai_links, ARRAY_SIZE(msm_sun_dai_links), \
++			     (count), (source), ARRAY_SIZE(source))
+ 
+ static struct snd_soc_card *populate_snd_card_dailinks(struct device *dev, int wsa_max_devs)
+ {
+ 	struct snd_soc_card *card = NULL;
+ 	struct snd_soc_dai_link *dailink = NULL;
+-	int total_links = 0;
++	unsigned int total_links = 0;
+ 	int rc = 0;
+ 	u32 val = 0;
+ 	const struct of_device_id *match;
+@@ -1761,33 +1828,23 @@
+ 		switch (wsa_max_devs) {
+ 		case MONO_SPEAKER:
+ 		case STEREO_SPEAKER:
+-			memcpy(msm_sun_dai_links + total_links,
+-			       msm_wsa_cdc_dma_be_dai_links,
+-			       sizeof(msm_wsa_cdc_dma_be_dai_links));
+-			total_links += ARRAY_SIZE(msm_wsa_cdc_dma_be_dai_links);
++			if (MSM_ADD_LINKS(&total_links, msm_wsa_cdc_dma_be_dai_links))
++				return ERR_PTR(-E2BIG);
+ 			break;
+ 		case QUAD_SPEAKER:
+ 			if (of_find_property(dev->of_node,
+ 					"qcom,dedicated-wsa2", NULL)) {
+-				memcpy(msm_sun_dai_links + total_links,
+-					msm_wsa_cdc_dma_be_dai_links,
+-					sizeof(msm_wsa_cdc_dma_be_dai_links));
+-				total_links += ARRAY_SIZE(msm_wsa_cdc_dma_be_dai_links);
+-
+-				memcpy(msm_sun_dai_links + total_links,
+-					msm_wsa2_cdc_dma_be_dai_links,
+-					sizeof(msm_wsa2_cdc_dma_be_dai_links));
+-				total_links += ARRAY_SIZE(msm_wsa2_cdc_dma_be_dai_links);
++				if (MSM_ADD_LINKS(&total_links, msm_wsa_cdc_dma_be_dai_links))
++					return ERR_PTR(-E2BIG);
++
++				if (MSM_ADD_LINKS(&total_links, msm_wsa2_cdc_dma_be_dai_links))
++					return ERR_PTR(-E2BIG);
+ 			} else {
+-				memcpy(msm_sun_dai_links + total_links,
+-					msm_wsa2_cdc_dma_be_dai_links,
+-					sizeof(msm_wsa2_cdc_dma_be_dai_links));
+-				total_links += ARRAY_SIZE(msm_wsa2_cdc_dma_be_dai_links);
+-
+-				memcpy(msm_sun_dai_links + total_links,
+-					msm_wsa_wsa2_cdc_dma_be_dai_links,
+-					sizeof(msm_wsa_wsa2_cdc_dma_be_dai_links));
+-				total_links += ARRAY_SIZE(msm_wsa_wsa2_cdc_dma_be_dai_links);
++				if (MSM_ADD_LINKS(&total_links, msm_wsa2_cdc_dma_be_dai_links))
++					return ERR_PTR(-E2BIG);
++
++				if (MSM_ADD_LINKS(&total_links, msm_wsa_wsa2_cdc_dma_be_dai_links))
++					return ERR_PTR(-E2BIG);
+ 			}
+ 			break;
+ 		default:
+@@ -1797,27 +1854,21 @@
+ 			break;
+ 		}
+ 
+-		memcpy(msm_sun_dai_links + total_links,
+-		       msm_common_be_dai_links,
+-		       sizeof(msm_common_be_dai_links));
+-		total_links += ARRAY_SIZE(msm_common_be_dai_links);
++		if (MSM_ADD_LINKS(&total_links, msm_common_be_dai_links))
++			return ERR_PTR(-E2BIG);
+ 
+ 		rc = of_property_read_u32(dev->of_node,
+ 				"qcom,mi2s-audio-intf", &val);
+ 		if (!rc && val) {
+-			memcpy(msm_sun_dai_links + total_links,
+-					msm_mi2s_dai_links,
+-					sizeof(msm_mi2s_dai_links));
+-			total_links += ARRAY_SIZE(msm_mi2s_dai_links);
++			if (MSM_ADD_LINKS(&total_links, msm_mi2s_dai_links))
++				return ERR_PTR(-E2BIG);
+ 		}
+ 
+ 		rc = of_property_read_u32(dev->of_node,
+ 				"qcom,tdm-audio-intf", &val);
+ 		if (!rc && val) {
+-			memcpy(msm_sun_dai_links + total_links,
+-					msm_tdm_dai_links,
+-					sizeof(msm_tdm_dai_links));
+-			total_links += ARRAY_SIZE(msm_tdm_dai_links);
++			if (MSM_ADD_LINKS(&total_links, msm_tdm_dai_links))
++				return ERR_PTR(-E2BIG);
+ 		}
+ 
+ 		rc = of_property_read_u32(dev->of_node,
+@@ -1826,10 +1877,8 @@
+ 			if (!socinfo_get_part_info(PART_DISPLAY)) {
+ 				dev_dbg(dev, "%s(): ext disp audio support present\n",
+ 					__func__);
+-				memcpy(msm_sun_dai_links + total_links,
+-					ext_disp_be_dai_link,
+-						sizeof(ext_disp_be_dai_link));
+-				total_links += ARRAY_SIZE(ext_disp_be_dai_link);
++				if (MSM_ADD_LINKS(&total_links, ext_disp_be_dai_link))
++					return ERR_PTR(-E2BIG);
+ 			}
+ 		}
+ 
+@@ -1839,10 +1888,8 @@
+ 			if (!socinfo_get_part_info(PART_DISPLAY)) {
+ 				dev_dbg(dev, "%s(): ext hdmi audio support present\n",
+ 					__func__);
+-				memcpy(msm_sun_dai_links + total_links,
+-					ext_hdmi_be_dai_link,
+-						sizeof(ext_hdmi_be_dai_link));
+-				total_links += ARRAY_SIZE(ext_hdmi_be_dai_link);
++				if (MSM_ADD_LINKS(&total_links, ext_hdmi_be_dai_link))
++					return ERR_PTR(-E2BIG);
+ 			}
+ 		}
+ 
+@@ -1850,61 +1897,46 @@
+ 		if (!rc && val) {
+ 			dev_dbg(dev, "%s(): WCN BT support present\n",
+ 				__func__);
+-			memcpy(msm_sun_dai_links + total_links,
+-			       msm_wcn_be_dai_links,
+-			       sizeof(msm_wcn_be_dai_links));
+-			total_links += ARRAY_SIZE(msm_wcn_be_dai_links);
++			if (MSM_ADD_LINKS(&total_links, msm_wcn_be_dai_links))
++				return ERR_PTR(-E2BIG);
+ 		}
+ 
+ 		rc = of_property_read_u32(dev->of_node, "qcom,wcn-bt-ext", &val);
+ 		if (!rc && val) {
+ 			dev_dbg(dev, "%s(): WCN BT EXT support present\n",
+ 				__func__);
+-			memcpy(msm_sun_dai_links + total_links,
+-			       msm_wcn_be_dai_links_ext,
+-			       sizeof(msm_wcn_be_dai_links_ext));
+-			total_links += ARRAY_SIZE(msm_wcn_be_dai_links_ext);
++			if (MSM_ADD_LINKS(&total_links, msm_wcn_be_dai_links_ext))
++				return ERR_PTR(-E2BIG);
+ 		}
+ 
+ 		rc = of_property_read_u32(dev->of_node, "qcom,qmp-mic", &val);
+ 		if (!rc && val) {
+ 			dev_dbg(dev, "%s(): QMP MIC support present\n",
+ 				__func__);
+-			memcpy(msm_sun_dai_links + total_links,
+-			       msm_cdc_qmp_dma_be_dai_links,
+-			       sizeof(msm_cdc_qmp_dma_be_dai_links));
+-			total_links += ARRAY_SIZE(msm_cdc_qmp_dma_be_dai_links);
++			if (MSM_ADD_LINKS(&total_links, msm_cdc_qmp_dma_be_dai_links))
++				return ERR_PTR(-E2BIG);
+ 		} else {
+-			memcpy(msm_sun_dai_links + total_links,
+-			       msm_cdc_tx_va_dma_be_dai_links,
+-			       sizeof(msm_cdc_tx_va_dma_be_dai_links));
+-			total_links += ARRAY_SIZE(msm_cdc_tx_va_dma_be_dai_links);
+-			memcpy(msm_sun_dai_links + total_links,
+-			       msm_tx_cdc_dma_be_dai_links,
+-			       sizeof(msm_tx_cdc_dma_be_dai_links));
+-			total_links += ARRAY_SIZE(msm_tx_cdc_dma_be_dai_links);
+-			memcpy(msm_sun_dai_links + total_links,
+-				msm_va_cdc_dma_be_dai_links,
+-				sizeof(msm_va_cdc_dma_be_dai_links));
+-			total_links += ARRAY_SIZE(msm_va_cdc_dma_be_dai_links);
++			if (MSM_ADD_LINKS(&total_links, msm_cdc_tx_va_dma_be_dai_links))
++				return ERR_PTR(-E2BIG);
++			if (MSM_ADD_LINKS(&total_links, msm_tx_cdc_dma_be_dai_links))
++				return ERR_PTR(-E2BIG);
++			if (MSM_ADD_LINKS(&total_links, msm_va_cdc_dma_be_dai_links))
++				return ERR_PTR(-E2BIG);
+ 		}
+ 
+ 		if (of_find_property(dev->of_node, "swr-haptics-unsupported",
+ 			NULL)) {
+ 			dev_dbg(dev, "%s(): swr haptics support not present\n", __func__);
+ 		} else {
+-			memcpy(msm_sun_dai_links + total_links,
+-					msm_swr_haptics_be_dai_links,
+-					sizeof(msm_swr_haptics_be_dai_links));
+-			total_links += ARRAY_SIZE(msm_swr_haptics_be_dai_links);
++			if (MSM_ADD_LINKS(&total_links, msm_swr_haptics_be_dai_links))
++				return ERR_PTR(-E2BIG);
+ 
+ 			if (wsa_max_devs != QUAD_SPEAKER) {
+ 				if (of_find_property(dev->of_node, "qcom,dedicated-wsa2",
+ 					NULL)) {
+-					memcpy(msm_sun_dai_links + total_links,
+-					msm_wsa2_cdc_dma_be_dai_links,
+-					sizeof(msm_wsa2_cdc_dma_be_dai_links));
+-					total_links += ARRAY_SIZE(msm_wsa2_cdc_dma_be_dai_links);
++					if (MSM_ADD_LINKS(&total_links,
++							  msm_wsa2_cdc_dma_be_dai_links))
++						return ERR_PTR(-E2BIG);
+ 				} else {
+ 					dev_err_ratelimited(dev, "%s:Unable to active haptics path\n",
+ 						__func__);
+@@ -1946,6 +1978,42 @@
+ 	}
+ 
+ 	if (card) {
++		card = devm_kmemdup(dev, card, sizeof(*card), GFP_KERNEL);
++		if (!card)
++			return ERR_PTR(-ENOMEM);
++		dailink = devm_kmemdup(dev, dailink, total_links * sizeof(*dailink), GFP_KERNEL);
++		if (!dailink)
++			return ERR_PTR(-ENOMEM);
++		for (i = 0; i < total_links; i++) {
++			struct snd_soc_dai_link *link = &dailink[i];
++
++			if (link->num_cpus) {
++				size_t size = link->num_cpus * sizeof(*link->cpus);
++
++				link->cpus = devm_kmemdup(dev, link->cpus,
++							  size, GFP_KERNEL);
++				if (!link->cpus)
++					return ERR_PTR(-ENOMEM);
++			}
++			if (link->num_platforms) {
++				size_t size = link->num_platforms * sizeof(*link->platforms);
++
++				link->platforms = devm_kmemdup(dev, link->platforms,
++							       size, GFP_KERNEL);
++				if (!link->platforms)
++					return ERR_PTR(-ENOMEM);
++			}
++			if (link->num_codecs) {
++				size_t size = link->num_codecs * sizeof(*link->codecs);
++
++				link->codecs = devm_kmemdup(dev, link->codecs,
++							    size, GFP_KERNEL);
++				if (!link->codecs)
++					return ERR_PTR(-ENOMEM);
++			}
++			if (link->init == msm_rx_tx_codec_init)
++				link->exit = msm_rx_tx_codec_exit;
++		}
+ 		card->dai_link = dailink;
+ 		card->num_links = total_links;
+ 		if (!strcmp(match->data, "codec"))
+@@ -2388,7 +2456,6 @@
+ 		return ret;
+ 	}
+ done:
+-	codec_reg_done = true;
+ 	msm_common_dai_link_init(rtd);
+ 
+ 	return ret;
+@@ -2500,25 +2567,32 @@
+ 
+ static int msm_audio_ssr_register(struct device *dev)
+ {
+-	struct device_node *np = dev->of_node;
+-	struct snd_event_clients *ssr_clients = NULL;
+-	struct device_node *node = NULL;
+-	int ret = 0;
+-	int i = 0;
++	struct snd_soc_card *card = dev_get_drvdata(dev);
++	struct msm_asoc_mach_data *pdata = snd_soc_card_get_drvdata(card);
++	struct snd_event_clients *clients = NULL;
++	struct device_node *node;
++	int ret, i;
+ 
+ 	for (i = 0; ; i++) {
+-		node = of_parse_phandle(np, "qcom,msm_audio_ssr_devs", i);
++		node = of_parse_phandle(dev->of_node, "qcom,msm_audio_ssr_devs", i);
+ 		if (!node)
+ 			break;
+-		snd_event_mstr_add_client(&ssr_clients,
+-					msm_audio_ssr_compare, node);
+-	}
+-
+-	ret = snd_event_master_register(dev, &sun_ssr_ops,
+-					ssr_clients, NULL);
+-	if (!ret)
+-		snd_event_notify(dev, SND_EVENT_UP);
+-
++		ret = devm_add_action_or_reset(dev, msm_machine_put_node, node);
++		if (ret)
++			goto free_clients;
++		snd_event_mstr_add_client(&clients, msm_audio_ssr_compare, node);
++		if (IS_ERR(clients)) {
++			ret = PTR_ERR(clients);
++			goto free_clients;
++		}
++	}
++	ret = snd_event_master_register(dev, &sun_ssr_ops, clients, NULL);
++	if (ret)
++		goto free_clients;
++	pdata->ssr_registered = true;
++	return snd_event_notify(dev, SND_EVENT_UP);
++free_clients:
++	snd_event_clients_free(clients);
+ 	return ret;
+ }
+ 
+@@ -2543,371 +2617,482 @@
+ 	pdata->common_pdata = common_pdata;
+ }
+ 
+-//add for smartpa compatible begin
++static int smartpa_type_index(const char *name)
++{
++	int i;
++
++	if (!name)
++		return -EINVAL;
++	for (i = 0; i < SMARTPA_MAX; i++)
++		if (!strcmp(name, smartpa_cust_name[i]))
++			return i;
++	return -EINVAL;
++}
++
+ bool check_smartpa_type(const char *name)
+ {
+-	pr_debug("%s smartpa_type: %s \n", __func__, smartpa_type);
+-	if (!strcmp(smartpa_type, "none") || !strcmp(smartpa_type, name)) {
+-		return true;
++	bool match;
++
++	mutex_lock(&smartpa_lock);
++	match = name && (!smartpa_num || !strcmp(smartpa_type, name));
++	mutex_unlock(&smartpa_lock);
++	return match;
++}
++EXPORT_SYMBOL_GPL(check_smartpa_type);
++
++int get_smartpa_type(void)
++{
++	int type;
++
++	mutex_lock(&smartpa_lock);
++	type = smartpa_num;
++	mutex_unlock(&smartpa_lock);
++	return type;
++}
++EXPORT_SYMBOL_GPL(get_smartpa_type);
++
++int set_smartpa_type(const char *name, unsigned int size)
++{
++	char type[PA_NAME_MAX];
++	size_t len;
++	int index, ret = 0;
++
++	if (!name || !size || size > sizeof(type))
++		return -1;
++	len = strnlen(name, size);
++	if (!len || len >= sizeof(type))
++		return -1;
++	memcpy(type, name, len);
++	type[len] = '\0';
++	index = smartpa_type_index(type);
++	if (index < 0)
++		return -1;
++	mutex_lock(&smartpa_lock);
++	if (smartpa_count && index != smartpa_num) {
++		ret = -1;
+ 	} else {
+-		return false;
+-	}
+-}
+-EXPORT_SYMBOL_GPL(check_smartpa_type);
+-
+-int get_smartpa_type(void)
+-{
+-	pr_debug("%s smartpa_num: %d \n", __func__, smartpa_num);
+-	return smartpa_num;
+-}
+-EXPORT_SYMBOL_GPL(get_smartpa_type);
+-
+-int set_smartpa_type(const char *name, unsigned int size)
+-{
+-	int i;
+-
+-	if (size > PA_NAME_MAX) {
+-		pr_err("%s size[%d] > %d too large \n", __func__, size, PA_NAME_MAX);
+-		return -1;
+-	}
+-
+-	for (i = 0; i < SMARTPA_MAX; i++) {
+-		if(!strncmp(name, smartpa_cust_name[i], size)){
+-			pr_debug("%s find: %s \n", __func__, smartpa_cust_name[i]);
+-			smartpa_num = i;
+-			break;
+-		}
+-	}
+-
+-	if (i == SMARTPA_MAX) {
+-		pr_err("%s find: %s failed\n", __func__, name);
+-		return -1;
+-	}
+-
+-	memcpy(smartpa_type, name, size);
+-	pr_info("%s smartpa_type: %s \n", __func__, smartpa_type);
+-
+-	return 0;
++		smartpa_num = index;
++		strscpy(smartpa_type, type, sizeof(smartpa_type));
++	}
++	mutex_unlock(&smartpa_lock);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(set_smartpa_type);
+ 
+-#define NAME_SIZE (32)
+ static char *fmt_single_name(struct device *dev, int *id)
+ {
+-	char *found, name[NAME_SIZE];
++	char *found, *name, *formatted;
+ 	unsigned int id1, id2;
+ 
+-	if (dev_name(dev) == NULL)
++	if (!dev_name(dev))
+ 		return NULL;
+-
+-	strlcpy(name, dev_name(dev), NAME_SIZE);
+-
+-	/* are we a "%s.%d" name (platform and SPI components) */
++	name = kstrdup(dev_name(dev), GFP_KERNEL);
++	if (!name)
++		return NULL;
++	*id = 0;
+ 	found = strstr(name, dev->driver->name);
+ 	if (found) {
+-		/* get ID */
+-		if (sscanf(&found[strlen(dev->driver->name)], ".%d", id) == 1) {
+-
+-			/* discard ID from name if ID == -1 */
+-			if (*id == -1)
+-				found[strlen(dev->driver->name)] = '\0';
+-		}
+-
+-	} else {
+-		/* I2C component devices are named "bus-addr"  */
+-		if (sscanf(name, "%x-%x", &id1, &id2) == 2) {
+-			char tmp[NAME_SIZE];
+-
+-			/* create unique ID number from I2C addr and bus */
+-			*id = ((id1 & 0xffff) << 16) + id2;
+-
+-			/* sanitize component name for DAI link creation */
+-			snprintf(tmp, NAME_SIZE, "%s.%s", dev->driver->name, name);
+-			strlcpy(name, tmp, NAME_SIZE);
+-		} else
+-			*id = 0;
+-	}
+-
+-	return kstrdup(name, GFP_KERNEL);
+-}
++		if (sscanf(&found[strlen(dev->driver->name)], ".%d", id) == 1 && *id == -1)
++			found[strlen(dev->driver->name)] = '\0';
++	} else if (sscanf(name, "%x-%x", &id1, &id2) == 2) {
++		*id = ((id1 & 0xffff) << 16) + id2;
++		formatted = kasprintf(GFP_KERNEL, "%s.%s", dev->driver->name, name);
++		kfree(name);
++		name = formatted;
++	}
++	return name;
++}
++
++int register_smartpa_codec(struct device *dev, const char *dai_name,
++			   const char *type)
++{
++	char *name, *dai;
++	int id, index, ret = 0;
++	unsigned int i;
++
++	if (!dev || !dev->driver || !dai_name || !*dai_name)
++		return -EINVAL;
++	index = smartpa_type_index(type);
++	if (index < 0)
++		return index;
++	name = fmt_single_name(dev, &id);
++	if (!name)
++		return -ENOMEM;
++	dai = kstrdup(dai_name, GFP_KERNEL);
++	if (!dai) {
++		kfree(name);
++		return -ENOMEM;
++	}
++	mutex_lock(&smartpa_lock);
++	if (smartpa_num && smartpa_num != index) {
++		ret = -ENODEV;
++		goto out;
++	}
++	for (i = 0; i < smartpa_count; i++) {
++		if (smartpa_devices[i] != dev)
++			continue;
++		if (strcmp(smartpa_dails[i].name, name) ||
++		    strcmp(smartpa_dails[i].dai_name, dai))
++			ret = -EEXIST;
++		goto out;
++	}
++	if (smartpa_count == SMARTPA_MAX_NUM) {
++		ret = -ENOSPC;
++		goto out;
++	}
++	smartpa_devices[smartpa_count] = get_device(dev);
++	smartpa_dails[smartpa_count].name = name;
++	smartpa_dails[smartpa_count].dai_name = dai;
++	smartpa_count++;
++	smartpa_num = index;
++	strscpy(smartpa_type, type, sizeof(smartpa_type));
++	name = NULL;
++	dai = NULL;
++out:
++	mutex_unlock(&smartpa_lock);
++	kfree(name);
++	kfree(dai);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(register_smartpa_codec);
++
++void unregister_smartpa_codec(struct device *dev)
++{
++	struct device *held = NULL;
++	unsigned int i;
++
++	mutex_lock(&smartpa_lock);
++	for (i = 0; i < smartpa_count; i++) {
++		if (smartpa_devices[i] != dev)
++			continue;
++		held = smartpa_devices[i];
++		kfree(smartpa_dails[i].name);
++		kfree(smartpa_dails[i].dai_name);
++		smartpa_count--;
++		memmove(&smartpa_dails[i], &smartpa_dails[i + 1],
++			(smartpa_count - i) * sizeof(smartpa_dails[0]));
++		memmove(&smartpa_devices[i], &smartpa_devices[i + 1],
++			(smartpa_count - i) * sizeof(smartpa_devices[0]));
++		memset(&smartpa_dails[smartpa_count], 0, sizeof(smartpa_dails[0]));
++		smartpa_devices[smartpa_count] = NULL;
++		break;
++	}
++	if (!smartpa_count) {
++		smartpa_num = SMARTPA_NONE;
++		strscpy(smartpa_type, "none", sizeof(smartpa_type));
++	}
++	mutex_unlock(&smartpa_lock);
++	put_device(held);
++}
++EXPORT_SYMBOL_GPL(unregister_smartpa_codec);
+ 
+ void set_smartpa_codec(struct device *dev, const char *dai_name)
+ {
+-	int id;
+-
+-	if ((dev == NULL) || (dai_name == NULL)
+-		|| (smartpa_count >= SMARTPA_MAX_NUM)) {
+-		dev_err(dev, "%s dev or dai_name is NULL, or count > MAX!\n", __func__);
+-		return;
+-	}
+-
+-	smartpa_dails[smartpa_count].of_node = NULL;
+-	smartpa_dails[smartpa_count].name = fmt_single_name(dev, &id);
+-	smartpa_dails[smartpa_count].dai_name = dai_name;
+-
+-	dev_info(dev, "%s smartpa_dails name:%s  dai_name:%s \n", __func__,
+-		smartpa_dails[smartpa_count].name, smartpa_dails[smartpa_count].dai_name);
+-
+-	smartpa_count++;
++	char type[PA_NAME_MAX];
++	int ret;
++
++	mutex_lock(&smartpa_lock);
++	strscpy(type, smartpa_type, sizeof(type));
++	mutex_unlock(&smartpa_lock);
++	ret = register_smartpa_codec(dev, dai_name, type);
++	if (ret)
++		pr_err("%s: codec registration failed: %d\n", __func__, ret);
+ }
+ EXPORT_SYMBOL_GPL(set_smartpa_codec);
+ 
+-static void smartpa_dai_link_select(void)
+-{
+-	struct snd_soc_dai_link *dailink = msm_tdm_dai_links;
+-	int size = ARRAY_SIZE(msm_tdm_dai_links);
+-	int i = 0;
+-
+-	if (smartpa_count == 0) {
+-		pr_err("%s smartpa_count:%d return \n", __func__, smartpa_count);
+-		return;
+-	}
+-
+-	for (i = 0; i < size; i++) {
+-		if (!strncmp(dailink[i].name, tdm_rx_dailink_name[tdm_rx0_id], strlen(dailink[i].name))
+-			||!strncmp(dailink[i].name, tdm_rx_dailink_name[tdm_rx1_id], strlen(dailink[i].name))
+-			|| !strncmp(dailink[i].name, tdm_tx_dailink_name[tdm_tx_id], strlen(dailink[i].name))) {
+-			dailink[i].codecs = smartpa_dails;
+-			dailink[i].num_codecs = smartpa_count;
+-			pr_info("%s dailink:%s codec_name: %s codec_dai: %s \n", __func__,
+-				dailink[i].name, smartpa_dails[0].name, smartpa_dails[0].dai_name);
+-		}
+-	}
++static unsigned int smartpa_dt_count(const char *compatible)
++{
++	struct device_node *node;
++	unsigned int count = 0;
++
++	for_each_compatible_node(node, NULL, compatible) {
++		struct device_node *parent = of_node_get(node);
++		bool available = true;
++
++		while (parent) {
++			struct device_node *next;
++
++			if (!of_device_is_available(parent)) {
++				available = false;
++				of_node_put(parent);
++				break;
++			}
++			next = of_get_parent(parent);
++			of_node_put(parent);
++			parent = next;
++		}
++		if (available)
++			count++;
++	}
++	return count;
++}
++
++static bool smartpa_ready(struct snd_soc_card *card)
++{
++	unsigned int aw, sia, needed;
++	u32 tdm = 0;
++
++	of_property_read_u32(card->dev->of_node, "qcom,tdm-audio-intf", &tdm);
++	if (!tdm)
++		return true;
++	aw = smartpa_dt_count("awinic,aw882xx_smartpa");
++	sia = smartpa_dt_count("si,sia91xx-i2c");
++	if (!aw && !sia)
++		return true;
++	if (smartpa_num == SMARTPA_AW882XX)
++		needed = aw;
++	else if (smartpa_num == SMARTPA_SIA91XX)
++		needed = sia;
++	else
++		return false;
++	return needed && smartpa_count >= needed;
++}
++
++static int smartpa_dai_link_select(struct snd_soc_card *card)
++{
++	struct snd_soc_dai_link_component *codecs;
++	struct snd_soc_dai_link *link;
++	unsigned int i, j;
++	int ret = 0;
++
++	mutex_lock(&smartpa_lock);
++	if (!smartpa_ready(card)) {
++		ret = -EPROBE_DEFER;
++		goto out;
++	}
++	if (!smartpa_count)
++		goto out;
++	for (i = 0; i < card->num_links; i++) {
++		link = &card->dai_link[i];
++		if (strcmp(link->name, tdm_rx_dailink_name[tdm_rx0_id]) &&
++		    strcmp(link->name, tdm_rx_dailink_name[tdm_rx1_id]) &&
++		    strcmp(link->name, tdm_tx_dailink_name[tdm_tx_id]))
++			continue;
++		codecs = devm_kcalloc(card->dev, smartpa_count, sizeof(*codecs), GFP_KERNEL);
++		if (!codecs) {
++			ret = -ENOMEM;
++			goto out;
++		}
++		for (j = 0; j < smartpa_count; j++) {
++			codecs[j].name = devm_kstrdup(card->dev, smartpa_dails[j].name, GFP_KERNEL);
++			codecs[j].dai_name = devm_kstrdup(card->dev,
++							  smartpa_dails[j].dai_name,
++							  GFP_KERNEL);
++			if (!codecs[j].name || !codecs[j].dai_name) {
++				ret = -ENOMEM;
++				goto out;
++			}
++		}
++		link->codecs = codecs;
++		link->num_codecs = smartpa_count;
++	}
++out:
++	mutex_unlock(&smartpa_lock);
++	return ret;
+ }
+ 
+ static ssize_t smartpa_type_show(struct kobject *kobj,
+ 				struct kobj_attribute *attr, char *buff)
+ {
+-	return sprintf(buff, "%s\n", smartpa_type);
++	ssize_t ret;
++
++	mutex_lock(&smartpa_lock);
++	ret = sysfs_emit(buff, "%s\n", smartpa_type);
++	mutex_unlock(&smartpa_lock);
++	return ret;
+ }
+ 
+ static struct kobj_attribute smartpa_type_attr =
+ 	__ATTR(smartpa_type, 0644, smartpa_type_show, NULL);
+ 
++static struct kobject *smartpa_kobj;
++
+ static int smartpa_sysfs_init(void)
+ {
+-	int ret = -1;
+-
+-	static struct kobject *ext_debug_kobj;
+-
+-	if (ext_debug_kobj)
+-		return 0;
+-
+-	ext_debug_kobj = kobject_create_and_add("smartpa", kernel_kobj);
+-	if (ext_debug_kobj == NULL) {
++	int ret;
++
++	smartpa_kobj = kobject_create_and_add("smartpa", kernel_kobj);
++	if (!smartpa_kobj)
++		return -ENOMEM;
++	ret = sysfs_create_file(smartpa_kobj, &smartpa_type_attr.attr);
++	if (ret) {
++		kobject_put(smartpa_kobj);
++		smartpa_kobj = NULL;
++	}
++	return ret;
++}
++
++static void smartpa_sysfs_exit(void)
++{
++	if (!smartpa_kobj)
++		return;
++	sysfs_remove_file(smartpa_kobj, &smartpa_type_attr.attr);
++	kobject_put(smartpa_kobj);
++	smartpa_kobj = NULL;
++}
++
++static void msm_asoc_machine_cleanup(struct snd_soc_card *card)
++{
++	struct msm_asoc_mach_data *pdata = snd_soc_card_get_drvdata(card);
++	int ret;
++
++	if (pdata->ssr_registered) {
++		snd_event_master_deregister(card->dev);
++		pdata->ssr_registered = false;
++	}
++	if (pdata->card_registered) {
++		snd_soc_unregister_card(card);
++		pdata->card_registered = false;
++	}
++	msm_common_snd_deinit(pdata->common_pdata);
++	pdata->common_pdata = NULL;
++	if (pdata->dmic_enabled) {
++		ret = msm_cdc_pinctrl_select_sleep_state(pdata->dmic_enable_gpio);
++		if (ret)
++			dev_err(card->dev, "DMIC shutdown failed: %d\n", ret);
++		pdata->dmic_enabled = false;
++	}
++	snd_card_set_card_status(SND_CARD_STATUS_OFFLINE);
++}
++
++static int msm_machine_get_nodes(struct device *dev, struct msm_asoc_mach_data *pdata)
++{
++	struct {
++		const char *name;
++		struct device_node **node;
++	} props[] = {
++		{ "fsa4480-i2c-handle", &pdata->fsa_handle },
++		{ "wcd939x-i2c-handle", &pdata->wcd_usbss_handle },
++		{ "qcom,cdc-dmic01-gpios", &pdata->dmic01_gpio_p },
++		{ "qcom,cdc-dmic23-gpios", &pdata->dmic23_gpio_p },
++		{ "qcom,cdc-dmic45-gpios", &pdata->dmic45_gpio_p },
++		{ "qcom,cdc-dmic67-gpios", &pdata->dmic67_gpio_p },
++	};
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < ARRAY_SIZE(props); i++) {
++		ret = msm_machine_get_node(dev, props[i].name, props[i].node);
++		if (ret)
++			return ret;
++	}
++	if (pdata->wcd_disabled)
++		return msm_machine_get_node(dev, "qcom,cdc-dmic-enable-gpios",
++					    &pdata->dmic_enable_gpio);
++	return 0;
++}
++
++static int msm_asoc_machine_probe(struct platform_device *pdev)
++{
++	struct msm_asoc_mach_data *pdata;
++	struct snd_soc_card *card = NULL;
++	const struct of_device_id *match;
++	struct device_node *dmic_nodes[4];
++	unsigned int i;
++	int ret;
++
++	if (!pdev->dev.of_node)
++		return -EINVAL;
++	mutex_lock(&machine_probe_lock);
++	if (machine_device) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
++	if (!pdata) {
+ 		ret = -ENOMEM;
+-		pr_err("register sysfs failed. ret = %d\n", ret);
+-		return ret;
+-	}
+-	ret = sysfs_create_file(ext_debug_kobj, &smartpa_type_attr.attr);
+-
+-	if (ret)
+- 		pr_err("create sysfs failed. ret = %d\n", ret);
+-	return ret;
+-}
+-//add for smartpa compatibe end
+-
+-static int msm_asoc_machine_probe(struct platform_device *pdev)
+-{
+-	struct snd_soc_card *card = NULL;
+-	struct msm_asoc_mach_data *pdata = NULL;
+-	int ret = 0;
+-	struct clk *lpass_audio_hw_vote = NULL;
+-	const struct of_device_id *match;
+-
+-	if (!pdev->dev.of_node) {
+-		dev_err(&pdev->dev, "%s: No platform supplied from device tree\n", __func__);
+-		return -EINVAL;
+-	}
+-	pdata = devm_kzalloc(&pdev->dev,
+-			sizeof(struct msm_asoc_mach_data), GFP_KERNEL);
+-	if (!pdata)
+-		return -ENOMEM;
+-
+-	of_property_read_u32(pdev->dev.of_node,
+-						"qcom,wcd-disabled",
+-						&pdata->wcd_disabled);
+-
+-	/* Get maximum WSA device count for this platform */
+-	ret = of_property_read_u32(pdev->dev.of_node,
+-		"qcom,wsa-max-devs", &pdata->wsa_max_devs);
+-	if (ret) {
+-		dev_info(&pdev->dev,
+-		"%s: wsa-max-devs property missing in DT %s, ret = %d\n",
+-		__func__, pdev->dev.of_node->full_name, ret);
+-		pdata->wsa_max_devs = 0;
+-	}
+-
+-	/* Check if WSA2 Backends were used for dedicated usecase */
+-	pdata->dedicated_wsa2 = of_find_property(pdev->dev.of_node,
+-				"qcom,dedicated-wsa2", NULL);
+-
+-	//add for smartpa compatible begin
+-	if (probe_cout == 0) {
+-		smartpa_dai_link_select();
+-		smartpa_sysfs_init();
+-	}
+-	probe_cout++;
+-	//end for smartpa compatibe end
+-
++		goto unlock;
++	}
++	pdata->mbhc_cfg = wcd_mbhc_defaults;
++	of_property_read_u32(pdev->dev.of_node, "qcom,wcd-disabled", &pdata->wcd_disabled);
++	of_property_read_u32(pdev->dev.of_node, "qcom,wsa-max-devs", &pdata->wsa_max_devs);
++	pdata->dedicated_wsa2 = of_property_read_bool(pdev->dev.of_node, "qcom,dedicated-wsa2");
+ 	card = populate_snd_card_dailinks(&pdev->dev, pdata->wsa_max_devs);
+-	if (!card) {
+-		dev_err(&pdev->dev, "%s: Card uninitialized\n", __func__);
+-		ret = -EINVAL;
+-		goto err;
+-	}
+-
+-	match = of_match_node(sun_asoc_machine_of_match, pdev->dev.of_node);
+-	if (!match) {
+-		dev_err(&pdev->dev, "%s: No DT match found for sound card\n",
+-			__func__);
+-		ret = -EINVAL;
+-		goto err;
+-	}
+-
++	if (IS_ERR_OR_NULL(card)) {
++		ret = card ? PTR_ERR(card) : -EINVAL;
++		goto unlock;
++	}
+ 	card->dev = &pdev->dev;
+ 	platform_set_drvdata(pdev, card);
+ 	snd_soc_card_set_drvdata(card, pdata);
+-
++	match = of_match_node(sun_asoc_machine_of_match, pdev->dev.of_node);
++	if (!match) {
++		ret = -EINVAL;
++		goto cleanup;
++	}
+ 	ret = snd_soc_of_parse_card_name(card, "qcom,model");
+-	if (ret) {
+-		dev_err(&pdev->dev, "%s: parse card name failed, err:%d\n",
+-			__func__, ret);
+-		goto err;
+-	}
+-
+-	if(!strcmp(match->data, "codec")) {
++	if (ret)
++		goto cleanup;
++	if (!strcmp(match->data, "codec")) {
+ 		ret = snd_soc_of_parse_audio_routing(card, "qcom,audio-routing");
+-		if (ret) {
+-			dev_err(&pdev->dev, "%s: parse audio routing failed, err:%d\n",
+-				__func__, ret);
+-			goto err;
+-		}
+-	}
+-
++		if (ret)
++			goto cleanup;
++	}
++	ret = smartpa_dai_link_select(card);
++	if (ret)
++		goto cleanup;
+ 	ret = msm_populate_dai_link_component_of_node(card);
+-	if (ret) {
+-		dev_err(&pdev->dev, "%s:%d err:%d\n", __func__, __LINE__, ret);
+-		ret = -EPROBE_DEFER;
+-		goto err;
+-	}
+-
+-	/* parse upd configuration */
++	if (ret)
++		goto cleanup;
+ 	msm_parse_upd_configuration(pdev, pdata);
+-
+-	pdata->fsa_handle = of_parse_phandle(pdev->dev.of_node,
+-						"fsa4480-i2c-handle", 0);
+-	if (!pdata->fsa_handle)
+-		dev_dbg(&pdev->dev, "property %s not detected in node %s\n",
+-			"fsa4480-i2c-handle", pdev->dev.of_node->full_name);
+-
+-	pdata->wcd_usbss_handle = of_parse_phandle(pdev->dev.of_node,
+-						"wcd939x-i2c-handle", 0);
+-	if (!pdata->wcd_usbss_handle)
+-		dev_dbg(&pdev->dev, "property %s not detected in node %s\n",
+-			"wcd939x-i2c-handle", pdev->dev.of_node->full_name);
+-
+-	//if ((pdata->wcd_usbss_handle) || (pdata->fsa_handle))
+-	//	wcd_mbhc_cfg.swap_gnd_mic = msm_usbc_swap_gnd_mic;
+-
+-	ret = devm_snd_soc_register_card(&pdev->dev, card);
+-	if (ret == -EPROBE_DEFER) {
+-		dev_err(&pdev->dev, "%s:%d err:%d\n", __func__, __LINE__, ret);
+-		if (codec_reg_done)
+-			ret = -EINVAL;
+-		goto err;
+-	} else if (ret) {
+-		dev_err(&pdev->dev, "%s: snd_soc_register_card failed (%d)\n",
+-			__func__, ret);
+-		goto err;
+-	}
+-	dev_info(&pdev->dev, "%s: Sound card %s registered\n",
+-		 __func__, card->name);
+-
+-	if (wcd_mbhc_cfg.enable_usbc_analog) {
+-		dev_dbg(&pdev->dev, "%s: get swap_gnd_mic \n", __func__);
+-		wcd_mbhc_cfg.swap_gnd_mic = msm_usbc_swap_gnd_mic;
+-	}
+-
+-	pdata->dmic01_gpio_p = of_parse_phandle(pdev->dev.of_node,
+-					      "qcom,cdc-dmic01-gpios",
+-					       0);
+-	pdata->dmic23_gpio_p = of_parse_phandle(pdev->dev.of_node,
+-					      "qcom,cdc-dmic23-gpios",
+-					       0);
+-	pdata->dmic45_gpio_p = of_parse_phandle(pdev->dev.of_node,
+-					      "qcom,cdc-dmic45-gpios",
+-					       0);
+-	pdata->dmic67_gpio_p = of_parse_phandle(pdev->dev.of_node,
+-					      "qcom,cdc-dmic67-gpios",
+-					       0);
+-
+-	if(pdata->wcd_disabled){
+-		pdata->dmic_enable_gpio = of_parse_phandle(pdev->dev.of_node,
+-						      "qcom,cdc-dmic-enable-gpios",
+-						       0);
++	ret = msm_machine_get_nodes(&pdev->dev, pdata);
++	if (ret)
++		goto cleanup;
++	if (pdata->fsa_handle || pdata->wcd_usbss_handle)
++		pdata->mbhc_cfg.swap_gnd_mic = msm_usbc_swap_gnd_mic;
++	if (pdata->wcd_disabled && pdata->dmic_enable_gpio) {
+ 		ret = msm_cdc_pinctrl_select_active_state(pdata->dmic_enable_gpio);
+-		if(ret)
+-			dev_err(&pdev->dev, "%s:%d dmicenable_gpio set failed, err:%d\n", __func__, __LINE__, ret);
+-	}
+-	if (pdata->dmic01_gpio_p)
+-		msm_cdc_pinctrl_set_wakeup_capable(pdata->dmic01_gpio_p, false);
+-	if (pdata->dmic23_gpio_p)
+-		msm_cdc_pinctrl_set_wakeup_capable(pdata->dmic23_gpio_p, false);
+-	if (pdata->dmic45_gpio_p)
+-		msm_cdc_pinctrl_set_wakeup_capable(pdata->dmic45_gpio_p, false);
+-	if (pdata->dmic67_gpio_p)
+-		msm_cdc_pinctrl_set_wakeup_capable(pdata->dmic67_gpio_p, false);
+-
+-	msm_common_snd_init(pdev, card);
+-
+-	/* Register LPASS audio hw vote */
+-	lpass_audio_hw_vote = devm_clk_get(&pdev->dev, "lpass_audio_hw_vote");
+-	if (IS_ERR(lpass_audio_hw_vote)) {
+-		ret = PTR_ERR(lpass_audio_hw_vote);
+-		dev_dbg(&pdev->dev, "%s: clk get %s failed %d\n",
+-			__func__, "lpass_audio_hw_vote", ret);
+-		lpass_audio_hw_vote = NULL;
+-		ret = 0;
+-	}
+-	pdata->lpass_audio_hw_vote = lpass_audio_hw_vote;
+-	pdata->core_audio_vote_count = 0;
+-
++		if (ret)
++			goto cleanup;
++		pdata->dmic_enabled = true;
++	}
++	dmic_nodes[0] = pdata->dmic01_gpio_p;
++	dmic_nodes[1] = pdata->dmic23_gpio_p;
++	dmic_nodes[2] = pdata->dmic45_gpio_p;
++	dmic_nodes[3] = pdata->dmic67_gpio_p;
++	for (i = 0; i < ARRAY_SIZE(dmic_nodes); i++)
++		if (dmic_nodes[i])
++			msm_cdc_pinctrl_set_wakeup_capable(dmic_nodes[i], false);
++	pdata->lpass_audio_hw_vote = devm_clk_get(&pdev->dev, "lpass_audio_hw_vote");
++	if (IS_ERR(pdata->lpass_audio_hw_vote)) {
++		ret = PTR_ERR(pdata->lpass_audio_hw_vote);
++		pdata->lpass_audio_hw_vote = NULL;
++		if (ret == -EPROBE_DEFER)
++			goto cleanup;
++	}
++	ret = msm_common_snd_init(pdev, card);
++	if (ret)
++		goto cleanup;
++	/* All callbacks can now use common state and clock/pinctrl ownership. */
++	ret = snd_soc_register_card(card);
++	if (ret)
++		goto cleanup;
++	pdata->card_registered = true;
+ 	ret = msm_audio_ssr_register(&pdev->dev);
+ 	if (ret)
+-		pr_err("%s: Registration with SND event FWK failed ret = %d\n",
+-			__func__, ret);
+-
+-	is_initial_boot = true;
+-
+-	/* change card status to ONLINE */
+-	dev_dbg(&pdev->dev, "%s: setting snd_card to ONLINE\n", __func__);
++		goto cleanup;
++	machine_device = &pdev->dev;
+ 	snd_card_set_card_status(SND_CARD_STATUS_ONLINE);
+-
++	mutex_unlock(&machine_probe_lock);
+ 	return 0;
+-err:
+-	devm_kfree(&pdev->dev, pdata);
+-	dev_err(&pdev->dev, "%s:%d err:%d\n", __func__, __LINE__, ret);
++cleanup:
++	msm_asoc_machine_cleanup(card);
++	platform_set_drvdata(pdev, NULL);
++unlock:
++	mutex_unlock(&machine_probe_lock);
+ 	return ret;
+ }
+ 
+-static int msm_asoc_machine_remove(struct platform_device *pdev)
++static void msm_asoc_machine_remove(struct platform_device *pdev)
+ {
+ 	struct snd_soc_card *card = platform_get_drvdata(pdev);
+-	struct msm_asoc_mach_data *pdata = NULL;
+-	struct msm_common_pdata *common_pdata = NULL;
+-
++
++	mutex_lock(&machine_probe_lock);
+ 	if (card)
+-		pdata = snd_soc_card_get_drvdata(card);
+-
+-	if (pdata)
+-		common_pdata = pdata->common_pdata;
+-
+-	msm_common_snd_deinit(common_pdata);
+-	snd_event_master_deregister(&pdev->dev);
+-	snd_soc_unregister_card(card);
+-
+-	return 0;
++		msm_asoc_machine_cleanup(card);
++	platform_set_drvdata(pdev, NULL);
++	machine_device = NULL;
++	mutex_unlock(&machine_probe_lock);
+ }
+ 
+ static struct platform_driver sun_asoc_machine_driver = {
+@@ -2924,14 +3109,34 @@
+ 
+ static int __init msm_asoc_machine_init(void)
+ {
+-	snd_card_sysfs_init();
+-	return platform_driver_register(&sun_asoc_machine_driver);
++	int ret;
++
++	ret = snd_card_sysfs_init();
++	if (ret)
++		return ret;
++	ret = smartpa_sysfs_init();
++	if (ret)
++		goto card_exit;
++	ret = platform_driver_register(&sun_asoc_machine_driver);
++	if (ret) {
++		smartpa_sysfs_exit();
++		goto card_exit;
++	}
++	return 0;
++card_exit:
++	snd_card_sysfs_deinit();
++	return ret;
+ }
+ module_init(msm_asoc_machine_init);
+ 
+ static void __exit msm_asoc_machine_exit(void)
+ {
+ 	platform_driver_unregister(&sun_asoc_machine_driver);
++	smartpa_sysfs_exit();
++	snd_card_sysfs_deinit();
++	/* Native callers are module dependencies and have already stopped. */
++	while (smartpa_count)
++		unregister_smartpa_codec(smartpa_devices[0]);
+ }
+ module_exit(msm_asoc_machine_exit);
+ 
+--- a/qcom/opensource/audio-kernel/asoc/msm_common.h
++++ b/qcom/opensource/audio-kernel/asoc/msm_common.h
+@@ -36,7 +36,14 @@
+ 	SMARTPA_MAX,
+ };
+ 
++bool check_smartpa_type(const char *name);
+ int get_smartpa_type(void);
++int set_smartpa_type(const char *name, unsigned int size);
++void set_smartpa_codec(struct device *dev, const char *dai_name);
++/* Withdraw before the component/DAI storage is released. */
++int register_smartpa_codec(struct device *dev, const char *dai_name,
++			   const char *type);
++void unregister_smartpa_codec(struct device *dev);
+ //add for smartpa compatibe end
+ 
+ typedef enum snd_card_status_t {
+@@ -48,6 +55,10 @@
+ 	uint8_t *aud_dev_state;
+ 	struct kobject aud_dev_kobj;
+ 	struct mutex aud_dev_lock;
++	/* Serializes shared LPASS hardware votes across interfaces. */
++	struct mutex hw_vote_lock;
++	bool aud_sysfs_added;
++	bool aud_attr_added;
+ 	uint32_t num_aud_devs;
+ 	struct device_node *mi2s_gpio_p[MI2S_TDM_AUXPCM_MAX];
+ 	struct mutex lock[MI2S_TDM_AUXPCM_MAX];
+@@ -69,6 +80,8 @@
+ 			  struct msm_common_pdata *pdata);
+ 
+ int snd_card_sysfs_init(void);
++void snd_card_sysfs_deinit(void);
++void msm_common_snd_card_reset(void);
+ 
+ int msm_common_snd_hw_params(struct snd_pcm_substream *substream,
+ 			struct snd_pcm_hw_params *params);

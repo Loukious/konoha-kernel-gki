@@ -1,0 +1,17 @@
+--- a/qcom/opensource/camera-kernel/drivers/cam_req_mgr/cam_req_mgr_dev.c
++++ b/qcom/opensource/camera-kernel/drivers/cam_req_mgr/cam_req_mgr_dev.c
+@@ -1032,12 +1032,13 @@
+ 	rc = media_entity_pads_init(&g_dev.video->entity, 0, NULL);
+ 	if (rc)
+ 		goto free_video;
+-	g_dev.video->entity.function = CAM_VNODE_DEVICE_TYPE;
+ 	rc = video_register_device(g_dev.video, VFL_TYPE_VIDEO, -1);
+ 	if (rc) {
+ 		media_entity_cleanup(&g_dev.video->entity);
+ 		goto free_video;
+ 	}
++	/* V4L2 registration installs its generic type; restore the camera ABI. */
++	g_dev.video->entity.function = CAM_VNODE_DEVICE_TYPE;
+ 	g_dev.video->entity.name = video_device_node_name(g_dev.video);
+ 	return 0;
+ 

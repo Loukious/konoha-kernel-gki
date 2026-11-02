@@ -1,0 +1,60 @@
+Subject: Serialize SoundWire bulk transfers without recursive I/O locking
+
+Keep command ID assignment and transfer under one mutex, preserve
+controller-internal serialization, and return platform transfer errors.
+The existing hardware CMD Ignored interrupt remains unchanged.
+
+---
+
+--- a/qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.c
++++ b/qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.c
+@@ -696,15 +696,15 @@
+ 		swrm_ahb_write(swrm, reg_addr, &val);
+ }
+ 
+-static int swr_master_bulk_write(struct swr_mstr_ctrl *swrm, u32 *reg_addr,
+-				u32 *val, unsigned int length)
++static int swr_master_bulk_write_locked(struct swr_mstr_ctrl *swrm, u32 *reg_addr,
++					u32 *val, unsigned int length)
+ {
+ 	int i = 0;
+ 
++	lockdep_assert_held(&swrm->iolock);
+ 	if (swrm->bulk_write)
+-		swrm->bulk_write(swrm->handle, reg_addr, val, length);
++		return swrm->bulk_write(swrm->handle, reg_addr, val, length);
+ 	else {
+-		mutex_lock(&swrm->iolock);
+ 		for (i = 0; i < length; i++) {
+ 		/* wait for FIFO WR command to complete to avoid overflow */
+ 		/*
+@@ -718,9 +718,19 @@
+ 			swr_master_write(swrm, reg_addr[i], val[i]);
+ 		}
+ 		usleep_range(100, 110);
+-		mutex_unlock(&swrm->iolock);
+ 	}
+ 	return 0;
++}
++
++static int swr_master_bulk_write(struct swr_mstr_ctrl *swrm, u32 *reg_addr,
++				 u32 *val, unsigned int length)
++{
++	int ret;
++
++	mutex_lock(&swrm->iolock);
++	ret = swr_master_bulk_write_locked(swrm, reg_addr, val, length);
++	mutex_unlock(&swrm->iolock);
++	return ret;
+ }
+ 
+ static bool swrm_check_link_status(struct swr_mstr_ctrl *swrm, bool active)
+@@ -1230,7 +1240,7 @@
+ 							 ((u16 *)reg)[i]);
+ 			swr_fifo_reg[i] = SWRM_CMD_FIFO_WR_CMD(swrm->ee_val);
+ 		}
+-		ret = swr_master_bulk_write(swrm, swr_fifo_reg, val, len);
++		ret = swr_master_bulk_write_locked(swrm, swr_fifo_reg, val, len);
+ 		mutex_unlock(&swrm->iolock);
+ 		if (ret) {
+ 			dev_err_ratelimited(&master->dev, "%s: bulk write failed\n",

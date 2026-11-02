@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/dts-v1/;
+/plugin/;
+
+/* Both radios use the same permanent WCN switch-control mux. Let TLMM
+ * own it, rather than making the radio drivers contend for GPIO 80.
+ */
+&tlmm {
+	pinctrl-names = "default";
+	pinctrl-0 = <&wcn_shared_sw_ctrl>;
+
+	wcn_shared_sw_ctrl: wcn-shared-sw-ctrl {
+		mux {
+			pins = "gpio80";
+			function = "wcn_sw_ctrl";
+		};
+	};
+};
+
+/* Keep the named states available to both native drivers. */
+&soc {
+	bt_tuna {
+		pinctrl-1 = <>;
+	};
+
+	qcom,wcn7750 {
+		pinctrl-0 = <>;
+	};
+};

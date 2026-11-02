@@ -1,0 +1,22 @@
+--- a/drivers/usb/phy/phy-msm-snps-eusb2.c
++++ b/drivers/usb/phy/phy-msm-snps-eusb2.c
+@@ -982,7 +982,7 @@
+ 		goto err_ret;
+ 	}
+ 
+-	if (of_property_read_bool(dev->of_node, "vdd_refgen-supply")) {
++	if (of_property_present(dev->of_node, "vdd_refgen-supply")) {
+ 		phy->vdd_refgen = devm_regulator_get_optional(dev, "vdd_refgen");
+ 		if (IS_ERR(phy->vdd_refgen)) {
+ 			ret = PTR_ERR(phy->vdd_refgen);
+--- a/drivers/usb/dwc3/dwc3-msm-core.c
++++ b/drivers/usb/dwc3/dwc3-msm-core.c
+@@ -6496,7 +6496,7 @@
+ 	struct device_node *node = mdwc->dev->of_node;
+ 	int ret = 0;
+ 
+-	if (of_property_read_bool(node, "extcon")) {
++	if (of_property_present(node, "extcon")) {
+ 		ret = dwc3_msm_extcon_register(mdwc);
+ 		if (ret)
+ 			return ret;

@@ -1,0 +1,20 @@
+--- a/drivers/soc/qcom/dcvs/bwmon.c
++++ b/drivers/soc/qcom/dcvs/bwmon.c
+@@ -1910,6 +1910,7 @@
+ 	{ .compatible = "qcom,bwmon5", .data = &spec[4] },
+ 	{}
+ };
++MODULE_DEVICE_TABLE(of, qcom_bwmon_match_table);
+ 
+ static int configure_bwmon_resources(struct platform_device *pdev, struct bwmon *m)
+ {
+@@ -2245,7 +2246,8 @@
+ 		.suppress_bind_attrs = true,
+ 	},
+ };
+-module_platform_driver(qcom_bwmon_driver);
++/* No remove callback: keep the DCVS monitor registered for the boot lifetime. */
++builtin_platform_driver(qcom_bwmon_driver);
+ 
+ MODULE_DESCRIPTION("QCOM BWMON driver");
+ MODULE_LICENSE("GPL");

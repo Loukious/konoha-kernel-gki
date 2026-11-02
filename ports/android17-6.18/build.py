@@ -35,6 +35,7 @@ def main():
     artifacts.mkdir(parents=True)
     command = ["tools/bazel", "build", "--keep_going", f"--jobs={args.jobs}",
                f"--local_resources=memory={args.memory_mb}",
+               "--//build/kernel/kleaf:user_kmi_symbol_lists=//onyx:kmi-symbols",
                "//common:kernel_aarch64", "//onyx:platform_modules"]
     print(f"Building; log: {artifacts / 'build.log'}", flush=True)
     with (artifacts / "build.log").open("w") as log:
@@ -44,6 +45,7 @@ def main():
         ["tools/bazel", "info", "execution_root"], cwd=workspace, text=True).strip())
     query = subprocess.check_output([
         "tools/bazel", "cquery", "--output=files",
+        "--//build/kernel/kleaf:user_kmi_symbol_lists=//onyx:kmi-symbols",
         "//common:kernel_aarch64 + //onyx:platform_modules"
     ], cwd=workspace, text=True)
     (artifacts / "bazel-outputs.txt").write_text(query)
@@ -78,7 +80,7 @@ def main():
     for name in ["sources.json", "imports.json", "onyx-port.xml", "dependency-lock.xml",
                  "BUILD.bazel", "Kconfig", "scm_defconfig", "platform_defconfig", "relay.fragment", "modules.json",
                  "build.py", "prepare.py", "stage.py", "verify_modules.py", "boot-parameters.txt",
-                 "build_devicetrees.py", "devicetrees.json"]:
+                 "build_devicetrees.py", "devicetrees.json", "kmi-symbols"]:
         shutil.copyfile(HERE / name, inputs / name)
     shutil.copytree(HERE / "patches", inputs / "patches")
     if (HERE / "validation").is_dir():
@@ -105,7 +107,7 @@ def main():
         "sha256": hashes,
         "limits": [
             "Build and imported-symbol CRC checks only; no device boot or hardware validation.",
-            "Not flashable: the rest of the Onyx driver stack and boot images are not ported.",
+            "Build archive only; assemble and verify matched boot and DLKM images before flashing.",
             "Gunyah secure-VM loading, proxy scheduling, memory assignment, and QRTR host transport are compiled together but have not been exercised with device firmware. Guest-power drivers are disabled, matching the Onyx HLOS baseline.",
             "The default Kleaf build uses the maybe-dirty suffix without stamping; input revisions are recorded separately.",
         ],

@@ -1,8 +1,10 @@
 # Onyx Android 17 / Linux 6.18 port
 
-This directory contains the first implementation of the POCO F7 / SM8735 port.
-The pinned **6.18.33 GKI and 288 vendor modules build successfully**. This is
-an initial platform build, **not a flashable kernel or a boot-tested port**.
+This directory contains the POCO F7 / SM8735 port recipe. The pinned
+**6.18.33 GKI and 318 platform modules build successfully**. Matched boot and
+DLKM images now boot Android on the test device, and direct fastbootd and
+Android return have been verified. This remains an experimental port with
+unresolved hardware and warning investigations. See [the current checkpoint](PROGRESS.md).
 
 The branch stores the port recipe in this directory. Its top-level kernel is
 still the validated 6.6 tree; the commands below create and build a separate
@@ -35,7 +37,7 @@ stock KMI checks and compiler warnings enabled. Outputs go to
 `WORKSPACE/artifacts/TIMESTAMP/`, including:
 
 - GKI Image variants, vmlinux, symbol tables, configuration, headers and modules.
-- 288 platform `.ko` files, their symbol tables and DDK configurations.
+- 318 platform `.ko` files, their symbol tables and DDK configurations.
 - Merged Tuna/Tuna7 DTBs, the Onyx board overlay, `dtb.img` and `dtbo.img`.
 - Input manifests, source/blob pins, patches, staged-file hashes and the new
   validation records/host-test fixtures.
@@ -72,8 +74,9 @@ The original four appear in the ROM's first-stage module lists. SCM depends on G
 exports, pinctrl-msm depends on SCM, and pinctrl-tuna depends on pinctrl-msm.
 The vendor wakeup, eGPIO ownership, reserved-GPIO and I3C helper behavior is
 retained. No dummy secure-monitor functions or symbol-version bypasses are
-used. The current [validation report](validation-20261031.json) checks 18,369
-imported symbol CRCs across all 288 modules.
+used. The initial [validation report](validation-20261031.json) checked 18,369
+imported symbol CRCs across 288 modules; subsequent build reports verify the
+expanded module catalog described in [the current checkpoint](PROGRESS.md).
 
 The platform group also builds IPC logging, PDC interrupts, command DB,
 CRM v2, RPMh, hardware spinlocks, SMEM, SoC information, the SPMI PMIC arbiter,
@@ -1906,3 +1909,66 @@ with 1,084 existing vendor DTC warnings. ROM module-name coverage is 285/466
 The GKI Image and symbol table match the preceding 277-module checkpoint.
 Codec/amplifier/machine and peripheral work, KernelSU/NetHunter, boot/DLKM images
 and ZIP packaging remain. No flashable ZIP or phone validation exists yet.
+
+## Native audio consumers and upstream mac80211
+
+Archive `artifacts/20261101T105938232076Z` contains 304 modules and passes 19,698 imported-symbol CRC checks. It integrates six WCD93xx codec/slave modules, WSA883x/884x, six small audio endpoints, the SUN machine driver, SoundWire IRQ and display/SND event provider updates, and upstream mac80211. The original GKI exports remain available; the build retains two additional existing LED exports for mac80211 with strict KMI checks enabled. mac80211 depends on cfg80211 and the matching GKI libarc4 module.
+
+ROM module-name build coverage is 301/466 (64.6%); 165 names remain, including alternative hardware. Device-tree and overlay validation passes with existing vendor warnings. Group validation records and production-function test fixtures are archived under `validation/`. Amplifier integration, remaining peripherals, KernelSU/NetHunter, boot/DLKM images, ZIP packaging and phone validation remain unfinished. No flashable ZIP or physical audio/RF functionality is claimed.
+
+## Native third-party amplifiers
+
+Three modules retain all 15 native compilation units, native dependencies,
+device aliases, parameters and exported-symbol names. Thirty pinned source and
+header inputs replay exactly through patch 0131. Firmware size, lists, nested
+records and CRC checks reject malformed data. Tuning messages use a copied,
+validated header and bounded queues. Registration failures unwind owned state;
+component removal drains work and IRQ ownership before freeing resources.
+
+Integrated production-function tests pass 250 cases with ASan/UBSan and reject
+18 compiled regressions. Strict builds and imported-symbol CRC checks pass.
+Checkpatch reports zero errors, four uncommented acquire-load advisories and
+20 style checks; the complete report is in validation/audio_amplifiers/.
+
+Archive artifacts/20261101T111342557781Z contains 307 platform modules and passes 19,909
+imported-symbol CRC checks. The GKI Image, GKI exports and all previous platform
+symbol tables match the 304-module checkpoint. Device-tree/overlay checks pass.
+Vendor-name coverage is 304/466 (65.2%); 162 names remain to assess or port.
+
+These checks do not establish physical audio, amplifier firmware compatibility,
+concurrent hot-unbind, phone boot, or complete kernel/DSP/SSR behavior. Matching
+boot/DLKM packaging, KernelSU/NetHunter and phone validation remain unfinished.
+
+## Niobe UFS PHY and packaging audit
+
+Archive `artifacts/20261101T112158076955Z` contains 308 modules and passes 19,936 imported CRC checks plus device-tree/overlay validation. Native Niobe calibration tables and metadata are preserved. Generic PHY provider-registration errors propagate to both callers; invalid Niobe modes are rejected before reset. Three compiled regression controls reject broken error handling. GKI Image and existing platform export CRCs are unchanged. Coverage is 305/466 (65.5%). See `validation/ufs_niobe/` and `packaging-audit-20261101.json`. Physical UFS operation and phone boot remain unvalidated; matching boot/DLKM images and a flashable ZIP remain unfinished.
+
+## First-stage module dependency closure
+
+Archive `artifacts/20261101T112808685369Z` contains 309 modules and passes 19,947 imported CRC checks and DT/overlay checks. The new TLMM VM IRQ module resolves the Tuna pinctrl soft dependency, uses per-device domain storage and passes two compiled rejecting cleanup controls. GKI Image and previous provider symbol tables are unchanged. ROM-name coverage remains 305/466 (65.5%) because this provider was absent from the baseline load lists.
+
+`assemble_first_stage.py` creates the 99-module first-stage tree with hard/soft dependency ordering, clean depmod symbol/CRC checks and modprobe dry runs. It records evidence for excluding 19 alternate/disabled board entries and requires both final Onyx DT hashes to match that evidence. See `first-stage-assembly-20261101.json`. This establishes module metadata closure, not phone boot. Recovery/second-stage coverage and complete image/ZIP assembly remain unfinished.
+
+## Native QTI fixed regulator
+
+Archive `artifacts/20261101T113117551299Z` builds 310 modules and passes 19,972 imported CRC checks and DT/overlay validation. QTI fixed retains its native compilation unit, aliases and dependencies. Probe lets the 6.18 regulator core release its GPIO on registration failure and propagates proxy/debug setup errors. Five mocked production probe scenarios pass and reject three compiled regressions. GKI Image and prior provider export CRCs are unchanged. Coverage is 306/466 (65.7%); physical rails and phone boot remain unvalidated. See `validation/qti_fixed/`.
+
+## Native GLINK ADC
+
+Archive `artifacts/20261101T145824674484Z` builds 311 modules and passes 19,998 imported CRC checks and DT/overlay validation. GLINK ADC retains the native wire structures, channel table and module metadata. It validates packet headers and pending response identity, quarantines reads after timeout until a transport DOWN/UP cycle, wakes readers on removal/disconnect, and drains IIO publication/writes before client SRCU cleanup. Six compiled protocol/lifetime regressions are rejected with mocked services; physical ADC, firmware and real concurrent removal are unvalidated. Duplicate successful same-channel responses are a firmware assumption because the protocol has no transaction ID. GKI Image and prior provider CRCs are unchanged. Coverage is 307/466 (65.9%). See `validation/glink_adc/`.
+
+## Native QRTR transport consumers
+
+Archive `artifacts/20261101T150526062786Z` builds 314 modules and passes 20,074 imported CRC checks and DT/overlay validation. MHI/SMD/TUN selectors are enabled as modules; all three native units, aliases and dependencies are preserved. MHI retry/stop/error paths pass 16 host scenarios with four rejecting controls. SMD rejects malformed previews and passes five callback cases with two controls; TUN source is unchanged. Live DMA, RPMSG and modem operation remain unvalidated. GKI Image and prior provider CRCs are unchanged. Coverage is 310/466 (66.5%). The user selected an experimental boot-test ZIP before full optional-feature parity; see `EXPERIMENTAL_ZIP.md`.
+
+## Experimental module bundle
+
+The user-selected boot-test bundle contains 424 matching modules and generated first-stage, recovery, vendor and system load lists. `verify_modules.py` reads classic and extended ELF CRC sections directly. This covers 237 Rust Binder imports, including 41 long names omitted by kmod classic output; a real extended-only CRC corruption is rejected. Known depmod long-Rust-symbol disagreements are accepted only after direct CRC verification. All other diagnostics remain fatal. The bundle passes load dry runs; omitted optional entries are recorded in `experimental-module-bundle-20261101.json`. Boot/vendor_boot/DTBO/DLKM images and the installer still need assembly and validation.
+
+The current experimental bundle is `packaging/experimental-bundle-20261101-314-v5`: 395 unique packaged modules after 424-module, 26,475-import verification. All three physical partition trees pass clean depmod checks and dry runs. USB, graphics and IPA stay enabled; three absent native legacy soft dependencies are documented as optional with baseline evidence. The full-catalog Rust metadata discrepancy does not occur in the physical partition trees, since the unrequested Rust Binder module is outside their required closures. Image and ZIP assembly remain pending.
+
+## Experimental boot-test ZIP available
+
+`Konoha-Onyx-6.18.33-Android17-experimental-boot-test-20261101.zip` is available under the build workspace `release/` directory, with SHA-256 and validation sidecars. It contains matched boot/vendor_boot/DTBO/system-DLKM/vendor-DLKM images, 395 unique modules, and an Onyx recovery installer. AVB verification, image unpack/extraction, preserved non-module ramdisk records, module dependency/CRC checks, 24 mocked installer scenarios and final ZIP hash/mode/path audits pass.
+
+This first test requires unlocked Onyx, mapped active-slot DLKM partitions, recovery installation and AVB/verity already disabled (vbmeta flags 3), as in the baseline ROM. System DLKM grows about 1 MiB. init_boot, recovery and vbmeta remain untouched. Hardware and boot are unvalidated, optional modules are omitted explicitly, and KernelSU/NetHunter completion is deferred. See `experimental-zip-validation-20261101.json` and the ZIP README/manifest. No phone was flashed during creation.

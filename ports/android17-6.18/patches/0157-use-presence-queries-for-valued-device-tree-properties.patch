@@ -1,0 +1,92 @@
+--- a/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.c
+@@ -1425,7 +1425,7 @@
+ 		}
+ 		child->dev.parent = priv->dev;
+ 		child->dev.of_node = of_node_get(node);
+-		if (of_property_read_bool(node, "qcom,split-codec")) {
++		if (of_property_present(node, "qcom,split-codec")) {
+ 			priv->child_phase[priv->child_count] = 0;
+ 			priv->wcd_dev = &child->dev;
+ 		} else if (of_device_is_compatible(node, "qcom,lpass-cdc-clk-rsc-mngr")) {
+--- a/qcom/opensource/camera-kernel/drivers/cam_cpas/cam_cpas_soc.c
++++ b/qcom/opensource/camera-kernel/drivers/cam_cpas/cam_cpas_soc.c
+@@ -1383,11 +1383,11 @@
+ 	CAM_DBG(CAM_CPAS, "cam-max-rt-axi-bw = %llu", soc_private->cam_max_rt_axi_bw);
+ 
+ 	soc_private->client_id_based = of_property_read_bool(of_node, "client-id-based");
+-	soc_private->bus_icc_based = of_property_read_bool(of_node, "interconnect-names");
++	soc_private->bus_icc_based = of_property_present(of_node, "interconnect-names");
+ 
+ 	if (soc_private->bus_icc_based) {
+-		soc_private->use_cam_icc_path_str = of_property_read_bool(of_node,
+-			"cam-icc-path-names");
++		soc_private->use_cam_icc_path_str =
++			of_property_present(of_node, "cam-icc-path-names");
+ 		if (soc_private->use_cam_icc_path_str) {
+ 			rc = of_property_read_string(of_node, "cam-icc-path-names",
+ 				&cpas_core->ahb_bus_client.common_data.name);
+--- a/qcom/opensource/camera-kernel/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/cam_vfe_soc.c
++++ b/qcom/opensource/camera-kernel/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/cam_vfe_soc.c
+@@ -68,7 +68,7 @@
+ 		goto pid;
+ 	}
+ 
+-	if (!of_property_read_bool(of_node, "ubwc-static-cfg")) {
++	if (!of_property_present(of_node, "ubwc-static-cfg")) {
+ 		CAM_DBG(CAM_ISP, "ubwc-static-cfg not supported");
+ 		goto pid;
+ 	}
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_res_parse.c
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_res_parse.c
+@@ -1145,7 +1145,7 @@
+ 		cb->addr_range.size = 0x24800000;
+ 	}
+ 
+-	cb->is_secure = of_property_read_bool(np, "qcom,iommu-vmid");
++	cb->is_secure = of_property_present(np, "qcom,iommu-vmid");
+ 	dprintk(CVP_CORE, "context bank %s : secure = %d\n",
+ 			cb->name, cb->is_secure);
+ 
+--- a/qcom/opensource/graphics-kernel/kgsl_iommu.c
++++ b/qcom/opensource/graphics-kernel/kgsl_iommu.c
+@@ -2821,7 +2821,7 @@
+ 	 * IOMMU device is already bound to power domain by core framework
+ 	 * as there is only single power domain
+ 	 */
+-	if (of_property_read_bool(pdev->dev.of_node, "power-domains")) {
++	if (of_property_present(pdev->dev.of_node, "power-domains")) {
+ 		pm_runtime_enable(&pdev->dev);
+ 	} else {
+ 		struct regulator *cx_regulator = devm_regulator_get(&pdev->dev, "vddcx");
+--- a/qcom/opensource/graphics-kernel/kgsl_pwrctrl.c
++++ b/qcom/opensource/graphics-kernel/kgsl_pwrctrl.c
+@@ -1469,7 +1469,7 @@
+ {
+ 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
+ 
+-	if (of_property_read_bool(pdev->dev.of_node, "power-domains")) {
++	if (of_property_present(pdev->dev.of_node, "power-domains")) {
+ 		/* Get virtual device handle for CX GDSC to control it */
+ 		struct device *cx_pd = dev_pm_domain_attach_by_name(&pdev->dev, "cx");
+ 
+@@ -1505,7 +1505,7 @@
+ {
+ 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
+ 
+-	if (of_property_read_bool(pdev->dev.of_node, "power-domains")) {
++	if (of_property_present(pdev->dev.of_node, "power-domains")) {
+ 		/* Get virtual device handle for GX GDSC to control it */
+ 		struct device *gx_pd = dev_pm_domain_attach_by_name(&pdev->dev, "gx");
+ 
+--- a/qcom/opensource/securemsm-kernel/hdcp/hdcp_main.c
++++ b/qcom/opensource/securemsm-kernel/hdcp/hdcp_main.c
+@@ -335,7 +335,7 @@
+ 		return 0;
+ 		}
+ 
+-	use_smcinvoke = of_property_read_bool(np, "qcom,use-smcinvoke");
++	use_smcinvoke = of_property_present(np, "qcom,use-smcinvoke");
+ 	of_node_put(np);
+ 
+ 	select_interface(use_smcinvoke);

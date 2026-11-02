@@ -1,3 +1,15 @@
-# Unified-diff context includes a space before tabs and empty lines.
-# Check the contained source changes with scripts/checkpatch.pl instead.
+# Preserve upstream snapshot bytes used by hash and production-source checks.
+validation/**/before*.c whitespace=-blank-at-eof,-space-before-tab
+validation/**/candidate*.c whitespace=-blank-at-eof,-space-before-tab
+validation/**/before/** whitespace=-blank-at-eof,-space-before-tab
+validation/**/candidate/** whitespace=-blank-at-eof,-space-before-tab
+validation/**/native-startup-worker.c whitespace=-blank-at-eof
+validation/**/*.fragment whitespace=-blank-at-eof
+# Captured text is evidence; retain its original line endings and whitespace.
+validation/**/*.txt -whitespace
+
+# Diff context and original source snapshots retain exact upstream bytes.
 patches/*.patch -whitespace
+validation/**/patch -whitespace
+validation/**/*.before -whitespace
+validation/msm_sharedmem/helper.inc whitespace=-blank-at-eof

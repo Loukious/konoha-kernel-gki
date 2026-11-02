@@ -1,0 +1,37 @@
+--- a/qcom/opensource/audio-kernel/dsp/digital-cdc-rsc-mgr.c
++++ b/qcom/opensource/audio-kernel/dsp/digital-cdc-rsc-mgr.c
+@@ -40,7 +40,7 @@
+  * digital_cdc_rsc_mgr_hw_vote_enable - Enables hw vote in DSP
+  *
+  * @vote_handle: vote handle for which voting needs to be done
+- * @dev: indicate which device votes
++ * @dev: optional diagnostic device; may be NULL
+  *
+  * Returns 0 on success or -EINVAL/error code on failure
+  */
+@@ -49,7 +49,7 @@
+ 	struct hw_vote_entry *vote;
+ 	int ret;
+ 
+-	if (IS_ERR_OR_NULL(vote_handle) || !dev)
++	if (IS_ERR_OR_NULL(vote_handle))
+ 		return -EINVAL;
+ 	mutex_lock(&hw_vote_lock);
+ 	if (!is_init_done) {
+@@ -89,14 +89,14 @@
+  * digital_cdc_rsc_mgr_hw_vote_disable - Disables hw vote in DSP
+  *
+  * @vote_handle: vote handle for which voting needs to be disabled
+- * @dev: indicate which device unvotes
++ * @dev: optional diagnostic device; may be NULL
+  *
+  */
+ void digital_cdc_rsc_mgr_hw_vote_disable(struct clk *vote_handle, struct device *dev)
+ {
+ 	struct hw_vote_entry *vote;
+ 
+-	if (IS_ERR_OR_NULL(vote_handle) || !dev)
++	if (IS_ERR_OR_NULL(vote_handle))
+ 		return;
+ 	mutex_lock(&hw_vote_lock);
+ 	vote = is_init_done ? hw_vote_find(vote_handle) : NULL;

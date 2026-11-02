@@ -1,0 +1,21 @@
+--- a/drivers/power/supply/mca/mca_hardware_monitor/mca_bmd.c
++++ b/drivers/power/supply/mca/mca_hardware_monitor/mca_bmd.c
+@@ -226,9 +226,15 @@
+ 	ret = mca_parse_dts_u32_array(node, "btb_bmd_scheme", values, MAX_BTB);
+ 	if (ret)
+ 		return ret;
+-	ret = mca_parse_dts_u32(node, "fg_type", &info->fg_type, 0);
+-	if (ret)
+-		return ret;
++	/* Missing fg_type selects the native single-fuel-gauge default. */
++	info->fg_type = 0;
++	if (of_property_present(node, "fg_type")) {
++		if (of_property_count_u32_elems(node, "fg_type") != 1)
++			return -EINVAL;
++		ret = mca_parse_dts_u32(node, "fg_type", &info->fg_type, 0);
++		if (ret)
++			return ret;
++	}
+ 	if (info->fg_type != 0 && info->fg_type != MCA_BMD_DUAL_FG)
+ 		return -EINVAL;
+ 	for (i = 0; i < MAX_BTB; i++) {

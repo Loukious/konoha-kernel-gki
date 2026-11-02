@@ -1,0 +1,22 @@
+/dts-v1/;
+/plugin/;
+
+/* /soc uses one address/size cell; SRAM children retain two of each.
+ * Describe the firmware's existing 0x17d09400..0x17d097ff window using
+ * bus-local child addresses, without changing the SCMI phandle or ABI.
+ */
+&{/soc} {
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	mmio-sram@17D09400 {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		reg = <0x17d09400 0x400>;
+		ranges = <0 0 0x17d09400 0 0x400>;
+
+		scmi-shmem@0 {
+			reg = <0 0 0 0x400>;
+		};
+	};
+};

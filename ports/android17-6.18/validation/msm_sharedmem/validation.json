@@ -1,0 +1,41 @@
+{
+  "status": "PASS",
+  "checks": {
+    "exact": {
+      "exit_code": 0,
+      "stdout": "PASS: 46 lifecycle, mapping, physical-address and failure-path cases",
+      "stderr": ""
+    },
+    "DMA_handle_as_physical_address": {
+      "exit_code": -6,
+      "stdout": "",
+      "stderr": "DMA_handle_as_physical_address: /tmp/onyx-sharedmem-vd2nf14b/lifecycle_test.c:66: int qcom_scm_assign_mem(phys_addr_t, size_t, u64 *, const struct qcom_scm_vmperm *, unsigned int): Assertion `addr==physical||addr==physical+SZ_4K' failed.\n"
+    },
+    "missing_registration_failure_cleanup": {
+      "exit_code": -6,
+      "stdout": "",
+      "stderr": "missing_registration_failure_cleanup: /tmp/onyx-sharedmem-vd2nf14b/lifecycle_test.c:100: int main(void): Assertion `!published&&frees==allocations' failed.\n"
+    },
+    "guard_offset_omitted": {
+      "exit_code": -6,
+      "stdout": "",
+      "stderr": "guard_offset_omitted: /tmp/onyx-sharedmem-vd2nf14b/lifecycle_test.c:91: int main(void): Assertion `last_dma_map_offset==(unsigned long)guard' failed.\n"
+    },
+    "freeing_remote_owned_pages": {
+      "exit_code": -6,
+      "stdout": "",
+      "stderr": "freeing_remote_owned_pages: /tmp/onyx-sharedmem-vd2nf14b/lifecycle_test.c:102: int main(void): Assertion `s->allocation&&s->assigned&&!frees' failed.\n"
+    },
+    "wrong_DMA_free_handle": {
+      "exit_code": -6,
+      "stdout": "",
+      "stderr": "wrong_DMA_free_handle: /tmp/onyx-sharedmem-vd2nf14b/lifecycle_test.c:94: int main(void): Assertion `last_free_handle==handle&&last_free_size==SZ_4M+(guard?SZ_8K:0)' failed.\n"
+    }
+  },
+  "sha256": {
+    "candidate.c": "7059cb9c84c9f705f6de901fc161da8ef850da3848b1c3b101c419be022268f2",
+    "helper.inc": "8c201ce836b86b6b7268d7ee4898fcb3d775856db1d8d698b968d1244ff53d56",
+    "lifecycle_test.c": "28e39f8c3dd5e56b263548de8f2dd25aa63e2dfc3ee6a5c05e261a20f0f941b9"
+  },
+  "limits": "Exact staged source helpers with mocked UIO, DMA and SCM; live allocation, secure sharing and modem completion still need hardware validation."
+}

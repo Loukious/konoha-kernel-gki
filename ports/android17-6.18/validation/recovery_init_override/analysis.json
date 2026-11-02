@@ -1,0 +1,24 @@
+{
+  "status": "Native RC selection and fastbootd startup confirmed; separate VRAM/worker/ADCI kernel defects remain",
+  "observations": [
+    "adb reboot fastboot requests recovery/fastbootd; failed6.18 entry recorded.",
+    "Recovery image has no own kernel (header kernel_size0); uses installedbootkernel.",
+    "Installed diagnosticbootconfig setsandroidboot.init_rc=/metadata/ota/konoha-serial-20261101-v2/init.rc.",
+    "Android LoadBootScripts parses customscript exclusively when ro.boot.init_rc is nonempty; it does not fall back if ParseConfig fails.",
+    "Recovery FirstStageMain skips normal first-stage mount, leaving metadata script unavailable before loading boot actions.",
+    "The customscript attempts mounting metadata only after it has itself been parsed; this cannot make its initial filepath accessible."
+  ],
+  "source_sha256": {
+    "/home/loukious/Android/custom-rom/system/core/init/init.cpp": "4070fb5640a42fcd24d1d4b6cb88981b4648be5c9135e984e88800e345bf4f3b",
+    "/home/loukious/Android/custom-rom/system/core/init/first_stage_init.cpp": "ddb34b37d470ad8266150865513ed25cbf29e1d404e248022765fbb1d9bc3b31",
+    "/home/loukious/Android/konoha-android17-6.18-port-20261031/packaging/serial-module-loaders-20261101-v2/init.rc": "241184fa567c3f4440f41c0d3a225f8ba72d448fa0c63884ca79e889d9ff195c"
+  },
+  "pending": "Fix VRAM initialization ordering, start kthread workers, mark ADCI accept protocol waits idle; preserve diagnostic hang detection",
+  "implementation": "recovery/patches/0001-scope-normal-boot-serial-init-override-out-of-recovery.patch",
+  "user_steering": "User rejected metadata fallback/bootstrap; none created. Apply proper source-level init mode handling.",
+  "binary_build": "binary-build.json",
+  "selection_tests": "selection-tests.json",
+  "native_rc_tests": "native-rc-tests.json",
+  "failure_result": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-init-20261102T005304Z/RESULT.json",
+  "latest_failure_result": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/display-gem-20261102T011821Z/RESULT.json"
+}

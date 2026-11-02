@@ -1,0 +1,47 @@
+{
+  "device": "onyx / 5493f3c6",
+  "tested_candidate": "20261101T150526062786Z",
+  "evidence_directory": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation",
+  "confirmed": [
+    "Both restored 6.6 and flashed 6.18 build PSTORE, PSTORE_RAM, CONSOLE and PMSG in kernel",
+    "Live DT and both candidate merged DTs use fixed 0xa3500000 region, size 0x400000",
+    "console-size=0x200000 and pmsg-size=0x200000; no record-size, so no dedicated panic/oops records",
+    "Restored kernel registers ramoops at approximately 0.05s, before platform modules",
+    "6.18 has CONFIG_MTD disabled and packages neither mtdoops nor block2mtd",
+    "OEM 16 MiB oops partition contains eight old reports; no 6.18 trace found",
+    "Normal 6.6 reboot marker did not survive to early post-fs-data archive; no capture errors",
+    "Disk live logger successfully captured unique marker and sync completed",
+    "New rescue recovery has offline AVB/key/size/CPIO audit PASS, not flashed or boot-tested",
+    "Controlled 6.6 panic with download_mode temporarily 0 produced empty live/archived pstore, while the synced disk marker survived",
+    "Qualcomm rawdump contains the failed 6.18 kernel banner and matching build ID c71015b1e0fbc19fb46b7b584d619f7c1c1cf92c",
+    "Rawdump console independently matches md_kmsg; 29052 chronological console bytes recovered",
+    "6.18 reaches first-stage init, repeatedly fails SMMU registration, then times out waiting for storage partitions at 10.461 seconds and panics after init exits 127",
+    "Durable rawdump survived rollback and subsequent 6.6 reboots, including the controlled test with download_mode=0",
+    "A validated bounded host collector reads only selected kernel-log sections and checks header snapshot stability before/after capture"
+  ],
+  "uncertain": [
+    "Exact firmware and intervening-boot mechanism that removed live pstore records",
+    "Whether corrected SMMU lookup is sufficient for UFS enumeration and successful Android boot",
+    "Whether later crashes use the same durable Qualcomm dump path"
+  ],
+  "collection_correction": "logcat -L reads prior userspace pmsg; it is not a substitute for the raw console-ramoops kernel record",
+  "implemented": {
+    "early_archiver": "/data/adb/post-fs-data.d/00-onyx-capture-pstore.sh",
+    "bounded_live_logger": "/data/adb/service.d/00-onyx-persist-kernel-log.sh",
+    "durable_android_directory": "/data/adb/onyx-boot-logs/<boot-id>",
+    "rescue_image": "packaging/recovery-logging-20261101-v2/recovery.img",
+    "rescue_hook": "recovery-pstore.rc",
+    "host_collector": "collect_boot_logs.py",
+    "rawdump_collector": "collect_rawdump_logs.py",
+    "verified_rawdump_evidence": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/rawdump-collector-verified",
+    "smmu_fix": "patches/0137-fix-smmu-lookup-during-iommu-registration.patch"
+  },
+  "limits": [
+    "Archiving cannot recreate absent records",
+    "Live disk logger requires mounted storage and working userspace",
+    "Once-per-second fsync leaves a possible one-second loss window",
+    "No reliable panic writes to UFS can be promised by simply enabling pstore_blk best_effort",
+    "Never perform multiple rescue boots before preserving the first surviving pstore snapshot"
+  ],
+  "conclusion": "Initial collection missed the durable Qualcomm rawdump partition. RAM retention remains unreliable for the tested resets; valid failed-boot console bytes persisted on disk. Collect rawdump on the first available rooted Android/recovery ADB connection, before another dump-producing crash."
+}

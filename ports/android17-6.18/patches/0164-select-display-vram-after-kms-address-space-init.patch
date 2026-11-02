@@ -1,0 +1,25 @@
+--- a/qcom/opensource/display-drivers/msm/msm_drv.c
++++ b/qcom/opensource/display-drivers/msm/msm_drv.c
+@@ -951,10 +951,6 @@
+ 		goto bind_fail;
+ 	}
+ 
+-	ret = msm_init_vram(ddev);
+-	if (ret)
+-		goto fail;
+-
+ 	ddev->mode_config.funcs = &mode_config_funcs;
+ 	ddev->mode_config.helper_private = &mode_config_helper_funcs;
+ 
+@@ -964,6 +960,11 @@
+ 		ret = IS_ERR(kms) ? PTR_ERR(kms) : -ENODEV;
+ 		goto fail;
+ 	}
++
++	/* KMS hw_init establishes the address spaces used by VRAM selection. */
++	ret = msm_init_vram(ddev);
++	if (ret)
++		goto fail;
+ 
+ 	msm_drm_notify_components(ddev, MSM_COMP_OBJECT_CREATED);
+ 	/* Register rotator platform driver only after genpd init */

@@ -1,0 +1,13 @@
+--- a/drivers/input/fingerprint/mi_fp/fp_platform.c
++++ b/drivers/input/fingerprint/mi_fp/fp_platform.c
+@@ -271,8 +271,9 @@
+ 
+ int fp_disable_irq(struct fp_device *fp_dev)
+ {
++	/* No requested IRQ is already disabled, including HAL discovery. */
+ 	if (!fp_dev->irq_request)
+-		return -ENODEV;
++		return 0;
+ 	if (fp_dev->irq_enabled) {
+ 		disable_irq(fp_dev->irq_num);
+ 		fp_dev->irq_enabled = 0;

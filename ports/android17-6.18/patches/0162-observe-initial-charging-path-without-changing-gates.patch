@@ -1,0 +1,18 @@
+--- a/drivers/power/supply/mca/mca_hardware_monitor/mca_path_control.c
++++ b/drivers/power/supply/mca/mca_hardware_monitor/mca_path_control.c
+@@ -394,11 +394,11 @@
+ 	if (reverse)
+ 		value |= BIT(PATH_CONTROL_WLS_REV);
+ #endif
++	/* Observe the boot state without changing firmware-owned gates. */
+ 	memcpy(info->boost_src_default, sources, sizeof(sources));
+-	ret = path_apply_condition(info, value);
+-	if (!ret)
+-		info->ready = true;
+-	return ret;
++	info->condition_value = value;
++	info->ready = true;
++	return 0;
+ }
+ 
+ static int path_set_source(struct mca_path_control *info, CONTROL_SRC src,

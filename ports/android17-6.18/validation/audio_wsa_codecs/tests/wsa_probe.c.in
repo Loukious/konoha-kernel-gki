@@ -1,0 +1,492 @@
+/* Host fault injection for the production probe/remove and register reader. */
+#define _GNU_SOURCE
+#include <assert.h>
+#include <errno.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+typedef uint8_t u8;
+typedef uint32_t u32;
+#define __user
+#define GFP_KERNEL 0
+#define EPROBE_DEFER 517
+#define CONFIG_DEBUG_FS 1
+#define PAGE_SIZE 4096
+#define REGDUMP_PRINT_LEN 8
+#define MAX_NAME_LEN 40
+#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
+#define DL_FLAG_AUTOREMOVE_CONSUMER 1
+#define IS_ERR(p) ((uintptr_t)(p) > (uintptr_t)-4096)
+#define PTR_ERR(p) ((int)(intptr_t)(p))
+#define ERR_PTR(e) ((void *)(intptr_t)(e))
+#define dev_err(...) ((void)0)
+#define dev_err_ratelimited(...) ((void)0)
+#define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
+#define REG_FIELD_VALUE(reg, field, val) 0, 0, val
+#define CODEC_INTR_LEVEL0 0x40
+#define CODEC_MAX_SWR_PORTS 6
+#define SWR_PORT_PARAMS 2
+#define SWR_UC_MAX 3
+#define SPEAKER 0
+#define IDLE_DETECT 0
+#define NG3 3
+#define G_MAX_DB 19
+#define WSA_MAX_OHMS 4
+#define CONFIG_MAX 7
+#define WSA_4_OHMS 0
+#define WSA_6_OHMS 1
+#define WSA8845H 5
+#define CONFIG_1S 1
+#define EXT_1S 4
+#define CODEC_ANA_WO_CTL_0 1
+#define CODEC_ANA_WO_CTL_1 2
+
+struct device_node { int id, refs; };
+struct device { struct device_node *of_node; void *data; int refs; };
+struct platform_device { struct device dev; };
+struct swr_device { struct device dev; unsigned long long addr; u8 dev_num; };
+struct regmap { int id; };
+struct irq_domain { int id; };
+struct regmap_irq_chip { int num_regs; void *irq_drv_data; };
+struct mutex { bool initialized; };
+struct notifier_block { int (*notifier_call)(struct notifier_block *, unsigned long, void *); };
+struct snd_soc_component { struct device *dev; };
+struct snd_soc_component_driver { const char *name; };
+struct snd_soc_dai_driver { const char *name; struct { const char *stream_name; } playback; };
+struct wcd_irq_info {
+	struct regmap_irq_chip *wcd_regmap_irq_chip;
+	const char *codec_name;
+	struct regmap *regmap;
+	struct device *dev;
+};
+struct cdc_regulator { int id; };
+struct regulator_bulk_data { int id; };
+struct proc_dir_entry { int id; };
+struct dentry { int id; };
+struct swr_port_params { u32 offset1, lane_ctrl; };
+struct swr_dev_frame_config { struct swr_port_params *pp; };
+struct codec_priv {
+	struct device *dev;
+	struct swr_device *swr_slave;
+	struct mutex res_lock;
+	struct regmap *regmap;
+	struct irq_domain *virq;
+	struct wcd_irq_info irq_info;
+	unsigned long requested_irqs;
+	bool irq_published, component_registered, notifier_registered;
+	bool supplies_initialized, reset_active, reset_was_active, pdm_wd_enabled;
+	struct device_node *wsa_rst_np, *parent_np, *macro_np;
+	struct platform_device *parent_dev, *macro_dev;
+	struct notifier_block parent_nblock;
+	int (*register_notifier)(void *, struct notifier_block *, bool);
+	void *handle;
+	struct cdc_regulator *regulator;
+	struct regulator_bulk_data *supplies;
+	int num_supplies;
+	struct snd_soc_component_driver *driver;
+	struct snd_soc_dai_driver *dai_driver;
+	struct snd_soc_component *component;
+	struct proc_dir_entry *codec_proc_entry;
+	struct dentry *debugfs_dent, *debugfs_peek, *debugfs_poke, *debugfs_reg_dump;
+	int dev_mode, dev_index, noise_gate_mode, variant, pa_aux_gain;
+	u32 rload, bat_cfg, sys_gains[4];
+	u8 system_gain;
+	bool comp_enable;
+	struct swr_port_params wsa_port_params[SWR_UC_MAX][CODEC_MAX_SWR_PORTS];
+	struct swr_dev_frame_config swr_wsa_port_params[SWR_UC_MAX];
+};
+struct wsa_ctrl_platform_data {
+	void *handle;
+	int (*register_notifier)(void *, struct notifier_block *, bool);
+};
+
+@@IRQ_ENUM@@
+
+static struct device_node nodes[4];
+static struct platform_device parents[2];
+static struct swr_device slave;
+static struct regmap map;
+static struct irq_domain domain;
+static struct snd_soc_component component;
+static struct regmap_irq_chip codec_regmap_irq_chip = { .num_regs = 2 };
+static const struct snd_soc_component_driver soc_codec_dev_codec_wsa = { .name = "" };
+static const struct snd_soc_dai_driver wsa_dai[] = { { .name = "", .playback.stream_name = "" } };
+static int codec_regmap_config, codec_proc_ops, codec_debug_read_ops;
+static int codec_debug_write_ops, codec_debug_dump_ops;
+static struct cdc_regulator supply_config;
+static struct regulator_bulk_data bulk;
+static struct proc_dir_entry proc_dir;
+static struct dentry dent;
+static void *allocations[256];
+static size_t allocation_count, step, fail_step, full_steps;
+static unsigned long live_irqs;
+static bool live_domain, published, notified, registered, supply_initialized;
+static bool pin_active, saved_pin_active, bypass, fail_copy, oom_dump;
+static bool ports_initialized;
+static int gain_bytes, port_bytes, gain_value, rload, bat_cfg;
+static int last_freed_irq;
+static size_t last_allocation, read_count, scenario_count;
+
+static int fault(void) { return ++step == fail_step ? -EIO : 0; }
+static void *devm_kzalloc(struct device *dev, size_t size, int flags)
+{
+	(void)dev; (void)flags;
+	if (fault()) return NULL;
+	void *p = calloc(1, size);
+	assert(p && allocation_count < ARRAY_SIZE(allocations));
+	allocations[allocation_count++] = p;
+	return p;
+}
+static char *devm_kstrdup(struct device *dev, const char *str, int flags)
+{
+	char *p = devm_kzalloc(dev, strlen(str) + 1, flags);
+	if (p) strcpy(p, str);
+	return p;
+}
+static char *devm_kasprintf(struct device *dev, int flags, const char *fmt, ...)
+{
+	char tmp[80]; va_list args;
+	va_start(args, fmt); vsnprintf(tmp, sizeof(tmp), fmt, args); va_end(args);
+	return devm_kstrdup(dev, tmp, flags);
+}
+static void *kzalloc(size_t size, int flags)
+{
+	(void)flags;
+	last_allocation = size;
+	return oom_dump ? NULL : calloc(1, size);
+}
+#define kfree free
+static void mutex_init(struct mutex *m) { assert(!m->initialized); m->initialized = true; }
+static void mutex_destroy(struct mutex *m) { assert(m->initialized); m->initialized = false; }
+static void swr_set_dev_data(struct swr_device *d, void *p) { d->dev.data = p; }
+static void *swr_get_dev_data(struct swr_device *d) { return d->dev.data; }
+#if IS884
+static void *dev_get_drvdata(struct device *d) { return d->data; }
+#endif
+static void set_bit(int bit, unsigned long *mask) { *mask |= 1UL << bit; }
+static bool test_and_clear_bit(int bit, unsigned long *mask)
+{
+	bool value = !!(*mask & (1UL << bit));
+	*mask &= ~(1UL << bit);
+	return value;
+}
+static void msm_cdc_get_power_supplies(struct device *dev, struct cdc_regulator **out, int *n)
+{
+	(void)dev; *out = fault() ? NULL : &supply_config; *n = *out ? 1 : 0;
+}
+static int msm_cdc_init_supplies(struct device *dev, struct regulator_bulk_data **out,
+	struct cdc_regulator *cfg, int n)
+{
+	(void)dev; assert(cfg && n == 1);
+	if (fault()) { *out = NULL; return -EIO; }
+	*out = &bulk; supply_initialized = true; return 0;
+}
+static int msm_cdc_enable_static_supplies(struct device *dev, struct regulator_bulk_data *p,
+	struct cdc_regulator *cfg, int n)
+{
+	(void)dev; assert(p && cfg && n == 1 && supply_initialized); return fault();
+}
+static int msm_cdc_release_supplies(struct device *dev, struct regulator_bulk_data *p,
+	struct cdc_regulator *cfg, int n)
+{
+	(void)dev; assert(p && cfg && n == 1 && supply_initialized);
+	assert(!live_domain && !published && !notified && !registered);
+	supply_initialized = false; return 0;
+}
+static struct device_node *of_parse_phandle(struct device_node *np, const char *prop, int index)
+{
+	(void)np; (void)index;
+	if (fault()) return NULL;
+	int n = !strcmp(prop, "qcom,spkr-sd-n-node") ? 1 :
+		!strcmp(prop, "qcom,wsa-macro-handle") ? 3 : 2;
+	nodes[n].refs++; return &nodes[n];
+}
+static struct platform_device *of_find_device_by_node(struct device_node *node)
+{
+	if (fault()) return NULL;
+	struct platform_device *p = &parents[node->id == 3];
+	p->dev.refs++; return p;
+}
+static void of_node_put(struct device_node *p) { if (p) { assert(p->refs > 0); p->refs--; } }
+static void put_device(struct device *dev) { assert(dev->refs > 0); dev->refs--; }
+static bool msm_cdc_pinctrl_get_state(struct device_node *np) { assert(np); return pin_active; }
+static int msm_cdc_pinctrl_select_active_state(struct device_node *np)
+{
+	assert(np); if (fault()) return -EIO; pin_active = true; return 0;
+}
+static int msm_cdc_pinctrl_select_sleep_state(struct device_node *np)
+{
+	assert(np && !notified && !published && !registered && !live_domain);
+	pin_active = false; return 0;
+}
+static void usleep_range(int a, int b) { assert(a <= b); }
+static int swr_get_logical_dev_num(struct swr_device *dev, unsigned long long addr, u8 *num)
+{
+	assert(dev == &slave && addr == slave.addr); if (fault()) return -EIO; *num = 1; return 0;
+}
+static struct regmap *devm_regmap_init_swr(struct swr_device *dev, void *cfg)
+{
+	assert(dev && cfg); return fault() ? ERR_PTR(-EIO) : &map;
+}
+static void devm_regmap_qti_debugfs_register(struct device *dev, struct regmap *p) { assert(dev && p == &map); }
+#if !IS884
+static int regmap_write(struct regmap *p, int reg, int value)
+{
+	(void)reg; (void)value; assert(p == &map); return fault();
+}
+#endif
+static int wcd_irq_init(struct wcd_irq_info *info, struct irq_domain **out)
+{
+	assert(info->dev && info->regmap && !live_domain);
+	if (fault()) return -EIO;
+	live_domain = true; *out = &domain; return 0;
+}
+static int wcd_request_irq(struct wcd_irq_info *info, int irq, const char *name, int (*handler)(int, void *), void *data)
+{
+	assert(info && name && handler && data == slave.dev.data && live_domain);
+	if (fault()) return -EIO;
+	assert(!(live_irqs & (1UL << irq))); live_irqs |= 1UL << irq; return 0;
+}
+static void wcd_disable_irq(struct wcd_irq_info *info, int irq)
+{
+	assert(info && (live_irqs & (1UL << irq)));
+}
+static void wcd_free_irq(struct wcd_irq_info *info, int irq, void *data)
+{
+	assert(info && live_domain && !published && !notified && !registered);
+	assert(data == slave.dev.data && (live_irqs & (1UL << irq)));
+	assert(irq < last_freed_irq); last_freed_irq = irq;
+	live_irqs &= ~(1UL << irq);
+}
+static int wcd_irq_exit(struct wcd_irq_info *info, struct irq_domain *p)
+{
+	assert(info && p == &domain && live_domain && !live_irqs && !published);
+	live_domain = false; return 0;
+}
+static int swr_set_slave_irq(struct swr_device *dev, struct irq_domain *p)
+{
+	assert(dev == &slave);
+	if (p) {
+		assert(live_domain && live_irqs == (1UL << CODEC_NUM_IRQS) - 1);
+		assert(registered && !published);
+		if (fault()) return -EIO;
+		published = true;
+	} else {
+		assert(published && !notified); published = false;
+	}
+	return 0;
+}
+#define IRQ_STUB(s) static int codec_##s##_handle_irq(int irq, void *data) { (void)irq; (void)data; return 0; }
+IRQ_STUB(saf2war) IRQ_STUB(war2saf) IRQ_STUB(otp) IRQ_STUB(ocp)
+IRQ_STUB(clip) IRQ_STUB(pdm_wd) IRQ_STUB(clk_wd) IRQ_STUB(ext_int)
+IRQ_STUB(uvlo) IRQ_STUB(pa_on_err)
+#undef IRQ_STUB
+/* The request interface takes callable symbols; their bodies are not under test. */
+static bool of_device_is_compatible(struct device_node *np, const char *name) { (void)np; (void)name; return false; }
+static int snd_soc_register_component(struct device *dev, struct snd_soc_component_driver *driver,
+	struct snd_soc_dai_driver *dai, int n)
+{
+	struct codec_priv *p = dev->data;
+	assert(p->res_lock.initialized && driver->name && dai->name && dai->playback.stream_name && n == 1);
+	if (fault()) return -EIO;
+	registered = true; component.dev = dev; p->component = &component; return 0;
+}
+static struct snd_soc_component *snd_soc_lookup_component(struct device *dev, const char *name)
+{
+	assert(dev && name && registered); return fault() ? NULL : &component;
+}
+static void snd_soc_unregister_component(struct device *dev)
+{
+	struct codec_priv *p = dev->data;
+	assert(registered && p->res_lock.initialized && live_domain && !published && !notified);
+	registered = false;
+}
+static int codec_event_notify(struct notifier_block *nb, unsigned long event, void *data)
+{
+	(void)event; (void)data;
+	struct codec_priv *p = slave.dev.data;
+	assert(nb == &p->parent_nblock && p->res_lock.initialized && p->handle);
+	assert(registered && published && (!IS884 || ports_initialized));
+	return 0;
+}
+static int register_notifier(void *handle, struct notifier_block *nb, bool enable)
+{
+	assert(handle && nb);
+	if (enable) {
+		if (fault()) return -EIO;
+		assert(!notified); notified = true; nb->notifier_call(nb, 0, NULL);
+	} else { assert(notified); notified = false; }
+	return 0;
+}
+static struct wsa_ctrl_platform_data plat = { .handle = &plat, .register_notifier = register_notifier };
+static void *dev_get_platdata(struct device *dev) { assert(dev); return fault() ? NULL : &plat; }
+static void *device_link_add(struct device *dev, struct device *supplier, int flags)
+{
+	assert(dev && supplier && flags == DL_FLAG_AUTOREMOVE_CONSUMER); return fault() ? NULL : &plat;
+}
+static struct proc_dir_entry *proc_mkdir(const char *name, void *parent)
+{
+	(void)parent; assert(name && notified); return fault() ? NULL : &proc_dir;
+}
+static void *proc_create_data(const char *name, int mode, struct proc_dir_entry *dir, void *ops, void *data)
+{
+	(void)mode; assert(name && dir && ops && data); return fault() ? NULL : &proc_dir;
+}
+static void proc_remove(struct proc_dir_entry *p) { assert(!p || p == &proc_dir); }
+static const char *dev_name(struct device *dev) { assert(dev); return "codec"; }
+static struct dentry *debugfs_create_dir(const char *name, void *parent)
+{
+	(void)parent; assert(name); return fault() ? ERR_PTR(-ENOMEM) : &dent;
+}
+static struct dentry *debugfs_create_file(const char *name, int mode, struct dentry *d, void *data, void *ops)
+{
+	(void)mode; assert(name && d && data && ops); return fault() ? ERR_PTR(-ENOMEM) : &dent;
+}
+static void debugfs_remove_recursive(struct dentry *p) { assert(!p || p == &dent || IS_ERR(p)); }
+static int scnprintf(char *buf, size_t size, const char *fmt, ...)
+{
+	va_list args; va_start(args, fmt); int n = vsnprintf(buf, size, fmt, args); va_end(args);
+	return !size ? 0 : n < (int)size ? n : (int)size - 1;
+}
+static void regcache_cache_bypass(struct regmap *p, bool enabled) { assert(p == &map); bypass = enabled; }
+static int regmap_read(struct regmap *p, int reg, unsigned int *value)
+{
+	assert(p == &map && bypass); read_count++; *value = reg & 255; return reg == 0x1001 ? -EIO : 0;
+}
+static int copy_to_user(void *dest, const void *src, size_t count)
+{
+	if (fail_copy) return 1;
+	memcpy(dest, src, count); return 0;
+}
+
+#if IS884
+static const void *of_find_property(struct device_node *np, const char *prop, void *length)
+{
+	assert(np && prop);
+	if (fault()) return NULL;
+	*(int *)length = !strcmp(prop, "qcom,wsa-system-gains") ? gain_bytes : port_bytes;
+	return prop;
+}
+static int of_property_read_u32_index(struct device_node *np, const char *prop, int index, u32 *out)
+{
+	assert(np && index == 0);
+	if (fault()) return -EIO;
+	*out = !strcmp(prop, "qcom,wsa-rloads") ? rload : bat_cfg; return 0;
+}
+static int of_property_read_u32(struct device_node *np, const char *prop, u32 *out)
+{
+	assert(np && prop); if (fault()) return -EIO; *out = IDLE_DETECT; return 0;
+}
+static int of_property_read_u32_array(struct device_node *np, const char *prop, u32 *out, int size)
+{
+	assert(np && prop);
+	if (fault()) return -EIO;
+	for (int i = 0; i < size; i++) out[i] = !strcmp(prop, "qcom,wsa-system-gains") ? gain_value : i;
+	return 0;
+}
+static int codec_validate_dt_configuration_params(struct snd_soc_component *p, u8 load, u8 cfg, u8 gain)
+{
+	assert(p && load < WSA_MAX_OHMS && cfg < CONFIG_MAX && gain < G_MAX_DB);
+	return fault();
+}
+static void codec_set_gain_parameters(struct snd_soc_component *p) { assert(p); }
+static void codec_set_pbr_parameters(struct snd_soc_component *p) { assert(p); }
+static void snd_soc_component_write(struct snd_soc_component *p, int reg, int val) { (void)reg; (void)val; assert(p); }
+static void snd_soc_component_update_bits(struct snd_soc_component *p, int reg, int mask, int val)
+{
+	(void)reg; (void)mask; (void)val; assert(p);
+}
+static int swr_init_port_params(struct swr_device *dev, int n, struct swr_dev_frame_config *params)
+{
+	assert(dev && n == CODEC_MAX_SWR_PORTS);
+	for (int i = 0; i < SWR_UC_MAX; i++) assert(params[i].pp);
+	if (fault()) return -EIO;
+	ports_initialized = true; return 0;
+}
+#endif
+
+@@PRODUCTION@@
+
+static void reset_case(void)
+{
+	assert(!allocation_count && !slave.dev.data && !live_domain && !live_irqs);
+	memset(&slave, 0, sizeof(slave));
+	memset(nodes, 0, sizeof(nodes));
+	memset(parents, 0, sizeof(parents));
+	for (int i = 0; i < 4; i++) nodes[i].id = i;
+	parents[0].dev.of_node = &nodes[2]; parents[1].dev.of_node = &nodes[3];
+	slave.dev.of_node = &nodes[0]; slave.addr = 0;
+	step = 0; last_freed_irq = CODEC_NUM_IRQS;
+	pin_active = saved_pin_active; ports_initialized = false;
+}
+static int run_case(void)
+{
+	reset_case();
+	int ret = codec_swr_probe(&slave);
+	if (!ret) assert(codec_swr_remove(&slave) == 0);
+	assert(!slave.dev.data && !published && !notified && !registered);
+	assert(!live_domain && !live_irqs && !supply_initialized && pin_active == saved_pin_active);
+	for (int i = 0; i < 4; i++) assert(!nodes[i].refs);
+	assert(!parents[0].dev.refs && !parents[1].dev.refs);
+	if (allocation_count) {
+		struct codec_priv *p = allocations[0];
+		assert(!p->res_lock.initialized);
+	}
+	for (size_t i = allocation_count; i; i--) free(allocations[i - 1]);
+	allocation_count = 0; scenario_count++;
+	return ret;
+}
+static void test_dump(void)
+{
+	char output[8192]; loff_t pos; int ret;
+	for (size_t n = 0; n <= 30; n++) {
+		char *tiny = calloc(1, n ? n : 1);
+		pos = 0; ret = regdump_read(&map, 0x1000, 0x1004, tiny, n, &pos);
+		assert(ret >= 0 && (size_t)ret <= n && ret % 9 == 0 && pos == ret / 9 && !bypass);
+		free(tiny);
+	}
+	pos = 0; ret = regdump_read(&map, 0x1000, 0x1004, output, sizeof(output), &pos);
+	assert(ret == 45 && pos == 5 && last_allocation == PAGE_SIZE);
+	assert(!memcmp(output, "1000: 00\n1001: XX\n1002: 02\n1003: 03\n1004: 04\n", 45));
+	assert(regdump_read(&map, 0x1000, 0x1004, output, sizeof(output), &pos) == 0);
+	pos = INT64_MAX; assert(regdump_read(&map, 0x1000, 0x1004, output, sizeof(output), &pos) == 0);
+	pos = -1; assert(regdump_read(&map, 0x1000, 0x1004, output, sizeof(output), &pos) == -EINVAL);
+	pos = 0; fail_copy = true;
+	assert(regdump_read(&map, 0x1000, 0x1004, output, 18, &pos) == -EFAULT && !pos && !bypass);
+	fail_copy = false; oom_dump = true;
+	assert(regdump_read(&map, 0x1000, 0x1004, output, 18, &pos) == -ENOMEM && !pos && !bypass);
+	oom_dump = false;
+	scenario_count += 37;
+}
+int main(void)
+{
+	gain_bytes = 16; port_bytes = SWR_UC_MAX * CODEC_MAX_SWR_PORTS * SWR_PORT_PARAMS * sizeof(u32);
+	gain_value = 3; rload = 0; bat_cfg = 1;
+	assert(run_case() == 0); full_steps = step;
+	for (fail_step = 1; fail_step <= full_steps; fail_step++) run_case();
+	fail_step = 0; saved_pin_active = true; assert(run_case() == 0); saved_pin_active = false;
+#if IS884
+	int sizes[] = {0, 4, 12, 15, 20, 4096};
+	for (size_t i = 0; i < ARRAY_SIZE(sizes); i++) { gain_bytes = sizes[i]; assert(run_case() == -EINVAL); }
+	gain_bytes = 16;
+	int gains[] = {19, 255, 256, 0x10003};
+	for (size_t i = 0; i < ARRAY_SIZE(gains); i++) { gain_value = gains[i]; assert(run_case() == -EINVAL); }
+	gain_value = 3; rload = 256; assert(run_case() == -EINVAL);
+	rload = 0; bat_cfg = 256; assert(run_case() == -EINVAL); bat_cfg = 1;
+	port_bytes = 0; assert(run_case() == -EINVAL);
+	port_bytes = 4; assert(run_case() == -EINVAL);
+	port_bytes = SWR_UC_MAX * CODEC_MAX_SWR_PORTS * SWR_PORT_PARAMS * sizeof(u32) + 4;
+	assert(run_case() == -EINVAL);
+#endif
+	test_dump();
+	printf("%s: %zu production-source scenarios passed (%zu probe failpoints)\n", IS884 ? "WSA884x" : "WSA883x", scenario_count, full_steps);
+	return 0;
+}

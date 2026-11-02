@@ -1,0 +1,975 @@
+--- a/drivers/input/misc/si_haptic/haptic.c
++++ b/drivers/input/misc/si_haptic/haptic.c
+@@ -248,6 +248,8 @@
+ int CUSTOME_WAVE_ID;
+ int awinic_rtp_name_len = sizeof(awinic_rtp_name) / SIH_RTP_NAME_MAX;
+ static sih_haptic_ptr_t g_haptic_t;
++static DEFINE_MUTEX(sih_global_lock);
++static int sih_request_ram(sih_haptic_t *sih_haptic);
+ /*****************************************************
+  *
+  * parse dts
+@@ -305,7 +307,7 @@
+ 		hp_err("%s:lra name acquire failed\n", __func__);
+ 		return -EIO;
+ 	}
+-	strlcpy(sih_haptic->chip_attr.lra_name, str, SIH_LRA_NAME_LEN);
++	strscpy(sih_haptic->chip_attr.lra_name, str, SIH_LRA_NAME_LEN);
+ 	hp_info("%s:lra_name = %s\n", __func__, sih_haptic->chip_attr.lra_name);
+ 
+ 	val = of_property_read_u32(np, "vib_f0_pre",
+@@ -380,7 +382,7 @@
+ 
+ 	if (gpio_is_valid(sih_haptic->chip_attr.irq_gpio)) {
+ 		ret = devm_gpio_request_one(dev, sih_haptic->chip_attr.irq_gpio,
+-					    GPIOF_DIR_IN, "sih_haptic_irq");
++					    GPIOF_IN, "sih_haptic_irq");
+ 		if (ret) {
+ 			hp_err("%s:irq gpio request failed, ret = %d\n",
+ 			       __func__, ret);
+@@ -580,7 +582,7 @@
+ 
+ 	ret = devm_request_threaded_irq(
+ 		dev, gpio_to_irq(sih_haptic->chip_attr.irq_gpio), NULL,
+-		sih_irq_isr, irq_flags, sih_haptic->soft_frame.vib_dev.name,
++		sih_irq_isr, irq_flags, "si_haptic",
+ 		sih_haptic);
+ 
+ 	if (ret != 0)
+@@ -835,7 +837,7 @@
+ 	mutex_unlock(&sih_haptic->lock);
+ }
+ 
+-static void sih_ram_load(const struct firmware *cont, void *context)
++static void sih_ram_load_data(const struct firmware *cont, void *context)
+ {
+ 	int i;
+ 	int ret = -1;
+@@ -845,7 +847,7 @@
+ 
+ 	hp_info("%s:enter\n", __func__);
+ 
+-	if (!cont) {
++	if (!cont || cont->size < 2) {
+ 		hp_err("%s:failed to read %s\n", __func__,
+ 		       awinic_ram_name[sih_haptic->ram.lib_index]);
+ 		release_firmware(cont);
+@@ -895,6 +897,38 @@
+ 	kfree(sih_haptic_fw);
+ }
+ 
++static void sih_ram_load(const struct firmware *cont, void *context)
++{
++	sih_haptic_t *sih_haptic = context;
++
++	if (READ_ONCE(sih_haptic->stopping))
++		release_firmware(cont);
++	else
++		sih_ram_load_data(cont, context);
++	if (atomic_dec_and_test(&sih_haptic->fw_refs))
++		wake_up_all(&sih_haptic->fw_wait);
++}
++
++static int sih_request_ram(sih_haptic_t *sih_haptic)
++{
++	int ret;
++
++	mutex_lock(&sih_haptic->fw_lock);
++	if (sih_haptic->stopping) {
++		mutex_unlock(&sih_haptic->fw_lock);
++		return -ENODEV;
++	}
++	atomic_inc(&sih_haptic->fw_refs);
++	ret = request_firmware_nowait(THIS_MODULE, FW_ACTION_UEVENT,
++				      awinic_ram_name[sih_haptic->ram.lib_index],
++				      sih_haptic->dev, GFP_KERNEL,
++				      sih_haptic, sih_ram_load);
++	if (ret && atomic_dec_and_test(&sih_haptic->fw_refs))
++		wake_up_all(&sih_haptic->fw_wait);
++	mutex_unlock(&sih_haptic->fw_lock);
++	return ret;
++}
++
+ static void sih_ram_play(sih_haptic_t *sih_haptic, uint8_t mode)
+ {
+ 	hp_info("%s:enter\n", __func__);
+@@ -905,13 +939,24 @@
+ 	sih_haptic->hp_func->play_go(sih_haptic, true);
+ }
+ 
+-sih_haptic_t *get_global_haptic_ptr(void)
+-{
+-	return g_haptic_t.g_haptic[SIH_HAPTIC_MMAP_DEV_INDEX];
+-}
+-
+-int pointer_prehandle(struct device *dev, const char *buf,
+-		      sih_haptic_t **sih_haptic)
++sih_haptic_t *sih_lock_global(void)
++{
++	sih_haptic_t *sih_haptic;
++
++	mutex_lock(&sih_global_lock);
++	sih_haptic = g_haptic_t.g_haptic[SIH_HAPTIC_MMAP_DEV_INDEX];
++	if (!sih_haptic)
++		mutex_unlock(&sih_global_lock);
++	return sih_haptic;
++}
++
++void sih_unlock_global(void)
++{
++	mutex_unlock(&sih_global_lock);
++}
++
++static int pointer_prehandle(struct device *dev, const char *buf,
++			     sih_haptic_t **sih_haptic)
+ {
+ 	hp_info("%s:enter\n", __func__);
+ 	null_pointer_err_check(dev);
+@@ -926,7 +971,7 @@
+  * input ff
+  *
+  *****************************************************/
+-void sih_set_gain_work_routine(struct work_struct *work)
++static void sih_set_gain_work_routine(struct work_struct *work)
+ {
+ 	sih_haptic_t *sih_haptic =
+ 		container_of(work, sih_haptic_t, ram.gain_work);
+@@ -946,7 +991,7 @@
+ 	sih_haptic->hp_func->vbat_comp(sih_haptic);
+ }
+ 
+-void sih_effect_strength_gain_adapter(sih_haptic_t *sih_haptic)
++static void sih_effect_strength_gain_adapter(sih_haptic_t *sih_haptic)
+ {
+ 	if (sih_haptic->chip_ipara.new_gain >= 0x7FFF)
+ 		sih_haptic->chip_ipara.gain = 0x80; /*128 */
+@@ -962,7 +1007,7 @@
+ 		sih_haptic->chip_ipara.new_gain, sih_haptic->chip_ipara.gain);
+ }
+ 
+-void sih_set_gain(struct input_dev *dev, u16 gain)
++static void sih_set_gain(struct input_dev *dev, u16 gain)
+ {
+ 	sih_haptic_t *sih_haptic = input_get_drvdata(dev);
+ 
+@@ -971,8 +1016,8 @@
+ 	sih_effect_strength_gain_adapter(sih_haptic);
+ }
+ 
+-int sih_upload_effect(struct input_dev *dev, struct ff_effect *effect,
+-		      struct ff_effect *old)
++static int sih_upload_effect(struct input_dev *dev, struct ff_effect *effect,
++			     struct ff_effect *old)
+ {
+ 	sih_haptic_t *sih_haptic = input_get_drvdata(dev);
+ 	s16 data[CUSTOM_DATA_LEN];
+@@ -1096,7 +1141,7 @@
+ 	return 0;
+ }
+ 
+-int sih_playback(struct input_dev *dev, int effect_id, int val)
++static int sih_playback(struct input_dev *dev, int effect_id, int val)
+ {
+ 	sih_haptic_t *sih_haptic = input_get_drvdata(dev);
+ 	int rc = 0;
+@@ -1136,7 +1181,7 @@
+ 	return rc;
+ }
+ 
+-int sih_erase(struct input_dev *dev, int effect_id)
++static int sih_erase(struct input_dev *dev, int effect_id)
+ {
+ 	sih_haptic_t *sih_haptic = input_get_drvdata(dev);
+ 	int rc = 0;
+@@ -1472,7 +1517,7 @@
+ 	if (rc < 0)
+ 		return rc;
+ 
+-	rc = strtobool(buf, &val);
++	rc = kstrtobool(buf, &val);
+ 	if (rc < 0)
+ 		return rc;
+ 
+@@ -1735,10 +1780,7 @@
+ 
+ 		sih_haptic->ram.lib_index = val - 1;
+ 		sih_haptic->ram.ram_init = false;
+-		request_firmware_nowait(
+-			THIS_MODULE, FW_ACTION_UEVENT,
+-			awinic_ram_name[sih_haptic->ram.lib_index],
+-			sih_haptic->dev, GFP_KERNEL, sih_haptic, sih_ram_load);
++		sih_request_ram(sih_haptic);
+ 	}
+ 
+ 	return count;
+@@ -3428,8 +3470,8 @@
+ static void vibrator_init(sih_haptic_t *sih_haptic)
+ {
+ 	/* timer init */
+-	hrtimer_init(&sih_haptic->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-	sih_haptic->timer.function = haptic_timer_func;
++	hrtimer_setup(&sih_haptic->timer, haptic_timer_func,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	/* work func init */
+ 	INIT_WORK(&sih_haptic->ram.ram_work, ram_work_func);
+ 	INIT_WORK(&sih_haptic->rtp.rtp_work, rtp_work_func);
+@@ -3445,18 +3487,68 @@
+ 
+ static int ram_work_init(sih_haptic_t *sih_haptic)
+ {
+-	int ret = -1;
+-
+-	hp_info("%s:enter\n", __func__);
+-
+ 	sih_haptic->ram.ram_init = false;
+-
+-	ret = request_firmware_nowait(
+-		THIS_MODULE, FW_ACTION_UEVENT,
+-		awinic_ram_name[sih_haptic->ram.lib_index], sih_haptic->dev,
+-		GFP_KERNEL, sih_haptic, sih_ram_load);
+-
+-	return ret;
++	return sih_request_ram(sih_haptic);
++}
++
++static void sih_cleanup(sih_haptic_t *sih_haptic)
++{
++	mutex_lock(&sih_haptic->fw_lock);
++	WRITE_ONCE(sih_haptic->stopping, true);
++	mutex_unlock(&sih_haptic->fw_lock);
++	if (sih_haptic->sysfs_created) {
++		sysfs_remove_group(&sih_haptic->dev->kobj,
++				   &sih_vibra_attribute_group);
++		sih_haptic->sysfs_created = false;
++	}
++	mutex_lock(&sih_global_lock);
++	if (g_haptic_t.g_haptic[SIH_HAPTIC_MMAP_DEV_INDEX] == sih_haptic)
++		g_haptic_t.g_haptic[SIH_HAPTIC_MMAP_DEV_INDEX] = NULL;
++	mutex_unlock(&sih_global_lock);
++	if (sih_haptic->input_registered) {
++		input_unregister_device(sih_haptic->input_dev);
++		sih_haptic->input_registered = false;
++		sih_haptic->ff_created = false;
++	} else if (sih_haptic->ff_created) {
++		input_ff_destroy(sih_haptic->input_dev);
++		sih_haptic->ff_created = false;
++	}
++	if (sih_haptic->ring_owned)
++		rb_force_exit();
++	atomic_set(&sih_haptic->rtp.exit_in_rtp_loop, 1);
++	wake_up_interruptible(&sih_haptic->rtp.wait_q);
++	wake_up_interruptible(&sih_haptic->rtp.stop_wait_q);
++	if (sih_haptic->irq_requested) {
++		devm_free_irq(sih_haptic->dev,
++			      gpio_to_irq(sih_haptic->chip_attr.irq_gpio),
++			      sih_haptic);
++		sih_haptic->irq_requested = false;
++	}
++	wait_event(sih_haptic->fw_wait, !atomic_read(&sih_haptic->fw_refs));
++	hrtimer_cancel(&sih_haptic->timer);
++	if (sih_haptic->stream_initialized) {
++		sih_haptic->stream_func->stream_rtp_work_release(sih_haptic);
++		sih_haptic->stream_initialized = false;
++	}
++	cancel_work_sync(&sih_haptic->ram.gain_work);
++	cancel_work_sync(&sih_haptic->ram.ram_work);
++	cancel_work_sync(&sih_haptic->rtp.rtp_work);
++	if (sih_haptic->work_queue) {
++		destroy_workqueue(sih_haptic->work_queue);
++		sih_haptic->work_queue = NULL;
++	}
++	if (!IS_ERR_OR_NULL(sih_haptic->regmapp.regmapping) && sih_haptic->hp_func)
++		sih_haptic->hp_func->stop(sih_haptic);
++	pm_relax(sih_haptic->dev);
++	device_init_wakeup(sih_haptic->dev, false);
++	sih_vfree_container(sih_haptic, sih_haptic->rtp.rtp_cont);
++	sih_haptic->rtp.rtp_cont = NULL;
++	kfree(sih_haptic->chip_reg.reg_addr);
++	sih_haptic->chip_reg.reg_addr = NULL;
++	if (sih_haptic->ring_owned) {
++		release_rb();
++		sih_haptic->ring_owned = false;
++	}
+ }
+ 
+ static int sih_i2c_probe(struct i2c_client *i2c)
+@@ -3464,197 +3556,110 @@
+ 	sih_haptic_t *sih_haptic;
+ 	struct input_dev *input_dev;
+ 	struct ff_device *ff;
+-	struct device_node *np = i2c->dev.of_node;
+-	int effect_count_max;
+-	int ret = -1;
+-
+-	/* I2C Adapter capability detection */
+-	if (!i2c_check_functionality(i2c->adapter, I2C_FUNC_I2C)) {
+-		hp_err("%s:i2c algorithm ability detect failed\n", __func__);
++	int ret;
++
++	if (!i2c_check_functionality(i2c->adapter, I2C_FUNC_I2C))
+ 		return -EIO;
+-	}
+-
+-	/* Allocate cache space for haptic device */
+-	sih_haptic = devm_kzalloc(&i2c->dev, sizeof(sih_haptic_t), GFP_KERNEL);
+-	if (sih_haptic == NULL)
++	sih_haptic = devm_kzalloc(&i2c->dev, sizeof(*sih_haptic), GFP_KERNEL);
++	if (!sih_haptic)
+ 		return -ENOMEM;
+-
+ 	input_dev = devm_input_allocate_device(&i2c->dev);
+ 	if (!input_dev)
+ 		return -ENOMEM;
+ 	input_dev->name = "si_haptic";
++	sih_haptic->input_dev = input_dev;
+ 	sih_haptic->dev = &i2c->dev;
+ 	sih_haptic->i2c = i2c;
++	i2c_set_clientdata(i2c, sih_haptic);
++	vibrator_init(sih_haptic);
++	INIT_WORK(&sih_haptic->ram.gain_work, sih_set_gain_work_routine);
++	mutex_init(&sih_haptic->fw_lock);
++	atomic_set(&sih_haptic->fw_refs, 0);
++	init_waitqueue_head(&sih_haptic->fw_wait);
+ 	device_init_wakeup(sih_haptic->dev, true);
+-	i2c_set_clientdata(i2c, sih_haptic);
+-
+-	xm_hap_driver_init(true);
+-
+-	/* matching dts */
+-	ret = sih_parse_dts(&i2c->dev, sih_haptic, np);
++	ret = sih_parse_dts(&i2c->dev, sih_haptic, i2c->dev.of_node);
+ 	if (ret)
+-		goto err_parse_dts;
+-
+-	/* acquire gpio resources and read id code */
++		goto error;
+ 	ret = sih_acquire_prepare_res(&i2c->dev, sih_haptic);
+ 	if (ret) {
+ 		if (ret == -EBUSY)
+ 			ret = -EPROBE_DEFER;
+-		goto err_prepare_res;
+-	}
+-
+-	/* Registers chip manipulation functions */
++		goto error;
++	}
+ 	ret = sih_register_func(sih_haptic);
+ 	if (ret)
+-		goto err_id;
+-
+-	/* registers regmap */
++		goto error;
+ 	sih_haptic->regmapp.regmapping =
+ 		haptic_regmap_init(i2c, sih_haptic->regmapp.config);
+-	if (sih_haptic->regmapp.regmapping == NULL)
+-		goto err_regmap;
+-
+-	/* handle gpio irq */
++	if (IS_ERR_OR_NULL(sih_haptic->regmapp.regmapping)) {
++		ret = sih_haptic->regmapp.regmapping ?
++			PTR_ERR(sih_haptic->regmapp.regmapping) : -ENOMEM;
++		goto error;
++	}
++	ret = create_rb();
++	if (ret)
++		goto error;
++	sih_haptic->ring_owned = true;
++	sih_haptic->work_queue = create_singlethread_workqueue("sih_haptic_work_queue");
++	if (!sih_haptic->work_queue) {
++		ret = -ENOMEM;
++		goto error;
++	}
++	ret = vibrator_chip_init(sih_haptic);
++	if (ret)
++		goto error;
++	sih_haptic->hp_func->get_tracking_f0(sih_haptic);
++	ret = sih_haptic->stream_func->stream_rtp_work_init(sih_haptic);
++	if (ret)
++		goto error;
++	sih_haptic->stream_initialized = true;
+ 	ret = sih_acquire_irq_res(&i2c->dev, sih_haptic);
+ 	if (ret)
+-		goto err_irq;
+-
++		goto error;
++	sih_haptic->irq_requested = true;
+ 	CUSTOME_WAVE_ID = sih_haptic->chip_ipara.effect_max;
+-	/* input device config */
+ 	input_set_drvdata(input_dev, sih_haptic);
+-	sih_haptic->soft_frame.vib_dev = *input_dev;
+ 	input_set_capability(input_dev, EV_FF, FF_CONSTANT);
+ 	input_set_capability(input_dev, EV_FF, FF_GAIN);
+ 	input_set_capability(input_dev, EV_FF, FF_PERIODIC);
+ 	input_set_capability(input_dev, EV_FF, FF_CUSTOM);
+ 	sih_haptic->chip_ipara.effects_count = 10;
+-	if (sih_haptic->chip_ipara.effects_count + 1 > FF_EFFECT_COUNT_MAX)
+-		effect_count_max = sih_haptic->chip_ipara.effects_count + 1;
+-	else
+-		effect_count_max = FF_EFFECT_COUNT_MAX;
+-	ret = input_ff_create(input_dev, effect_count_max);
+-	if (ret < 0) {
+-		hp_err("%s create FF input device failed, ret=%d\n", __func__,
+-		       ret);
+-		goto err_input_ff;
+-	}
+-
+-	INIT_WORK(&sih_haptic->ram.gain_work, sih_set_gain_work_routine);
++	ret = input_ff_create(input_dev,
++			      max_t(int, FF_EFFECT_COUNT_MAX,
++				    sih_haptic->chip_ipara.effects_count + 1));
++	if (ret)
++		goto error;
++	sih_haptic->ff_created = true;
+ 	ff = input_dev->ff;
+ 	ff->upload = sih_upload_effect;
+ 	ff->playback = sih_playback;
+ 	ff->erase = sih_erase;
+ 	ff->set_gain = sih_set_gain;
++	ret = ram_work_init(sih_haptic);
++	if (ret)
++		goto error;
+ 	ret = input_register_device(input_dev);
+-	if (ret < 0) {
+-		hp_err("%s register input device failed, ret=%d\n", __func__,
+-		       ret);
+-		XM_HAP_REGISTER_EXCEPTION("Device register",
+-					  "input_register_device");
+-		goto err_destroy_ff;
+-	}
+-
+-	ret = create_rb();
+-	if (ret < 0) {
+-		XM_HAP_REGISTER_EXCEPTION("Hardware", "haptics_hw_init");
+-		hp_info("%s: error creating ringbuffer\n", __func__);
+-		goto err_rb;
+-	}
+-
+-	/* vibrator sysfs node create */
+-	ret = sysfs_create_group(&sih_haptic->i2c->dev.kobj,
+-				 &sih_vibra_attribute_group);
+-	if (ret < 0) {
+-		hp_err("%s:sysfs node create failed = %d\n ", __func__, ret);
+-		return ret;
+-	}
+-	/* vibrator globle ptr init */
++	if (ret)
++		goto error;
++	sih_haptic->input_registered = true;
++	ret = sysfs_create_group(&i2c->dev.kobj, &sih_vibra_attribute_group);
++	if (ret)
++		goto error;
++	sih_haptic->sysfs_created = true;
++	mutex_lock(&sih_global_lock);
+ 	g_haptic_t.sih_num = SIH_HAPTIC_DEV_NUM;
+ 	g_haptic_t.g_haptic[SIH_HAPTIC_MMAP_DEV_INDEX] = sih_haptic;
+-
+-	/* vibrator init */
+-	vibrator_init(sih_haptic);
+-
+-	sih_haptic->work_queue =
+-		create_singlethread_workqueue("sih_haptic_work_queue");
+-	if (!sih_haptic->work_queue) {
+-		hp_err("%s: Error creating sih_haptic_work_queue\n", __func__);
+-		goto err_dev_sysfs;
+-	}
+-	/* vibrator chip init */
+-	ret = vibrator_chip_init(sih_haptic);
+-	if (ret)
+-		goto err_dev_sysfs;
+-
+-	sih_haptic->hp_func->get_tracking_f0(sih_haptic);
+-	/* ram work init */
+-	ret = ram_work_init(sih_haptic);
+-	if (ret)
+-		goto err_dev_sysfs;
+-
+-	ret = sih_haptic->stream_func->stream_rtp_work_init(sih_haptic);
+-	if (ret)
+-		goto err_dev_sysfs;
+-
+-	hp_info("%s:end\n", __func__);
++	mutex_unlock(&sih_global_lock);
++	xm_hap_driver_init(true);
++	return 0;
++error:
++	sih_cleanup(sih_haptic);
+ 	return ret;
+-
+-err_rb:
+-err_destroy_ff:
+-	input_ff_destroy(&sih_haptic->soft_frame.vib_dev);
+-err_input_ff:
+-err_dev_sysfs:
+-	sih_haptic->stream_func->stream_rtp_work_release(sih_haptic);
+-	devm_free_irq(&i2c->dev, gpio_to_irq(sih_haptic->chip_attr.irq_gpio),
+-		      sih_haptic);
+-err_irq:
+-err_regmap:
+-err_id:
+-err_prepare_res:
+-err_parse_dts:
+-	devm_kfree(&i2c->dev, sih_haptic);
+-
+-	sih_haptic = NULL;
+-	hp_info("%s:error, ret = %d\n", __func__, ret);
+-	return ret;
+ }
+ 
+ static void sih_i2c_remove(struct i2c_client *i2c)
+ {
+-	sih_haptic_t *sih_haptic = i2c_get_clientdata(i2c);
+-	hp_info("%s:enter\n", __func__);
+-
+-	/* work_struct release */
+-	cancel_work_sync(&sih_haptic->ram.ram_work);
+-	cancel_work_sync(&sih_haptic->rtp.rtp_work);
+-
+-	/* hrtimer release */
+-	hrtimer_cancel(&sih_haptic->timer);
+-
+-	/* mutex release */
+-	mutex_destroy(&sih_haptic->lock);
+-	mutex_destroy(&sih_haptic->rtp.rtp_lock);
+-
+-	/* input device release */
+-	input_unregister_device(&sih_haptic->soft_frame.vib_dev);
+-
+-	/* irq release */
+-	devm_free_irq(&i2c->dev, gpio_to_irq(sih_haptic->chip_attr.irq_gpio),
+-		      sih_haptic);
+-
+-	/* gpio release */
+-	/* GPIOs requested with devm_gpio_request will be automatically freed on driver detach */
+-
+-	/* regmap exit */
+-	haptic_regmap_remove(sih_haptic->regmapp.regmapping);
+-
+-	/* container release */
+-	sih_vfree_container(sih_haptic, sih_haptic->rtp.rtp_cont);
+-	/* reg addr release */
+-	if (sih_haptic->chip_reg.reg_addr != NULL)
+-		kfree(sih_haptic->chip_reg.reg_addr);
+-
+-	sih_haptic->stream_func->stream_rtp_work_release(sih_haptic);
++	sih_cleanup(i2c_get_clientdata(i2c));
+ }
+ 
+ static int sih_suspend(struct device *dev)
+@@ -3683,10 +3688,13 @@
+ static const struct i2c_device_id sih_i2c_id[] = { { SIH_HAPTIC_NAME_688X, 0 },
+ 						   {} };
+ 
+-static struct of_device_id sih_dt_match[] = {
++static const struct of_device_id sih_dt_match[] = {
+ 	{ .compatible = "silicon,sih_haptic_688X" },
+ 	{},
+ };
++
++MODULE_DEVICE_TABLE(of, sih_dt_match);
++MODULE_DEVICE_TABLE(i2c, sih_i2c_id);
+ 
+ static struct i2c_driver sih_i2c_driver = {
+ 	.driver = {
+@@ -3702,27 +3710,20 @@
+ 
+ static int __init sih_i2c_init(void)
+ {
+-	int ret = -1;
+-
++	int ret;
++
++	ret = sih_add_misc_dev();
++	if (ret)
++		return ret;
+ 	ret = i2c_add_driver(&sih_i2c_driver);
+-
+-	hp_info("%s:i2c_add_driver,ret = %d\n", __func__, ret);
+-
+-	if (ret) {
+-		hp_err("%s:fail to add haptic device,ret = %d\n", __func__,
+-		       ret);
+-		return ret;
+-	}
+-	ret = sih_add_misc_dev();
+-	if (ret) {
+-		hp_err("%s:misc fail:%d\n", __func__, ret);
+-		return ret;
+-	}
+-	return 0;
++	if (ret)
++		sih_del_misc_dev();
++	return ret;
+ }
+ 
+ static void __exit sih_i2c_exit(void)
+ {
++	sih_del_misc_dev();
+ 	i2c_del_driver(&sih_i2c_driver);
+ }
+ 
+--- a/drivers/input/misc/si_haptic/haptic.h
++++ b/drivers/input/misc/si_haptic/haptic.h
+@@ -302,6 +302,18 @@
+ 	haptic_stream_play_para_t stream_para;
+ 	struct haptic_stream_func *stream_func;
+ 	struct workqueue_struct *work_queue;
++	struct input_dev *input_dev;
++	/* Serializes firmware admission with teardown. */
++	struct mutex fw_lock;
++	atomic_t fw_refs;
++	wait_queue_head_t fw_wait;
++	bool stopping;
++	bool input_registered;
++	bool ff_created;
++	bool irq_requested;
++	bool ring_owned;
++	bool sysfs_created;
++	bool stream_initialized;
+ 	bool f0_cali_status;
+ } sih_haptic_t;
+ 
+@@ -388,7 +400,8 @@
+  *
+  *********************************************************/
+ 
+-sih_haptic_t *get_global_haptic_ptr(void);
++sih_haptic_t *sih_lock_global(void);
++void sih_unlock_global(void);
+ 
+ /*********************************************************
+  *
+--- a/drivers/input/misc/si_haptic/haptic_misc.c
++++ b/drivers/input/misc/si_haptic/haptic_misc.c
+@@ -35,7 +35,6 @@
+ #include <sound/soc.h>
+ #include <linux/errno.h>
+ #include <linux/mman.h>
+-#include <linux/page_size_compat.h>
+ 
+ #include "haptic.h"
+ #include "haptic_mid.h"
+@@ -52,7 +51,7 @@
+ 
+ 	for (i = 0; i < IOCTL_MMAP_BUF_SUM; i++) {
+ 		opbuf->status = status;
+-		opbuf = opbuf->kernel_next;
++		opbuf = sih_haptic->stream_para.start_buf + (i + 1) % IOCTL_MMAP_BUF_SUM;
+ 	}
+ }
+ 
+@@ -73,6 +72,8 @@
+ 		container_of(work, sih_haptic_t, stream_para.stream_work);
+ 	mmap_buf_format_t *opbuf = sih_haptic->stream_para.start_buf;
+ 	uint32_t count = IOCTL_WAIT_BUFF_VALID_MAX_TRY;
++	unsigned int index = 0;
++	unsigned int length;
+ 	uint8_t reg_val;
+ 	unsigned int write_start;
+ 
+@@ -109,16 +110,20 @@
+ 		} else if (opbuf->status == MMAP_BUF_DATA_VALID &&
+ 			   ((reg_val & SIH_SYSSST_BIT_FIFO_AE) ==
+ 			    SIH_SYSSST_BIT_FIFO_AE)) {
++			length = READ_ONCE(opbuf->length);
++			if (length > sizeof(opbuf->data))
++				break;
+ 			haptic_regmap_write(sih_haptic->regmapp.regmapping,
+-					    SIH688X_REG_RTPDATA, opbuf->length,
++					    SIH688X_REG_RTPDATA, length,
+ 					    opbuf->data);
+ 
+ 			hp_info("%s:writes length:%d\n", __func__,
+ 				opbuf->length);
+-			memset(opbuf->data, 0, opbuf->length);
++			memset(opbuf->data, 0, length);
+ 			opbuf->status = MMAP_BUF_DATA_INVALID;
+ 			opbuf->length = 0;
+-			opbuf = opbuf->kernel_next;
++			index = (index + 1) % IOCTL_MMAP_BUF_SUM;
++			opbuf = sih_haptic->stream_para.start_buf + index;
+ 			write_start = sih_get_sys_msecs();
+ 		} else {
+ 			usleep_range(1000, 2000);
+@@ -131,52 +136,62 @@
+ 	sih_haptic->stream_para.stream_mode = false;
+ }
+ 
++static void sih_vma_open(struct vm_area_struct *vma)
++{
++	get_page(vma->vm_private_data);
++}
++
++static void sih_vma_close(struct vm_area_struct *vma)
++{
++	put_page(vma->vm_private_data);
++}
++
++static const struct vm_operations_struct sih_vm_ops = {
++	.open = sih_vma_open,
++	.close = sih_vma_close,
++};
++
+ static int memo_file_mmap(struct file *filp, struct vm_area_struct *vma)
+ {
+-	unsigned long phys;
+-	sih_haptic_t *sih_haptic = (sih_haptic_t *)filp->private_data;
+-	int ret = -1;
+-#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 7, 0)
+-	/* only accept PROT_READ, PROT_WRITE and MAP_SHARED from the API of mmap */
+-	vm_flags_t vm_flags = calc_vm_prot_bits(PROT_READ | PROT_WRITE, 0);
+-	vm_flags |= current->mm->def_flags | VM_MAYREAD | VM_MAYWRITE |
+-		    VM_MAYEXEC | VM_SHARED | VM_MAYSHARE;
+-	if (vma && (pgprot_val(vma->vm_page_prot) !=
+-		    pgprot_val(vm_get_page_prot(vm_flags))))
+-		return -EPERM;
+-
+-	if (vma && ((vma->vm_end - vma->vm_start) !=
+-		    (PAGE_SIZE << IOCTL_MMAP_PAGE_ORDER)))
+-		return -ENOMEM;
+-#endif
+-	phys = virt_to_phys(sih_haptic->stream_para.start_buf);
+-
+-	ret = remap_pfn_range(vma, vma->vm_start, (phys >> PAGE_SHIFT),
+-			      (vma->vm_end - vma->vm_start), vma->vm_page_prot);
+-	if (ret) {
+-		hp_err("%s:error mmap failed\n", __func__);
+-		return ret;
+-	}
+-
++	sih_haptic_t *sih_haptic = sih_lock_global();
++	struct page *page;
++	int ret;
++
++	if (!sih_haptic)
++		return -ENODEV;
++	if (vma->vm_pgoff || !(vma->vm_flags & VM_SHARED) ||
++	    (vma->vm_flags & VM_EXEC) ||
++	    vma->vm_end - vma->vm_start != PAGE_SIZE << IOCTL_MMAP_PAGE_ORDER) {
++		ret = -EINVAL;
++		goto out;
++	}
++	page = virt_to_page(sih_haptic->stream_para.start_buf);
++	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
++	vm_flags_clear(vma, VM_MAYEXEC);
++	ret = remap_pfn_range(vma, vma->vm_start, page_to_pfn(page),
++			      vma->vm_end - vma->vm_start, vma->vm_page_prot);
++	if (!ret) {
++		vma->vm_private_data = page;
++		vma->vm_ops = &sih_vm_ops;
++		sih_vma_open(vma);
++	}
++out:
++	sih_unlock_global();
+ 	return ret;
+ }
+ 
+ static int memo_file_open(struct inode *inode, struct file *file)
+ {
+-	if (!try_module_get(THIS_MODULE))
++	sih_haptic_t *sih_haptic = sih_lock_global();
++
++	if (!sih_haptic)
+ 		return -ENODEV;
+-
+-	file->private_data = (void *)get_global_haptic_ptr();
+-
++	sih_unlock_global();
+ 	return 0;
+ }
+ 
+ static int memo_file_release(struct inode *inode, struct file *file)
+ {
+-	file->private_data = (void *)NULL;
+-
+-	module_put(THIS_MODULE);
+-
+ 	return 0;
+ }
+ 
+@@ -197,10 +212,16 @@
+ static long memo_file_unlocked_ioctl(struct file *file, unsigned int cmd,
+ 				     unsigned long arg)
+ {
+-	sih_haptic_t *sih_haptic = (sih_haptic_t *)file->private_data;
++	sih_haptic_t *sih_haptic = sih_lock_global();
+ 	uint32_t tmp;
+-	int ret = -1;
+-
++	int ret = 0;
++
++	if (!sih_haptic)
++		return -ENODEV;
++	if (cmd == IOCTL_STREAM_MODE || cmd == IOCTL_STOP_MODE) {
++		WRITE_ONCE(sih_haptic->stream_para.stream_mode, false);
++		cancel_work_sync(&sih_haptic->stream_para.stream_work);
++	}
+ 	hp_info("cmd:%u arg:%lu\n", cmd, arg);
+ 	mutex_lock(&sih_haptic->lock);
+ 	switch (cmd) {
+@@ -247,7 +268,6 @@
+ 	case IOCTL_STREAM_MODE:
+ 		hp_info("%s:stream mode enter\n", __func__);
+ 		sih_haptic->stream_para.stream_mode = false;
+-		cancel_work_sync(&sih_haptic->stream_para.stream_work);
+ 		haptic_clean_buf(sih_haptic, MMAP_BUF_DATA_INVALID);
+ 		sih_haptic->hp_func->stop(sih_haptic);
+ 		sih_haptic->stream_para.done_flag = false;
+@@ -258,7 +278,6 @@
+ 		hp_info("%s:stop mode enter\n", __func__);
+ 		sih_haptic->stream_para.done_flag = true;
+ 		sih_haptic->stream_para.stream_mode = false;
+-		cancel_work_sync(&sih_haptic->stream_para.stream_work);
+ 		sih_haptic->chip_ipara.state = SIH_STANDBY_MODE;
+ 		sih_haptic->chip_ipara.play_mode = SIH_IDLE_MODE;
+ 		sih_haptic->hp_func->set_rtp_aei(sih_haptic, false);
+@@ -266,11 +285,13 @@
+ 		sih_haptic->hp_func->clear_interrupt_state(sih_haptic);
+ 		break;
+ 	default:
++		ret = -ENOTTY;
+ 		break;
+ 	}
+ 
+ 	mutex_unlock(&sih_haptic->lock);
+-	return 0;
++	sih_unlock_global();
++	return ret;
+ }
+ 
+ static const struct file_operations fops = {
+@@ -293,20 +314,21 @@
+ {
+ #ifdef STREAM_RTP_MODE
+ 	sih_haptic->stream_para.rtp_ptr =
+-		kmalloc(IOCTL_MMAP_BUF_SIZE * IOCTL_MMAP_BUF_SUM, GFP_KERNEL);
++		kzalloc(IOCTL_MMAP_BUF_SIZE * IOCTL_MMAP_BUF_SUM, GFP_KERNEL);
+ 	if (sih_haptic->stream_para.rtp_ptr == NULL) {
+ 		hp_err("malloc rtp memory failed\n");
+ 		return -ENOMEM;
+ 	}
+ 
+ 	sih_haptic->stream_para.start_buf =
+-		(mmap_buf_format_t *)__get_free_pages(GFP_KERNEL,
++		(mmap_buf_format_t *)__get_free_pages(GFP_KERNEL | __GFP_ZERO | __GFP_COMP,
+ 						      IOCTL_MMAP_PAGE_ORDER);
+ 	if (sih_haptic->stream_para.start_buf == NULL) {
+ 		hp_err("error get page failed\n");
++		kfree(sih_haptic->stream_para.rtp_ptr);
++		sih_haptic->stream_para.rtp_ptr = NULL;
+ 		return -ENOMEM;
+ 	}
+-	SetPageReserved(virt_to_page(sih_haptic->stream_para.start_buf));
+ 	{
+ 		mmap_buf_format_t *temp;
+ 		uint32_t i;
+@@ -333,9 +355,13 @@
+ static void sih_stream_rtp_work_release(sih_haptic_t *sih_haptic)
+ {
+ #ifdef STREAM_RTP_MODE
++	WRITE_ONCE(sih_haptic->stream_para.stream_mode, false);
++	cancel_work_sync(&sih_haptic->stream_para.stream_work);
+ 	kfree(sih_haptic->stream_para.rtp_ptr);
++	sih_haptic->stream_para.rtp_ptr = NULL;
+ 	free_pages((unsigned long)sih_haptic->stream_para.start_buf,
+ 		   IOCTL_MMAP_PAGE_ORDER);
++	sih_haptic->stream_para.start_buf = NULL;
+ #endif
+ }
+ 
+@@ -363,3 +389,8 @@
+ 	return 0;
+ #endif
+ }
++
++void sih_del_misc_dev(void)
++{
++	misc_deregister(&sih_haptic_misc);
++}
+--- a/drivers/input/misc/si_haptic/haptic_misc.h
++++ b/drivers/input/misc/si_haptic/haptic_misc.h
+@@ -50,5 +50,6 @@
+ } haptic_buf_status_e;
+ 
+ int sih_add_misc_dev(void);
++void sih_del_misc_dev(void);
+ 
+ #endif
+--- a/drivers/input/misc/si_haptic/haptic_regmap.c
++++ b/drivers/input/misc/si_haptic/haptic_regmap.c
+@@ -120,6 +120,5 @@
+ 
+ void haptic_regmap_remove(struct regmap *regmap)
+ {
+-	if (!IS_ERR(regmap))
+-		regmap_exit(regmap);
++	/* devm_regmap_init_i2c releases the map on detach. */
+ }
+--- a/drivers/input/misc/si_haptic/ringbuffer.c
++++ b/drivers/input/misc/si_haptic/ringbuffer.c
+@@ -26,7 +26,7 @@
+ 
+ struct rb *grb;
+ 
+-int32_t get_free_size(int32_t tail, int32_t head)
++static s32 get_free_size(s32 tail, s32 head)
+ {
+ 	if (head == tail)
+ 		return BUFFER_SIZE - 1;
+@@ -164,32 +164,25 @@
+ 
+ int create_rb(void)
+ {
+-	int32_t tail;
+-	int32_t head;
+-	grb = kzalloc(sizeof(struct rb), GFP_KERNEL);
+-	if (grb == NULL) {
+-		goto err;
+-		;
+-	}
++	s32 tail, head;
++
++	if (grb)
++		return -EBUSY;
++	grb = kzalloc(sizeof(*grb), GFP_KERNEL);
++	if (!grb)
++		return -ENOMEM;
+ 	grb->gbuffer = kzalloc(BUFFER_SIZE, GFP_KERNEL);
+-	if (grb->gbuffer == NULL) {
+-		goto err;
+-	}
+-
++	if (!grb->gbuffer) {
++		kfree(grb);
++		grb = NULL;
++		return -ENOMEM;
++	}
+ 	rb_init();
+-
+ 	init_waitqueue_head(&grb->wait_q);
+ 	tail = atomic_read(&grb->wr_index);
+ 	head = atomic_read(&grb->rd_index);
+ 	grb->aval_size = get_free_size(tail, head);
+-
+ 	return 0;
+-err:
+-	if (grb->gbuffer)
+-		kfree(grb->gbuffer);
+-	if (grb)
+-		kfree(grb);
+-	return -EPERM;
+ }
+ 
+ void rb_init(void)
+--- a/drivers/input/misc/si_haptic/sih688x_func_config.c
++++ b/drivers/input/misc/si_haptic/sih688x_func_config.c
+@@ -417,8 +417,8 @@
+ 	}
+ }
+ 
+-void sih_reg_config_parse(sih_haptic_t *sih_haptic,
+-			  haptic_reg_config_t *reg_config)
++static void sih_reg_config_parse(sih_haptic_t *sih_haptic,
++				 haptic_reg_config_t *reg_config)
+ {
+ 	uint8_t reg_addr = 0;
+ 	uint8_t reg_value = 0;

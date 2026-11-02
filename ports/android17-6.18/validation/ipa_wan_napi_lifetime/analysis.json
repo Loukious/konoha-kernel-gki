@@ -1,0 +1,20 @@
+{
+  "status": "Source/build/package/current6.18 restore and installer mock checks PASS; hardware test pending",
+  "patch": "0169-retain-shared-wan-napi-until-netdev-removal.patch",
+  "runtime_warning": "net/core/dev.c:7604 __netif_napi_del_locked via free_netdev in IPA modem AFTER_SHUTDOWN; current installed ipam unmodified",
+  "changes": [
+    "WAN NAPI owner is the netdev, with final disable/delete after unregister; pipe consumers drain and drop borrowed references without deleting owner.",
+    "Repeated ndo_open does not double-enable polling; enable flag initialized before registration publication.",
+    "Stopped endpoint work drained before reset; non-WAN NAPI ownership retained."
+  ],
+  "source_locking": "rmnet netdev does not request ops locking; ndo_open runs under RTNL, napi_enable/disable take own netdev_lock in 6.18. Final deletion after unregister prevents an open racing teardown.",
+  "known_limits": [
+    "No firmware or SMP race validation yet.",
+    "Current WAN protocol opens netdev before enabling ingress producers; pre-open ingress producer scheduling requires separate audit.",
+    "Existing GSI failure unwind and RX post-napi_complete tail accesses remain audit items; no test claims those are fixed."
+  ],
+  "source_validation": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/ipa_wan_napi_lifetime/validation.json",
+  "build_log": "/tmp/onyx-ipa-napi-lifetime-build.log",
+  "artifact": "20261102T024104137567Z",
+  "ready": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-napi-lifetime-20261102T024454Z/READY.json"
+}

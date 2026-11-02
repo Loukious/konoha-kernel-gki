@@ -1,0 +1,2338 @@
+{
+  "objective": "keep analysing the logs and fixing every single error or warning related to the kernel",
+  "status": "active; not complete",
+  "attempt": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bwmon-display-20261101T225345Z",
+  "source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bwmon-display-20261101T225345Z/kernel-live-dump.txt",
+  "inventory_limit": "Historical inventory preserved. Current explicit -b kernel stream is separate from -b all, which omits kernel on this device. Earliest boot may be overwritten; logged E/W severity is not alone proof of a fault.",
+  "priority_findings": [
+    {
+      "id": "charger-policy-startup",
+      "status": "0155 installed; Android boot complete; battery CHARGING observed; continuous binding/error checks in progress",
+      "evidence": "Buck policy module+driver registered but DT device unbound; PMIC early transport writes return-ENODEV, later transport reads succeed; current probe invokes votes before is_init_ok check."
+    },
+    {
+      "id": "iommu-display-eva",
+      "status": "patch0156 dispatch and caller lifecycle sanitizers PASS; live warning/handler verification pending",
+      "evidence": "Six warnings at iommu_set_fault_handler from display/EVA DMA-domain callers."
+    },
+    {
+      "id": "ipa-parent-cells",
+      "status": "overlay integrated; native tuple/pool/translation invariance PASS; live warning absence pending",
+      "evidence": "Two of_bus_n_*_cells warnings from IPA address pool consumer."
+    },
+    {
+      "id": "audio-hw-votes",
+      "status": "patch0158 exact-helper lifecycle/accounting sanitizers PASS; live stream verification pending",
+      "evidence": "LPASS audio hw vote enable fails-22, followed by ASoC hw_params failure."
+    },
+    {
+      "id": "pmic-bcl-defer",
+      "status": "SDAM reg2 overlay installed; PMK8550SDAM7000 provider and both BCL PMIC devices now bound live",
+      "evidence": "PM7550BA BCL probe remains deferred through last captured successful probes."
+    },
+    {
+      "id": "valued-of-presence",
+      "status": "patch0157 helper fixtures PASS; live warning absence pending",
+      "evidence": "12 warnings, 11 node/property pairs, nine presence checks in seven files; preserve present-zero semantics and data"
+    },
+    {
+      "id": "analog-microphone-unmute",
+      "status": "0159 installed; user confirms microphone works in Messenger, Recorder with built-in mic selected, and normal phone calls",
+      "evidence": "No level or voice on builtin mic in calls and recordings; analog channels excluded from pending worker while hw_params sets PGA mute; native worker included them."
+    },
+    {
+      "id": "silicon-vibrator-driver-omitted",
+      "status": "0160 installed; native Si driver binds5-006b/inputevent2; user confirms vibration works",
+      "evidence": "Installed Awinic variant NACKs and does not bind; native6.6 also NACKs unused Awinic but binds si_haptic at5-006b/input7. DT SIH688X enabled; module omitted because no OF aliases. Correct hardware driver restored, MODULE_DEVICE_TABLE added."
+    },
+    {
+      "id": "charging-path-startup-writes",
+      "status": "0162 installed; Androidbootcomplete, USB and charging; no initial-status retries in explicitcapture",
+      "evidence": "1125 initial-status ENOENT retries in current explicit kernel capture. Native worker only observes startup state; port applies gate table during snapshot. Startup now observes all valid states without switching firmware-owned gates. Explicit unsupported rows/provider errors still fail.",
+      "validation": "validation/path_initial_snapshot/analysis.json",
+      "live_result": "validation/path_initial_snapshot/live-result-20261102.json"
+    },
+    {
+      "id": "usb-valued-of-presence",
+      "status": "0161 installed; USBADBand88e3000PHY/a600000controllerbound; zero valuedOFwarnings inavailablecapture",
+      "evidence": "USB extcon and vdd_refgen-supply phandles queried as booleans; replace only presence queries, retaining all values and actions. Four actual board/property fixtures preserved.",
+      "validation": "validation/path_initial_snapshot/usb-presence.json",
+      "live_result": "validation/path_initial_snapshot/live-result-20261102.json"
+    },
+    {
+      "id": "recovery-fastbootd-boot-failure",
+      "status": "fixed and hardware verified with recovery init correction +0163-0166",
+      "evidence": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z/RESULT.json",
+      "next": "Verify direct normal Android return; preserve current working candidate",
+      "validation": "validation/recovery_init_override/analysis.json",
+      "prepared_attempt": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-init-20261102T005304Z"
+    },
+    {
+      "id": "battery-bmd-optional-fg-type",
+      "status": "0167 fixed and hardware bound; source336case/actualboards/buildPASS; charging97%",
+      "evidence": "mca_bmd probe -EINVAL; both checked DT nodes omit optional fg_type; port0082 rejects helper default return",
+      "next": "Preserve missing-property default0 while validating explicit scalar/type; build source fix",
+      "live_result": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bmd-lastclose-20261102T021305Z/RESULT.json"
+    },
+    {
+      "id": "drm-lastclose-client-no-framebuffer",
+      "status": "0168 fixed and hardware shutdowntestPASS; threepriorDRMwarnsnowzero; fbdev/KMScleanupsource128casesPASS",
+      "evidence": "3drm_atomic.c1901 WARN_ON(!set->fb) during shutdown; probe-only KMS client has modesets without fb",
+      "next": "Stop treating probe-only client as framebuffer restore target; preserve real fbdev and KMS cleanup",
+      "live_result": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bmd-lastclose-20261102T021305Z/RESULT.json"
+    },
+    {
+      "id": "ipa-ssr-napi-enabled-delete",
+      "status": "Stillonekernelshutdownwarning; missingNDOnapi_disableandlateprobeenabledflagresetconfirmed; pipe-vs-netdevlifecycleauditinprogress",
+      "evidence": "NAPI free_netdev warning after modem SSR; wwan open enables NAPI, stop does not disable; teardown may delete it separately",
+      "next": "Audit network vs pipe-owned lifecycle and normal close/SSR/coalescing paths before changing NAPI ownership",
+      "live_result": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bmd-lastclose-20261102T021305Z/transition-test.json"
+    },
+    {
+      "id": "scmi-sram-address-cells",
+      "status": "Source/build checks pass; corrected SRAM platform driver binds on the installed candidate",
+      "evidence": "Root6.18recovery: sramresource0..17d093ff probe-EBUSY. /soc has1+1cells; /soc/mmio-sram@17D09400 uses4cellreg and6cellranges; childscmi-shmem@0 usesabsoluteaddressoutside0..400range",
+      "next": "Preserve the firmware window and driver binding in subsequent candidates",
+      "validation": "validation/scmi_sram_layout/validation.json",
+      "prepared_attempt": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-wlan-swr-20261102T032453Z",
+      "hardware_result": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-wlan-swr-eva-20261102T043038Z/RESULT.json"
+    },
+    {
+      "id": "reboot-black-interval",
+      "status": "Delaypersists34.2secAndroid\u2192fastbootdwith/withoutDRMfix; fastbootd\u2192Androidkernelstarts~28.38s; causeunproven",
+      "evidence": "hostfile/firstkerneluptime estimate~76sec native recovery\u2192kernelstart; monotonicAndroid\u2192fastbootd entry34.2sec; cable disconnected/reconnected later in Android logs",
+      "next": "Capture exact shutdown/bootloader phase evidence; do notattribute delay solely to cable or to solvedrecoverypanic"
+    },
+    {
+      "id": "off-charger-boot-mode-selection",
+      "status": "Unresolved: full Android on both computer USB and wall charger; prior baseline uncertain",
+      "evidence": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bmd-lastclose-20261102T021305Z/off-charger-observation-20261102T022651Z/OBSERVATION.json",
+      "next": "Audit bootloader charging-mode policy and restart-reason handoff; distinguish absence of charger mode at first boot from a transient failed charger boot. Do not set charger mode globally or alter images without source/runtime evidence.",
+      "rom_source_audit": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/bmd-lastclose-20261102T021305Z/off-charger-observation-20261102T022651Z/rom-source-audit.json"
+    },
+    {
+      "id": "ipa-wan-napi-owner-lifetime",
+      "status": "RX and TX ownership corrections installed; controlled modem AFTER_SHUTDOWN completes without NAPI deletion warning",
+      "evidence": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/ipa_wan_napi_lifetime/analysis.json",
+      "next": "Preserve final-owner cleanup; firmware/SMP and other restart paths remain to be tested",
+      "prepared_attempt": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-wlan-swr-20261102T032453Z",
+      "hardware_result": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/ipa_wan_tx_napi/hardware-validation.json"
+    },
+    {
+      "id": "soundwire-command-ignored",
+      "status": "Observed in original6.6 baseline too:28 vs33 current; cause unresolved",
+      "next": "Identify rejected register/command before altering hardware IRQ behavior; separate bulk deadlock/error propagation fix under verification",
+      "evidence": {
+        "snapshot": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-20261102T030100Z/before-test-working/logcat-kernel.txt",
+        "occurrences": 33,
+        "sample": "11-02 03:27:30.182  1875  1875 E swr-mgr va_swr_ctrl: swr_mstr_interrupt: SWR CMD Ignored, fifo status 0x40000005"
+      },
+      "baseline_evidence": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/soundwire_bulk_lock/analysis.json"
+    },
+    {
+      "id": "wlan-data-stall-command-failure",
+      "status": "Installed; Wi-Fi associates and 3/3 gateway ping replies; absent-setting failure message is absent in the captured boot",
+      "next": "Preserve explicit firmware command failure reporting; no roaming stress test claim",
+      "evidence": {
+        "snapshot": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-20261102T030100Z/before-test-working/logcat-kernel.txt",
+        "occurrences": 16,
+        "sample": "11-02 03:27:38.464  5932  5932 E [wpa_su][0x228c6432][02:27:38.461302] wcn7750: [5932:E:HDD] hdd_config_data_stall_param: Set data stall params fail"
+      },
+      "validation": "validation/wlan_data_stall_dispatch/analysis.json",
+      "classification": "Misleadingabsent-attributereportandduplicatecallback; thesehistoricalerrorsdidnotreachfirmware",
+      "artifact": "/home/loukious/Android/konoha-android17-6.18-port-20261031/artifacts/20261102T031131665393Z",
+      "prepared_attempt": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-wlan-swr-20261102T032453Z",
+      "hardware_result": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-wlan-swr-eva-20261102T043038Z/RESULT.json"
+    },
+    {
+      "id": "soundwire-bulk-recursive-lock",
+      "status": "Installed and normal Android/camera operation observed; source concurrency tests pass",
+      "evidence": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/soundwire_bulk_lock/analysis.json",
+      "next": "Actual bulk-path hardware coverage is not established; CMD Ignored remains separate",
+      "build_log": "/tmp/onyx-soundwire-bulk-build-v2.log",
+      "prepared_attempt": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-wlan-swr-20261102T032453Z",
+      "hardware_result": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-wlan-swr-eva-20261102T043038Z/RESULT.json"
+    },
+    {
+      "id": "adb-functionfs-bcd-version",
+      "status": "ROMsource and adbd target rebuilt; both compiled MSOS headers0x0100 and dependenciesverified; APEX/ROMdeploy and hardware pending",
+      "evidence": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/adb_os_descriptor/validation.json",
+      "next": "Integrate rebuiltadbd into appropriate complete signed ROM/APEX or recovery update, with rollback; do not replace installedsystembinary or bypassroot. Kernelcandidate remains independent.",
+      "kernel_change": false,
+      "binary_artifact": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/adb_os_descriptor/candidate-adbd",
+      "binary_sha256": "93c15e289114383ee5855948ea191ba8782b14aa242814e37bd3358db4396b2a",
+      "canonical_rom_patch": "/home/loukious/Android/crdroid_onyx_patches/patches/packages_modules_adb/0001-fix-functionfs-os-descriptor-bcd-version.patch"
+    },
+    {
+      "id": "usb-webcam-disabled-property",
+      "status": "ROM source flag corrected and vendor property artifact built; ROM patch carried in canonical repository; device deployment pending",
+      "evidence": "ports/android17-6.18/validation/usb_webcam_config/validation.json",
+      "canonical_rom_patch": "/home/loukious/Android/crdroid_onyx_patches/patches/device_xiaomi_onyx/0016-enable-device-as-webcam.patch",
+      "next": "Include in rebuilt ROM and test USB host enumeration and camera streaming",
+      "rom_commit": "08d7297f3f59e6144c52d18fbcdb3d6ba34ac0e5",
+      "rom_branch": "evolution-cnb"
+    }
+  ],
+  "records": [
+    {
+      "count": 1282,
+      "normalized": "[N:N:N:N-E][mca_business_charger]business_charger_pmic_init_done_notify_work: N wls_basic or buckchg not init done, rerun work",
+      "sample": "11-01 23:55:21.362    85    85 E [22:55:21:359-E][mca_business_charger]business_charger_pmic_init_done_notify_work: 968 wls_basic or buckchg not init done, rerun work",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 314,
+      "normalized": "[N:N:N:N-E][mca_path_control]mca_path_control_update_status_work: N initial path status failed: -N",
+      "sample": "11-01 23:55:25.047    13    13 E [22:55:25:044-E][mca_path_control]mca_path_control_update_status_work: 454 initial path status failed: -2",
+      "status": "0162 installed; retry errors0 innewcapture; charging/Android/USB confirmed",
+      "classification": "port startup adds gate application absent from native snapshot; no gate-table policy changed"
+    },
+    {
+      "count": 279,
+      "normalized": "[N:N:N:N-E][mca_strategy_fg]fg_update_status: N UISOC:N CURRENT:N RSOC:N VOLTAGE:N TEMP:N PVBAT:N PIBAT:N PTBAT:N HEALTH:N",
+      "sample": "11-01 23:55:22.150    12    12 E [22:55:22:147-E][mca_strategy_fg]fg_update_status: 2167 UISOC:96 CURRENT:2291000 RSOC:93 VOLTAGE:4378 TEMP:291 PVBAT:4339 PIBAT:1741 PTBAT:31 HEALTH:1",
+      "status": "source audited: operational diagnostic; no fault reported by this template",
+      "classification": "normal operation printed at vendor error severity",
+      "source_audit": {
+        "rule": "fuel-gauge-success",
+        "source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/drivers/power/supply/mca/mca_strategy/strategy_fg/mca_strategy_fg.c",
+        "source_sha256": "19baa471d97c232d2d409347d5c4dbb754d6f079f184c7941385550bde51b445",
+        "rationale": "Successful fuel-gauge snapshot follows cleared sample_error and returns0."
+      }
+    },
+    {
+      "count": 117,
+      "normalized": "[N:N:N:N-E][mca_buckchg_jeita]mca_buckchg_jeita_parse_para: N jeita para N N N N N N N N",
+      "sample": "11-01 23:55:21.290   176   176 E [22:55:21:287-E][mca_buckchg_jeita]mca_buckchg_jeita_parse_para: 799 jeita para 0 5 1 1 3115 4530 572 0",
+      "status": "source audited: operational diagnostic; no fault reported by this template",
+      "classification": "normal operation printed at vendor error severity",
+      "source_audit": {
+        "rule": "jeita-success",
+        "source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/drivers/power/supply/mca/mca_strategy/strategy_charger/mca_buckchg_jeita.c",
+        "source_sha256": "84e7ba94c84a032f92577e67941c36afab3729593c192672443a1eb20f9eb812",
+        "rationale": "Normal-temperature table dump after parameter validation; failure branches are separate."
+      }
+    },
+    {
+      "count": 65,
+      "normalized": "[N:N:N:N-E][mca_buckchg_jeita]mca_buckchg_jeita_parse_para: N jeita ffc para N N N N N N N N",
+      "sample": "11-01 23:55:21.290   176   176 E [22:55:21:287-E][mca_buckchg_jeita]mca_buckchg_jeita_parse_para: 882 jeita ffc para 20 35 1 2 15600 4580 2667 0",
+      "status": "source audited: operational diagnostic; no fault reported by this template",
+      "classification": "normal operation printed at vendor error severity",
+      "source_audit": {
+        "rule": "jeita-ffc-success",
+        "source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/drivers/power/supply/mca/mca_strategy/strategy_charger/mca_buckchg_jeita.c",
+        "source_sha256": "84e7ba94c84a032f92577e67941c36afab3729593c192672443a1eb20f9eb812",
+        "rationale": "Fast-charge table dump immediately before successful return0."
+      }
+    },
+    {
+      "count": 50,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_set_cur_value N: mode:N, value:N, bTouchIsAwake:N",
+      "sample": "11-01 23:55:21.429  1758  1758 E         : [22:55:21.426] [NVT-ts] nvt_set_cur_value 3233: mode:1011, value:120, bTouchIsAwake:1",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 30,
+      "normalized": "power_supply battery: driver failed to report `status' property: -N",
+      "sample": "11-01 23:55:21.305  1619  1619 E power_supply battery: driver failed to report `status' property: -1",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 21,
+      "normalized": "SELinux : avc:  denied  { find } for pid=N uid=N name=vendor.xiaomi.hardware.misys.common.IMiSysImpl/default scontext=u:r:platform_app_36:s0:c512,c768 tcontext=u:object_r:default_android_service:s0 tclass=service_manager permissive=N",
+      "sample": "11-01 23:58:16.634   447   447 E SELinux : avc:  denied  { find } for pid=10744 uid=10496 name=vendor.xiaomi.hardware.misys.common.IMiSysImpl/default scontext=u:r:platform_app_36:s0:c512,c768 tcontext=u:object_r:default_android_service:s0 tclass=service_manager permissive=0",
+      "status": "untriaged",
+      "classification": "userspace/policy or audit consequence; trace cause before deciding kernel change"
+    },
+    {
+      "count": 18,
+      "normalized": "init    : Control message: Could not find 'aidl/vendor.qti.qhcp.IQHDC/default' for ctl.interface_start from pid: N (/system/bin/servicemanager)",
+      "sample": "11-01 23:55:21.754     1     1 E init    : Control message: Could not find 'aidl/vendor.qti.qhcp.IQHDC/default' for ctl.interface_start from pid: 447 (/system/bin/servicemanager)",
+      "status": "untriaged",
+      "classification": "userspace/policy or audit consequence; trace cause before deciding kernel change"
+    },
+    {
+      "count": 18,
+      "normalized": "swr-mgr va_swr_ctrl: swr_mstr_interrupt: SWR CMD Ignored, fifo status ADDR",
+      "sample": "11-01 23:55:28.201  1904  1904 E swr-mgr va_swr_ctrl: swr_mstr_interrupt: SWR CMD Ignored, fifo status 0x40000005",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 17,
+      "normalized": "[N:N:N:N-E][mca_strategy_fg]fg_update_status: N UISOC:N CURRENT:N RSOC:N VOLTAGE:N TEMP:N PVBAT:N PIBAT:-N PTBAT:N HEALTH:N",
+      "sample": "11-01 23:55:55.983   181   181 E [22:55:55:980-E][mca_strategy_fg]fg_update_status: 2167 UISOC:96 CURRENT:20000 RSOC:93 VOLTAGE:4391 TEMP:301 PVBAT:4400 PIBAT:-12 PTBAT:33 HEALTH:1",
+      "status": "source audited: operational diagnostic; no fault reported by this template",
+      "classification": "normal operation printed at vendor error severity",
+      "source_audit": {
+        "rule": "fuel-gauge-success",
+        "source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/drivers/power/supply/mca/mca_strategy/strategy_fg/mca_strategy_fg.c",
+        "source_sha256": "19baa471d97c232d2d409347d5c4dbb754d6f079f184c7941385550bde51b445",
+        "rationale": "Successful fuel-gauge snapshot follows cleared sample_error and returns0."
+      }
+    },
+    {
+      "count": 15,
+      "normalized": "audit   : audit_lost=N audit_rate_limit=N audit_backlog_limit=N",
+      "sample": "11-01 23:55:37.581  2335  2335 W audit   : audit_lost=1 audit_rate_limit=5 audit_backlog_limit=64",
+      "status": "untriaged",
+      "classification": "userspace/policy or audit consequence; trace cause before deciding kernel change"
+    },
+    {
+      "count": 15,
+      "normalized": "audit   : rate limit exceeded",
+      "sample": "11-01 23:55:37.581  2335  2335 E audit   : rate limit exceeded",
+      "status": "untriaged",
+      "classification": "userspace/policy or audit consequence; trace cause before deciding kernel change"
+    },
+    {
+      "count": 14,
+      "normalized": "init    : Control message: Could not find 'aidl/android.frameworks.sensorservice.ISensorManager/default' for ctl.interface_start from pid: N (/system/bin/servicemanager)",
+      "sample": "11-01 23:55:21.300     1     1 E init    : Control message: Could not find 'aidl/android.frameworks.sensorservice.ISensorManager/default' for ctl.interface_start from pid: 447 (/system/bin/servicemanager)",
+      "status": "untriaged",
+      "classification": "userspace/policy or audit consequence; trace cause before deciding kernel change"
+    },
+    {
+      "count": 13,
+      "normalized": "[N:N:N:N-E][mca_dts]mca_parse_dts_u32: N prop base_vbat_low_hyst read fail, set default N",
+      "sample": "11-01 23:55:21.289   176   176 E [22:55:21:286-E][mca_dts]mca_parse_dts_u32: 57 prop base_vbat_low_hyst read fail, set default 50",
+      "status": "Source and actual both-board audit: native optional50mV defaults retained; no fault established by these templates",
+      "classification": "unknown",
+      "source_audit": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/jeita_optional_defaults/analysis.json",
+      "rationale": "Missing base/flip hysteresis properties take native50mV defaults; caller ignores helperEINVAL for these optionalreads, then validates0..1000. Bothboardsomittheseproperties and support-base-flip. This exact pair of default-setting messages does not indicatefailedJEITAprobe or invalidconfiguration."
+    },
+    {
+      "count": 13,
+      "normalized": "[N:N:N:N-E][mca_dts]mca_parse_dts_u32: N prop flip_vbat_low_hyst read fail, set default N",
+      "sample": "11-01 23:55:21.289   176   176 E [22:55:21:286-E][mca_dts]mca_parse_dts_u32: 57 prop flip_vbat_low_hyst read fail, set default 50",
+      "status": "Source and actual both-board audit: native optional50mV defaults retained; no fault established by these templates",
+      "classification": "unknown",
+      "source_audit": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/jeita_optional_defaults/analysis.json",
+      "rationale": "Missing base/flip hysteresis properties take native50mV defaults; caller ignores helperEINVAL for these optionalreads, then validates0..1000. Bothboardsomittheseproperties and support-base-flip. This exact pair of default-setting messages does not indicatefailedJEITAprobe or invalidconfiguration."
+    },
+    {
+      "count": 13,
+      "normalized": "[N:N:N:N-E][mca_buckchg_jeita]mca_buckchg_jeita_parse_para: N jeita para -N -N N N N N N N",
+      "sample": "11-01 23:55:21.290   176   176 E [22:55:21:287-E][mca_buckchg_jeita]mca_buckchg_jeita_parse_para: 799 jeita para -65535 -9 0 2 0 4530 572 0",
+      "status": "source audited: operational diagnostic; no fault reported by this template",
+      "classification": "normal operation printed at vendor error severity",
+      "source_audit": {
+        "rule": "jeita-success",
+        "source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/drivers/power/supply/mca/mca_strategy/strategy_charger/mca_buckchg_jeita.c",
+        "source_sha256": "84e7ba94c84a032f92577e67941c36afab3729593c192672443a1eb20f9eb812",
+        "rationale": "Normal-temperature table dump after parameter validation; failure branches are separate."
+      }
+    },
+    {
+      "count": 13,
+      "normalized": "[N:N:N:N-E][mca_buckchg_jeita]mca_buckchg_jeita_parse_para: N jeita para -N N N N N N N N",
+      "sample": "11-01 23:55:21.290   176   176 E [22:55:21:287-E][mca_buckchg_jeita]mca_buckchg_jeita_parse_para: 799 jeita para -9 0 1 2 940 4530 572 2",
+      "status": "source audited: operational diagnostic; no fault reported by this template",
+      "classification": "normal operation printed at vendor error severity",
+      "source_audit": {
+        "rule": "jeita-success",
+        "source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/drivers/power/supply/mca/mca_strategy/strategy_charger/mca_buckchg_jeita.c",
+        "source_sha256": "84e7ba94c84a032f92577e67941c36afab3729593c192672443a1eb20f9eb812",
+        "rationale": "Normal-temperature table dump after parameter validation; failure branches are separate."
+      }
+    },
+    {
+      "count": 13,
+      "normalized": "[N:N:N:N-E][mca_buckchg_jeita]mca_buckchg_jeita_parse_para: N new name:jeita_para_ffc",
+      "sample": "11-01 23:55:21.290   176   176 E [22:55:21:287-E][mca_buckchg_jeita]mca_buckchg_jeita_parse_para: 804 new name:jeita_para_ffc",
+      "status": "untriaged",
+      "classification": "apparently normal operation at elevated log severity; source audit required"
+    },
+    {
+      "count": 11,
+      "normalized": "[N:N:N:N-E][mca_strategy_fg]fg_update_status: N UISOC:N CURRENT:-N RSOC:N VOLTAGE:N TEMP:N PVBAT:N PIBAT:N PTBAT:N HEALTH:N",
+      "sample": "11-01 23:56:00.143    13    13 E [22:56:00:140-E][mca_strategy_fg]fg_update_status: 2167 UISOC:96 CURRENT:-14000 RSOC:93 VOLTAGE:4393 TEMP:301 PVBAT:4399 PIBAT:20 PTBAT:33 HEALTH:1",
+      "status": "source audited: operational diagnostic; no fault reported by this template",
+      "classification": "normal operation printed at vendor error severity",
+      "source_audit": {
+        "rule": "fuel-gauge-success",
+        "source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/drivers/power/supply/mca/mca_strategy/strategy_fg/mca_strategy_fg.c",
+        "source_sha256": "19baa471d97c232d2d409347d5c4dbb754d6f079f184c7941385550bde51b445",
+        "rationale": "Successful fuel-gauge snapshot follows cleared sample_error and returns0."
+      }
+    },
+    {
+      "count": 10,
+      "normalized": ": bcdVersion must be 0x0100, stored in Little Endian order. Userspace driver should be fixed, accepting 0x0001 for compatibility.",
+      "sample": "11-01 23:55:21.782  2517  2517 W         : bcdVersion must be 0x0100, stored in Little Endian order. Userspace driver should be fixed, accepting 0x0001 for compatibility.",
+      "status": "ROMsource+adbd binary fix built and compiled headers verified; installedbinary unchanged; hardware deployment pending",
+      "classification": "unknown",
+      "source_audit": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/adb_os_descriptor/validation.json",
+      "rationale": "Actual ROM ADB descriptor initializer used cpu_to_le32(1), emitted0001; kernel warnscompatibility. Fix changes only version bytes and retains properparser behavior."
+    },
+    {
+      "count": 10,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_set_extend_custom_cmd N: ++, cmd: 0xBF, sub_cmd: 0x1E, value: N",
+      "sample": "11-01 23:55:32.545   978   978 E         : [22:55:32.542] [NVT-ts] nvt_set_extend_custom_cmd 757: ++, cmd: 0xBF, sub_cmd: 0x1E, value: 0",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 10,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_xm_htc_set_gesture_switch N: --",
+      "sample": "11-01 23:55:32.557   978   978 E         : [22:55:32.553] [NVT-ts] nvt_xm_htc_set_gesture_switch 1321: --",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 10,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_xm_htc_set_op_mode N: ++, set op_mode: N",
+      "sample": "11-01 23:55:33.103   129   129 E         : [22:55:33.100] [NVT-ts] nvt_xm_htc_set_op_mode 883: ++, set op_mode: 2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 10,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_set_extend_custom_cmd N: ++, cmd: 0xBF, sub_cmd: 0x01, value: N",
+      "sample": "11-01 23:55:33.103   129   129 E         : [22:55:33.100] [NVT-ts] nvt_set_extend_custom_cmd 757: ++, cmd: 0xBF, sub_cmd: 0x01, value: 2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 10,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_xm_htc_set_op_mode N: --",
+      "sample": "11-01 23:55:33.114   129   129 E         : [22:55:33.111] [NVT-ts] nvt_xm_htc_set_op_mode 891: --",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 9,
+      "normalized": "[N:N:N:N-E][mca_strategy_fg]fg_update_status: N UISOC:N CURRENT:-N RSOC:N VOLTAGE:N TEMP:N PVBAT:N PIBAT:-N PTBAT:N HEALTH:N",
+      "sample": "11-01 23:56:07.309   181   181 E [22:56:07:306-E][mca_strategy_fg]fg_update_status: 2167 UISOC:96 CURRENT:-14000 RSOC:93 VOLTAGE:4394 TEMP:302 PVBAT:4404 PIBAT:-8 PTBAT:32 HEALTH:1",
+      "status": "source audited: operational diagnostic; no fault reported by this template",
+      "classification": "normal operation printed at vendor error severity",
+      "source_audit": {
+        "rule": "fuel-gauge-success",
+        "source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/drivers/power/supply/mca/mca_strategy/strategy_fg/mca_strategy_fg.c",
+        "source_sha256": "19baa471d97c232d2d409347d5c4dbb754d6f079f184c7941385550bde51b445",
+        "rationale": "Successful fuel-gauge snapshot follows cleared sample_error and returns0."
+      }
+    },
+    {
+      "count": 8,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_xm_htc_set_report_rate N: ++",
+      "sample": "11-01 23:55:21.429  1758  1758 E         : [22:55:21.426] [NVT-ts] nvt_xm_htc_set_report_rate 2092: ++",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 8,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_xm_htc_set_report_rate N: set report_rate: N",
+      "sample": "11-01 23:55:21.429  1758  1758 E         : [22:55:21.426] [NVT-ts] nvt_xm_htc_set_report_rate 2094: set report_rate: 120",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 8,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_set_extend_custom_cmd N: ++, cmd: 0xBF, sub_cmd: 0x0A, value: N",
+      "sample": "11-01 23:55:21.429  1758  1758 E         : [22:55:21.426] [NVT-ts] nvt_set_extend_custom_cmd 757: ++, cmd: 0xBF, sub_cmd: 0x0A, value: 120",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 8,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_xm_htc_set_report_rate N: --",
+      "sample": "11-01 23:55:21.441  1758  1758 E         : [22:55:21.438] [NVT-ts] nvt_xm_htc_set_report_rate 2103: --",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 7,
+      "normalized": "init    : Control message: Could not find 'aidl/vendor.xiaomi.sensor.citsensorservice.ICitSensorService/default' for ctl.interface_start from pid: N (/system/bin/servicemanager)",
+      "sample": "11-01 23:55:22.002     1     1 E init    : Control message: Could not find 'aidl/vendor.xiaomi.sensor.citsensorservice.ICitSensorService/default' for ctl.interface_start from pid: 447 (/system/bin/servicemanager)",
+      "status": "untriaged",
+      "classification": "userspace/policy or audit consequence; trace cause before deciding kernel change"
+    },
+    {
+      "count": 7,
+      "normalized": "gsi soc : qcom,msm_gsi: gsi_stop_channel:N chan=N busy try again",
+      "sample": "11-01 23:55:23.005    13    13 E gsi soc : qcom,msm_gsi: gsi_stop_channel:3679 chan=14 busy try again",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 7,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_set_gesture_mode N: Screen off, applying gesture flags(N), ic state is N",
+      "sample": "11-01 23:55:32.597   129   129 E         : [22:55:32.594] [NVT-ts] nvt_set_gesture_mode 2984: Screen off, applying gesture flags(01), ic state is 0",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 7,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_set_gesture_mode N: Screen off, don't set gesture flag(N), ic state is N",
+      "sample": "11-01 23:55:32.654   129   129 E         : [22:55:32.651] [NVT-ts] nvt_set_gesture_mode 3001: Screen off, don't set gesture flag(01), ic state is 1",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 6,
+      "normalized": "healthd : battery l=N v=N t=N.N h=N st=N c=N fc=N cc=N chg=",
+      "sample": "11-01 23:55:27.809  1619  1619 W healthd : battery l=96 v=4362 t=29.3 h=2 st=1 c=1722000 fc=6402000 cc=80 chg=",
+      "status": "untriaged",
+      "classification": "apparently normal operation at elevated log severity; source audit required"
+    },
+    {
+      "count": 6,
+      "normalized": "[binder][ADDR][N:N:N.N] wcn7750: [N:E:HDD] hdd_config_data_stall_param: Set data stall params from use space start",
+      "sample": "11-01 23:55:35.763  5246  5246 E [binder][0x21ffdbc2][22:55:35.760138] wcn7750: [5246:E:HDD] hdd_config_data_stall_param: Set data stall params from use space start",
+      "status": "untriaged",
+      "classification": "apparently normal operation at elevated log severity; source audit required"
+    },
+    {
+      "count": 6,
+      "normalized": "[binder][ADDR][N:N:N.N] wcn7750: [N:E:HDD] hdd_config_data_stall_param: Set data stall params fail",
+      "sample": "11-01 23:55:35.763  5246  5246 E [binder][0x21ffdcbe][22:55:35.760151] wcn7750: [5246:E:HDD] hdd_config_data_stall_param: Set data stall params fail",
+      "status": "0170sourcechecked; compiled/hardwarepending",
+      "classification": "Unconditionalcallbackwithabsentattrsreportsfailurebeforefirmware; duplicatevtableregistrationdoublesit",
+      "source_audit": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/wlan_data_stall_dispatch/analysis.json"
+    },
+    {
+      "count": 6,
+      "normalized": "[N:N:N:N-E][mca_strategy_fg]strategy_fg_report_battery_status_changed: N ui_soc: N => N, temp: N => N",
+      "sample": "11-01 23:55:42.636   178   178 E [22:55:42:633-E][mca_strategy_fg]strategy_fg_report_battery_status_changed: 1012 ui_soc: 96 => 96, temp: 29 => 30",
+      "status": "source audited: operational diagnostic; no fault reported by this template",
+      "classification": "normal operation printed at vendor error severity",
+      "source_audit": {
+        "rule": "battery-change-notification",
+        "source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/drivers/power/supply/mca/mca_strategy/strategy_fg/mca_strategy_fg.c",
+        "source_sha256": "19baa471d97c232d2d409347d5c4dbb754d6f079f184c7941385550bde51b445",
+        "rationale": "Normal temperature/SOC change notification; updates cached fields and notifies battery observers."
+      }
+    },
+    {
+      "count": 5,
+      "normalized": "init    : Control message: Could not find 'aidl/activity' for ctl.interface_start from pid: N (/system/bin/servicemanager)",
+      "sample": "11-01 23:55:22.780     1     1 E init    : Control message: Could not find 'aidl/activity' for ctl.interface_start from pid: 447 (/system/bin/servicemanager)",
+      "status": "untriaged",
+      "classification": "userspace/policy or audit consequence; trace cause before deciding kernel change"
+    },
+    {
+      "count": 5,
+      "normalized": "[    C1] [soft_i][ADDR][N: N:N.N] wcn7750: [N:E:QDF] htc_rx_completion_handler: Received initial wake up",
+      "sample": "11-01 23:55:32.398     0     0 E [    C1] [soft_i][0x1e260192][22: 55:32.395096] wcn7750: [0:E:QDF] htc_rx_completion_handler: Received initial wake up",
+      "status": "source audited: operational diagnostic; no fault reported by this template",
+      "classification": "normal operation printed at vendor error severity",
+      "source_audit": {
+        "rule": "wlan-wakeup-notification",
+        "source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/qca-wifi-host-cmn/htc/htc_recv.c",
+        "source_sha256": "ef6686d2cc76016fb48d4057b418305a3ef95eaff3a7823754e3141daad0fdff",
+        "rationale": "HTC wake-from-suspend event invokes wakeup callback and exits the case normally."
+      }
+    },
+    {
+      "count": 5,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_ts_wakeup_gesture_report N: get FOD event, fod_status=N, display_suspend_ready=N",
+      "sample": "11-01 23:55:32.689  1017  1017 E         : [22:55:32.686] [NVT-ts] nvt_ts_wakeup_gesture_report 1944: get FOD event, fod_status=2, display_suspend_ready=0",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 5,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_set_gesture_mode N: Screen on, set gesture flag(N), ic state is N",
+      "sample": "11-01 23:55:33.125   129   129 E         : [22:55:33.122] [NVT-ts] nvt_set_gesture_mode 3004: Screen on, set gesture flag(05), ic state is 3",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 4,
+      "normalized": "lpass_cdc_va_macro va-macro: lpass_cdc_va_macro_probe: failed to get swr pin state",
+      "sample": "11-01 23:55:21.302   177   177 E lpass_cdc_va_macro va-macro: lpass_cdc_va_macro_probe: failed to get swr pin state",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 4,
+      "normalized": "lpass_cdc_tx_macro tx-macro: lpass_cdc_tx_macro_probe: va-macro not registered yet, defer",
+      "sample": "11-01 23:55:21.302   177   177 E lpass_cdc_tx_macro tx-macro: lpass_cdc_tx_macro_probe: va-macro not registered yet, defer",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 4,
+      "normalized": "lpass_cdc_rx_macro rx-macro: lpass_cdc_rx_macro_probe: va-macro not registered yet, defer",
+      "sample": "11-01 23:55:21.302   177   177 E lpass_cdc_rx_macro rx-macro: lpass_cdc_rx_macro_probe: va-macro not registered yet, defer",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 4,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_set_charge_state N: Power supply state:N",
+      "sample": "11-01 23:55:33.137    94    94 E         : [22:55:33.134] [NVT-ts] nvt_set_charge_state 3394: Power supply state:1",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 4,
+      "normalized": "[androi][ADDR][N:N:N.N] wcn7750: [N:E:HDD] hdd_config_data_stall_param: Set data stall params from use space start",
+      "sample": "11-01 23:55:37.509  1652  1652 E [androi][0x23ff5e48][22:55:37.506092] wcn7750: [1652:E:HDD] hdd_config_data_stall_param: Set data stall params from use space start",
+      "status": "untriaged",
+      "classification": "apparently normal operation at elevated log severity; source audit required"
+    },
+    {
+      "count": 4,
+      "normalized": "[androi][ADDR][N:N:N.N] wcn7750: [N:E:HDD] hdd_config_data_stall_param: Set data stall params fail",
+      "sample": "11-01 23:55:37.509  1652  1652 E [androi][0x23ff5fa0][22:55:37.506110] wcn7750: [1652:E:HDD] hdd_config_data_stall_param: Set data stall params fail",
+      "status": "0170sourcechecked; compiled/hardwarepending",
+      "classification": "Unconditionalcallbackwithabsentattrsreportsfailurebeforefirmware; duplicatevtableregistrationdoublesit",
+      "source_audit": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/wlan_data_stall_dispatch/analysis.json"
+    },
+    {
+      "count": 3,
+      "normalized": "ipa3_set_aggr_limit: N set rx_buff_sz config from netmngr N",
+      "sample": "11-01 23:55:23.789  2316  2316 E ipa3_set_aggr_limit: 5811 set rx_buff_sz config from netmngr 32768",
+      "status": "untriaged",
+      "classification": "apparently normal operation at elevated log severity; source audit required"
+    },
+    {
+      "count": 3,
+      "normalized": ": msm_common_snd_hw_params lpass audio hw vote enable failed -N",
+      "sample": "11-01 23:55:30.753  4939  4939 E         : msm_common_snd_hw_params lpass audio hw vote enable failed -22",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 3,
+      "normalized": "TDM-LPAIF_VA-RX-PRIMARY-VIRT-N: ASoC error (-N): at snd_soc_link_hw_params() on TDM-LPAIF_VA-RX-PRIMARY-VIRT-N",
+      "sample": "11-01 23:55:30.753  4939  4939 E TDM-LPAIF_VA-RX-PRIMARY-VIRT-2: ASoC error (-22): at snd_soc_link_hw_params() on TDM-LPAIF_VA-RX-PRIMARY-VIRT-2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 3,
+      "normalized": "TDM-LPAIF_VA-RX-PRIMARY-VIRT-N: ASoC error (-N): at __soc_pcm_hw_params() on TDM-LPAIF_VA-RX-PRIMARY-VIRT-N",
+      "sample": "11-01 23:55:30.753  4939  4939 E TDM-LPAIF_VA-RX-PRIMARY-VIRT-2: ASoC error (-22): at __soc_pcm_hw_params() on TDM-LPAIF_VA-RX-PRIMARY-VIRT-2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 3,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_ts_suspend N: start, gesture_command:0x00, fod_finger: N",
+      "sample": "11-01 23:55:32.545   978   978 E         : [22:55:32.542] [NVT-ts] nvt_ts_suspend 4566: start, gesture_command:0x00, fod_finger: 0",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 3,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_xm_htc_set_gesture_switch N: ++, set gesture_switch: 0x0000",
+      "sample": "11-01 23:55:32.545   978   978 E         : [22:55:32.542] [NVT-ts] nvt_xm_htc_set_gesture_switch 1313: ++, set gesture_switch: 0x0000",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 3,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_enable_gesture_mode N: Gesture mode on, Disable doubletap gesture, Disable singletap gesture",
+      "sample": "11-01 23:55:32.590   978   978 E         : [22:55:32.587] [NVT-ts] nvt_enable_gesture_mode 3033: Gesture mode on, Disable doubletap gesture, Disable singletap gesture",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 3,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_ts_suspend N: end",
+      "sample": "11-01 23:55:32.642   978   978 E         : [22:55:32.639] [NVT-ts] nvt_ts_suspend 4611: end",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 3,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_xm_htc_set_gesture_switch N: ++, set gesture_switch: 0x0001",
+      "sample": "11-01 23:55:32.644   129   129 E         : [22:55:32.641] [NVT-ts] nvt_xm_htc_set_gesture_switch 1313: ++, set gesture_switch: 0x0001",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 3,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_irq_enable N: enable=N",
+      "sample": "11-01 23:55:32.655   129   129 E         : [22:55:32.652] [NVT-ts] nvt_irq_enable 390: enable=1",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 3,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_xm_htc_set_fod_enable N: ++, set fod_enable: N",
+      "sample": "11-01 23:55:32.655   129   129 E         : [22:55:32.652] [NVT-ts] nvt_xm_htc_set_fod_enable 1456: ++, set fod_enable: 1",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 3,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_set_extend_custom_cmd N: ++, cmd: 0xBF, sub_cmd: 0x1A, value: N",
+      "sample": "11-01 23:55:32.655   129   129 E         : [22:55:32.652] [NVT-ts] nvt_set_extend_custom_cmd 757: ++, cmd: 0xBF, sub_cmd: 0x1A, value: 1",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 3,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_xm_htc_set_fod_enable N: --",
+      "sample": "11-01 23:55:32.677   129   129 E         : [22:55:32.674] [NVT-ts] nvt_xm_htc_set_fod_enable 1460: --",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 3,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_ts_wakeup_gesture_report N: Gesture : FOD ignored, display not suspend ready",
+      "sample": "11-01 23:55:32.689  1017  1017 E         : [22:55:32.686] [NVT-ts] nvt_ts_wakeup_gesture_report 1950: Gesture : FOD ignored, display not suspend ready",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 3,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_display_suspend_ready N: display suspend ready",
+      "sample": "11-01 23:55:32.827   978   978 E         : [22:55:32.824] [NVT-ts] nvt_display_suspend_ready 3180: display suspend ready",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": "aw882xx_smartpa N-N: Direct firmware load for aw882xx_acf.bin failed with error -N",
+      "sample": "11-01 23:55:21.510   176   176 W aw882xx_smartpa 15-0034: Direct firmware load for aw882xx_acf.bin failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": "aw882xx_smartpa N-N: Falling back to sysfs fallback for: aw882xx_acf.bin",
+      "sample": "11-01 23:55:21.510   176   176 W aw882xx_smartpa 15-0034: Falling back to sysfs fallback for: aw882xx_acf.bin",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": ": USB cable not connected",
+      "sample": "11-01 23:55:23.726  2471  2471 E         : USB cable not connected",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": ": Boot completed",
+      "sample": "11-01 23:55:30.566   212   212 W         : Boot completed",
+      "status": "untriaged",
+      "classification": "apparently normal operation at elevated log severity; source audit required"
+    },
+    {
+      "count": 2,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:WMI] send_action_oui_cmd_tlv: Invalid action id",
+      "sample": "11-01 23:55:31.305   181   181 E [kworke][0x1ce604c9][22:55:31.302872] wcn7750: [181:E:WMI] send_action_oui_cmd_tlv: Invalid action id",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:action_oui] action_oui_send_config: Failed to send: N",
+      "sample": "11-01 23:55:31.305   181   181 E [kworke][0x1ce60504][22:55:31.302875] wcn7750: [181:E:action_oui] action_oui_send_config: Failed to send: 14",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": "[binder][ADDR][N:N:N.N] wcn7750: [N:E:HDD] wlan_hdd_update_dbs_scan_and_fw_mode_config: DBS is not supported by HW",
+      "sample": "11-01 23:55:31.412  1680  1680 E [binder][0x1d055c55][22:55:31.409853] wcn7750: [1680:E:HDD] wlan_hdd_update_dbs_scan_and_fw_mode_config: DBS is not supported by HW",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": "[androi][ADDR][N:N:N.N] wcn7750: [N:E:HDD] hdd_convert_nl80211_to_reg_band_mask: band: N not supported",
+      "sample": "11-01 23:55:31.440  1652  1652 E [androi][0x1d0d7efd][22:55:31.437621] wcn7750: [1652:E:HDD] hdd_convert_nl80211_to_reg_band_mask: band: 2 not supported",
+      "status": "Source audited: operational or unsupported-feature diagnostic; exact template does not establish hardware failure",
+      "classification": "unknown",
+      "source_audit": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/operational_wlan_templates/analysis.json",
+      "rationale": "NL80211_BAND_60GHZ has enum value2; input is a mask, and source strips the unsupported60GHz bit while preserving2/5/6GHz bits and continues the usable-channel query. The message does not indicate absent6GHz support."
+    },
+    {
+      "count": 2,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_ts_resume N: start",
+      "sample": "11-01 23:55:33.031   129   129 E         : [22:55:33.028] [NVT-ts] nvt_ts_resume 4635: start",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": ": [N:N:N.N] [NVT-ts] update_firmware_request N: filename is o10u/novatek_nt38771_o10u_fw_tm.bin",
+      "sample": "11-01 23:55:33.031   129   129 E         : [22:55:33.028] [NVT-ts] update_firmware_request 388: filename is o10u/novatek_nt38771_o10u_fw_tm.bin",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": "NVT-ts spi4.N: Direct firmware load for o10u/novatek_nt38771_o10u_fw_tm.bin failed with error -N",
+      "sample": "11-01 23:55:33.031   129   129 W NVT-ts spi4.0: Direct firmware load for o10u/novatek_nt38771_o10u_fw_tm.bin failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": "NVT-ts spi4.N: Falling back to sysfs fallback for: o10u/novatek_nt38771_o10u_fw_tm.bin",
+      "sample": "11-01 23:55:33.031   129   129 W NVT-ts spi4.0: Falling back to sysfs fallback for: o10u/novatek_nt38771_o10u_fw_tm.bin",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_get_fw_need_write_size N: fw_need_write_size = N(0x30000), NVT end flag",
+      "sample": "11-01 23:55:33.040   129   129 E         : [22:55:33.037] [NVT-ts] nvt_get_fw_need_write_size 57: fw_need_write_size = 196608(0x30000), NVT end flag",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_bin_header_parser N: cascade_2nd_header_info = N",
+      "sample": "11-01 23:55:33.040   129   129 E         : [22:55:33.037] [NVT-ts] nvt_bin_header_parser 178: cascade_2nd_header_info = 0",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_bin_header_parser N: ovly_info = N, ilm_dlm_num = N, ovly_sec_num = N, info_sec_num = N, partition = N",
+      "sample": "11-01 23:55:33.040   129   129 E         : [22:55:33.037] [NVT-ts] nvt_bin_header_parser 203: ovly_info = 0, ilm_dlm_num = 2, ovly_sec_num = 0, info_sec_num = 13, partition = 15",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_bootloader_reset N: end",
+      "sample": "11-01 23:55:33.046   129   129 E         : [22:55:33.042] [NVT-ts] nvt_bootloader_reset 1317: end",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_update_firmware N: Update firmware success! <N us>",
+      "sample": "11-01 23:55:33.103   129   129 E         : [22:55:33.099] [NVT-ts] nvt_update_firmware 983: Update firmware success! <62478 us>",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_get_fw_info N: fw_ver=0x35, fw_type=0x01, PID=0x5999",
+      "sample": "11-01 23:55:33.103   129   129 E         : [22:55:33.100] [NVT-ts] nvt_get_fw_info 1496: fw_ver=0x35, fw_type=0x01, PID=0x5999",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_ts_resume N: end",
+      "sample": "11-01 23:55:33.125   129   129 E         : [22:55:33.122] [NVT-ts] nvt_ts_resume 4711: end",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": "[wpa_su][ADDR][N:N:N.N] wcn7750: [N:E:HDD] hdd_config_data_stall_param: Set data stall params from use space start",
+      "sample": "11-01 23:55:35.749  5970  5970 E [wpa_su][0x21fbd417][22:55:35.746383] wcn7750: [5970:E:HDD] hdd_config_data_stall_param: Set data stall params from use space start",
+      "status": "untriaged",
+      "classification": "apparently normal operation at elevated log severity; source audit required"
+    },
+    {
+      "count": 2,
+      "normalized": "[wpa_su][ADDR][N:N:N.N] wcn7750: [N:E:HDD] hdd_config_data_stall_param: Set data stall params fail",
+      "sample": "11-01 23:55:35.749  5970  5970 E [wpa_su][0x21fbd473][22:55:35.746387] wcn7750: [5970:E:HDD] hdd_config_data_stall_param: Set data stall params fail",
+      "status": "0170sourcechecked; compiled/hardwarepending",
+      "classification": "Unconditionalcallbackwithabsentattrsreportsfailurebeforefirmware; duplicatevtableregistrationdoublesit",
+      "source_audit": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/wlan_data_stall_dispatch/analysis.json"
+    },
+    {
+      "count": 2,
+      "normalized": "[binder][ADDR][N:N:N.N] wcn7750: [N:E:OSIF] wlan_hdd_set_station_stats_request_pending: peer is null",
+      "sample": "11-01 23:55:35.841  5246  5246 E [binder][0x2216e74b][22:55:35.838799] wcn7750: [5246:E:OSIF] wlan_hdd_set_station_stats_request_pending: peer is null",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": "[binder][ADDR][N:N:N.N] wcn7750: [N:E:SME] sme_get_nss_chain_shift: Device mode N invalid",
+      "sample": "11-01 23:55:35.971  5246  5246 E [binder][0x223cdb33][22:55:35.968344] wcn7750: [5246:E:SME] sme_get_nss_chain_shift: Device mode 16 invalid",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": "[androi][ADDR][N:N:N.N] wcn7750: [N:E:HDD] hdd_config_power: power attr and opm attr is null",
+      "sample": "11-01 23:55:37.509  1652  1652 E [androi][0x23ff5b0e][22:55:37.506049] wcn7750: [1652:E:HDD] hdd_config_power: power attr and opm attr is null",
+      "status": "Source audited: operational or unsupported-feature diagnostic; exact template does not establish hardware failure",
+      "classification": "unknown",
+      "source_audit": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/operational_wlan_templates/analysis.json",
+      "rationale": "Both optional settings absent in a configuration callback; source returns0 before any firmware command. Invalid simultaneous and malformed explicit settings still returnEINVAL."
+    },
+    {
+      "count": 2,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_xm_htc_set_gesture_switch N: ++, set gesture_switch: 0x0007",
+      "sample": "11-01 23:55:43.498   129   129 E         : [22:55:43.495] [NVT-ts] nvt_xm_htc_set_gesture_switch 1313: ++, set gesture_switch: 0x0007",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": "[binder][ADDR][N:N:N.N] wcn7750: [N:E:HDD] hdd_config_power: power attr and opm attr is null",
+      "sample": "11-01 23:58:14.730  1680  1680 E [binder][0xd7ec6d22][22:58:14.727836] wcn7750: [1680:E:HDD] hdd_config_power: power attr and opm attr is null",
+      "status": "Source audited: operational or unsupported-feature diagnostic; exact template does not establish hardware failure",
+      "classification": "unknown",
+      "source_audit": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/operational_wlan_templates/analysis.json",
+      "rationale": "Both optional settings absent in a configuration callback; source returns0 before any firmware command. Invalid simultaneous and malformed explicit settings still returnEINVAL."
+    },
+    {
+      "count": 2,
+      "normalized": "SELinux : avc:  denied  { find } for pid=N uid=N name=vendor.qti.qspmhal.IQspmhal/default scontext=u:r:platform_app_36:s0:c512,c768 tcontext=u:object_r:vendor_hal_qspmhal_service:s0 tclass=service_manager permissive=N",
+      "sample": "11-01 23:58:46.291   447   447 E SELinux : avc:  denied  { find } for pid=16520 uid=10496 name=vendor.qti.qspmhal.IQspmhal/default scontext=u:r:platform_app_36:s0:c512,c768 tcontext=u:object_r:vendor_hal_qspmhal_service:s0 tclass=service_manager permissive=0",
+      "status": "untriaged",
+      "classification": "userspace/policy or audit consequence; trace cause before deciding kernel change"
+    },
+    {
+      "count": 2,
+      "normalized": "cam_smmu_map_user_iova: N callbacks suppressed",
+      "sample": "11-01 23:58:52.523  2900  2900 W cam_smmu_map_user_iova: 143 callbacks suppressed",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 2,
+      "normalized": "[    C0] [soft_i][ADDR][N: N:N.N] wcn7750: [N:E:QDF] htc_rx_completion_handler: Received initial wake up",
+      "sample": "11-01 23:59:11.018     0     0 E [    C0] [soft_i][0x11856df4b][22: 59:11.015226] wcn7750: [0:E:QDF] htc_rx_completion_handler: Received initial wake up",
+      "status": "source audited: operational diagnostic; no fault reported by this template",
+      "classification": "normal operation printed at vendor error severity",
+      "source_audit": {
+        "rule": "wlan-wakeup-notification",
+        "source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/qca-wifi-host-cmn/htc/htc_recv.c",
+        "source_sha256": "ef6686d2cc76016fb48d4057b418305a3ef95eaff3a7823754e3141daad0fdff",
+        "rationale": "HTC wake-from-suspend event invokes wakeup callback and exits the case normally."
+      }
+    },
+    {
+      "count": 1,
+      "normalized": "OF      : /soc/spf_core_platform/lpass-cdc/wcd9378-codec: Read of boolean property 'qcom,split-codec' with a value.",
+      "sample": "11-01 23:55:21.306   177   177 W OF      : /soc/spf_core_platform/lpass-cdc/wcd9378-codec: Read of boolean property 'qcom,split-codec' with a value.",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Control message: Could not find 'aidl/android.hardware.audio.core.IConfig/default' for ctl.interface_start from pid: N (/system/bin/servicemanager)",
+      "sample": "11-01 23:55:21.354     1     1 E init    : Control message: Could not find 'aidl/android.hardware.audio.core.IConfig/default' for ctl.interface_start from pid: 447 (/system/bin/servicemanager)",
+      "status": "untriaged",
+      "classification": "userspace/policy or audit consequence; trace cause before deciding kernel change"
+    },
+    {
+      "count": 1,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_panel_vendor_read N: nvt_panel_vendor_read Get panel vendor: N",
+      "sample": "11-01 23:55:21.366  1918  1918 E         : [22:55:21.363] [NVT-ts] nvt_panel_vendor_read 3444: nvt_panel_vendor_read Get panel vendor: 70",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_panel_display_read N: nvt_panel_display_read Get panel display: N",
+      "sample": "11-01 23:55:21.386  2008  2008 E         : [22:55:21.383] [NVT-ts] nvt_panel_display_read 3473: nvt_panel_display_read Get panel display: 54",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "remoteproc2: Direct firmware load for modem.mdt failed with error -N",
+      "sample": "11-01 23:55:21.395  1804  1804 W remoteproc2: Direct firmware load for modem.mdt failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "remoteproc2: Falling back to sysfs fallback for: modem.mdt",
+      "sample": "11-01 23:55:21.395  1804  1804 W remoteproc2: Falling back to sysfs fallback for: modem.mdt",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "kgsl-3d 3d00000.qcom,kgsl-3d0: Direct firmware load for gen80000_sqe.fw failed with error -N",
+      "sample": "11-01 23:55:21.397  1924  1924 W kgsl-3d 3d00000.qcom,kgsl-3d0: Direct firmware load for gen80000_sqe.fw failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "kgsl-3d 3d00000.qcom,kgsl-3d0: Falling back to sysfs fallback for: gen80000_sqe.fw",
+      "sample": "11-01 23:55:21.397  1924  1924 W kgsl-3d 3d00000.qcom,kgsl-3d0: Falling back to sysfs fallback for: gen80000_sqe.fw",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem_dtb.mdt failed with error -N",
+      "sample": "11-01 23:55:21.399  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem_dtb.mdt failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem_dtb.mdt",
+      "sample": "11-01 23:55:21.399  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem_dtb.mdt",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "kgsl-3d 3d00000.qcom,kgsl-3d0: Direct firmware load for gen80000_aqe.fw failed with error -N",
+      "sample": "11-01 23:55:21.401  1924  1924 W kgsl-3d 3d00000.qcom,kgsl-3d0: Direct firmware load for gen80000_aqe.fw failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "kgsl-3d 3d00000.qcom,kgsl-3d0: Falling back to sysfs fallback for: gen80000_aqe.fw",
+      "sample": "11-01 23:55:21.401  1924  1924 W kgsl-3d 3d00000.qcom,kgsl-3d0: Falling back to sysfs fallback for: gen80000_aqe.fw",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "adreno-gen8-gmu 3d37000.qcom,gmu: Direct firmware load for gen80600_gmu.bin failed with error -N",
+      "sample": "11-01 23:55:21.405  1924  1924 W adreno-gen8-gmu 3d37000.qcom,gmu: Direct firmware load for gen80600_gmu.bin failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "adreno-gen8-gmu 3d37000.qcom,gmu: Falling back to sysfs fallback for: gen80600_gmu.bin",
+      "sample": "11-01 23:55:21.405  1924  1924 W adreno-gen8-gmu 3d37000.qcom,gmu: Falling back to sysfs fallback for: gen80600_gmu.bin",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_touch_vendor_read N: nvt_touch_vendor_read Get touch vendor: N",
+      "sample": "11-01 23:55:21.420  2048  2048 E         : [22:55:21.417] [NVT-ts] nvt_touch_vendor_read 3423: nvt_touch_vendor_read Get touch vendor: 4",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem_dtb.b01 failed with error -N",
+      "sample": "11-01 23:55:21.423  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem_dtb.b01 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem_dtb.b01",
+      "sample": "11-01 23:55:21.423  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem_dtb.b01",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Could not start service 'ptt_socket_app' as part of class 'main': Cannot find '/system/vendor/bin/ptt_socket_app': No such file or directory",
+      "sample": "11-01 23:55:21.474     1     1 E init    : Could not start service 'ptt_socket_app' as part of class 'main': Cannot find '/system/vendor/bin/ptt_socket_app': No such file or directory",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Could not start service 'vendor.cnss_diag' as part of class 'main': Cannot find '/system/vendor/bin/cnss_diag': No such file or directory",
+      "sample": "11-01 23:55:21.474     1     1 E init    : Could not start service 'vendor.cnss_diag' as part of class 'main': Cannot find '/system/vendor/bin/cnss_diag': No such file or directory",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b01 failed with error -N",
+      "sample": "11-01 23:55:21.478  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b01 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b01",
+      "sample": "11-01 23:55:21.478  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b01",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b02 failed with error -N",
+      "sample": "11-01 23:55:21.482  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b02 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b02",
+      "sample": "11-01 23:55:21.482  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b02",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b03 failed with error -N",
+      "sample": "11-01 23:55:21.484  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b03 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b03",
+      "sample": "11-01 23:55:21.484  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b03",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b04 failed with error -N",
+      "sample": "11-01 23:55:21.487  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b04 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b04",
+      "sample": "11-01 23:55:21.487  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b04",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b05 failed with error -N",
+      "sample": "11-01 23:55:21.491  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b05 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b05",
+      "sample": "11-01 23:55:21.491  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b05",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b06 failed with error -N",
+      "sample": "11-01 23:55:21.495  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b06 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b06",
+      "sample": "11-01 23:55:21.495  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b06",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b07 failed with error -N",
+      "sample": "11-01 23:55:21.497  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b07 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b07",
+      "sample": "11-01 23:55:21.497  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b07",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b08 failed with error -N",
+      "sample": "11-01 23:55:21.499  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b08 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b08",
+      "sample": "11-01 23:55:21.499  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b08",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b09 failed with error -N",
+      "sample": "11-01 23:55:21.503  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b09 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b09",
+      "sample": "11-01 23:55:21.503  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b09",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "kgsl-3d 3d00000.qcom,kgsl-3d0: Direct firmware load for gen80000_zap.mbn failed with error -N",
+      "sample": "11-01 23:55:21.504  1924  1924 W kgsl-3d 3d00000.qcom,kgsl-3d0: Direct firmware load for gen80000_zap.mbn failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "kgsl-3d 3d00000.qcom,kgsl-3d0: Falling back to sysfs fallback for: gen80000_zap.mbn",
+      "sample": "11-01 23:55:21.504  1924  1924 W kgsl-3d 3d00000.qcom,kgsl-3d0: Falling back to sysfs fallback for: gen80000_zap.mbn",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b10 failed with error -N",
+      "sample": "11-01 23:55:21.505  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b10 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b10",
+      "sample": "11-01 23:55:21.505  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b10",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b11 failed with error -N",
+      "sample": "11-01 23:55:21.513  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b11 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b11",
+      "sample": "11-01 23:55:21.513  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b11",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b12 failed with error -N",
+      "sample": "11-01 23:55:21.516  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b12 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b12",
+      "sample": "11-01 23:55:21.516  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b12",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b13 failed with error -N",
+      "sample": "11-01 23:55:21.522  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b13 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b13",
+      "sample": "11-01 23:55:21.522  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b13",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b14 failed with error -N",
+      "sample": "11-01 23:55:21.528  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b14 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b14",
+      "sample": "11-01 23:55:21.528  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b14",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b15 failed with error -N",
+      "sample": "11-01 23:55:21.532  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b15 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b15",
+      "sample": "11-01 23:55:21.532  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b15",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b16 failed with error -N",
+      "sample": "11-01 23:55:21.537  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b16 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b16",
+      "sample": "11-01 23:55:21.537  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b16",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b17 failed with error -N",
+      "sample": "11-01 23:55:21.551  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b17 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b17",
+      "sample": "11-01 23:55:21.551  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b17",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b18 failed with error -N",
+      "sample": "11-01 23:55:21.556  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b18 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b18",
+      "sample": "11-01 23:55:21.556  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b18",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b19 failed with error -N",
+      "sample": "11-01 23:55:21.570  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b19 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b19",
+      "sample": "11-01 23:55:21.570  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b19",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b20 failed with error -N",
+      "sample": "11-01 23:55:21.575  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b20 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b20",
+      "sample": "11-01 23:55:21.575  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b20",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b21 failed with error -N",
+      "sample": "11-01 23:55:21.580  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b21 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b21",
+      "sample": "11-01 23:55:21.580  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b21",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": ": msm_rx_tx_codec_init could not find component for wcd939x_codec",
+      "sample": "11-01 23:55:21.590   176   176 E         : msm_rx_tx_codec_init could not find component for wcd939x_codec",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "sun-asoc-snd soc: spf_core_platform:sound: ASoC: driver name too long 'tuna-mtp-snd-card' -> 'tuna-mtp-snd-ca'",
+      "sample": "11-01 23:55:21.590   176   176 E sun-asoc-snd soc: spf_core_platform:sound: ASoC: driver name too long 'tuna-mtp-snd-card' -> 'tuna-mtp-snd-ca'",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b22 failed with error -N",
+      "sample": "11-01 23:55:21.611  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b22 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b22",
+      "sample": "11-01 23:55:21.611  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b22",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Could not start service 'vendor.qsap.location' as part of class 'main': Cannot find '/vendor/bin/qsap_location': No such file or directory",
+      "sample": "11-01 23:55:21.614     1     1 E init    : Could not start service 'vendor.qsap.location' as part of class 'main': Cannot find '/vendor/bin/qsap_location': No such file or directory",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_lockdown_info_read N: end",
+      "sample": "11-01 23:55:21.656  2356  2356 E         : [22:55:21.653] [NVT-ts] nvt_lockdown_info_read 3622: end",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Could not start service 'nqnfcinfo' as part of class 'late_start': Cannot find '/system/vendor/bin/nqnfcinfo': No such file or directory",
+      "sample": "11-01 23:55:21.658     1     1 E init    : Could not start service 'nqnfcinfo' as part of class 'late_start': Cannot find '/system/vendor/bin/nqnfcinfo': No such file or directory",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b23 failed with error -N",
+      "sample": "11-01 23:55:21.661  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b23 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b23",
+      "sample": "11-01 23:55:21.661  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b23",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b24 failed with error -N",
+      "sample": "11-01 23:55:21.665  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b24 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b24",
+      "sample": "11-01 23:55:21.665  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b24",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b25 failed with error -N",
+      "sample": "11-01 23:55:21.670  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b25 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b25",
+      "sample": "11-01 23:55:21.670  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b25",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Could not start service 'qvop-daemon' as part of class 'late_start': Cannot find '/vendor/bin/qvop-daemon': No such file or directory",
+      "sample": "11-01 23:55:21.677     1     1 E init    : Could not start service 'qvop-daemon' as part of class 'late_start': Cannot find '/vendor/bin/qvop-daemon': No such file or directory",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Could not start service 'vendor.atfwd' as part of class 'late_start': Cannot find '/vendor/bin/ATFWD-daemon': No such file or directory",
+      "sample": "11-01 23:55:21.677     1     1 E init    : Could not start service 'vendor.atfwd' as part of class 'late_start': Cannot find '/vendor/bin/ATFWD-daemon': No such file or directory",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Could not start service 'qseeproxydaemon' as part of class 'late_start': Cannot find '/system/vendor/bin/qseeproxydaemon': No such file or directory",
+      "sample": "11-01 23:55:21.677     1     1 E init    : Could not start service 'qseeproxydaemon' as part of class 'late_start': Cannot find '/system/vendor/bin/qseeproxydaemon': No such file or directory",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Could not start service 'chre' as part of class 'late_start': Cannot find '/vendor/bin/chre': No such file or directory",
+      "sample": "11-01 23:55:21.677     1     1 E init    : Could not start service 'chre' as part of class 'late_start': Cannot find '/vendor/bin/chre': No such file or directory",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b26 failed with error -N",
+      "sample": "11-01 23:55:21.681  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b26 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b26",
+      "sample": "11-01 23:55:21.681  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b26",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b27 failed with error -N",
+      "sample": "11-01 23:55:21.685  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b27 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b27",
+      "sample": "11-01 23:55:21.685  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b27",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Could not start service 'wifi_qos_daemon' as part of class 'late_start': Cannot find '/vendor/bin/wifi_qos_daemon': No such file or directory",
+      "sample": "11-01 23:55:21.720     1     1 E init    : Could not start service 'wifi_qos_daemon' as part of class 'late_start': Cannot find '/vendor/bin/wifi_qos_daemon': No such file or directory",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b28 failed with error -N",
+      "sample": "11-01 23:55:21.727  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b28 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b28",
+      "sample": "11-01 23:55:21.727  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b28",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b29 failed with error -N",
+      "sample": "11-01 23:55:21.736  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b29 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b29",
+      "sample": "11-01 23:55:21.736  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b29",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Control message: Could not find 'aidl/android.hardware.audio.core.IModule/default' for ctl.interface_start from pid: N (/system/bin/servicemanager)",
+      "sample": "11-01 23:55:21.743     1     1 E init    : Control message: Could not find 'aidl/android.hardware.audio.core.IModule/default' for ctl.interface_start from pid: 447 (/system/bin/servicemanager)",
+      "status": "untriaged",
+      "classification": "userspace/policy or audit consequence; trace cause before deciding kernel change"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b30 failed with error -N",
+      "sample": "11-01 23:55:21.746  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b30 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b30",
+      "sample": "11-01 23:55:21.746  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b30",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b31 failed with error -N",
+      "sample": "11-01 23:55:21.750  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b31 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b31",
+      "sample": "11-01 23:55:21.750  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b31",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Direct firmware load for modem.b32 failed with error -N",
+      "sample": "11-01 23:55:21.762  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Direct firmware load for modem.b32 failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "qcom_q6v5_pas N.remoteproc-mss: Falling back to sysfs fallback for: modem.b32",
+      "sample": "11-01 23:55:21.762  1804  1804 W qcom_q6v5_pas 4080000.remoteproc-mss: Falling back to sysfs fallback for: modem.b32",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "swr-mgr bt_swr_mstr: swrm_runtime_suspend: clk stop mode not supported or SSR entry",
+      "sample": "11-01 23:55:21.926   182   182 E swr-mgr bt_swr_mstr: swrm_runtime_suspend: clk stop mode not supported or SSR entry",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": ": [drm:programmable_fetch_get_num_lines:N] low vbp+vfp may lead to perf issues in some cases",
+      "sample": "11-01 23:55:22.013   978   978 W         : [drm:programmable_fetch_get_num_lines:257] low vbp+vfp may lead to perf issues in some cases",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Control message: Could not find 'aidl/android.hardware.audio.effect.IFactory/default' for ctl.interface_start from pid: N (/system/bin/servicemanager)",
+      "sample": "11-01 23:55:22.334     1     1 E init    : Control message: Could not find 'aidl/android.hardware.audio.effect.IFactory/default' for ctl.interface_start from pid: 447 (/system/bin/servicemanager)",
+      "status": "untriaged",
+      "classification": "userspace/policy or audit consequence; trace cause before deciding kernel change"
+    },
+    {
+      "count": 1,
+      "normalized": "dwc3 a600000.dwc3: request ADDR was not queued to ep0out",
+      "sample": "11-01 23:55:22.385  1650  1650 E dwc3 a600000.dwc3: request 00000000e8a7993b was not queued to ep0out",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "ipa3_odl_pipe_open: N adpl pipe not configured",
+      "sample": "11-01 23:55:22.561  1804  1804 E ipa3_odl_pipe_open: 371 adpl pipe not configured",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Unable to set property 'ro.vendor.radio.manufacturer_id' from uid:N gid:N pid:N: Read-only property was already set",
+      "sample": "11-01 23:55:22.644   211   211 E init    : Unable to set property 'ro.vendor.radio.manufacturer_id' from uid:1001 gid:1001 pid:2119: Read-only property was already set",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Unable to set property 'ro.vendor.radio.hal_chip_id' from uid:N gid:N pid:N: Read-only property was already set",
+      "sample": "11-01 23:55:22.644   211   211 E init    : Unable to set property 'ro.vendor.radio.hal_chip_id' from uid:1001 gid:1001 pid:2119: Read-only property was already set",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "ipa-wan ipa3_handle_indication_req: N not send indication",
+      "sample": "11-01 23:55:22.990   178   178 E ipa-wan ipa3_handle_indication_req: 149 not send indication",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "ipa3_uc_wdi_event_log_info_handler: N WDI protocol missing 0x1",
+      "sample": "11-01 23:55:23.005   178   178 E ipa3_uc_wdi_event_log_info_handler: 372 WDI protocol missing 0x1",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "ipa3_uc_ntn_event_log_info_handler: N NTN protocol missing 0x1",
+      "sample": "11-01 23:55:23.005   178   178 E ipa3_uc_ntn_event_log_info_handler: 19 NTN protocol missing 0x1",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "ipa 3e00000.qcom,ipa: mbox_request_channel: can't parse \"mboxes\" property",
+      "sample": "11-01 23:55:23.005   178   178 E ipa 3e00000.qcom,ipa: mbox_request_channel: can't parse \"mboxes\" property",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "ipa_pc_qmp_enable: N mailbox channel request failed, ret=-N",
+      "sample": "11-01 23:55:23.005   178   178 E ipa_pc_qmp_enable: 12394 mailbox channel request failed, ret=-2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "ipa3_uc_send_cmd_64b_param: N uC cmd(N): Received status N, Expected status N",
+      "sample": "11-01 23:55:23.005    13    13 E ipa3_uc_send_cmd_64b_param: 1089 uC cmd(17): Received status 4, Expected status 0",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "ipa3_deferred_holb_work: N Failed to enable HOLB monitoring -N",
+      "sample": "11-01 23:55:23.005    13    13 E ipa3_deferred_holb_work: 389 Failed to enable HOLB monitoring -14",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "ipa-wan ipa3_q6_clnt_svc_arrive: N send ipa3_qmi_init_modem_send_sync_msg to modem rc:N",
+      "sample": "11-01 23:55:23.013    12    12 E ipa-wan ipa3_q6_clnt_svc_arrive: 2097 send ipa3_qmi_init_modem_send_sync_msg to modem rc:0",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "ipa3_setup_apps_low_lat_prod_pipe: N Configuring low lat prod with rmnet config",
+      "sample": "11-01 23:55:23.779  2316  2316 E ipa3_setup_apps_low_lat_prod_pipe: 352 Configuring low lat prod with rmnet config",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "ipa3_setup_apps_low_lat_data_prod_pipe: N Configuring low lat data prod with rmnet config",
+      "sample": "11-01 23:55:23.782  2316  2316 E ipa3_setup_apps_low_lat_data_prod_pipe: 513 Configuring low lat data prod with rmnet config",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "ipa3_setup_apps_low_lat_data_prod_pipe: N Not enabling deaggr on low_lat_prod",
+      "sample": "11-01 23:55:23.782  2316  2316 E ipa3_setup_apps_low_lat_data_prod_pipe: 541 Not enabling deaggr on low_lat_prod",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "libprocessgroup: Failed to write N to /sys/fs/cgroup/system/uid_1001/pid_2236/cgroup.kill: No such file or directory",
+      "sample": "11-01 23:55:23.783     1     1 E libprocessgroup: Failed to write 1 to /sys/fs/cgroup/system/uid_1001/pid_2236/cgroup.kill: No such file or directory",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "libprocessgroup: Failed to write N to /sys/fs/cgroup/system/uid_1001/pid_2237/cgroup.kill: No such file or directory",
+      "sample": "11-01 23:55:23.785     1     1 E libprocessgroup: Failed to write 1 to /sys/fs/cgroup/system/uid_1001/pid_2237/cgroup.kill: No such file or directory",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "ipa-wan ipa3_wwan_ioctl: N dev(rmnet_data0) register to IPA",
+      "sample": "11-01 23:55:23.832  2559  2559 E ipa-wan ipa3_wwan_ioctl: 2922 dev(rmnet_data0) register to IPA",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Unable to set property 'ro.vendor.ril.svlte1x' from uid:N gid:N pid:N: Read-only property was already set",
+      "sample": "11-01 23:55:24.662   211   211 E init    : Unable to set property 'ro.vendor.ril.svlte1x' from uid:1001 gid:1001 pid:2119: Read-only property was already set",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Unable to set property 'ro.vendor.ril.svdo' from uid:N gid:N pid:N: Read-only property was already set",
+      "sample": "11-01 23:55:24.662   211   211 E init    : Unable to set property 'ro.vendor.ril.svdo' from uid:1001 gid:1001 pid:2119: Read-only property was already set",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Control message: Could not find 'aidl/sensor_privacy' for ctl.interface_start from pid: N (/system/bin/servicemanager)",
+      "sample": "11-01 23:55:27.674     1     1 E init    : Control message: Could not find 'aidl/sensor_privacy' for ctl.interface_start from pid: 447 (/system/bin/servicemanager)",
+      "status": "untriaged",
+      "classification": "userspace/policy or audit consequence; trace cause before deciding kernel change"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Unable to set property 'ro.vendor.radio.bp_chip_id' from uid:N gid:N pid:N: Read-only property was already set",
+      "sample": "11-01 23:55:28.479   211   211 E init    : Unable to set property 'ro.vendor.radio.bp_chip_id' from uid:1001 gid:1001 pid:2067: Read-only property was already set",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Unable to set property 'ro.ril.region' from uid:N gid:N pid:N: Read-only property was already set",
+      "sample": "11-01 23:55:28.486   211   211 E init    : Unable to set property 'ro.ril.region' from uid:1001 gid:1001 pid:2067: Read-only property was already set",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Unable to set property 'ro.ril.operator' from uid:N gid:N pid:N: Read-only property was already set",
+      "sample": "11-01 23:55:28.486   211   211 E init    : Unable to set property 'ro.ril.operator' from uid:1001 gid:1001 pid:2067: Read-only property was already set",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Unable to set property 'ro.ril.nal' from uid:N gid:N pid:N: Read-only property was already set",
+      "sample": "11-01 23:55:28.486   211   211 E init    : Unable to set property 'ro.ril.nal' from uid:1001 gid:1001 pid:2067: Read-only property was already set",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : Unable to set property 'ro.ril.factory_id' from uid:N gid:N pid:N: Read-only property was already set",
+      "sample": "11-01 23:55:28.489   211   211 E init    : Unable to set property 'ro.ril.factory_id' from uid:1001 gid:1001 pid:2067: Read-only property was already set",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "SELinux : avc:  denied  { find } for pid=N uid=N name=gpu scontext=u:r:parts_app:s0:c232,c259,c512,c768 tcontext=u:object_r:gpu_service:s0 tclass=service_manager permissive=N",
+      "sample": "11-01 23:55:29.391   447   447 E SELinux : avc:  denied  { find } for pid=4025 uid=1000 name=gpu scontext=u:r:parts_app:s0:c232,c259,c512,c768 tcontext=u:object_r:gpu_service:s0 tclass=service_manager permissive=0",
+      "status": "untriaged",
+      "classification": "userspace/policy or audit consequence; trace cause before deciding kernel change"
+    },
+    {
+      "count": 1,
+      "normalized": "power_disable: both BT and UWB regulators already voted-Off",
+      "sample": "11-01 23:55:29.669    73    73 E power_disable: both BT and UWB regulators already voted-Off",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "platform_regulators_pwr: not avilable to vote on",
+      "sample": "11-01 23:55:29.669    73    73 W platform_regulators_pwr: not avilable to vote on",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "NxpDrv  : i2c_write: write failed ret(-N), maybe in standby",
+      "sample": "11-01 23:55:29.717  4433  4433 W NxpDrv  : i2c_write: write failed ret(-107), maybe in standby",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "bt_ioctl_dispatch: unified Current SOC Version : ADDR",
+      "sample": "11-01 23:55:29.797  4410  4410 W bt_ioctl_dispatch: unified Current SOC Version : 40262100",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "icnss2  : Fail to get thermal zone. ret: -N",
+      "sample": "11-01 23:55:30.374   181   181 E icnss2  : Fail to get thermal zone. ret: -19",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "platform_regulators_pwr: not avilable to vote for retention",
+      "sample": "11-01 23:55:30.393  1230  1230 W platform_regulators_pwr: not avilable to vote for retention",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "set_capacity_and_notify: N callbacks suppressed",
+      "sample": "11-01 23:55:30.630  4821  4821 W set_capacity_and_notify: 34 callbacks suppressed",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": ": start qrtr-lookup after Boot completed",
+      "sample": "11-01 23:55:30.671   212   212 W         : start qrtr-lookup after Boot completed",
+      "status": "untriaged",
+      "classification": "apparently normal operation at elevated log severity; source audit required"
+    },
+    {
+      "count": 1,
+      "normalized": "wlan_pld: pld_is_ipa_offload_disabled:N:: Not supported on type N",
+      "sample": "11-01 23:55:31.134   181   181 E wlan_pld: pld_is_ipa_offload_disabled:2839:: Not supported on type 6",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:QDF] __cds_get_context: Module ID N context is Null (via wlan_mlme_set_epcs_capability)",
+      "sample": "11-01 23:55:31.134   181   181 E [kworke][0x1cb3d58e][22:55:31.131575] wcn7750: [181:E:QDF] __cds_get_context: Module ID 53 context is Null (via wlan_mlme_set_epcs_capability)",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:POLICY_MGR] policy_mgr_init_cfg: max_conc_cxns N non-nan",
+      "sample": "11-01 23:55:31.134   181   181 E [kworke][0x1cb3d761][22:55:31.131600] wcn7750: [181:E:POLICY_MGR] policy_mgr_init_cfg: max_conc_cxns 4 non-nan",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:QDF] __cds_get_context: Module ID N context is Null (via hdd_update_ol_config)",
+      "sample": "11-01 23:55:31.134   181   181 E [kworke][0x1cb3e4fe][22:55:31.131781] wcn7750: [181:E:QDF] __cds_get_context: Module ID 66 context is Null (via hdd_update_ol_config)",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:QDF] __cds_get_context: Module ID N context is Null (via cds_open)",
+      "sample": "11-01 23:55:31.135   181   181 E [kworke][0x1cb41dde][22:55:31.132540] wcn7750: [181:E:QDF] __cds_get_context: Module ID 66 context is Null (via cds_open)",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:QDF] htc_wait_target: Target Ready! TX resource : N size:N, MaxMsgsPerHTCBundle = N",
+      "sample": "11-01 23:55:31.138   181   181 E [kworke][0x1cb50a9e][22:55:31.135696] wcn7750: [181:E:QDF] htc_wait_target: Target Ready! TX resource : 1 size:2176, MaxMsgsPerHTCBundle = 1",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:QDF] htc_setup_target_buffer_assignments: SVS Index : N TX : 0x100 : alloc:N",
+      "sample": "11-01 23:55:31.138   181   181 E [kworke][0x1cb50b86][22:55:31.135708] wcn7750: [181:E:QDF] htc_setup_target_buffer_assignments: SVS Index : 1 TX : 0x100 : alloc:1",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:WMA] wma_update_supported_bands: wrong supported band",
+      "sample": "11-01 23:55:31.161   178   178 E [kworke][0x1cbbb7fb][22:55:31.158488] wcn7750: [178:E:WMA] wma_update_supported_bands: wrong supported band",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:TIF] get_sar_flag: failed to parse sar flag",
+      "sample": "11-01 23:55:31.161   178   178 E [kworke][0x1cbbbcc7][22:55:31.158552] wcn7750: [178:E:TIF] get_sar_flag: failed to parse sar flag",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:REGULATORY] reg_set_keep_6ghz_sta_cli_connection: pdev reg component is NULL",
+      "sample": "11-01 23:55:31.302   176   176 E [kworke][0x1ce4fa54][22:55:31.299319] wcn7750: [176:E:REGULATORY] reg_set_keep_6ghz_sta_cli_connection: pdev reg component is NULL",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:OBJMGR] wlan_objmgr_pdev_try_get_ref: [Ref id: N] pdev [N] is not in Created(st:N)",
+      "sample": "11-01 23:55:31.302   176   176 E [kworke][0x1ce50a5c][22:55:31.299533] wcn7750: [176:E:OBJMGR] wlan_objmgr_pdev_try_get_ref: [Ref id: 22] pdev [0] is not in Created(st:0)",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:REGULATORY] reg_send_scheduler_msg_nb: error taking pdev ref cnt",
+      "sample": "11-01 23:55:31.302   176   176 E [kworke][0x1ce50ae6][22:55:31.299540] wcn7750: [176:E:REGULATORY] reg_send_scheduler_msg_nb: error taking pdev ref cnt",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:HDD] hdd_sysfs_create_max_chipset_log_size_interface: max_chipset_log_size feature is disabled/no supp",
+      "sample": "11-01 23:55:31.305   181   181 E [kworke][0x1ce5e09f][22:55:31.302390] wcn7750: [181:E:HDD] hdd_sysfs_create_max_chipset_log_size_interface: max_chipset_log_size feature is disabled/no supp",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "cnss_utils: WLAN MAC address is not set, type N",
+      "sample": "11-01 23:55:31.336   181   181 E cnss_utils: WLAN MAC address is not set, type 0",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "cnss-daemon: no interop issues ap currently",
+      "sample": "11-01 23:55:31.346  2383  2383 W cnss-daemon: no interop issues ap currently",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:HDD] __wlan_hdd_validate_context: Driver load is in progress (via hdd_country_change_work_handle)",
+      "sample": "11-01 23:55:31.356   899   899 E [kworke][0x1cf4f16e][22:55:31.353814] wcn7750: [899:E:HDD] __wlan_hdd_validate_context: Driver load is in progress (via hdd_country_change_work_handle)",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "icnss2  : Failed to get cooling device node",
+      "sample": "11-01 23:55:31.393   181   181 E icnss2  : Failed to get cooling device node",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[binder][ADDR][N:N:N.N] wcn7750: [N:E:MLO_MGR] mlo_mgr_ml_peer_exist_on_diff_ml_ctx: MLD ID N exists with mac N:b9:N:e9:2f:8f",
+      "sample": "11-01 23:55:31.410  1680  1680 E [binder][0x1d04c537][22:55:31.407838] wcn7750: [1680:E:MLO_MGR] mlo_mgr_ml_peer_exist_on_diff_ml_ctx: MLD ID 0 exists with mac 88:b9:51:e9:2f:8f",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[binder][ADDR][N:N:N.N] wcn7750: [N:E:HDD] hdd_sysfs_bmiss_create: could not create bmiss sysfs file",
+      "sample": "11-01 23:55:31.412  1680  1680 E [binder][0x1d055fd3][22:55:31.409899] wcn7750: [1680:E:HDD] hdd_sysfs_bmiss_create: could not create bmiss sysfs file",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[kworke][ADDR][N:N:N.N] wcn7750: [N:E:PMO] pmo_core_psoc_bus_runtime_suspend: Target wake up received before suspend completion",
+      "sample": "11-01 23:55:32.414  1879  1879 E [kworke][0x1e2adcee][22:55:32.411674] wcn7750: [1879:E:PMO] pmo_core_psoc_bus_runtime_suspend: Target wake up received before suspend completion",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_xm_htc_set_gesture_switch N: ++, set gesture_switch: 0x0005",
+      "sample": "11-01 23:55:32.677   129   129 E         : [22:55:32.674] [NVT-ts] nvt_xm_htc_set_gesture_switch 1313: ++, set gesture_switch: 0x0005",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "platform soc: mca_strategy_quick_charge: deferred probe pending: (reason unknown)",
+      "sample": "11-01 23:55:33.242   209   209 W platform soc: mca_strategy_quick_charge: deferred probe pending: (reason unknown)",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "platform soc: mca_buckchg_jeita: deferred probe pending: (reason unknown)",
+      "sample": "11-01 23:55:33.242   209   209 W platform soc: mca_buckchg_jeita: deferred probe pending: (reason unknown)",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "platform c42d000.qcom,spmi: qcom,pm7550ba@N:bcl@N: deferred probe pending: platform: wait for supplier /soc/qcom,spmi@c42d000/qcom,pmk8550@N/sdam@N/sm1510_present@5d",
+      "sample": "11-01 23:55:33.242   209   209 W platform c42d000.qcom,spmi: qcom,pm7550ba@7:bcl@4700: deferred probe pending: platform: wait for supplier /soc/qcom,spmi@c42d000/qcom,pmk8550@0/sdam@7000/sm1510_present@5d",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "init    : wait for '/sys/class/thermal/thermal_message/boot_complete' timed out and took 5009ms",
+      "sample": "11-01 23:55:35.689   212   212 W init    : wait for '/sys/class/thermal/thermal_message/boot_complete' timed out and took 5009ms",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[wpa_su][ADDR][N:N:N.N] wcn7750: [N:E:HDD] hdd_config_power: power attr and opm attr is null",
+      "sample": "11-01 23:55:35.749  5970  5970 E [wpa_su][0x21fbcfbe][22:55:35.746325] wcn7750: [5970:E:HDD] hdd_config_power: power attr and opm attr is null",
+      "status": "Source audited: operational or unsupported-feature diagnostic; exact template does not establish hardware failure",
+      "classification": "unknown",
+      "source_audit": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/operational_wlan_templates/analysis.json",
+      "rationale": "Both optional settings absent in a configuration callback; source returns0 before any firmware command. Invalid simultaneous and malformed explicit settings still returnEINVAL."
+    },
+    {
+      "count": 1,
+      "normalized": "[binder][ADDR][N:N:N.N] wcn7750: [N:E:DP] dp_telemetry_init: stats not supported in device mode: N",
+      "sample": "11-01 23:55:35.971  5246  5246 E [binder][0x223cbe2f][22:55:35.967957] wcn7750: [5246:E:DP] dp_telemetry_init: stats not supported in device mode: 16",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[binder][ADDR][N:N:N.N] wcn7750: [N:E:PMO] pmo_register_wow_wakeup_events: Skipping wake event configuration for vdev_opmode N",
+      "sample": "11-01 23:55:35.971  5246  5246 E [binder][0x223cd44c][22:55:35.968252] wcn7750: [5246:E:PMO] pmo_register_wow_wakeup_events: Skipping wake event configuration for vdev_opmode 16",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[schedu][ADDR][N:N:N.N] wcn7750: [N:E:DP] dp_tx_flow_pool_unmap_handler: flow pool id: N is inactive, ignore unmap",
+      "sample": "11-01 23:55:35.996  5132  5132 E [schedu][0x2244230d][22:55:35.993195] wcn7750: [5132:E:DP] dp_tx_flow_pool_unmap_handler: flow pool id: 2 is inactive, ignore unmap",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[schedu][ADDR][N:N:N.N] wcn7750: [N:E:DP] dp_telemetry_deinit: stats not supported in device mode: N",
+      "sample": "11-01 23:55:35.996  5132  5132 E [schedu][0x22443fd1][22:55:35.993579] wcn7750: [5132:E:DP] dp_telemetry_deinit: stats not supported in device mode: 16",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[androi][ADDR][N:N:N.N] wcn7750: [N:E:OSIF] wlan_hdd_set_station_stats_request_pending: peer is null",
+      "sample": "11-01 23:55:37.139  1652  1652 E [androi][0x2392ecc0][22:55:37.135938] wcn7750: [1652:E:OSIF] wlan_hdd_set_station_stats_request_pending: peer is null",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[WifiSc][ADDR][N:N:N.N] wcn7750: [N:E:HDD] __wlan_hdd_cfg80211_scan: Scan not allowed. scan_ebusy_cnt: N Session N Reason N",
+      "sample": "11-01 23:55:37.280  3635  3635 E [WifiSc][0x23bc7504][22:55:37.277702] wcn7750: [3635:E:HDD] __wlan_hdd_cfg80211_scan: Scan not allowed. scan_ebusy_cnt: 1 Session 0 Reason 1",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[schedu][ADDR][N:N:N.N] wcn7750: [N:E:PE] lim_extract_msd_caps: mlo peer ctx is null",
+      "sample": "11-01 23:55:37.366  5132  5132 E [schedu][0x23d57def][22:55:37.363154] wcn7750: [5132:E:PE] lim_extract_msd_caps: mlo peer ctx is null",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[schedu][ADDR][N:N:N.N] wcn7750: [N:E:CMN_MLME] mlme_sr_update: Spatial Reuse disabled for vdev_id: N",
+      "sample": "11-01 23:55:37.371  5132  5132 E [schedu][0x23d71eda][22:55:37.368713] wcn7750: [5132:E:CMN_MLME] mlme_sr_update: Spatial Reuse disabled for vdev_id: 0",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[schedu][ADDR][N:N:N.N] wcn7750: [N:E:MLO_MGR] mlo_mgr_update_link_status_code: Link info not found for link id N",
+      "sample": "11-01 23:55:37.371  5132  5132 E [schedu][0x23d7241e][22:55:37.368783] wcn7750: [5132:E:MLO_MGR] mlo_mgr_update_link_status_code: Link info not found for link id 255",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[schedu][ADDR][N:N:N.N] wcn7750: [N:E:tdls] tdls_set_tdls_offchannelmode: vdev:N TDLS Off-Channel is not enabled. current_mode:N",
+      "sample": "11-01 23:55:37.377  5132  5132 E [schedu][0x23d8ce5c][22:55:37.374466] wcn7750: [5132:E:tdls] tdls_set_tdls_offchannelmode: vdev:0 TDLS Off-Channel is not enabled. current_mode:3",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[    C1] [soft_i][ADDR][N: N:N.N] wcn7750: [N:E:HAL] hal_rx_print_pn_be: PN number pn_95_64 0x0 pn_63_32 0x0 pn_31_0 0x2",
+      "sample": "11-01 23:55:37.535     0     0 E [    C1] [soft_i][0x2406f610][22: 55:37.532009] wcn7750: [0:E:HAL] hal_rx_print_pn_be: PN number pn_95_64 0x0 pn_63_32 0x0 pn_31_0 0x2",
+      "status": "untriaged",
+      "classification": "unknown",
+      "source_audit": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/operational_wlan_templates/analysis.json",
+      "rationale": "PN printer is called from both PN-error drop and successful defrag paths; live caller and packet disposition unresolved"
+    },
+    {
+      "count": 1,
+      "normalized": "[N:N:N:N-E][mca_business_charger]business_charger_process_batt_auth_pass: N reviced batt_auth pass",
+      "sample": "11-01 23:55:38.129    13    13 E [22:55:38:125-E][mca_business_charger]business_charger_process_batt_auth_pass: 1170 reviced batt_auth pass",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[schedu][ADDR][N:N:N.N] wcn7750: [N:E:MLO_MGR] util_get_bvmlie_persta_partner_info: Pointer to Multi-Link element sequence is NULL",
+      "sample": "11-01 23:55:39.994  5132  5132 E [schedu][0x26d76054][22:55:39.991026] wcn7750: [5132:E:MLO_MGR] util_get_bvmlie_persta_partner_info: Pointer to Multi-Link element sequence is NULL",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[schedu][ADDR][N:N:N.N] wcn7750: [N:E:CMN_MLME] mlo_add_all_link_probe_rsp_to_scan_db: Per STA profile parsing failed",
+      "sample": "11-01 23:55:39.994  5132  5132 E [schedu][0x26d76321][22:55:39.991063] wcn7750: [5132:E:CMN_MLME] mlo_add_all_link_probe_rsp_to_scan_db: Per STA profile parsing failed",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[schedu][ADDR][N:N:N.N] wcn7750: [N:E:SME] sme_ps_disable_uapsd_req_params: UAPSD is already disabled",
+      "sample": "11-01 23:55:39.998  5132  5132 E [schedu][0x26d8bfad][22:55:39.995711] wcn7750: [5132:E:SME] sme_ps_disable_uapsd_req_params: UAPSD is already disabled",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[    C0] [soft_i][ADDR][N: N:N.N] wcn7750: [N:F:DP] dp_peer_update_state: Invalid state shift from N to N peer fc:N:N:8b:N:N",
+      "sample": "11-01 23:55:39.999     0     0 F [    C0] [soft_i][0x26d910e7][22: 55:39.996794] wcn7750: [0:F:DP] dp_peer_update_state: Invalid state shift from 2 to 4 peer fc:34:97:8b:50:18",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "libprocessgroup: Failed to write N to /sys/fs/cgroup/system/uid_1000/pid_2177/cgroup.kill: No such file or directory",
+      "sample": "11-01 23:55:40.205     1     1 E libprocessgroup: Failed to write 1 to /sys/fs/cgroup/system/uid_1000/pid_2177/cgroup.kill: No such file or directory",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": ": [N:N:N.N] [NVT-ts] nvt_xm_htc_set_gesture_switch N: ++, set gesture_switch: 0x0003",
+      "sample": "11-01 23:55:43.475   129   129 E         : [22:55:43.472] [NVT-ts] nvt_xm_htc_set_gesture_switch 1313: ++, set gesture_switch: 0x0003",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[schedu][ADDR][N:N:N.N] wcn7750: [N:E:WMI] extract_roam_trigger_stats_tlv: roam_result or idx error.N",
+      "sample": "11-01 23:56:12.183  5132  5132 E [schedu][0x4badfc50][22:56:12.180839] wcn7750: [5132:E:WMI] extract_roam_trigger_stats_tlv: roam_result or idx error.0",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[schedu][ADDR][N:N:N.N] wcn7750: [N:E:WMI] extract_roam_trigger_stats_tlv: roam_scan_info or idx error.N",
+      "sample": "11-01 23:56:12.183  5132  5132 E [schedu][0x4badfe8a][22:56:12.180869] wcn7750: [5132:E:WMI] extract_roam_trigger_stats_tlv: roam_scan_info or idx error.0",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "charger_partition soc: charger_partition: charger partition unavailable: -N",
+      "sample": "11-01 23:56:56.439    36    36 E charger_partition soc: charger_partition: charger partition unavailable: -13",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "libbinder.BackendUnifiedServiceManager: Thread Pool max thread count is N. Cannot cache binder as linkToDeath cannot be implemented. serviceName: vold",
+      "sample": "11-01 23:58:07.240  6839  6839 W libbinder.BackendUnifiedServiceManager: Thread Pool max thread count is 0. Cannot cache binder as linkToDeath cannot be implemented. serviceName: vold",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "apexd   : /odm/apex does not exist. Skipping",
+      "sample": "11-01 23:58:07.776  6839  6839 W apexd   : /odm/apex does not exist. Skipping",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "servicemanager: Isolated app with UID N requested 'network_management', but the service is not allowed for isolated apps.",
+      "sample": "11-01 23:58:12.206   447   447 W servicemanager: Isolated app with UID 99000 requested 'network_management', but the service is not allowed for isolated apps.",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "servicemanager: Isolated app with UID N requested 'connectivity', but the service is not allowed for isolated apps.",
+      "sample": "11-01 23:58:12.208   447   447 W servicemanager: Isolated app with UID 99000 requested 'connectivity', but the service is not allowed for isolated apps.",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "servicemanager: Isolated app with UID N requested 'content_capture', but the service is not allowed for isolated apps.",
+      "sample": "11-01 23:58:12.408   447   447 W servicemanager: Isolated app with UID 99000 requested 'content_capture', but the service is not allowed for isolated apps.",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "libprocessgroup: Failed to write N to /sys/fs/cgroup/system/uid_1000/pid_11479/cgroup.kill: No such file or directory",
+      "sample": "11-01 23:58:28.028     1     1 E libprocessgroup: Failed to write 1 to /sys/fs/cgroup/system/uid_1000/pid_11479/cgroup.kill: No such file or directory",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "binder_debug: N callbacks suppressed",
+      "sample": "11-01 23:58:32.048   209   209 W binder_debug: 2 callbacks suppressed",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "msm_cvp ab00000.qcom,cvp: Direct firmware load for evass.mbn failed with error -N",
+      "sample": "11-01 23:58:47.160 17479 17479 W msm_cvp ab00000.qcom,cvp: Direct firmware load for evass.mbn failed with error -2",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "msm_cvp ab00000.qcom,cvp: Falling back to sysfs fallback for: evass.mbn",
+      "sample": "11-01 23:58:47.160 17479 17479 W msm_cvp ab00000.qcom,cvp: Falling back to sysfs fallback for: evass.mbn",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "debugfs : 'inst_0000000000000000' already exists in 'core0'",
+      "sample": "11-01 23:58:47.229 17479 17479 E debugfs : 'inst_0000000000000000' already exists in 'core0'",
+      "status": "source_fix_validated_build_hardware_pending",
+      "classification": "restricted-pointer debugfs identity collision",
+      "source_repair": "patches/0172-allocate-unique-eva-instance-debugfs-ids.patch",
+      "validation": "validation/cvp_debugfs_identity/validation.json",
+      "limits": "717 host cases and 4096 concurrent trees passed; full build and on-device warning absence pending; not evidence of preview lag cause."
+    },
+    {
+      "count": 1,
+      "normalized": "[    C0] __cam_isp_ctx_recover_sof_timestamp: N callbacks suppressed",
+      "sample": "11-01 23:58:52.416     0     0 W [    C0] __cam_isp_ctx_recover_sof_timestamp: 138 callbacks suppressed",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[    C0] __cam_isp_ctx_send_sof_timestamp: N callbacks suppressed",
+      "sample": "11-01 23:58:52.416     0     0 W [    C0] __cam_isp_ctx_send_sof_timestamp: 138 callbacks suppressed",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[    C1] __cam_isp_ctx_recover_sof_timestamp: N callbacks suppressed",
+      "sample": "11-01 23:58:57.446     0     0 W [    C1] __cam_isp_ctx_recover_sof_timestamp: 141 callbacks suppressed",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "[    C1] __cam_isp_ctx_send_sof_timestamp: N callbacks suppressed",
+      "sample": "11-01 23:58:57.446     0     0 W [    C1] __cam_isp_ctx_send_sof_timestamp: 141 callbacks suppressed",
+      "status": "untriaged",
+      "classification": "unknown"
+    },
+    {
+      "count": 1,
+      "normalized": "SELinux : avc:  denied  { find } for pid=N uid=N name=vendor.qti.qspmhal.IQspmhal/default scontext=u:r:pcc_component:s0:c66,c374,c512,c768 tcontext=u:object_r:vendor_hal_qspmhal_service:s0 tclass=service_manager permissive=N",
+      "sample": "11-01 23:58:58.633   447   447 E SELinux : avc:  denied  { find } for pid=6886 uid=30274 name=vendor.qti.qspmhal.IQspmhal/default scontext=u:r:pcc_component:s0:c66,c374,c512,c768 tcontext=u:object_r:vendor_hal_qspmhal_service:s0 tclass=service_manager permissive=0",
+      "status": "untriaged",
+      "classification": "userspace/policy or audit consequence; trace cause before deciding kernel change"
+    }
+  ],
+  "latest_attempt": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-tx-napi-20261102T044411Z",
+  "current_explicit_kernel_stream": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-tx-napi-20261102T044411Z/returned-618/logcat-kernel.txt",
+  "recovery_fastbootd": {
+    "status": "PASS: direct Android adb reboot fastboot reaches stable userspacefastbootd; native root6.18recoveryverified; Android return pending",
+    "artifact": "/home/loukious/Android/konoha-android17-6.18-port-20261031/artifacts/20261102T014419982366Z",
+    "fastbootd_test": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z/fastbootd-test.json",
+    "persistent_fastbootd": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z/fastbootd-persistence.json",
+    "root_recovery_evidence": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z/native-618-state-detail",
+    "recovery_log_sha256": "a268360d83e964651da47cb0af916c349a0c64089d68c47cac4c52d3c17d2b35",
+    "panic_or_kernel_warn": false,
+    "scanout_allocation_failures": 0,
+    "adci_state": "TASK_IDLE; inside explicit qcom_scm_invoke_smc_adci firmware accept",
+    "display_feature_worker_state": "TASK_INTERRUPTIBLE sleeping inside kthread_worker_fn",
+    "hung_task_timeout_secs": 5,
+    "hung_task_panic": 1,
+    "four_physical_image_hashes": {
+      "recovery_a": "cd4a2ccff5bd02170ac4054780eeb72b7ff9ecacfc2c79f70010d416cc28e5f3",
+      "boot_a": "a2c7d0394c3cbd14c43bbb814e7981a6c8812d7df63b8cafc3b1a4009c6a0e6a",
+      "vendor_boot_a": "b52e3dd779ee24b3af155cb2ce02e4f3c42c205efb91361e28821795003c5374",
+      "dtbo_a": "febaa713a01e65f43146be9bf85d9ef3ff5c87e1ae4bea9a55319c580e8f6ee7"
+    },
+    "logical_partition_limit": "No device-mapper logical mappings in native recovery; those two full partition readbacks unavailable. Five-image flash receipt/vendor_boot readbacks and actual loaded module build IDs verified.",
+    "remaining_android_shutdown_warnings": [
+      "DRM probe-only client NULL framebuffer restore",
+      "IPA enabled-NAPI delete during modem SSR"
+    ],
+    "uncertain_transition": "User reported accidental button press during first recovery transition; no crash attribution established; repeated adb recovery route and rootcapture passed",
+    "return_capture": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z/returned-618",
+    "attempt": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z"
+  },
+  "prepared_attempt": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-tx-napi-20261102T044411Z",
+  "current_capture_state": "TX candidate044143 boot and return passed; captures stopped; Android running on slot A",
+  "normal_diagnostic_source_audit": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-20261102T030100Z/normal-diagnostic-source-audit.json",
+  "goal_turn_result": {
+    "classification": "progress",
+    "objective_unchanged": true,
+    "completed_work": [
+      "Combined candidate installed with Wi-Fi, SRAM and EVA checks",
+      "Separate WAN TX NAPI omission repaired; source controls, full build and image checks pass",
+      "New candidate boots and returns from fastbootd; modem teardown has no NAPI warning",
+      "ROM ADB/webcam patches committed and pushed to evolution-cnb in the patches repository"
+    ],
+    "pending": [
+      "SoundWire ignored-command cause",
+      "Powered-off charging mode selection and bootloader black interval",
+      "Other kernel warning ledger records",
+      "ROM ADB/webcam deployment and streaming; firmware/SMP stress"
+    ]
+  }
+}

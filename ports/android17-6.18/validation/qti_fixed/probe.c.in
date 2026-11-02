@@ -1,0 +1,59 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#define QTI_FIXED_REGULATOR 1
+#define GFP_KERNEL 0
+#define ENOMEM 12
+#define THIS_MODULE NULL
+#define REGULATOR_VOLTAGE 0
+#define ERR_PTR(n) ((void *)(intptr_t)(n))
+#define PTR_ERR(p) ((int)(intptr_t)(p))
+#define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
+#define dev_err(...) ((void)0)
+#define dev_dbg(...) ((void)0)
+#define dev_err_probe(dev,err,...) (err)
+enum gpiod_flags {GPIOD_OUT_LOW=0,GPIOD_OUT_HIGH=1,GPIOD_FLAGS_BIT_NONEXCLUSIVE=2};
+struct device {void *of_node;};
+struct platform_device {struct device dev;};
+struct regulator_dev {int unused;};
+struct regulator_desc {const char *name,*supply_name;void *owner,*ops;int type,enable_time,off_on_delay,n_voltages,fixed_uV;};
+struct regulator_config {struct device *dev;void *init_data,*driver_data,*of_node,*ena_gpiod;};
+struct fixed_voltage_config {const char *supply_name,*input_supply;void *init_data;int startup_delay,off_on_delay,microvolts;bool enabled_at_boot;};
+struct fixed_voltage_data {struct regulator_desc desc;void *enable_clock;int performance_state;struct regulator_dev *dev;};
+struct fixed_dev_type {bool has_enable_clock,has_performance_state;};
+static struct fixed_voltage_data data;
+static struct fixed_voltage_config config={.supply_name="supply",.microvolts=1800000};
+static struct regulator_dev regulator;
+static int fixed_voltage_clkenabled_ops,fixed_voltage_domain_ops,fixed_voltage_ops;
+static int failure,gpio_owned,gpio_puts,proxy_calls,debug_calls;
+static void *of_device_get_match_data(struct device *d) {return NULL;}
+static void *devm_kzalloc(struct device *d,size_t n,int f) {return failure==1?NULL:&data;}
+static struct fixed_voltage_config *of_get_fixed_voltage_config(struct device *d,struct regulator_desc *r) {return &config;}
+static void *dev_get_platdata(struct device *d) {return &config;}
+static const char *devm_kstrdup(struct device *d,const char *n,int f) {return n;}
+static void *devm_clk_get(struct device *d,void *n) {return NULL;}
+static int of_get_required_opp_performance_state(void *d,int n) {return 0;}
+static void *gpiod_get_optional(struct device *d,void *n,enum gpiod_flags f) {gpio_owned=1;return &gpio_owned;}
+static void gpiod_put(void *g) {assert(gpio_owned);gpio_owned=0;gpio_puts++;}
+static struct regulator_dev *devm_regulator_register(struct device *d,struct regulator_desc *r,struct regulator_config *c) {
+ if(failure==2) {gpiod_put(c->ena_gpiod);return ERR_PTR(-22);}return &regulator;
+}
+static void platform_set_drvdata(struct platform_device *p,void *d) { }
+static int devm_regulator_proxy_consumer_register(struct device *d,void *n) {proxy_calls++;return failure==3?-517:0;}
+static int devm_regulator_debug_register(struct device *d,struct regulator_dev *r) {debug_calls++;return failure==4?-12:0;}
+/* PRODUCTION */
+int main(void) {
+ struct platform_device p={0};
+ for(failure=0;failure<=4;failure++) {
+  gpio_owned=gpio_puts=proxy_calls=debug_calls=0;
+  int expected[]={0,-12,-22,-517,-12};
+  assert(reg_fixed_voltage_probe(&p)==expected[failure]);
+  if(failure==1)assert(!gpio_owned && !gpio_puts && !proxy_calls);
+  if(failure==2)assert(!gpio_owned && gpio_puts==1 && !proxy_calls);
+  if(failure==3)assert(proxy_calls==1 && !debug_calls);
+  if(failure==4 || failure==0)assert(proxy_calls==1 && debug_calls==1);
+ }
+ puts("PASS allocation, regulator GPIO ownership, proxy defer and debug failure");
+}

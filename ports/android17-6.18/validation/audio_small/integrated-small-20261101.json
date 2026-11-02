@@ -1,0 +1,128 @@
+{
+  "tests": {
+    "sdca": {
+      "bounded_reads": true,
+      "short_read_chunks": 36,
+      "positions_and_faults": true,
+      "write_errors": true,
+      "creation_failures": 4,
+      "owner_and_permissions": true
+    },
+    "lpi": {
+      "probe_failures": 8,
+      "pin_and_mmio_bounds": true,
+      "public_pinctrl_access": true,
+      "runtime_errors_balanced": true,
+      "multiple_pin_configurations": true,
+      "ordered_teardown": true
+    },
+    "haptics": {
+      "probe_failure_paths": 12,
+      "native_pmic_variants": 3,
+      "enumeration_retries": 30,
+      "notifiers_and_component_before_power": true,
+      "failed_voltage_reset_not_double_disabled": true
+    },
+    "dmic": {
+      "probe_failure_paths": 14,
+      "supplier_ref_and_link": true,
+      "native_enumeration_retries": 5,
+      "notifier_registration_error_and_drain": true,
+      "micbias_vote_failures": true,
+      "optional_supplier": true
+    }
+  },
+  "negative_controls": {
+    "sdca_stack_tail_read": {
+      "rejected": true,
+      "diagnostic": "sdca_stack_tail_read: /tmp/onyx-audio-small-tests-lqdkcgm0/sdca_stack_tail_read.c:455: main: Assertion `ret == 11 && pos == 11 && !memcmp(result, \"0x40000011\\n\", 11)' failed."
+    },
+    "sdca_write_error_hidden": {
+      "rejected": true,
+      "diagnostic": "sdca_write_error_hidden: /tmp/onyx-audio-small-tests-lqdkcgm0/sdca_write_error_hidden.c:480: main: Assertion `codec_debug_data_write(&file, \"255\", 3, &pos) == -EIO' failed."
+    },
+    "sdca_wrong_dump_stride": {
+      "rejected": true,
+      "diagnostic": "sdca_wrong_dump_stride: /tmp/onyx-audio-small-tests-lqdkcgm0/sdca_wrong_dump_stride.c:495: main: Assertion `!ret && total == 34 && pos == 34' failed."
+    },
+    "sdca_address_ref_not_updated": {
+      "rejected": true,
+      "diagnostic": "sdca_address_ref_not_updated: /tmp/onyx-audio-small-tests-lqdkcgm0/sdca_address_ref_not_updated.c:465: main: Assertion `info.reg_address == 0x40000022' failed."
+    },
+    "sdca_partial_create_not_removed": {
+      "rejected": true,
+      "diagnostic": "sdca_partial_create_not_removed: /tmp/onyx-audio-small-tests-lqdkcgm0/sdca_partial_create_not_removed.c:521: main: Assertion `!debug.sdca_dentry && !debug.address && !debug.data && !debug.registers' failed."
+    },
+    "lpi_pin_count_bounds_removed": {
+      "rejected": true,
+      "diagnostic": "/tmp/onyx-audio-small-tests-lqdkcgm0/lpi_pin_count_bounds_removed.c:697:34: runtime error: index 32 out of bounds for type 'char *[32]'"
+    },
+    "lpi_slew_loop_reuses_config_index": {
+      "rejected": true,
+      "diagnostic": "lpi_slew_loop_reuses_config_index: /tmp/onyx-audio-small-tests-lqdkcgm0/lpi_slew_loop_reuses_config_index.c:903: main: Assertion `pad->strength == 12 && pad->value && pad->pullup == LPI_GPIO_PULL_UP' failed."
+    },
+    "lpi_snd_event_leaked_on_notifier_failure": {
+      "rejected": true,
+      "diagnostic": "lpi_snd_event_leaked_on_notifier_failure: /tmp/onyx-audio-small-tests-lqdkcgm0/lpi_snd_event_leaked_on_notifier_failure.c:843: release_devres: Assertion `!gpio_live && !pinctrl_live && !event_live && !notifier_live && !pm_enabled && !pm_users' failed."
+    },
+    "lpi_pm_error_hidden": {
+      "rejected": true,
+      "diagnostic": "lpi_pm_error_hidden: /tmp/onyx-audio-small-tests-lqdkcgm0/lpi_pm_error_hidden.c:884: main: Assertion `lpi_gpio_read(pad, 0) == -EIO && !pm_users' failed."
+    },
+    "haptics_ssr_notifier_not_drained": {
+      "rejected": true,
+      "diagnostic": "haptics_ssr_notifier_not_drained: /tmp/onyx-audio-small-tests-lqdkcgm0/haptics_ssr_notifier_not_drained.c:200: unregister_hboost_event_notifier: Assertion `hboost_live && !ssr_live' failed."
+    },
+    "haptics_component_registration_not_recorded": {
+      "rejected": true,
+      "diagnostic": "haptics_component_registration_not_recorded: /tmp/onyx-audio-small-tests-lqdkcgm0/haptics_component_registration_not_recorded.c:463: release_devres: Assertion `!sdev->dev.data && !component_live && !hboost_live && !ssr_live' failed."
+    },
+    "haptics_runtime_failure_skips_cleanup": {
+      "rejected": true,
+      "diagnostic": "haptics_runtime_failure_skips_cleanup: /tmp/onyx-audio-small-tests-lqdkcgm0/haptics_runtime_failure_skips_cleanup.c:463: release_devres: Assertion `!sdev->dev.data && !component_live && !hboost_live && !ssr_live' failed."
+    },
+    "dmic_supplier_device_reference_leak": {
+      "rejected": true,
+      "diagnostic": "dmic_supplier_device_reference_leak: /tmp/onyx-audio-small-tests-lqdkcgm0/dmic_supplier_device_reference_leak.c:611: release_devres: Assertion `!sdev->dev.data && !supplier_node.references && !supplier.dev.references' failed."
+    },
+    "dmic_supplier_node_reference_leak": {
+      "rejected": true,
+      "diagnostic": "dmic_supplier_node_reference_leak: /tmp/onyx-audio-small-tests-lqdkcgm0/dmic_supplier_node_reference_leak.c:611: release_devres: Assertion `!sdev->dev.data && !supplier_node.references && !supplier.dev.references' failed."
+    },
+    "dmic_notifier_not_tracked": {
+      "rejected": true,
+      "diagnostic": "dmic_notifier_not_tracked: /tmp/onyx-audio-small-tests-lqdkcgm0/dmic_notifier_not_tracked.c:644: main: Assertion `priv->notifier_registered && notifier_live' failed."
+    },
+    "dmic_failed_enable_increments_vote": {
+      "rejected": true,
+      "diagnostic": "dmic_failed_enable_increments_vote: /tmp/onyx-audio-small-tests-lqdkcgm0/dmic_failed_enable_increments_vote.c:653: main: Assertion `swr_dmic_up(&sdev) == -EIO && !priv->is_en_supply && !power_count' failed."
+    },
+    "dmic_successful_registration_not_tracked": {
+      "rejected": true,
+      "diagnostic": "dmic_successful_registration_not_tracked: /tmp/onyx-audio-small-tests-lqdkcgm0/dmic_successful_registration_not_tracked.c:612: release_devres: Assertion `!component_live && !notifier_live && !power_count' failed."
+    }
+  },
+  "source_sha256": {
+    "qcom/opensource/audio-kernel/asoc/codecs/msm_hdmi_codec_rx.c": "df388871e65ee63f64170d818766df36bc27710ec612f0eb85ee7c6817e1fbb4",
+    "qcom/opensource/audio-kernel/asoc/codecs/msm_stub.c": "b8a1889191ff2fc0ab7c1145248cbd372c5259ae6396d4a10f2224af72483e79",
+    "qcom/opensource/audio-kernel/asoc/codecs/sdca-registers-api.c": "86fa36d1b05c3431ebab75b13201dacc1b68e8f6756797f8a210d26448771b83",
+    "qcom/opensource/audio-kernel/asoc/codecs/swr-dmic.c": "cdc5aa82a7495e827061718f0707eeff8f232f755e7bc07d4bfe06737aabcfc6",
+    "qcom/opensource/audio-kernel/asoc/codecs/swr-dmic.h": "31a4c7e480723ad1ce1ccf485492ed55d41e79f0b18f515f3aa9c1ce39511ea2",
+    "qcom/opensource/audio-kernel/asoc/codecs/swr-haptics.c": "3048d562399ededdd75ef70cdad1fa88ee3e3475877cde69736f97ccb590369b",
+    "qcom/opensource/audio-kernel/include/asoc/sdca-registers-api.h": "3e15abc15d106a780e90fdbe51a64b9b0ecbc446b67ae16e09049062bd0fe421",
+    "qcom/opensource/audio-kernel/soc/core.h": "a2ee39ca696d7db7b84220dd26ba390c5a9a66ada956eaff4a9768162125de16",
+    "qcom/opensource/audio-kernel/soc/pinctrl-lpi.c": "2f49f9bd6a9fa3bd02c470ad0dfbf05f4a908447645f858924a6b541db84af83",
+    "qcom/opensource/audio-kernel/soc/pinctrl-utils.h": "e9cbae65512c44477a356ac37cd47e72d26b018a6a85fbda2c7f2541eb403a2f"
+  },
+  "harness_sha256": {
+    "dmic.c": "9a9e89a525b1473d99dd0fd68776ae524172aee6574e4f001c9eeb38c6283f0a",
+    "dmic.json": "a7cc7b585e5a2d8b702a0d71daadf826e816e27504eabccb990c0728e5d97cb5",
+    "haptics.c": "6d43cdd894b921188b2eaee6c88df5201dc3703e1c6d2951e28321b6b826b021",
+    "haptics.json": "dc926caa4e76ed89a300fcf44b0d73065eea6095257c3d3ca54bb141d6f07551",
+    "lpi.c": "913c132bcfe81ab94810eda273e1e4294c97ca0914aeee44e6dcaa628107aee7",
+    "lpi.json": "ac3d466a651c0e892e3c887221905c4861cae568e821e1bd1da40b5ada60c01c",
+    "mutations.json": "5358e60d32c6cc0b747d6ebab90d3c3f92addd006c298000d1a484f155bef908",
+    "sdca.c": "03dc7b8d723c68b02aa726a96bac9f2be6eb76b261cf74a2d3fe87f54f31e844"
+  },
+  "limits": "Extracted production C under ASan/UBSan with simulated Linux, DT, ASoC, regmap, SoundWire, PM, clocks and notifier services. No real IRQ/DAPM, debugfs proxy, supplier unbind, DSP, electrical or phone boot validation."
+}

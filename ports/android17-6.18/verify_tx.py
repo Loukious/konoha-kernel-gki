@@ -16,6 +16,7 @@ GROUPS={
  'clock':[P+'mclk_enable'],
  'headset':['tx_macro_hs_unmute_dwork',P+'mute_hs',P+'close_headset'],
  'stream':[P+'get_data','is_msm_dmic_enabled','mute_stream_dec_unmute','lpass_cdc_tx_mute_stream'],
+ 'analog':[P+'get_data','is_msm_dmic_enabled','mute_stream_dec_unmute','lpass_cdc_tx_mute_stream'],
  'rates':[P+'get_data',P+'hw_params',P+'get_channel_map',P+'clk_div_get'],
 }
 MUTATIONS=json.loads((H/'audio_tx_mutations.json').read_text())
@@ -23,9 +24,10 @@ def extract(s,name):
  m=re.search(r'^(?:(?:static|inline)\s+)*(?:[\w]+\s+|\*\s*)+\b'+re.escape(name)+r'\([^;{}]*\)\n\{',s,re.M);assert m,name
  return s[m.start():s.index('\n}',m.end())+2]
 def main():
- ap=argparse.ArgumentParser();ap.add_argument('workspace',type=Path);ap.add_argument('--source-dir',default='onyx');ap.add_argument('--negative',action='store_true');ap.add_argument('--output',type=Path,required=True);a=ap.parse_args();p=a.workspace/a.source_dir/SOURCE;original=p.read_text();headers={n:a.workspace/'onyx'/(CDC+n) for n in ['lpass-cdc.h','lpass-cdc-registers.h']};results={}
+ ap=argparse.ArgumentParser();ap.add_argument('workspace',type=Path);ap.add_argument('--source-dir',default='onyx');ap.add_argument('--group',choices=GROUPS);ap.add_argument('--negative',action='store_true');ap.add_argument('--output',type=Path,required=True);a=ap.parse_args();p=a.workspace/a.source_dir/SOURCE;original=p.read_text();headers={n:a.workspace/'onyx'/(CDC+n) for n in ['lpass-cdc.h','lpass-cdc-registers.h']};results={}
  with tempfile.TemporaryDirectory(prefix='onyx-tx-test-') as tmp:
   for key in MUTATIONS if a.negative else GROUPS:
+   if a.group and (MUTATIONS[key][2] if a.negative else key) != a.group:continue
    source=original;group=key
    if a.negative:
     before,after,group=MUTATIONS[key];assert before in source,key;source=source.replace(before,after)

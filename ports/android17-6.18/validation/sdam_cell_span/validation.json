@@ -1,0 +1,40 @@
+{
+  "status": "PASS",
+  "boards": {
+    "tuna.dtb": {
+      "only_changed_property": "/soc/qcom,spmi@c42d000/qcom,pmk8550@0/sdam@7000/sm1510_present@5d/reg",
+      "reg": [
+        93,
+        2
+      ],
+      "bits_preserved": [
+        5,
+        5
+      ],
+      "bitfield_cells_audited": 3
+    },
+    "tuna7.dtb": {
+      "only_changed_property": "/soc/qcom,spmi@c42d000/qcom,pmk8550@0/sdam@7000/sm1510_present@5d/reg",
+      "reg": [
+        93,
+        2
+      ],
+      "bits_preserved": [
+        5,
+        5
+      ],
+      "bitfield_cells_audited": 3
+    }
+  },
+  "functions": {
+    "old:nvmem_cell_info_to_nvmem_cell_entry_nodup": "f4ff62e872761637b082b743fba44e6d515c655568f50b942740d88c8e42b7c5",
+    "old:nvmem_shift_read_buffer_in_place": "c3a25245cefd8ab2682ec7f6663809d52de38271d4cba59ab3388de1d8c4a0a0",
+    "old:nvmem_add_cells_from_dt": "e04b6ae2aec4493a15110952d7a02dabd09487bdf74759e22c71eeecb883ea6c",
+    "new:nvmem_cell_info_to_nvmem_cell_entry_nodup": "f4ff62e872761637b082b743fba44e6d515c655568f50b942740d88c8e42b7c5",
+    "new:nvmem_shift_read_buffer_in_place": "c1fa0c173ae87427f66482e0d6bd21a6825ea1065f67f24fac37268352790d70",
+    "new:nvmem_add_cells_from_dt": "123d2c1769a2a3ae36f6e38d065fdede69444040878976b1d7ca89a30d11962c"
+  },
+  "output": "PASS: exact native/current NVMEM parsers, preserved offset/bitfield/two-byte reads and sibling cell; 65536 identical read results; four invalid-span controls rejected",
+  "upstream_error_path_observation": "Pinned current parser allocates cell diagnostic name before validating bits and leaves it allocated on invalid-bit error. Host test cleanup frees these allocations after negative controls; the valid corrected DT never enters this error path.",
+  "limits": "Actual source parsers, cell geometry and bit extraction with host OF/device/allocation adapters. Native physical read geometry preserved. Live SDAM provider binding and BCL probe outcome are separate checks."
+}

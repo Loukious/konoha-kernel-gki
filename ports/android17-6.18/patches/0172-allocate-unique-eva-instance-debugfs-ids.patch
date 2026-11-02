@@ -1,0 +1,71 @@
+Subject: Allocate unique EVA instance debugfs identities
+
+Restricted pointers become zero directory names. Allocate a non-address
+ID per debugfs tree and release it after removal or failed creation.
+Keep the protected file operations, permissions and lifetime intact.
+
+---
+
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_debug.c
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_debug.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/debugfs.h>
++#include <linux/idr.h>
+ #include "msm_cvp_debug.h"
+ #include "msm_cvp_common.h"
+ #include "cvp_core_hfi.h"
+@@ -57,9 +58,12 @@
+ 
+ #define MAX_DBG_BUF_SIZE 4096
+ 
++static DEFINE_IDA(cvp_debugfs_ids);
++
+ struct cvp_core_inst_pair {
+ 	struct msm_cvp_core *core;
+ 	struct msm_cvp_inst *inst;
++	int debugfs_id;
+ };
+ 
+ static int core_info_open(struct inode *inode, struct file *file)
+@@ -582,13 +586,20 @@
+ 		dprintk(CVP_ERR, "Invalid params, inst: %pK\n", inst);
+ 		goto exit;
+ 	}
+-	snprintf(debugfs_name, MAX_DEBUGFS_NAME, "inst_%pK", inst);
+-
+ 	idata = kzalloc(sizeof(*idata), GFP_KERNEL);
+ 	if (!idata) {
+ 		dprintk(CVP_ERR, "%s: Allocation failed!\n", __func__);
+ 		goto exit;
+ 	}
++
++	idata->debugfs_id = ida_alloc(&cvp_debugfs_ids, GFP_KERNEL);
++	if (idata->debugfs_id < 0) {
++		dprintk(CVP_ERR, "%s: Failed to allocate debugfs ID: %d\n",
++			__func__, idata->debugfs_id);
++		goto failed_alloc_id;
++	}
++	snprintf(debugfs_name, MAX_DEBUGFS_NAME, "inst_%d",
++		 idata->debugfs_id);
+ 
+ 	idata->core = inst->core;
+ 	idata->inst = inst;
+@@ -615,6 +626,8 @@
+ 	debugfs_remove_recursive(dir);
+ 	dir = NULL;
+ failed_create_dir:
++	ida_free(&cvp_debugfs_ids, idata->debugfs_id);
++failed_alloc_id:
+ 	kfree(idata);
+ exit:
+ 	return dir;
+@@ -630,6 +643,7 @@
+ 	dentry = inst->debugfs_root;
+ 	idata = dentry->d_inode->i_private;
+ 	debugfs_remove_recursive(dentry);
++	ida_free(&cvp_debugfs_ids, idata->debugfs_id);
+ 	kfree(idata);
+ 	inst->debugfs_root = NULL;
+ }

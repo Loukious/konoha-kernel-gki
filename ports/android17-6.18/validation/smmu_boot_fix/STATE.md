@@ -1,0 +1,1 @@
+PASS: patch 0137 integrated and strict 314-module archive 20261101T170423790381Z verified. Five host scenarios pass and three compiled regressions are rejected. Only arm_smmu.ko changes versus the failed candidate; GKI files are identical. Corrected diagnostic hardware boot remains pending. Preparation is one-shot; do not rerun.

@@ -1,0 +1,31 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+typedef unsigned int u32;
+#define EINVAL 22
+#define EAGAIN 11
+#define dev_err(...) ((void)0)
+#define pr_err_ratelimited(...) ((void)0)
+struct device {void *data;};
+struct rpmsg_device {struct device dev;};
+struct qrtr_endpoint {int unused;};
+struct qrtr_smd_dev {struct qrtr_endpoint ep;struct device *dev;};
+static int post_result,wakeup_calls,preview_calls;
+static bool wakeup;
+static void *dev_get_drvdata(struct device *d) {return d->data;}
+static int qrtr_endpoint_post(struct qrtr_endpoint *ep,const void *data,size_t len) {return post_result;}
+static bool qcom_glink_is_wakeup(bool clear) {wakeup_calls++;return wakeup;}
+static void qrtr_print_wakeup_reason(const void *data) {assert(post_result==0);preview_calls++;}
+/* PRODUCTION */
+int main(void) {
+ struct qrtr_smd_dev qdev={0};struct rpmsg_device rpdev={.dev={.data=&qdev}};char tiny[1]={0};
+ int errors[]={0,-EINVAL,-12,0};
+ for(int i=0;i<4;i++) {
+  post_result=errors[i];wakeup=i!=3;wakeup_calls=preview_calls=0;
+  assert(qcom_smd_qrtr_callback(&rpdev,tiny,sizeof(tiny),NULL,0)==(post_result==-EINVAL?0:post_result));
+  assert(wakeup_calls==(post_result==0));assert(preview_calls==(post_result==0 && wakeup));
+ }
+ rpdev.dev.data=NULL;assert(qcom_smd_qrtr_callback(&rpdev,tiny,sizeof(tiny),NULL,0)==-EAGAIN);
+ puts("PASS valid, malformed, failed and non-wakeup SMD delivery");
+}

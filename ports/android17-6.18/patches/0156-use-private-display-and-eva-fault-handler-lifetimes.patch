@@ -1,0 +1,126 @@
+--- a/qcom/opensource/display-drivers/msm/msm_smmu.c
++++ b/qcom/opensource/display-drivers/msm/msm_smmu.c
+@@ -248,14 +248,8 @@
+ static void msm_smmu_destroy(struct msm_mmu *mmu)
+ {
+ 	struct msm_smmu *smmu = to_msm_smmu(mmu);
+-	struct platform_device *pdev = to_platform_device(smmu->client_dev);
+-	struct iommu_domain *domain = iommu_get_domain_for_dev(smmu->client_dev);
+-
+-	if (domain)
+-		iommu_set_fault_handler(domain, NULL, NULL);
+-
+-	if (smmu->client_dev)
+-		platform_device_unregister(pdev);
++
++	/* The context-bank device and fault handler belong to the client probe. */
+ 	kfree(smmu);
+ }
+ 
+@@ -587,8 +581,11 @@
+ 	dma_set_max_seg_size(client->dev, (unsigned int)DMA_BIT_MASK(32));
+ 	dma_set_seg_boundary(client->dev, (unsigned long)DMA_BIT_MASK(64));
+ 
+-	iommu_set_fault_handler(client->domain,
+-			msm_smmu_fault_handler, (void *)client);
++	ret = qcom_iommu_set_fault_handler(client->domain,
++					   msm_smmu_fault_handler, client);
++	if (ret)
++		return dev_err_probe(client->dev, ret,
++				     "failed to register SMMU fault handler\n");
+ 
+ 	DRM_INFO("Created domain %s, secure=%d\n",
+ 			domain->label, domain->secure);
+@@ -600,8 +597,14 @@
+ 	mutex_unlock(&smmu_list_lock);
+ 
+ 	ret = component_add(&pdev->dev, &msm_smmu_comp_ops);
+-	if (ret)
++	if (ret) {
+ 		pr_err("component add failed\n");
++		qcom_iommu_set_fault_handler(client->domain, NULL, NULL);
++		mutex_lock(&smmu_list_lock);
++		list_del(&client->smmu_list);
++		mutex_unlock(&smmu_list_lock);
++		platform_set_drvdata(pdev, NULL);
++	}
+ 
+ 	return ret;
+ }
+@@ -612,6 +615,9 @@
+ 	struct msm_smmu_client *curr, *next;
+ 
+ 	client = platform_get_drvdata(pdev);
++	component_del(&pdev->dev, &msm_smmu_comp_ops);
++	/* Drain faults before the client token is released by devres. */
++	qcom_iommu_set_fault_handler(client->domain, NULL, NULL);
+ 	client->domain_attached = false;
+ 
+ 	mutex_lock(&smmu_list_lock);
+--- a/qcom/opensource/eva-kernel/msm/eva/cvp.c
++++ b/qcom/opensource/eva-kernel/msm/eva/cvp.c
+@@ -9,6 +9,7 @@
+ #include <linux/init.h>
+ #include <linux/ioctl.h>
+ #include <linux/iommu.h>
++#include <linux/qcom-iommu-util.h>
+ #include <linux/list.h>
+ #include <linux/module.h>
+ #include <linux/of_platform.h>
+@@ -483,7 +484,7 @@
+ 
+ 	/* Children share their parent's core and never own it. */
+ 	if (!of_device_is_compatible(pdev->dev.of_node, "qcom,msm-cvp")) {
+-		struct context_bank_info *cb, *next;
++		struct context_bank_info *cb, *next, *other;
+ 
+ 		core = dev_get_drvdata(pdev->dev.parent);
+ 		if (!core)
+@@ -491,8 +492,20 @@
+ 		list_for_each_entry_safe(cb, next, &core->resources.context_banks, list) {
+ 			if (cb->dev != &pdev->dev)
+ 				continue;
+-			if (cb->domain)
+-				iommu_set_fault_handler(cb->domain, NULL, NULL);
++			if (cb->domain) {
++				bool shared_domain = false;
++
++				list_for_each_entry(other, &core->resources.context_banks, list) {
++					if (other->domain == cb->domain &&
++					    other->dev != &pdev->dev) {
++						shared_domain = true;
++						break;
++					}
++				}
++				/* Nonsecure and DSP banks can share one core-owned handler. */
++				if (!shared_domain)
++					qcom_iommu_set_fault_handler(cb->domain, NULL, NULL);
++			}
+ 			list_del(&cb->list);
+ 		}
+ 		return;
+--- a/qcom/opensource/eva-kernel/msm/eva/msm_cvp_res_parse.c
++++ b/qcom/opensource/eva-kernel/msm/eva/msm_cvp_res_parse.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/iommu.h>
++#include <linux/qcom-iommu-util.h>
+ #include <linux/of.h>
+ #include <linux/slab.h>
+ #include <linux/sort.h>
+@@ -1174,8 +1175,12 @@
+ 		goto err_setup_cb;
+ 	}
+ 
+-	iommu_set_fault_handler(cb->domain,
+-		msm_cvp_smmu_fault_handler, (void *)core);
++	rc = qcom_iommu_set_fault_handler(cb->domain,
++					  msm_cvp_smmu_fault_handler, core);
++	if (rc) {
++		dprintk(CVP_ERR, "Cannot register context bank fault handler %d\n", rc);
++		goto err_setup_cb;
++	}
+ 
+ 	return 0;
+ 

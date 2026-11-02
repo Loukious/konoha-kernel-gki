@@ -1,0 +1,1417 @@
+Subject: Port native WSA883x and WSA884x codecs to 6.18
+
+Retain native speaker interfaces; drain resources before teardown.
+
+---
+
+--- a/qcom/opensource/audio-kernel/asoc/codecs/wsa883x/internal.h
++++ b/qcom/opensource/audio-kernel/asoc/codecs/wsa883x/internal.h
+@@ -108,6 +108,13 @@
+ 	u8 pa_gain;
+ 	struct irq_domain *virq;
+ 	struct wcd_irq_info irq_info;
++	unsigned long requested_irqs;
++	bool irq_published;
++	bool component_registered;
++	bool notifier_registered;
++	bool supplies_initialized;
++	bool reset_active;
++	bool reset_was_active;
+ #ifdef CONFIG_DEBUG_FS
+ 	struct dentry *debugfs_dent;
+ 	struct dentry *debugfs_peek;
+--- a/qcom/opensource/audio-kernel/asoc/codecs/wsa883x/wsa883x.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/wsa883x/wsa883x.c
+@@ -1664,11 +1664,13 @@
+ 
+ 	ret = msm_cdc_init_supplies(dev, &priv->supplies,
+ 				    priv->regulator, priv->num_supplies);
+-	if (!priv->supplies) {
++	if (ret || !priv->supplies) {
+ 		dev_err(dev, "%s: Cannot init wsa supplies\n",
+ 			__func__);
+ 		return ret;
+ 	}
++
++	priv->supplies_initialized = true;
+ 
+ 	ret = msm_cdc_enable_static_supplies(dev, priv->supplies,
+ 					     priv->regulator,
+@@ -1695,64 +1697,56 @@
+ 	},
+ };
+ 
+-static int regdump_read(struct regmap *map, int baseReg, int endReg,
+-		char __user *user_buf, size_t count, loff_t *ppos)
+-{
+-	int i = 0, ret = 0;
++static int regdump_read(struct regmap *map, int base_reg, int end_reg,
++			char __user *user_buf, size_t count, loff_t *ppos)
++{
++	char address[16], *buf;
++	unsigned int reg_val, reg_len, reg_val_len, line_len;
+ 	size_t pos = 0;
+-	char *buf;
+-	unsigned int reg_val = 0, reg_len = 0;
+-	unsigned int reg_val_len = 0, regdump_wr_len = 0;
+-
+-	i  = ((int) *ppos + baseReg);
+-
+-
++	int i, ret, records = 0;
++
++	if (*ppos < 0 || end_reg < base_reg)
++		return -EINVAL;
++	if (*ppos > end_reg - base_reg || !count)
++		return 0;
++
++	reg_len = scnprintf(address, sizeof(address), "%x", end_reg);
++	reg_val_len = 2 * DIV_ROUND_UP(REGDUMP_PRINT_LEN, 8);
++	line_len = reg_len + reg_val_len + 3;
++	count = min_t(size_t, count, PAGE_SIZE);
++	/* Check the first complete record before writing into a short buffer. */
++	if (count < line_len)
++		return 0;
+ 	buf = kzalloc(count, GFP_KERNEL);
+ 	if (!buf)
+ 		return -ENOMEM;
+ 
+-	reg_len = scnprintf(buf, count, "%x", endReg);
+-	reg_val_len = 2 * DIV_ROUND_UP(REGDUMP_PRINT_LEN, 8);
+-	regdump_wr_len = reg_len + reg_val_len + 3;
+-
+-	/* Disable Reading/Writing from Cache */
++	i = base_reg + *ppos;
+ 	regcache_cache_bypass(map, true);
+-	for (; i >= 0 && i <= endReg; i++) {
+-
+-		scnprintf(buf+pos, count-pos, "%.*x: ", reg_len, i);
++	for (; i <= end_reg && count - pos >= line_len; i++) {
++		scnprintf(buf + pos, count - pos, "%.*x: ", reg_len, i);
+ 		pos += reg_len + 2;
+ 		ret = regmap_read(map, i, &reg_val);
+-		if (ret == 0)
+-			scnprintf(buf+pos, count-pos, "%.*x", reg_val_len, reg_val);
++		if (!ret)
++			scnprintf(buf + pos, count - pos, "%.*x",
++				  reg_val_len, reg_val);
+ 		else
+-			memset(buf+pos, 'X', reg_val_len);
+-
+-		pos +=  reg_val_len;
++			memset(buf + pos, 'X', reg_val_len);
++		pos += reg_val_len;
+ 		buf[pos++] = '\n';
+-		*ppos += 1;
+-
+-		/*
+-		 * Check not to overwrite the buffer, by ensuring we have
+-		 * space for writing next register data
+-		 *
+-		 * this is scalable if we use proc or any other fs interface
+-		 * as count would take the buf_size passed from userspace
+-		 */
+-		if ((pos + regdump_wr_len) >= count)
+-			break;
+-	}
+-	/* Enable Reading/Writing from Cache */
++		records++;
++	}
+ 	regcache_cache_bypass(map, false);
+ 
+ 	ret = pos;
+ 	if (copy_to_user(user_buf, buf, pos))
+ 		ret = -EFAULT;
+-
++	else
++		*ppos += records;
+ 	kfree(buf);
+ 	return ret;
+ }
+ 
+-
+ static ssize_t wsa883x_proc_read(struct file *filep, char __user *buf, size_t size, loff_t *ppos)
+ {
+ 	ssize_t ret = 0;
+@@ -1771,13 +1765,63 @@
+ static const struct proc_ops wsa883x_proc_ops = {
+ 	.proc_read = wsa883x_proc_read,
+ };
++
++/* Called by the driver core with probe/remove serialized, never from an IRQ. */
++static int wsa883x_swr_cleanup(struct wsa883x_priv *wsa883x)
++{
++	int irq, ret;
++
++	if (wsa883x->notifier_registered) {
++		ret = wsa883x->register_notifier(wsa883x->handle,
++					  &wsa883x->parent_nblock, false);
++		if (ret)
++			return ret;
++		wsa883x->notifier_registered = false;
++	}
++	if (wsa883x->irq_published) {
++		/* Withdrawal waits for dispatch without holding handler locks. */
++		ret = swr_set_slave_irq(wsa883x->swr_slave, NULL);
++		if (ret)
++			return ret;
++		wsa883x->irq_published = false;
++	}
++	proc_remove(wsa883x->wsa883x_proc_entry);
++	wsa883x->wsa883x_proc_entry = NULL;
++#ifdef CONFIG_DEBUG_FS
++	debugfs_remove_recursive(wsa883x->debugfs_dent);
++	wsa883x->debugfs_dent = NULL;
++#endif
++	if (wsa883x->component_registered) {
++		snd_soc_unregister_component(wsa883x->dev);
++		wsa883x->component_registered = false;
++	}
++	for (irq = WSA883X_NUM_IRQS - 1; irq >= 0; irq--) {
++		if (test_and_clear_bit(irq, &wsa883x->requested_irqs))
++			wcd_free_irq(&wsa883x->irq_info, irq, wsa883x);
++	}
++	if (wsa883x->virq) {
++		wcd_irq_exit(&wsa883x->irq_info, wsa883x->virq);
++		wsa883x->virq = NULL;
++	}
++	if (wsa883x->reset_active && !wsa883x->reset_was_active)
++		wsa883x_gpio_ctrl(wsa883x, false);
++	if (wsa883x->supplies_initialized)
++		msm_cdc_release_supplies(wsa883x->dev, wsa883x->supplies,
++					 wsa883x->regulator, wsa883x->num_supplies);
++	if (wsa883x->parent_dev)
++		put_device(&wsa883x->parent_dev->dev);
++	of_node_put(wsa883x->parent_np);
++	of_node_put(wsa883x->wsa_rst_np);
++	swr_set_dev_data(wsa883x->swr_slave, NULL);
++	mutex_destroy(&wsa883x->res_lock);
++	return 0;
++}
+ 
+ static int wsa883x_swr_probe(struct swr_device *pdev)
+ {
+ 	int ret = 0, i = 0;
+ 	struct wsa883x_priv *wsa883x;
+ 	u8 devnum = 0;
+-	bool pin_state_current = false;
+ 	struct wsa_ctrl_platform_data *plat_data = NULL;
+ 	struct snd_soc_component *component;
+ 	char buffer[MAX_NAME_LEN];
+@@ -1787,34 +1831,41 @@
+ 	struct regmap_irq_chip *wsa883x_sub_regmap_irq_chip = NULL;
+ 
+ 	wsa883x = devm_kzalloc(&pdev->dev, sizeof(struct wsa883x_priv),
+-			    GFP_KERNEL);
++			       GFP_KERNEL);
+ 	if (!wsa883x)
+ 		return -ENOMEM;
+ 
++	mutex_init(&wsa883x->res_lock);
++	wsa883x->dev = &pdev->dev;
++	wsa883x->swr_slave = pdev;
++	swr_set_dev_data(pdev, wsa883x);
++
+ 	wsa883x_sub_regmap_irq_chip = devm_kzalloc(&pdev->dev, sizeof(struct regmap_irq_chip),
+-				GFP_KERNEL);
+-	if (!wsa883x_sub_regmap_irq_chip)
+-		return -ENOMEM;
++						   GFP_KERNEL);
++	if (!wsa883x_sub_regmap_irq_chip) {
++		ret = -ENOMEM;
++		goto err;
++	}
+ 	memcpy(wsa883x_sub_regmap_irq_chip, &wsa883x_regmap_irq_chip,
+ 		sizeof(struct regmap_irq_chip));
+ 
+ 	ret = wsa883x_enable_supplies(&pdev->dev, wsa883x);
+-	if (ret) {
+-		ret = -EPROBE_DEFER;
++	if (ret)
+ 		goto err;
+-	}
+ 
+ 	wsa883x->wsa_rst_np = of_parse_phandle(pdev->dev.of_node,
+-					     "qcom,spkr-sd-n-node", 0);
++					       "qcom,spkr-sd-n-node", 0);
+ 	if (!wsa883x->wsa_rst_np) {
+ 		dev_dbg(&pdev->dev, "%s: pinctrl not defined\n", __func__);
+-		goto err_supply;
+-	}
+-	swr_set_dev_data(pdev, wsa883x);
+-	wsa883x->swr_slave = pdev;
+-	wsa883x->dev = &pdev->dev;
+-	pin_state_current = msm_cdc_pinctrl_get_state(wsa883x->wsa_rst_np);
+-	wsa883x_gpio_ctrl(wsa883x, true);
++		ret = -EINVAL;
++		goto err;
++	}
++	wsa883x->reset_was_active =
++		msm_cdc_pinctrl_get_state(wsa883x->wsa_rst_np);
++	ret = wsa883x_gpio_ctrl(wsa883x, true);
++	if (ret)
++		goto err;
++	wsa883x->reset_active = true;
+ 	/*
+ 	 * Add 5msec delay to provide sufficient time for
+ 	 * soundwire auto enumeration of slave devices as
+@@ -1827,7 +1878,7 @@
+ 			"%s get devnum %d for dev addr %llx failed\n",
+ 			__func__, devnum, pdev->addr);
+ 		ret = -EPROBE_DEFER;
+-		goto err_supply;
++		goto err;
+ 	}
+ 	pdev->dev_num = devnum;
+ 
+@@ -1837,33 +1888,17 @@
+ 		ret = PTR_ERR(wsa883x->regmap);
+ 		dev_err(&pdev->dev, "%s: regmap_init failed %d\n",
+ 			__func__, ret);
+-		goto dev_err;
++		goto err;
+ 	}
+ 
+ 	devm_regmap_qti_debugfs_register(&pdev->dev, wsa883x->regmap);
+ 
+-	/*
+-	 * gracefully handle proc creation
+-	 * if proc fails, probe should not be affected
+-	 **/
+-	proc_entry_name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "wsa883x_reginfo_%d", devnum);
+-	wsa883x->wsa883x_proc_entry = proc_mkdir(proc_entry_name, NULL);
+-	if (wsa883x->wsa883x_proc_entry) {
+-		wsa883x_proc_regdump_file = proc_create_data("wsa883x_regdump", 0444,
+-				wsa883x->wsa883x_proc_entry, &wsa883x_proc_ops, wsa883x);
+-		if (!wsa883x_proc_regdump_file) {
+-			dev_err(&pdev->dev, "%s: Error creating proc read file interface\n",
+-					__func__);
+-			proc_remove(wsa883x->wsa883x_proc_entry);
+-			wsa883x->wsa883x_proc_entry = NULL;
+-		}
+-	} else {
+-		dev_err(&pdev->dev, "%s: Error creating proc dir interface\n", __func__);
+-	}
+-
+ 	/* Set all interrupts as edge triggered */
+-	for (i = 0; i < wsa883x_sub_regmap_irq_chip->num_regs; i++)
+-		regmap_write(wsa883x->regmap, (WSA883X_INTR_LEVEL0 + i), 0);
++	for (i = 0; i < wsa883x_sub_regmap_irq_chip->num_regs; i++) {
++		ret = regmap_write(wsa883x->regmap, WSA883X_INTR_LEVEL0 + i, 0);
++		if (ret)
++			goto err;
++	}
+ 
+ 	wsa883x_sub_regmap_irq_chip->irq_drv_data = wsa883x;
+ 	wsa883x->irq_info.wcd_regmap_irq_chip = wsa883x_sub_regmap_irq_chip;
+@@ -1875,80 +1910,109 @@
+ 	if (ret) {
+ 		dev_err(wsa883x->dev, "%s: IRQ init failed: %d\n",
+ 			__func__, ret);
+-		goto dev_err;
+-	}
+-    wsa883x->swr_slave->slave_irq = wsa883x->virq;
+-
+-	wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_SAF2WAR,
+-			"WSA SAF2WAR", wsa883x_saf2war_handle_irq, wsa883x);
++		goto err;
++	}
++
++	ret = wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_SAF2WAR,
++			      "WSA SAF2WAR", wsa883x_saf2war_handle_irq, wsa883x);
++	if (ret)
++		goto err;
++	set_bit(WSA883X_IRQ_INT_SAF2WAR, &wsa883x->requested_irqs);
+ 
+ 	wcd_disable_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_SAF2WAR);
+ 
+-	wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_WAR2SAF,
+-			"WSA WAR2SAF", wsa883x_war2saf_handle_irq, wsa883x);
++	ret = wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_WAR2SAF,
++			      "WSA WAR2SAF", wsa883x_war2saf_handle_irq, wsa883x);
++	if (ret)
++		goto err;
++	set_bit(WSA883X_IRQ_INT_WAR2SAF, &wsa883x->requested_irqs);
+ 
+ 	wcd_disable_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_WAR2SAF);
+ 
+-	wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_DISABLE,
+-			"WSA OTP", wsa883x_otp_handle_irq, wsa883x);
++	ret = wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_DISABLE,
++			      "WSA OTP", wsa883x_otp_handle_irq, wsa883x);
++	if (ret)
++		goto err;
++	set_bit(WSA883X_IRQ_INT_DISABLE, &wsa883x->requested_irqs);
+ 
+ 	wcd_disable_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_DISABLE);
+ 
+-	wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_OCP,
+-			"WSA OCP", wsa883x_ocp_handle_irq, wsa883x);
++	ret = wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_OCP,
++			      "WSA OCP", wsa883x_ocp_handle_irq, wsa883x);
++	if (ret)
++		goto err;
++	set_bit(WSA883X_IRQ_INT_OCP, &wsa883x->requested_irqs);
+ 
+ 	wcd_disable_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_OCP);
+ 
+-	wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_CLIP,
+-			"WSA CLIP", wsa883x_clip_handle_irq, wsa883x);
++	ret = wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_CLIP,
++			      "WSA CLIP", wsa883x_clip_handle_irq, wsa883x);
++	if (ret)
++		goto err;
++	set_bit(WSA883X_IRQ_INT_CLIP, &wsa883x->requested_irqs);
+ 
+ 	wcd_disable_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_CLIP);
+ 
+-	wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_PDM_WD,
+-			"WSA PDM WD", wsa883x_pdm_wd_handle_irq, wsa883x);
++	ret = wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_PDM_WD,
++			      "WSA PDM WD", wsa883x_pdm_wd_handle_irq, wsa883x);
++	if (ret)
++		goto err;
++	set_bit(WSA883X_IRQ_INT_PDM_WD, &wsa883x->requested_irqs);
+ 
+ 	wcd_disable_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_PDM_WD);
+ 	wsa883x->pdm_wd_enabled = false;
+ 
+-	wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_CLK_WD,
+-			"WSA CLK WD", wsa883x_clk_wd_handle_irq, wsa883x);
++	ret = wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_CLK_WD,
++			      "WSA CLK WD", wsa883x_clk_wd_handle_irq, wsa883x);
++	if (ret)
++		goto err;
++	set_bit(WSA883X_IRQ_INT_CLK_WD, &wsa883x->requested_irqs);
+ 
+ 	wcd_disable_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_CLK_WD);
+ 
+-	wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_INTR_PIN,
+-			"WSA EXT INT", wsa883x_ext_int_handle_irq, wsa883x);
++	ret = wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_INTR_PIN,
++			      "WSA EXT INT", wsa883x_ext_int_handle_irq, wsa883x);
++	if (ret)
++		goto err;
++	set_bit(WSA883X_IRQ_INT_INTR_PIN, &wsa883x->requested_irqs);
+ 
+ 	wcd_disable_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_INTR_PIN);
+ 
+ 	/* Under Voltage Lock out (UVLO) interrupt handle */
+-	wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_UVLO,
+-			"WSA UVLO", wsa883x_uvlo_handle_irq, wsa883x);
++	ret = wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_UVLO,
++			      "WSA UVLO", wsa883x_uvlo_handle_irq, wsa883x);
++	if (ret)
++		goto err;
++	set_bit(WSA883X_IRQ_INT_UVLO, &wsa883x->requested_irqs);
+ 
+ 	wcd_disable_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_UVLO);
+ 
+-	wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_PA_ON_ERR,
+-			"WSA PA ERR", wsa883x_pa_on_err_handle_irq, wsa883x);
++	ret = wcd_request_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_PA_ON_ERR,
++			      "WSA PA ERR", wsa883x_pa_on_err_handle_irq, wsa883x);
++	if (ret)
++		goto err;
++	set_bit(WSA883X_IRQ_INT_PA_ON_ERR, &wsa883x->requested_irqs);
+ 
+ 	wcd_disable_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_PA_ON_ERR);
+ 
+ 	wsa883x->driver = devm_kzalloc(&pdev->dev,
+-			sizeof(struct snd_soc_component_driver), GFP_KERNEL);
+-        if (!wsa883x->driver) {
+-                ret = -ENOMEM;
+-                goto err_irq;
+-        }
+-
+-        memcpy(wsa883x->driver, &soc_codec_dev_wsa883x_wsa,
+-                        sizeof(struct snd_soc_component_driver));
++				       sizeof(*wsa883x->driver), GFP_KERNEL);
++	if (!wsa883x->driver) {
++		ret = -ENOMEM;
++		goto err;
++	}
++
++	memcpy(wsa883x->driver, &soc_codec_dev_wsa883x_wsa,
++	       sizeof(*wsa883x->driver));
+ 
+ 	wsa883x->dai_driver = devm_kzalloc(&pdev->dev,
+-				sizeof(struct snd_soc_dai_driver), GFP_KERNEL);
++					   sizeof(*wsa883x->dai_driver), GFP_KERNEL);
+ 	if (!wsa883x->dai_driver) {
+ 		ret = -ENOMEM;
+-		goto err_mem;
+-	}
+-
+-	memcpy(wsa883x->dai_driver, wsa_dai, sizeof(struct snd_soc_dai_driver));
++		goto err;
++	}
++
++	memcpy(wsa883x->dai_driver, wsa_dai, sizeof(*wsa883x->dai_driver));
+ 
+ 	/* Get last digit from HEX format */
+ 	dev_index = (int)((char)(pdev->addr & 0xF));
+@@ -1957,61 +2021,89 @@
+ 		dev_index += 2;
+ 
+ 	snprintf(buffer, sizeof(buffer), "wsa-codec.%d", dev_index);
+-	wsa883x->driver->name = kstrndup(buffer, strlen(buffer), GFP_KERNEL);
++	wsa883x->driver->name = devm_kstrdup(&pdev->dev, buffer, GFP_KERNEL);
+ 
+ 	snprintf(buffer, sizeof(buffer), "wsa_rx%d", dev_index);
+ 	wsa883x->dai_driver->name =
+-				kstrndup(buffer, strlen(buffer), GFP_KERNEL);
++				devm_kstrdup(&pdev->dev, buffer, GFP_KERNEL);
+ 
+ 	snprintf(buffer, sizeof(buffer), "WSA883X_AIF%d Playback", dev_index);
+ 	wsa883x->dai_driver->playback.stream_name =
+-				kstrndup(buffer, strlen(buffer), GFP_KERNEL);
++				devm_kstrdup(&pdev->dev, buffer, GFP_KERNEL);
++
++	if (!wsa883x->driver->name || !wsa883x->dai_driver->name ||
++	    !wsa883x->dai_driver->playback.stream_name) {
++		ret = -ENOMEM;
++		goto err;
++	}
+ 
+ 	/* Number of DAI's used is 1 */
+ 	ret = snd_soc_register_component(&pdev->dev,
+-				wsa883x->driver, wsa883x->dai_driver, 1);
++					 wsa883x->driver, wsa883x->dai_driver, 1);
++	if (ret)
++		goto err;
++	wsa883x->component_registered = true;
+ 
+ 	component = snd_soc_lookup_component(&pdev->dev, wsa883x->driver->name);
+ 	if (!component) {
+-		dev_err(&pdev->dev, "%s: component is NULL \n", __func__);
++		dev_err(&pdev->dev, "%s: component is NULL\n", __func__);
+ 		ret = -EINVAL;
+-		goto err_mem;
+-	}
++		goto err;
++	}
++
++	ret = swr_set_slave_irq(pdev, wsa883x->virq);
++	if (ret)
++		goto err;
++	wsa883x->irq_published = true;
+ 
+ 	wsa883x->parent_np = of_parse_phandle(pdev->dev.of_node,
+ 					      "qcom,bolero-handle", 0);
+ 	if (!wsa883x->parent_np)
+ 		wsa883x->parent_np = of_parse_phandle(pdev->dev.of_node,
+-					      "qcom,lpass-cdc-handle", 0);
++						      "qcom,lpass-cdc-handle", 0);
+ 	if (wsa883x->parent_np) {
+-		wsa883x->parent_dev =
+-				of_find_device_by_node(wsa883x->parent_np);
+-		if (wsa883x->parent_dev) {
+-			plat_data = dev_get_platdata(&wsa883x->parent_dev->dev);
+-			if (plat_data) {
+-				wsa883x->parent_nblock.notifier_call =
+-							wsa883x_event_notify;
+-				if (plat_data->register_notifier)
+-					plat_data->register_notifier(
+-						plat_data->handle,
+-						&wsa883x->parent_nblock,
+-						true);
+-				wsa883x->register_notifier =
+-						plat_data->register_notifier;
+-				wsa883x->handle = plat_data->handle;
+-			} else {
+-				dev_err(&pdev->dev, "%s: plat data not found\n",
+-					__func__);
+-			}
+-		} else {
+-			dev_err(&pdev->dev, "%s: parent dev not found\n",
++		wsa883x->parent_dev = of_find_device_by_node(wsa883x->parent_np);
++		if (!wsa883x->parent_dev) {
++			ret = -EPROBE_DEFER;
++			goto err;
++		}
++		plat_data = dev_get_platdata(&wsa883x->parent_dev->dev);
++		if (!plat_data || !plat_data->register_notifier) {
++			ret = -EPROBE_DEFER;
++			goto err;
++		}
++		if (!device_link_add(&pdev->dev, &wsa883x->parent_dev->dev,
++				     DL_FLAG_AUTOREMOVE_CONSUMER)) {
++			ret = -ENOMEM;
++			goto err;
++		}
++		wsa883x->handle = plat_data->handle;
++		wsa883x->register_notifier = plat_data->register_notifier;
++		wsa883x->parent_nblock.notifier_call = wsa883x_event_notify;
++		ret = wsa883x->register_notifier(wsa883x->handle,
++					  &wsa883x->parent_nblock, true);
++		if (ret)
++			goto err;
++		wsa883x->notifier_registered = true;
++	}
++
++	proc_entry_name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "wsa883x_reginfo_%d", devnum);
++	if (proc_entry_name)
++		wsa883x->wsa883x_proc_entry = proc_mkdir(proc_entry_name, NULL);
++	if (wsa883x->wsa883x_proc_entry) {
++		wsa883x_proc_regdump_file =
++			proc_create_data("wsa883x_regdump", 0444,
++					 wsa883x->wsa883x_proc_entry,
++					 &wsa883x_proc_ops, wsa883x);
++		if (!wsa883x_proc_regdump_file) {
++			dev_err(&pdev->dev, "%s: Error creating proc read file interface\n",
+ 				__func__);
++			proc_remove(wsa883x->wsa883x_proc_entry);
++			wsa883x->wsa883x_proc_entry = NULL;
+ 		}
+ 	} else {
+-		dev_info(&pdev->dev, "%s: parent node not found\n", __func__);
+-	}
+-
+-	mutex_init(&wsa883x->res_lock);
++		dev_err(&pdev->dev, "%s: Error creating proc dir interface\n", __func__);
++	}
+ 
+ #ifdef CONFIG_DEBUG_FS
+ 	if (!wsa883x->debugfs_dent) {
+@@ -2045,88 +2137,18 @@
+ 
+ 	return 0;
+ 
+-err_mem:
+-	if (wsa883x->dai_driver) {
+-		kfree(wsa883x->dai_driver->name);
+-		kfree(wsa883x->dai_driver->playback.stream_name);
+-		kfree(wsa883x->dai_driver);
+-	}
+-	if (wsa883x->driver) {
+-		kfree(wsa883x->driver->name);
+-		kfree(wsa883x->driver);
+-	}
+-err_irq:
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_SAF2WAR, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_WAR2SAF, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_DISABLE, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_OCP, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_CLIP, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_PDM_WD, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_CLK_WD, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_INTR_PIN, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_UVLO, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_PA_ON_ERR, NULL);
+-	wcd_irq_exit(&wsa883x->irq_info, wsa883x->virq);
+-dev_err:
+-	if (pin_state_current == false)
+-		wsa883x_gpio_ctrl(wsa883x, false);
+-	swr_remove_device(pdev);
+-err_supply:
+-	msm_cdc_release_supplies(&pdev->dev, wsa883x->supplies,
+-				 wsa883x->regulator,
+-				 wsa883x->num_supplies);
+ err:
+-	swr_set_dev_data(pdev, NULL);
++	wsa883x_swr_cleanup(wsa883x);
+ 	return ret;
+ }
+ 
+ static int wsa883x_swr_remove(struct swr_device *pdev)
+ {
+-	struct wsa883x_priv *wsa883x;
+-
+-	wsa883x = swr_get_dev_data(pdev);
+-	if (!wsa883x) {
+-		dev_err(&pdev->dev, "%s: wsa883x is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if (wsa883x->wsa883x_proc_entry)
+-		proc_remove(wsa883x->wsa883x_proc_entry);
+-
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_SAF2WAR, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_WAR2SAF, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_DISABLE, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_OCP, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_CLIP, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_PDM_WD, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_CLK_WD, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_INTR_PIN, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_UVLO, NULL);
+-	wcd_free_irq(&wsa883x->irq_info, WSA883X_IRQ_INT_PA_ON_ERR, NULL);
+-
+-	if (wsa883x->register_notifier)
+-		wsa883x->register_notifier(wsa883x->handle,
+-				&wsa883x->parent_nblock, false);
+-#ifdef CONFIG_DEBUG_FS
+-	debugfs_remove_recursive(wsa883x->debugfs_dent);
+-	wsa883x->debugfs_dent = NULL;
+-#endif
+-	mutex_destroy(&wsa883x->res_lock);
+-	snd_soc_unregister_component(&pdev->dev);
+-	if (wsa883x->dai_driver) {
+-		kfree(wsa883x->dai_driver->name);
+-		kfree(wsa883x->dai_driver->playback.stream_name);
+-		kfree(wsa883x->dai_driver);
+-	}
+-	if (wsa883x->driver) {
+-		kfree(wsa883x->driver->name);
+-		kfree(wsa883x->driver);
+-	}
+-	msm_cdc_release_supplies(&pdev->dev, wsa883x->supplies,
+-				 wsa883x->regulator,
+-				 wsa883x->num_supplies);
+-	swr_set_dev_data(pdev, NULL);
+-	return 0;
++	struct wsa883x_priv *wsa883x = swr_get_dev_data(pdev);
++
++	if (!wsa883x)
++		return 0;
++	return wsa883x_swr_cleanup(wsa883x);
+ }
+ 
+ #ifdef CONFIG_PM_SLEEP
+--- a/qcom/opensource/audio-kernel/asoc/codecs/wsa884x/internal.h
++++ b/qcom/opensource/audio-kernel/asoc/codecs/wsa884x/internal.h
+@@ -376,6 +376,13 @@
+ 	u8 dev_index;
+ 	struct irq_domain *virq;
+ 	struct wcd_irq_info irq_info;
++	unsigned long requested_irqs;
++	bool irq_published;
++	bool component_registered;
++	bool notifier_registered;
++	bool supplies_initialized;
++	bool reset_active;
++	bool reset_was_active;
+ 	struct swr_port_params wsa_port_params[SWR_UC_MAX][WSA884X_MAX_SWR_PORTS];
+ 	struct swr_dev_frame_config swr_wsa_port_params[SWR_UC_MAX];
+ #ifdef CONFIG_DEBUG_FS
+--- a/qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x.c
+@@ -560,6 +560,8 @@
+ 	if (!wsa884x)
+ 		return IRQ_NONE;
+ 	component = wsa884x->component;
++	if (!component)
++		return IRQ_NONE;
+ 	snd_soc_component_update_bits(component,
+ 		REG_FIELD_VALUE(PDM_WD_CTL, PDM_WD_EN, 0x00));
+ 	snd_soc_component_update_bits(component,
+@@ -1907,7 +1909,8 @@
+ 
+ 	max_uc = map_size / (WSA884X_MAX_SWR_PORTS * SWR_PORT_PARAMS * sizeof(u32));
+ 
+-	if (max_uc != SWR_UC_MAX) {
++	if (map_size != SWR_UC_MAX * WSA884X_MAX_SWR_PORTS *
++			SWR_PORT_PARAMS * sizeof(u32)) {
+ 		dev_err(dev, "%s: port params not provided for all usecases\n",
+ 			__func__);
+ 		ret = -EINVAL;
+@@ -1959,11 +1962,13 @@
+ 
+ 	ret = msm_cdc_init_supplies(dev, &priv->supplies,
+ 				    priv->regulator, priv->num_supplies);
+-	if (!priv->supplies) {
++	if (ret || !priv->supplies) {
+ 		dev_err(dev, "%s: Cannot init wsa supplies\n",
+ 			__func__);
+ 		return ret;
+ 	}
++
++	priv->supplies_initialized = true;
+ 
+ 	ret = msm_cdc_enable_static_supplies(dev, priv->supplies,
+ 					     priv->regulator,
+@@ -1990,57 +1995,52 @@
+ 	},
+ };
+ 
+-static int regdump_read(struct regmap *map, int baseReg, int endReg,
+-		char __user *user_buf, size_t count, loff_t *ppos)
+-{
+-	int i = 0, ret = 0;
++static int regdump_read(struct regmap *map, int base_reg, int end_reg,
++			char __user *user_buf, size_t count, loff_t *ppos)
++{
++	char address[16], *buf;
++	unsigned int reg_val, reg_len, reg_val_len, line_len;
+ 	size_t pos = 0;
+-	char *buf;
+-	unsigned int reg_val = 0, reg_len = 0;
+-	unsigned int reg_val_len = 0, regdump_wr_len = 0;
+-
+-	i  = ((int) *ppos + baseReg);
+-
++	int i, ret, records = 0;
++
++	if (*ppos < 0 || end_reg < base_reg)
++		return -EINVAL;
++	if (*ppos > end_reg - base_reg || !count)
++		return 0;
++
++	reg_len = scnprintf(address, sizeof(address), "%x", end_reg);
++	reg_val_len = 2 * DIV_ROUND_UP(REGDUMP_PRINT_LEN, 8);
++	line_len = reg_len + reg_val_len + 3;
++	count = min_t(size_t, count, PAGE_SIZE);
++	/* Check the first complete record before writing into a short buffer. */
++	if (count < line_len)
++		return 0;
+ 	buf = kzalloc(count, GFP_KERNEL);
+ 	if (!buf)
+ 		return -ENOMEM;
+ 
+-	reg_len = scnprintf(buf, count, "%x", endReg);
+-	reg_val_len = 2 * DIV_ROUND_UP(REGDUMP_PRINT_LEN, 8);
+-	regdump_wr_len = reg_len + reg_val_len + 3;
+-
+-	/* Disable reading/writing from regmap-cache */
++	i = base_reg + *ppos;
+ 	regcache_cache_bypass(map, true);
+-	for (; i >= 0 && i <= endReg; i += 1) {
+-		/*
+-		 * Check not to overwrite the buffer, by ensuring we have
+-		 * space for writing next register data
+-		 *
+-		 * this is scalable if we use proc or any other fs interface
+-		 * as count would take the buf_size passed from userspace
+-		 */
+-		if ((pos + regdump_wr_len) >= count)
+-			break;
+-		scnprintf(buf+pos, count-pos, "%.*x: ", reg_len, i);
++	for (; i <= end_reg && count - pos >= line_len; i++) {
++		scnprintf(buf + pos, count - pos, "%.*x: ", reg_len, i);
+ 		pos += reg_len + 2;
+ 		ret = regmap_read(map, i, &reg_val);
+-		if (ret == 0)
+-			scnprintf(buf+pos, count-pos, "%.*x", reg_val_len, reg_val);
++		if (!ret)
++			scnprintf(buf + pos, count - pos, "%.*x",
++				  reg_val_len, reg_val);
+ 		else
+-			memset(buf+pos, 'X', reg_val_len);
+-
+-		pos +=  reg_val_len;
++			memset(buf + pos, 'X', reg_val_len);
++		pos += reg_val_len;
+ 		buf[pos++] = '\n';
+-		*ppos += 1;
+-
+-	}
+-	/* Enable reading/writing from regmap-cache */
++		records++;
++	}
+ 	regcache_cache_bypass(map, false);
+ 
+ 	ret = pos;
+ 	if (copy_to_user(user_buf, buf, pos))
+ 		ret = -EFAULT;
+-
++	else
++		*ppos += records;
+ 	kfree(buf);
+ 	return ret;
+ }
+@@ -2065,12 +2065,65 @@
+ 	.proc_read = wsa884x_proc_read,
+ };
+ 
++/* Called by the driver core with probe/remove serialized, never from an IRQ. */
++static int wsa884x_swr_cleanup(struct wsa884x_priv *wsa884x)
++{
++	int irq, ret;
++
++	if (wsa884x->notifier_registered) {
++		ret = wsa884x->register_notifier(wsa884x->handle,
++					  &wsa884x->parent_nblock, false);
++		if (ret)
++			return ret;
++		wsa884x->notifier_registered = false;
++	}
++	if (wsa884x->irq_published) {
++		/* Withdrawal waits for dispatch without holding handler locks. */
++		ret = swr_set_slave_irq(wsa884x->swr_slave, NULL);
++		if (ret)
++			return ret;
++		wsa884x->irq_published = false;
++	}
++	proc_remove(wsa884x->wsa884x_proc_entry);
++	wsa884x->wsa884x_proc_entry = NULL;
++#ifdef CONFIG_DEBUG_FS
++	debugfs_remove_recursive(wsa884x->debugfs_dent);
++	wsa884x->debugfs_dent = NULL;
++#endif
++	if (wsa884x->component_registered) {
++		snd_soc_unregister_component(wsa884x->dev);
++		wsa884x->component_registered = false;
++	}
++	for (irq = WSA884X_NUM_IRQS - 1; irq >= 0; irq--) {
++		if (test_and_clear_bit(irq, &wsa884x->requested_irqs))
++			wcd_free_irq(&wsa884x->irq_info, irq, wsa884x);
++	}
++	if (wsa884x->virq) {
++		wcd_irq_exit(&wsa884x->irq_info, wsa884x->virq);
++		wsa884x->virq = NULL;
++	}
++	if (wsa884x->reset_active && !wsa884x->reset_was_active)
++		wsa884x_gpio_ctrl(wsa884x, false);
++	if (wsa884x->supplies_initialized)
++		msm_cdc_release_supplies(wsa884x->dev, wsa884x->supplies,
++					 wsa884x->regulator, wsa884x->num_supplies);
++	if (wsa884x->macro_dev)
++		put_device(&wsa884x->macro_dev->dev);
++	of_node_put(wsa884x->macro_np);
++	if (wsa884x->parent_dev)
++		put_device(&wsa884x->parent_dev->dev);
++	of_node_put(wsa884x->parent_np);
++	of_node_put(wsa884x->wsa_rst_np);
++	swr_set_dev_data(wsa884x->swr_slave, NULL);
++	mutex_destroy(&wsa884x->res_lock);
++	return 0;
++}
++
+ static int wsa884x_swr_probe(struct swr_device *pdev)
+ {
+-	int ret = 0;
++	int ret = 0, i;
+ 	struct wsa884x_priv *wsa884x;
+ 	u8 devnum = 0;
+-	bool pin_state_current = false;
+ 	struct wsa_ctrl_platform_data *plat_data = NULL;
+ 	struct snd_soc_component *component;
+ 	u32 noise_gate_mode;
+@@ -2083,36 +2136,42 @@
+ 	char *proc_entry_name;
+ 	struct proc_dir_entry *wsa884x_proc_regdump_file = NULL;
+ 
+-
+ 	wsa884x = devm_kzalloc(&pdev->dev, sizeof(struct wsa884x_priv),
+-			    GFP_KERNEL);
++			       GFP_KERNEL);
+ 	if (!wsa884x)
+ 		return -ENOMEM;
+ 
++	mutex_init(&wsa884x->res_lock);
++	wsa884x->dev = &pdev->dev;
++	wsa884x->swr_slave = pdev;
++	swr_set_dev_data(pdev, wsa884x);
++
+ 	wsa884x_sub_regmap_irq_chip = devm_kzalloc(&pdev->dev, sizeof(struct regmap_irq_chip),
+-				 GFP_KERNEL);
+-	if (!wsa884x_sub_regmap_irq_chip)
+-		return -ENOMEM;
++						   GFP_KERNEL);
++	if (!wsa884x_sub_regmap_irq_chip) {
++		ret = -ENOMEM;
++		goto err;
++	}
+ 	memcpy(wsa884x_sub_regmap_irq_chip, &wsa884x_regmap_irq_chip,
+ 			sizeof(struct regmap_irq_chip));
+ 
+ 	ret = wsa884x_enable_supplies(&pdev->dev, wsa884x);
+-	if (ret) {
+-		ret = -EPROBE_DEFER;
+-		goto err;
+-	}
++	if (ret)
++		goto err;
+ 
+ 	wsa884x->wsa_rst_np = of_parse_phandle(pdev->dev.of_node,
+-					     "qcom,spkr-sd-n-node", 0);
++					       "qcom,spkr-sd-n-node", 0);
+ 	if (!wsa884x->wsa_rst_np) {
+ 		dev_dbg(&pdev->dev, "%s: pinctrl not defined\n", __func__);
+-		goto err_supply;
+-	}
+-	swr_set_dev_data(pdev, wsa884x);
+-	wsa884x->swr_slave = pdev;
+-	wsa884x->dev = &pdev->dev;
+-	pin_state_current = msm_cdc_pinctrl_get_state(wsa884x->wsa_rst_np);
+-	wsa884x_gpio_ctrl(wsa884x, true);
++		ret = -EINVAL;
++		goto err;
++	}
++	wsa884x->reset_was_active =
++		msm_cdc_pinctrl_get_state(wsa884x->wsa_rst_np);
++	ret = wsa884x_gpio_ctrl(wsa884x, true);
++	if (ret)
++		goto err;
++	wsa884x->reset_active = true;
+ 	/*
+ 	 * Add 5msec delay to provide sufficient time for
+ 	 * soundwire auto enumeration of slave devices as
+@@ -2125,7 +2184,7 @@
+ 			"%s get devnum %d for dev addr %llx failed\n",
+ 			__func__, devnum, pdev->addr);
+ 		ret = -EPROBE_DEFER;
+-		goto err_supply;
++		goto err;
+ 	}
+ 	pdev->dev_num = devnum;
+ 
+@@ -2135,23 +2194,10 @@
+ 		ret = PTR_ERR(wsa884x->regmap);
+ 		dev_err(&pdev->dev, "%s: regmap_init failed %d\n",
+ 			__func__, ret);
+-		goto dev_err;
++		goto err;
+ 	}
+ 
+ 	devm_regmap_qti_debugfs_register(&pdev->dev, wsa884x->regmap);
+-
+-	proc_entry_name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "wsa884x_reginfo_%d", devnum);
+-	wsa884x->wsa884x_proc_entry = proc_mkdir(proc_entry_name, NULL);
+-	if (wsa884x->wsa884x_proc_entry) {
+-		wsa884x_proc_regdump_file = proc_create_data("wsa884x_regdump", 0444,
+-				wsa884x->wsa884x_proc_entry, &wsa884x_proc_ops, wsa884x);
+-		if (!wsa884x_proc_regdump_file) {
+-			dev_err(&pdev->dev, "%s: error creating proc read interface\n",
+-					__func__);
+-			proc_remove(wsa884x->wsa884x_proc_entry);
+-			wsa884x->wsa884x_proc_entry = NULL;
+-		}
+-	}
+ 
+ 	wsa884x_sub_regmap_irq_chip->irq_drv_data = wsa884x;
+ 	wsa884x->irq_info.wcd_regmap_irq_chip = wsa884x_sub_regmap_irq_chip;
+@@ -2163,64 +2209,92 @@
+ 	if (ret) {
+ 		dev_err(wsa884x->dev, "%s: IRQ init failed: %d\n",
+ 			__func__, ret);
+-		goto dev_err;
+-	}
+-
+-	wsa884x->swr_slave->slave_irq = wsa884x->virq;
+-
+-	wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_SAF2WAR,
+-			"WSA SAF2WAR", wsa884x_saf2war_handle_irq, wsa884x);
+-
+-	wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_WAR2SAF,
+-			"WSA WAR2SAF", wsa884x_war2saf_handle_irq, wsa884x);
+-
+-	wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_DISABLE,
+-			"WSA OTP", wsa884x_otp_handle_irq, wsa884x);
+-
+-	wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_OCP,
+-			"WSA OCP", wsa884x_ocp_handle_irq, wsa884x);
+-
+-	wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_CLIP,
+-			"WSA CLIP", wsa884x_clip_handle_irq, wsa884x);
++		goto err;
++	}
++
++	ret = wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_SAF2WAR,
++			      "WSA SAF2WAR", wsa884x_saf2war_handle_irq, wsa884x);
++	if (ret)
++		goto err;
++	set_bit(WSA884X_IRQ_INT_SAF2WAR, &wsa884x->requested_irqs);
++
++	ret = wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_WAR2SAF,
++			      "WSA WAR2SAF", wsa884x_war2saf_handle_irq, wsa884x);
++	if (ret)
++		goto err;
++	set_bit(WSA884X_IRQ_INT_WAR2SAF, &wsa884x->requested_irqs);
++
++	ret = wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_DISABLE,
++			      "WSA OTP", wsa884x_otp_handle_irq, wsa884x);
++	if (ret)
++		goto err;
++	set_bit(WSA884X_IRQ_INT_DISABLE, &wsa884x->requested_irqs);
++
++	ret = wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_OCP,
++			      "WSA OCP", wsa884x_ocp_handle_irq, wsa884x);
++	if (ret)
++		goto err;
++	set_bit(WSA884X_IRQ_INT_OCP, &wsa884x->requested_irqs);
++
++	ret = wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_CLIP,
++			      "WSA CLIP", wsa884x_clip_handle_irq, wsa884x);
++	if (ret)
++		goto err;
++	set_bit(WSA884X_IRQ_INT_CLIP, &wsa884x->requested_irqs);
+ 
+ 	wcd_disable_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_CLIP);
+ 
+-	wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_PDM_WD,
+-			"WSA PDM WD", wsa884x_pdm_wd_handle_irq, wsa884x);
+-
+-	wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_CLK_WD,
+-			"WSA CLK WD", wsa884x_clk_wd_handle_irq, wsa884x);
+-
+-	wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_INTR_PIN,
+-			"WSA EXT INT", wsa884x_ext_int_handle_irq, wsa884x);
++	ret = wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_PDM_WD,
++			      "WSA PDM WD", wsa884x_pdm_wd_handle_irq, wsa884x);
++	if (ret)
++		goto err;
++	set_bit(WSA884X_IRQ_INT_PDM_WD, &wsa884x->requested_irqs);
++
++	ret = wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_CLK_WD,
++			      "WSA CLK WD", wsa884x_clk_wd_handle_irq, wsa884x);
++	if (ret)
++		goto err;
++	set_bit(WSA884X_IRQ_INT_CLK_WD, &wsa884x->requested_irqs);
++
++	ret = wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_INTR_PIN,
++			      "WSA EXT INT", wsa884x_ext_int_handle_irq, wsa884x);
++	if (ret)
++		goto err;
++	set_bit(WSA884X_IRQ_INT_INTR_PIN, &wsa884x->requested_irqs);
+ 
+ 	wcd_disable_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_INTR_PIN);
+ 
+ 	/* Under Voltage Lock out (UVLO) interrupt handle */
+-	wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_UVLO,
+-			"WSA UVLO", wsa884x_uvlo_handle_irq, wsa884x);
+-
+-	wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_PA_ON_ERR,
+-			"WSA PA ERR", wsa884x_pa_on_err_handle_irq, wsa884x);
++	ret = wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_UVLO,
++			      "WSA UVLO", wsa884x_uvlo_handle_irq, wsa884x);
++	if (ret)
++		goto err;
++	set_bit(WSA884X_IRQ_INT_UVLO, &wsa884x->requested_irqs);
++
++	ret = wcd_request_irq(&wsa884x->irq_info, WSA884X_IRQ_INT_PA_ON_ERR,
++			      "WSA PA ERR", wsa884x_pa_on_err_handle_irq, wsa884x);
++	if (ret)
++		goto err;
++	set_bit(WSA884X_IRQ_INT_PA_ON_ERR, &wsa884x->requested_irqs);
+ 
+ 	wsa884x->driver = devm_kzalloc(&pdev->dev,
+-			sizeof(struct snd_soc_component_driver), GFP_KERNEL);
++				       sizeof(*wsa884x->driver), GFP_KERNEL);
+ 	if (!wsa884x->driver) {
+ 		ret = -ENOMEM;
+-		goto err_irq;
++		goto err;
+ 	}
+ 
+ 	memcpy(wsa884x->driver, &soc_codec_dev_wsa884x_wsa,
+-			sizeof(struct snd_soc_component_driver));
++			sizeof(*wsa884x->driver));
+ 
+ 	wsa884x->dai_driver = devm_kzalloc(&pdev->dev,
+-				sizeof(struct snd_soc_dai_driver), GFP_KERNEL);
++					   sizeof(*wsa884x->dai_driver), GFP_KERNEL);
+ 	if (!wsa884x->dai_driver) {
+ 		ret = -ENOMEM;
+-		goto err_mem;
+-	}
+-
+-	memcpy(wsa884x->dai_driver, wsa_dai, sizeof(struct snd_soc_dai_driver));
++		goto err;
++	}
++
++	memcpy(wsa884x->dai_driver, wsa_dai, sizeof(*wsa884x->dai_driver));
+ 
+ 	/* Get last digit from HEX format */
+ 	dev_index = (int)((char)(pdev->addr & 0xF));
+@@ -2230,58 +2304,34 @@
+ 		dev_index += 2;
+ 
+ 	snprintf(buffer, sizeof(buffer), "wsa-codec.%d", dev_index);
+-	wsa884x->driver->name = kstrndup(buffer, strlen(buffer), GFP_KERNEL);
++	wsa884x->driver->name = devm_kstrdup(&pdev->dev, buffer, GFP_KERNEL);
+ 
+ 	snprintf(buffer, sizeof(buffer), "wsa_rx%d", dev_index);
+ 	wsa884x->dai_driver->name =
+-				kstrndup(buffer, strlen(buffer), GFP_KERNEL);
++				devm_kstrdup(&pdev->dev, buffer, GFP_KERNEL);
+ 
+ 	snprintf(buffer, sizeof(buffer), "WSA884X_AIF%d Playback", dev_index);
+ 	wsa884x->dai_driver->playback.stream_name =
+-				kstrndup(buffer, strlen(buffer), GFP_KERNEL);
++				devm_kstrdup(&pdev->dev, buffer, GFP_KERNEL);
++
++	if (!wsa884x->driver->name || !wsa884x->dai_driver->name ||
++	    !wsa884x->dai_driver->playback.stream_name) {
++		ret = -ENOMEM;
++		goto err;
++	}
+ 
+ 	/* Number of DAI's used is 1 */
+ 	ret = snd_soc_register_component(&pdev->dev,
+-				wsa884x->driver, wsa884x->dai_driver, 1);
++					 wsa884x->driver, wsa884x->dai_driver, 1);
++	if (ret)
++		goto err;
++	wsa884x->component_registered = true;
+ 
+ 	component = snd_soc_lookup_component(&pdev->dev, wsa884x->driver->name);
+ 	if (!component) {
+ 		dev_err(&pdev->dev, "%s: component is NULL\n", __func__);
+ 		ret = -EINVAL;
+-		goto err_mem;
+-	}
+-
+-	wsa884x->parent_np = of_parse_phandle(pdev->dev.of_node,
+-					      "qcom,bolero-handle", 0);
+-	if (!wsa884x->parent_np)
+-		wsa884x->parent_np = of_parse_phandle(pdev->dev.of_node,
+-					      "qcom,lpass-cdc-handle", 0);
+-	if (wsa884x->parent_np) {
+-		wsa884x->parent_dev =
+-				of_find_device_by_node(wsa884x->parent_np);
+-		if (wsa884x->parent_dev) {
+-			plat_data = dev_get_platdata(&wsa884x->parent_dev->dev);
+-			if (plat_data) {
+-				wsa884x->parent_nblock.notifier_call =
+-							wsa884x_event_notify;
+-				if (plat_data->register_notifier)
+-					plat_data->register_notifier(
+-						plat_data->handle,
+-						&wsa884x->parent_nblock,
+-						true);
+-				wsa884x->register_notifier =
+-						plat_data->register_notifier;
+-				wsa884x->handle = plat_data->handle;
+-			} else {
+-				dev_err(&pdev->dev, "%s: plat data not found\n",
+-					__func__);
+-			}
+-		} else {
+-			dev_err(&pdev->dev, "%s: parent dev not found\n",
+-				__func__);
+-		}
+-	} else {
+-		dev_info(&pdev->dev, "%s: parent node not found\n", __func__);
++		goto err;
+ 	}
+ 
+ 	/* Start in speaker mode by default */
+@@ -2290,7 +2340,7 @@
+ 	/* wsa_dev_index is macro_agnostic index */
+ 	wsa_dev_index = (wsa884x->dev_index - 1) % 2;
+ 	wsa884x->macro_np = of_parse_phandle(pdev->dev.of_node,
+-				"qcom,wsa-macro-handle", 0);
++					     "qcom,wsa-macro-handle", 0);
+ 	if (wsa884x->macro_np) {
+ 		wsa884x->macro_dev =
+ 				of_find_device_by_node(wsa884x->macro_np);
+@@ -2304,7 +2354,7 @@
+ 				dev_err(&pdev->dev,
+ 					"%s: Failed to read wsa rloads\n",
+ 							__func__);
+-				goto err_mem;
++				goto err;
+ 			}
+ 
+ 			ret = of_property_read_u32_index(
+@@ -2316,7 +2366,7 @@
+ 				dev_err(&pdev->dev,
+ 					"%s: Failed to read wsa bat cfgs\n",
+ 							__func__);
+-				goto err_mem;
++				goto err;
+ 			}
+ 
+ 			ret = of_property_read_u32(wsa884x->macro_dev->dev.of_node,
+@@ -2338,10 +2388,15 @@
+ 				dev_err(&pdev->dev,
+ 					"%s: missing wsa-system-gains\n",
+ 					__func__);
+-				goto err_mem;
++				ret = -EINVAL;
++				goto err;
+ 			}
+-
+-			sys_gain_length = sys_gain_size / sizeof(u32);
++			if (sys_gain_size != sizeof(wsa884x->sys_gains)) {
++				ret = -EINVAL;
++				goto err;
++			}
++
++			sys_gain_length = ARRAY_SIZE(wsa884x->sys_gains);
+ 			ret = of_property_read_u32_array(
+ 				wsa884x->macro_dev->dev.of_node,
+ 				"qcom,wsa-system-gains", wsa884x->sys_gains,
+@@ -2351,23 +2406,35 @@
+ 				dev_err(&pdev->dev,
+ 					"%s: Failed to read wsa system gains\n",
+ 						__func__);
+-				goto err_mem;
++				goto err;
++			}
++			for (i = 0; i < ARRAY_SIZE(wsa884x->sys_gains); i++) {
++				if (wsa884x->sys_gains[i] >= G_MAX_DB) {
++					ret = -EINVAL;
++					goto err;
++				}
+ 			}
+ 			wsa884x->system_gain = wsa884x->sys_gains[
+ 				wsa884x->dev_mode + wsa_dev_index * 2];
+ 		} else {
+ 			dev_err(&pdev->dev, "%s: parent dev not found\n",
+ 				__func__);
+-			goto err_mem;
++			ret = -EPROBE_DEFER;
++			goto err;
+ 		}
+ 	} else {
+ 		dev_err(&pdev->dev, "%s: parent node not found\n", __func__);
+-		goto err_mem;
++		ret = -EINVAL;
++		goto err;
+ 	}
+ 
+ 	dev_dbg(component->dev,
+ 		"%s: Bat_cfg: 0x%x rload: 0x%x, sys_gain: 0x%x\n", __func__,
+ 		wsa884x->bat_cfg, wsa884x->rload, wsa884x->system_gain);
++	if (wsa884x->rload >= WSA_MAX_OHMS || wsa884x->bat_cfg >= CONFIG_MAX) {
++		ret = -EINVAL;
++		goto err;
++	}
+ 	ret = wsa884x_validate_dt_configuration_params(component, wsa884x->rload,
+ 		wsa884x->bat_cfg, wsa884x->system_gain);
+ 	if (ret) {
+@@ -2375,7 +2442,7 @@
+ 			"%s: invalid dt parameter: Bat_cfg: 0x%x rload: 0x%x, sys_gain: 0x%x\n",
+ 			__func__, wsa884x->bat_cfg, wsa884x->rload, wsa884x->system_gain);
+ 		ret = -EINVAL;
+-		goto err_mem;
++		goto err;
+ 	}
+ 	/* Assume that compander is enabled by default unless it is haptics sku */
+ 	if (wsa884x->variant == WSA8845H)
+@@ -2413,9 +2480,62 @@
+ 		dev_err(&pdev->dev, "Failed to read port params\n");
+ 		goto err;
+ 	}
+-	swr_init_port_params(wsa884x->swr_slave, WSA884X_MAX_SWR_PORTS,
+-		wsa884x->swr_wsa_port_params);
+-	mutex_init(&wsa884x->res_lock);
++	ret = swr_init_port_params(wsa884x->swr_slave, WSA884X_MAX_SWR_PORTS,
++				   wsa884x->swr_wsa_port_params);
++	if (ret)
++		goto err;
++
++	ret = swr_set_slave_irq(pdev, wsa884x->virq);
++	if (ret)
++		goto err;
++	wsa884x->irq_published = true;
++
++	wsa884x->parent_np = of_parse_phandle(pdev->dev.of_node,
++					      "qcom,bolero-handle", 0);
++	if (!wsa884x->parent_np)
++		wsa884x->parent_np = of_parse_phandle(pdev->dev.of_node,
++						      "qcom,lpass-cdc-handle", 0);
++	if (wsa884x->parent_np) {
++		wsa884x->parent_dev = of_find_device_by_node(wsa884x->parent_np);
++		if (!wsa884x->parent_dev) {
++			ret = -EPROBE_DEFER;
++			goto err;
++		}
++		plat_data = dev_get_platdata(&wsa884x->parent_dev->dev);
++		if (!plat_data || !plat_data->register_notifier) {
++			ret = -EPROBE_DEFER;
++			goto err;
++		}
++		if (!device_link_add(&pdev->dev, &wsa884x->parent_dev->dev,
++				     DL_FLAG_AUTOREMOVE_CONSUMER)) {
++			ret = -ENOMEM;
++			goto err;
++		}
++		wsa884x->handle = plat_data->handle;
++		wsa884x->register_notifier = plat_data->register_notifier;
++		wsa884x->parent_nblock.notifier_call = wsa884x_event_notify;
++		ret = wsa884x->register_notifier(wsa884x->handle,
++					  &wsa884x->parent_nblock, true);
++		if (ret)
++			goto err;
++		wsa884x->notifier_registered = true;
++	}
++
++	proc_entry_name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "wsa884x_reginfo_%d", devnum);
++	if (proc_entry_name)
++		wsa884x->wsa884x_proc_entry = proc_mkdir(proc_entry_name, NULL);
++	if (wsa884x->wsa884x_proc_entry) {
++		wsa884x_proc_regdump_file =
++			proc_create_data("wsa884x_regdump", 0444,
++					 wsa884x->wsa884x_proc_entry,
++					 &wsa884x_proc_ops, wsa884x);
++		if (!wsa884x_proc_regdump_file) {
++			dev_err(&pdev->dev, "%s: error creating proc read interface\n",
++				__func__);
++			proc_remove(wsa884x->wsa884x_proc_entry);
++			wsa884x->wsa884x_proc_entry = NULL;
++		}
++	}
+ 
+ #ifdef CONFIG_DEBUG_FS
+ 	if (!wsa884x->debugfs_dent) {
+@@ -2449,70 +2569,18 @@
+ 
+ 	return 0;
+ 
+-err_mem:
+-	snd_soc_unregister_component(&pdev->dev);
+-	if (wsa884x->dai_driver) {
+-		kfree(wsa884x->dai_driver->name);
+-		kfree(wsa884x->dai_driver->playback.stream_name);
+-		devm_kfree(&pdev->dev, wsa884x->dai_driver);
+-		wsa884x->dai_driver = NULL;
+-	}
+-	if (wsa884x->driver) {
+-		kfree(wsa884x->driver->name);
+-		devm_kfree(&pdev->dev, wsa884x->driver);
+-		wsa884x->driver = NULL;
+-	}
+-err_irq:
+-	wcd_irq_exit(&wsa884x->irq_info, wsa884x->virq);
+-dev_err:
+-	if (pin_state_current == false)
+-		wsa884x_gpio_ctrl(wsa884x, false);
+-	swr_remove_device(pdev);
+-err_supply:
+-	msm_cdc_release_supplies(&pdev->dev, wsa884x->supplies,
+-				 wsa884x->regulator,
+-				 wsa884x->num_supplies);
+ err:
+-	swr_set_dev_data(pdev, NULL);
++	wsa884x_swr_cleanup(wsa884x);
+ 	return ret;
+ }
+ 
+ static int wsa884x_swr_remove(struct swr_device *pdev)
+ {
+-	struct wsa884x_priv *wsa884x;
+-
+-	wsa884x = swr_get_dev_data(pdev);
+-	if (!wsa884x) {
+-		dev_err(&pdev->dev, "%s: wsa884x is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	if (wsa884x->wsa884x_proc_entry)
+-		proc_remove(wsa884x->wsa884x_proc_entry);
+-
+-	if (wsa884x->register_notifier)
+-		wsa884x->register_notifier(wsa884x->handle,
+-				&wsa884x->parent_nblock, false);
+-#ifdef CONFIG_DEBUG_FS
+-	debugfs_remove_recursive(wsa884x->debugfs_dent);
+-	wsa884x->debugfs_dent = NULL;
+-#endif
+-	mutex_destroy(&wsa884x->res_lock);
+-	snd_soc_unregister_component(&pdev->dev);
+-	if (wsa884x->dai_driver) {
+-		kfree(wsa884x->dai_driver->name);
+-		kfree(wsa884x->dai_driver->playback.stream_name);
+-		kfree(wsa884x->dai_driver);
+-	}
+-	if (wsa884x->driver) {
+-		kfree(wsa884x->driver->name);
+-		kfree(wsa884x->driver);
+-	}
+-	msm_cdc_release_supplies(&pdev->dev, wsa884x->supplies,
+-				 wsa884x->regulator,
+-				 wsa884x->num_supplies);
+-	swr_set_dev_data(pdev, NULL);
+-	return 0;
++	struct wsa884x_priv *wsa884x = swr_get_dev_data(pdev);
++
++	if (!wsa884x)
++		return 0;
++	return wsa884x_swr_cleanup(wsa884x);
+ }
+ 
+ #ifdef CONFIG_PM_SLEEP

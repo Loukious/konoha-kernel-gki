@@ -1,0 +1,46 @@
+--- a/drivers/power/supply/mca/mca_hardware_ic/fuelgauge_ic/bq27z561/bq27z561.c
++++ b/drivers/power/supply/mca/mca_hardware_ic/fuelgauge_ic/bq27z561/bq27z561.c
+@@ -653,7 +653,8 @@
+ 	int i;
+ 	int byte, base, step;
+ 
+-	ret = fg_mac_read_block(bq, FG_MAC_CMD_MANU_NAME, t_buf, 32);
++	ret = fg_mac_read_block(bq, FG_MAC_CMD_MANU_NAME, t_buf,
++				FFC_TERMINATION_BYTE + 1);
+ 	if (ret < 0) {
+ 		mca_log_info("failed to get MANE NAME\n");
+ 		return ret;
+@@ -2996,7 +2997,7 @@
+ 	int ret = 0;
+ 	u8 t_buf[REG_BLOCK_LENGTH];
+ 
+-	ret = fg_mac_read_block(bq, FG_MAC_CMD_MANU_NAME, t_buf, REG_BLOCK_LENGTH);
++	ret = fg_mac_read_block(bq, FG_MAC_CMD_MANU_NAME, t_buf, 3);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -3456,13 +3457,13 @@
+ static const char *fg_get_device_name(struct bq_fg_chip *bq)
+ {
+ 	const struct mca_hwid *hwid = mca_get_hwid_info();
+-	char data[8] = { 0 };
++	char data[6] = { 0 };
+ 	int ret;
+ 
+ 	if (strcmp(bq->fake_device_name, "") != 0)
+ 		return bq->fake_device_name;
+ 
+-	ret = fg_mac_read_block(bq, FG_MAC_CMD_DEVICE_NAME, data, 8);
++	ret = fg_mac_read_block(bq, FG_MAC_CMD_DEVICE_NAME, data, 5);
+ 	if (ret < 0) {
+ 		mca_log_err("could not read device_name, ret=%d\n", ret);
+ 		return bq->device_name;
+@@ -6125,7 +6126,7 @@
+ {
+ 	int ret;
+ 	struct bq_fg_chip *bq;
+-	char data[32];
++	u8 data[3];
+ 
+ 	bq = devm_kzalloc(&client->dev, sizeof(*bq), GFP_KERNEL);
+ 	if (!bq)

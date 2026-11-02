@@ -1,0 +1,107 @@
+--- a/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_driver.c
++++ b/qcom/opensource/video-driver/driver/vidc/src/msm_vidc_driver.c
+@@ -3126,6 +3126,9 @@
+ 	q->mem_ops = core->vb2_mem_ops;
+ 	q->drv_priv = inst;
+ 	q->copy_timestamp = 1;
++	/* Metadata queues share the instance lock with the M2M queues. */
++	q->lock = &inst->ctx_q_lock;
++	q->dev = &core->pdev->dev;
+ 	rc = vb2_queue_init(q);
+ 	if (rc)
+ 		i_vpr_e(inst, "%s: vb2_queue_init failed for type %d\n",
+--- a/qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.c
++++ b/qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.c
+@@ -3474,11 +3474,13 @@
+ 		port_type = temp[3 * i + 1];
+ 		ch_mask = temp[3 * i + 2];
+ 
+-		if (!port_num || port_num > num_ports ||
++		if (!port_num || port_num > SWR_MSTR_PORT_LEN ||
+ 		    port_type > 0xff || !ch_mask || ch_mask > 0xff) {
+ 			ret = -EINVAL;
+ 			goto err_pdata_fail;
+ 		}
++		/* The DT count need not equal the highest sparse hardware ID. */
++		swrm->num_ports = max(swrm->num_ports, port_num);
+ 		ch_iter = mapped_channels[port_num];
+ 		if (ch_iter >= SWR_MAX_CH_PER_PORT) {
+ 			dev_err(&pdev->dev,
+--- a/qcom/opensource/audio-kernel/asoc/sun.c
++++ b/qcom/opensource/audio-kernel/asoc/sun.c
+@@ -2990,6 +2990,7 @@
+ 	struct device_node *dmic_nodes[4];
+ 	unsigned int i;
+ 	int ret;
++	const char *stage = "card allocation";
+ 
+ 	if (!pdev->dev.of_node)
+ 		return -EINVAL;
+@@ -3020,27 +3021,33 @@
+ 		ret = -EINVAL;
+ 		goto cleanup;
+ 	}
++	stage = "card name";
+ 	ret = snd_soc_of_parse_card_name(card, "qcom,model");
+ 	if (ret)
+ 		goto cleanup;
+ 	if (!strcmp(match->data, "codec")) {
++		stage = "audio routing";
+ 		ret = snd_soc_of_parse_audio_routing(card, "qcom,audio-routing");
+ 		if (ret)
+ 			goto cleanup;
+ 	}
++	stage = "amplifier selection";
+ 	ret = smartpa_dai_link_select(card);
+ 	if (ret)
+ 		goto cleanup;
++	stage = "DAI device nodes";
+ 	ret = msm_populate_dai_link_component_of_node(card);
+ 	if (ret)
+ 		goto cleanup;
+ 	msm_parse_upd_configuration(pdev, pdata);
++	stage = "pinctrl device nodes";
+ 	ret = msm_machine_get_nodes(&pdev->dev, pdata);
+ 	if (ret)
+ 		goto cleanup;
+ 	if (pdata->fsa_handle || pdata->wcd_usbss_handle)
+ 		pdata->mbhc_cfg.swap_gnd_mic = msm_usbc_swap_gnd_mic;
+ 	if (pdata->wcd_disabled && pdata->dmic_enable_gpio) {
++		stage = "DMIC pin activation";
+ 		ret = msm_cdc_pinctrl_select_active_state(pdata->dmic_enable_gpio);
+ 		if (ret)
+ 			goto cleanup;
+@@ -3053,6 +3060,7 @@
+ 	for (i = 0; i < ARRAY_SIZE(dmic_nodes); i++)
+ 		if (dmic_nodes[i])
+ 			msm_cdc_pinctrl_set_wakeup_capable(dmic_nodes[i], false);
++	stage = "LPASS audio clock";
+ 	pdata->lpass_audio_hw_vote = devm_clk_get(&pdev->dev, "lpass_audio_hw_vote");
+ 	if (IS_ERR(pdata->lpass_audio_hw_vote)) {
+ 		ret = PTR_ERR(pdata->lpass_audio_hw_vote);
+@@ -3060,14 +3068,17 @@
+ 		if (ret == -EPROBE_DEFER)
+ 			goto cleanup;
+ 	}
++	stage = "common card state";
+ 	ret = msm_common_snd_init(pdev, card);
+ 	if (ret)
+ 		goto cleanup;
+ 	/* All callbacks can now use common state and clock/pinctrl ownership. */
++	stage = "ASoC card registration";
+ 	ret = snd_soc_register_card(card);
+ 	if (ret)
+ 		goto cleanup;
+ 	pdata->card_registered = true;
++	stage = "SSR clients";
+ 	ret = msm_audio_ssr_register(&pdev->dev);
+ 	if (ret)
+ 		goto cleanup;
+@@ -3076,6 +3087,7 @@
+ 	mutex_unlock(&machine_probe_lock);
+ 	return 0;
+ cleanup:
++	ret = dev_err_probe(&pdev->dev, ret, "%s failed\n", stage);
+ 	msm_asoc_machine_cleanup(card);
+ 	platform_set_drvdata(pdev, NULL);
+ unlock:

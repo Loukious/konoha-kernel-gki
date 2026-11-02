@@ -1,0 +1,15 @@
+ddk_headers(
+    name = "extdisp_audio_headers",
+    hdrs = ["qcom/opensource/mm-drivers/msm_ext_display/include/msm_ext_display.h"],
+    includes = ["qcom/opensource/mm-drivers/msm_ext_display/include"],
+)
+
+ddk_module(
+    name = "msm_ext_display",
+    srcs = ["qcom/opensource/mm-drivers/msm_ext_display/src/msm_ext_display.c"],
+    out = "msm_ext_display.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":extdisp_audio_headers"],
+)

@@ -1,0 +1,112 @@
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+@@ -9226,10 +9226,6 @@
+ 		.type = NLA_U8},
+ 	[QCA_WLAN_VENDOR_ATTR_CONFIG_REDUCED_POWER_SCAN_MODE] = {
+ 		.type = NLA_U8},
+-	[QCA_WLAN_VENDOR_ATTR_CONFIG_CONSECUTIVE_TX_NO_ACK_DURATION] = {
+-		.type = NLA_U16 },
+-	[QCA_WLAN_VENDOR_ATTR_CONFIG_CONSECUTIVE_TX_NO_ACK_THRESHOLD] = {
+-		.type = NLA_U16 },
+ 	[QCA_WLAN_VENDOR_ATTR_CONFIG_FOLLOW_AP_PREFERENCE_FOR_CNDS_SELECT] = {
+ 		.type = NLA_U8},
+ 	[QCA_WLAN_VENDOR_ATTR_CONFIG_P2P_GO_BEACON_INTERVAL] = {
+@@ -10740,7 +10736,8 @@
+ 			    struct nlattr *tb[])
+ {
+ 	QDF_STATUS status;
+-	uint16_t tx_no_ack_duration, tx_no_ack_threshold;
++	u32 param_id;
++	u16 tx_no_ack_duration = 0, tx_no_ack_threshold = 0;
+ 	struct nlattr *tx_no_ack_duration_attr =
+ 		tb[QCA_WLAN_VENDOR_ATTR_CONFIG_CONSECUTIVE_TX_NO_ACK_DURATION];
+ 	struct nlattr *tx_no_ack_threshold_attr =
+@@ -10748,43 +10745,44 @@
+ 	struct dev_set_param setparam[MAX_PDEV_DATA_STALL_PARAMS] = {};
+ 	uint8_t index = 0;
+ 
+-	hdd_err("Set data stall params from use space start");
+-	if (!tx_no_ack_duration_attr || !tx_no_ack_threshold_attr) {
+-		hdd_err("Set data stall params fail");
++	if (!tx_no_ack_duration_attr && !tx_no_ack_threshold_attr)
+ 		return 0;
+-        }
+-
+-	tx_no_ack_duration = nla_get_u16(tx_no_ack_duration_attr);
+-	tx_no_ack_threshold = nla_get_u16(tx_no_ack_threshold_attr);
+-
+-	hdd_err("tx_no_ack_duration %d, tx_no_ack_threshold %d",
+-		  tx_no_ack_duration, tx_no_ack_threshold);
+-
+-	if ((tx_no_ack_duration > TX_NO_ACK_DURATION_MAX ||
+-	     (tx_no_ack_duration < TX_NO_ACK_DURATION_MIN &&
+-	      tx_no_ack_duration)) ||
+-	    (tx_no_ack_threshold < TX_NO_ACK_THRESHOLD_MIN &&
+-	     tx_no_ack_threshold)) {
+-		hdd_debug("param invalid");
+-		return -EINVAL;
+-	}
+-
+-	status = mlme_check_index_setparam(setparam,
+-					   wmi_pdev_param_dstall_consecutive_tx_no_ack_interval,
+-					   tx_no_ack_duration, index++,
+-					   MAX_PDEV_DATA_STALL_PARAMS);
+-	if (QDF_IS_STATUS_ERROR(status)) {
+-		hdd_err("failed at wmi_pdev_param_dstall_consecutive_tx_no_ack_interval");
+-		return -EINVAL;
+-	}
+-
+-	status = mlme_check_index_setparam(setparam,
+-					   wmi_pdev_param_dstall_consecutive_tx_no_ack_threshold,
+-					   tx_no_ack_threshold,
+-					   index++, MAX_PDEV_DATA_STALL_PARAMS);
+-	if (QDF_IS_STATUS_ERROR(status)) {
+-		hdd_err("failed at wmi_pdev_param_dstall_consecutive_tx_no_ack_threshold");
+-		return -EINVAL;
++
++	/* Validate every supplied value before submitting any firmware command. */
++	if (tx_no_ack_duration_attr) {
++		tx_no_ack_duration = nla_get_u16(tx_no_ack_duration_attr);
++		if (tx_no_ack_duration > TX_NO_ACK_DURATION_MAX ||
++		    (tx_no_ack_duration &&
++		     tx_no_ack_duration < TX_NO_ACK_DURATION_MIN))
++			return -EINVAL;
++	}
++	if (tx_no_ack_threshold_attr) {
++		tx_no_ack_threshold = nla_get_u16(tx_no_ack_threshold_attr);
++		if (tx_no_ack_threshold &&
++		    tx_no_ack_threshold < TX_NO_ACK_THRESHOLD_MIN)
++			return -EINVAL;
++	}
++
++	/* Each optional attribute changes only its own configured value. */
++	if (tx_no_ack_duration_attr) {
++		param_id = wmi_pdev_param_dstall_consecutive_tx_no_ack_interval;
++		status = mlme_check_index_setparam(setparam,
++						   param_id, tx_no_ack_duration,
++						   index++, MAX_PDEV_DATA_STALL_PARAMS);
++		if (QDF_IS_STATUS_ERROR(status)) {
++			hdd_err("failed to prepare tx no ack duration");
++			return -EINVAL;
++		}
++	}
++	if (tx_no_ack_threshold_attr) {
++		param_id = wmi_pdev_param_dstall_consecutive_tx_no_ack_threshold;
++		status = mlme_check_index_setparam(setparam,
++						   param_id, tx_no_ack_threshold,
++						   index++, MAX_PDEV_DATA_STALL_PARAMS);
++		if (QDF_IS_STATUS_ERROR(status)) {
++			hdd_err("failed to prepare tx no ack threshold");
++			return -EINVAL;
++		}
+ 	}
+ 
+ 	status = wma_send_multi_pdev_vdev_set_params(MLME_PDEV_SETPARAM,
+@@ -14907,7 +14905,6 @@
+ 	hdd_config_data_stall_param,
+ 	hdd_config_tx_rx_nss_per_band,
+ 	hdd_config_vdev_chains_per_band,
+-	hdd_config_data_stall_param,
+ };
+ 
+ /**

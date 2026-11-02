@@ -1,0 +1,1 @@
+FROZEN upstream MAC80211: 74 unchanged pinned inputs, 45 native units. Preserves booted NetHunter Minstrel and LED settings. Requires the supplied KMI symbol-list extension retaining two existing upstream LED exports; original GKI exports and strict checks preserved. No source patch. Root integration must carry the symbol-list flag into all matching builds.

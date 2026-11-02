@@ -1,0 +1,29 @@
+ddk_headers(
+    name = "audio_swr_irq_headers",
+    hdrs = ["qcom/opensource/audio-kernel/include/soc/soundwire.h", "//onyx:qcom/opensource/audio-kernel/include/bindings/audio-codec-port-types.h", "//onyx:audio_gpr_headers"],
+    includes = ["qcom/opensource/audio-kernel/include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "swr_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/soc/soundwire.c", "qcom/opensource/audio-kernel/soc/regmap-swr.c"],
+    out = "swr_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_swr_irq_headers", "//onyx:audio_gpr_headers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "swr_ctrl_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.c", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "swr_ctrl_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_swr_irq_headers", "//onyx:audio_swrctrl_headers", "//onyx:audio_spf_headers", "//onyx:audio_foundation_headers", ":swr_dlkm", "//onyx:spf_core_dlkm"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)

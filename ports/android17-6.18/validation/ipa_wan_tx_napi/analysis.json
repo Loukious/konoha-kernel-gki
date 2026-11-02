@@ -1,0 +1,15 @@
+{
+  "status": "PASS: normal Android boot, modem shutdown without NAPI warning, userspace fastbootd and Android return",
+  "hardware_attempt": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-wlan-swr-eva-20261102T043038Z",
+  "loaded_ipam_build_id": "48dd476926e2d90f8ff8a9d9b004104ea8ca1a83",
+  "finding": "RX lifecycle correction is installed but modem AFTER_SHUTDOWN still warns from free_netdev. WAN producer adds a separate TX napi to the same netdev; full teardown deliberately skips it, and rmnet removes only its private RX napi.",
+  "repair": "Apply the existing per-producer TX NAPI disable/delete to WAN_PROD too; preserve shared RX owner and existing channel cleanup ordering.",
+  "limits": [
+    "Existing producer drain and GSI failure semantics unchanged",
+    "SMP/firmware races need hardware testing",
+    "Do not classify the shutdown warning as resolved yet"
+  ],
+  "artifact": "/home/loukious/Android/konoha-android17-6.18-port-20261031/artifacts/20261102T044143670048Z",
+  "package_validation": "ports/android17-6.18/validation/ipa_wan_tx_napi/package-validation.json",
+  "hardware_validation": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/ipa_wan_tx_napi/hardware-validation.json"
+}

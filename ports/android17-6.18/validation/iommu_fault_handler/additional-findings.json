@@ -1,0 +1,84 @@
+[
+  {
+    "id": "IOMMU-DMA-HANDLER-DISPLAY-EVA",
+    "status": "observed; proposed fix verified on host; DDK/live pending",
+    "evidence": "/tmp/onyx-iommu-warning-summary.json",
+    "consumers": [
+      {
+        "source": "onyx/qcom/opensource/display-drivers/msm/msm_smmu.c:590",
+        "warnings": 2
+      },
+      {
+        "source": "onyx/qcom/opensource/eva-kernel/msm/eva/msm_cvp_res_parse.c:1177",
+        "warnings": 4
+      }
+    ],
+    "cause": "core setter rejects DMA_IOVA domain because fault_handler storage shares IOVA-cookie union; handlers are not installed",
+    "patch": "/tmp/onyx-iommu-proposed.patch"
+  },
+  {
+    "id": "IOMMU-DISPLAY-COMPONENT-LIFETIME",
+    "status": "linked correction included in proposed patch",
+    "source": "onyx/qcom/opensource/display-drivers/msm/msm_smmu.c:248",
+    "cause": "MMU wrapper borrowed existing OF-created context-bank device but unregisters it on wrapper destruction; component_del would recursively reenter aggregate teardown/component_mutex",
+    "fix": "wrapper destroy frees wrapper only; client remove component_del/clear/list_del owns component, handler and list cleanup"
+  },
+  {
+    "id": "IOMMU-EVA-SHARED-DOMAIN",
+    "status": "observed domain sharing; protection included",
+    "evidence": "first and fourth EVA warning domain both ffffff88160d1500, corresponding nonsecure and DSP CBs",
+    "fix": "keep core-owned private callback while another remaining bank shares domain; synchronous clear at last child before core free"
+  },
+  {
+    "id": "IOMMU-ICNSS-OLD-WCN-DMA-HANDLER",
+    "status": "compiled dormant branch; not in observed patch",
+    "source": "onyx/platform/icnss2/main.c:5835",
+    "applicability": "WCN6750/WCN6450 branch only; current logs identify WCN7750 and its IRQ callback path",
+    "cause": "iommu_domain comes from iommu_get_domain_for_dev:5879; legacy setter conflicts with DMA cookie",
+    "required_followup": "private qcom setter, propagate error, reassess callback withdrawal and existing module/data retention"
+  },
+  {
+    "id": "IOMMU-CNSS-69-DMA-HANDLER",
+    "status": "compiled in cnss2 target; no matching current warning; not in observed patch",
+    "sources": [
+      "onyx/platform/cnss2/pci_qcom.c:550",
+      "onyx/platform/cnss2/pci_qcom.c:643",
+      "onyx/platform/cnss2/pci.c:1201"
+    ],
+    "applicability": "6.18 selects >=6.9 fallback; fastmap PCI devices using CNSS2 invoke this path; current runtime uses WCN7750/ICNSS2",
+    "cause": "existing DMA domain core setter rejected; unregister is no-op on >=6.9; registration occurs before fallible address setup",
+    "required_followup": "private setter and synchronized withdrawal on remove and setup failures; propagate register error; validate PCI firmware recovery return -ENOSYS remains visible"
+  },
+  {
+    "id": "IOMMU-TVM-PROXY-DMA-HANDLER",
+    "status": "source-only dormant; not compiled in current smmu_proxy target",
+    "source": "onyx/qcom/opensource/securemsm-kernel/smmu-proxy/qti-smmu-proxy-tvm.c:787",
+    "applicability": "current BUILD target compiles common+pvm sources, not tvm",
+    "cause": "cb_probe gets DMA domain then uses core setter; no teardown callback implemented",
+    "required_followup": "if TVM image ported, private setter with synchronous withdrawal and driver/module lifetime handling"
+  },
+  {
+    "id": "IOMMU-KGSL-GMU-UNMANAGED",
+    "status": "audited valid core callers; unchanged",
+    "sources": [
+      "onyx/qcom/opensource/graphics-kernel/kgsl_gmu_core.c:260",
+      "onyx/qcom/opensource/graphics-kernel/kgsl_iommu.c:2577",
+      "onyx/qcom/opensource/graphics-kernel/kgsl_iommu.c:2702"
+    ],
+    "reason": "each allocates an unmanaged paging domain; NONE cookie allows core fault handler; not implicated in warnings"
+  },
+  {
+    "id": "EVA-VALUED-VMID-BOOLEAN",
+    "status": "separate actual OF warning; not in IOMMU handler patch",
+    "source": "onyx/qcom/opensource/eva-kernel/msm/eva/msm_cvp_res_parse.c:1147",
+    "evidence": "Read of boolean property qcom,iommu-vmid with a value for secure nonpixel and pixel CBs",
+    "required_followup": "property is numeric VMID; if semantics only presence, use of_property_present rather than bool API; or parse u32 if value drives security policy"
+  },
+  {
+    "id": "EVA-MISSING-LABEL-DEREFERENCE",
+    "status": "latent malformed-DT issue; not observed; not included",
+    "source": "onyx/qcom/opensource/eva-kernel/msm/eva/msm_cvp_res_parse.c:1111",
+    "cause": "label read error sets rc=0, then later strcmp dereferences NULL cb->name",
+    "required_followup": "reject missing label before list publication; validate malformed-DT probe failure in a separate scoped fix"
+  }
+]

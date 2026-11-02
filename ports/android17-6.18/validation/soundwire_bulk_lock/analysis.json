@@ -1,0 +1,26 @@
+{
+  "status": "Source/build/images/Windows stage/previous6.18restore and10installer failure fixtures PASS; hardware pending",
+  "original_kernel_state": "Linux kali 6.6.144-Kono-Ha-Kernel #5 SMP PREEMPT Fri Oct 30 23:12:56 CET 2026 aarch64 Toybox",
+  "baseline_log": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/pre-smmu-retry/kernel-current.txt",
+  "baseline_log_sha256": "6b2544590209b568796424e32e503158c30b19f3a5171d5cf56fe428321c9313",
+  "baseline_ignored_count": 28,
+  "current_log": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/soundwire_bulk_lock/live-kernel.txt",
+  "current_log_sha256": "508ac647396fd20ee655cb212965e0f998de66fa284b4d7bcf875b6f814a3f7c",
+  "current_ignored_count": 33,
+  "source": "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.c",
+  "before_sha256": "6b518f3137604e896cbd3c1147beb9dce1246c51851203cacc822c0e3250dfa0",
+  "findings": [
+    "swrm_bulk_write holds iolock while swr_master_bulk_write fallback reacquires the same nonrecursive mutex",
+    "The VA macro sets bulk_write=NULL for the GPIO/MMIO controller path, and probe registers swrm_bulk_write as its public API",
+    "swr_master_bulk_write discards int return from platform bulk callback, so master init and public writes cannot observe transport errors",
+    "Native6.6 and current6.18 both report CMD_IGNORED_AND_EXEC_CONTINUED. Existing logs do not identify the rejected register/command."
+  ],
+  "limitations": "The bulk defects do not establish the origin of CMD Ignored; current successful audio can use single-register transfers.",
+  "validation": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/soundwire_bulk_lock/validation.json",
+  "source_sha256": "0410bec29dd0ff2c5ef37fadc5c4da2e808af2f5aca3b745e5c977ef5226fb76",
+  "artifact": "/home/loukious/Android/konoha-android17-6.18-port-20261031/artifacts/20261102T032148820151Z",
+  "build_log": "/tmp/onyx-soundwire-bulk-build-v2.log",
+  "archive_hashes_verified": 2570,
+  "prepared_attempt": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/ipa-sram-wlan-swr-20261102T032453Z",
+  "package_validation": "/home/loukious/Android/konoha-6.18-port-control/ports/android17-6.18/validation/soundwire_bulk_lock/package-validation.json"
+}

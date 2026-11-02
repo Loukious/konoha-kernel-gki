@@ -1,0 +1,39 @@
+Subject: [PATCH] sched: walt: detect group runtime underflow before migration
+
+Validate all four group totals before moving task contributions. The old
+unchecked migration subtraction can wrap silently and only panic later at
+group removal, losing the source of the corruption. Retain the existing
+WALT debug print/panic policy. Include task window, age and delayed state
+in the task dump to distinguish queue and window-accounting paths.
+
+---
+--- a/kernel/sched/walt/walt.c
++++ b/kernel/sched/walt/walt.c
+@@ -224,6 +224,9 @@
+ 	SCHED_PRINT(p->policy);
+ 	SCHED_PRINT(p->prio);
+ 	SCHED_PRINT(wts->mark_start);
++	SCHED_PRINT(wts->window_start);
++	SCHED_PRINT(wts->active_time);
++	SCHED_PRINT(p->se.sched_delayed);
+ 	SCHED_PRINT(wts->demand);
+ 	SCHED_PRINT(wts->coloc_demand);
+ 	SCHED_PRINT(wts->enqueue_after_migration);
+@@ -1215,6 +1218,17 @@
+ 		src_prev_runnable_sum = &cpu_time->prev_runnable_sum;
+ 		src_nt_curr_runnable_sum = &cpu_time->nt_curr_runnable_sum;
+ 		src_nt_prev_runnable_sum = &cpu_time->nt_prev_runnable_sum;
++
++		if (*src_curr_runnable_sum < wts->curr_window ||
++		    *src_prev_runnable_sum < wts->prev_window ||
++		    (new_task &&
++		     (*src_nt_curr_runnable_sum < wts->curr_window ||
++		      *src_nt_prev_runnable_sum < wts->prev_window)))
++			WALT_BUG(WALT_BUG_WALT, p,
++				 "group migration underflow src=%d dst=%d crs=%llu prs=%llu nt_crs=%llu nt_prs=%llu young=%d",
++				 src_rq->cpu, new_cpu, *src_curr_runnable_sum,
++				 *src_prev_runnable_sum, *src_nt_curr_runnable_sum,
++				 *src_nt_prev_runnable_sum, new_task);
+ 
+ 		if (wts->curr_window) {
+ 			*src_curr_runnable_sum -= wts->curr_window;

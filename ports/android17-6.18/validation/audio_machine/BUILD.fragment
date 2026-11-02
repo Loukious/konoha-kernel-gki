@@ -1,0 +1,57 @@
+ddk_headers(
+    name = "audio_machine_headers",
+    hdrs = ["qcom/opensource/audio-kernel/asoc/msm_common.h", "qcom/opensource/audio-kernel/asoc/msm-audio-defs.h", "qcom/opensource/audio-kernel/asoc/device_event.h", "qcom/opensource/audio-kernel/asoc/sun-port-config.h", "qcom/opensource/audio-kernel/asoc/msm_dailink.h"],
+    includes = ["qcom/opensource/audio-kernel/asoc"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_headers(
+    name = "pending_codec_headers",
+    hdrs = ["qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-wsa-macro.h", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-mbhc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-mbhc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa883x/wsa883x.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x-reg-masks.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x-reg-shifts.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x-registers.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x.h", "qcom/opensource/audio-kernel/config/sunautoconf.h", "qcom/opensource/audio-kernel/include/asoc/msm-cdc-pinctrl.h", "qcom/opensource/audio-kernel/include/asoc/wcd-mbhc-v2.h", "qcom/opensource/audio-kernel/include/asoc/wcdcal-hwdep.h", "qcom/opensource/audio-kernel/include/bindings/audio-codec-port-types.h", "qcom/opensource/audio-kernel/include/bindings/qcom,gpr.h", "qcom/opensource/audio-kernel/include/dsp/audio_prm.h", "qcom/opensource/audio-kernel/include/dsp/digital-cdc-rsc-mgr.h", "qcom/opensource/audio-kernel/include/dsp/msm_audio_ion.h", "qcom/opensource/audio-kernel/include/dsp/spf-core.h", "qcom/opensource/audio-kernel/include/ipc/gpr-lite.h", "qcom/opensource/audio-kernel/include/soc/audio_mod_devicetable.h", "qcom/opensource/audio-kernel/include/soc/snd_event.h", "qcom/opensource/audio-kernel/include/soc/soundwire.h", "qcom/opensource/audio-kernel/include/soc/swr-common.h", "qcom/opensource/audio-kernel/include/uapi/audio/sound/msmcal-hwdep.h"],
+    includes = ["qcom/opensource/audio-kernel/asoc"],
+)
+
+ddk_module(
+    name = "machine_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/msm_common.c", "qcom/opensource/audio-kernel/asoc/sun.c", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "machine_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_machine_event_headers", "//onyx_wcd_codecs:wcd9378_dlkm", "//onyx_wcd_codecs:wcd939x_dlkm", "//onyx_audio_speakers:wsa883x_dlkm", "//onyx_audio_speakers:wsa884x_dlkm", ":audio_machine_headers", ":pending_codec_headers", "//onyx:audio_foundation_headers", "//onyx:audio_codec_support_headers", "//onyx:audio_lpasscdc_headers", "//onyx:audio_swrctrl_headers", "//onyx:audio_swr_headers", "//onyx:audio_spf_headers", "//onyx:audio_prm_headers", "//onyx:audio_ion_headers", "//onyx:audio_gpr_headers", "//onyx:soc_headers", "//onyx:wcd_headers", "//onyx:altmode_headers", "//onyx:spf_core_dlkm", "//onyx:audio_prm_dlkm", "//onyx:wcd_core_dlkm", "//onyx:socinfo", "//onyx:hwid", ":snd_event_dlkm", "//onyx:fsa4480_i2c", "//onyx:wcd_usbss_i2c", "//onyx:lpass_cdc_dlkm", "//onyx:lpass_cdc_rx_macro_dlkm"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_headers(
+    name = "audio_machine_event_headers",
+    hdrs = ["qcom/opensource/audio-kernel/include/soc/snd_event.h"],
+    includes = ["qcom/opensource/audio-kernel/include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "snd_event_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/soc/snd_event.c", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "snd_event_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_machine_event_headers"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)
+
+# Temporary strict compiler iteration; absent vendor providers must fail modpost.
+ddk_module(
+    name = "machine_compile_check",
+    srcs = ["qcom/opensource/audio-kernel/asoc/msm_common.c", "qcom/opensource/audio-kernel/asoc/sun.c", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "machine_compile_check.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_machine_event_headers", ":audio_machine_headers", ":pending_codec_headers", "//onyx:audio_foundation_headers", "//onyx:audio_codec_support_headers", "//onyx:audio_lpasscdc_headers", "//onyx:audio_swrctrl_headers", "//onyx:audio_swr_headers", "//onyx:audio_spf_headers", "//onyx:audio_prm_headers", "//onyx:audio_ion_headers", "//onyx:audio_gpr_headers", "//onyx:soc_headers", "//onyx:wcd_headers", "//onyx:altmode_headers", "//onyx:spf_core_dlkm", "//onyx:audio_prm_dlkm", "//onyx:wcd_core_dlkm", "//onyx:socinfo", "//onyx:hwid", ":snd_event_dlkm", "//onyx:fsa4480_i2c", "//onyx:wcd_usbss_i2c", "//onyx:lpass_cdc_dlkm", "//onyx:lpass_cdc_rx_macro_dlkm"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)
+

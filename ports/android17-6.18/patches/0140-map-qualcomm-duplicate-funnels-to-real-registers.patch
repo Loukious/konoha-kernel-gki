@@ -1,0 +1,122 @@
+From: Konoha port <port@localhost>
+Subject: [PATCH] coresight: funnel: honor Qualcomm duplicate register aliases
+
+The Onyx DT uses qcom,duplicate-funnel to represent two logical routes
+through one physical funnel. Its first AMBA resource is a dummy address;
+the native driver deliberately maps funnel-base-real without claiming an
+exclusive resource. Preserve that behavior before claim-register access.
+
+Retain ordinary resource mapping and add opt-in probe checkpoints. The
+serial boot log completes eight normal funnels and stops immediately
+before the first duplicate, consistent with the missing native mapping.
+This does not establish successful hardware boot until retested.
+
+Signed-off-by: Konoha port <port@localhost>
+---
+--- a/drivers/hwtracing/coresight/coresight-funnel.c
++++ b/drivers/hwtracing/coresight/coresight-funnel.c
+@@ -14,6 +14,7 @@
+ #include <linux/fs.h>
+ #include <linux/slab.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/coresight.h>
+@@ -31,6 +32,17 @@
+ #define FUNNEL_ENSx_MASK	0xff
+ 
+ DEFINE_CORESIGHT_DEVLIST(funnel_devs, "funnel");
++
++static bool boot_trace;
++module_param(boot_trace, bool, 0444);
++MODULE_PARM_DESC(boot_trace, "Log CoreSight funnel probe checkpoints");
++
++static void funnel_boot_trace(struct device *dev, const char *stage, int ret)
++{
++	if (boot_trace)
++		dev_info(dev, "Konoha boot: funnel.%s ret=%d\n", stage, ret);
++}
++
+ 
+ /**
+  * struct funnel_drvdata - specifics associated to a funnel component
+@@ -211,7 +223,35 @@
+ };
+ ATTRIBUTE_GROUPS(coresight_funnel);
+ 
+-static int funnel_probe(struct device *dev, struct resource *res)
++/* Qualcomm exposes logical duplicates with a dummy AMBA resource. */
++static void __iomem *funnel_ioremap(struct device *dev, struct resource *res)
++{
++	struct resource real;
++	void __iomem *base;
++	int index, ret;
++
++	if (!of_property_read_bool(dev->of_node, "qcom,duplicate-funnel"))
++		return devm_ioremap_resource(dev, res);
++
++	index = of_property_match_string(dev->of_node, "reg-names",
++					 "funnel-base-real");
++	if (index < 0)
++		return ERR_PTR(index);
++
++	ret = of_address_to_resource(dev->of_node, index, &real);
++	if (ret)
++		return ERR_PTR(ret);
++	if (!(real.flags & IORESOURCE_MEM) || real.end < real.start)
++		return ERR_PTR(-EINVAL);
++
++	if (boot_trace)
++		dev_info(dev, "Konoha boot: funnel.map.real %pR\n", &real);
++	/* The physical range is shared with the original funnel device. */
++	base = devm_ioremap(dev, real.start, resource_size(&real));
++	return base ? base : ERR_PTR(-ENOMEM);
++}
++
++static int funnel_probe_impl(struct device *dev, struct resource *res)
+ {
+ 	void __iomem *base;
+ 	struct coresight_platform_data *pdata = NULL;
+@@ -240,13 +280,15 @@
+ 	 * validated by AMBA core.
+ 	 */
+ 	if (res) {
+-		base = devm_ioremap_resource(dev, res);
++		base = funnel_ioremap(dev, res);
+ 		if (IS_ERR(base))
+ 			return PTR_ERR(base);
+ 		drvdata->base = base;
+ 		desc.groups = coresight_funnel_groups;
+ 		desc.access = CSDEV_ACCESS_IOMEM(base);
++		funnel_boot_trace(dev, "claim-clear.enter", 0);
+ 		coresight_clear_self_claim_tag(&desc.access);
++		funnel_boot_trace(dev, "claim-clear.exit", 0);
+ 	}
+ 
+ 	dev_set_drvdata(dev, drvdata);
+@@ -263,11 +305,24 @@
+ 	desc.ops = &funnel_cs_ops;
+ 	desc.pdata = pdata;
+ 	desc.dev = dev;
++	funnel_boot_trace(dev, "register.enter", 0);
+ 	drvdata->csdev = coresight_register(&desc);
++	funnel_boot_trace(dev, "register.exit", IS_ERR(drvdata->csdev) ?
++			  PTR_ERR(drvdata->csdev) : 0);
+ 	if (IS_ERR(drvdata->csdev))
+ 		return PTR_ERR(drvdata->csdev);
+ 
+ 	return 0;
++}
++
++static int funnel_probe(struct device *dev, struct resource *res)
++{
++	int ret;
++
++	funnel_boot_trace(dev, "probe.enter", 0);
++	ret = funnel_probe_impl(dev, res);
++	funnel_boot_trace(dev, "probe.exit", ret);
++	return ret;
+ }
+ 
+ static int funnel_remove(struct device *dev)

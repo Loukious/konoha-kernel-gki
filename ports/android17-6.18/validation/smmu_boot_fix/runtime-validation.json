@@ -1,0 +1,27 @@
+{
+  "status": "PARTIAL RUNTIME PASS: SMMU and UFS work; Android boot still fails",
+  "artifact": "/home/loukious/Android/konoha-android17-6.18-port-20261031/artifacts/20261101T170423790381Z",
+  "zip_sha256": "150b529f76ddaa9410569415896e5347eafa16e64024e24c0267f56a044ba5a9",
+  "evidence": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/after-smmu-diagnostic",
+  "console_sha256": "54fcd1c9ac91363afd1509b270bae84e1c6a9ddd471e47e020b519dc354d958a",
+  "console_bytes": 498659,
+  "console_lines": 6068,
+  "snapshot_unchanged": true,
+  "observations": [
+    "GPU and Apps SMMU probes return 0",
+    "UFS discovers SKhynix storage and enumerates partition tables",
+    "F2FS metadata mounts",
+    "SELinux policy loads and init second stage starts at 0.678251 seconds",
+    "Last captured console event is at 1.384110 seconds",
+    "No recorded kernel panic/oops and panic context/runqueue/task-stack buffers contain only zeros",
+    "Saved watchdog in_panic=0 and last_pet=370920365 ns",
+    "Only coresight_funnel and qcom_spmi_adc5_gen3 module initcalls are unfinished at captured console end"
+  ],
+  "inference": "The SMMU lookup fix resolves the original first-stage storage failure. A later silent reset/hang remains; unfinished module initcalls are leads for isolation, not proven causes.",
+  "limits": [
+    "The last console event does not establish the exact reset time",
+    "Saved CPU context prefixes contain only PCs, with most registers zero; kernel backtraces cannot be reconstructed",
+    "GKI build ID is unchanged because only a platform module changed; diagnostic cmdline and changed console hash establish this is a new capture",
+    "No further candidate has been booted at this checkpoint"
+  ]
+}

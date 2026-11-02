@@ -294,6 +294,10 @@ config QCOM_DCVS
 	tristate "Onyx bus frequency voting"
 	depends on INTERCONNECT && QCOM_DCVS_FP
 
+config QCOM_BWMON
+	tristate "Onyx DDR and LLCC bandwidth monitors"
+	depends on QCOM_DCVS && SCHED_WALT
+
 config QCOM_PMU_LIB
 	tristate "Onyx CPU performance counter service"
 	depends on PERF_EVENTS && QCOM_LLCC_PMU && QCOM_CPU_PHYS_LOG_MAP && QTI_QCOM_SCMI_CLIENT
@@ -1299,3 +1303,19 @@ menuconfig RMNET_WLAN
     depends on RMNET_CORE
     help
         WLAN processing module for RmNet driver
+
+# Native WSA883x/WSA884x selections come from frozen sunautoconf.h.
+
+# WCD93xx features use the exact native forced sunautoconf.h.
+
+# Native small-audio selections use the pinned sunautoconf.h.
+
+
+config SND_SOC_SUN
+	tristate "Onyx SUN sound card"
+
+# Native amplifier selections retain the pinned sunautoconf.h.
+
+config SIH_VIBRATOR
+	tristate "Silicon Integrated Onyx vibrator"
+	depends on I2C && INPUT

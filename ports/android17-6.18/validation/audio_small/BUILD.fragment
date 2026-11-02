@@ -1,0 +1,71 @@
+ddk_headers(
+    name = "audio_small_headers",
+    hdrs = ["qcom/opensource/audio-kernel/include/asoc/sdca-registers-api.h"],
+    includes = ["qcom/opensource/audio-kernel/include"],
+)
+
+ddk_module(
+    name = "pinctrl_lpi_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/soc/core.h", "qcom/opensource/audio-kernel/soc/pinctrl-lpi.c", "qcom/opensource/audio-kernel/soc/pinctrl-utils.h", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "pinctrl_lpi_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = ["//onyx:audio_foundation_headers", "//onyx:audio_notifier_headers", "//onyx:audio_spf_headers", "//onyx:spf_core_dlkm", "//onyx:q6_notifier_dlkm", "//onyx:snd_event_dlkm"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "sdca_registers_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/sdca-registers-api.c", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "sdca_registers_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_small_headers"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "swr_dmic_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/swr-dmic.c", "qcom/opensource/audio-kernel/asoc/codecs/swr-dmic.h", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "swr_dmic_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = ["//onyx_swr_irq:audio_swr_irq_headers", "//onyx:audio_wcdcore_headers", "//onyx_swr_irq:swr_dlkm", "//onyx_wcd_codecs:audio_wcd_codecs_headers", "//onyx_wcd_codecs:wcd939x_dlkm"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "swr_haptics_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/swr-haptics.c", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "swr_haptics_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = ["//onyx_swr_irq:audio_swr_irq_headers", "//onyx:soc_headers", "//onyx:remote_headers", "//onyx:qti_flash_led_headers", "//onyx_swr_irq:swr_dlkm", "//onyx:rproc_qcom_common"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "stub_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/msm_stub.c", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "stub_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "hdmi_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/msm_hdmi_codec_rx.c", "//onyx:qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "hdmi_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = ["//onyx_extdisp_audio:extdisp_audio_headers", "//onyx_extdisp_audio:msm_ext_display"],
+    copts = ["-include", "$(location //onyx:qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)

@@ -1,0 +1,37 @@
+--- a/drivers/power/supply/mca/mca_strategy/strategy_charger/mca_strategy_buckchg.c
++++ b/drivers/power/supply/mca/mca_strategy/strategy_charger/mca_strategy_buckchg.c
+@@ -490,7 +490,7 @@
+ 				      int effective_result,
+ 				      const char *effective_client)
+ {
+-	struct strategy_buckchg_dev *info = NULL;
++	struct strategy_buckchg_dev *info = data;
+ 	int vterm = 0;
+ 	int batt_temp = 0;
+ 	int compensation;
+@@ -498,10 +498,7 @@
+ 
+ 	if (!data)
+ 		return -EINVAL;
+-	if (READ_ONCE(info->stopping))
+-		return -ENODEV;
+-
+-	info = data;
++
+ 	if (READ_ONCE(info->stopping))
+ 		return -ENODEV;
+ 	if (effective_result < 2000 || effective_result > 6000)
+@@ -3817,6 +3814,13 @@
+ 	ret = strategy_buckchg_validate_config(info);
+ 	if (ret)
+ 		return ret;
++	/* The provider can register before its ADSP transport accepts writes. */
++	ret = platform_class_buckchg_ops_is_init_ok(MAIN_BUCK_CHARGER);
++	if (ret <= 0) {
++		if (!ret || ret == -1 || ret == -ENODEV)
++			return -EPROBE_DEFER;
++		return ret;
++	}
+ 	/* The class uses -1 when no hardware provider has registered yet. */
+ 	ret = platform_class_buckchg_ops_get_online(MAIN_BUCK_CHARGER, &online);
+ 	if (ret)

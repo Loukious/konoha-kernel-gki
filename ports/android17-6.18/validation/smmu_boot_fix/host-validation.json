@@ -1,0 +1,53 @@
+{
+  "status": "PASS",
+  "source_sha256": "e48dfbe841e94237aa9ea1760f9b50cdbac7fe34fe711bd64c5032901f71f8ab",
+  "fixture_sha256": "2ebe98184ac92066c3d605690bd1d1f4ee748044b1f1976e02d6ddfacf18a615",
+  "scenarios": 5,
+  "results": [
+    {
+      "name": "production",
+      "compiled": true,
+      "rejected": false,
+      "output": "Five lookup scenarios pass; eager registration and held-reference access verified\n"
+    },
+    {
+      "name": "driver_bound_lookup",
+      "compiled": true,
+      "rejected": true,
+      "output": "driver_bound_lookup: test.c:74: int main(void): Assertion `arm_smmu_get_by_fwnode(&fwnode) == &smmu' failed.\n"
+    },
+    {
+      "name": "read_after_reference_release",
+      "compiled": true,
+      "rejected": true,
+      "output": "read_after_reference_release: test.c:57: struct arm_smmu_device *dev_get_drvdata(struct device *): Assertion `dev && dev->refs' failed.\n"
+    },
+    {
+      "name": "leaked_lookup_reference",
+      "compiled": true,
+      "rejected": true,
+      "output": "leaked_lookup_reference: test.c:71: int main(void): Assertion `dev.refs == 0' failed.\n"
+    }
+  ],
+  "negative_controls": [
+    {
+      "name": "driver_bound_lookup",
+      "compiled": true,
+      "rejected": true,
+      "output": "driver_bound_lookup: test.c:74: int main(void): Assertion `arm_smmu_get_by_fwnode(&fwnode) == &smmu' failed.\n"
+    },
+    {
+      "name": "read_after_reference_release",
+      "compiled": true,
+      "rejected": true,
+      "output": "read_after_reference_release: test.c:57: struct arm_smmu_device *dev_get_drvdata(struct device *): Assertion `dev && dev->refs' failed.\n"
+    },
+    {
+      "name": "leaked_lookup_reference",
+      "compiled": true,
+      "rejected": true,
+      "output": "leaked_lookup_reference: test.c:71: int main(void): Assertion `dev.refs == 0' failed.\n"
+    }
+  ],
+  "limits": "Exact production lookup function tested with kernel-list/reference mocks; full kernel probe and UFS enumeration still require hardware validation."
+}

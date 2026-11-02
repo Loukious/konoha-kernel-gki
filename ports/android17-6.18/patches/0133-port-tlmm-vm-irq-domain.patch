@@ -1,0 +1,64 @@
+Subject: Port the native TLMM VM IRQ soft dependency
+
+Use per-device domain ownership and the 6.18 void remove callback.
+Consumers must release mappings before controller removal.
+
+---
+
+index 0857ebe3db0f..4220b6b3ac6b 100644
+--- a/drivers/soc/qcom/qcom_tlmm_vm_irqchip.c
++++ b/drivers/soc/qcom/qcom_tlmm_vm_irqchip.c
+@@ -12,6 +12,7 @@
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
+ #include <linux/io.h>
++#include <linux/slab.h>
+ 
+ #define TLMM_VM_NUM_IRQ 10
+ 
+@@ -19,7 +20,6 @@ struct qcom_tlmm_vm_irqchip_data {
+ 	struct irq_domain       *domain;
+ };
+ 
+-static struct qcom_tlmm_vm_irqchip_data qcom_tlmm_vm_irqchip_data __read_mostly;
+ /*
+  * Set simple handler and mark IRQ as valid. Nothing interesting to do here
+  * since we are using a dummy interrupt chip.
+@@ -38,25 +38,30 @@ static const struct irq_domain_ops qcom_tlmm_vm_irqchip_domain_ops = {
+ 
+ static int qcom_tlmm_vm_irqchip_probe(struct platform_device *pdev)
+ {
++	struct qcom_tlmm_vm_irqchip_data *data;
+ 
+-	qcom_tlmm_vm_irqchip_data.domain = irq_domain_add_linear(pdev->dev.of_node, TLMM_VM_NUM_IRQ,
++	data = devm_kzalloc(&pdev->dev, sizeof(*data), GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	data->domain = irq_domain_add_linear(pdev->dev.of_node, TLMM_VM_NUM_IRQ,
+ 						&qcom_tlmm_vm_irqchip_domain_ops,
+ 						NULL);
+-	if (!qcom_tlmm_vm_irqchip_data.domain)
++	if (!data->domain)
+ 		return -ENOMEM;
+ 
+-	qcom_tlmm_vm_irqchip_data.domain->name = "qcom-tlmm-vm-irq-domain";
++	data->domain->name = "qcom-tlmm-vm-irq-domain";
++	platform_set_drvdata(pdev, data);
+ 
+ 	pr_debug("qcom tlmm vm irq controller registered\n");
+ 
+ 	return 0;
+ }
+ 
+-static int qcom_tlmm_vm_irqchip_remove(struct platform_device *pdev)
++static void qcom_tlmm_vm_irqchip_remove(struct platform_device *pdev)
+ {
+-	irq_domain_remove(qcom_tlmm_vm_irqchip_data.domain);
+-
+-	return 0;
++	struct qcom_tlmm_vm_irqchip_data *data = platform_get_drvdata(pdev);
++	irq_domain_remove(data->domain);
+ }
+ 
+ static const struct of_device_id qcom_tlmm_vm_irqchip_of_match[] = {

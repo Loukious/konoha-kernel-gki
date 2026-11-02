@@ -1,0 +1,53 @@
+{
+  "status": "PASS",
+  "source_sha256": {
+    "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/qcom/opensource/audio-kernel/soc/soundwire.c": "25091d00f81e80df82a33163811c5b368b5199a82403d61bcff1157e1454a9e7",
+    "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.c": "afc9b919520f69fda7bd1c1ee479620dc1bdb87e738e5313a7607e9cf5ed8c7b",
+    "/home/loukious/Android/konoha-android17-6.18-port-20261031/onyx/qcom/opensource/audio-kernel/include/soc/soundwire.h": "d81a764fef4407a483c5db2c4ed6290b1992b7f00b6ac004dbf3376ec2b1fda9"
+  },
+  "fixture_sha256": "6dec44d589c2d28e4ab520d5e27cc1d4a1e8c1cace920285e7c74ca65ba4f612",
+  "verifier_sha256": "cf73077d912aa671fd70746c5f958829e8e98fd5a969dad01a8d9d47520defd6",
+  "public_device_and_master_layout": "unchanged",
+  "scenarios": 9,
+  "production": {
+    "name": "production",
+    "status": "PASS",
+    "log": "PASS: IRQ registration, pending loop, shutdown, references, self-withdraw, concurrent drain and reserved dispatch\n"
+  },
+  "negative_controls": [
+    {
+      "name": "missing_drain_lock",
+      "status": "REJECTED",
+      "log": "missing_drain_lock: test.c:211: void wait_stopping(struct swr_device *): Assertion `!atomic_load(&withdraw_done)' failed.\n"
+    },
+    {
+      "name": "missing_device_reference",
+      "status": "REJECTED",
+      "log": "missing_device_reference: test.c:63: void put_device(struct device *): Assertion `atomic_fetch_sub(&dev->refs, 1) > 1' failed.\n"
+    },
+    {
+      "name": "missing_dispatch_reference",
+      "status": "REJECTED",
+      "log": "=================================================================\n==2168044==ERROR: AddressSanitizer: heap-use-after-free on address 0x6f721c7e00e8 at pc 0x624eb92a442b bp 0x7ffd16a177f0 sp 0x7ffd16a177e8\nREAD of size 8 at 0x6f721c7e00e8 thread T0\n    #0 0x624eb92a442a  (/tmp/swr-irq-test-68yb92ya/missing_dispatch_reference+0x15142a)\n    #1 0x624eb92a352d  (/tmp/swr-irq-test-68yb92ya/missing_dispatch_reference+0x15052d)\n    #2 0x624eb92a5aa4  (/tmp/swr-irq-test-68yb92ya/missing_dispatch_reference+0x152aa4)\n    #3 0x72f21d62a600  (/usr/lib/x86_64-linux-gnu/libc.so.6+0x2a600) (BuildId: 066527e430a32768d82741e00b81eebb1a872294)\n    #4 0x72f21d62a717  (/usr/lib/x86_64-linux-gnu/libc.so.6+0x2a717) (BuildId: 066527e430a32768d82741e00b81eebb1a872294)\n    #5 0x624eb91c3224  (/tmp/swr-irq-test-68yb92ya/missing_dispatch_reference+0x70224)\n\n0x6f721c7e00e8 is located 72 bytes inside of 88-byte region [0x6f721c7e00a0,0x6f721c7e00f8)\nfreed by thread T0 here:\n    #0 0x624eb92621b6  (/tmp/swr-irq-test-68yb92ya/missing_dispatch_reference+0x10f1b6)\n    #1 0x624eb92a4e95  (/tmp/swr-irq-test-68yb92ya/missing_dispatch_reference+0x151e95)\n    #2 0x624eb92a5a81  (/tmp/swr-irq-test-68yb92ya/missing_dispatch_reference+0x152a81)\n    #3 0x72f21d62a600  (/usr/lib/x86_64-linux-gnu/libc.so.6+0x2a600) (BuildId: 066527e430a32768d82741e00b81eebb1a872294)\n    #4 0x72f21d62a717  (/usr/lib/x86_64-linux-gnu/libc.so.6+0x2a717) (BuildId: 066527e430a32768d82741e00b81eebb1a872294)\n    #5 0x624eb91c3224  (/tmp/swr-irq-test-68yb92ya/missing_dispatch_reference+0x70224)\n\npreviously allocated by thread T0 here:\n    #0 0x624eb9262629  (/tmp/swr-irq-test-68yb92ya/missing_dispatch_reference+0x10f629)\n    #1 0x624eb92a3788  (/tmp/swr-irq-test-68yb92ya/missing_dispatch_reference+0x150788)\n    #2 0x624eb92a5a61  (/tmp/swr-irq-test-68yb92ya/missing_dispatch_reference+0x152a61)\n    #3 0x72f21d62a600  (/usr/lib/x86_64-linux-gnu/libc.so.6+0x2a600) (BuildId: 066527e430a32768d82741e00b81eebb1a872294)\n    #4 0x72f21d62a717  (/usr/lib/x86_64-linux-gnu/libc.so.6+0x2a717) (BuildId: 066527e430a32768d82741e00b81eebb1a872294)\n    #5 0x624eb91c3224  (/tmp/swr-irq-test-68yb92ya/missing_dispatch_reference+0x70224)\n\nSUMMARY: AddressSanitizer: heap-use-after-free (/tmp/swr-irq-test-68yb92ya/missing_dispatch_reference+0x15142a) \nShadow bytes around the buggy address:\n  0x6f721c7dfe00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x6f721c7dfe80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x6f721c7dff00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x6f721c7dff80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x6f721c7e0000: fa fa fa fa 00 00 00 00 00 00 00 00 00 00 07 fa\n=>0x6f721c7e0080: fa fa fa fa fd fd fd fd fd fd fd fd fd[fd]fd fa\n  0x6f721c7e0100: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x6f721c7e0180: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x6f721c7e0200: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x6f721c7e0280: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x6f721c7e0300: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\nShadow byte legend (one shadow byte represents 8 application bytes):\n  Addressable:           00\n  Partially addressable: 01 02 03 04 05 06 07 \n  Heap left redzone:       fa\n  Freed heap region:       fd\n  Stack left redzone:      f1\n  Stack mid redzone:       f2\n  Stack right redzone:     f3\n  Stack after return:      f5\n  Stack use after scope:   f8\n  Global redzone:          f9\n  Global init order:       f6\n  Poisoned by user:        f7\n  Container overflow:      fc\n  Array cookie:            ac\n  Intra object redzone:    bb\n  ASan internal:           fe\n  Left alloca redzone:     ca\n  Right alloca redzone:    cb\n==2168044==ABORTING\n"
+    },
+    {
+      "name": "missing_self_rejection",
+      "status": "REJECTED",
+      "log": "Timed out while testing the mutated production synchronization path."
+    },
+    {
+      "name": "dispatch_after_withdrawal",
+      "status": "REJECTED",
+      "log": "test.c:95:17: runtime error: member access within null pointer of type 'struct irq_domain'\nSUMMARY: UndefinedBehaviorSanitizer: undefined-behavior test.c:95:17 \ntest.c:95:17: runtime error: load of null pointer of type 'unsigned int'\nSUMMARY: UndefinedBehaviorSanitizer: undefined-behavior test.c:95:17 \nAddressSanitizer:DEADLYSIGNAL\n=================================================================\n==2195648==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000 (pc 0x64707ff0220d bp 0x72aea68f4d10 sp 0x72aea68f4d00 T3)\n==2195648==The signal is caused by a READ memory access.\n==2195648==Hint: address points to the zero page.\n    #0 0x64707ff0220d  (/tmp/swr-irq-test-68yb92ya/dispatch_after_withdrawal+0x15420d)\n    #1 0x64707feffd5f  (/tmp/swr-irq-test-68yb92ya/dispatch_after_withdrawal+0x151d5f)\n    #2 0x64707ff02960  (/tmp/swr-irq-test-68yb92ya/dispatch_after_withdrawal+0x154960)\n    #3 0x64707febae18  (/tmp/swr-irq-test-68yb92ya/dispatch_after_withdrawal+0x10ce18)\n    #4 0x76aeab0a3df9  (/usr/lib/x86_64-linux-gnu/libc.so.6+0xa3df9) (BuildId: 066527e430a32768d82741e00b81eebb1a872294)\n    #5 0x76aeab1375cb  (/usr/lib/x86_64-linux-gnu/libc.so.6+0x1375cb) (BuildId: 066527e430a32768d82741e00b81eebb1a872294)\n\n==2195648==Register values:\nrax = 0x0000000000000000  rbx = 0x0000000000000000  rcx = 0x0000000000000000  rdx = 0x0000000000000000  \nrdi = 0x0000000000000000  rsi = 0x0000000000000000  rbp = 0x000072aea68f4d10  rsp = 0x000072aea68f4d00  \n r8 = 0xffffff0000000000   r9 = 0x000000000000007c  r10 = 0xafffff00000fffff  r11 = 0x0000000000000246  \nr12 = 0x0000732eaa1e0238  r13 = 0x0000732eaa1e0230  r14 = 0x0000732eaa1e0220  r15 = 0x0000732eaa1e0268  \nAddressSanitizer can not provide additional info.\nSUMMARY: AddressSanitizer: SEGV (/tmp/swr-irq-test-68yb92ya/dispatch_after_withdrawal+0x15420d) \nThread T3 created by T0 here:\n    #0 0x64707fea1a51  (/tmp/swr-irq-test-68yb92ya/dispatch_after_withdrawal+0xf3a51)\n    #1 0x64707ff014cf  (/tmp/swr-irq-test-68yb92ya/dispatch_after_withdrawal+0x1534cf)\n    #2 0x76aeab02a600  (/usr/lib/x86_64-linux-gnu/libc.so.6+0x2a600) (BuildId: 066527e430a32768d82741e00b81eebb1a872294)\n    #3 0x76aeab02a717  (/usr/lib/x86_64-linux-gnu/libc.so.6+0x2a717) (BuildId: 066527e430a32768d82741e00b81eebb1a872294)\n    #4 0x64707fe1e1e4  (/tmp/swr-irq-test-68yb92ya/dispatch_after_withdrawal+0x701e4)\n\n==2195648==ABORTING\n"
+    },
+    {
+      "name": "missing_controller_up_check",
+      "status": "REJECTED",
+      "log": "missing_controller_up_check: test.c:275: int main(void): Assertion `atomic_load(&callback_count) == 1' failed.\n"
+    }
+  ],
+  "limits": [
+    "Production synchronization functions and controller pending loop compiled with host service mocks.",
+    "No physical SoundWire, regmap IRQ, Linux device removal, or phone test."
+  ]
+}

@@ -1,0 +1,64 @@
+--- a/drivers/tty/serial/msm_geni_serial.c
++++ b/drivers/tty/serial/msm_geni_serial.c
+@@ -146,6 +146,7 @@
+ #define GENI_UART_NR_PORTS	(6)
+ #define GENI_UART_CONS_PORTS	(1)
+ #define DEF_FIFO_DEPTH_WORDS	(16)
++#define MAX_RX_FIFO_DEPTH_WORDS	(RX_FIFO_DEPTH_MSK_256_BYTES >> RX_FIFO_DEPTH_SHFT)
+ #define DEF_TX_WM		(2)
+ #define DEF_FIFO_WIDTH_BITS	(32)
+ 
+@@ -3003,6 +3004,15 @@
+ 	int ret;
+ 	int rx_bytes = 0;
+ 
++	if (!rx_fifo_wc)
++		return 0;
++	if (rx_fifo_wc > port->rx_fifo_depth ||
++	    rx_fifo_wc > MAX_RX_FIFO_DEPTH_WORDS ||
++	    rx_last_byte_valid > port->tx_fifo_width / 8) {
++		dev_err_ratelimited(uport->dev, "invalid UART RX FIFO status\n");
++		return -EIO;
++	}
++
+ 	rx_bytes = (port->tx_fifo_width * (rx_fifo_wc - 1)) >> 3;
+ 	rx_bytes += ((rx_last && rx_last_byte_valid) ?
+ 		     rx_last_byte_valid : port->tx_fifo_width >> 3);
+@@ -3760,7 +3770,7 @@
+ 	}
+ 
+ 	port->rx_fifo_depth = geni_se_get_rx_fifo_depth(&port->se);
+-	if (port->rx_fifo_depth < 4 || port->rx_fifo_depth > DEF_FIFO_DEPTH_WORDS) {
++	if (port->rx_fifo_depth < 4 || port->rx_fifo_depth > MAX_RX_FIFO_DEPTH_WORDS) {
+ 		dev_err(uport->dev, "%s:Invalid RX FIFO depth read\n", __func__);
+ 		return -ENXIO;
+ 	}
+@@ -5181,7 +5191,7 @@
+ 			return -ENOMEM;
+ 	} else {
+ 		port->handle_rx = handle_rx_hs;
+-		port->rx_fifo = devm_kzalloc(uport->dev, (port->rx_fifo_depth * sizeof(u32)),
++		port->rx_fifo = devm_kzalloc(uport->dev, (MAX_RX_FIFO_DEPTH_WORDS * sizeof(u32)),
+ 					     GFP_KERNEL);
+ 		if (!port->rx_fifo)
+ 			return -ENOMEM;
+--- a/drivers/input/fingerprint/mi_fp/fp_driver.c
++++ b/drivers/input/fingerprint/mi_fp/fp_driver.c
+@@ -687,6 +687,7 @@
+ 			retval = -EFAULT;
+ 			break;
+ 		}
++		pr_debug("fingerprint power-on supply=%s\n", vendor_name);
+ 		if (!strcmp(vendor_name, POWER_LDO_3V3)) {
+ 			retval = fp_power_on(&fp_dev->vreg_3v3);
+ 		} else if (!strcmp(vendor_name, POWER_LDO_1V8)) {
+@@ -960,6 +961,9 @@
+ 	mutex_lock(&fp_io_lock);
+ 	if (fp_present && filp->private_data == &fp)
+ 		ret = fp_ioctl_locked(filp, cmd, arg);
++	if (ret || cmd == FP_IOC_ENABLE_POWER || cmd == FP_IOC_RESET ||
++	    cmd == FP_IOC_RESET_TIME_MS)
++		pr_info("fingerprint ioctl cmd=%#x result=%ld\n", cmd, ret);
+ 	mutex_unlock(&fp_io_lock);
+ 	return ret;
+ }

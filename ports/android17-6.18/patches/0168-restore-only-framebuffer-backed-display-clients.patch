@@ -1,0 +1,18 @@
+--- a/qcom/opensource/display-drivers/msm/msm_drv.c
++++ b/qcom/opensource/display-drivers/msm/msm_drv.c
+@@ -1228,14 +1228,11 @@
+ 
+ 	msm_atomic_flush_display_threads(priv);
+ 
++	/* The topology-probing KMS client has no framebuffer to restore. */
+ 	if (priv->fbdev) {
+ 		rc = drm_fb_helper_restore_fbdev_mode_unlocked(priv->fbdev);
+ 		if (rc)
+ 			DRM_ERROR("restore FBDEV mode failed: %d\n", rc);
+-	} else if (kms && kms->client.dev) {
+-		rc = drm_client_modeset_commit_locked(&kms->client);
+-		if (rc)
+-			DRM_ERROR("client modeset commit failed: %d\n", rc);
+ 	}
+ 
+ 	/* wait again, before kms driver does it's lastclose commit */

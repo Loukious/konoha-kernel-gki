@@ -512,6 +512,17 @@ ddk_module(
 )
 
 ddk_module(
+    name = "phy_qcom_ufs_niobe",
+    srcs = ["drivers/phy/qualcomm/phy-qcom-ufs-qmp-v4-niobe.c"],
+    out = "phy-qcom-ufs-qmp-v4-niobe.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":storage_pmic_headers", ":platform_headers", ":regulator_headers", ":phy_qcom_ufs"],
+)
+
+
+ddk_module(
     name = "nvmem_qcom_spmi_sdam",
     srcs = ["drivers/nvmem/qcom-spmi-sdam.c"],
     out = "nvmem_qcom-spmi-sdam.ko",
@@ -1105,6 +1116,17 @@ ddk_module(
     defconfig = "platform_defconfig",
     kernel_build = "//common:kernel_aarch64",
     deps = [":dcvs_headers", ":interconnect_headers", ":dcvs_fp"],
+)
+
+ddk_module(
+    name = "bwmon",
+    srcs = ["drivers/soc/qcom/dcvs/bwmon.c", "drivers/soc/qcom/dcvs/bwmon.h"],
+    out = "bwmon.ko",
+    includes = ["drivers/soc/qcom/dcvs"],
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":dcvs_headers", ":walt_headers", ":qcom_dcvs", ":sched_walt"],
 )
 
 ddk_headers(
@@ -3034,6 +3056,17 @@ ddk_module(
 )
 
 ddk_module(
+    name = "si_haptic",
+    srcs = ["drivers/input/misc/si_haptic/haptic.c", "drivers/input/misc/si_haptic/haptic.h", "drivers/input/misc/si_haptic/haptic_mid.c", "drivers/input/misc/si_haptic/haptic_mid.h", "drivers/input/misc/si_haptic/haptic_misc.c", "drivers/input/misc/si_haptic/haptic_misc.h", "drivers/input/misc/si_haptic/haptic_regmap.c", "drivers/input/misc/si_haptic/haptic_regmap.h", "drivers/input/misc/si_haptic/ringbuffer.c", "drivers/input/misc/si_haptic/ringbuffer.h", "drivers/input/misc/si_haptic/sih688x.c", "drivers/input/misc/si_haptic/sih688x.h", "drivers/input/misc/si_haptic/sih688x_func_config.c", "drivers/input/misc/si_haptic/sih688x_func_config.h", "drivers/input/misc/si_haptic/sih688x_reg.c", "drivers/input/misc/si_haptic/sih688x_reg.h", "drivers/input/misc/si_haptic/xm-haptic.h"],
+    out = "si_haptic.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":smartcharge_headers", ":miev"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
     name = "aw8697_haptic",
     srcs = ["drivers/input/misc/aw86927_haptic/aw_haptic.c", "drivers/input/misc/aw86927_haptic/aw_haptic.h", "drivers/input/misc/aw86927_haptic/aw86927.c", "drivers/input/misc/aw86927_haptic/aw86927.h", "drivers/input/misc/aw86927_haptic/aw8697.c", "drivers/input/misc/aw86927_haptic/aw8697.h", "drivers/input/misc/aw86927_haptic/aw_config.h", "drivers/input/misc/aw86927_haptic/xm-haptic.h", "drivers/input/misc/aw86927_haptic/ringbuffer.c", "drivers/input/misc/aw86927_haptic/ringbuffer.h"],
     out = "aw8697-haptic.ko",
@@ -3585,7 +3618,7 @@ ddk_module(
     defconfig = "platform_defconfig",
     kernel_build = "//common:kernel_aarch64",
     local_defines = ["CONFIG_EVA_SUN=1", "CONFIG_MSM_MMRM=1"],
-    deps = [":eva_headers", ":fastrpc_headers", ":frpc_adsprpc", ":scm_headers", ":mem_buf_headers", ":iommu_headers", ":gunyah_headers", ":platform_headers", ":clock_headers", ":loader_headers", ":gpu_stack_headers", ":display_support_headers", ":mem_buf_dev", ":qcom_scm", ":llcc_qcom", ":synx_driver", ":msm_mmrm", ":mdt_loader", ":gh_rm_drv", ":gh_msgq"],
+    deps = [":eva_headers", ":fastrpc_headers", ":frpc_adsprpc", ":scm_headers", ":mem_buf_headers", ":iommu_headers", ":gunyah_headers", ":platform_headers", ":clock_headers", ":loader_headers", ":gpu_stack_headers", ":display_support_headers", ":mem_buf_dev", ":qcom_scm", ":llcc_qcom", ":synx_driver", ":msm_mmrm", ":mdt_loader", ":gh_rm_drv", ":gh_msgq", ":qcom_iommu_util"],
     visibility = ["//visibility:public"],
 )
 
@@ -3827,9 +3860,381 @@ ddk_module(
 )
 
 
+ddk_headers(
+    name = "audio_wsa_codec_headers",
+    hdrs = ["qcom/opensource/audio-kernel/asoc/codecs/wsa883x/internal.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa883x/wsa883x-registers.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa883x/wsa883x.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/internal.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x-reg-masks.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x-reg-shifts.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x-registers.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x.h", "qcom/opensource/audio-kernel/include/asoc/bolero-slave-internal.h"],
+    includes = ["qcom/opensource/audio-kernel/include", "qcom/opensource/audio-kernel/asoc"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wsa883x_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wsa883x/wsa883x.c", "qcom/opensource/audio-kernel/asoc/codecs/wsa883x/wsa883x-regmap.c", "qcom/opensource/audio-kernel/asoc/codecs/wsa883x/wsa883x-tables.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wsa883x_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wsa_codec_headers", ":audio_foundation_headers", ":audio_swr_headers", ":audio_wcdcore_headers", ":soc_headers", ":swr_dlkm", ":wcd_core_dlkm", ":qti_regmap_debugfs"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wsa884x_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x.c", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x-regmap.c", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x-tables.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wsa884x_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wsa_codec_headers", ":audio_foundation_headers", ":audio_swr_headers", ":audio_wcdcore_headers", ":soc_headers", ":swr_dlkm", ":wcd_core_dlkm", ":qti_regmap_debugfs"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)
+
+
+ddk_headers(
+    name = "audio_wcd_codecs_headers",
+    hdrs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd9378/internal.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-mbhc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-reg-masks.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-registers.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd938x/internal.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x-mbhc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x-registers.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/internal.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-mbhc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-reg-masks.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-reg-shifts.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-registers.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x.h", ":audio_swr_headers", ":soc_headers", ":audio_codec_support_headers", ":audio_small_headers", ":audio_wsa_codec_headers"],
+    includes = ["qcom/opensource/audio-kernel/asoc/codecs"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wcd9378_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-regmap.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-tables.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-mbhc.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wcd9378_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wcd_codecs_headers", ":wcd_core_dlkm", ":swr_dlkm", ":qti_regmap_debugfs", ":wcd9xxx_dlkm", ":mbhc_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)", "-DANI_LITTLE_BYTE_ENDIAN", "-DANI_LITTLE_BIT_ENDIAN", "-DDOT11F_LITTLE_ENDIAN_HOST", "-DANI_COMPILER_TYPE_GCC", "-DANI_OS_TYPE_ANDROID=6", "-DPTT_SOCK_SVC_ENABLE", "-D__linux__"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wcd9378_slave_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-slave.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wcd9378_slave_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wcd_codecs_headers", ":swr_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)", "-DANI_LITTLE_BYTE_ENDIAN", "-DANI_LITTLE_BIT_ENDIAN", "-DDOT11F_LITTLE_ENDIAN_HOST", "-DANI_COMPILER_TYPE_GCC", "-DANI_OS_TYPE_ANDROID=6", "-DPTT_SOCK_SVC_ENABLE", "-D__linux__"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wcd938x_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x-regmap.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x-tables.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x-mbhc.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wcd938x_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wcd_codecs_headers", ":swr_dlkm", ":wcd_core_dlkm", ":qti_regmap_debugfs", ":wcd9xxx_dlkm", ":mbhc_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)", "-DANI_LITTLE_BYTE_ENDIAN", "-DANI_LITTLE_BIT_ENDIAN", "-DDOT11F_LITTLE_ENDIAN_HOST", "-DANI_COMPILER_TYPE_GCC", "-DANI_OS_TYPE_ANDROID=6", "-DPTT_SOCK_SVC_ENABLE", "-D__linux__"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wcd938x_slave_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd938x/wcd938x-slave.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wcd938x_slave_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wcd_codecs_headers", ":swr_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)", "-DANI_LITTLE_BYTE_ENDIAN", "-DANI_LITTLE_BIT_ENDIAN", "-DDOT11F_LITTLE_ENDIAN_HOST", "-DANI_COMPILER_TYPE_GCC", "-DANI_OS_TYPE_ANDROID=6", "-DPTT_SOCK_SVC_ENABLE", "-D__linux__"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wcd939x_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-regmap.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-tables.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-mbhc.c", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-regulator.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wcd939x_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wcd_codecs_headers", ":swr_dlkm", ":wcd_core_dlkm", ":wcd_usbss_i2c", ":wcd939x_slave_dlkm", ":qti_regmap_debugfs", ":wcd9xxx_dlkm", ":mbhc_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)", "-DANI_LITTLE_BYTE_ENDIAN", "-DANI_LITTLE_BIT_ENDIAN", "-DDOT11F_LITTLE_ENDIAN_HOST", "-DANI_COMPILER_TYPE_GCC", "-DANI_OS_TYPE_ANDROID=6", "-DPTT_SOCK_SVC_ENABLE", "-D__linux__"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "wcd939x_slave_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-slave.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "wcd939x_slave_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_wcd_codecs_headers", ":swr_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)", "-DANI_LITTLE_BYTE_ENDIAN", "-DANI_LITTLE_BIT_ENDIAN", "-DDOT11F_LITTLE_ENDIAN_HOST", "-DANI_COMPILER_TYPE_GCC", "-DANI_OS_TYPE_ANDROID=6", "-DPTT_SOCK_SVC_ENABLE", "-D__linux__"],
+    visibility = ["//visibility:public"],
+)
+
+
+ddk_headers(
+    name = "audio_small_headers",
+    hdrs = ["qcom/opensource/audio-kernel/include/asoc/sdca-registers-api.h"],
+    includes = ["qcom/opensource/audio-kernel/include"],
+)
+
+ddk_module(
+    name = "pinctrl_lpi_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/soc/core.h", "qcom/opensource/audio-kernel/soc/pinctrl-lpi.c", "qcom/opensource/audio-kernel/soc/pinctrl-utils.h", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "pinctrl_lpi_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_foundation_headers", ":audio_notifier_headers", ":audio_spf_headers", ":spf_core_dlkm", ":q6_notifier_dlkm", ":snd_event_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "sdca_registers_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/sdca-registers-api.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "sdca_registers_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_small_headers"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "swr_dmic_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/swr-dmic.c", "qcom/opensource/audio-kernel/asoc/codecs/swr-dmic.h", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "swr_dmic_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_swr_headers", ":audio_wcdcore_headers", ":swr_dlkm", ":audio_wcd_codecs_headers", ":wcd939x_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "swr_haptics_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/swr-haptics.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "swr_haptics_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_swr_headers", ":soc_headers", ":remote_headers", ":qti_flash_led_headers", ":swr_dlkm", ":rproc_qcom_common"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "stub_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/msm_stub.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "stub_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_module(
+    name = "hdmi_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/msm_hdmi_codec_rx.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "hdmi_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":display_support_headers", ":msm_ext_display"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+)
+
+ddk_headers(
+    name = "audio_machine_headers",
+    hdrs = ["qcom/opensource/audio-kernel/asoc/msm_common.h", "qcom/opensource/audio-kernel/asoc/msm-audio-defs.h", "qcom/opensource/audio-kernel/asoc/device_event.h", "qcom/opensource/audio-kernel/asoc/sun-port-config.h", "qcom/opensource/audio-kernel/asoc/msm_dailink.h"],
+    includes = ["qcom/opensource/audio-kernel/asoc"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_headers(
+    name = "audio_machine_dependency_headers",
+    hdrs = ["qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-wsa-macro.h", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-mbhc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-mbhc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa883x/wsa883x.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x-reg-masks.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x-reg-shifts.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x-registers.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x.h", "qcom/opensource/audio-kernel/config/sunautoconf.h", "qcom/opensource/audio-kernel/include/asoc/msm-cdc-pinctrl.h", "qcom/opensource/audio-kernel/include/asoc/wcd-mbhc-v2.h", "qcom/opensource/audio-kernel/include/asoc/wcdcal-hwdep.h", "qcom/opensource/audio-kernel/include/bindings/audio-codec-port-types.h", "qcom/opensource/audio-kernel/include/bindings/qcom,gpr.h", "qcom/opensource/audio-kernel/include/dsp/audio_prm.h", "qcom/opensource/audio-kernel/include/dsp/digital-cdc-rsc-mgr.h", "qcom/opensource/audio-kernel/include/dsp/msm_audio_ion.h", "qcom/opensource/audio-kernel/include/dsp/spf-core.h", "qcom/opensource/audio-kernel/include/ipc/gpr-lite.h", "qcom/opensource/audio-kernel/include/soc/audio_mod_devicetable.h", "qcom/opensource/audio-kernel/include/soc/snd_event.h", "qcom/opensource/audio-kernel/include/soc/soundwire.h", "qcom/opensource/audio-kernel/include/soc/swr-common.h", "qcom/opensource/audio-kernel/include/uapi/audio/sound/msmcal-hwdep.h"],
+    includes = ["qcom/opensource/audio-kernel/asoc"],
+)
+
+ddk_module(
+    name = "machine_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/msm_common.c", "qcom/opensource/audio-kernel/asoc/sun.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "machine_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":wcd9378_dlkm", ":wcd939x_dlkm", ":wsa883x_dlkm", ":wsa884x_dlkm", ":audio_machine_headers", ":audio_machine_dependency_headers", ":audio_foundation_headers", ":audio_codec_support_headers", ":audio_lpasscdc_headers", ":audio_swrctrl_headers", ":audio_swr_headers", ":audio_spf_headers", ":audio_prm_headers", ":audio_ion_headers", ":audio_gpr_headers", ":soc_headers", ":wcd_headers", ":altmode_headers", ":spf_core_dlkm", ":audio_prm_dlkm", ":wcd_core_dlkm", ":socinfo", ":hwid", ":snd_event_dlkm", ":fsa4480_i2c", ":wcd_usbss_i2c", ":lpass_cdc_dlkm", ":lpass_cdc_rx_macro_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)
+
+
+exports_files(["kmi-symbols"])
+
+ddk_headers(
+    name = "mac80211_headers",
+    hdrs = ["net/mac80211/aead_api.h", "net/mac80211/aes_ccm.h", "net/mac80211/aes_cmac.h", "net/mac80211/aes_gcm.h", "net/mac80211/aes_gmac.h", "net/mac80211/debug.h", "net/mac80211/debugfs.h", "net/mac80211/debugfs_key.h", "net/mac80211/debugfs_netdev.h", "net/mac80211/debugfs_sta.h", "net/mac80211/driver-ops.h", "net/mac80211/drop.h", "net/mac80211/fils_aead.h", "net/mac80211/ieee80211_i.h", "net/mac80211/key.h", "net/mac80211/led.h", "net/mac80211/mesh.h", "net/mac80211/michael.h", "net/mac80211/rate.h", "net/mac80211/rc80211_minstrel_ht.h", "net/mac80211/sta_info.h", "net/mac80211/tkip.h", "net/mac80211/trace.h", "net/mac80211/trace_msg.h", "net/mac80211/wep.h", "net/mac80211/wme.h", "net/mac80211/wpa.h"],
+    includes = ["net/mac80211"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "mac80211",
+    srcs = ["net/mac80211/main.c", "net/mac80211/status.c", "net/mac80211/driver-ops.c", "net/mac80211/sta_info.c", "net/mac80211/wep.c", "net/mac80211/aead_api.c", "net/mac80211/wpa.c", "net/mac80211/scan.c", "net/mac80211/offchannel.c", "net/mac80211/ht.c", "net/mac80211/agg-tx.c", "net/mac80211/agg-rx.c", "net/mac80211/vht.c", "net/mac80211/he.c", "net/mac80211/s1g.c", "net/mac80211/ibss.c", "net/mac80211/iface.c", "net/mac80211/link.c", "net/mac80211/rate.c", "net/mac80211/michael.c", "net/mac80211/tkip.c", "net/mac80211/aes_cmac.c", "net/mac80211/aes_gmac.c", "net/mac80211/fils_aead.c", "net/mac80211/cfg.c", "net/mac80211/ethtool.c", "net/mac80211/rx.c", "net/mac80211/spectmgmt.c", "net/mac80211/tx.c", "net/mac80211/key.c", "net/mac80211/util.c", "net/mac80211/parse.c", "net/mac80211/wme.c", "net/mac80211/chan.c", "net/mac80211/trace.c", "net/mac80211/mlme.c", "net/mac80211/tdls.c", "net/mac80211/ocb.c", "net/mac80211/airtime.c", "net/mac80211/eht.c", "net/mac80211/nan.c", "net/mac80211/led.c", "net/mac80211/pm.c", "net/mac80211/rc80211_minstrel_ht.c", "net/mac80211/wbrf.c"],
+    out = "mac80211.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":mac80211_headers", ":cfg80211"],
+    copts = ["-DDEBUG"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_headers(
+    name = "audio_amplifier_headers",
+    hdrs = ["qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx.h", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_bin_parse.h", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_calib.h", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_data_type.h", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_device.h", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_dsp.h", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_init.h", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_log.h", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_monitor.h", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_spin.h", "qcom/opensource/audio-kernel/asoc/codecs/sia91xx/sipa_91xx.h", "qcom/opensource/audio-kernel/asoc/codecs/sia91xx/sipa_common.h", "qcom/opensource/audio-kernel/asoc/codecs/sia91xx/sipa_parameter.h", "qcom/opensource/audio-kernel/asoc/codecs/sia91xx/sipa_regmap.h", "qcom/opensource/audio-kernel/asoc/codecs/sia91xx/sipa_tuning_if.h", "qcom/opensource/audio-kernel/config/sunautoconf.h", "qcom/opensource/audio-kernel/asoc/msm_common.h", "include/miev/mievent.h"],
+    includes = ["qcom/opensource/audio-kernel/asoc"],
+    linux_includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "aw882xx_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx.c", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_bin_parse.c", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_calib.c", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_device.c", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_dsp.c", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_init.c", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_monitor.c", "qcom/opensource/audio-kernel/asoc/codecs/aw882xx/aw882xx_spin.c", "qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "aw882xx_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_amplifier_headers", ":machine_dlkm", ":miev"],
+    copts = ["-DDEBUG", "-include", "$(location qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "sia91xx_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/sia91xx/sipa.c", "qcom/opensource/audio-kernel/asoc/codecs/sia91xx/sipa_regmap.c", "qcom/opensource/audio-kernel/asoc/codecs/sia91xx/sipa_aux_dev_if.c", "qcom/opensource/audio-kernel/asoc/codecs/sia91xx/sipa_91xx.c", "qcom/opensource/audio-kernel/asoc/codecs/sia91xx/sipa_parameter.c", "qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "sia91xx_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_amplifier_headers", ":machine_dlkm"],
+    copts = ["-include", "$(location qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "sia91xx_tuning_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/codecs/sia91xx/sipa_tuning_misc.c", "qcom/opensource/audio-kernel/asoc/codecs/sia91xx/sipa_tuning_if.c", "qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "sia91xx_tuning_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_amplifier_headers"],
+    copts = ["-include", "$(location qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)
+
+
+ddk_module(
+    name = "qcom_tlmm_vm_irqchip",
+    srcs = ["drivers/soc/qcom/qcom_tlmm_vm_irqchip.c"],
+    out = "qcom_tlmm_vm_irqchip.ko",
+    kernel_build = "//common:kernel_aarch64",
+)
+
+ddk_headers(
+    name = "qti_fixed_source",
+    hdrs = ["drivers/regulator/fixed.c"],
+)
+
+ddk_module(
+    name = "qti_fixed_regulator",
+    srcs = ["drivers/regulator/qti-fixed-regulator.c"],
+    out = "qti-fixed-regulator.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":qti_fixed_source", ":regulator_headers", ":debug_regulator", ":proxy_consumer"],
+)
+
+ddk_module(
+    name = "qti_glink_adc",
+    srcs = ["drivers/iio/adc/qti-glink-adc.c"],
+    out = "qti-glink-adc.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":pmic_glink_headers", ":qti_pmic_glink"],
+)
+
+ddk_headers(
+    name = "transport_consumer_headers",
+    hdrs = ["net/qrtr/qrtr.h", "drivers/rpmsg/qcom_glink_native.h"],
+    includes = ["net/qrtr", "drivers/rpmsg"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "qrtr_mhi",
+    srcs = ["net/qrtr/mhi.c"],
+    out = "qrtr-mhi.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":transport_consumer_headers", ":remote_headers", ":platform_headers", ":qrtr_headers", ":qrtr", ":mhi", ":pcie_mhi_headers"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "qrtr_smd",
+    srcs = ["net/qrtr/smd.c"],
+    out = "qrtr-smd.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":transport_consumer_headers", ":remote_headers", ":platform_headers", ":qrtr_headers", ":qrtr", ":qcom_glink_smem", ":qcom_glink"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_module(
+    name = "qrtr_tun",
+    srcs = ["net/qrtr/tun.c"],
+    out = "qrtr-tun.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":transport_consumer_headers", ":remote_headers", ":platform_headers", ":qrtr_headers", ":qrtr"],
+    visibility = ["//visibility:public"],
+)
+
+# Preserve Qualcomm duplicate-funnel aliases while retaining the 6.18 API.
+ddk_module(
+    name = "coresight_funnel",
+    srcs = [
+        "drivers/hwtracing/coresight/coresight-funnel.c",
+        "drivers/hwtracing/coresight/coresight-priv.h",
+    ],
+    out = "coresight-funnel.ko",
+    kernel_build = "//common:kernel_aarch64",
+)
+
+# Native UIO ABI used by the modem's remote storage daemon.
+ddk_module(
+    name = "msm_sharedmem",
+    srcs = ["drivers/uio/msm_sharedmem/msm_sharedmem.c"],
+    out = "msm_sharedmem.ko",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    kernel_build = "//common:kernel_aarch64",
+    deps = [":scm_headers", ":qcom_scm"],
+)
+
 kernel_module_group(
     name = "platform_modules",
     srcs = [
+        ":msm_sharedmem",
+        ":coresight_funnel",
         ":mca_charge_mievent",
         ":mca_smart_charge",
         ":mca_soc_limit",
@@ -3957,6 +4362,7 @@ kernel_module_group(
         ":qcom_scmi_client",
         ":dcvs_fp",
         ":qcom_dcvs",
+        ":bwmon",
         ":qcom_pmu_lib",
         ":qfprom_sys",
         ":debug_symbol",
@@ -4053,6 +4459,7 @@ kernel_module_group(
         ":wlan_firmware_service",
         ":audio_pkt_dlkm",
         ":aw8697_haptic",
+        ":si_haptic",
         ":cfg80211",
         ":audio_prm_dlkm",
         ":ipam",
@@ -4105,6 +4512,32 @@ kernel_module_group(
         ":rmnet_sch",
         ":rmnet_shs",
         ":rmnet_wlan",
+        ":wsa883x_dlkm",
+        ":wsa884x_dlkm",
+        ":wcd9378_dlkm",
+        ":wcd9378_slave_dlkm",
+        ":wcd938x_dlkm",
+        ":wcd938x_slave_dlkm",
+        ":wcd939x_dlkm",
+        ":wcd939x_slave_dlkm",
+        ":pinctrl_lpi_dlkm",
+        ":sdca_registers_dlkm",
+        ":swr_dmic_dlkm",
+        ":swr_haptics_dlkm",
+        ":stub_dlkm",
+        ":hdmi_dlkm",
+        ":machine_dlkm",
+        ":mac80211",
+        ":aw882xx_dlkm",
+        ":sia91xx_dlkm",
+        ":sia91xx_tuning_dlkm",
+        ":phy_qcom_ufs_niobe",
+        ":qcom_tlmm_vm_irqchip",
+        ":qti_fixed_regulator",
+        ":qti_glink_adc",
+        ":qrtr_mhi",
+        ":qrtr_smd",
+        ":qrtr_tun",
     ],
 )
 

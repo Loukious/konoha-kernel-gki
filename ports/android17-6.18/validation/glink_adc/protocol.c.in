@@ -1,0 +1,104 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdio.h>
+typedef uint32_t u32;
+typedef int spinlock_t;
+struct device {int unused;};
+struct mutex {int held;};
+struct completion {int done;};
+struct pmic_glink_client {int unused;};
+struct pmic_glink_hdr {u32 owner,type,opcode;};
+enum pmic_glink_state {PMIC_GLINK_STATE_DOWN,PMIC_GLINK_STATE_UP};
+struct iio_chan_spec {int channel;};
+struct iio_dev {int num_channels;struct iio_chan_spec *channels;};
+struct fwnode_reference_args {int nargs;u32 args[2];};
+#define EINVAL 22
+#define ENODEV 19
+#define ENOTCONN 107
+#define EIO 5
+#define EINPROGRESS 115
+#define ETIMEDOUT 110
+#define GENMASK(h,l) ((~0U<<(l)) & (~0U>>(31-(h))))
+#define FIELD_GET(m,v) (((v)&(m))>>__builtin_ctz(m))
+#define dev_err(...) ((void)0)
+#define dev_dbg(...) ((void)0)
+#define msecs_to_jiffies(v) (v)
+#define spin_lock_irqsave(l,f) do{(f)=0;assert(!*(l));*(l)=1;}while(0)
+#define spin_unlock_irqrestore(l,f) do{(void)(f);assert(*(l));*(l)=0;}while(0)
+static void mutex_lock(struct mutex *m) {assert(!m->held);m->held=1;}
+static void mutex_unlock(struct mutex *m) {assert(m->held);m->held=0;}
+static void reinit_completion(struct completion *c) {c->done=0;}
+static void complete(struct completion *c) {c->done++;}
+/* PRODUCTION_TYPES */
+static struct glink_adc_dev *active;
+static int mode,writes,unregistered;
+static int glink_adc_callback(void *,void *,size_t);
+static void glink_adc_state_callback(void *,enum pmic_glink_state);
+static void glink_adc_stop(struct glink_adc_dev *);
+static int pmic_glink_write(struct pmic_glink_client *c,void *p,size_t len) {
+ assert(active->lock.held && active->pending && len==sizeof(struct smb_adc_read_req_msg));writes++;
+ return mode==2 ? -ENOTCONN : 0;
+}
+static unsigned long wait_for_completion_timeout(struct completion *c,unsigned long t) {
+ struct smb_adc_read_resp_msg msg={.hdr={MSG_OWNER_SMB_ADC,MSG_TYPE_REQ_RESP,SMB_ADC_READ_REQ_OP},
+ .bus_id=active->request.bus_id,.pmic_id=active->request.pmic_id,.chan=active->request.chan,.raw_data=321,.conv_data=1234};
+ if(mode==1)return 0;
+ if(mode==3)msg.status=SMB_ADC_READ_STATUS_ERR_FAILED;
+ if(mode==4)msg.chan++;
+ if(mode==5)glink_adc_state_callback(active,PMIC_GLINK_STATE_DOWN);
+ else if(mode==6)glink_adc_stop(active);
+ else {
+  if(mode==8)msg.hdr.owner++;
+  if(mode==9)msg.hdr.type++;
+  if(mode==10)msg.hdr.opcode++;
+  glink_adc_callback(active,&msg,mode==7 ? sizeof(msg)-1:sizeof(msg));
+ }
+ return c->done ? 1 : 0;
+}
+static int pmic_glink_unregister_client(struct pmic_glink_client *c) {
+ assert(active->lock.held && active->stopping && !active->pending);unregistered++;return 0;
+}
+/* PRODUCTION_FUNCTIONS */
+static void reset(struct glink_adc_dev *a) {memset(a,0,sizeof(*a));a->available=true;active=a;writes=0;}
+int main(void) {
+ struct glink_adc_dev adc;
+ struct iio_chan_spec channel={.channel=0x00020103};
+ int conv,raw;
+ int expected[]={0,-ETIMEDOUT,-ENOTCONN,-EIO,-ETIMEDOUT,-ENOTCONN,-ENODEV,-ETIMEDOUT,-ETIMEDOUT,-ETIMEDOUT,-ETIMEDOUT};
+ for(mode=0;mode<=10;mode++) {
+  reset(&adc);conv=raw=-123;
+  assert(glink_adc_read_channel(&adc,&channel,&conv,&raw)==expected[mode]);
+  assert(!adc.pending && !adc.lock.held && writes==1);
+  if(mode==0)assert(conv==1234 && raw==321);
+  else assert(conv==-123 && raw==-123);
+  if(mode==1) {
+   mode=0;
+   assert(glink_adc_read_channel(&adc,&channel,&conv,&raw)==-EIO && writes==1);
+   glink_adc_state_callback(&adc,PMIC_GLINK_STATE_UP);
+   assert(glink_adc_read_channel(&adc,&channel,&conv,&raw)==-EIO && writes==1);
+   glink_adc_state_callback(&adc,PMIC_GLINK_STATE_DOWN);
+   assert(glink_adc_read_channel(&adc,&channel,&conv,&raw)==-ENOTCONN);
+   glink_adc_state_callback(&adc,PMIC_GLINK_STATE_UP);
+   assert(glink_adc_read_channel(&adc,&channel,&conv,&raw)==0 && writes==2);
+   mode=1;
+  }
+ }
+ reset(&adc);
+ assert(glink_adc_callback(&adc,NULL,0)==-EINVAL);
+ unsigned char tiny[1]={0};assert(glink_adc_callback(&adc,tiny,sizeof(tiny))==-EINVAL);
+ struct smb_adc_read_resp_msg msg={.hdr={MSG_OWNER_SMB_ADC,MSG_TYPE_REQ_RESP,SMB_ADC_READ_REQ_OP},.chan=3};
+ adc.pending=true;adc.request.chan=3;
+ assert(glink_adc_callback(&adc,&msg,sizeof(msg))==0 && adc.ack.done==1);
+ msg.conv_data=99;glink_adc_callback(&adc,&msg,sizeof(msg));assert(adc.ack.done==1 && adc.read_msg.conv_data==0);
+ adc.pending=true;glink_adc_stop(&adc);assert(adc.result==-ENODEV && !adc.pending && adc.ack.done==2);
+ glink_adc_state_callback(&adc,PMIC_GLINK_STATE_UP);assert(adc.stopping);
+ glink_adc_unregister_client(&adc);assert(unregistered==1 && !adc.lock.held);
+ struct iio_dev indio={.num_channels=1,.channels=&channel};
+ struct fwnode_reference_args ref={.nargs=0,.args={channel.channel,0}};
+ assert(glink_adc_fwnode_xlate(&indio,&ref)==-EINVAL);ref.nargs=2;assert(glink_adc_fwnode_xlate(&indio,&ref)==-EINVAL);
+ ref.nargs=1;assert(glink_adc_fwnode_xlate(&indio,&ref)==0);ref.args[0]++;assert(glink_adc_fwnode_xlate(&indio,&ref)==-EINVAL);
+ puts("PASS GLINK ADC response identity, timeout quarantine, restart, stop and client cleanup");
+}

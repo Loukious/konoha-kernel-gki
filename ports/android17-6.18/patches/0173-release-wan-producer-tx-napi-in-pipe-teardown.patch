@@ -1,0 +1,24 @@
+Subject: Release WAN producer TX NAPI in its owning pipe
+
+rmnet frees only the netdev-owned RX NAPI. The producer TX NAPI is
+separately attached to that same netdev and must be disabled and removed
+by pipe teardown before free_netdev walks the remaining NAPI list.
+
+---
+
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_dp.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_dp.c
+@@ -2037,11 +2037,8 @@
+ 		} while (1);
+ 
+ 		delete_avail_tx_wrapper_list(ep);
+-		/* Delete NAPI TX object. For WAN_PROD, it is deleted
+-		 * in rmnet_ipa driver.
+-		 */
+-		if (ep->sys->napi_tx_enable &&
+-			(ep->client != IPA_CLIENT_APPS_WAN_PROD)) {
++		/* Each producer pipe owns its TX NAPI, including WAN_PROD. */
++		if (ep->sys->napi_tx_enable) {
+ 			napi_disable(&ep->sys->napi_tx);
+ 			netif_napi_del(&ep->sys->napi_tx);
+ 		}

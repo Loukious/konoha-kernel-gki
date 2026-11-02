@@ -1,0 +1,254 @@
+Subject: Port native GLINK ADC with bounded response lifetime
+
+Validate message headers and response identity before completion.
+Serialize pending-response state, quarantine timeouts until a new transport
+session, and drain IIO readers before unregistering the GLINK client.
+
+---
+
+index 21f2e208303f..4bf7eb0d85c6 100644
+--- a/drivers/iio/adc/qti-glink-adc.c
++++ b/drivers/iio/adc/qti-glink-adc.c
+@@ -12,6 +12,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/property.h>
+ #include <linux/slab.h>
++#include <linux/spinlock.h>
+ #include <linux/iio/iio.h>
+ #include <linux/soc/qcom/qti_pmic_glink.h>
+ 
+@@ -60,6 +61,14 @@ struct glink_adc_dev {
+ 	struct iio_chan_spec		*iio_chans;
+ 	unsigned int			nchannels;
+ 	struct smb_adc_read_resp_msg	read_msg;
++	spinlock_t			response_lock;
++	struct smb_adc_read_req_msg	request;
++	bool				pending;
++	bool				stopping;
++	bool				available;
++	bool				desynced;
++	bool				down_seen;
++	int				result;
+ };
+ 
+ #define ADC_GLINK_CHAN(hwchan)		FIELD_GET(GENMASK(7, 0), hwchan)
+@@ -70,15 +79,25 @@ static void glink_adc_handle_read_resp(struct glink_adc_dev *adc,
+ 				       struct smb_adc_read_resp_msg *read_resp,
+ 				       size_t len)
+ {
++	unsigned long flags;
++
+ 	if (len != sizeof(*read_resp)) {
+ 		dev_err(adc->dev, "Invalid read response, glink packet size=%zu\n",
+ 			len);
+ 		return;
+ 	}
+ 
+-	memcpy(&adc->read_msg, read_resp, sizeof(adc->read_msg));
+-
+-	complete(&adc->ack);
++	spin_lock_irqsave(&adc->response_lock, flags);
++	if (adc->pending && !adc->stopping &&
++	    read_resp->bus_id == adc->request.bus_id &&
++	    read_resp->pmic_id == adc->request.pmic_id &&
++	    read_resp->chan == adc->request.chan) {
++		memcpy(&adc->read_msg, read_resp, sizeof(adc->read_msg));
++		adc->result = 0;
++		adc->pending = false;
++		complete(&adc->ack);
++	}
++	spin_unlock_irqrestore(&adc->response_lock, flags);
+ }
+ 
+ static int glink_adc_callback(void *priv, void *data, size_t len)
+@@ -86,6 +105,11 @@ static int glink_adc_callback(void *priv, void *data, size_t len)
+ 	struct glink_adc_dev *adc = priv;
+ 	struct pmic_glink_hdr *hdr = data;
+ 
++	if (!data || len < sizeof(*hdr))
++		return -EINVAL;
++	if (hdr->owner != MSG_OWNER_SMB_ADC || hdr->type != MSG_TYPE_REQ_RESP)
++		return -EINVAL;
++
+ 	dev_dbg(adc->dev, "owner: %u type: %u opcode: %#x len: %zu\n",
+ 		hdr->owner, hdr->type, hdr->opcode, len);
+ 
+@@ -101,11 +125,37 @@ static int glink_adc_callback(void *priv, void *data, size_t len)
+ 	return 0;
+ }
+ 
++static void glink_adc_state_callback(void *priv, enum pmic_glink_state state)
++{
++	struct glink_adc_dev *adc = priv;
++	unsigned long flags;
++
++	spin_lock_irqsave(&adc->response_lock, flags);
++	if (adc->stopping)
++		goto out;
++	adc->available = state == PMIC_GLINK_STATE_UP;
++	if (!adc->available) {
++		adc->down_seen = true;
++		if (adc->pending) {
++			adc->pending = false;
++			adc->result = -ENOTCONN;
++			complete(&adc->ack);
++		}
++	} else if (adc->down_seen) {
++		/* A new transport session follows provider RX-queue drainage. */
++		adc->desynced = false;
++		adc->down_seen = false;
++	}
++out:
++	spin_unlock_irqrestore(&adc->response_lock, flags);
++}
++
+ static int glink_adc_read_channel(struct glink_adc_dev *adc,
+ 				  struct iio_chan_spec const *chan,
+ 				  int *conv_data, int *raw_data)
+ {
+ 	struct smb_adc_read_req_msg msg = {{0}};
++	unsigned long flags;
+ 	int ret;
+ 
+ 	msg.hdr.owner = MSG_OWNER_SMB_ADC;
+@@ -117,18 +167,39 @@ static int glink_adc_read_channel(struct glink_adc_dev *adc,
+ 	msg.chan = ADC_GLINK_CHAN(chan->channel);
+ 
+ 	mutex_lock(&adc->lock);
++	spin_lock_irqsave(&adc->response_lock, flags);
++	if (adc->stopping || !adc->available || adc->desynced) {
++		ret = adc->stopping ? -ENODEV :
++			(!adc->available ? -ENOTCONN : -EIO);
++		spin_unlock_irqrestore(&adc->response_lock, flags);
++		goto done;
++	}
+ 	reinit_completion(&adc->ack);
++	adc->request = msg;
++	adc->pending = true;
++	adc->result = -EINPROGRESS;
++	spin_unlock_irqrestore(&adc->response_lock, flags);
+ 	ret = pmic_glink_write(adc->client, &msg, sizeof(msg));
+-	if (ret)
++	if (ret) {
++		spin_lock_irqsave(&adc->response_lock, flags);
++		adc->pending = false;
++		spin_unlock_irqrestore(&adc->response_lock, flags);
+ 		goto done;
++	}
+ 
+ 	ret = wait_for_completion_timeout(&adc->ack,
+ 				msecs_to_jiffies(ADC_READ_WAIT_TIME_MS));
+-	if (!ret) {
+-		dev_err(adc->dev, "Error, ADC conversion timed out\n");
+-		ret = -ETIMEDOUT;
+-		goto done;
++	spin_lock_irqsave(&adc->response_lock, flags);
++	if (adc->pending) {
++		/* Without a transaction ID a late reply cannot be safely reused. */
++		adc->pending = false;
++		adc->desynced = true;
++		adc->result = -ETIMEDOUT;
+ 	}
++	ret = adc->result;
++	spin_unlock_irqrestore(&adc->response_lock, flags);
++	if (ret)
++		goto done;
+ 
+ 	if (adc->read_msg.status != SMB_ADC_READ_STATUS_SUCCESS) {
+ 		dev_err(adc->dev, "glink ADC read failed, bus_id=%u, pmic_id=%u, chan=%u, ret=%u\n",
+@@ -183,6 +254,9 @@ static int glink_adc_fwnode_xlate(struct iio_dev *indio_dev,
+ {
+ 	int i;
+ 
++	if (iiospec->nargs != 1)
++		return -EINVAL;
++
+ 	for (i = 0; i < indio_dev->num_channels; i++) {
+ 		if (indio_dev->channels[i].channel == iiospec->args[0])
+ 			return i;
+@@ -275,6 +349,31 @@ static int glink_adc_get_dt_data(struct glink_adc_dev *adc)
+ 	return 0;
+ }
+ 
++static void glink_adc_stop(struct glink_adc_dev *adc)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&adc->response_lock, flags);
++	adc->stopping = true;
++	if (adc->pending) {
++		adc->pending = false;
++		adc->result = -ENODEV;
++		complete(&adc->ack);
++	}
++	spin_unlock_irqrestore(&adc->response_lock, flags);
++}
++
++static void glink_adc_unregister_client(void *data)
++{
++	struct glink_adc_dev *adc = data;
++
++	glink_adc_stop(adc);
++	/* IIO publication is withdrawn first; drain writes before client free. */
++	mutex_lock(&adc->lock);
++	pmic_glink_unregister_client(adc->client);
++	mutex_unlock(&adc->lock);
++}
++
+ static int glink_adc_probe(struct platform_device *pdev)
+ {
+ 	struct glink_adc_dev *adc;
+@@ -289,12 +388,15 @@ static int glink_adc_probe(struct platform_device *pdev)
+ 	adc = iio_priv(indio_dev);
+ 	adc->dev = &pdev->dev;
+ 	mutex_init(&adc->lock);
++	spin_lock_init(&adc->response_lock);
++	adc->available = true;
+ 	init_completion(&adc->ack);
+ 	platform_set_drvdata(pdev, adc);
+ 
+ 	client_data.id = MSG_OWNER_SMB_ADC;
+ 	client_data.name = "adc";
+ 	client_data.msg_cb = glink_adc_callback;
++	client_data.state_cb = glink_adc_state_callback;
+ 	client_data.priv = adc;
+ 
+ 	ret = glink_adc_get_dt_data(adc);
+@@ -309,6 +411,9 @@ static int glink_adc_probe(struct platform_device *pdev)
+ 				ret);
+ 		return ret;
+ 	}
++	ret = devm_add_action_or_reset(&pdev->dev, glink_adc_unregister_client, adc);
++	if (ret)
++		return ret;
+ 
+ 	indio_dev->dev.parent = &pdev->dev;
+ 	indio_dev->dev.of_node = pdev->dev.of_node;
+@@ -322,23 +427,18 @@ static int glink_adc_probe(struct platform_device *pdev)
+ 	if (ret < 0) {
+ 		dev_err(&pdev->dev, "iio device registration failed, ret=%d\n",
+ 			ret);
+-		goto fail;
++		return ret;
+ 	}
+ 
+ 	return 0;
+-
+-fail:
+-	pmic_glink_unregister_client(adc->client);
+-	return ret;
+ }
+ 
+-static int glink_adc_remove(struct platform_device *pdev)
++static void glink_adc_remove(struct platform_device *pdev)
+ {
+ 	struct glink_adc_dev *adc = platform_get_drvdata(pdev);
+ 
+-	pmic_glink_unregister_client(adc->client);
+-
+-	return 0;
++	/* Wake in-flight readers before managed IIO withdrawal drains them. */
++	glink_adc_stop(adc);
+ }
+ 
+ static const struct of_device_id glink_adc_match_table[] = {

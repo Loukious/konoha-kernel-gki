@@ -1,0 +1,271 @@
+Subject: Drain borrowed SoundWire IRQ domains before consumer teardown
+
+Retain slave registrations and serialize threaded dispatch with checked
+domain withdrawal. Preserve the controller pending loop and public device
+layout.
+
+---
+
+--- a/qcom/opensource/audio-kernel/soc/soundwire.c
++++ b/qcom/opensource/audio-kernel/soc/soundwire.c
+@@ -52,6 +52,185 @@
+ 	if (atomic_dec_and_test(&master->active_calls))
+ 		wake_up_all(&master->call_wait);
+ }
++
++/* The codec owns the domain; registration retains only its slave device. */
++struct swr_slave_irq {
++	struct list_head node;
++	struct swr_device *swr;
++	struct irq_domain *domain;
++	/* Serializes dispatch with synchronous withdrawal. */
++	struct mutex dispatch_lock;
++	struct task_struct *handler;
++	refcount_t refs;
++	bool stopping;
++};
++
++static LIST_HEAD(swr_slave_irqs);
++static DEFINE_MUTEX(swr_slave_irq_lock);
++
++static void swr_slave_irq_put(struct swr_slave_irq *irq)
++{
++	if (refcount_dec_and_test(&irq->refs)) {
++		put_device(&irq->swr->dev);
++		mutex_destroy(&irq->dispatch_lock);
++		kfree(irq);
++	}
++}
++
++/* swr_slave_irq_lock protects the registry and the stopping flag. */
++static bool swr_slave_irq_in_handler(void)
++{
++	struct swr_slave_irq *irq;
++
++	list_for_each_entry(irq, &swr_slave_irqs, node)
++		if (READ_ONCE(irq->handler) == current)
++			return true;
++	return false;
++}
++
++/**
++ * swr_set_slave_irq - publish or withdraw a borrowed codec IRQ domain
++ * @swr: retained slave device owned by the caller
++ * @domain: domain to publish, or NULL to withdraw and drain dispatch
++ *
++ * The owner must serialize lifecycle calls and keep its domain, IRQ handlers,
++ * and handler data alive until withdrawal returns zero. A NULL domain is safe
++ * after master shutdown and succeeds when no domain is registered. A second
++ * publication or simultaneous withdrawal returns -EBUSY. Lifecycle calls from
++ * any nested slave IRQ handler return -EDEADLK without changing registration;
++ * defer those calls to process context after the handler has returned.
++ *
++ * Context: process context, may sleep. Do not hold a lock needed by a handler.
++ */
++int swr_set_slave_irq(struct swr_device *swr, struct irq_domain *domain)
++{
++	struct swr_slave_irq *irq, *found = NULL;
++	int ret = 0;
++
++	if (!swr || IS_ERR(domain))
++		return -EINVAL;
++	if (domain) {
++		ret = swr_master_begin(swr->master);
++		if (ret)
++			return ret;
++	}
++
++	mutex_lock(&swr_slave_irq_lock);
++	if (swr_slave_irq_in_handler()) {
++		ret = -EDEADLK;
++		goto unlock;
++	}
++	list_for_each_entry(irq, &swr_slave_irqs, node) {
++		if (irq->swr == swr) {
++			found = irq;
++			break;
++		}
++	}
++
++	if (domain) {
++		if (found) {
++			ret = -EBUSY;
++			goto unlock;
++		}
++		irq = kzalloc(sizeof(*irq), GFP_KERNEL);
++		if (!irq) {
++			ret = -ENOMEM;
++			goto unlock;
++		}
++		irq->swr = swr;
++		irq->domain = domain;
++		mutex_init(&irq->dispatch_lock);
++		refcount_set(&irq->refs, 1);
++		get_device(&swr->dev);
++		WRITE_ONCE(swr->slave_irq, domain);
++		list_add_tail(&irq->node, &swr_slave_irqs);
++		goto unlock;
++	}
++
++	if (!found) {
++		/* Untracked direct stores cannot provide a safe drain contract. */
++		if (READ_ONCE(swr->slave_irq))
++			ret = -EINVAL;
++		goto unlock;
++	}
++	if (found->stopping) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	found->stopping = true;
++	mutex_unlock(&swr_slave_irq_lock);
++
++	/* A reserved dispatcher either completes first or observes NULL. */
++	mutex_lock(&found->dispatch_lock);
++	found->domain = NULL;
++	WRITE_ONCE(swr->slave_irq, NULL);
++	mutex_unlock(&found->dispatch_lock);
++
++	mutex_lock(&swr_slave_irq_lock);
++	list_del(&found->node);
++	mutex_unlock(&swr_slave_irq_lock);
++	swr_slave_irq_put(found);
++	return 0;
++
++unlock:
++	mutex_unlock(&swr_slave_irq_lock);
++	if (domain)
++		swr_master_end(swr->master);
++	return ret;
++}
++EXPORT_SYMBOL(swr_set_slave_irq);
++
++/**
++ * swr_handle_slave_irq - dispatch one nested interrupt for a registered slave
++ * @master: controller whose threaded IRQ handler is running
++ * @dev_num: logical slave number reported by the controller
++ * @dispatch: controller callback which maps and dispatches the borrowed domain
++ *
++ * Returns true when the codec reports a pending interrupt after dispatch. The
++ * controller retains its native pending loop and device-up check. Registration
++ * retains the device; each dispatch reserves both registration and controller.
++ * Recursive dispatch from a nested slave IRQ handler is rejected.
++ *
++ * Context: threaded IRQ/process context, may sleep.
++ */
++bool swr_handle_slave_irq(struct swr_master *master, u8 dev_num,
++			  void (*dispatch)(struct irq_domain *))
++{
++	struct swr_slave_irq *irq, *found = NULL;
++	bool pending = false;
++
++	if (!dispatch || swr_master_begin(master))
++		return false;
++	mutex_lock(&swr_slave_irq_lock);
++	if (!swr_slave_irq_in_handler()) {
++		list_for_each_entry(irq, &swr_slave_irqs, node) {
++			if (!irq->stopping && irq->swr->master == master &&
++			    irq->swr->dev_num == dev_num) {
++				refcount_inc(&irq->refs);
++				found = irq;
++				break;
++			}
++		}
++	}
++	mutex_unlock(&swr_slave_irq_lock);
++	if (!found)
++		goto out;
++
++	mutex_lock(&found->dispatch_lock);
++	if (found->domain) {
++		WRITE_ONCE(found->handler, current);
++		WRITE_ONCE(found->swr->slave_irq_pending, false);
++		dispatch(found->domain);
++		pending = READ_ONCE(found->swr->slave_irq_pending);
++		WRITE_ONCE(found->handler, NULL);
++	}
++	mutex_unlock(&found->dispatch_lock);
++	swr_slave_irq_put(found);
++out:
++	swr_master_end(master);
++	return pending;
++}
++EXPORT_SYMBOL(swr_handle_slave_irq);
+ 
+ struct swr_transaction {
+ 	struct swr_params params;
+--- a/qcom/opensource/audio-kernel/include/soc/soundwire.h
++++ b/qcom/opensource/audio-kernel/include/soc/soundwire.h
+@@ -435,6 +435,15 @@
+ /* Returns a device reference; balance with put_device(&swr->dev). */
+ extern struct swr_device *get_matching_swr_slave_device(struct device_node *np);
+ 
++/*
++ * Serialize owner lifecycle calls. NULL withdraws and drains threaded dispatch;
++ * preserve the domain and all handler state until withdrawal returns zero.
++ * May sleep; calls from nested slave IRQ handlers return -EDEADLK unchanged.
++ */
++int swr_set_slave_irq(struct swr_device *dev, struct irq_domain *domain);
++bool swr_handle_slave_irq(struct swr_master *master, u8 dev_num,
++			  void (*dispatch)(struct irq_domain *domain));
++
+ extern int swr_device_wakeup_vote(struct swr_device *dev);
+ 
+ extern int swr_device_wakeup_unvote(struct swr_device *dev);
+--- a/qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.c
++++ b/qcom/opensource/audio-kernel/soc/swr-mstr-ctrl.c
+@@ -2507,6 +2507,24 @@
+ 	}
+ }
+ 
++static void swrm_handle_nested_irq(struct irq_domain *domain)
++{
++	unsigned int virq = irq_find_mapping(domain, 0);
++
++	if (virq)
++		handle_nested_irq(virq);
++}
++
++static void swrm_dispatch_slave_irq(struct swr_mstr_ctrl *swrm, u8 devnum)
++{
++	bool pending;
++
++	do {
++		pending = swr_handle_slave_irq(&swrm->master, devnum,
++					       swrm_handle_nested_irq);
++	} while (pending && READ_ONCE(swrm->dev_up));
++}
++
+ static irqreturn_t swr_mstr_interrupt(int irq, void *dev)
+ {
+ 	struct swr_mstr_ctrl *swrm = dev;
+@@ -2515,8 +2533,6 @@
+ 	u32 status, i;
+ 	u8 devnum = 0;
+ 	int ret = IRQ_HANDLED;
+-	struct swr_device *swr_dev;
+-	struct swr_master *mstr = &swrm->master;
+ 	int retry = 5;
+ 
+ 	if (unlikely(swrm_lock_sleep(swrm) == false)) {
+@@ -2574,19 +2590,7 @@
+ 						SWRS_SCP_INT_STATUS_CLEAR_1);
+ 
+ 
+-			list_for_each_entry(swr_dev, &mstr->devices, dev_list) {
+-				if (swr_dev->dev_num != devnum)
+-					continue;
+-				if (swr_dev->slave_irq) {
+-					do {
+-						swr_dev->slave_irq_pending = 0;
+-						handle_nested_irq(
+-							irq_find_mapping(
+-							swr_dev->slave_irq, 0));
+-					} while (swr_dev->slave_irq_pending && swrm->dev_up);
+-				}
+-
+-			}
++			swrm_dispatch_slave_irq(swrm, devnum);
+ 			break;
+ 		case SWRM_INTERRUPT_STATUS_NEW_SLAVE_ATTACHED:
+ 			dev_dbg(swrm->dev, "%s: SWR new slave attached\n",

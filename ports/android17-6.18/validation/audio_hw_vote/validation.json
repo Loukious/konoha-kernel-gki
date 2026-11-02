@@ -1,0 +1,73 @@
+{
+  "status": "PASS",
+  "checks": {
+    "positive": {
+      "exit_code": 0,
+      "stdout": "PASS: 280 lifecycle/accounting checks; NULL-device common caller reaches real LPASS provider/PRM; nested votes1..128; SSR/failure/refcount controls",
+      "stderr": "",
+      "manager_fragment_sha256": "98e81c9d26e5dbf2edc4547bb87d69f478dfed555ff511d5fe578f5e0496db32"
+    },
+    "before_null_device_rejection": {
+      "exit_code": -6,
+      "stdout": "",
+      "stderr": "before_null_device_rejection: /tmp/onyx-audio-hw-vote-validation/harness.c:101: int main(void): Assertion `digital_cdc_rsc_mgr_hw_vote_enable(&audio,NULL)==-ENODEV' failed.",
+      "manager_fragment_sha256": "a11010c7217311f958ed531d1bec5e87875db4a90346232f08d369ebacbf8b12"
+    },
+    "enable_only_null_device_rejection": {
+      "exit_code": -6,
+      "stdout": "",
+      "stderr": "enable_only_null_device_rejection: /tmp/onyx-audio-hw-vote-validation/harness.c:101: int main(void): Assertion `digital_cdc_rsc_mgr_hw_vote_enable(&audio,NULL)==-ENODEV' failed.",
+      "manager_fragment_sha256": "ffedc0a27525c2f9ae6f2096ef8a5574f6b74eddb20cda8e983ff4afd5f02e08"
+    },
+    "disable_only_null_device_rejection": {
+      "exit_code": -6,
+      "stdout": "",
+      "stderr": "disable_only_null_device_rejection: /tmp/onyx-audio-hw-vote-validation/harness.c:110: int main(void): Assertion `release_calls==1' failed.",
+      "manager_fragment_sha256": "6135a2a927f36c3389653cd4b4ea2f82205cdc3ee6134b4bc869c805c44ba759"
+    },
+    "bypassed_real_clock_enable": {
+      "exit_code": -6,
+      "stdout": "",
+      "stderr": "bypassed_real_clock_enable: /tmp/onyx-audio-hw-vote-validation/harness.c:108: int main(void): Assertion `audio.users==1 && audio_votes==1 && request_calls==1' failed.",
+      "manager_fragment_sha256": "1f697eb420a4e370d1ad66aa8230a759b6faecd75b82517e1c820317d0d9ddf9"
+    },
+    "leaked_failed_first_request": {
+      "exit_code": -6,
+      "stdout": "",
+      "stderr": "leaked_failed_first_request: /tmp/onyx-audio-hw-vote-validation/harness.c:88: void balanced(void): Assertion `!live_allocations && hw_votes.next==&hw_votes && hw_votes.prev==&hw_votes' failed.",
+      "manager_fragment_sha256": "9df6188fc408ce689dc952f64f358f12fcfc4ce0ebfd2c2809a26f2e09a50d11"
+    },
+    "lost_manager_readiness": {
+      "exit_code": -6,
+      "stdout": "",
+      "stderr": "lost_manager_readiness: /tmp/onyx-audio-hw-vote-validation/harness.c:101: int main(void): Assertion `digital_cdc_rsc_mgr_hw_vote_enable(&audio,NULL)==-ENODEV' failed.",
+      "manager_fragment_sha256": "235a92f6c525c2997e9a61cd2ca742bd727148f11e8a976a8ad977c1b19facc6"
+    }
+  },
+  "source_sha256": {
+    "common": "db321759bf29973f5c8a2c935d110979a36f8f52114b1f62172fe9f298c35b94",
+    "provider": "d888489b626571b71dba2904d1f78c61df68f832963608c525092a23ca87c4aa",
+    "before_manager": "0984dacbd904f3e02a077c330666fe37bf5ce1eaf588eb3fea14429935520ec8",
+    "candidate_manager": "af2f280424b3951fce2102406cf08a13b885e4535ecd17733a8e22d4607336fa",
+    "harness": "baa3ce63296a0093022e976f71c5d5cc89fc24511608c7630eb19b5b9ea73c1d"
+  },
+  "functions": {
+    "common": [
+      "mi2s_tdm_hw_vote_req"
+    ],
+    "provider": [
+      "lpass_hw_set_vote",
+      "lpass_hw_vote_prepare",
+      "lpass_hw_vote_unprepare"
+    ],
+    "manager": [
+      "hw_vote_find",
+      "digital_cdc_rsc_mgr_hw_vote_enable",
+      "digital_cdc_rsc_mgr_hw_vote_disable",
+      "digital_cdc_rsc_mgr_hw_vote_reset",
+      "digital_cdc_rsc_mgr_init",
+      "digital_cdc_rsc_mgr_exit"
+    ]
+  },
+  "limits": "Exact production common caller, manager and provider callbacks; CCF refcounts, locking/allocation and firmware PRM are modeled. No hardware audio, firmware failure policy or concurrency verification. Shared source/recipe/device unchanged."
+}

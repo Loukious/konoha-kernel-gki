@@ -1,0 +1,243 @@
+Subject: [PATCH] qcom: add opt-in boot probe and watchdog checkpoints
+
+Gate labelled probe entry/exit and initialization-stage records behind
+read-only boot_trace module parameters, disabled by default. Record I2C
+adapter/client registration, IPA device setup and watchdog timer/IPI/pet
+progress without changing timeouts, hardware calls or probe results.
+The diagnostic image selects these parameters and GKI lockup reporting.
+
+---
+diff --git a/drivers/i2c/busses/i2c-msm-geni.c b/drivers/i2c/busses/i2c-msm-geni.c
+--- a/drivers/i2c/busses/i2c-msm-geni.c
++++ b/drivers/i2c/busses/i2c-msm-geni.c
+@@ -26,6 +26,16 @@
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/sched/clock.h>
+ #include <linux/slab.h>
++
++static bool boot_trace;
++module_param(boot_trace, bool, 0400);
++MODULE_PARM_DESC(boot_trace, "Log boot initialization checkpoints");
++
++static void geni_i2c_boot_checkpoint(struct device *dev, const char *stage, int ret)
++{
++	if (boot_trace)
++		dev_info(dev, "Konoha boot: %s ret=%d\n", stage, ret);
++}
+ 
+ #define SE_GENI_TEST_BUS_CTRL	0x44
+ #define SE_NUM_FOR_TEST_BUS	5
+@@ -2985,7 +2995,8 @@
+ 
+ 	return 0;
+ }
+-static int geni_i2c_probe(struct platform_device *pdev)
++
++static int geni_i2c_probe_impl(struct platform_device *pdev)
+ {
+ 	struct geni_i2c_dev *gi2c;
+ 	struct resource *res;
+@@ -3062,7 +3073,9 @@
+ 	 * se irq not required. Below properties will not be present
+ 	 * in I2C LE dt.
+ 	 */
++	geni_i2c_boot_checkpoint(dev, "i2c.resources-init.enter", 0);
+ 	ret = geni_i2c_resources_init(pdev, gi2c);
++	geni_i2c_boot_checkpoint(dev, "i2c.resources-init.exit", ret);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -3121,7 +3134,9 @@
+ 	gi2c->ipc_log_kpi = ipc_log_context_create(IPC_LOG_KPI_PAGES, ipc_name, 0);
+ 	atomic_set(&gi2c->is_xfer_in_progress, 0);
+ 	pm_runtime_enable(gi2c->dev);
++	geni_i2c_boot_checkpoint(dev, "i2c.adapter-add.enter", 0);
+ 	ret = i2c_add_adapter(&gi2c->adap);
++	geni_i2c_boot_checkpoint(dev, "i2c.adapter-add.exit", ret);
+ 	if (ret) {
+ 		dev_err(gi2c->dev, "Add adapter failed, ret=%d\n", ret);
+ 		pm_runtime_disable(gi2c->dev);
+@@ -3140,6 +3155,16 @@
+ 	pr_info("boot_kpi: M - DRIVER GENI_I2C_%d Ready\n", gi2c->adap.nr);
+ 	dev_info(gi2c->dev, "I2C probed\n");
+ 	return 0;
++}
++
++static int geni_i2c_probe(struct platform_device *pdev)
++{
++	int ret;
++
++	geni_i2c_boot_checkpoint(&pdev->dev, "i2c.probe.enter", 0);
++	ret = geni_i2c_probe_impl(pdev);
++	geni_i2c_boot_checkpoint(&pdev->dev, "i2c.probe.exit", ret);
++	return ret;
+ }
+ 
+ static void geni_i2c_remove(struct platform_device *pdev)
+diff --git a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa.c b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa.c
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa.c
+@@ -55,6 +55,16 @@
+ #define __cpuc_flush_dcache_area __flush_dcache_area
+ 
+ #endif
++
++static bool boot_trace;
++module_param(boot_trace, bool, 0400);
++MODULE_PARM_DESC(boot_trace, "Log boot initialization checkpoints");
++
++static void ipa_boot_checkpoint(struct device *dev, const char *stage, int ret)
++{
++	if (boot_trace)
++		dev_info(dev, "Konoha boot: %s ret=%d\n", stage, ret);
++}
+ 
+ #define DRV_NAME "ipa"
+ #define DELAY_BEFORE_FW_LOAD 500
+@@ -11764,7 +11774,7 @@
+ 	return 0;
+ }
+ 
+-int ipa3_plat_drv_probe(struct platform_device *pdev_p)
++static int ipa3_plat_drv_probe_impl(struct platform_device *pdev_p)
+ {
+ 	int result;
+ 	struct device *dev = &pdev_p->dev;
+@@ -11898,7 +11908,9 @@
+ 	    "qcom,smp2p-map-ipa-1-in"))
+ 		return ipa3_smp2p_probe(dev);
+ 
++	ipa_boot_checkpoint(dev, "ipa.dts.enter", 0);
+ 	result = get_ipa_dts_configuration(pdev_p, &ipa3_res);
++	ipa_boot_checkpoint(dev, "ipa.dts.exit", result);
+ 	if (result) {
+ 		IPAERR("IPA dts parsing failed\n");
+ 		return result;
+@@ -11910,6 +11922,7 @@
+ 	* functions, that deal with the transport, require the
+ 	* access.
+ 	*/
++	ipa_boot_checkpoint(dev, "ipa.gsi-map.enter", 0);
+ 	if (gsi_map_base(
+ 		ipa3_res.transport_mem_base,
+ 		ipa3_res.transport_mem_size,
+@@ -11917,6 +11930,8 @@
+ 		IPAERR("Allocation of gsi base failed\n");
+ 		return -EFAULT;
+ 	}
++
++	ipa_boot_checkpoint(dev, "ipa.gsi-map.exit", 0);
+ 
+ 	/* Get GSI version */
+ 	ipa3_ctx->gsi_ver = ipa3_get_gsi_ver(ipa3_res.ipa_hw_type);
+@@ -11948,7 +11963,9 @@
+ 		 * existing flow initialzies only for smmu
+ 		 * enabled node.*/
+ 
++		ipa_boot_checkpoint(dev, "ipa.pre-init.enter", 0);
+ 		result = ipa3_pre_init(&ipa3_res, pdev_p);
++		ipa_boot_checkpoint(dev, "ipa.pre-init.exit", result);
+ 		if (result) {
+ 			IPAERR("ipa3_init failed\n");
+ 			return result;
+@@ -11958,15 +11975,19 @@
+ 	}
+ 
+ 	/* Proceed to real initialization */
++	ipa_boot_checkpoint(dev, "ipa.pre-init.enter", 0);
+ 	result = ipa3_pre_init(&ipa3_res, pdev_p);
++	ipa_boot_checkpoint(dev, "ipa.pre-init.exit", result);
+ 	if (result) {
+ 		IPAERR("ipa3_init failed\n");
+ 		return result;
+ 	}
+ 
+ skip_repeat_pre_init:
++	ipa_boot_checkpoint(dev, "ipa.populate.enter", 0);
+ 	result = of_platform_populate(pdev_p->dev.of_node,
+ 		ipa_plat_drv_match, NULL, &pdev_p->dev);
++	ipa_boot_checkpoint(dev, "ipa.populate.exit", result);
+ 	if (result) {
+ 		IPAERR("failed to populate platform\n");
+ 		return result;
+@@ -11976,6 +11997,16 @@
+ 		IPAERR("ipa: ipa_plat_drv_probe failed\n");
+ 
+ 	return result;
++}
++
++int ipa3_plat_drv_probe(struct platform_device *pdev_p)
++{
++	int ret;
++
++	ipa_boot_checkpoint(&pdev_p->dev, "ipa.probe.enter", 0);
++	ret = ipa3_plat_drv_probe_impl(pdev_p);
++	ipa_boot_checkpoint(&pdev_p->dev, "ipa.probe.exit", ret);
++	return ret;
+ }
+ 
+ /**
+diff --git a/drivers/soc/qcom/qcom_wdt_core.c b/drivers/soc/qcom/qcom_wdt_core.c
+--- a/drivers/soc/qcom/qcom_wdt_core.c
++++ b/drivers/soc/qcom/qcom_wdt_core.c
+@@ -37,6 +37,16 @@
+ #include <linux/cpu.h>
+ #include <linux/rcupdate.h>
+ 
++static bool boot_trace;
++module_param(boot_trace, bool, 0400);
++MODULE_PARM_DESC(boot_trace, "Log boot initialization checkpoints");
++
++static void qcom_wdt_boot_checkpoint(struct device *dev, const char *stage, int ret)
++{
++	if (boot_trace)
++		dev_info(dev, "Konoha boot: %s ret=%d\n", stage, ret);
++}
++
+ #define MASK_SIZE        32
+ 
+ static struct msm_watchdog_data __rcu *wdog_data;
+@@ -573,10 +583,16 @@
+ 	smp_mb();
+ 	for_each_cpu(cpu, cpu_online_mask) {
+ 		if (!READ_ONCE(wdog_dd->cpu_idle_pc_state[cpu])) {
++			if (boot_trace)
++				dev_info(wdog_dd->dev, "Konoha boot: wdt.ipi.enter cpu=%d\n",
++					 cpu);
+ 			wdog_dd->ping_start[cpu] = sched_clock();
+ 			smp_call_function_single(cpu,
+ 						 qcom_wdt_keep_alive_response,
+ 						 wdog_dd, 1);
++			if (boot_trace)
++				dev_info(wdog_dd->dev, "Konoha boot: wdt.ipi.exit cpu=%d\n",
++					 cpu);
+ 		}
+ 	}
+ }
+@@ -585,6 +601,7 @@
+ {
+ 	struct msm_watchdog_data *wdog_dd =
+ 		timer_container_of(wdog_dd, t, pet_timer);
++	qcom_wdt_boot_checkpoint(wdog_dd->dev, "wdt.timer", 0);
+ 	WRITE_ONCE(wdog_dd->timer_expired, true);
+ 	wdog_dd->timer_fired = sched_clock();
+ 	wake_up(&wdog_dd->pet_complete);
+@@ -616,6 +633,7 @@
+ 		if (kthread_should_stop())
+ 			break;
+ 
++		qcom_wdt_boot_checkpoint(wdog_dd->dev, "wdt.thread", 0);
+ 		wdog_dd->thread_start = sched_clock();
+ 		for_each_cpu(cpu, cpu_present_mask)
+ 			wdog_dd->ping_start[cpu] = wdog_dd->ping_end[cpu] = 0;
+@@ -637,7 +655,9 @@
+ 		spin_lock(&wdog_dd->freeze_lock);
+ 		if (wdog_dd->enabled && !wdog_dd->freeze_in_progress) {
+ 			delay_time = msecs_to_jiffies(wdog_dd->pet_time);
+-			wdog_dd->ops->reset_wdt(wdog_dd);
++			qcom_wdt_boot_checkpoint(wdog_dd->dev, "wdt.reset.enter", 0);
++			ret = wdog_dd->ops->reset_wdt(wdog_dd);
++			qcom_wdt_boot_checkpoint(wdog_dd->dev, "wdt.reset.exit", ret);
+ 			wdog_dd->last_pet = sched_clock();
+ 		}
+ 		/* Check again before scheduling

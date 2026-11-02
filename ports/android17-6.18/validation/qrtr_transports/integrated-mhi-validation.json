@@ -1,0 +1,37 @@
+{
+  "status": "PASS",
+  "suites": [
+    {
+      "suite": "mhi",
+      "source": "net/qrtr/mhi.c",
+      "sha256": "2658b1912a1c7c61b32ab0dec9763758d12b299c0d3c58cf2054146aa6c32364",
+      "results": [
+        {
+          "case": "production",
+          "status": "PASS",
+          "log": "16 MHI retry, configuration and lifecycle scenarios passed\n"
+        },
+        {
+          "case": "missing_stop_wakeup",
+          "status": "REJECTED",
+          "log": "missing_stop_wakeup: /tmp/onyx-transport-mhi-e29sylnz/test.c:68: void qrtr_endpoint_unregister(struct qrtr_endpoint *): Assertion `q->stopping&&q->prepared.done&&q->ringfull.done' failed.\n"
+        },
+        {
+          "case": "retry_socket_leak",
+          "status": "REJECTED",
+          "log": "retry_socket_leak: /tmp/onyx-transport-mhi-e29sylnz/test.c:80: void send_case(int): Assertion `rc==0&&!skb.freed&&sock.refs==2' failed.\n"
+        },
+        {
+          "case": "uninitialized_latency",
+          "status": "REJECTED",
+          "log": "uninitialized_latency: /tmp/onyx-transport-mhi-e29sylnz/test.c:86: int main(void): Assertion `id==0&&!rt' failed.\n"
+        },
+        {
+          "case": "missing_failure_cleanup",
+          "status": "REJECTED",
+          "log": "missing_failure_cleanup: /tmp/onyx-transport-mhi-e29sylnz/test.c:93: int main(void): Assertion `qcom_mhi_qrtr_probe(&dev,NULL)==-EIO&&dev.dev.data==NULL&&unregistered==1' failed.\n"
+        }
+      ]
+    }
+  ]
+}

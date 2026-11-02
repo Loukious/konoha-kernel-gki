@@ -1,0 +1,11 @@
+{
+  "patch": "0166",
+  "cause": "ADCI root op8 accepts asynchronous firmware callback requests indefinitely; WAITQ completion sleeps TASK_UNINTERRUPTIBLE and five-second diagnostic reports expected idle as hung",
+  "fix": "After context initialization mark only exact ROOT_SI_OBJECT/op8; narrowly scoped exported Si transport wrappers set internal waitq_idle; WAITQ resumes noninterruptible TASK_IDLE for accept/continuations. Standard API ABI/CRCs and all other calls unchanged; result-collection wait also TASK_IDLE",
+  "tests": "528 actual-source protocol/context/wait/retry/error/continuation cases, stop-state restoration; original, forced-uninterruptible, blanket-idle, erased-context-tag and lost-continuation controls rejected",
+  "limits": "Host adapters do not exercise firmware delivery or recovery graphics. Hardware test still required; no generic scanner, timeout or panic setting change",
+  "evidence": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/display-gem-20261102T011821Z/failure-rawdump/kernel-console.txt",
+  "status": "hardware verified in native root6.18recovery and stablefastbootd; normalAndroidreturnpending",
+  "artifact": "/home/loukious/Android/konoha-android17-6.18-port-20261031/artifacts/20261102T014419982366Z",
+  "hardware_result": "/home/loukious/Android/konoha-android17-6.18-port-20261031/device-backups/5493f3c6-20261101T160034Z/logging-investigation/recovery-runtime-20261102T014842Z/RESULT.json"
+}

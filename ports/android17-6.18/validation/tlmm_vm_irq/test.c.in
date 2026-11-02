@@ -1,0 +1,31 @@
+#include <assert.h>
+#include <stdlib.h>
+#include <stdio.h>
+#define GFP_KERNEL 0
+#define ENOMEM 12
+#define TLMM_VM_NUM_IRQ 10
+#define pr_debug(...) ((void)0)
+struct device { void *of_node; };
+struct platform_device {struct device dev; void *data;};
+struct irq_domain {const char *name; int removed;};
+struct qcom_tlmm_vm_irqchip_data {struct irq_domain *domain;};
+static int alloc_fail, domain_fail, used;
+static struct irq_domain domains[2];
+static struct qcom_tlmm_vm_irqchip_data objects[3];
+static int allocated;
+static void *last_data;
+static int qcom_tlmm_vm_irqchip_domain_ops;
+static void *devm_kzalloc(struct device *d, size_t n, int flags) {return alloc_fail ? NULL : &objects[allocated++];}
+static struct irq_domain *irq_domain_add_linear(void *n,int nr,void *ops,void *arg) {assert(nr==10);return domain_fail ? NULL : &domains[used++];}
+static void platform_set_drvdata(struct platform_device *p,void *d) {p->data=d;last_data=d;}
+static void *platform_get_drvdata(struct platform_device *p) {return p->data;}
+static void irq_domain_remove(struct irq_domain *d) {assert(!d->removed);d->removed=1;}
+/* BODY */
+int main(void) {
+ struct platform_device a={0},b={0},c={0};
+ alloc_fail=1;assert(qcom_tlmm_vm_irqchip_probe(&c)==-ENOMEM);assert(used==0);alloc_fail=0;
+ domain_fail=1;assert(qcom_tlmm_vm_irqchip_probe(&c)==-ENOMEM);assert(!c.data);domain_fail=0;
+ assert(qcom_tlmm_vm_irqchip_probe(&a)==0);assert(qcom_tlmm_vm_irqchip_probe(&b)==0);assert(a.data!=b.data);
+ qcom_tlmm_vm_irqchip_remove(&a);assert(domains[0].removed && !domains[1].removed);
+ qcom_tlmm_vm_irqchip_remove(&b);assert(domains[1].removed);puts("PASS allocation/domain failures and isolated two-device cleanup");
+}

@@ -1,0 +1,51 @@
+--- a/qcom/opensource/display-drivers/msm/mi_disp/mi_disp_feature.c
++++ b/qcom/opensource/display-drivers/msm/mi_disp/mi_disp_feature.c
+@@ -67,6 +67,7 @@
+ 
+ 	init_waitqueue_head(&dd_ptr->pending_wq);
+ 	atomic_set(&dd_ptr->pending_doze_cnt, 0);
++	wake_up_process(dd_ptr->worker->task);
+ 
+ 	DISP_INFO("create disp_feature:%d kthread success\n", disp_id);
+ 
+--- a/qcom/opensource/graphics-kernel/adreno_dispatch.c
++++ b/qcom/opensource/graphics-kernel/adreno_dispatch.c
+@@ -2757,6 +2757,7 @@
+ 	sched_set_fifo(adreno_dev->scheduler_worker->task);
+ 
+ 	set_bit(ADRENO_DISPATCHER_INIT, &dispatcher->priv);
++	wake_up_process(adreno_dev->scheduler_worker->task);
+ 
+ 	return 0;
+ }
+--- a/qcom/opensource/graphics-kernel/adreno_hwsched.c
++++ b/qcom/opensource/graphics-kernel/adreno_hwsched.c
+@@ -2055,6 +2055,8 @@
+ 		timer_setup(&hwsched->lsr_timer, hwsched_lsr_timer, 0);
+ 	}
+ 
++	wake_up_process(adreno_dev->scheduler_worker->task);
++
+ 	return 0;
+ }
+ 
+--- a/qcom/opensource/graphics-kernel/kgsl.c
++++ b/qcom/opensource/graphics-kernel/kgsl.c
+@@ -5214,6 +5214,7 @@
+ 	}
+ 
+ 	sched_set_fifo(device->events_worker->task);
++	wake_up_process(device->events_worker->task);
+ 
+ 	status = kgsl_reclaim_init();
+ 	if (status)
+--- a/qcom/opensource/graphics-kernel/kgsl_pwrscale.c
++++ b/qcom/opensource/graphics-kernel/kgsl_pwrscale.c
+@@ -744,6 +744,7 @@
+ 	INIT_WORK(&pwrscale->devfreq_resume_ws, do_devfreq_resume);
+ 	kthread_init_work(&pwrscale->devfreq_notify_work, do_devfreq_notify);
+ 	sched_set_fifo(pwrscale->devfreq_notify_worker->task);
++	wake_up_process(pwrscale->devfreq_notify_worker->task);
+ 	pwrscale->next_governor_call = ktime_add_us(ktime_get(),
+ 			KGSL_GOVERNOR_CALL_INTERVAL);
+ 

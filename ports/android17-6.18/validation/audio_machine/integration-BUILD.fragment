@@ -1,0 +1,25 @@
+ddk_headers(
+    name = "audio_machine_headers",
+    hdrs = ["qcom/opensource/audio-kernel/asoc/msm_common.h", "qcom/opensource/audio-kernel/asoc/msm-audio-defs.h", "qcom/opensource/audio-kernel/asoc/device_event.h", "qcom/opensource/audio-kernel/asoc/sun-port-config.h", "qcom/opensource/audio-kernel/asoc/msm_dailink.h"],
+    includes = ["qcom/opensource/audio-kernel/asoc"],
+    visibility = ["//visibility:public"],
+)
+
+ddk_headers(
+    name = "audio_machine_dependency_headers",
+    hdrs = ["qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc-wsa-macro.h", "qcom/opensource/audio-kernel/asoc/codecs/lpass-cdc/lpass-cdc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378-mbhc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd9378/wcd9378.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x-mbhc.h", "qcom/opensource/audio-kernel/asoc/codecs/wcd939x/wcd939x.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa883x/wsa883x.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x-reg-masks.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x-reg-shifts.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x-registers.h", "qcom/opensource/audio-kernel/asoc/codecs/wsa884x/wsa884x.h", "qcom/opensource/audio-kernel/config/sunautoconf.h", "qcom/opensource/audio-kernel/include/asoc/msm-cdc-pinctrl.h", "qcom/opensource/audio-kernel/include/asoc/wcd-mbhc-v2.h", "qcom/opensource/audio-kernel/include/asoc/wcdcal-hwdep.h", "qcom/opensource/audio-kernel/include/bindings/audio-codec-port-types.h", "qcom/opensource/audio-kernel/include/bindings/qcom,gpr.h", "qcom/opensource/audio-kernel/include/dsp/audio_prm.h", "qcom/opensource/audio-kernel/include/dsp/digital-cdc-rsc-mgr.h", "qcom/opensource/audio-kernel/include/dsp/msm_audio_ion.h", "qcom/opensource/audio-kernel/include/dsp/spf-core.h", "qcom/opensource/audio-kernel/include/ipc/gpr-lite.h", "qcom/opensource/audio-kernel/include/soc/audio_mod_devicetable.h", "qcom/opensource/audio-kernel/include/soc/snd_event.h", "qcom/opensource/audio-kernel/include/soc/soundwire.h", "qcom/opensource/audio-kernel/include/soc/swr-common.h", "qcom/opensource/audio-kernel/include/uapi/audio/sound/msmcal-hwdep.h"],
+    includes = ["qcom/opensource/audio-kernel/asoc"],
+)
+
+ddk_module(
+    name = "machine_dlkm",
+    srcs = ["qcom/opensource/audio-kernel/asoc/msm_common.c", "qcom/opensource/audio-kernel/asoc/sun.c", ":qcom/opensource/audio-kernel/config/sunautoconf.h"],
+    out = "machine_dlkm.ko",
+    kernel_build = "//common:kernel_aarch64",
+    kconfig = "Kconfig",
+    defconfig = "platform_defconfig",
+    deps = [":audio_foundation_headers", ":wcd9378_dlkm", ":wcd939x_dlkm", ":wsa883x_dlkm", ":wsa884x_dlkm", ":audio_machine_headers", ":audio_machine_dependency_headers", ":audio_foundation_headers", ":audio_codec_support_headers", ":audio_lpasscdc_headers", ":audio_swrctrl_headers", ":audio_swr_headers", ":audio_spf_headers", ":audio_prm_headers", ":audio_ion_headers", ":audio_gpr_headers", ":soc_headers", ":wcd_headers", ":altmode_headers", ":spf_core_dlkm", ":audio_prm_dlkm", ":wcd_core_dlkm", ":socinfo", ":hwid", ":snd_event_dlkm", ":fsa4480_i2c", ":wcd_usbss_i2c", ":lpass_cdc_dlkm", ":lpass_cdc_rx_macro_dlkm"],
+    copts = ["-include", "$(location :qcom/opensource/audio-kernel/config/sunautoconf.h)"],
+    visibility = ["//visibility:public"],
+)
+

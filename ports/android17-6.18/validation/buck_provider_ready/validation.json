@@ -1,0 +1,36 @@
+{
+  "status": "PASS",
+  "readiness_cases": 2500,
+  "voltage_valid_cases": 4001,
+  "cases": {
+    "before": {
+      "readiness": {
+        "returncode": -6,
+        "stdout": "",
+        "stderr_excerpt": "before: /tmp/onyx-buck-ready-r07a166t/before.c:1422: test_readiness: Assertion `rc==(pmic_ready_status==-EIO ? -EIO : -EPROBE_DEFER)' failed.\n"
+      },
+      "voltage": {
+        "returncode": 1,
+        "stdout": "",
+        "stderr_excerpt": "/tmp/onyx-buck-ready-r07a166t/before.c:1322:6: runtime error: member access within null pointer of type 'struct strategy_buckchg_dev'\nAddressSanitizer:DEADLYSIGNAL\n=================================================================\n==1314639==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000270 (pc 0x5733998c1356 bp 0x7ffdf60e1bb0 sp 0x7ffdf60e1b10 T0)\n==1314639==The signal is caused by a READ memory access.\n==1314639==Hint: address points to the zero page.\n    #0 0x5733998c1356 in strategy_buckchg_set_vterm /tmp/onyx-buck-ready-r07a166t/before.c:1322\n    #1 0x5733998c1d50 in test_voltage /tmp/onyx-buck-ready-r07a166t/before.c:1438\n    #2 0x5733998c2743 in main /tmp/onyx-buck-ready-"
+      }
+    },
+    "candidate": {
+      "readiness": {
+        "returncode": 0,
+        "stdout": "PASS",
+        "stderr_excerpt": ""
+      },
+      "voltage": {
+        "returncode": 0,
+        "stdout": "PASS",
+        "stderr_excerpt": ""
+      }
+    }
+  },
+  "source_sha256": {
+    "before": "ac376c8f2287b34e421c24ce5e297f302302097b2387c830a97d1ac62d80595f",
+    "candidate": "12de849a256bf6f61f4d4ecc63ccfc842febfc8f1c7dfe7acb26da2f16ac12d7"
+  },
+  "limits": "Exact production probe/stop and voltage callback under ASan/UBSan. PMIC readiness, transport error, workqueue and voter dispatch are host adapters. No live firmware readiness or charging validation."
+}

@@ -1,0 +1,54 @@
+Subject: Port native QTI fixed regulator to 6.18
+
+Let the 6.18 regulator core release the GPIO on registration failure.
+Propagate proxy/debug registration errors so managed resources unwind.
+
+---
+
+index bc2795348951..3780a7685a57 100644
+--- a/drivers/regulator/fixed.c
++++ b/drivers/regulator/fixed.c
+@@ -176,20 +176,20 @@ static const struct regulator_ops fixed_voltage_domain_ops = {
+ };
+ 
+ #ifdef QTI_FIXED_REGULATOR
+-static void qti_reg_fixed_voltage_init(struct device *dev,
++static int qti_reg_fixed_voltage_init(struct device *dev,
+ 				       struct regulator_dev *rdev)
+ {
+ 	int ret;
+ 
+ 	ret = devm_regulator_proxy_consumer_register(dev, dev->of_node);
+ 	if (ret)
+-		dev_err(dev, "failed to register proxy consumer, ret=%d\n",
+-			ret);
++		return dev_err_probe(dev, ret, "failed to register proxy consumer\n");
+ 
+ 	ret = devm_regulator_debug_register(dev, rdev);
+ 	if (ret)
+-		dev_err(dev, "failed to register debug regulator, ret=%d\n",
+-			ret);
++		return dev_err_probe(dev, ret, "failed to register debug regulator\n");
++
++	return 0;
+ }
+ #endif
+ 
+@@ -308,14 +308,15 @@ static int reg_fixed_voltage_probe(struct platform_device *pdev)
+ 		ret = dev_err_probe(&pdev->dev, PTR_ERR(drvdata->dev),
+ 				    "Failed to register regulator: %ld\n",
+ 				    PTR_ERR(drvdata->dev));
+-		gpiod_put(cfg.ena_gpiod);
+ 		return ret;
+ 	}
+ 
+ 	platform_set_drvdata(pdev, drvdata);
+ 
+ #ifdef QTI_FIXED_REGULATOR
+-	qti_reg_fixed_voltage_init(dev, drvdata->dev);
++	ret = qti_reg_fixed_voltage_init(dev, drvdata->dev);
++	if (ret)
++		return ret;
+ #endif
+ 
+ 	dev_dbg(&pdev->dev, "%s supplying %duV\n", drvdata->desc.name,

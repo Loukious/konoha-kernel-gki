@@ -1,0 +1,1345 @@
+Subject: Port native LPI, SDCA, SoundWire DMIC/haptics and HDMI audio helpers to 6.18
+
+Keep all six native one-object modules, configuration branches and
+audio tables.
+Use public pinctrl APIs and 6.18 callback conventions, bound debugfs reads,
+and balance notifier, component, supplier and PM lifetimes.
+HDMI requires the preceding display codec withdrawal provider extension.
+
+---
+
+--- a/qcom/opensource/audio-kernel/asoc/codecs/msm_hdmi_codec_rx.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/msm_hdmi_codec_rx.c
+@@ -780,6 +780,7 @@
+ {
+ 	struct msm_ext_disp_audio_codec_rx_data *codec_data;
+ 	struct device_node *of_node_parent = NULL;
++	int ret;
+ 
+ 	codec_data = kzalloc(sizeof(struct msm_ext_disp_audio_codec_rx_data),
+ 		GFP_KERNEL);
+@@ -799,23 +800,27 @@
+ 	}
+ 
+ 	codec_data->ext_disp_core_pdev = of_find_device_by_node(of_node_parent);
++	of_node_put(of_node_parent);
+ 	if (!codec_data->ext_disp_core_pdev) {
+ 		dev_err(component->dev, "%s(): can't get parent pdev\n",
+ 			__func__);
+ 		kfree(codec_data);
+-		return -ENODEV;
+-	}
+-
+-	if (msm_ext_disp_register_audio_codec(codec_data->ext_disp_core_pdev,
+-				&codec_data->ext_disp_ops)) {
++		return -EPROBE_DEFER;
++	}
++
++	mutex_init(&codec_data->dp_ops_lock);
++	dev_set_drvdata(component->dev, codec_data);
++	ret = msm_ext_disp_register_audio_codec(codec_data->ext_disp_core_pdev,
++						&codec_data->ext_disp_ops);
++	if (ret) {
+ 		dev_err(component->dev, "%s(): can't register with ext disp core",
+ 				__func__);
++		dev_set_drvdata(component->dev, NULL);
++		mutex_destroy(&codec_data->dp_ops_lock);
++		put_device(&codec_data->ext_disp_core_pdev->dev);
+ 		kfree(codec_data);
+-		return -ENODEV;
+-	}
+-
+-	mutex_init(&codec_data->dp_ops_lock);
+-	dev_set_drvdata(component->dev, codec_data);
++		return ret;
++	}
+ 
+ 	dev_dbg(component->dev, "%s(): registered %s with ext disp core\n",
+ 		__func__, component->name);
+@@ -827,12 +832,24 @@
+ 		struct snd_soc_component *component)
+ {
+ 	struct msm_ext_disp_audio_codec_rx_data *codec_data;
++	int ret;
+ 
+ 	codec_data = dev_get_drvdata(component->dev);
++	if (!codec_data)
++		return;
++
++	mutex_lock(&codec_data->dp_ops_lock);
++	ret = msm_ext_disp_unregister_audio_codec(codec_data->ext_disp_core_pdev,
++						  &codec_data->ext_disp_ops);
++	mutex_unlock(&codec_data->dp_ops_lock);
++	if (ret && ret != -ENOENT) {
++		dev_err(component->dev, "cannot withdraw display codec: %d\n", ret);
++		return;
++	}
++	dev_set_drvdata(component->dev, NULL);
+ 	mutex_destroy(&codec_data->dp_ops_lock);
++	put_device(&codec_data->ext_disp_core_pdev->dev);
+ 	kfree(codec_data);
+-
+-	return;
+ }
+ 
+ static struct snd_soc_dai_ops msm_ext_disp_audio_codec_rx_dai_ops = {
+@@ -929,11 +946,9 @@
+ 		ARRAY_SIZE(msm_ext_disp_audio_codec_rx_dais));
+ }
+ 
+-static int msm_ext_disp_audio_codec_rx_plat_remove(
+-		struct platform_device *pdev)
++static void msm_ext_disp_audio_codec_rx_plat_remove(struct platform_device *pdev)
+ {
+ 	snd_soc_unregister_component(&pdev->dev);
+-	return 0;
+ }
+ static const struct of_device_id msm_ext_disp_audio_codec_rx_dt_match[] = {
+ 	{ .compatible = "qcom,msm-ext-disp-audio-codec-rx", },
+--- a/qcom/opensource/audio-kernel/asoc/codecs/msm_stub.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/msm_stub.c
+@@ -89,10 +89,9 @@
+ 	&soc_msm_stub, msm_stub_dais, ARRAY_SIZE(msm_stub_dais));
+ }
+ 
+-static int msm_stub_dev_remove(struct platform_device *pdev)
++static void msm_stub_dev_remove(struct platform_device *pdev)
+ {
+ 	snd_soc_unregister_component(&pdev->dev);
+-	return 0;
+ }
+ static const struct of_device_id msm_stub_codec_dt_match[] = {
+ 	{ .compatible = "qcom,msm-stub-codec", },
+--- a/qcom/opensource/audio-kernel/asoc/codecs/sdca-registers-api.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/sdca-registers-api.c
+@@ -7,16 +7,17 @@
+ 
+ #define RW_BUF_LEN (20)
+ #define SDCA_REG_BASE (0x40000000)
+-#define BYTES_PER_LINE (20)
++#define BYTES_PER_LINE (17)
+ 
+ static ssize_t codec_debug_address_read(struct file *file, char __user *ubuf,
+ 					size_t count, loff_t *ppos)
+ {
+ 	char buf[RW_BUF_LEN];
+-	struct sdca_regdump_info *regdump_info = NULL;
+-	struct snd_soc_component *component = NULL;
+-
+-	if (!count || !file || !ppos || !ubuf)
++	int len;
++	struct sdca_regdump_info *regdump_info = NULL;
++	struct snd_soc_component *component = NULL;
++
++	if (!file || !ppos || !ubuf)
+ 		return -EINVAL;
+ 
+ 	regdump_info = file->private_data;
+@@ -30,8 +31,9 @@
+ 	if (*ppos < 0)
+ 		return -EINVAL;
+ 
+-	snprintf(buf, sizeof(buf), "0x%x\n", regdump_info->reg_address);
+-	return simple_read_from_buffer(ubuf, count, ppos, buf, RW_BUF_LEN);
++	len = scnprintf(buf, sizeof(buf), "0x%x\n",
++			READ_ONCE(regdump_info->reg_address));
++	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
+ }
+ 
+ static ssize_t codec_debug_address_write(struct file *file,
+@@ -40,6 +42,7 @@
+ {
+ 	char buf[RW_BUF_LEN];
+ 	int rc = 0, ret = 0;
++	u32 address;
+ 	struct sdca_regdump_info *regdump_info = NULL;
+ 	struct snd_soc_component *component = NULL;
+ 
+@@ -62,12 +65,13 @@
+ 		return -EFAULT;
+ 
+ 	buf[cnt] = '\0';
+-	ret = kstrtouint(buf, 0, &regdump_info->reg_address);
++	ret = kstrtouint(buf, 0, &address);
+ 	if (ret) {
+ 		dev_dbg(component->dev, "%s: convert data string failed\n",
+ 			__func__);
+ 		return -EINVAL;
+ 	}
++	WRITE_ONCE(regdump_info->reg_address, address);
+ 	return cnt;
+ }
+ 
+@@ -78,8 +82,10 @@
+ 	struct sdca_regdump_info *regdump_info = NULL;
+ 	struct snd_soc_component *component = NULL;
+ 	int reg_val = 0;
+-
+-	if (!count || !file || !ppos || !ubuf)
++	int len;
++	u32 address;
++
++	if (!file || !ppos || !ubuf)
+ 		return -EINVAL;
+ 
+ 	regdump_info = file->private_data;
+@@ -93,17 +99,20 @@
+ 	if (*ppos < 0)
+ 		return -EINVAL;
+ 
+-	if (regdump_info->reg_address > SDCA_REG_BASE) {
++	if (!count)
++		return 0;
++	address = READ_ONCE(regdump_info->reg_address);
++	if (address > SDCA_REG_BASE) {
+ 		reg_val = snd_soc_component_read(component,
+-						 regdump_info->reg_address);
++						 address);
+ 	} else {
+ 		pr_err("%s: invalid reg_address\n", __func__);
+ 		return -EINVAL;
+ 	}
+ 
+-	snprintf(buf, sizeof(buf), "0x%.8x: 0x%.2x\n",
+-		 regdump_info->reg_address, reg_val);
+-	return simple_read_from_buffer(ubuf, count, ppos, buf, RW_BUF_LEN);
++	len = scnprintf(buf, sizeof(buf), "0x%.8x: 0x%.2x\n",
++			address, reg_val & 0xFF);
++	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
+ }
+ 
+ static ssize_t codec_debug_data_write(struct file *file,
+@@ -113,7 +122,11 @@
+ 	char buf[RW_BUF_LEN];
+ 	struct sdca_regdump_info *regdump_info = NULL;
+ 	struct snd_soc_component *component = NULL;
+-	int data = 0, rc = 0, ret = 0;
++	u32 data, address;
++	int rc = 0, ret = 0;
++
++	if (!file || !ppos || !ubuf)
++		return -EINVAL;
+ 
+ 	regdump_info = file->private_data;
+ 	if (!regdump_info)
+@@ -138,9 +151,11 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (regdump_info->reg_address > SDCA_REG_BASE) {
+-		snd_soc_component_update_bits(
+-			component, regdump_info->reg_address, 0xFF, data);
++	address = READ_ONCE(regdump_info->reg_address);
++	if (address > SDCA_REG_BASE) {
++		ret = snd_soc_component_update_bits(component, address, 0xFF, data);
++		if (ret < 0)
++			return ret;
+ 	} else {
+ 		pr_err("%s: the reg isn't in the range\n", __func__);
+ 		return -EINVAL;
+@@ -155,55 +170,63 @@
+ 	struct sdca_regdump_info *regdump_info = NULL;
+ 	struct snd_soc_component *component = NULL;
+ 	char tmp_buf[RW_BUF_LEN];
+-	int i = 0, reg_val = 0, len = 0;
++	int i, reg_val, len;
++	loff_t offset;
++	ssize_t copied;
+ 	ssize_t total = 0;
+ 
+-	if (!count || !file || !ppos || !ubuf)
+-		return -EINVAL;
+-
+-	regdump_info = file->private_data;
+-	if (!regdump_info)
+-		return -EINVAL;
+-
+-	component = regdump_info->component;
+-	if (!component)
+-		return -EINVAL;
+-
+-	for (i = ((int)*ppos / BYTES_PER_LINE); i < regdump_info->reg_num;
+-	     i++) {
++	if (!file || !ppos || !ubuf || *ppos < 0)
++		return -EINVAL;
++
++	regdump_info = file->private_data;
++	if (!regdump_info)
++		return -EINVAL;
++
++	component = regdump_info->component;
++	if (!component)
++		return -EINVAL;
++
++	if (regdump_info->reg_num < 0 ||
++	    (regdump_info->reg_num && !regdump_info->reg_array))
++		return -EINVAL;
++
++	while (count && *ppos < (loff_t)regdump_info->reg_num * BYTES_PER_LINE) {
++		i = *ppos / BYTES_PER_LINE;
++		offset = *ppos % BYTES_PER_LINE;
+ 		reg_val = snd_soc_component_read(component,
+ 						 regdump_info->reg_array[i]);
+-		len = scnprintf(tmp_buf, BYTES_PER_LINE, "0x%.8x: 0x%.2x\n",
++		len = scnprintf(tmp_buf, sizeof(tmp_buf), "0x%.8x: 0x%.2x\n",
+ 				regdump_info->reg_array[i], (reg_val & 0xFF));
+-		if (((total + len) >= count - 1) || (len < 0))
++		copied = simple_read_from_buffer(ubuf + total, count,
++						 &offset, tmp_buf, len);
++		if (copied < 0)
++			return total ? total : copied;
++		if (!copied)
+ 			break;
+-
+-		if (copy_to_user((ubuf + total), tmp_buf, len)) {
+-			total = -EFAULT;
+-			goto copy_err;
+-		}
+-		total += len;
+-		*ppos += len;
+-	}
+-
+-copy_err:
+-	*ppos = i * BYTES_PER_LINE;
++		total += copied;
++		*ppos += copied;
++		count -= copied;
++	}
++
+ 	return total;
+ }
+ 
+ static const struct file_operations codec_debug_address_ops = {
++	.owner = THIS_MODULE,
+ 	.open = simple_open,
+ 	.read = codec_debug_address_read,
+ 	.write = codec_debug_address_write,
+ };
+ 
+ static const struct file_operations codec_debug_data_ops = {
++	.owner = THIS_MODULE,
+ 	.open = simple_open,
+ 	.read = codec_debug_data_read,
+ 	.write = codec_debug_data_write,
+ };
+ 
+ static const struct file_operations codec_debug_registers_ops = {
++	.owner = THIS_MODULE,
+ 	.open = simple_open,
+ 	.read = codec_debug_registers_dump,
+ };
+@@ -211,31 +234,42 @@
+ void sdca_devices_debugfs_dentry_create(struct sdca_debugfs_info *debugfs_info,
+ 					struct sdca_regdump_info *regdump_info)
+ {
+-	struct snd_soc_component *component = regdump_info->component;
++	struct snd_soc_component *component;
++
++	if (!debugfs_info || !regdump_info || !regdump_info->component)
++		return;
++	component = regdump_info->component;
+ 
+ 	debugfs_info->sdca_dentry =
+ 		debugfs_create_dir(dev_name(component->dev), 0);
+-	if (!IS_ERR(debugfs_info->sdca_dentry)) {
++	if (!IS_ERR_OR_NULL(debugfs_info->sdca_dentry)) {
+ 		debugfs_info->address = debugfs_create_file(
+ 			"address", S_IFREG | 0444, debugfs_info->sdca_dentry,
+ 			(void *)regdump_info, &codec_debug_address_ops);
+-		if (IS_ERR(debugfs_info->sdca_dentry))
++		if (IS_ERR_OR_NULL(debugfs_info->address))
+ 			pr_err("%s: debugfs_create_file address failed\n",
+ 			       __func__);
+ 
+ 		debugfs_info->data = debugfs_create_file(
+ 			"data", S_IFREG | 0444, debugfs_info->sdca_dentry,
+ 			(void *)regdump_info, &codec_debug_data_ops);
+-		if (IS_ERR(debugfs_info->data))
++		if (IS_ERR_OR_NULL(debugfs_info->data))
+ 			pr_err("%s: debugfs_create_file data failed\n",
+ 			       __func__);
+ 
+ 		debugfs_info->registers = debugfs_create_file(
+ 			"registers", S_IFREG | 0444, debugfs_info->sdca_dentry,
+ 			(void *)regdump_info, &codec_debug_registers_ops);
+-		if (IS_ERR(debugfs_info->registers))
++		if (IS_ERR_OR_NULL(debugfs_info->registers))
+ 			pr_err("%s: debugfs_create_file registers failed\n",
+ 			       __func__);
++	}
++	if (IS_ERR_OR_NULL(debugfs_info->sdca_dentry) ||
++	    IS_ERR_OR_NULL(debugfs_info->address) ||
++	    IS_ERR_OR_NULL(debugfs_info->data) ||
++	    IS_ERR_OR_NULL(debugfs_info->registers)) {
++		sdca_devices_debugfs_dentry_remove(debugfs_info);
++		return;
+ 	}
+ 	dev_info(component->dev, "%s: create files success\n", __func__);
+ }
+@@ -246,8 +280,12 @@
+ 	if (debugfs_info) {
+ 		debugfs_remove_recursive(debugfs_info->sdca_dentry);
+ 		debugfs_info->sdca_dentry = NULL;
++		debugfs_info->address = NULL;
++		debugfs_info->data = NULL;
++		debugfs_info->registers = NULL;
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(sdca_devices_debugfs_dentry_remove);
+ 
+ MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("SDCA codec register debugfs access");
+--- a/qcom/opensource/audio-kernel/asoc/codecs/swr-dmic.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/swr-dmic.c
+@@ -69,6 +69,11 @@
+ 	struct snd_soc_component_driver *driver;
+ 	struct snd_soc_dai_driver *dai_driver;
+ 	struct snd_soc_component *supply_component;
++	struct device *supply_dev;
++	/* Serializes the micbias vote count and first/last power operations. */
++	struct mutex supply_lock;
++	bool notifier_registered;
++	bool component_registered;
+ 	u32 micb_num;
+ 	struct device_node *wcd_handle;
+ 	bool is_wcd_supply;
+@@ -328,7 +333,8 @@
+ 
+ 	max_uc = map_size / (SWR_DMIC_MAX_PORTS * SWR_PORT_PARAMS * sizeof(u32));
+ 
+-	if (max_uc != SWR_UC_MAX) {
++	if (map_size != SWR_UC_MAX * SWR_DMIC_MAX_PORTS *
++			SWR_PORT_PARAMS * sizeof(u32)) {
+ 		dev_err(dev,
+ 			"%s:port params not provided for all usecases\n",
+ 			__func__);
+@@ -439,6 +445,7 @@
+ 	struct snd_soc_dapm_context *dapm =
+ 			snd_soc_component_get_dapm(component);
+ 	char w_name[MAX_NAME_LEN];
++	int ret;
+ 
+ 	if (!swr_dmic)
+ 		return -EINVAL;
+@@ -488,14 +495,19 @@
+ 
+ 	snd_soc_dapm_sync(dapm);
+ 
+-	swr_dmic->nblock.notifier_call = swr_dmic_event_notify;
++	if (swr_dmic->is_wcd_supply) {
++		swr_dmic->nblock.notifier_call = swr_dmic_event_notify;
+ #ifdef CONFIG_SND_SOC_WCD939X
+-	wcd939x_swr_dmic_register_notifier(swr_dmic->supply_component,
+-					&swr_dmic->nblock, true);
++		ret = wcd939x_swr_dmic_register_notifier(swr_dmic->supply_component,
++							 &swr_dmic->nblock, true);
+ #else
+-	wcd938x_swr_dmic_register_notifier(swr_dmic->supply_component,
+-					&swr_dmic->nblock, true);
++		ret = wcd938x_swr_dmic_register_notifier(swr_dmic->supply_component,
++							 &swr_dmic->nblock, true);
+ #endif
++		if (ret)
++			return ret;
++		swr_dmic->notifier_registered = true;
++	}
+ 
+ 	return 0;
+ }
+@@ -505,8 +517,17 @@
+ 	struct swr_dmic_priv *swr_dmic =
+ 			snd_soc_component_get_drvdata(component);
+ 
++	if (swr_dmic->notifier_registered) {
++#ifdef CONFIG_SND_SOC_WCD939X
++		wcd939x_swr_dmic_register_notifier(swr_dmic->supply_component,
++						   &swr_dmic->nblock, false);
++#else
++		wcd938x_swr_dmic_register_notifier(swr_dmic->supply_component,
++						   &swr_dmic->nblock, false);
++#endif
++		swr_dmic->notifier_registered = false;
++	}
+ 	swr_dmic->component = NULL;
+-	return;
+ }
+ 
+ static const struct snd_soc_component_driver soc_codec_dev_swr_dmic = {
+@@ -556,18 +577,43 @@
+ static int swr_dmic_parse_supply(struct device_node *np,
+ 				struct swr_dmic_priv *swr_dmic)
+ {
+-	struct platform_device *pdev = NULL;
++	struct platform_device *pdev;
++	struct snd_soc_component *component;
+ 
+ 	if (!np || !swr_dmic)
+ 		return -EINVAL;
+-
+ 	pdev = of_find_device_by_node(np);
+ 	if (!pdev)
+-		return -EINVAL;
+-
+-	swr_dmic->supply_component = snd_soc_lookup_component(&pdev->dev, NULL);
+-
+-	return 0;
++		return -EPROBE_DEFER;
++
++	/* The borrowed component must outlive this consumer's binding. */
++	if (!device_link_add(swr_dmic->dev, &pdev->dev,
++			     DL_FLAG_AUTOREMOVE_CONSUMER)) {
++		put_device(&pdev->dev);
++		return -ENOMEM;
++	}
++	component = snd_soc_lookup_component(&pdev->dev, NULL);
++	if (!component) {
++		put_device(&pdev->dev);
++		return -EPROBE_DEFER;
++	}
++	swr_dmic->supply_component = component;
++	swr_dmic->supply_dev = &pdev->dev;
++	return 0;
++}
++
++static void swr_dmic_release_supply(struct swr_dmic_priv *swr_dmic)
++{
++	if (swr_dmic->is_en_supply > 0) {
++		enable_wcd_codec_supply(swr_dmic, false);
++		swr_dmic->is_en_supply = 0;
++	}
++	swr_dmic->supply_component = NULL;
++	put_device(swr_dmic->supply_dev);
++	swr_dmic->supply_dev = NULL;
++	of_node_put(swr_dmic->wcd_handle);
++	swr_dmic->wcd_handle = NULL;
++	swr_dmic->is_wcd_supply = false;
+ }
+ 
+ static struct snd_soc_dai_driver swr_dmic_dai[] = {
+@@ -637,6 +683,11 @@
+ 	if (!swr_dmic)
+ 		return -ENOMEM;
+ 
++	swr_dmic->dev = &pdev->dev;
++	swr_dmic->swr_slave = pdev;
++	mutex_init(&swr_dmic->supply_lock);
++	swr_set_dev_data(pdev, swr_dmic);
++
+ 	ret = of_property_read_u32(pdev->dev.of_node, "qcom,swr-dmic-supply",
+ 				&swr_dmic->micb_num);
+ 	if (ret) {
+@@ -652,7 +703,9 @@
+ 			__func__);
+ 		swr_dmic->is_wcd_supply = false;
+ 	} else {
+-		swr_dmic_parse_supply(swr_dmic->wcd_handle, swr_dmic);
++		ret = swr_dmic_parse_supply(swr_dmic->wcd_handle, swr_dmic);
++		if (ret)
++			goto err;
+ 		swr_dmic->is_wcd_supply = true;
+ 	}
+ 
+@@ -660,16 +713,10 @@
+ 		ret = enable_wcd_codec_supply(swr_dmic, true);
+ 		if (ret) {
+ 			ret = -EPROBE_DEFER;
+-			swr_dmic->is_wcd_supply = false;
+-			swr_dmic->wcd_handle = NULL;
+ 			goto err;
+ 		}
+ 		++swr_dmic->is_en_supply;
+ 	}
+-
+-	swr_set_dev_data(pdev, swr_dmic);
+-
+-	swr_dmic->swr_slave = pdev;
+ 
+ 	ret = of_property_read_string(pdev->dev.of_node, "qcom,codec-name",
+ 				&swr_dmic_codec_name_of);
+@@ -706,12 +753,6 @@
+ 			__func__, swr_devnum, pdev->addr);
+ 		ret = -EPROBE_DEFER;
+ 
+-		if (swr_dmic->is_en_supply == 1) {
+-			enable_wcd_codec_supply(swr_dmic, false);
+-			--swr_dmic->is_en_supply;
+-		}
+-		swr_dmic->is_wcd_supply = false;
+-		swr_dmic->wcd_handle = NULL;
+ 		goto err;
+ 	}
+ 	pdev->dev_num = swr_devnum;
+@@ -764,11 +805,13 @@
+ 		goto dev_err;
+ 	}
+ 
++	swr_dmic->component_registered = true;
+ 	component = snd_soc_lookup_component(&pdev->dev,
+ 						swr_dmic->driver->name);
+ 	if (!component) {
+ 		dev_err(&pdev->dev, "%s: could not find swr_dmic component\n",
+ 			__func__);
++		ret = -EPROBE_DEFER;
+ 		goto dev_err;
+ 	}
+ 	swr_dmic->component = component;
+@@ -776,77 +819,63 @@
+ 	return 0;
+ 
+ dev_err:
+-	if (swr_dmic->is_en_supply == 1) {
+-		enable_wcd_codec_supply(swr_dmic, false);
+-		--swr_dmic->is_en_supply;
+-	}
+-	swr_dmic->is_wcd_supply = false;
+-	swr_dmic->wcd_handle = NULL;
+-	swr_remove_device(pdev);
+ err:
++	if (swr_dmic->component_registered)
++		snd_soc_unregister_component(&pdev->dev);
++	swr_dmic_release_supply(swr_dmic);
++	swr_set_dev_data(pdev, NULL);
++	mutex_destroy(&swr_dmic->supply_lock);
+ 	return ret;
+ }
+ 
+ static int swr_dmic_remove(struct swr_device *pdev)
+ {
+-	struct swr_dmic_priv *swr_dmic;
+-
+-	swr_dmic = swr_get_dev_data(pdev);
+-	if (!swr_dmic) {
+-		dev_err(&pdev->dev, "%s: swr_dmic is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-	if (swr_dmic->is_en_supply == 1) {
+-		enable_wcd_codec_supply(swr_dmic, false);
+-		--swr_dmic->is_en_supply;
+-	}
+-	snd_soc_unregister_component(&pdev->dev);
++	struct swr_dmic_priv *swr_dmic = swr_get_dev_data(pdev);
++
++	if (!swr_dmic)
++		return 0;
++	/* Component removal drains the supplier notifier before releasing power. */
++	if (swr_dmic->component_registered)
++		snd_soc_unregister_component(&pdev->dev);
++	swr_dmic_release_supply(swr_dmic);
+ 	swr_set_dev_data(pdev, NULL);
++	mutex_destroy(&swr_dmic->supply_lock);
+ 	return 0;
+ }
+ 
+ static int swr_dmic_up(struct swr_device *pdev)
+ {
++	struct swr_dmic_priv *swr_dmic = swr_get_dev_data(pdev);
+ 	int ret = 0;
+-	struct swr_dmic_priv *swr_dmic;
+-
+-	swr_dmic = swr_get_dev_data(pdev);
+-	if (!swr_dmic) {
+-		dev_err_ratelimited(&pdev->dev, "%s: swr_dmic is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	++swr_dmic->is_en_supply;
++
++	if (!swr_dmic)
++		return -EINVAL;
++	if (!swr_dmic->is_wcd_supply)
++		return 0;
++	mutex_lock(&swr_dmic->supply_lock);
++	if (!swr_dmic->is_en_supply)
++		ret = enable_wcd_codec_supply(swr_dmic, true);
++	if (!ret)
++		swr_dmic->is_en_supply++;
++	mutex_unlock(&swr_dmic->supply_lock);
++	return ret;
++}
++
++static int swr_dmic_down(struct swr_device *pdev)
++{
++	struct swr_dmic_priv *swr_dmic = swr_get_dev_data(pdev);
++	int ret = 0;
++
++	if (!swr_dmic)
++		return -EINVAL;
++	if (!swr_dmic->is_wcd_supply)
++		return 0;
++	mutex_lock(&swr_dmic->supply_lock);
+ 	if (swr_dmic->is_en_supply == 1)
+-		ret = enable_wcd_codec_supply(swr_dmic, true);
+-
+-	return ret;
+-}
+-
+-static int swr_dmic_down(struct swr_device *pdev)
+-{
+-	struct swr_dmic_priv *swr_dmic;
+-	int ret = 0;
+-
+-	swr_dmic = swr_get_dev_data(pdev);
+-	if (!swr_dmic) {
+-		dev_err_ratelimited(&pdev->dev, "%s: swr_dmic is NULL\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	dev_dbg(&pdev->dev, "%s: is_en_supply: %d\n",
+-		__func__, swr_dmic->is_en_supply);
+-	--swr_dmic->is_en_supply;
+-	if (swr_dmic->is_en_supply < 0) {
+-		dev_warn(&pdev->dev, "%s: mismatch in supply count %d\n",
+-			__func__, swr_dmic->is_en_supply);
+-		swr_dmic->is_en_supply = 0;
+-		goto done;
+-	}
+-	if (!swr_dmic->is_en_supply)
+-		enable_wcd_codec_supply(swr_dmic, false);
+-
+-done:
++		ret = enable_wcd_codec_supply(swr_dmic, false);
++	if (!ret && swr_dmic->is_en_supply > 0)
++		swr_dmic->is_en_supply--;
++	mutex_unlock(&swr_dmic->supply_lock);
+ 	return ret;
+ }
+ 
+--- a/qcom/opensource/audio-kernel/asoc/codecs/swr-haptics.c
++++ b/qcom/opensource/audio-kernel/asoc/codecs/swr-haptics.c
+@@ -120,6 +120,8 @@
+ 	u8				flags;
+ 	u8				visense_enable;
+ 	bool				is_ssr;
++	bool				component_registered;
++	bool				hboost_registered;
+ };
+ 
+ 
+@@ -205,6 +207,7 @@
+ 				__func__, rc);
+ 		return rc;
+ 	}
++	swr_hap->hpwr_vreg_enabled = false;
+ 
+ 	rc = regulator_set_voltage(swr_hap->hpwr_vreg, 0, INT_MAX);
+ 	if (rc < 0) {
+@@ -214,7 +217,6 @@
+ 	}
+ 
+ 	dev_dbg(swr_hap->dev, "%s: disabled hpwr_regulator\n", __func__);
+-	swr_hap->hpwr_vreg_enabled = false;
+ 	return 0;
+ }
+ 
+@@ -744,6 +746,39 @@
+ 	mutex_unlock(&swr_hap->play_lock);
+ 	return rc;
+ }
++
++static int swr_haptics_cleanup(struct swr_device *sdev)
++{
++	struct swr_haptics_dev *swr_hap = swr_get_dev_data(sdev);
++	int ret = 0, rc;
++
++	if (!swr_hap)
++		return 0;
++
++	if (!IS_ERR_OR_NULL(swr_hap->ssr_handle)) {
++		qcom_unregister_ssr_notifier(swr_hap->ssr_handle, &swr_hap->ssr_nb);
++		swr_hap->ssr_handle = NULL;
++	}
++	if (swr_hap->hboost_registered) {
++		unregister_hboost_event_notifier(&swr_hap->hboost_nb);
++		swr_hap->hboost_registered = false;
++	}
++	if (swr_hap->component_registered) {
++		snd_soc_unregister_component(&sdev->dev);
++		swr_hap->component_registered = false;
++	}
++	if (swr_hap->hpwr_vreg_enabled)
++		ret = swr_hap_disable_hpwr_vreg(swr_hap);
++	if (swr_hap->slave_enabled) {
++		rc = swr_haptics_slave_disable(swr_hap);
++		if (!ret)
++			ret = rc;
++	}
++	mutex_destroy(&swr_hap->play_lock);
++	swr_set_dev_data(sdev, NULL);
++	return ret;
++}
++
+ static int swr_haptics_probe(struct swr_device *sdev)
+ {
+ 	struct swr_haptics_dev *swr_hap;
+@@ -831,58 +866,37 @@
+ 				__func__, rc);
+ 		goto error;
+ 	}
++	swr_hap->component_registered = true;
+ 
+ 	swr_hap->hboost_nb.notifier_call = hboost_notifier;
+-	register_hboost_event_notifier(&swr_hap->hboost_nb);
++	rc = register_hboost_event_notifier(&swr_hap->hboost_nb);
++	if (rc)
++		goto error;
++	swr_hap->hboost_registered = true;
+ 	if (swr_hap->flags & HAP_ENUM_AFTER_SSR) {
+ 		swr_hap->ssr_nb.notifier_call = lpass_ssr_notifier;
+ 		swr_hap->ssr_handle =
+ 			qcom_register_ssr_notifier("lpass", &swr_hap->ssr_nb);
+-		if (IS_ERR(swr_hap->ssr_handle)) {
+-			rc = PTR_ERR(swr_hap->ssr_handle);
++		if (IS_ERR_OR_NULL(swr_hap->ssr_handle)) {
++			rc = swr_hap->ssr_handle ? PTR_ERR(swr_hap->ssr_handle) : -ENODEV;
+ 			dev_err(swr_hap->dev, "%s: register SSR notifier failed, rc:%d\n", __func__,
+ 					rc);
+ 			goto error;
+ 		}
+ 	}
+ 
+-	return swr_haptics_runtime_disable(swr_hap);
++	rc = swr_haptics_runtime_disable(swr_hap);
++	if (!rc)
++		return 0;
+ error:
+-	swr_haptics_slave_disable(swr_hap);
+-	swr_remove_device(sdev);
+ clean:
+-	mutex_destroy(&swr_hap->play_lock);
+-	swr_set_dev_data(sdev, NULL);
++	swr_haptics_cleanup(sdev);
+ 	return rc;
+ }
+ 
+ static int swr_haptics_remove(struct swr_device *sdev)
+ {
+-	struct swr_haptics_dev *swr_hap;
+-	int rc = 0;
+-
+-	swr_hap = swr_get_dev_data(sdev);
+-	if (!swr_hap) {
+-		dev_err(&sdev->dev, "%s: no data for swr_hap\n", __func__);
+-		rc = -ENODEV;
+-		goto clean;
+-	}
+-
+-	if (swr_hap->flags & HAP_ENUM_AFTER_SSR)
+-		qcom_unregister_ssr_notifier(swr_hap->ssr_handle, &swr_hap->ssr_nb);
+-
+-	unregister_hboost_event_notifier(&swr_hap->hboost_nb);
+-	rc = swr_haptics_slave_disable(swr_hap);
+-	if (rc < 0) {
+-		dev_err(swr_hap->dev, "%s: disable swr-slave failed, rc=%d\n",
+-				__func__, rc);
+-		goto clean;
+-	}
+-clean:
+-	snd_soc_unregister_component(&sdev->dev);
+-	mutex_destroy(&swr_hap->play_lock);
+-	swr_set_dev_data(sdev, NULL);
+-	return rc;
++	return swr_haptics_cleanup(sdev);
+ }
+ 
+ static int swr_haptics_device_up(struct swr_device *sdev)
+--- a/qcom/opensource/audio-kernel/soc/pinctrl-lpi.c
++++ b/qcom/opensource/audio-kernel/soc/pinctrl-lpi.c
+@@ -24,8 +24,6 @@
+ #include <dsp/audio_notifier.h>
+ #include <linux/gpio/driver.h>
+ 
+-#include "core.h"
+-#include "pinctrl-utils.h"
+ 
+ #define LPI_AUTO_SUSPEND_DELAY           100 /* delay in msec */
+ #define LPI_AUTO_SUSPEND_DELAY_ERROR     1   /* delay in msec */
+@@ -124,6 +122,7 @@
+ struct lpi_gpio_state {
+ 	struct device       *dev;
+ 	struct pinctrl_dev  *ctrl;
++	struct pinctrl_desc *desc;
+ 	struct gpio_chip     chip;
+ 	char __iomem        *base;
+ 	struct clk          *lpass_core_hw_vote;
+@@ -155,7 +154,7 @@
+ 	[LPI_GPIO_FUNC_INDEX_FUNC5]	= LPI_GPIO_FUNC_FUNC5,
+ };
+ 
+-int lpi_pinctrl_runtime_suspend(struct device *dev);
++static int lpi_pinctrl_runtime_suspend(struct device *dev);
+ 
+ static int lpi_gpio_read(struct lpi_gpio_pad *pad, unsigned int addr)
+ {
+@@ -178,7 +177,9 @@
+ 				   __func__);
+ 		return 0;
+ 	}
+-	pm_runtime_get_sync(lpi_dev);
++	ret = pm_runtime_resume_and_get(lpi_dev);
++	if (ret < 0)
++		return ret;
+ 	mutex_lock(&state->core_hw_vote_lock);
+ 	if (!state->core_hw_vote_status) {
+ 		if (__ratelimit(&rtl))
+@@ -218,7 +219,9 @@
+ 	if (!lpi_dev_up) {
+ 		return 0;
+ 	}
+-	pm_runtime_get_sync(lpi_dev);
++	ret = pm_runtime_resume_and_get(lpi_dev);
++	if (ret < 0)
++		return ret;
+ 	mutex_lock(&state->core_hw_vote_lock);
+ 	if (!state->core_hw_vote_status) {
+ 		if (__ratelimit(&rtl))
+@@ -236,16 +239,23 @@
+ 	return ret;
+ }
+ 
++static const struct pinctrl_desc *lpi_gpio_desc(struct pinctrl_dev *pctldev)
++{
++	struct lpi_gpio_state *state = pinctrl_dev_get_drvdata(pctldev);
++
++	return state->desc;
++}
++
+ static int lpi_gpio_get_groups_count(struct pinctrl_dev *pctldev)
+ {
+ 	/* Every PIN is a group */
+-	return pctldev->desc->npins;
++	return lpi_gpio_desc(pctldev)->npins;
+ }
+ 
+ static const char *lpi_gpio_get_group_name(struct pinctrl_dev *pctldev,
+ 					   unsigned int pin)
+ {
+-	return pctldev->desc->pins[pin].name;
++	return lpi_gpio_desc(pctldev)->pins[pin].name;
+ }
+ 
+ static int lpi_gpio_get_group_pins(struct pinctrl_dev *pctldev,
+@@ -253,7 +263,7 @@
+ 				   const unsigned int **pins,
+ 				   unsigned int *num_pins)
+ {
+-	*pins = &pctldev->desc->pins[pin].number;
++	*pins = &lpi_gpio_desc(pctldev)->pins[pin].number;
+ 	*num_pins = 1;
+ 	return 0;
+ }
+@@ -263,7 +273,7 @@
+ 	.get_group_name		= lpi_gpio_get_group_name,
+ 	.get_group_pins		= lpi_gpio_get_group_pins,
+ 	.dt_node_to_map		= pinconf_generic_dt_node_to_map_group,
+-	.dt_free_map		= pinctrl_utils_free_map,
++	.dt_free_map		= pinconf_generic_dt_free_map,
+ };
+ 
+ static int lpi_gpio_get_functions_count(struct pinctrl_dev *pctldev)
+@@ -283,7 +293,7 @@
+ 					unsigned *const num_qgroups)
+ {
+ 	*groups = lpi_gpio_groups;
+-	*num_qgroups = pctldev->desc->npins;
++	*num_qgroups = lpi_gpio_desc(pctldev)->npins;
+ 	return 0;
+ }
+ 
+@@ -293,7 +303,7 @@
+ 	struct lpi_gpio_pad *pad;
+ 	unsigned int val;
+ 
+-	pad = pctldev->desc->pins[pin].drv_data;
++	pad = lpi_gpio_desc(pctldev)->pins[pin].drv_data;
+ 
+ 	if (pad != NULL) {
+ 		pad->function = function;
+@@ -319,23 +329,23 @@
+ 	struct lpi_gpio_pad *pad;
+ 	unsigned int arg;
+ 
+-	pad = pctldev->desc->pins[pin].drv_data;
++	pad = lpi_gpio_desc(pctldev)->pins[pin].drv_data;
+ 
+ 	switch (param) {
+ 	case PIN_CONFIG_BIAS_DISABLE:
+-		arg = pad->pullup = LPI_GPIO_BIAS_DISABLE;
++		arg = pad->pullup == LPI_GPIO_BIAS_DISABLE;
+ 		break;
+ 	case PIN_CONFIG_BIAS_PULL_DOWN:
+ 		arg = pad->pullup == LPI_GPIO_PULL_DOWN;
+ 		break;
+ 	case PIN_CONFIG_BIAS_BUS_HOLD:
+-		arg = pad->pullup = LPI_GPIO_KEEPER;
++		arg = pad->pullup == LPI_GPIO_KEEPER;
+ 		break;
+ 	case PIN_CONFIG_BIAS_PULL_UP:
+ 		arg = pad->pullup == LPI_GPIO_PULL_UP;
+ 		break;
+ 	case PIN_CONFIG_INPUT_ENABLE:
+-	case PIN_CONFIG_OUTPUT:
++	case PIN_CONFIG_LEVEL:
+ 		arg = pad->output_enabled;
+ 		break;
+ 	default:
+@@ -361,17 +371,17 @@
+ {
+ 	struct lpi_gpio_pad *pad;
+ 	unsigned int param, arg;
+-	int i, ret = 0;
++	int i, bit, ret = 0;
+ 	volatile unsigned long val;
+-	struct lpi_gpio_state *state = dev_get_drvdata(pctldev->dev);
+-
+-	pad = pctldev->desc->pins[pin].drv_data;
++	struct lpi_gpio_state *state = pinctrl_dev_get_drvdata(pctldev);
++
++	pad = lpi_gpio_desc(pctldev)->pins[pin].drv_data;
+ 
+ 	for (i = 0; i < nconfs; i++) {
+ 		param = pinconf_to_config_param(configs[i]);
+ 		arg = pinconf_to_config_argument(configs[i]);
+ 
+-		dev_dbg(pctldev->dev, "%s: param: %d arg: %d pin: %d\n",
++		dev_dbg(state->dev, "%s: param: %d arg: %d pin: %d\n",
+ 			__func__, param, arg, pin);
+ 
+ 		switch (param) {
+@@ -390,7 +400,7 @@
+ 		case PIN_CONFIG_INPUT_ENABLE:
+ 			pad->output_enabled = false;
+ 			break;
+-		case PIN_CONFIG_OUTPUT:
++		case PIN_CONFIG_LEVEL:
+ 			pad->output_enabled = true;
+ 			pad->value = arg;
+ 			break;
+@@ -400,13 +410,14 @@
+ 		case PIN_CONFIG_SLEW_RATE:
+ 			if (pad->slew_base == NULL ||
+ 				pad->slew_offset == LPI_SLEW_OFFSET_INVALID) {
+-				dev_dbg(pctldev->dev, "%s: invalid slew settings for pin: %d\n",
++				dev_dbg(state->dev, "%s: invalid slew settings for pin: %d\n",
+ 					__func__, pin);
+ 				goto set_gpio;
+ 			}
+ 			if (arg > LPI_SLEW_RATE_MAX) {
+-				dev_err_ratelimited(pctldev->dev, "%s: invalid slew rate %u for \
+-					pin: %d\n", __func__, arg, pin);
++				dev_err_ratelimited(state->dev,
++						    "%s: invalid slew rate %u for pin: %d\n",
++						    __func__, arg, pin);
+ 				goto set_gpio;
+ 			}
+ 			pad->base = pad->slew_base;
+@@ -417,7 +428,7 @@
+ 				if (pad->slew_offset != LPI_SLEW_OFFSET_INVALID) {
+ 					val = lpi_gpio_read(pad, LPI_SLEW_REG_VAL_CTL);  //16-bit
+ 					pad->offset = pad->slew_offset;
+-					for (i = 0; i < LPI_SLEW_BITS_SIZE; i++) {
++					for (bit = 0; bit < LPI_SLEW_BITS_SIZE; bit++) {
+ 						if (arg & 0x01)
+ 							set_bit(pad->offset, &val);
+ 						else
+@@ -435,7 +446,7 @@
+ 			}
+ 			val = lpi_gpio_read(pad, LPI_SLEW_REG_VAL_CTL);
+ 			pad->offset = pad->slew_offset;
+-			for (i = 0; i < LPI_SLEW_BITS_SIZE; i++) {
++			for (bit = 0; bit < LPI_SLEW_BITS_SIZE; bit++) {
+ 				if (arg & 0x01)
+ 					set_bit(pad->offset, &val);
+ 				else
+@@ -495,7 +506,7 @@
+ 	struct lpi_gpio_state *state = gpiochip_get_data(chip);
+ 	unsigned long config;
+ 
+-	config = pinconf_to_config_packed(PIN_CONFIG_OUTPUT, val);
++	config = pinconf_to_config_packed(PIN_CONFIG_LEVEL, val);
+ 
+ 	return lpi_config_set(state->ctrl, pin, &config, 1);
+ }
+@@ -506,20 +517,20 @@
+ 	struct lpi_gpio_pad *pad;
+ 	int value;
+ 
+-	pad = state->ctrl->desc->pins[pin].drv_data;
++	pad = state->desc->pins[pin].drv_data;
+ 
+ 	value = lpi_gpio_read(pad, LPI_GPIO_REG_VAL_CTL);
+ 	return value;
+ }
+ 
+-static void lpi_gpio_set(struct gpio_chip *chip, unsigned int pin, int value)
++static int lpi_gpio_set(struct gpio_chip *chip, unsigned int pin, int value)
+ {
+ 	struct lpi_gpio_state *state = gpiochip_get_data(chip);
+ 	unsigned long config;
+ 
+-	config = pinconf_to_config_packed(PIN_CONFIG_OUTPUT, value);
+-
+-	lpi_config_set(state->ctrl, pin, &config, 1);
++	config = pinconf_to_config_packed(PIN_CONFIG_LEVEL, value);
++
++	return lpi_config_set(state->ctrl, pin, &config, 1);
+ }
+ 
+ static int lpi_notifier_service_cb(struct notifier_block *this,
+@@ -548,7 +559,7 @@
+ 	return NOTIFY_OK;
+ }
+ 
+-int lpi_pinctrl_suspend(struct device *dev)
++static int lpi_pinctrl_suspend(struct device *dev)
+ {
+ 	int ret = 0;
+ 
+@@ -576,7 +587,7 @@
+ 	return ret;
+ }
+ 
+-int lpi_pinctrl_resume(struct device *dev)
++static int lpi_pinctrl_resume(struct device *dev)
+ {
+ 	return 0;
+ }
+@@ -658,8 +669,8 @@
+ 	};
+ 
+ 	pctldev = pctldev ? : state->ctrl;
+-	pindesc = pctldev->desc->pins[offset];
+-	pad = pctldev->desc->pins[offset].drv_data;
++	pindesc = lpi_gpio_desc(pctldev)->pins[offset];
++	pad = lpi_gpio_desc(pctldev)->pins[offset].drv_data;
+ 	ctl_reg = lpi_gpio_read(pad, LPI_GPIO_REG_DIR_CTL);
+ 	is_out = (ctl_reg & LPI_GPIO_REG_DIR_MASK) >> LPI_GPIO_REG_DIR_SHIFT;
+ 	ctl_reg = lpi_gpio_read(pad, LPI_GPIO_REG_VAL_CTL);
+@@ -708,7 +719,8 @@
+ 	struct pinctrl_desc *pctrldesc;
+ 	struct lpi_gpio_pad *pad, *pads;
+ 	struct lpi_gpio_state *state;
+-	int ret, npins, i;
++	int ret, i;
++	u32 npins;
+ 	char __iomem *lpi_base;
+ 	char __iomem *slew_base;
+ 	u32 reg, slew_reg;
+@@ -731,7 +743,8 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	WARN_ON(npins > ARRAY_SIZE(lpi_gpio_groups));
++	if (!npins || npins > ARRAY_SIZE(lpi_gpio_groups))
++		return -EINVAL;
+ 
+ 	ret = of_property_read_u32_array(dev->of_node, "qcom,lpi-offset-tbl",
+ 					 lpi_offset, npins);
+@@ -804,6 +817,7 @@
+ 	pctrldesc->name = dev_name(dev);
+ 	pctrldesc->pins = pindesc;
+ 	pctrldesc->npins = npins;
++	state->desc = pctrldesc;
+ 
+ 	lpi_base = devm_ioremap(dev, reg, LPI_ADDRESS_SIZE);
+ 	if (lpi_base == NULL) {
+@@ -827,10 +841,17 @@
+ 		pad->slew_offset = lpi_slew_offset[i];
+ 		pad->offset = pad->gpio_offset;
+ 		pad->lpi_slew_reg = NULL;
+-		if ((lpi_slew_base[i] != LPI_SLEW_OFFSET_INVALID) &&
+-		     lpi_slew_base[i])
+-			pad->lpi_slew_reg = devm_ioremap(dev,
+-                                                lpi_slew_base[i], 0x4);
++		if (lpi_offset[i] > LPI_ADDRESS_SIZE - 2 * sizeof(u32) ||
++		    (lpi_offset[i] & 3) ||
++		    (lpi_slew_offset[i] != LPI_SLEW_OFFSET_INVALID &&
++		     lpi_slew_offset[i] > 32 - LPI_SLEW_BITS_SIZE))
++			return -EINVAL;
++		if (lpi_slew_base[i] != LPI_SLEW_OFFSET_INVALID &&
++		    lpi_slew_base[i]) {
++			pad->lpi_slew_reg = devm_ioremap(dev, lpi_slew_base[i], sizeof(u32));
++			if (!pad->lpi_slew_reg)
++				return -ENOMEM;
++		}
+ 	}
+ 
+ 	state->chip = lpi_gpio_template;
+@@ -839,14 +860,52 @@
+ 	state->chip.ngpio = npins;
+ 	state->chip.label = dev_name(dev);
+ 	state->chip.of_gpio_n_cells = 2;
+-	state->chip.can_sleep = false;
++	state->chip.can_sleep = true;
+ 
+ 	mutex_init(&state->slew_access_lock);
+ 	mutex_init(&state->core_hw_vote_lock);
+ 
+-	state->ctrl = devm_pinctrl_register(dev, pctrldesc, state);
+-	if (IS_ERR(state->ctrl))
+-		return PTR_ERR(state->ctrl);
++	/* Register LPASS core hw vote */
++	lpass_core_hw_vote = devm_clk_get(&pdev->dev, "lpass_core_hw_vote");
++	if (IS_ERR(lpass_core_hw_vote)) {
++		ret = PTR_ERR(lpass_core_hw_vote);
++		if (ret == -EPROBE_DEFER)
++			goto err_locks;
++		dev_dbg(&pdev->dev, "%s: clk get %s failed %d\n",
++			__func__, "lpass_core_hw_vote", ret);
++		lpass_core_hw_vote = NULL;
++		ret = 0;
++	}
++	state->lpass_core_hw_vote = lpass_core_hw_vote;
++
++	/* Register LPASS audio hw vote */
++	lpass_audio_hw_vote = devm_clk_get(&pdev->dev, "lpass_audio_hw_vote");
++	if (IS_ERR(lpass_audio_hw_vote)) {
++		ret = PTR_ERR(lpass_audio_hw_vote);
++		if (ret == -EPROBE_DEFER)
++			goto err_locks;
++		dev_dbg(&pdev->dev, "%s: clk get %s failed %d\n",
++			__func__, "lpass_audio_hw_vote", ret);
++		lpass_audio_hw_vote = NULL;
++		ret = 0;
++	}
++	state->lpass_audio_hw_vote = lpass_audio_hw_vote;
++
++	state->core_hw_vote_status = false;
++	pm_runtime_set_autosuspend_delay(&pdev->dev, LPI_AUTO_SUSPEND_DELAY);
++	pm_runtime_use_autosuspend(&pdev->dev);
++	pm_runtime_set_suspended(&pdev->dev);
++	pm_runtime_enable(&pdev->dev);
++
++	lpi_dev = dev;
++	lpi_dev_up = true;
++	initial_boot = true;
++
++	state->ctrl = pinctrl_register(pctrldesc, dev, state);
++	if (IS_ERR(state->ctrl)) {
++		ret = PTR_ERR(state->ctrl);
++		goto err_pm;
++	}
+ 
+ 	ret = gpiochip_add_data(&state->chip, state);
+ 	if (ret) {
+@@ -859,10 +918,6 @@
+ 		dev_err(dev, "failed to add pin range\n");
+ 		goto err_range;
+ 	}
+-
+-	lpi_dev = &pdev->dev;
+-	lpi_dev_up = true;
+-	initial_boot = true;
+ 
+ 	ret = snd_event_client_register(dev, &lpi_pinctrl_ssr_ops, NULL);
+ 	if (!ret) {
+@@ -878,64 +933,46 @@
+ 	if (ret < 0) {
+ 		pr_err("%s: Audio notifier register failed ret = %d\n",
+ 			__func__, ret);
+-		goto err_range;
+-	}
+-
+-	/* Register LPASS core hw vote */
+-	lpass_core_hw_vote = devm_clk_get(&pdev->dev, "lpass_core_hw_vote");
+-	if (IS_ERR(lpass_core_hw_vote)) {
+-		ret = PTR_ERR(lpass_core_hw_vote);
+-		dev_dbg(&pdev->dev, "%s: clk get %s failed %d\n",
+-			__func__, "lpass_core_hw_vote", ret);
+-		lpass_core_hw_vote = NULL;
+-		ret = 0;
+-	}
+-	state->lpass_core_hw_vote = lpass_core_hw_vote;
+-
+-	/* Register LPASS audio hw vote */
+-	lpass_audio_hw_vote = devm_clk_get(&pdev->dev, "lpass_audio_hw_vote");
+-	if (IS_ERR(lpass_audio_hw_vote)) {
+-		ret = PTR_ERR(lpass_audio_hw_vote);
+-		dev_dbg(&pdev->dev, "%s: clk get %s failed %d\n",
+-			__func__, "lpass_audio_hw_vote", ret);
+-		lpass_audio_hw_vote = NULL;
+-		ret = 0;
+-	}
+-	state->lpass_audio_hw_vote = lpass_audio_hw_vote;
+-
+-	state->core_hw_vote_status = false;
+-	pm_runtime_set_autosuspend_delay(&pdev->dev, LPI_AUTO_SUSPEND_DELAY);
+-	pm_runtime_use_autosuspend(&pdev->dev);
+-	pm_runtime_set_suspended(&pdev->dev);
+-	pm_runtime_enable(&pdev->dev);
++		goto err_snd_event;
++	}
+ 
+ 	return 0;
+ 
+-//err_snd_evt:
+-//	audio_notifier_deregister("lpi_tlmm");
++err_snd_event:
++	snd_event_client_deregister(dev);
+ err_range:
+ 	gpiochip_remove(&state->chip);
+ err_chip:
++	pinctrl_unregister(state->ctrl);
++err_pm:
++	pm_runtime_disable(dev);
++	lpi_pinctrl_runtime_suspend(dev);
++	pm_runtime_set_suspended(dev);
++	lpi_dev_up = false;
++	lpi_dev = NULL;
++err_locks:
+ 	mutex_destroy(&state->core_hw_vote_lock);
+ 	mutex_destroy(&state->slew_access_lock);
+ err_io:
+ 	return ret;
+ }
+ 
+-static int lpi_pinctrl_remove(struct platform_device *pdev)
+-{
++static void lpi_pinctrl_remove(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
+ 	struct lpi_gpio_state *state = platform_get_drvdata(pdev);
+ 
+-	pm_runtime_disable(&pdev->dev);
+-	pm_runtime_set_suspended(&pdev->dev);
+-
+-	snd_event_client_deregister(&pdev->dev);
+ 	audio_notifier_deregister("lpi_tlmm");
++	snd_event_client_deregister(dev);
+ 	gpiochip_remove(&state->chip);
++	pinctrl_unregister(state->ctrl);
++	pm_runtime_disable(dev);
++	lpi_pinctrl_runtime_suspend(dev);
++	pm_runtime_set_suspended(dev);
++	lpi_dev_up = false;
++	lpi_dev = NULL;
+ 	mutex_destroy(&state->core_hw_vote_lock);
+ 	mutex_destroy(&state->slew_access_lock);
+-
+-	return 0;
+ }
+ 
+ static const struct of_device_id lpi_pinctrl_of_match[] = {
+@@ -945,7 +982,7 @@
+ 
+ MODULE_DEVICE_TABLE(of, lpi_pinctrl_of_match);
+ 
+-int lpi_pinctrl_runtime_resume(struct device *dev)
++static int lpi_pinctrl_runtime_resume(struct device *dev)
+ {
+ 	struct lpi_gpio_state *state = dev_get_drvdata(dev);
+ 	int ret = 0;
+@@ -976,10 +1013,10 @@
+ 
+ exit:
+ 	mutex_unlock(&state->core_hw_vote_lock);
+-	return 0;
+-}
+-
+-int lpi_pinctrl_runtime_suspend(struct device *dev)
++	return ret;
++}
++
++static int lpi_pinctrl_runtime_suspend(struct device *dev)
+ {
+ 	struct lpi_gpio_state *state = dev_get_drvdata(dev);
+ 	struct clk *hw_vote = state->lpass_core_hw_vote;

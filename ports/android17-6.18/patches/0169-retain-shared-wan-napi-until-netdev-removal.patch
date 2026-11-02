@@ -1,0 +1,158 @@
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c
+@@ -1328,6 +1328,21 @@
+ #define reinit_completion(x) INIT_COMPLETION(*(x))
+ #endif /* INIT_COMPLETION */
+ 
++/* RX pipes must be quiesced and the netdev unpublished before this call. */
++static void ipa3_wwan_napi_del(struct net_device *dev)
++{
++	struct ipa3_wwan_private *wwan_ptr = netdev_priv(dev);
++
++	if (!ipa3_rmnet_res.ipa_napi_enable)
++		return;
++
++	if (ipa3_ctx->rmnet_napi_enable) {
++		napi_disable(&wwan_ptr->napi);
++		ipa3_ctx->rmnet_napi_enable = false;
++	}
++	netif_napi_del(&wwan_ptr->napi);
++}
++
+ static int __ipa_wwan_open(struct net_device *dev)
+ {
+ 	struct ipa3_wwan_private *wwan_ptr = netdev_priv(dev);
+@@ -1337,7 +1352,8 @@
+ 		reinit_completion(&wwan_ptr->resource_granted_completion);
+ 	wwan_ptr->device_status = WWAN_DEVICE_ACTIVE;
+ 
+-	if (ipa3_rmnet_res.ipa_napi_enable) {
++	/* The modem port and its RX polling stay up across ndo_stop. */
++	if (ipa3_rmnet_res.ipa_napi_enable && !ipa3_ctx->rmnet_napi_enable) {
+ 		napi_enable(&(wwan_ptr->napi));
+ 		ipa3_ctx->rmnet_napi_enable = true;
+ 	}
+@@ -3654,6 +3670,8 @@
+ 		dev->gso_max_size = RMNET_IPA_ULSO_SIZE_LIMIT;
+ 	}
+ 
++	/* Initialize before register_netdev() can publish an ndo_open. */
++	ipa3_ctx->rmnet_napi_enable = false;
+ 	if (ipa3_rmnet_res.ipa_napi_enable)
+ #if (LINUX_VERSION_CODE > KERNEL_VERSION(6, 0, 14))
+ 		netif_napi_add(dev, &(rmnet_ipa3_ctx->wwan_priv->napi),
+@@ -3706,14 +3724,12 @@
+ 		egress_pipe_status[j].status = 0;
+ 	}
+ 
+-	ipa3_ctx->rmnet_napi_enable = false;
+ 	IPAWANERR("rmnet_ipa completed initialization\n");
+ 	return 0;
+ config_err:
+-	if (ipa3_rmnet_res.ipa_napi_enable)
+-		netif_napi_del(&(rmnet_ipa3_ctx->wwan_priv->napi));
+ 	unregister_netdev(dev);
+ set_perf_err:
++	ipa3_wwan_napi_del(dev);
+ 
+ 	ipa3_wwan_deregister_netdev_pm_client();
+ fail_pm:
+@@ -3772,8 +3788,10 @@
+ 	 * targets. */
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0))
+ 	IPAWANINFO("rmnet_ipa unregister_netdev\n");
+-	if (IPA_NETDEV())
++	if (IPA_NETDEV()) {
+ 		unregister_netdev(IPA_NETDEV());
++		ipa3_wwan_napi_del(IPA_NETDEV());
++	}
+ 	ipa3_wwan_deregister_netdev_pm_client();
+ #endif
+ 	cancel_work_sync(&ipa3_tx_wakequeue_work);
+@@ -4026,8 +4044,10 @@
+ 		 * enabled targets. */
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0))
+ 		IPAWANINFO("rmnet_ipa unregister_netdev\n");
+-		if (IPA_NETDEV())
++		if (IPA_NETDEV()) {
+ 			unregister_netdev(IPA_NETDEV());
++			ipa3_wwan_napi_del(IPA_NETDEV());
++		}
+ 		ipa3_wwan_deregister_netdev_pm_client();
+ 		if (IPA_NETDEV())
+ 			free_netdev(IPA_NETDEV());
+--- a/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_dp.c
++++ b/qcom/opensource/dataipa/drivers/platform/msm/ipa/ipa_v3/ipa_dp.c
+@@ -2084,6 +2084,11 @@
+ 	if (IPA_CLIENT_IS_PROD(ep->client))
+ 		atomic_set(&ep->sys->workqueue_flushed, 1);
+ 
++	/* WAN NAPI belongs to rmnet; wait for posted RX before ring cleanup. */
++	if (IPA_CLIENT_IS_WAN_CONS(ep->client) && ep->sys->napi_obj &&
++	    ipa3_ctx->rmnet_napi_enable)
++		napi_synchronize(ep->sys->napi_obj);
++
+ 	if (ep->client == IPA_CLIENT_APPS_WAN_LOW_LAT_DATA_CONS) {
+ 		napi_disable(&ep->sys->napi_rx);
+ 		netif_napi_del(&ep->sys->napi_rx);
+@@ -2117,9 +2122,6 @@
+ 				}
+ 				return result;
+ 			}
+-		} else {
+-			napi_disable(ep->sys->napi_obj);
+-			netif_napi_del(ep->sys->napi_obj);
+ 		}
+ 	}
+ 
+@@ -2231,6 +2233,8 @@
+ 	if (!atomic_read(&ipa3_ctx->wc_memb.active_clnt_cnt))
+ 		ipa3_cleanup_wlan_rx_common_cache();
+ 
++	if (IPA_CLIENT_IS_WAN_CONS(ep->client))
++		ep->sys->napi_obj = NULL;
+ 	ep->valid = 0;
+ 
+ 	IPA_ACTIVE_CLIENTS_DEC_EP(ipa3_get_client_mapping(clnt_hdl));
+@@ -2287,12 +2291,16 @@
+ 		do {
+ 			usleep_range(95, 105);
+ 		} while (atomic_read(&ep->sys->curr_polling_state));
+-		if (ipa3_ctx->rmnet_napi_enable) {
+-			napi_disable(ep->sys->napi_obj);
+-			netif_napi_del(ep->sys->napi_obj);
+-			ipa3_ctx->rmnet_napi_enable = false;
+-		}
+-	}
++	}
++
++	if (IPA_CLIENT_IS_CONS(ep->client))
++		cancel_delayed_work_sync(&ep->sys->replenish_rx_work);
++
++	flush_workqueue(ep->sys->wq);
++
++	if (IPA_CLIENT_IS_WAN_CONS(ep->client) && ep->sys->napi_obj &&
++	    ipa3_ctx->rmnet_napi_enable)
++		napi_synchronize(ep->sys->napi_obj);
+ 
+ 	result = ipa3_reset_gsi_channel(clnt_hdl);
+ 	if (result != GSI_STATUS_SUCCESS) {
+@@ -2311,16 +2319,13 @@
+ 		return result;
+ 	}
+ 
+-	if (IPA_CLIENT_IS_CONS(ep->client))
+-		cancel_delayed_work_sync(&ep->sys->replenish_rx_work);
+-
+-	flush_workqueue(ep->sys->wq);
+-
+ 	if (ep->sys->repl_wq)
+ 		flush_workqueue(ep->sys->repl_wq);
+ 	if (IPA_CLIENT_IS_CONS(ep->client) && !ep->sys->common_buff_pool)
+ 		ipa3_cleanup_rx(ep->sys);
+ 
++	if (IPA_CLIENT_IS_WAN_CONS(ep->client))
++		ep->sys->napi_obj = NULL;
+ 	ep->valid = 0;
+ 
+ 	IPADBG("client (ep: %d) disconnected\n", clnt_hdl);
