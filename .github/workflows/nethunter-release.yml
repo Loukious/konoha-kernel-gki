@@ -274,7 +274,7 @@ jobs:
             lib32ncurses-dev lib32readline-dev lib32z1-dev libncurses-dev \
             libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush \
             rsync schedtool squashfs-tools xsltproc zip zlib1g-dev \
-            python3 clang lld llvm jq
+            python3 clang-18 lld-18 llvm-18 jq cpio
 
       - name: Setup ccache
         uses: actions/cache@v4
@@ -294,10 +294,14 @@ jobs:
           ccache -o compiler_check=${{ env.CCACHE_COMPILERCHECK }}
           ccache -o sloppiness=${{ env.CCACHE_SLOPPINESS }}
 
-      - name: Download Clang Toolchain
+      - name: Verify tested Clang toolchain
         run: |
-          mkdir -p toolchains
-          git clone --depth=1 https://github.com/ZyCromerZ/Clang.git -b main toolchains/clang
+          # Release 27 and the device-tested fix use Ubuntu Clang 18.1.3.
+          # Compiler changes can alter exported symbol CRCs.
+          /usr/lib/llvm-18/bin/clang --version
+          /usr/lib/llvm-18/bin/ld.lld --version
+          test "$(/usr/lib/llvm-18/bin/clang -dumpversion)" = 18.1.3
+          /usr/lib/llvm-18/bin/ld.lld --version | grep -F 'LLD 18.1.3'
 
       - name: Setup AnyKernel3
         run: |
@@ -328,6 +332,10 @@ jobs:
 
       - name: Build Kernel
         env:
+          # Preserve the dependencies used by the successful device test.
+          CLANG_PATH: /usr/lib/llvm-18
+          ROOT_REF: ${{ inputs.root == 'ksu-next' && 'cd4a6b468653fb9640caaf203c05e07609ba5da1' || '' }}
+          BBG_REF: a54e0dc6cf0aff4dd87fec49644a02d2eb612905
           KPM_SUPERKEY_SECRET: ${{ secrets.KPM_SUPERKEY }}
           INPUT_VARIANT: ${{ inputs.variant }}
           INPUT_NETHUNTER: ${{ inputs.nethunter }}
@@ -959,6 +967,17 @@ jobs:
           tag_name: nethunter-${{ steps.combine.outputs.kernel_release }}-${{ github.run_number }}
           name: NetHunter Combined ${{ steps.combine.outputs.kernel_release }}
           body: |
+            Fixes vendor drivers incorrectly appearing as `[permanent]` when
+            their valid cleanup callback relocates to a different module
+            descriptor offset. The ARM64 loader corrects recognized layouts
+            without driver-specific offsets or forced unloading; compatible
+            and ambiguous layouts retain their existing behavior.
+
+            The WLAN installer now stops and restores Wi-Fi if `rmmod` fails.
+            Update both the kernel and the WLAN injection ZIP. No partition
+            resizing or vendor_dlkm replacement is needed. The test package
+            was reported working on device before this release.
+
             Four deliverables, all built in one run against the same ABI:
 
             1. **`*-kernel-only.zip`** — flash from recovery (AnyKernel3).
@@ -987,7 +1006,8 @@ jobs:
             - WLAN source: ${{ inputs.wlan_repo }}@${{ inputs.wlan_branch }}
             - Built entirely in run ${{ github.run_id }} (kernel, WLAN and
               modules from the same artifacts)
-          prerelease: true
+          prerelease: false
+          make_latest: true
           files: |
             release/*
             release-abi/Module.symvers

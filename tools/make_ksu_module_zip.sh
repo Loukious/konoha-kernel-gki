@@ -198,7 +198,11 @@ swap_in() {
 		i=\$((i + 1))
 	done
 	if [ "\$(cat /sys/module/\$name/refcnt 2>/dev/null)" = "0" ]; then
-		rmmod "\$name"
+		if ! rmmod "\$name"; then
+			log -p e -t "$MODULE_ID" "could not unload \$name; keeping driver"
+			[ "\$wifi_on" = "1" ] && svc wifi enable
+			return 1
+		fi
 		if insmod "\$ko"; then
 			log -p i -t "$MODULE_ID" "swapped \$name for \$(basename "\$ko")"
 		else

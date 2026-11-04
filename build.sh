@@ -35,6 +35,8 @@ fi
 #   autofdo=on|off        AutoFDO (default: on)
 #   droidspaces=on|off    Droidspaces support (default: off)
 #   nethunter=on|off      Kali NetHunter support (default: off)
+# Environment: ROOT_REF / BBG_REF optionally pin dependency commits.
+#              CLANG_PATH selects a toolchain prefix containing bin/clang.
 # ==========================================
 
 VERSION="1.1"
@@ -305,6 +307,12 @@ else
         (cd "$MODULES_DIR/$REPO_NAME" && git fetch origin && git reset --hard "origin/$BRANCH" || true)
     fi
 
+    if [ -n "${ROOT_REF:-}" ]; then
+        echo "[+] Pinning $REPO_NAME to $ROOT_REF..."
+        git -C "$MODULES_DIR/$REPO_NAME" fetch origin "$ROOT_REF"
+        git -C "$MODULES_DIR/$REPO_NAME" checkout --detach FETCH_HEAD
+    fi
+
     # Apply SUSFS
     if [ "$VARIANT" == "susfs" ]; then
         SUSFS_DIR="$MODULES_DIR/susfs4ksu"
@@ -486,6 +494,11 @@ BBG_DIR="$KERNEL_DIR/Baseband-guard"
 if [ ! -d "$BBG_DIR" ]; then
     echo "[+] Cloning Baseband-guard..."
     git clone https://github.com/vc-teahouse/Baseband-guard.git "$BBG_DIR"
+fi
+if [ -n "${BBG_REF:-}" ]; then
+    echo "[+] Pinning Baseband-guard to $BBG_REF..."
+    git -C "$BBG_DIR" fetch origin "$BBG_REF"
+    git -C "$BBG_DIR" checkout --detach FETCH_HEAD
 fi
 echo "[+] Running Baseband-guard setup..."
 (cd "$KERNEL_DIR" && sh "$BBG_DIR/setup.sh")

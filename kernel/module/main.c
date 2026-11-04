@@ -3686,6 +3686,115 @@ static void spam_log_live_patch(struct module *mod)
 	 return 0;
  }
  
+#if defined(CONFIG_ARM64) && defined(CONFIG_MODULE_UNLOAD)
+/*
+ * Config-dependent members can move module.exit without changing the
+ * cacheline-rounded sizeof(struct module). When an otherwise accepted
+ * module has this mismatch, its cleanup_module relocation leaves exit NULL
+ * and can overwrite another member. Use the standard modpost symbols to
+ * correct the destination before layout and relocation processing.
+ *
+ * Only recognize a zero-initialized module descriptor (apart from name),
+ * with the usual init_module/cleanup_module pair and an already matching
+ * init offset. Derive the exit offset from this kernel, not a vendor or
+ * module-name allowlist. Leave all other layouts untouched. This does not
+ * invent a cleanup function, bypass unload checks, or repair other ABI
+ * differences; the normal module compatibility checks still apply.
+ */
+static void fixup_module_exit_relocation(struct load_info *info)
+{
+	Elf_Shdr *relsec = NULL, *symsec = &info->sechdrs[info->index.sym];
+	Elf_Shdr *strsec = &info->sechdrs[info->index.str];
+	Elf_Rela *rels, *exit_rel = NULL;
+	Elf_Sym *syms = (void *)symsec->sh_addr;
+	const char *raw = (void *)info->mod;
+	size_t name_end = offsetof(struct module, name) + MODULE_NAME_LEN;
+	Elf_Addr old_offset;
+	unsigned int i;
+	bool have_init = false;
+
+	if (info->sechdrs[info->index.mod].sh_size != sizeof(struct module))
+		return;
+
+	/* Do not reinterpret descriptors with other initialized members. */
+	if (memchr_inv(raw, 0, offsetof(struct module, name)) ||
+	    memchr_inv(raw + name_end, 0, sizeof(struct module) - name_end))
+		return;
+
+	for (i = 1; i < info->hdr->e_shnum; i++) {
+		Elf_Shdr *sec = &info->sechdrs[i];
+
+		if ((sec->sh_type != SHT_RELA && sec->sh_type != SHT_REL) ||
+		    sec->sh_info != info->index.mod)
+			continue;
+		if (relsec || sec->sh_type != SHT_RELA ||
+		    sec->sh_link != info->index.sym ||
+		    sec->sh_entsize != sizeof(Elf_Rela) ||
+		    sec->sh_size != 2 * sizeof(Elf_Rela))
+			return;
+		relsec = sec;
+	}
+	if (!relsec || symsec->sh_entsize != sizeof(Elf_Sym) ||
+	    symsec->sh_size % sizeof(Elf_Sym))
+		return;
+
+	rels = (void *)relsec->sh_addr;
+	for (i = 0; i < 2; i++) {
+		unsigned long symidx = ELF64_R_SYM(rels[i].r_info);
+		Elf_Shdr *textsec;
+		Elf_Sym *sym;
+		const char *name;
+
+		if (ELF64_R_TYPE(rels[i].r_info) != R_AARCH64_ABS64 ||
+		    rels[i].r_addend ||
+		    symidx >= symsec->sh_size / sizeof(Elf_Sym))
+			return;
+		sym = &syms[symidx];
+		if (ELF_ST_TYPE(sym->st_info) != STT_FUNC ||
+		    sym->st_shndx == SHN_UNDEF ||
+		    sym->st_shndx >= SHN_LORESERVE ||
+		    sym->st_shndx >= info->hdr->e_shnum ||
+		    sym->st_name >= strsec->sh_size)
+			return;
+		name = info->strtab + sym->st_name;
+		if (!memchr(name, '\0', strsec->sh_size - sym->st_name))
+			return;
+		textsec = &info->sechdrs[sym->st_shndx];
+		if (textsec->sh_type != SHT_PROGBITS ||
+		    (textsec->sh_flags & (SHF_ALLOC | SHF_EXECINSTR)) !=
+		    (SHF_ALLOC | SHF_EXECINSTR) ||
+		    !sym->st_size || sym->st_value >= textsec->sh_size ||
+		    sym->st_size > textsec->sh_size - sym->st_value)
+			return;
+
+		if (!strcmp(name, "init_module") && !have_init &&
+		    rels[i].r_offset == offsetof(struct module, init)) {
+			have_init = true;
+		} else if (!strcmp(name, "cleanup_module") && !exit_rel &&
+			   IS_ALIGNED(rels[i].r_offset, sizeof(Elf_Addr)) &&
+			   rels[i].r_offset >= name_end &&
+			   rels[i].r_offset <= sizeof(struct module) - sizeof(Elf_Addr) &&
+			   rels[i].r_offset != offsetof(struct module, init) &&
+			   !module_init_layout_section(info->secstrings + textsec->sh_name)) {
+			exit_rel = &rels[i];
+		} else {
+			return;
+		}
+	}
+	if (!have_init || !exit_rel ||
+	    exit_rel->r_offset == offsetof(struct module, exit))
+		return;
+
+	old_offset = exit_rel->r_offset;
+	exit_rel->r_offset = offsetof(struct module, exit);
+	pr_info("%s: corrected cleanup_module relocation %#llx -> %#zx\n",
+		info->name, (unsigned long long)old_offset,
+		offsetof(struct module, exit));
+}
+#else
+static inline void fixup_module_exit_relocation(struct load_info *info) { }
+#endif
+
  /* Module within temporary copy, this doesn't do any allocation  */
  static int early_mod_check(struct load_info *info, int flags)
  {
@@ -3703,6 +3812,8 @@ static void spam_log_live_patch(struct module *mod)
 	 err = rewrite_section_headers(info, flags);
 	 if (err)
 		 return err;
+
+	 fixup_module_exit_relocation(info);
  
 	 /* Check module struct version now, before we try to use module. */
 	 if (!check_modstruct_version(info, info->mod))
